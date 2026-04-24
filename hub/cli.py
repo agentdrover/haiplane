@@ -316,6 +316,13 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_force_complete(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {"comment": args.message or ""}
+    result = _api("POST", f"/api/tasks/{args.task_id}/force-complete", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     result = _api("GET", "/api/dashboard")
     _print_json(result)
@@ -830,6 +837,19 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--rework", action="store_true", help="Send back for rework")
     p_decide.add_argument("--message", default="", help="Instructions for rework")
     p_decide.set_defaults(func=cmd_decide)
+
+    # force-complete — human override of the completion gate
+    p_force_complete = sub.add_parser(
+        "force-complete",
+        help="Force-complete a pending_report task without an agent done report (audited human override)",
+    )
+    p_force_complete.add_argument("task_id", type=int)
+    p_force_complete.add_argument(
+        "--message",
+        default="",
+        help="Reason for the override (recorded in audit trail)",
+    )
+    p_force_complete.set_defaults(func=cmd_force_complete)
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Get dashboard data (JSON)")

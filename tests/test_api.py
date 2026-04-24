@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from httpx import AsyncClient
 
+from hub import repository as repo
+
 
 async def test_create_task_api(client: AsyncClient):
     resp = await client.post("/api/tasks", json={"title": "API test task"})
@@ -145,6 +147,53 @@ async def test_approve_non_draft_returns_400(client: AsyncClient):
 
     resp = await client.post(f"/api/tasks/{task_id}/approve")
     assert resp.status_code == 400
+
+
+async def test_force_complete_api(client: AsyncClient, db):
+    create_resp = await client.post("/api/tasks", json={"title": "Pending report"})
+    task_id = create_resp.json()["id"]
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(f"/api/tasks/{task_id}/force-complete")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "completed"
+    assert any(
+        update["kind"] == "done" and "Force-completed by human" in update["content"]
+        for update in data["updates"]
+    )
+
+
+async def test_force_complete_api_rejects_wrong_status(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Open task"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(f"/api/tasks/{task_id}/force-complete")
+
+    assert resp.status_code == 400
+    assert "pending_report" in resp.text
+
+
+async def test_force_complete_api_records_human_comment(client: AsyncClient, db):
+    create_resp = await client.post("/api/tasks", json={"title": "Pending report"})
+    task_id = create_resp.json()["id"]
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/force-complete",
+        json={"comment": "reviewed manually, accepting risk"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "completed"
+    done_updates = [u for u in data["updates"] if u["kind"] == "done"]
+    assert len(done_updates) == 1
+    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["agent"] == "human"
 
 
 async def test_task_updates_api(client: AsyncClient):

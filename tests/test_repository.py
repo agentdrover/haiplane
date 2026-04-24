@@ -40,19 +40,46 @@ async def test_get_task_nonexistent(db: aiosqlite.Connection):
 
 async def test_list_tasks_filtered(db: aiosqlite.Connection):
     await repo.create_task(
-        db, title="Open 1", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Open 1",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.create_task(
-        db, title="Running 1", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="running", auto_review=True,
-        task_type="task", parent_id=None, priority="high",
+        db,
+        title="Running 1",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="high",
     )
     await repo.create_task(
-        db, title="Open 2", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="feature", parent_id=None, priority="low",
+        db,
+        title="Open 2",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="feature",
+        parent_id=None,
+        priority="low",
     )
     await db.commit()
 
@@ -75,9 +102,18 @@ async def test_list_tasks_filtered(db: aiosqlite.Connection):
 
 async def test_update_task(db: aiosqlite.Connection):
     task_id = await repo.create_task(
-        db, title="To update", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="To update",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 
@@ -92,9 +128,18 @@ async def test_update_task(db: aiosqlite.Connection):
 
 async def test_add_and_get_updates(db: aiosqlite.Connection):
     task_id = await repo.create_task(
-        db, title="With updates", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="With updates",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 
@@ -117,9 +162,18 @@ async def test_add_and_get_updates(db: aiosqlite.Connection):
 
 async def test_has_done_updates(db: aiosqlite.Connection):
     task_id = await repo.create_task(
-        db, title="Done check", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="running", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Done check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 
@@ -136,9 +190,18 @@ async def test_has_done_updates(db: aiosqlite.Connection):
 
 async def test_has_plan_updates(db: aiosqlite.Connection):
     task_id = await repo.create_task(
-        db, title="Plan check", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Plan check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 
@@ -155,19 +218,46 @@ async def test_has_plan_updates(db: aiosqlite.Connection):
 
 async def test_list_tasks_by_statuses(db: aiosqlite.Connection):
     await repo.create_task(
-        db, title="T1", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="T1",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.create_task(
-        db, title="T2", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="running", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="T2",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.create_task(
-        db, title="T3", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="completed", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="T3",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 
@@ -179,14 +269,32 @@ async def test_list_tasks_by_statuses(db: aiosqlite.Connection):
 
 async def test_list_agent_tasks(db: aiosqlite.Connection):
     await repo.create_task(
-        db, title="Agent task", description="", runtime="auto", source="agent",
-        assigned_agent="bot", rationale="need it", status="draft", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Agent task",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="need it",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.create_task(
-        db, title="Human task", description="", runtime="auto", source="human",
-        assigned_agent="", rationale="", status="open", auto_review=True,
-        task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Human task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.commit()
 

@@ -393,6 +393,11 @@ async def test_force_complete_task(db: aiosqlite.Connection):
 
     tv = await services.force_complete_task(db, task_id)
     assert tv.status.value == "completed"
+    assert tv.updates
+    assert any(
+        update.kind == "done" and "Force-completed by human" in update.content
+        for update in tv.updates
+    )
 
 
 async def test_force_complete_wrong_status(db: aiosqlite.Connection):

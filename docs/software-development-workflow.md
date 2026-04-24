@@ -159,7 +159,7 @@ flowchart TD
 
 Агентам не стоит обходить хаб, если действие влияет на состояние задачи. Код можно менять в workspace repo, но намерение, вопросы, блокеры, done report и решения должны возвращаться в хаб.
 
-Важно: текущий MCP `hub_approve_task` не принимает `force=true`. Для force approve сейчас нужно использовать API, CLI или Web UI, либо добавить `force` в MCP-контракт отдельным изменением.
+Force approve доступен единым контрактом через MCP (`hub_approve_task(..., force=True)`), REST API (`POST /api/tasks/{id}/approve` с `force: true`), CLI (`oc-hub approve --force`) и Web UI (форма `web-approve` с `force=true`). Любой force approve является audited human override: он оставляет alert-update в задаче и запись в activity log, что обеспечивает трассируемость причин обхода DoR.
 
 ## Definition of Ready как главный входной gate
 
@@ -197,6 +197,8 @@ flowchart TD
 6. После approval и успешного CI хаб может merge PR и завершить задачу.
 
 Если branch/PR/CI не удалось создать или интерпретировать, задача должна уходить в `needs_decision`, а не молча считаться выполненной.
+
+Формальные инварианты (один branch на задачу, запрет касания чужого branch, out-of-scope — только draft proposal, конфликт → `needs_decision`) описаны в [workspace-safety-policy.md](workspace-safety-policy.md).
 
 ## Режимы работы команды
 

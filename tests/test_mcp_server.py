@@ -7,7 +7,9 @@ import pytest
 from hub.mcp_server import (
     hub_add_acceptance_criterion,
     hub_add_risk,
+    hub_approve_task,
     hub_delete_acceptance_criterion,
+    hub_force_complete_task,
     hub_get_readiness,
     hub_list_acceptance_criteria,
     hub_list_tasks,
@@ -149,6 +151,42 @@ async def test_hub_start_task(mock_api_post: AsyncMock) -> None:
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/5/start",
         {"plan": "Step one then two", "runtime": "openrouter"},
+    )
+
+
+async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "open"}
+    msg = await hub_approve_task(
+        5,
+        comment="human override",
+        run=True,
+        runtime="vast",
+        force=True,
+    )
+    assert "Task #5 approved" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/5/approve",
+        {
+            "comment": "human override",
+            "run": True,
+            "force": True,
+            "runtime": "vast",
+        },
+    )
+
+
+async def test_hub_force_complete_task(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "completed"}
+    msg = await hub_force_complete_task(9)
+    assert "Task #9 force-completed" in msg
+    mock_api_post.assert_awaited_once_with("/api/tasks/9/force-complete", None)
+
+
+async def test_hub_force_complete_task_with_comment(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "completed"}
+    await hub_force_complete_task(9, comment="reviewed manually")
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/9/force-complete", {"comment": "reviewed manually"}
     )
 
 

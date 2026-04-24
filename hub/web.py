@@ -22,6 +22,7 @@ from hub.models import (
     TaskApprove,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskReject,
     TaskStart,
     TaskStatus,
@@ -424,8 +425,17 @@ async def web_decide_task(
 async def web_force_complete_task(
     task_id: int,
     request: Request,
+    comment: str = Form(""),
 ):
-    await services.force_complete_task(_db(request), task_id)
+    """Force-complete a pending_report task from the Web UI.
+
+    The audit-trail comment can be supplied either via the ``HX-Prompt``
+    header (populated by htmx ``hx-prompt``) or via a ``comment`` form field
+    for non-htmx clients. The header takes precedence.
+    """
+    reason = request.headers.get("HX-Prompt", "") or comment
+    body = TaskForceComplete(comment=reason) if reason else None
+    await services.force_complete_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

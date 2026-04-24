@@ -13,6 +13,18 @@
 3. If schema or task contracts change, update adjacent layers in the same change.
 4. Validate with ruff and targeted pytest before closing work.
 
+## Hub Lifecycle Duties
+
+- Call `hub_my_context(task_id)` before implementation.
+- Record a plan before work starts with `hub_start_task(..., plan="...")` or
+  `hub_task_update(..., kind="status", content="Plan: ...")`.
+- Use `hub_ask_question` for missing requirements and
+  `hub_task_update(..., kind="blocker")` for blocked execution.
+- Finish with `hub_report_done`; include changed files, behavior change, and
+  validation commands with results.
+- Propose out-of-scope follow-up work with `hub_propose_task`; do not absorb it
+  into the current task without a human decision.
+
 ## Quality Bar
 
 - Type hints stay intact.

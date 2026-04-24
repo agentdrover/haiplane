@@ -276,10 +276,16 @@ async def hub_task_update(
 
 @mcp.tool()
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
-    """Submit a completion report for a task. Required to move task from pending_report to completed.
+    """Submit a completion report for a task — the normal agent path out of pending_report.
 
-    After an agent finishes work, it must submit a done report describing what was changed
-    and how it was validated. This is the only way to complete a pending_report task.
+    After an agent finishes work it must submit a done report describing what was changed
+    and how it was validated; the report transitions the task from pending_report to
+    completed. This is the standard close-out path for agents.
+
+    The explicit human exception is `hub_force_complete_task`, which is reserved for cases
+    where a human has inspected the result and accepts that the agent report is missing or
+    unacceptably weak. Agents should not use `hub_force_complete_task` as a fallback —
+    they should always submit a real done report through this tool.
 
     Args:
         task_id: The task ID to report on
@@ -348,17 +354,22 @@ async def hub_my_context(task_id: int) -> str:
 
 @mcp.tool()
 async def hub_approve_task(
-    task_id: int, comment: str = "", run: bool = False, runtime: str = ""
+    task_id: int,
+    comment: str = "",
+    run: bool = False,
+    runtime: str = "",
+    force: bool = False,
 ) -> str:
-    """Approve a draft task (proposed by agent). Optionally dispatch immediately.
+    """Approve a draft task after DoR. Force approval is audited by the API.
 
     Args:
         task_id: The draft task ID to approve
         comment: Optional reviewer comment
         run: If True, also dispatch the task immediately after approval
         runtime: Override runtime: 'auto', 'openrouter', or 'vast'. Empty to keep existing.
+        force: If True, override failed DoR checks. Use only as a human decision.
     """
-    body: dict[str, Any] = {"comment": comment, "run": run}
+    body: dict[str, Any] = {"comment": comment, "run": run, "force": force}
     if runtime:
         body["runtime"] = runtime
     result = await _api_post(f"/api/tasks/{task_id}/approve", body)
@@ -399,6 +410,24 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
     status = result.get("status", "?")
     job_id = result.get("job_id", "-")
     return f"Task #{task_id} dispatched (status: {status}, job: {job_id})."
+
+
+@mcp.tool()
+async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
+    """Human force-completes a pending_report task without an agent done report.
+
+    Use this only when a human has inspected the result and intentionally accepts
+    responsibility for completing a task that lacks a normal done report. The
+    comment is recorded as the audit-trail message on the task update.
+
+    Args:
+        task_id: The pending_report task ID to complete
+        comment: Reason for the override; recorded as the audit-trail message
+    """
+    body = {"comment": comment} if comment else None
+    result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
+    status = result.get("status", "?")
+    return f"Task #{task_id} force-completed (status: {status})."
 
 
 # ---------------------------------------------------------------------------

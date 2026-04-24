@@ -120,7 +120,7 @@
                     hx-post="/tasks/{{ t.id }}/web-force-complete"
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
-                    hx-confirm="Force-complete #{{ t.id }} without report?">Force Complete</button>
+                    hx-prompt="Reason for force-completing #{{ t.id }} (recorded in audit trail):">Force Complete</button>
         </div>
     </article>
     {% endfor %}

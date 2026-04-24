@@ -7,7 +7,9 @@ HOME = Path(os.environ.get("OPENCLAW_HUB_HOME", Path.home()))
 
 REPO_NAME = os.environ.get("OPENCLAW_HUB_REPO", "")
 WORKSPACE_REPO_LINK = Path(
-    os.environ.get("OPENCLAW_WORKSPACE_REPO", str(HOME / ".openclaw" / "workspace" / "repo"))
+    os.environ.get(
+        "OPENCLAW_WORKSPACE_REPO", str(HOME / ".openclaw" / "workspace" / "repo")
+    )
 )
 
 DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "jobs"
@@ -65,7 +67,9 @@ HUB_TOKENS_RAW = os.environ.get("OPENCLAW_HUB_TOKENS", "")
 HUB_AUTH_DISABLED = os.environ.get("OPENCLAW_HUB_AUTH_DISABLED", "0") == "1"
 HUB_COOKIE_NAME = os.environ.get("OPENCLAW_HUB_COOKIE", "openclaw_hub_session")
 # 30 days by default — Hub is an internal tool, long-lived sessions are fine.
-HUB_COOKIE_MAX_AGE = int(os.environ.get("OPENCLAW_HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
+HUB_COOKIE_MAX_AGE = int(
+    os.environ.get("OPENCLAW_HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600))
+)
 
 
 def parse_tokens(raw: str) -> dict[str, str]:

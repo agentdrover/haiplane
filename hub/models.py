@@ -199,6 +199,11 @@ class TaskReject(BaseModel):
     comment: str = ""
 
 
+class TaskForceComplete(BaseModel):
+    # Reason for the human override; recorded as the audit-trail message.
+    comment: str = ""
+
+
 class TaskStart(BaseModel):
     runtime: RuntimeChoice | None = None
     plan: str = Field("", max_length=10000)

@@ -120,7 +120,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         if _looks_public(path):
-            request.state.user = _resolve_user(_extract_token(request)) or ANONYMOUS_USER
+            request.state.user = (
+                _resolve_user(_extract_token(request)) or ANONYMOUS_USER
+            )
             return await call_next(request)
 
         if _is_open_mode():

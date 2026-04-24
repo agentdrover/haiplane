@@ -1,0 +1,24 @@
+---
+description: OpenClaw Hub lifecycle rules for Cursor agents
+alwaysApply: true
+---
+
+# OpenClaw Hub Cursor Rules
+
+OpenClaw Hub is the source of truth for task state, questions, blockers,
+decisions, and completion reports.
+
+- Before starting work on a task, call `hub_my_context(task_id)`.
+- If the task is not ready, do not write code. Refine scope, acceptance
+  criteria, validation commands, or risks, then check `hub_get_readiness`.
+- Before implementation or dispatch, record `Plan:` through `hub_start_task`
+  with a `plan` argument or `hub_task_update(..., kind="status")`.
+- Ask requirement questions through `hub_ask_question`.
+- Record blockers through `hub_task_update(..., kind="blocker")`.
+- Complete normal work through `hub_report_done` with changed files, behavior
+  change, validation commands, and results.
+- Create new out-of-scope work through `hub_propose_task` as a draft proposal.
+- Do not close or force-complete a task with failed CI, unresolved blockers, or
+  review changes requested.
+- Use `hub_approve_task(..., force=true)` and `hub_force_complete_task` only as
+  explicit human gates.

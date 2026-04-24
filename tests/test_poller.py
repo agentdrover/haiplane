@@ -44,9 +44,18 @@ async def test_poll_no_running_tasks(mock_sleep, db):
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_poll_completed_task(mock_sleep, db):
     task_id = await repo.create_task(
-        db, title="Running task", description="", runtime="auto",
-        source="human", assigned_agent="", rationale="", status="running",
-        auto_review=False, task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Running task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.update_task(db, task_id, job_id="job-123")
     await repo.add_task_update(db, task_id, "dev", "done", "All done")
@@ -73,9 +82,18 @@ async def test_poll_completed_task(mock_sleep, db):
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_poll_stale_detection(mock_sleep, db):
     task_id = await repo.create_task(
-        db, title="Stale task", description="", runtime="auto",
-        source="human", assigned_agent="", rationale="", status="running",
-        auto_review=False, task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Stale task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await db.execute(
         "UPDATE tasks SET updated_at = datetime('now', '-120 minutes') WHERE id=?",
@@ -100,9 +118,18 @@ async def test_poll_stale_detection(mock_sleep, db):
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_poll_review_dispatch(mock_sleep, db):
     task_id = await repo.create_task(
-        db, title="Auto-review task", description="", runtime="auto",
-        source="human", assigned_agent="", rationale="", status="running",
-        auto_review=True, task_type="task", parent_id=None, priority="medium",
+        db,
+        title="Auto-review task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
     )
     await repo.update_task(db, task_id, job_id="job-456", branch="task-1/test")
     await repo.add_task_update(db, task_id, "agent", "done", "Task completed")

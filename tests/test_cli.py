@@ -433,6 +433,28 @@ def test_cmd_approve_passes_force_flag() -> None:
     )
 
 
+def test_cmd_force_complete_passes_message() -> None:
+    args = argparse.Namespace(task_id=9, message="reviewed manually")
+    mock_api = MagicMock(return_value={"id": 9, "status": "completed"})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_force_complete(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST", "/api/tasks/9/force-complete", {"comment": "reviewed manually"}
+    )
+
+
+def test_cmd_force_complete_default_empty_message() -> None:
+    args = argparse.Namespace(task_id=9, message="")
+    mock_api = MagicMock(return_value={"id": 9, "status": "completed"})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_force_complete(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST", "/api/tasks/9/force-complete", {"comment": ""}
+    )
+
+
 def test_print_http_error_pretty_prints_dor_failed_detail(capsys) -> None:
     body = json.dumps(
         {

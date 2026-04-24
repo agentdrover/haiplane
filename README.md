@@ -33,6 +33,27 @@ openclaw-hub
 # → http://localhost:8080
 ```
 
+## Cursor + Hub Workflow
+
+Run the hub, connect Cursor to its MCP endpoint, and treat OpenClaw Hub as the
+task state source. The delivery process is documented in
+[docs/software-development-workflow.md](docs/software-development-workflow.md);
+the staged rollout lives in
+[docs/software-development-workflow-implementation-plan.md](docs/software-development-workflow-implementation-plan.md).
+Cursor-specific rules are in
+[docs/cursor-agent-rules.md](docs/cursor-agent-rules.md), with an installable
+template at
+[docs/templates/cursor/openclaw-hub.mdc](docs/templates/cursor/openclaw-hub.mdc).
+
+Minimum MCP tools for daily work:
+
+- `hub_project_status`, `hub_list_tasks`, `hub_task_status`
+- `hub_my_context`, `hub_refine_task`, `hub_get_readiness`
+- `hub_add_acceptance_criterion`, `hub_replace_acceptance_criteria`, `hub_add_risk`
+- `hub_approve_task`, `hub_reject_task`, `hub_start_task`
+- `hub_task_update`, `hub_ask_question`, `hub_report_done`
+- `hub_force_complete_task`, `hub_decide_task`
+
 ## Configuration
 
 All configuration via environment variables:

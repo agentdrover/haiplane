@@ -6,7 +6,15 @@
 
 ## Этап 1. Минимальный Cursor workflow без миграций
 
-### 1.1. MCP parity для approval
+### 1.1. MCP parity для approval ✅ done (2026-04-24)
+
+**Итог**
+
+- `hub/mcp_server.py`: `hub_approve_task(..., force=False)` с обновлённым docstring, `force` прокидывается в `POST /api/tasks/{id}/approve`.
+- `tests/test_mcp_server.py::test_hub_approve_task_passes_force` покрывает контракт.
+- Примечание в `docs/software-development-workflow.md` обновлено: force approve доступен единым контрактом через MCP / REST / CLI / Web UI, является audited human override.
+
+
 
 **Проблема**
 
@@ -27,7 +35,14 @@ API, CLI и Web поддерживают `force=true` для `approve`, но MCP
 uv run pytest tests/test_mcp_server.py -q
 ```
 
-### 1.2. MCP tool для force-complete pending report
+### 1.2. MCP tool для force-complete pending report ✅ done (2026-04-24)
+
+**Итог**
+
+- REST endpoint `POST /api/tasks/{task_id}/force-complete` в `hub/app.py`, сервис `services.force_complete_task` в `hub/services/lifecycle.py`, MCP tool `hub_force_complete_task(task_id, comment="")` в `hub/mcp_server.py`, CLI `hub force-complete` в `hub/cli.py`.
+- Web UI parity закрыта: `POST /tasks/{id}/web-force-complete` теперь принимает комментарий через htmx `hx-prompt` (`HX-Prompt` header) или form field `comment`, кнопка в `hub/templates/partials/inbox.html` переведена на `hx-prompt`.
+- Тесты: `test_services.py`, `test_api.py`, `test_mcp_server.py`, `test_cli.py`, `test_web.py` (`test_web_force_complete_records_hx_prompt`, `test_web_force_complete_falls_back_to_form_comment`).
+
 
 **Проблема**
 
@@ -51,7 +66,14 @@ Web UI умеет явно закрывать `pending_report` через force-
 uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py -q
 ```
 
-### 1.3. Cursor agent rules
+### 1.3. Cursor agent rules ✅ done (2026-04-24)
+
+**Итог**
+
+- `docs/cursor-agent-rules.md` — 8 обязательных правил + раздел human gates + minimum MCP tools.
+- `docs/templates/cursor/openclaw-hub.mdc` — installable Cursor rule со `alwaysApply: true`.
+
+
 
 **Проблема**
 
@@ -75,7 +97,17 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
 
 Документальная проверка. Тесты не нужны.
 
-### 1.4. Уточнить role prompts
+### 1.4. Уточнить role prompts ✅ done (2026-04-24)
+
+**Итог**
+
+Все четыре `agents/*.md` получили секцию `Hub Lifecycle Duties`:
+- `architect-analyst.md` — refine / AC / risks / readiness, force=true как осознанный human override.
+- `python-senior-developer.md` — `hub_my_context`, `Plan:`, done report с changed files / behavior / validation.
+- `testing-agent.md` — validation commands возвращаются в update/report, failed validation → blocker.
+- `code-reviewer.md` — проверка diff vs acceptance criteria / validation / contract surfaces; `hub_decide_task` остаётся human gate.
+
+
 
 **Проблема**
 
@@ -100,7 +132,13 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
 
 Документальная проверка. Тесты не нужны.
 
-### 1.5. README entrypoint
+### 1.5. README entrypoint ✅ done (2026-04-24)
+
+**Итог**
+
+В `README.md` добавлен раздел `Cursor + Hub Workflow` со ссылками на `docs/software-development-workflow.md`, `docs/software-development-workflow-implementation-plan.md`, `docs/cursor-agent-rules.md`, шаблон `docs/templates/cursor/openclaw-hub.mdc` и минимальный набор MCP tools.
+
+
 
 **Проблема**
 

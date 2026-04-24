@@ -167,7 +167,10 @@ def test_task_refine_accepts_acs_and_risks():
     refine = TaskRefine(
         acceptance_criteria=[
             AcceptanceCriterion(
-                id="AC-1", given="g", when="w", then="t",
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
                 verifiable_by=ACVerifiableBy.test,
             )
         ],
@@ -246,8 +249,11 @@ def test_readiness_report_full_payload():
 def test_recommendation_rejects_unknown_severity():
     with pytest.raises(ValidationError):
         Recommendation(
-            field="x", severity="urgent", message="m",
-            expected_score_delta=0, estimated_minutes=0,
+            field="x",
+            severity="urgent",
+            message="m",
+            expected_score_delta=0,
+            estimated_minutes=0,
         )
 
 
@@ -282,21 +288,23 @@ def test_task_view_defaults_for_structured_fields():
 
 
 def test_task_view_accepts_structured_payload():
-    view = TaskView(**_minimal_task_view_payload(
-        work_type="bug",
-        size="L",
-        scope_in=["a"],
-        risks=[
-            TaskRisk(
-                kind=RiskKind.security,
-                severity=RiskSeverity.high,
-                description="d",
-                mitigation="m",
-            )
-        ],
-        readiness_score=72,
-        dor_passed=True,
-    ))
+    view = TaskView(
+        **_minimal_task_view_payload(
+            work_type="bug",
+            size="L",
+            scope_in=["a"],
+            risks=[
+                TaskRisk(
+                    kind=RiskKind.security,
+                    severity=RiskSeverity.high,
+                    description="d",
+                    mitigation="m",
+                )
+            ],
+            readiness_score=72,
+            dor_passed=True,
+        )
+    )
     assert view.work_type == WorkType.bug
     assert view.readiness_score == 72
     assert view.dor_passed is True

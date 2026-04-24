@@ -55,9 +55,14 @@ class GitHubIntegration:
 
     async def open_prs(self) -> list[dict[str, Any]]:
         raw = await _gh(
-            "pr", "list", "--repo", REPO_NAME,
-            "--state", "open",
-            "--json", "number,title,headRefName,author,createdAt,url",
+            "pr",
+            "list",
+            "--repo",
+            REPO_NAME,
+            "--state",
+            "open",
+            "--json",
+            "number,title,headRefName,author,createdAt,url",
         )
         if not raw.strip():
             return []

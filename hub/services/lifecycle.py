@@ -21,6 +21,7 @@ from hub.models import (
     TaskChildSummary,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskProgress,
     TaskQuestion,
     TaskReject,
@@ -589,8 +590,13 @@ async def reorder_task(
 async def force_complete_task(
     db: aiosqlite.Connection,
     task_id: int,
+    body: TaskForceComplete | None = None,
 ) -> TaskView:
-    """Force-complete a pending_report task without a done report."""
+    """Force-complete a pending_report task without a done report.
+
+    The optional ``body.comment`` is recorded as the audit-trail message; if
+    omitted, a default human-override message is used.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -600,13 +606,10 @@ async def force_complete_task(
             400,
             f"can only force-complete pending_report tasks, current: {task['status']}",
         )
-    await repo.add_task_update(
-        db,
-        task_id,
-        "human",
-        "done",
-        "Force-completed by human without agent report.",
+    comment = (body.comment.strip() if body else "") or (
+        "Force-completed by human without agent report."
     )
+    await repo.add_task_update(db, task_id, "human", "done", comment)
     await repo.update_task(db, task_id, status="completed")
     await db.commit()
     await log_activity(
@@ -615,4 +618,5 @@ async def force_complete_task(
         f"Task #{task_id} force-completed without report",
     )
     row = await repo.get_task(db, task_id)
-    return row_to_task(row)  # type: ignore[arg-type]
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]

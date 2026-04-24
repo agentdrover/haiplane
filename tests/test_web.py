@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from httpx import AsyncClient
 
+from hub import repository as repo
+
 
 async def test_dashboard_page(client: AsyncClient):
     resp = await client.get("/")
@@ -70,3 +72,46 @@ async def test_web_approve_task(client: AsyncClient):
     )
     assert resp.status_code == 303
     assert f"/tasks/{task_id}" in resp.headers["location"]
+
+
+async def test_web_force_complete_records_hx_prompt(client: AsyncClient, db):
+    create = await client.post("/api/tasks", json={"title": "Pending report via web"})
+    task_id = create.json()["id"]
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-force-complete",
+        headers={"HX-Prompt": "reviewed manually, accepting risk"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code in (200, 303)
+    detail = await client.get(f"/api/tasks/{task_id}")
+    data = detail.json()
+    assert data["status"] == "completed"
+    done_updates = [u for u in data["updates"] if u["kind"] == "done"]
+    assert len(done_updates) == 1
+    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["agent"] == "human"
+
+
+async def test_web_force_complete_falls_back_to_form_comment(client: AsyncClient, db):
+    create = await client.post("/api/tasks", json={"title": "Pending report form"})
+    task_id = create.json()["id"]
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-force-complete",
+        data={"comment": "form-based override"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code in (200, 303)
+    detail = await client.get(f"/api/tasks/{task_id}")
+    data = detail.json()
+    assert data["status"] == "completed"
+    done_updates = [u for u in data["updates"] if u["kind"] == "done"]
+    assert len(done_updates) == 1
+    assert done_updates[0]["content"] == "form-based override"

@@ -28,6 +28,7 @@ from hub.models import (
     TaskContextView,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskQuestion,
     TaskRefine,
     TaskReject,
@@ -384,6 +385,14 @@ async def api_task_answer(task_id: int, body: TaskAnswer, request: Request):
 @app.post("/api/tasks/{task_id}/decide", response_model=TaskView)
 async def api_decide_task(task_id: int, body: TaskDecide, request: Request):
     return await services.decide_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/force-complete", response_model=TaskView)
+async def api_force_complete_task(
+    task_id: int, request: Request, body: TaskForceComplete | None = None
+):
+    """Force-complete a pending_report task after explicit human acceptance."""
+    return await services.force_complete_task(_db(request), task_id, body)
 
 
 # --- Task Updates ---
