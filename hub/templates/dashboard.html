@@ -1,0 +1,381 @@
+{% extends "base.html" %}
+{% set active = "dashboard" %}
+
+{% block title %}Dashboard — OpenClaw Hub{% endblock %}
+
+{% block content %}
+{% set _running_count = (data.active_tasks|selectattr("status.value", "equalto", "running")|list|length) + (data.active_tasks|selectattr("status.value", "equalto", "fix_requested")|list|length) %}
+{% set _open_count = data.active_tasks|selectattr("status.value", "equalto", "open")|list|length %}
+{% set _vast_offline = data.vast_status and ('no instance' in data.vast_status|lower or 'unknown' in data.vast_status|lower or 'not found' in data.vast_status|lower) %}
+<header class="topbar">
+    <div class="topbar-brand">
+        <span class="topbar-title">Dashboard</span>
+        <span class="topbar-sub">overview</span>
+    </div>
+    <div class="topbar-stats">
+        <a href="#inbox-content" class="topbar-stat topbar-stat--inbox{% if inbox_total == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Inbox</span>
+            <span class="topbar-stat-value">{{ inbox_total }}</span>
+        </a>
+        <a href="/tasks?status=draft" class="topbar-stat topbar-stat--draft{% if data.draft_tasks|length == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Draft</span>
+            <span class="topbar-stat-value">{{ data.draft_tasks|length }}</span>
+        </a>
+        <a href="/tasks?status=open" class="topbar-stat topbar-stat--open{% if _open_count == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Open</span>
+            <span class="topbar-stat-value">{{ _open_count }}</span>
+        </a>
+        <a href="/tasks?status=running" class="topbar-stat topbar-stat--running{% if _running_count == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Running</span>
+            <span class="topbar-stat-value">{{ _running_count }}</span>
+        </a>
+        <a href="/tasks?status=review" class="topbar-stat topbar-stat--review{% if data.review_tasks|length == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Review</span>
+            <span class="topbar-stat-value">{{ data.review_tasks|length }}</span>
+        </a>
+        <a href="/tasks?status=needs_decision" class="topbar-stat topbar-stat--decision{% if data.needs_decision_tasks|length == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Decision</span>
+            <span class="topbar-stat-value">{{ data.needs_decision_tasks|length }}</span>
+        </a>
+    </div>
+    {% if data.vast_status %}
+    <div class="topbar-vast{% if _vast_offline %} is-offline{% endif %}" title="Vast.ai: {{ data.vast_status }}">
+        <span class="topbar-vast-dot"></span>
+        <span class="topbar-vast-label">Vast.ai</span>
+        <span class="topbar-vast-state">{{ 'offline' if _vast_offline else 'online' }}</span>
+    </div>
+    {% endif %}
+</header>
+
+<!-- ═══════════ INBOX ═══════════ -->
+<section class="section section-inbox">
+    <div class="section-header">
+        <h2 class="section-title">
+            Inbox
+            {% if inbox_total > 0 %}<span class="section-count section-count-warn">{{ inbox_total }}</span>{% endif %}
+        </h2>
+    </div>
+    <div id="inbox-content"
+         hx-get="/partials/inbox"
+         hx-trigger="every 30s"
+         hx-swap="innerHTML">
+        {% include "partials/inbox.html" with context %}
+    </div>
+</section>
+
+<!-- ═══════════ KANBAN ═══════════ -->
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Board</h2>
+    </div>
+    <div class="kanban"
+         id="kanban-board"
+         hx-get="/partials/kanban"
+         hx-trigger="every 30s"
+         hx-swap="innerHTML">
+        {% include "partials/kanban.html" %}
+    </div>
+</section>
+
+<!-- ═══════════ TWO-COL: Epics + Create | Info sidebar ═══════════ -->
+<div class="dash-two-col">
+    <div class="dash-primary">
+        <!-- Epics -->
+        <section class="section">
+            <div class="section-header">
+                <h2 class="section-title">
+                    Epics
+                    {% if epics_enriched %}<span class="section-count">{{ epics_enriched|length }}</span>{% endif %}
+                </h2>
+            </div>
+            <div id="epics-content"
+                 hx-get="/partials/epics"
+                 hx-trigger="every 60s"
+                 hx-swap="innerHTML">
+                {% include "partials/epic_list.html" with context %}
+            </div>
+        </section>
+
+        <!-- Create Task -->
+        <section class="section">
+            <div class="section-header collapsible-toggle" id="create-toggle" onclick="toggleCreate()">
+                <h2 class="section-title">
+                    <span class="toggle-icon">&#9654;</span>
+                    New Task
+                </h2>
+            </div>
+            <div class="collapsible-body" id="create-body">
+                <div class="new-task-card">
+                    <form method="post" action="/tasks/create" id="create-form">
+
+                        <!-- Type pills -->
+                        <div class="nt-row">
+                            <div class="nt-field">
+                                <span class="nt-label">Type</span>
+                                <div class="pill-tabs" id="nt-type">
+                                    <input type="radio" name="task_type" id="nt-type-task" value="task" checked>
+                                    <label class="pill-tab" for="nt-type-task">Task</label>
+
+                                    <input type="radio" name="task_type" id="nt-type-feature" value="feature">
+                                    <label class="pill-tab" for="nt-type-feature">Feature</label>
+
+                                    <input type="radio" name="task_type" id="nt-type-subtask" value="subtask">
+                                    <label class="pill-tab" for="nt-type-subtask">Subtask</label>
+
+                                    <input type="radio" name="task_type" id="nt-type-epic" value="epic">
+                                    <label class="pill-tab" for="nt-type-epic">Epic</label>
+                                </div>
+                            </div>
+
+                            <div class="nt-field">
+                                <span class="nt-label">Priority</span>
+                                <div class="pill-tabs" id="nt-priority">
+                                    <input type="radio" name="priority" id="nt-pr-low" value="low">
+                                    <label class="pill-tab" for="nt-pr-low"><span class="pill-dot"></span>Low</label>
+
+                                    <input type="radio" name="priority" id="nt-pr-med" value="medium" checked>
+                                    <label class="pill-tab" for="nt-pr-med"><span class="pill-dot"></span>Medium</label>
+
+                                    <input type="radio" name="priority" id="nt-pr-high" value="high">
+                                    <label class="pill-tab" for="nt-pr-high"><span class="pill-dot"></span>High</label>
+
+                                    <input type="radio" name="priority" id="nt-pr-crit" value="critical">
+                                    <label class="pill-tab" for="nt-pr-crit"><span class="pill-dot"></span>Critical</label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Title + Work type -->
+                        <div class="nt-row">
+                            <div class="nt-field nt-field--grow-2">
+                                <label class="nt-label" for="nt-title">Title</label>
+                                <input type="text" id="nt-title" name="title" required placeholder="e.g. Fix cart processing for edge case">
+                            </div>
+
+                            <div class="nt-field nt-field--narrow" id="nt-worktype-wrap">
+                                <label class="nt-label" for="nt-worktype">Work type</label>
+                                <select name="work_type" id="nt-worktype">
+                                    <option value="feature">feature — new capability</option>
+                                    <option value="bug">bug — fix existing behavior</option>
+                                    <option value="refactor">refactor — internal restructuring</option>
+                                    <option value="chore">chore — maintenance / config</option>
+                                    <option value="docs">docs — documentation only</option>
+                                    <option value="spike">spike — investigation / research</option>
+                                    <option value="incident">incident — production hotfix</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Description -->
+                        <div class="nt-row">
+                            <div class="nt-field nt-field--full">
+                                <label class="nt-label" for="nt-desc">Short description</label>
+                                <textarea id="nt-desc" name="description" class="textarea--sm" placeholder="One or two sentences — full context can be added in Refine ↓"></textarea>
+                            </div>
+                        </div>
+
+                        <!-- Parent + Runtime -->
+                        <div class="nt-row">
+                            <div class="nt-field nt-field--narrow" id="nt-parent-wrap">
+                                <label class="nt-label" for="nt-parent">Parent ID</label>
+                                <input type="number" id="nt-parent" name="parent_id" placeholder="e.g. 5" min="1">
+                            </div>
+                            <div class="nt-field nt-field--narrow" id="nt-runtime-wrap">
+                                <label class="nt-label" for="nt-runtime">Runtime</label>
+                                <select name="runtime" id="nt-runtime">
+                                    <option value="auto">Auto</option>
+                                    <option value="openrouter">OpenRouter</option>
+                                    <option value="vast">Vast.ai</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Refine accordion: structured fields for AI Analyst -->
+                        <div class="nt-refine">
+                            <button type="button" class="nt-refine-toggle" id="nt-refine-btn" onclick="toggleRefine()">
+                                <span class="toggle-icon">&#9654;</span>
+                                Refine for AI Analyst (optional, improves Definition of Ready)
+                            </button>
+                            <div class="nt-refine-body" id="nt-refine-body">
+                                <div class="nt-refine-hint">
+                                    Filling these helps the AI agent reach <strong>Definition of Ready</strong> faster.
+                                    You can also do this later on the task detail page (Refine button).
+                                </div>
+                                <div class="nt-row">
+                                    <div class="nt-field nt-field--full">
+                                        <label class="nt-label" for="nt-userstory">User story</label>
+                                        <input type="text" id="nt-userstory" name="user_story" placeholder="As a &lt;role&gt;, I want &lt;goal&gt;, so that &lt;benefit&gt;">
+                                    </div>
+                                </div>
+                                <div class="nt-row">
+                                    <div class="nt-field nt-field--full">
+                                        <label class="nt-label" for="nt-problem">Problem statement</label>
+                                        <textarea id="nt-problem" name="problem_statement" class="textarea--sm" placeholder="What's broken or missing today? Why does it matter?"></textarea>
+                                    </div>
+                                </div>
+                                <div class="nt-row">
+                                    <div class="nt-field nt-field--full">
+                                        <label class="nt-label" for="nt-scope">Scope (in) — one item per line</label>
+                                        <textarea id="nt-scope" name="scope_in" class="textarea--sm" placeholder="Update normalizer dictionary&#10;Add unit tests for new mappings&#10;Document the new behavior"></textarea>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Footer -->
+                        <div class="nt-footer">
+                            <div class="nt-footer-hint" id="nt-footer-hint">
+                                Drafts pass through the <strong>Definition of Ready</strong> gate before agents start work.
+                                If the AI Analyst needs clarification, it will ask via <strong>Inbox → Questions</strong> ↑ and pause until you answer.
+                            </div>
+                            <div class="nt-footer-actions">
+                                <button class="btn btn-ghost" type="submit" name="after_create" value="backlog">Save Draft</button>
+                                <button class="btn btn-primary" type="submit" name="after_create" value="refine">Save &amp; Refine →</button>
+                                <button class="btn btn-success" type="submit" name="run_immediately" value="on" id="nt-run-now">Run Now</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </section>
+
+    </div>
+
+    <!-- Info sidebar -->
+    <aside class="dash-aside">
+        <div class="card">
+            <div class="card-title">Commits</div>
+            {% if data.recent_commits %}
+            <ul class="item-list">
+                {% for c in data.recent_commits[:5] %}
+                <li>
+                    <code>{{ c.sha }}</code> {{ c.message.split('\n')[0][:60] }}{% if c.message.split('\n')[0]|length > 60 %}…{% endif %}
+                    <div class="meta">{{ c.author }} &middot; {{ c.date[:10] if c.date else '' }}</div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="empty empty-sm"><div class="empty-text">No commits</div></div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <div class="card-title">Pull Requests</div>
+            {% if data.open_prs %}
+            <ul class="item-list">
+                {% for pr in data.open_prs %}
+                <li>
+                    <a href="{{ pr.url }}" target="_blank" rel="noopener">#{{ pr.number }} {{ pr.title[:50] }}{% if pr.title|length > 50 %}…{% endif %}</a>
+                    <div class="meta">{{ pr.headRefName }}</div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="empty empty-sm"><div class="empty-text">No open PRs</div></div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <div class="card-title">Decisions</div>
+            {% if data.recent_decisions %}
+            <ul class="item-list">
+                {% for d in data.recent_decisions[:5] %}
+                <li>
+                    <strong>{{ d.title if d.title else 'Decision' }}</strong>
+                    <div class="meta">{{ (d.content or d.decision or '')[:80] }}</div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="empty empty-sm"><div class="empty-text">No decisions</div></div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <div class="card-title">Recent Activity</div>
+            {% if data.recent_activity %}
+            <ul class="activity-timeline activity-timeline--compact">
+                {% for a in data.recent_activity[:12] %}
+                <li>
+                    <div class="activity-meta-row">
+                        <span class="activity-time">{{ a.timestamp[5:16] }}</span>
+                        <span class="activity-kind"><span class="badge badge--xs badge-{{ a.kind.split('_')[0] }}">{{ a.kind }}</span></span>
+                    </div>
+                    <div class="activity-summary">{{ a.summary[:120] }}{% if a.summary|length > 120 %}…{% endif %}</div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="empty empty-sm"><div class="empty-text">No activity yet</div></div>
+            {% endif %}
+        </div>
+    </aside>
+</div>
+
+<script>
+function toggleCreate() {
+    var toggle = document.getElementById('create-toggle');
+    var body = document.getElementById('create-body');
+    toggle.classList.toggle('open');
+    body.classList.toggle('open');
+}
+
+function toggleRefine() {
+    var btn = document.getElementById('nt-refine-btn');
+    var body = document.getElementById('nt-refine-body');
+    btn.classList.toggle('open');
+    body.classList.toggle('open');
+}
+
+(function() {
+    function applyTypeRules() {
+        var checked = document.querySelector('input[name="task_type"]:checked');
+        if (!checked) return;
+        var v = checked.value;
+        var wt = document.getElementById('nt-worktype-wrap');
+        var pp = document.getElementById('nt-parent-wrap');
+        var rt = document.getElementById('nt-runtime-wrap');
+        var run = document.getElementById('nt-run-now');
+        // work_type only meaningful for plain Task
+        wt.style.display = (v === 'task') ? '' : 'none';
+        // Epic has no parent
+        pp.style.display = (v === 'epic') ? 'none' : '';
+        // Epic / Feature don't run on agents directly
+        var hideRun = (v === 'epic' || v === 'feature');
+        rt.style.display = hideRun ? 'none' : '';
+        run.style.display = hideRun ? 'none' : '';
+    }
+    document.querySelectorAll('input[name="task_type"]').forEach(function(el) {
+        el.addEventListener('change', applyTypeRules);
+    });
+    applyTypeRules();
+})();
+</script>
+
+<script>
+(function() {
+    var KEY = 'kanban_collapsed';
+    function save() {
+        var ids = [];
+        document.querySelectorAll('.kanban-col-toggle:checked').forEach(function(cb) { ids.push(cb.id); });
+        localStorage.setItem(KEY, JSON.stringify(ids));
+    }
+    function restore() {
+        try {
+            var ids = JSON.parse(localStorage.getItem(KEY) || '[]');
+            ids.forEach(function(id) {
+                var cb = document.getElementById(id);
+                if (cb) cb.checked = true;
+            });
+        } catch(e) {}
+    }
+    restore();
+    document.addEventListener('change', function(e) {
+        if (e.target.classList.contains('kanban-col-toggle')) save();
+    });
+    document.body.addEventListener('htmx:afterSwap', function(e) {
+        if (e.detail.target.id === 'kanban-board') restore();
+    });
+})();
+</script>
+{% endblock %}

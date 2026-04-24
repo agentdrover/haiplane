@@ -1,0 +1,59 @@
+<article class="kanban-card" id="kanban-card-{{ t.id }}">
+    <a class="card-link" href="/tasks/{{ t.id }}" title="#{{ t.id }} {{ t.title }}">
+        <span class="card-id">#{{ t.id }}</span>{{ t.title[:48] }}{% if t.title|length > 48 %}…{% endif %}
+    </a>
+    {% set _has_meta = (t.task_type.value != 'task') or (t.priority.value in ('critical', 'high')) or (t.runtime.value != 'auto') or (t.progress and t.progress.total > 0) %}
+    {% if _has_meta %}
+    <div class="card-meta">
+        {% if t.task_type.value != 'task' %}
+        <span class="badge badge--xs badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
+        {% endif %}
+        {% if t.priority.value in ('critical', 'high') %}
+        <span class="badge badge--xs badge-priority-{{ t.priority.value }}">{{ t.priority.value }}</span>
+        {% endif %}
+        {% if t.runtime.value != 'auto' %}
+        <span class="badge badge--xs badge-{{ t.runtime.value }}">{{ t.runtime.value }}</span>
+        {% endif %}
+        {% if t.progress and t.progress.total > 0 %}
+        <span class="card-progress-mini">{{ t.progress.percent }}%</span>
+        {% endif %}
+    </div>
+    {% endif %}
+    {% if t.status.value == 'draft' %}
+    <div class="card-actions">
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-approve"
+                hx-vals='{"run": "true"}'
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Approve &amp; Run</button>
+        <button class="btn btn-primary btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-approve"
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Approve</button>
+        <button class="btn btn-danger btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-reject"
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Reject</button>
+    </div>
+    {% elif t.status.value == 'open' %}
+    <div class="card-actions">
+        <button class="btn btn-primary btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-start"
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Start</button>
+    </div>
+    {% elif t.status.value == 'needs_decision' %}
+    <div class="card-actions">
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-decide"
+                hx-vals='{"action": "accept"}'
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Accept</button>
+        <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Review</a>
+    </div>
+    {% elif t.status.value == 'needs_info' %}
+    <div class="card-actions">
+        <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Answer</a>
+    </div>
+    {% endif %}
+</article>

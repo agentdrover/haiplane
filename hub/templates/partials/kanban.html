@@ -1,0 +1,158 @@
+{% set open_tasks = data.active_tasks|selectattr("status.value", "equalto", "open")|list %}
+{% set _running = data.active_tasks|selectattr("status.value", "equalto", "running")|list %}
+{% set _fixing = data.active_tasks|selectattr("status.value", "equalto", "fix_requested")|list %}
+{% set running_tasks = _running + _fixing %}
+{% set ci_tasks = data.active_tasks|selectattr("status.value", "equalto", "ci_check")|list %}
+
+<!-- Draft -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-draft">
+    <label class="kanban-collapsed col-draft" for="kt-draft">
+        <span class="col-count">{{ data.draft_tasks|length }}</span>
+        <span class="col-title">Draft</span>
+    </label>
+    <div class="kanban-column col-draft">
+        <div class="kanban-header">
+            <span class="col-title">Draft</span>
+            <span class="col-count">{{ data.draft_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-draft" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in data.draft_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Open -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-open">
+    <label class="kanban-collapsed col-open" for="kt-open">
+        <span class="col-count">{{ open_tasks|length }}</span>
+        <span class="col-title">Open</span>
+    </label>
+    <div class="kanban-column col-open">
+        <div class="kanban-header">
+            <span class="col-title">Open</span>
+            <span class="col-count">{{ open_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-open" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in open_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+        {% if open_tasks|length > 8 %}
+        <a href="/tasks?status=open" class="kanban-more">+{{ open_tasks|length - 8 }} more &#8594;</a>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Running -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-running">
+    <label class="kanban-collapsed col-running" for="kt-running">
+        <span class="col-count">{{ running_tasks|length }}</span>
+        <span class="col-title">Running</span>
+    </label>
+    <div class="kanban-column col-running">
+        <div class="kanban-header">
+            <span class="col-title">Running</span>
+            <span class="col-count">{{ running_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-running" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in running_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+        {% if running_tasks|length > 8 %}
+        <a href="/tasks?status=running" class="kanban-more">+{{ running_tasks|length - 8 }} more &#8594;</a>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Review -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-review">
+    <label class="kanban-collapsed col-review" for="kt-review">
+        <span class="col-count">{{ data.review_tasks|length }}</span>
+        <span class="col-title">Review</span>
+    </label>
+    <div class="kanban-column col-review">
+        <div class="kanban-header">
+            <span class="col-title">Review</span>
+            <span class="col-count">{{ data.review_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-review" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in data.review_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- CI Check -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-ci">
+    <label class="kanban-collapsed col-running" for="kt-ci">
+        <span class="col-count">{{ ci_tasks|length }}</span>
+        <span class="col-title">CI Check</span>
+    </label>
+    <div class="kanban-column col-running">
+        <div class="kanban-header">
+            <span class="col-title">CI Check</span>
+            <span class="col-count">{{ ci_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-ci" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in ci_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Decision -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-decision">
+    <label class="kanban-collapsed col-decision" for="kt-decision">
+        <span class="col-count">{{ data.needs_decision_tasks|length }}</span>
+        <span class="col-title">Decision</span>
+    </label>
+    <div class="kanban-column col-decision">
+        <div class="kanban-header">
+            <span class="col-title">Decision</span>
+            <span class="col-count">{{ data.needs_decision_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-decision" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in data.needs_decision_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Needs Info -->
+<div class="kanban-col-wrap">
+    <input type="checkbox" class="kanban-col-toggle" id="kt-info">
+    <label class="kanban-collapsed col-needs_info" for="kt-info">
+        <span class="col-count">{{ data.needs_info_tasks|length }}</span>
+        <span class="col-title">Needs Info</span>
+    </label>
+    <div class="kanban-column col-needs_info">
+        <div class="kanban-header">
+            <span class="col-title">Needs Info</span>
+            <span class="col-count">{{ data.needs_info_tasks|length }}</span>
+            <label class="kanban-collapse-btn" for="kt-info" title="Collapse">&#x25C0;</label>
+        </div>
+        {% for t in data.needs_info_tasks[:8] %}
+        {% include "partials/task_card.html" %}
+        {% else %}
+        <div class="empty empty-sm"><div class="empty-text">Empty</div></div>
+        {% endfor %}
+    </div>
+</div>

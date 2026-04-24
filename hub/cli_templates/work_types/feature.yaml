@@ -1,0 +1,46 @@
+# Feature — net-new user-facing capability.
+# DoR: user_story, problem_statement, business_value, scope_in (>=1),
+#      validation_commands (>=1), at least one acceptance criterion.
+
+work_type: feature
+class_of_service: standard      # standard | expedite | fixed_date | intangible
+size: M                         # XS | S | M | L | XL
+wip_tag: feature_work           # feature_work | bugfix | tech_debt | support
+
+user_story: |
+  As a <role>, I want <capability> so that <outcome>.
+
+problem_statement: |
+  What pain does this solve today? Why is the current behavior unacceptable?
+
+business_value: |
+  Outcome / metric this enables. Avoid restating the user_story.
+
+scope_in:
+  - <area or behavior IN scope>
+scope_out:
+  - <area or behavior OUT of scope>
+
+affected_areas:
+  - <module / file / service touched>
+
+validation_commands:
+  - uv run pytest -q
+  # - uv run ruff check
+  # - curl -fsS http://localhost:8080/health
+
+constraints:
+  - <hard constraint, e.g. "no DB schema change">
+assumptions:
+  - <assumption, e.g. "feature flag X is already enabled">
+
+technical_hints: |
+  Suggested approach, references, links.
+
+acceptance_criteria:
+  - id: AC-1
+    given: <preconditions>
+    when:  <action>
+    then:  <observable outcome>
+    verifiable_by: test         # test | manual | log_check | ui_check
+    test_ref: ""                # tests/test_x.py::test_y

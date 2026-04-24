@@ -1,0 +1,334 @@
+{% extends "base.html" %}
+{% set active = "tasks" %}
+
+{% block title %}Task #{{ task.id }} — OpenClaw Hub{% endblock %}
+
+{% block content %}
+
+{% if task.breadcrumb %}
+<nav class="breadcrumb">
+    {% for crumb in task.breadcrumb %}
+    <a href="/tasks/{{ crumb.id }}">{{ crumb.task_type.value | capitalize }}: {{ crumb.title }}</a>
+    <span class="breadcrumb-sep">&#8250;</span>
+    {% endfor %}
+    <span class="breadcrumb-current">{{ task.task_type.value | capitalize }}: {{ task.title }}</span>
+</nav>
+{% endif %}
+
+<header class="page-header">
+    <h1 class="page-title">
+        {% if task.task_type.value != 'task' %}<span class="badge badge-type-{{ task.task_type.value }}">{{ task.task_type.value }}</span> {% endif %}
+        Task #{{ task.id }}: {{ task.title }}
+    </h1>
+</header>
+
+{% if task.progress and task.progress.total > 0 %}
+<div class="progress-bar-container u-mb-6">
+    <div class="progress-bar" style="width:{{ task.progress.percent }}%"></div>
+    <span class="progress-label">{{ task.progress.completed }}/{{ task.progress.total }} completed ({{ task.progress.percent }}%)</span>
+</div>
+{% endif %}
+
+<div class="cards">
+    <div class="card">
+        <div class="card-title">Details</div>
+        <dl class="detail-grid">
+            <dt>Status</dt>
+            <dd><span class="badge badge-{{ task.status.value }}">{{ task.status.value }}</span></dd>
+            <dt>Type</dt>
+            <dd><span class="badge badge-type-{{ task.task_type.value }}">{{ task.task_type.value }}</span></dd>
+            <dt>Priority</dt>
+            <dd><span class="badge badge-priority-{{ task.priority.value }}">{{ task.priority.value }}</span></dd>
+            {% if task.parent_id %}
+            <dt>Parent</dt>
+            <dd><a href="/tasks/{{ task.parent_id }}">#{{ task.parent_id }}</a></dd>
+            {% endif %}
+            <dt>Source</dt>
+            <dd><span class="badge badge-{{ task.source.value }}">{{ task.source.value }}</span>{% if task.assigned_agent %} — {{ task.assigned_agent }}{% endif %}</dd>
+            <dt>Runtime</dt>
+            <dd><span class="badge badge-{{ task.runtime.value }}">{{ task.runtime.value }}</span></dd>
+            {% if task.job_id %}
+            <dt>Job ID</dt>
+            <dd><code>{{ task.job_id }}</code></dd>
+            {% endif %}
+            {% if task.exit_code is not none %}
+            <dt>Exit Code</dt>
+            <dd>{{ task.exit_code }}</dd>
+            {% endif %}
+            {% if task.branch %}
+            <dt>Branch</dt>
+            <dd><code>{{ task.branch }}</code></dd>
+            {% endif %}
+            {% if task.pr_number %}
+            <dt>PR</dt>
+            <dd><a href="https://github.com/mrPDA/vkuswill_bot/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a></dd>
+            {% endif %}
+            {% if task.auto_review %}
+            <dt>Review</dt>
+            <dd>cycle {{ task.review_cycle }}/3 {% if task.review_job_id %}<code class="code-sm">{{ task.review_job_id[:16] }}…</code>{% endif %}</dd>
+            {% endif %}
+            {% if task.ci_fix_cycle > 0 %}
+            <dt>CI Fix</dt>
+            <dd>cycle {{ task.ci_fix_cycle }}/3</dd>
+            {% endif %}
+            <dt>Created</dt>
+            <dd>{{ task.created_at }}</dd>
+            <dt>Updated</dt>
+            <dd>{{ task.updated_at }}</dd>
+        </dl>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Description</div>
+        <div class="u-pre-wrap u-text-body">{{ task.description or 'No description' }}</div>
+        {% if task.rationale %}
+        <div class="u-text-meta">
+            <strong>Rationale:</strong> {{ task.rationale }}
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+{% if task.children %}
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Children <span class="section-count">{{ task.children | length }}</span></h2>
+    </div>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Type</th>
+                <th>Title</th>
+                <th>Status</th>
+                <th>Priority</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for child in task.children %}
+            <tr>
+                <td><a href="/tasks/{{ child.id }}"><code>{{ child.id }}</code></a></td>
+                <td><span class="badge badge-type-{{ child.task_type.value }}">{{ child.task_type.value }}</span></td>
+                <td><a href="/tasks/{{ child.id }}">{{ child.title }}</a></td>
+                <td><span class="badge badge-{{ child.status.value }}">{{ child.status.value }}</span></td>
+                <td><span class="badge badge-priority-{{ child.priority.value }}">{{ child.priority.value }}</span></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<!-- Actions based on status -->
+{% if task.status.value == 'draft' %}
+<div class="action-panel">
+    <div class="action-panel-title">Approval Required</div>
+    <div class="u-row-end">
+        <form method="post" action="/tasks/{{ task.id }}/web-approve" class="u-form-contents">
+            <div class="form-group u-mb-2">
+                <label>Runtime</label>
+                <select name="runtime" class="select--auto">
+                    <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
+                    <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+                    <option value="vast" {% if task.runtime.value == 'vast' %}selected{% endif %}>Vast.ai</option>
+                </select>
+            </div>
+            <div class="u-row-tight">
+                <button class="btn btn-success" type="submit" name="run" value="true">Approve &amp; Run</button>
+                <button class="btn btn-primary" type="submit">Approve to Backlog</button>
+            </div>
+        </form>
+        <form method="post" action="/tasks/{{ task.id }}/web-reject" class="u-row-end">
+            <input type="text" name="comment" placeholder="Reason (optional)"
+                   class="inbox-answer-input input--md">
+            <button class="btn btn-danger" type="submit">Reject</button>
+        </form>
+    </div>
+</div>
+{% endif %}
+
+{% if task.status.value == 'open' %}
+<div class="action-panel">
+    <div class="action-panel-title">Ready to Run</div>
+    <form method="post" action="/tasks/{{ task.id }}/web-start" class="u-row-end">
+        <div class="form-group u-mb-0">
+            <label>Runtime</label>
+            <select name="runtime" class="select--auto">
+                <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
+                <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+                <option value="vast" {% if task.runtime.value == 'vast' %}selected{% endif %}>Vast.ai</option>
+            </select>
+        </div>
+        <button class="btn btn-success" type="submit">Start Task</button>
+    </form>
+</div>
+{% endif %}
+
+{% if task.status.value == 'needs_info' %}
+<div class="action-panel action-panel-warning">
+    <div class="action-panel-title">Agent Question — Answer Required</div>
+    {% if task.updates %}
+    {% for u in task.updates|reverse %}
+    {% if u.kind == 'question' %}
+    <div class="qa-item qa-question">
+        <div class="qa-label">Question from {{ u.agent or 'Agent' }}</div>
+        <div class="u-pre-wrap">{{ u.content }}</div>
+    </div>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+    <form method="post" action="/tasks/{{ task.id }}/web-answer" class="u-mt-4">
+        <div class="form-group">
+            <label>Your Answer</label>
+            <textarea name="answer" class="textarea--md" required placeholder="Type your answer…"></textarea>
+        </div>
+        <div class="u-row-tight">
+            <button class="btn btn-success" type="submit" name="resume" value="true">Answer &amp; Resume</button>
+            <button class="btn btn-ghost" type="submit" name="resume" value="">Answer Only</button>
+        </div>
+    </form>
+</div>
+{% endif %}
+
+{% if task.status.value == 'needs_decision' %}
+<div class="action-panel action-panel-danger">
+    <div class="action-panel-title">Arbiter Report — Your Decision Required</div>
+    {% if task.updates %}
+    {% for u in task.updates|reverse %}
+    {% if u.kind == 'arbitration' %}
+    <div class="qa-item qa-arbitration">
+        <div class="qa-label">Arbiter Assessment{% if u.agent %} by {{ u.agent }}{% endif %}</div>
+        <div class="u-pre-wrap">{{ u.content }}</div>
+    </div>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+    <form method="post" action="/tasks/{{ task.id }}/web-decide" class="u-mt-4">
+        <div class="u-row-end u-mb-4">
+            <button class="btn btn-success" type="submit" name="action" value="accept">Accept as Completed</button>
+        </div>
+        <div class="form-group">
+            <label>Instructions for rework (optional)</label>
+            <textarea name="instructions" class="textarea--sm" placeholder="What specifically needs to be fixed…"></textarea>
+        </div>
+        <button class="btn btn-warning" type="submit" name="action" value="rework">Send Back for Rework</button>
+    </form>
+</div>
+{% endif %}
+
+<!-- Agent Updates / Q&A Thread -->
+<section class="section u-mt-4">
+    <div class="section-header">
+        <h2 class="section-title">Updates &amp; Q&amp;A</h2>
+    </div>
+    <div class="card">
+        {% if task.updates %}
+        <div class="qa-thread">
+            {% for u in task.updates %}
+            {% if u.kind == 'question' %}
+            <div class="qa-item qa-question">
+                <div class="qa-label">Question from {{ u.agent or 'Agent' }} &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% elif u.kind == 'answer' %}
+            <div class="qa-item qa-answer">
+                <div class="qa-label">Answer &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% elif u.kind == 'review' %}
+            <div class="qa-item qa-review">
+                <div class="qa-label">Code Review{% if u.agent %} by {{ u.agent }}{% endif %} &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% elif u.kind == 'arbitration' %}
+            <div class="qa-item qa-arbitration">
+                <div class="qa-label">Arbiter Assessment{% if u.agent %} by {{ u.agent }}{% endif %} &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% elif u.kind == 'alert' %}
+            <div class="qa-item qa-alert">
+                <div class="qa-label">Alert{% if u.agent %} from {{ u.agent }}{% endif %} &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% else %}
+            <div class="qa-item qa-generic">
+                <div class="qa-label u-text-muted">
+                    <span class="badge badge-{{ u.kind }}">{{ u.kind }}</span>
+                    {% if u.agent %} {{ u.agent }} &middot; {% endif %}
+                    {{ u.created_at }}
+                </div>
+                <div class="u-pre-wrap u-mt-2">{{ u.content }}</div>
+            </div>
+            {% endif %}
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty empty-sm">
+            <div class="empty-text">No updates yet</div>
+        </div>
+        {% endif %}
+    </div>
+</section>
+
+{% if task.result_text %}
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Result</h2>
+    </div>
+    <div class="card">
+        <div class="u-pre-wrap u-text-body">{{ task.result_text }}</div>
+    </div>
+</section>
+{% endif %}
+
+{% if task.log_tail %}
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Log tail</h2>
+    </div>
+    <div class="log-output">{% for line in task.log_tail %}{{ line }}
+{% endfor %}</div>
+    <div class="u-row-tight u-mt-3">
+        {% if task.job_id %}
+        <a href="/tasks/{{ task.id }}/log?job=main" class="btn btn-ghost btn-sm">View full dispatch log</a>
+        {% endif %}
+        {% if task.review_job_id %}
+        <a href="/tasks/{{ task.id }}/log?job=review" class="btn btn-ghost btn-sm">View review log</a>
+        {% endif %}
+    </div>
+</section>
+{% elif task.job_id or task.review_job_id %}
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Logs</h2>
+    </div>
+    <div class="u-row-tight">
+        {% if task.job_id %}
+        <a href="/tasks/{{ task.id }}/log?job=main" class="btn btn-ghost btn-sm">View full dispatch log</a>
+        {% endif %}
+        {% if task.review_job_id %}
+        <a href="/tasks/{{ task.id }}/log?job=review" class="btn btn-ghost btn-sm">View review log</a>
+        {% endif %}
+    </div>
+</section>
+{% endif %}
+
+<nav class="nav-bar">
+    <a href="/tasks" class="btn btn-ghost">&#8592; All Tasks</a>
+    {% if task.parent_id %}
+    <a href="/tasks/{{ task.parent_id }}" class="btn btn-ghost">&#8593; Parent</a>
+    {% endif %}
+    {% if task.status.value in ('running', 'review', 'fix_requested', 'ci_check') %}
+    <button class="btn btn-primary"
+            hx-get="/tasks/{{ task.id }}"
+            hx-select=".main"
+            hx-target=".main"
+            hx-swap="innerHTML"
+            hx-trigger="click, every 15s">
+        Refresh Status <span class="htmx-indicator">&#10227;</span>
+    </button>
+    {% elif task.status.value in ('open', 'needs_info', 'needs_decision') %}
+    <button class="btn btn-ghost" onclick="location.reload()">Refresh</button>
+    {% endif %}
+</nav>
+{% endblock %}

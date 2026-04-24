@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "openclaw-hub-local": {
+      "command": "uv",
+      "args": ["run", "openclaw-hub-mcp"],
+      "env": {
+        "OPENCLAW_HUB_URL": "http://127.0.0.1:8080"
+      }
+    }
+  }
+}

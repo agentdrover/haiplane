@@ -1,0 +1,50 @@
+# Bug — defect in existing behavior.
+# DoR: problem_statement, business_value, scope_in (>=1),
+#      validation_commands (>=1), AC (>=1), size, wip_tag.
+# user_story is NOT required (problem_statement = "what broke").
+
+work_type: bug
+class_of_service: standard      # bump to 'expedite' for production-impacting bugs
+size: S
+wip_tag: bugfix
+
+problem_statement: |
+  Symptom + repro steps + observed vs expected.
+  Include log snippet / stack trace if relevant.
+
+business_value: |
+  Customer / revenue / SLA impact. Drives prioritization vs feature work.
+
+scope_in:
+  - <component / endpoint where the fix lives>
+scope_out:
+  - <related-but-separate behavior we WON'T touch in this fix>
+
+affected_areas:
+  - <module / file / service>
+
+validation_commands:
+  - uv run pytest -q tests/test_<module>.py
+  # - curl -fsS http://localhost:8080/<endpoint>
+
+constraints:
+  - <e.g. "must not change public API">
+assumptions:
+  - <e.g. "issue reproduces on Python 3.11">
+
+technical_hints: |
+  Likely root cause hypothesis or location.
+
+acceptance_criteria:
+  - id: AC-1
+    given: <preconditions that previously triggered the bug>
+    when:  <user action / API call>
+    then:  <correct, fixed behavior>
+    verifiable_by: test
+    test_ref: ""
+  - id: AC-2
+    given: regression-test
+    when:  the test suite runs
+    then:  a regression test for this bug is present and passing
+    verifiable_by: test
+    test_ref: ""

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}OpenClaw Hub{% endblock %}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f980;</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v={{ asset_version|default('20260419a') }}">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+<div class="layout">
+    <aside class="sidebar">
+        <div class="logo">
+            <span class="logo-main">OpenClaw</span>
+            <span class="logo-sub">Hub</span>
+        </div>
+        <nav>
+            <a href="/" class="{% if active == 'dashboard' %}active{% endif %}">
+                <span class="nav-icon">&#9632;</span> Dashboard
+            </a>
+            <a href="/tasks" class="{% if active == 'tasks' %}active{% endif %}">
+                <span class="nav-icon">&#9654;</span> Tasks
+            </a>
+            <a href="/tasks?type=epic" class="{% if active == 'epics' %}active{% endif %}">
+                <span class="nav-icon">&#9733;</span> Epics
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div>OpenClaw Hub v0.2</div>
+            {% if current_user and current_user != 'anonymous' %}
+            <div class="sidebar-user">
+                <span class="sidebar-user-name">{{ current_user }}</span>
+                <form method="post" action="/logout" class="sidebar-user-form">
+                    <button type="submit" class="sidebar-user-logout" title="Sign out">&times;</button>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+    </aside>
+    <main class="main">
+        {% block content %}{% endblock %}
+    </main>
+</div>
+</body>
+</html>

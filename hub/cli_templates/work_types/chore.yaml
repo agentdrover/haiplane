@@ -1,0 +1,25 @@
+# Chore — small operational task (deps bump, CI tweak, env config).
+# DoR: scope_in (>=1), validation_commands (>=1), size.
+# Deliberately minimal — chores would never pass full DoR and would
+# just clutter the inbox.
+
+work_type: chore
+class_of_service: standard
+size: XS
+# wip_tag: support           # uncomment if it counts toward "support" capacity
+
+scope_in:
+  - <e.g. "bump pydantic to 2.x in hub/pyproject.toml">
+
+validation_commands:
+  - uv run pytest -q
+  # - uv sync
+  # - uv run ruff check
+
+# Optional but recommended for non-trivial chores:
+# problem_statement: |
+#   Why now?
+# affected_areas:
+#   - <files>
+# constraints:
+#   - <e.g. "must not touch lockfile-pinned packages">

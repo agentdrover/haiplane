@@ -1,0 +1,7 @@
+interface:
+  display_name: "Project Context"
+  short_description: "Fast map for standalone OpenClaw Hub"
+  default_prompt: "Use $project-context to map the relevant files, invariants, and tests for this OpenClaw Hub task."
+
+policy:
+  allow_implicit_invocation: true

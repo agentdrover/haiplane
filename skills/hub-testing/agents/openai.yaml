@@ -1,0 +1,7 @@
+interface:
+  display_name: "Hub Testing"
+  short_description: "Verify regressions in standalone OpenClaw Hub"
+  default_prompt: "Use $hub-testing to add or fix regression coverage in this standalone OpenClaw Hub project."
+
+policy:
+  allow_implicit_invocation: true

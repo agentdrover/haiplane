@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% set active = "tasks" %}
+
+{% block title %}{{ label }} — Task #{{ task_id }} — OpenClaw Hub{% endblock %}
+
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">{{ label }}: Task #{{ task_id }}</h1>
+    <p class="page-subtitle">{{ task_title }}</p>
+</header>
+
+<div class="card u-mb-4">
+    <dl class="detail-grid">
+        <dt>Job ID</dt>
+        <dd><code>{{ job_id }}</code></dd>
+        <dt>Type</dt>
+        <dd>{{ job_type }}</dd>
+    </dl>
+</div>
+
+{% if log_content %}
+<div class="log-output log-output-full">{{ log_content }}</div>
+{% else %}
+<div class="card">
+    <div class="empty">
+        <div class="empty-icon">&#128196;</div>
+        <div class="empty-text">No log content available</div>
+    </div>
+</div>
+{% endif %}
+
+<nav class="nav-bar">
+    <a href="/tasks/{{ task_id }}" class="btn btn-ghost">&#8592; Task #{{ task_id }}</a>
+    <a href="/tasks" class="btn btn-ghost">&#8592; All Tasks</a>
+</nav>
+{% endblock %}

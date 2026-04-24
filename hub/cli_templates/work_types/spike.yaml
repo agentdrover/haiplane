@@ -1,0 +1,36 @@
+# Spike — time-boxed exploration to answer an unknown.
+# DoR: problem_statement, AC (>=1), size.
+# AC acts as the proxy completion criterion ("we have a documented
+# answer to <question>") until a first-class timebox_hours field lands.
+
+work_type: spike
+class_of_service: standard
+size: S
+
+problem_statement: |
+  What question are we trying to answer? What's the unknown that's
+  blocking downstream work?
+
+# Optional but recommended:
+# scope_in:
+#   - <area being explored>
+# constraints:
+#   - timebox: 4h         # MVP: enforce manually until timebox_hours lands
+# assumptions:
+#   - <e.g. "vendor docs are accurate">
+# technical_hints: |
+#   Hypotheses to test, prototypes to build, sources to read.
+
+acceptance_criteria:
+  - id: AC-1
+    given: the spike timebox is exhausted
+    when:  the analyst reviews the spike output
+    then:  there is a written answer / decision / handoff for <question>
+    verifiable_by: manual
+    test_ref: ""
+  - id: AC-2
+    given: the spike has produced a recommendation
+    when:  the team plans next iteration
+    then:  follow-up tasks are filed (or an explicit "do nothing" decision)
+    verifiable_by: manual
+    test_ref: ""

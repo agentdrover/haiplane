@@ -1,0 +1,40 @@
+{% if epics %}
+{% for e in epics %}
+<article class="epic-card">
+    <div class="epic-header">
+        <a href="/tasks/{{ e.id }}" class="epic-title">#{{ e.id }} {{ e.title }}</a>
+        <span class="badge badge-{{ e.status.value }}">{{ e.status.value }}</span>
+        {% if e.priority.value in ('critical', 'high') %}
+        <span class="badge badge-priority-{{ e.priority.value }}">{{ e.priority.value }}</span>
+        {% endif %}
+    </div>
+    {% if e.progress and e.progress.total > 0 %}
+    <div class="progress-bar-container progress-sm">
+        <div class="progress-bar" style="width:{{ e.progress.percent }}%"></div>
+        <span class="progress-label">{{ e.progress.completed }}/{{ e.progress.total }} ({{ e.progress.percent }}%)</span>
+    </div>
+    {% endif %}
+    {% if e.children %}
+    <div class="epic-children">
+        {% for child in e.children[:5] %}
+        <a href="/tasks/{{ child.id }}" class="epic-child-link">
+            <span class="badge badge--xs badge-type-{{ child.task_type.value }}">{{ child.task_type.value[:3] }}</span>
+            <span class="epic-child-title">{{ child.title[:48] }}{% if child.title|length > 48 %}…{% endif %}</span>
+            <span class="badge badge--xs badge-{{ child.status.value }}">{{ child.status.value }}</span>
+        </a>
+        {% endfor %}
+        {% if e.children|length > 5 %}
+        <a href="/tasks?parent_id={{ e.id }}" class="epic-more">+{{ e.children|length - 5 }} more &#8594;</a>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="epic-empty">No children yet</div>
+    {% endif %}
+</article>
+{% endfor %}
+{% else %}
+<div class="empty empty-sm">
+    <div class="empty-text">No active epics</div>
+    <div class="empty-hint">Create one with the form below</div>
+</div>
+{% endif %}

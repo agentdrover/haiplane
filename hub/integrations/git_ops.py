@@ -1,0 +1,537 @@
+"""Git + GitHub operations for Hub branching workflow.
+
+Local git operations run against the workspace repo (config.WORKSPACE_REPO_LINK).
+GitHub operations use the ``gh`` CLI (config.GH_BIN).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import Any
+
+from hub.config import GH_BIN, REPO_NAME, WORKSPACE_REPO_LINK
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (module-private)
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> str:
+    p = WORKSPACE_REPO_LINK
+    if p.is_symlink():
+        p = p.resolve()
+    return str(p)
+
+
+def _slugify(title: str, max_len: int = 40) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
+    return slug[:max_len].rstrip("-")
+
+
+def _conv_commit_type(title: str) -> str:
+    t = title.lower()
+    if any(k in t for k in ("fix", "bug", "исправ", "баг")):
+        return "fix"
+    if any(k in t for k in ("refactor", "рефактор", "выдел", "перенес")):
+        return "refactor"
+    if any(k in t for k in ("test", "тест")):
+        return "test"
+    if any(k in t for k in ("doc", "readme")):
+        return "docs"
+    if any(k in t for k in ("ci", "cd", "pipeline", "deploy")):
+        return "ci"
+    return "feat"
+
+
+def _git_env() -> dict[str, str]:
+    """Build env dict with SSH key for GitHub push."""
+    import os
+    from pathlib import Path
+
+    env = os.environ.copy()
+    ssh_key = Path.home() / ".ssh" / "id_ed25519"
+    if ssh_key.exists():
+        env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o StrictHostKeyChecking=accept-new"
+    return env
+
+
+async def _run(
+    *cmd: str,
+    cwd: str | None = None,
+    timeout: int = 60,
+    check: bool = True,
+) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=_git_env(),
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    rc = proc.returncode or 0
+    out = stdout.decode(errors="replace").strip()
+    err = stderr.decode(errors="replace").strip()
+    if check and rc != 0:
+        log.warning("%s failed (rc=%d): %s", " ".join(cmd[:4]), rc, err)
+    return rc, out, err
+
+
+async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
+    repo = repo or _repo_root()
+    return await _run("git", "-C", repo, *args, cwd=repo, **kw)
+
+
+async def _gh(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
+    repo = repo or _repo_root()
+    return await _run(GH_BIN, *args, cwd=repo, **kw)
+
+
+async def _reject_broken_files(repo: str) -> list[str]:
+    """Revert .py files that look single-line-serialized (literal \\n instead of newlines)."""
+    import pathlib
+
+    reverted: list[str] = []
+    repo_path = pathlib.Path(repo)
+
+    rc, diff_out, _ = await _git(
+        "diff",
+        "--name-only",
+        "--diff-filter=ACMR",
+        repo=repo,
+        check=False,
+    )
+    rc2, untracked, _ = await _git(
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        repo=repo,
+        check=False,
+    )
+    candidates = (diff_out + "\n" + untracked).strip().splitlines()
+
+    for rel in candidates:
+        rel = rel.strip()
+        if not rel.endswith(".py"):
+            continue
+        fpath = repo_path / rel
+        if not fpath.is_file():
+            continue
+        try:
+            content = fpath.read_text(errors="replace")
+        except OSError:
+            continue
+        line_count = content.count("\n")
+        if len(content) > 500 and line_count <= 1:
+            log.warning(
+                "auto_commit: BROKEN file %s (%d chars, %d lines) — reverting",
+                rel,
+                len(content),
+                line_count,
+            )
+            await _git("checkout", "--", rel, repo=repo, check=False)
+            if fpath.exists():
+                rc3, st, _ = await _git(
+                    "ls-files",
+                    "--error-unmatch",
+                    rel,
+                    repo=repo,
+                    check=False,
+                )
+                if rc3 != 0:
+                    fpath.unlink(missing_ok=True)
+            reverted.append(rel)
+    return reverted
+
+
+def _parse_pr_number(gh_output: str) -> int | None:
+    m = re.search(r"/pull/(\d+)", gh_output)
+    return int(m.group(1)) if m else None
+
+
+async def _find_pr_for_branch(branch: str, repo: str | None = None) -> int | None:
+    rc, out, _ = await _gh(
+        "pr",
+        "list",
+        "--repo",
+        REPO_NAME,
+        "--head",
+        branch,
+        "--state",
+        "open",
+        "--json",
+        "number",
+        repo=repo,
+        check=False,
+    )
+    if rc == 0 and out:
+        try:
+            prs = json.loads(out)
+            if prs:
+                return prs[0]["number"]
+        except (json.JSONDecodeError, KeyError, IndexError):
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Plugin class
+# ---------------------------------------------------------------------------
+
+
+class GitOpsIntegration:
+    """Concrete git_ops plugin backed by local git + gh CLI."""
+
+    async def current_branch(self, repo: str | None = None) -> str:
+        rc, out, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        return out if rc == 0 else "unknown"
+
+    async def create_branch(
+        self, task_id: int, title: str, repo: str | None = None
+    ) -> str:
+        repo = repo or _repo_root()
+        slug = _slugify(title)
+        branch = f"task-{task_id}/{slug}"
+
+        await _git("checkout", "main", repo=repo, check=False)
+
+        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        if dirty.strip():
+            log.warning("create_branch: dirty worktree on main, cleaning up")
+            await _git("checkout", ".", repo=repo, check=False)
+            await _git("clean", "-fd", repo=repo, check=False)
+
+        await _git("pull", "origin", "main", "--ff-only", repo=repo, check=False)
+
+        rc, _, err = await _git("checkout", "-b", branch, repo=repo, check=False)
+        if rc != 0:
+            if "already exists" in err:
+                await _git("checkout", branch, repo=repo)
+                log.info("Branch %s already exists, checked out", branch)
+            else:
+                log.error("Failed to create branch %s: %s", branch, err)
+                return ""
+        else:
+            log.info("Created and checked out branch %s", branch)
+        return branch
+
+    async def checkout(self, branch: str, repo: str | None = None) -> bool:
+        rc, _, _ = await _git("checkout", branch, repo=repo, check=False)
+        return rc == 0
+
+    async def auto_commit(
+        self,
+        task_id: int,
+        title: str = "",
+        message: str | None = None,
+        repo: str | None = None,
+    ) -> bool:
+        repo = repo or _repo_root()
+
+        reverted = await _reject_broken_files(repo)
+        if reverted:
+            log.warning(
+                "auto_commit: reverted %d broken file(s) for task #%d: %s",
+                len(reverted),
+                task_id,
+                ", ".join(reverted),
+            )
+
+        rc, status, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        if not status.strip():
+            log.info("auto_commit: no changes for task #%d", task_id)
+            return False
+
+        if message:
+            msg = message
+        else:
+            ctype = _conv_commit_type(title) if title else "feat"
+            msg = f"{ctype}(task): auto-commit for #{task_id}"
+
+        await _git("add", "-A", repo=repo)
+        rc, _, err = await _git(
+            "commit", "-m", msg, "--no-verify", repo=repo, check=False
+        )
+        if rc == 0:
+            log.info("auto_commit: committed for task #%d", task_id)
+            return True
+        log.warning("auto_commit failed for task #%d: %s", task_id, err)
+        return False
+
+    async def pull_main(self, repo: str | None = None) -> bool:
+        repo = repo or _repo_root()
+        await _git("checkout", "main", repo=repo, check=False)
+        rc, _, _ = await _git(
+            "pull", "origin", "main", "--ff-only", repo=repo, check=False
+        )
+        return rc == 0
+
+    async def squash_branch(
+        self, task_id: int, title: str, branch: str, repo: str | None = None
+    ) -> bool:
+        repo = repo or _repo_root()
+
+        await _git("checkout", branch, repo=repo, check=False)
+        await _git("fetch", "origin", "main", repo=repo, check=False)
+
+        rc, merge_base, _ = await _git(
+            "merge-base",
+            "origin/main",
+            branch,
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not merge_base.strip():
+            log.warning("squash_branch: cannot find merge-base for %s", branch)
+            return False
+
+        rc, rev_count, _ = await _git(
+            "rev-list",
+            "--count",
+            f"{merge_base.strip()}..HEAD",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or int(rev_count.strip() or "0") <= 1:
+            log.info("squash_branch: %s has <=1 commit, skip squash", branch)
+            return True
+
+        rc, _, err = await _git(
+            "reset",
+            "--soft",
+            merge_base.strip(),
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.error("squash_branch: reset failed for %s: %s", branch, err)
+            return False
+
+        ctype = _conv_commit_type(title) if title else "feat"
+        slug = _slugify(title, max_len=60)
+        msg = f"{ctype}(task): {slug} (#{task_id})"
+
+        await _git("add", "-A", repo=repo)
+        rc, _, err = await _git(
+            "commit",
+            "-m",
+            msg,
+            "--no-verify",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.error("squash_branch: commit failed for %s: %s", branch, err)
+            return False
+
+        log.info("squash_branch: squashed %s commits on %s", rev_count.strip(), branch)
+        return True
+
+    async def push_branch(
+        self, branch: str, repo: str | None = None, force: bool = False
+    ) -> bool:
+        args = ["push", "-u", "origin", branch]
+        if force:
+            args.insert(1, "--force-with-lease")
+        rc, _, err = await _git(*args, repo=repo, check=False, timeout=60)
+        if rc == 0:
+            log.info(
+                "Pushed branch %s to origin%s", branch, " (force)" if force else ""
+            )
+            return True
+        log.error("Failed to push %s: %s", branch, err)
+        return False
+
+    async def create_pr(
+        self,
+        task_id: int,
+        title: str,
+        description: str,
+        branch: str,
+        repo: str | None = None,
+    ) -> int | None:
+        ctype = _conv_commit_type(title)
+        pr_title = f"{ctype}(task): {title} (#{task_id})"
+        body = (
+            f"## Task #{task_id}\n\n"
+            f"{description or 'No description'}\n\n"
+            "---\n*Created automatically by OpenClaw Hub*"
+        )
+
+        rc, out, err = await _gh(
+            "pr",
+            "create",
+            "--repo",
+            REPO_NAME,
+            "--base",
+            "main",
+            "--head",
+            branch,
+            "--title",
+            pr_title,
+            "--body",
+            body,
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0:
+            if "already exists" in err:
+                return await _find_pr_for_branch(branch, repo)
+            log.error("Failed to create PR for %s: %s", branch, err)
+            return None
+
+        pr_number = _parse_pr_number(out)
+        if pr_number:
+            log.info("Created PR #%d for branch %s", pr_number, branch)
+        return pr_number
+
+    async def get_ci_failure_logs(
+        self,
+        pr_number: int,
+        branch: str,
+        max_log_chars: int = 12000,
+        repo: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {"failed_checks": [], "log_summary": "", "run_url": ""}
+
+        rc, out, _ = await _gh(
+            "pr",
+            "checks",
+            str(pr_number),
+            "--repo",
+            REPO_NAME,
+            "--json",
+            "name,state",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0 and out:
+            try:
+                checks = json.loads(out)
+                result["failed_checks"] = [
+                    c["name"]
+                    for c in checks
+                    if c.get("state", "").upper()
+                    in ("FAILURE", "ERROR", "ACTION_REQUIRED")
+                ]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        rc, out, _ = await _gh(
+            "run",
+            "list",
+            "--repo",
+            REPO_NAME,
+            "--branch",
+            branch,
+            "--limit",
+            "1",
+            "--json",
+            "databaseId,url,status",
+            repo=repo,
+            check=False,
+        )
+        run_id = None
+        if rc == 0 and out:
+            try:
+                runs = json.loads(out)
+                if runs:
+                    run_id = runs[0].get("databaseId")
+                    result["run_url"] = runs[0].get("url", "")
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
+
+        if run_id:
+            rc, out, _ = await _gh(
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                REPO_NAME,
+                "--log-failed",
+                repo=repo,
+                check=False,
+                timeout=90,
+            )
+            if rc == 0 and out:
+                if len(out) > max_log_chars:
+                    out = out[-max_log_chars:]
+                    out = "... (truncated) ...\n" + out
+                result["log_summary"] = out
+
+        return result
+
+    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str:
+        rc, out, _ = await _gh(
+            "pr",
+            "checks",
+            str(pr_number),
+            "--repo",
+            REPO_NAME,
+            "--json",
+            "name,state",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not out:
+            return "pending"
+        try:
+            checks = json.loads(out)
+        except json.JSONDecodeError:
+            return "pending"
+
+        if not checks:
+            return "pending"
+
+        states = [c.get("state", "").upper() for c in checks]
+        still_running = any(
+            s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "")
+            for s in states
+        )
+        if still_running:
+            return "pending"
+        if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
+            return "pass"
+        if any(s in ("FAILURE", "ERROR", "ACTION_REQUIRED") for s in states):
+            return "fail"
+        return "pending"
+
+    async def merge_pr(
+        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+    ) -> bool:
+        ctype = _conv_commit_type(title)
+        slug = _slugify(title, max_len=60)
+        subject = f"{ctype}(task): {slug} (#{task_id})"
+
+        rc, _, err = await _gh(
+            "pr",
+            "merge",
+            str(pr_number),
+            "--repo",
+            REPO_NAME,
+            "--squash",
+            "--admin",
+            "--delete-branch",
+            "--subject",
+            subject,
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc == 0:
+            log.info("Merged PR #%d (squash, admin)", pr_number)
+            return True
+        log.error("Failed to merge PR #%d: %s", pr_number, err)
+        return False
+
+    async def delete_branch(self, branch: str, repo: str | None = None) -> None:
+        await _git("checkout", "main", repo=repo, check=False)
+        await _git("branch", "-D", branch, repo=repo, check=False)
+        log.info("Deleted local branch %s", branch)

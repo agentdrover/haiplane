@@ -1,0 +1,47 @@
+# Incident — production issue requiring immediate response.
+# DoR: problem_statement, AC (>=1), validation_commands (>=1).
+# user_story / business_value / size are NOT gated — under fire we
+# accept partial info, but we still demand an explicit "fixed when".
+
+work_type: incident
+class_of_service: expedite     # incidents are expedite by default
+size: S
+# wip_tag: support
+
+problem_statement: |
+  What broke + when + observed blast radius (users / regions / services).
+  Include alert link, dashboard link, and first-responder notes.
+
+# Strongly recommended even though not gated:
+# business_value: |
+#   Revenue / SLA / customer impact — informs comms.
+# scope_in:
+#   - <component(s) being patched>
+
+validation_commands:
+  - <e.g. "curl -fsS https://prod/health">
+  - <e.g. "uv run pytest -q tests/test_<module>.py">
+
+# constraints:
+#   - rollback plan documented
+# assumptions:
+#   - <e.g. "DB schema unchanged">
+# risks:
+#   - kind: breaking_change
+#     severity: high
+#     description: hot-fix on prod
+#     mitigation: feature flag + canary rollout
+
+acceptance_criteria:
+  - id: AC-1
+    given: the hot-fix is deployed
+    when:  the failing health check / smoke test runs
+    then:  it returns success and the alert clears
+    verifiable_by: log_check
+    test_ref: ""
+  - id: AC-2
+    given: post-incident review
+    when:  the postmortem is filed
+    then:  root cause + follow-up tasks (regression test, runbook update) are linked
+    verifiable_by: manual
+    test_ref: ""

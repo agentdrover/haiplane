@@ -1,0 +1,153 @@
+{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + stale_tasks|length %}
+
+{% if total_inbox == 0 %}
+<div class="inbox-clear">All clear — nothing needs your attention right now.</div>
+{% else %}
+
+{% if drafts %}
+<section class="inbox-group inbox-drafts">
+    <h3 class="inbox-group-title">
+        Proposals <span class="inbox-count">{{ drafts|length }}</span>
+    </h3>
+    {% for t in drafts %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            {% if t.task_type.value != 'task' %}
+            <span class="badge badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
+            {% endif %}
+        </div>
+        {% if t.assigned_agent %}
+        <div class="inbox-item-meta">from {{ t.assigned_agent }}</div>
+        {% endif %}
+        {% if t.description %}
+        <div class="inbox-item-desc">{{ t.description[:120] }}{% if t.description|length > 120 %}…{% endif %}</div>
+        {% endif %}
+        <div class="inbox-item-actions">
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-approve"
+                    hx-vals='{"run": "true"}'
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Approve and run #{{ t.id }}?">Approve &amp; Run</button>
+            <button class="btn btn-primary btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-approve"
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML">Approve</button>
+            <button class="btn btn-danger btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-reject"
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Reject #{{ t.id }}?">Reject</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if questions %}
+<section class="inbox-group inbox-questions">
+    <h3 class="inbox-group-title">
+        Questions <span class="inbox-count">{{ questions|length }}</span>
+    </h3>
+    {% for t in questions %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+        </div>
+        {% if t.updates %}
+        {% set last_q = t.updates|selectattr("kind", "equalto", "question")|list|last %}
+        {% if last_q %}
+        <div class="inbox-question-text">{{ last_q.content[:200] }}{% if last_q.content|length > 200 %}…{% endif %}</div>
+        {% endif %}
+        {% endif %}
+        <form class="inbox-answer-form"
+              hx-post="/tasks/{{ t.id }}/web-answer"
+              hx-target="#inbox-task-{{ t.id }}"
+              hx-swap="outerHTML">
+            <input type="text" name="answer" placeholder="Type your answer…" required class="inbox-answer-input">
+            <input type="hidden" name="resume" value="true">
+            <button class="btn btn-success btn-xs" type="submit">Answer &amp; Resume</button>
+        </form>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if decisions %}
+<section class="inbox-group inbox-decisions">
+    <h3 class="inbox-group-title">
+        Decisions <span class="inbox-count">{{ decisions|length }}</span>
+    </h3>
+    {% for t in decisions %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-needs_decision">arbiter report</span>
+        </div>
+        <div class="inbox-item-actions">
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-decide"
+                    hx-vals='{"action": "accept"}'
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Accept #{{ t.id }} as completed?">Accept</button>
+            <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Review &amp; Decide</a>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if pending_reports %}
+<section class="inbox-group inbox-pending-reports">
+    <h3 class="inbox-group-title">
+        ⏳ Pending Reports <span class="inbox-count inbox-count-warn">{{ pending_reports|length }}</span>
+    </h3>
+    {% for t in pending_reports %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-pending_report">needs report</span>
+        </div>
+        {% if t.assigned_agent %}
+        <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
+        {% endif %}
+        <div class="inbox-item-desc">Job finished — agent must submit a done report to complete this task.</div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ t.id }}" class="btn btn-primary btn-xs">View &amp; Report</a>
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-force-complete"
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Force-complete #{{ t.id }} without report?">Force Complete</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if stale_tasks %}
+<section class="inbox-group inbox-stale">
+    <h3 class="inbox-group-title">
+        ⚠ Stale Tasks <span class="inbox-count inbox-count-danger">{{ stale_tasks|length }}</span>
+    </h3>
+    {% for t in stale_tasks %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-stale">stale</span>
+        </div>
+        {% if t.assigned_agent %}
+        <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
+        {% endif %}
+        <div class="inbox-item-desc">Running with no updates for 30+ minutes.</div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Investigate</a>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% endif %}

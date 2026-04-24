@@ -1,0 +1,55 @@
+# Refactor — internal change with no user-facing behavior change.
+# DoR: problem_statement, scope_in (>=1), AC (>=1), validation (>=1),
+#      size, wip_tag. wip_tag is typically 'tech_debt'.
+
+work_type: refactor
+class_of_service: standard
+size: M
+wip_tag: tech_debt
+
+problem_statement: |
+  What hurts about the current code? Coupling, duplication, hot path,
+  testability, etc. Be concrete — "code smell" is not a problem statement.
+
+scope_in:
+  - <module / boundary being reshaped>
+scope_out:
+  - <behavior changes — refactors must NOT change observable behavior>
+
+affected_areas:
+  - <files / modules touched>
+
+validation_commands:
+  - uv run pytest -q
+  # - uv run ruff check
+  # - uv run mypy hub/
+
+constraints:
+  - public API stays backward compatible
+  - no schema migrations
+assumptions:
+  - existing test coverage is sufficient to catch regressions
+
+technical_hints: |
+  Target shape: <pattern, structure, layering>.
+  Migration plan if multi-step.
+
+risks:
+  - kind: breaking_change
+    severity: medium
+    description: large blast radius across <area>
+    mitigation: incremental commits + green CI per step
+
+acceptance_criteria:
+  - id: AC-1
+    given: the refactored code
+    when:  the full test suite runs
+    then:  every test that passed before still passes (no behavior change)
+    verifiable_by: test
+    test_ref: ""
+  - id: AC-2
+    given: <new structural property, e.g. "module X depends on Y but not Z">
+    when:  static analysis runs
+    then:  the dependency rule holds
+    verifiable_by: log_check
+    test_ref: ""

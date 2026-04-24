@@ -1,0 +1,19 @@
+# Docs — documentation-only change (READMEs, AGENTS.md, ADRs, comments).
+# DoR: scope_in (>=1), size.
+# Adding ACs / validation commands to a doc change is overkill.
+
+work_type: docs
+class_of_service: standard
+size: XS
+
+scope_in:
+  - <doc file / section being written or updated>
+scope_out:
+  - <related-but-separate area we won't touch>
+
+# Optional:
+# affected_areas:
+#   - README.md
+#   - AGENTS.md
+# technical_hints: |
+#   Audience, voice, links to source of truth.
