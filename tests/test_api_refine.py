@@ -152,6 +152,27 @@ async def test_refine_rolls_back_structured_fields_when_ac_fails(
     assert after["scope_in"] == ["initial"]
 
 
+async def test_refine_updates_human_owner_and_reviewer(client: AsyncClient):
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"human_owner": "alice", "human_reviewer": "bob"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["human_owner"] == "alice"
+    assert body["human_reviewer"] == "bob"
+
+    # Second refine touching only owner; reviewer must persist.
+    resp2 = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"human_owner": "charlie"},
+    )
+    body2 = resp2.json()
+    assert body2["human_owner"] == "charlie"
+    assert body2["human_reviewer"] == "bob"
+
+
 async def test_refine_unknown_task_returns_404(client: AsyncClient):
     resp = await client.post("/api/tasks/99999/refine", json={"size": "S"})
     assert resp.status_code == 404

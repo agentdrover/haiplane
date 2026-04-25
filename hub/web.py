@@ -165,6 +165,8 @@ async def web_tasks_list_partial(
     priority: str | None = None,
     source: str | None = None,
     parent_id: int | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
     limit: int = Query(default=100, le=200),
 ):
     """HTML fragment: task table body for HTMX swap."""
@@ -175,6 +177,8 @@ async def web_tasks_list_partial(
         priority=priority,
         source=source,
         parent_id=parent_id,
+        human_owner=human_owner,
+        human_reviewer=human_reviewer,
         limit=limit,
     )
     return TEMPLATES.TemplateResponse(
@@ -218,6 +222,8 @@ async def web_tasks(
     priority: str | None = None,
     source: str | None = None,
     parent_id: int | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
 ):
     db = _db(request)
     tasks = await services.list_tasks(
@@ -227,6 +233,8 @@ async def web_tasks(
         priority=priority,
         source=source,
         parent_id=parent_id,
+        human_owner=human_owner,
+        human_reviewer=human_reviewer,
         limit=100,
     )
 
@@ -249,6 +257,8 @@ async def web_tasks(
             "filter_priority": priority or "",
             "filter_source": source or "",
             "filter_parent_id": parent_id,
+            "filter_human_owner": human_owner or "",
+            "filter_human_reviewer": human_reviewer or "",
             "parent_breadcrumb": parent_breadcrumb,
             "all_statuses": all_statuses,
             "all_types": all_types,
@@ -312,6 +322,8 @@ async def web_create_task(
     user_story: str = Form(""),
     problem_statement: str = Form(""),
     scope_in: str = Form(""),
+    human_owner: str = Form(""),
+    human_reviewer: str = Form(""),
     after_create: str = Form("backlog"),
 ):
     user = current_user(request)
@@ -332,6 +344,8 @@ async def web_create_task(
         user_story=user_story,
         problem_statement=problem_statement,
         scope_in=scope_in_items,
+        human_owner=human_owner,
+        human_reviewer=human_reviewer,
         agent=user,
     )
     created = await services.create_task(_db(request), body)

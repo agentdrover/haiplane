@@ -41,6 +41,8 @@ async def list_tasks_filtered(
     priority: str | None = None,
     source: str | None = None,
     parent_id: int | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
     limit: int = 50,
 ) -> list[aiosqlite.Row]:
     conditions: list[str] = []
@@ -61,6 +63,12 @@ async def list_tasks_filtered(
     if parent_id is not None:
         conditions.append("parent_id=?")
         params.append(parent_id)
+    if human_owner:
+        conditions.append("human_owner=?")
+        params.append(human_owner)
+    if human_reviewer:
+        conditions.append("human_reviewer=?")
+        params.append(human_reviewer)
 
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
@@ -280,6 +288,8 @@ async def create_task_full(
         else payload.source,
         "assigned_agent": payload.agent,
         "rationale": payload.rationale,
+        "human_owner": payload.human_owner,
+        "human_reviewer": payload.human_reviewer,
         "status": status,
         "auto_review": int(bool(payload.auto_review)),
         "task_type": payload.task_type.value

@@ -55,6 +55,43 @@ async def test_web_create_task(client: AsyncClient):
     assert resp.headers["location"] == "/tasks"
 
 
+async def test_web_create_task_with_owner_reviewer(client: AsyncClient):
+    page = await client.get("/")
+    assert 'name="human_owner"' in page.text
+    assert 'name="human_reviewer"' in page.text
+
+    resp = await client.post(
+        "/tasks/create",
+        data={
+            "title": "Web owned task",
+            "description": "",
+            "runtime": "auto",
+            "human_owner": "alice",
+            "human_reviewer": "bob",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    tasks = (await client.get("/api/tasks")).json()
+    owned = [t for t in tasks if t["title"] == "Web owned task"]
+    assert len(owned) == 1
+    assert owned[0]["human_owner"] == "alice"
+    assert owned[0]["human_reviewer"] == "bob"
+
+
+async def test_task_detail_shows_owner_reviewer(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Detail owner", "human_owner": "alice", "human_reviewer": "bob"},
+    )
+    task_id = create.json()["id"]
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "alice" in resp.text
+    assert "bob" in resp.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",

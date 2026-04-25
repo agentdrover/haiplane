@@ -164,6 +164,8 @@ class TaskCreate(BaseModel):
     source: TaskSource = TaskSource.human
     agent: str = Field("", max_length=100)
     rationale: str = Field("", max_length=5000)
+    human_owner: str = Field("", max_length=100)
+    human_reviewer: str = Field("", max_length=100)
     run_immediately: bool = False
     auto_review: bool = True
 
@@ -282,6 +284,8 @@ class TaskRefine(BaseModel):
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
+    human_owner: str | None = Field(default=None, max_length=100)
+    human_reviewer: str | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def _ac_ids_must_be_unique(self) -> "TaskRefine":
@@ -391,6 +395,8 @@ class TaskView(BaseModel):
     source: TaskSource = TaskSource.human
     assigned_agent: str = ""
     rationale: str = ""
+    human_owner: str = ""
+    human_reviewer: str = ""
     job_id: str | None = None
     exit_code: int | None = None
     result_text: str | None = None

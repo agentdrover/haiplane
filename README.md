@@ -45,6 +45,9 @@ Cursor-specific rules are in
 template at
 [docs/templates/cursor/openclaw-hub.mdc](docs/templates/cursor/openclaw-hub.mdc).
 
+Branch and workspace safety invariants for multi-agent work are in
+[docs/workspace-safety-policy.md](docs/workspace-safety-policy.md).
+
 Minimum MCP tools for daily work:
 
 - `hub_project_status`, `hub_list_tasks`, `hub_task_status`

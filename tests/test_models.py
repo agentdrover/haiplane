@@ -141,6 +141,23 @@ def test_task_create_backward_compatible_without_new_fields():
     assert tc.class_of_service == ClassOfService.standard
 
 
+def test_task_create_accepts_human_owner_and_reviewer():
+    tc = TaskCreate(title="x", human_owner="alice", human_reviewer="bob")
+    assert tc.human_owner == "alice"
+    assert tc.human_reviewer == "bob"
+
+
+def test_task_create_human_owner_defaults_to_empty():
+    tc = TaskCreate(title="x")
+    assert tc.human_owner == ""
+    assert tc.human_reviewer == ""
+
+
+def test_task_create_human_owner_max_length():
+    with pytest.raises(ValidationError):
+        TaskCreate(title="x", human_owner="a" * 101)
+
+
 # --- TaskRefine ---
 
 
@@ -161,6 +178,24 @@ def test_task_refine_validates_lists_and_enums():
         TaskRefine(work_type="not-a-real-work-type")
     with pytest.raises(ValidationError):
         TaskRefine(scope_in=[f"x-{i}" for i in range(21)])
+
+
+def test_task_refine_accepts_human_owner_and_reviewer():
+    refine = TaskRefine(human_owner="alice", human_reviewer="bob")
+    dumped = refine.model_dump(exclude_unset=True)
+    assert dumped == {"human_owner": "alice", "human_reviewer": "bob"}
+
+
+def test_task_refine_human_owner_none_means_untouched():
+    refine = TaskRefine()
+    dumped = refine.model_dump(exclude_unset=True)
+    assert "human_owner" not in dumped
+    assert "human_reviewer" not in dumped
+
+
+def test_task_refine_human_owner_max_length():
+    with pytest.raises(ValidationError):
+        TaskRefine(human_owner="a" * 101)
 
 
 def test_task_refine_accepts_acs_and_risks():
@@ -285,6 +320,20 @@ def test_task_view_defaults_for_structured_fields():
     assert view.ready_at is None
     assert view.started_at is None
     assert view.completed_at is None
+
+
+def test_task_view_defaults_for_human_owner_reviewer():
+    view = TaskView(**_minimal_task_view_payload())
+    assert view.human_owner == ""
+    assert view.human_reviewer == ""
+
+
+def test_task_view_accepts_human_owner_reviewer():
+    view = TaskView(
+        **_minimal_task_view_payload(human_owner="alice", human_reviewer="bob")
+    )
+    assert view.human_owner == "alice"
+    assert view.human_reviewer == "bob"
 
 
 def test_task_view_accepts_structured_payload():

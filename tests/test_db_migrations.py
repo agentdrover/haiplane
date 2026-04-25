@@ -36,6 +36,8 @@ STRUCTURED_TASK_COLUMNS = {
     "ready_at",
     "started_at",
     "completed_at",
+    "human_owner",
+    "human_reviewer",
 }
 
 
@@ -112,6 +114,21 @@ async def test_optional_columns_are_nullable(column: str):
     try:
         cols = await _table_columns(conn, "tasks")
         assert cols[column]["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["human_owner", "human_reviewer"],
+)
+async def test_human_owner_reviewer_columns_present_with_defaults(column: str):
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert column in cols
+        assert cols[column]["dflt_value"] == "''"
+        assert cols[column]["notnull"] == 1
     finally:
         await conn.close()
 

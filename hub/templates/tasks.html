@@ -58,6 +58,22 @@
                hx-trigger="change, keyup changed delay:500ms"
                min="1">
     </div>
+    <div class="filter-group">
+        <label>Owner</label>
+        <input type="text" name="human_owner" placeholder="Owner"
+               class="input--sm"
+               value="{{ filter_human_owner or '' }}"
+               hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]"
+               hx-trigger="change, keyup changed delay:500ms">
+    </div>
+    <div class="filter-group">
+        <label>Reviewer</label>
+        <input type="text" name="human_reviewer" placeholder="Reviewer"
+               class="input--sm"
+               value="{{ filter_human_reviewer or '' }}"
+               hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]"
+               hx-trigger="change, keyup changed delay:500ms">
+    </div>
     <div class="filter-group filter-group--end">
         <a href="/tasks" class="btn btn-ghost btn-sm">Reset</a>
     </div>

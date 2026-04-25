@@ -23,7 +23,9 @@ def test_cmd_list() -> None:
         },
     ]
     mock_api = MagicMock(return_value=tasks)
-    args = argparse.Namespace(limit=10, status="open", type=None, parent=None)
+    args = argparse.Namespace(
+        limit=10, status="open", type=None, parent=None, owner=None, reviewer=None
+    )
     with (
         patch.object(cli, "_api", mock_api),
         patch("sys.stdout", new=StringIO()) as out,
@@ -47,6 +49,8 @@ def test_cmd_create() -> None:
         parent=5,
         task_type="task",
         priority="high",
+        owner="",
+        reviewer="",
     )
     with (
         patch.object(cli, "_api", mock_api),
@@ -70,6 +74,29 @@ def test_cmd_create() -> None:
         },
     )
     assert json.loads(out.getvalue()) == created
+
+
+def test_cmd_create_with_owner_and_reviewer() -> None:
+    created = {"id": 100, "title": "Owned task", "status": "open"}
+    mock_api = MagicMock(return_value=created)
+    args = argparse.Namespace(
+        title="Owned task",
+        description="",
+        runtime="auto",
+        run=False,
+        no_review=False,
+        parent=None,
+        task_type="task",
+        priority="medium",
+        owner="alice",
+        reviewer="bob",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_task(args)
+    assert rc == 0
+    body = mock_api.call_args.args[2]
+    assert body["human_owner"] == "alice"
+    assert body["human_reviewer"] == "bob"
 
 
 def test_cmd_start() -> None:
@@ -177,10 +204,40 @@ def _refine_args(**overrides) -> argparse.Namespace:
         "constraint": None,
         "assumption": None,
         "out_of_scope_review": None,
+        "human_owner": None,
+        "human_reviewer": None,
         "clear_acs": False,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+def test_cmd_list_with_owner_filter() -> None:
+    tasks = [
+        {
+            "id": 1,
+            "title": "A",
+            "status": "open",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "human",
+            "human_owner": "alice",
+            "human_reviewer": "bob",
+        }
+    ]
+    mock_api = MagicMock(return_value=tasks)
+    args = argparse.Namespace(
+        limit=10, status=None, type=None, parent=None, owner="alice", reviewer=None
+    )
+    with (
+        patch.object(cli, "_api", mock_api),
+        patch("sys.stdout", new=StringIO()) as out,
+    ):
+        rc = cli.cmd_list(args)
+    assert rc == 0
+    mock_api.assert_called_once_with("GET", "/api/tasks?limit=10&human_owner=alice")
+    assert "[owner:alice]" in out.getvalue()
+    assert "[reviewer:bob]" in out.getvalue()
 
 
 def test_cmd_refine_only_includes_provided_fields() -> None:
@@ -206,6 +263,17 @@ def test_cmd_refine_only_includes_provided_fields() -> None:
             "validation_commands": ["uv run pytest -q"],
         },
     )
+
+
+def test_cmd_refine_with_owner_and_reviewer() -> None:
+    args = _refine_args(human_owner="alice", human_reviewer="bob")
+    mock_api = MagicMock(return_value={})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_refine(args)
+    assert rc == 0
+    payload = mock_api.call_args.args[2]
+    assert payload["human_owner"] == "alice"
+    assert payload["human_reviewer"] == "bob"
 
 
 def test_cmd_refine_clear_acs_sends_empty_list() -> None:

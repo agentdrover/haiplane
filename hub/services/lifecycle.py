@@ -69,6 +69,8 @@ def row_to_task(
         source=d.get("source", "human"),
         assigned_agent=d.get("assigned_agent", ""),
         rationale=d.get("rationale", ""),
+        human_owner=d.get("human_owner", ""),
+        human_reviewer=d.get("human_reviewer", ""),
         job_id=d.get("job_id"),
         exit_code=d.get("exit_code"),
         result_text=d.get("result_text"),

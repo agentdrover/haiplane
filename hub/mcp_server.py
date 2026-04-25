@@ -75,7 +75,9 @@ def _format_task(t: dict[str, Any]) -> str:
     tt = t.get("task_type", "task")
     tt_tag = f"[{tt}] " if tt != "task" else ""
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
-    return f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{parent} {t['title']}"
+    owner = f" [owner:{t['human_owner']}]" if t.get("human_owner") else ""
+    reviewer = f" [reviewer:{t['human_reviewer']}]" if t.get("human_reviewer") else ""
+    return f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{owner}{reviewer}{parent} {t['title']}"
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,8 @@ async def hub_create_task(
     priority: str = "medium",
     runtime: str = "auto",
     run_immediately: bool = False,
+    human_owner: str = "",
+    human_reviewer: str = "",
 ) -> str:
     """Create a new task, epic, feature, or subtask.
 
@@ -172,6 +176,8 @@ async def hub_create_task(
         priority: 'critical', 'high', 'medium', or 'low'
         runtime: 'auto', 'openrouter', or 'vast'
         run_immediately: If True, dispatch immediately (not applicable for epic/feature)
+        human_owner: Person who owns / is accountable for this task
+        human_reviewer: Person who will review and accept the result
     """
     body: dict[str, Any] = {
         "title": title,
@@ -181,6 +187,8 @@ async def hub_create_task(
         "runtime": runtime,
         "source": "human",
         "run_immediately": run_immediately,
+        "human_owner": human_owner,
+        "human_reviewer": human_reviewer,
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
@@ -194,7 +202,12 @@ async def hub_create_task(
 
 @mcp.tool()
 async def hub_list_tasks(
-    status: str = "", task_type: str = "", parent_id: int | None = None, limit: int = 20
+    status: str = "",
+    task_type: str = "",
+    parent_id: int | None = None,
+    human_owner: str = "",
+    human_reviewer: str = "",
+    limit: int = 20,
 ) -> str:
     """List tasks with optional filters.
 
@@ -202,16 +215,24 @@ async def hub_list_tasks(
         status: Filter by status: draft, open, running, needs_info, review, fix_requested, needs_decision, completed, failed, rejected. Empty for all.
         task_type: Filter by type: epic, feature, task, subtask. Empty for all.
         parent_id: Filter by parent task ID. None for all.
+        human_owner: Filter by human_owner (exact match). Empty for all.
+        human_reviewer: Filter by human_reviewer (exact match). Empty for all.
         limit: Max number of tasks to return
     """
-    params = f"?limit={limit}"
+    from urllib.parse import urlencode
+
+    params: dict[str, Any] = {"limit": limit}
     if status:
-        params += f"&status={status}"
+        params["status"] = status
     if task_type:
-        params += f"&type={task_type}"
+        params["type"] = task_type
     if parent_id is not None:
-        params += f"&parent_id={parent_id}"
-    tasks = await _api_get(f"/api/tasks{params}")
+        params["parent_id"] = parent_id
+    if human_owner:
+        params["human_owner"] = human_owner
+    if human_reviewer:
+        params["human_reviewer"] = human_reviewer
+    tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
     if not tasks:
         return "No tasks found."
     lines = [_format_task(t) for t in tasks]
@@ -511,6 +532,8 @@ async def hub_propose_task(
     agent: str = "",
     rationale: str = "",
     parent_id: int | None = None,
+    human_owner: str = "",
+    human_reviewer: str = "",
 ) -> str:
     """Propose a new task for human approval (used by agents). Creates a draft task.
 
@@ -520,6 +543,8 @@ async def hub_propose_task(
         agent: Name of the proposing agent
         rationale: Why this task is needed
         parent_id: Optional parent task ID (to propose subtask or task within a feature)
+        human_owner: Person who owns / is accountable for this task
+        human_reviewer: Person who will review and accept the result
     """
     body: dict[str, Any] = {
         "title": title,
@@ -527,6 +552,8 @@ async def hub_propose_task(
         "source": "agent",
         "agent": agent,
         "rationale": rationale,
+        "human_owner": human_owner,
+        "human_reviewer": human_reviewer,
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
@@ -772,6 +799,8 @@ async def hub_refine_task(
     constraints: list[str] | None = None,
     assumptions: list[str] | None = None,
     out_of_scope_for_review: list[str] | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
 ) -> str:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
@@ -796,6 +825,8 @@ async def hub_refine_task(
         constraints: Hard constraints (REPLACES).
         assumptions: Assumptions made (REPLACES).
         out_of_scope_for_review: Things the reviewer should ignore (REPLACES).
+        human_owner: Person who owns / is accountable for this task.
+        human_reviewer: Person who will review and accept the result.
     """
     body: dict[str, Any] = {}
     for key, val in (
@@ -815,6 +846,8 @@ async def hub_refine_task(
         ("constraints", constraints),
         ("assumptions", assumptions),
         ("out_of_scope_for_review", out_of_scope_for_review),
+        ("human_owner", human_owner),
+        ("human_reviewer", human_reviewer),
     ):
         if val is not None:
             body[key] = val

@@ -158,7 +158,14 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
 
 ## Этап 2. Улучшение контроля команды
 
-### 2.1. Human owner / reviewer fields
+### 2.1. Human owner / reviewer fields ✅ done (2026-04-25)
+
+**Итог**
+
+- `human_owner` и `human_reviewer` добавлены в task schema, REST API, refine payload, repository, migrations и `TaskView`.
+- CLI и MCP умеют задавать поля при create/propose, уточнять через refine и фильтровать список задач.
+- Web UI показывает owner/reviewer в списке и detail view, поддерживает фильтры и создание задач с этими полями.
+- Тесты покрывают модели, миграции, repository, REST API, refine, CLI, MCP и Web UI.
 
 **Проблема**
 
@@ -218,7 +225,12 @@ uv run pytest tests/test_api.py tests/test_cli.py tests/test_mcp_server.py tests
 uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_web.py -q
 ```
 
-### 2.3. Workspace safety policy
+### 2.3. Workspace safety policy ✅ done (2026-04-24)
+
+**Итог**
+
+- `docs/workspace-safety-policy.md` — 4 инварианта: один branch на задачу, неприкосновенность чужого branch, out-of-scope только через draft proposal, конфликт branch/PR/CI → `needs_decision`. Секции по ролям и аудиту.
+- Ссылки: `docs/software-development-workflow.md` (секция «Branch, PR и CI»), `docs/cursor-agent-rules.md` (вступление), `docs/templates/cursor/openclaw-hub.mdc` (правило branch isolation), `README.md` (секция «Cursor + Hub Workflow»).
 
 **Проблема**
 

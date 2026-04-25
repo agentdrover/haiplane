@@ -161,6 +161,8 @@ async def api_list_tasks(
     task_type: str | None = Query(default=None, alias="type"),
     priority: str | None = None,
     parent_id: int | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
     limit: int = Query(default=50, le=200),
 ):
     return await services.list_tasks(
@@ -169,6 +171,8 @@ async def api_list_tasks(
         task_type=task_type,
         priority=priority,
         parent_id=parent_id,
+        human_owner=human_owner,
+        human_reviewer=human_reviewer,
         limit=limit,
     )
 

@@ -272,5 +272,5 @@ Force approve доступен единым контрактом через MCP 
 4. **Review checklist field**: отделить acceptance criteria от reviewer-specific checklist.
 5. **MCP force approve parity**: добавить параметр `force` в `hub_approve_task`, чтобы Cursor не уступал CLI/Web в контролируемых override-сценариях.
 6. **Concurrent risk handling**: заменить read-modify-write в `hub_add_risk` отдельным API endpoint, если агенты часто добавляют риски параллельно.
-7. **Workspace safety policy**: формализовать правило branch isolation для нескольких агентов.
+7. ~~**Workspace safety policy**~~: формализовано в [workspace-safety-policy.md](workspace-safety-policy.md); ссылки из workflow и Cursor rules добавлены.
 8. **Decision capture flow**: сделать сохранение решений из `needs_decision` более явной частью UI/MCP.

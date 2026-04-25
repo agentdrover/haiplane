@@ -7,6 +7,8 @@
             <th>Title</th>
             <th>Status</th>
             <th>Priority</th>
+            <th>Owner</th>
+            <th>Reviewer</th>
             <th>Parent</th>
             <th>Created</th>
             <th>Actions</th>
@@ -20,6 +22,8 @@
             <td><a href="/tasks/{{ t.id }}">{{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a></td>
             <td><span class="badge badge-{{ t.status.value }}">{{ t.status.value }}</span></td>
             <td><span class="badge badge-priority-{{ t.priority.value }}">{{ t.priority.value }}</span></td>
+            <td>{{ t.human_owner or '—' }}</td>
+            <td>{{ t.human_reviewer or '—' }}</td>
             <td>
                 {% if t.parent_id %}
                 <a href="/tasks/{{ t.parent_id }}">#{{ t.parent_id }}</a>

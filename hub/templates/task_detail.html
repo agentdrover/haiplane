@@ -45,6 +45,14 @@
             {% endif %}
             <dt>Source</dt>
             <dd><span class="badge badge-{{ task.source.value }}">{{ task.source.value }}</span>{% if task.assigned_agent %} — {{ task.assigned_agent }}{% endif %}</dd>
+            {% if task.human_owner %}
+            <dt>Owner</dt>
+            <dd>{{ task.human_owner }}</dd>
+            {% endif %}
+            {% if task.human_reviewer %}
+            <dt>Reviewer</dt>
+            <dd>{{ task.human_reviewer }}</dd>
+            {% endif %}
             <dt>Runtime</dt>
             <dd><span class="badge badge-{{ task.runtime.value }}">{{ task.runtime.value }}</span></dd>
             {% if task.job_id %}

@@ -145,6 +145,8 @@ async def list_tasks(
     priority: str | None = None,
     source: str | None = None,
     parent_id: int | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
     limit: int = 50,
 ) -> list[TaskView]:
     """List tasks with optional filters, returning TaskView models."""
@@ -155,6 +157,8 @@ async def list_tasks(
         priority=priority,
         source=source,
         parent_id=parent_id,
+        human_owner=human_owner,
+        human_reviewer=human_reviewer,
         limit=limit,
     )
     return [row_to_task(r) for r in rows]

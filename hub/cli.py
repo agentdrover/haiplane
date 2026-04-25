@@ -113,9 +113,13 @@ def _print_task_short(t: dict[str, Any]) -> None:
     src = f" [{t.get('source', 'human')}]" if t.get("source") == "agent" else ""
     tt = t.get("task_type", "task")
     tt_tag = f"[{tt}] " if tt != "task" else ""
+    owner = f" [owner:{t.get('human_owner')}]" if t.get("human_owner") else ""
+    reviewer = (
+        f" [reviewer:{t.get('human_reviewer')}]" if t.get("human_reviewer") else ""
+    )
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
     print(
-        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{parent} {t['title']}"
+        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{owner}{reviewer}{parent} {t['title']}"
     )
 
 
@@ -137,6 +141,10 @@ def cmd_task(args: argparse.Namespace) -> int:
     }
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
+    if getattr(args, "owner", None):
+        body["human_owner"] = args.owner
+    if getattr(args, "reviewer", None):
+        body["human_reviewer"] = args.reviewer
     result = _api("POST", "/api/tasks", body)
     _print_json(result)
     return 0
@@ -155,6 +163,10 @@ def _cmd_create_typed(task_type: str) -> Any:
         }
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
+        if getattr(args, "owner", None):
+            body["human_owner"] = args.owner
+        if getattr(args, "reviewer", None):
+            body["human_reviewer"] = args.reviewer
         result = _api("POST", "/api/tasks", body)
         _print_json(result)
         return 0
@@ -269,6 +281,10 @@ def cmd_list(args: argparse.Namespace) -> int:
         params += f"&type={args.type}"
     if getattr(args, "parent", None) is not None:
         params += f"&parent_id={args.parent}"
+    if getattr(args, "owner", None):
+        params += f"&human_owner={urllib.parse.quote(args.owner)}"
+    if getattr(args, "reviewer", None):
+        params += f"&human_reviewer={urllib.parse.quote(args.reviewer)}"
     result = _api("GET", f"/api/tasks{params}")
     for t in result:
         _print_task_short(t)
@@ -348,6 +364,8 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("problem", "problem_statement"),
     ("value", "business_value"),
     ("tech_hints", "technical_hints"),
+    ("human_owner", "human_owner"),
+    ("human_reviewer", "human_reviewer"),
 )
 _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("scope_in", "scope_in"),
@@ -663,6 +681,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_task.add_argument(
         "--priority", choices=["critical", "high", "medium", "low"], default="medium"
     )
+    p_task.add_argument("--owner", default="", help="Human owner of the task")
+    p_task.add_argument("--reviewer", default="", help="Human reviewer of the task")
     p_task.set_defaults(func=cmd_task, task_type="task")
 
     # epic — create an epic
@@ -672,6 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_epic.add_argument(
         "--priority", choices=["critical", "high", "medium", "low"], default="medium"
     )
+    p_epic.add_argument("--owner", default="", help="Human owner")
+    p_epic.add_argument("--reviewer", default="", help="Human reviewer")
     p_epic.set_defaults(func=_cmd_create_typed("epic"))
 
     # feature — create a feature under an epic
@@ -682,6 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_feature.add_argument(
         "--priority", choices=["critical", "high", "medium", "low"], default="medium"
     )
+    p_feature.add_argument("--owner", default="", help="Human owner")
+    p_feature.add_argument("--reviewer", default="", help="Human reviewer")
     p_feature.set_defaults(func=_cmd_create_typed("feature"))
 
     # subtask — create a subtask under a task
@@ -692,6 +716,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_subtask.add_argument(
         "--priority", choices=["critical", "high", "medium", "low"], default="medium"
     )
+    p_subtask.add_argument("--owner", default="", help="Human owner")
+    p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
 
     # tree — show hierarchy tree
@@ -799,6 +825,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter by task type",
     )
     p_list.add_argument("--parent", type=int, default=None, help="Filter by parent ID")
+    p_list.add_argument("--owner", default=None, help="Filter by human_owner")
+    p_list.add_argument("--reviewer", default=None, help="Filter by human_reviewer")
     p_list.add_argument("--limit", type=int, default=20)
     p_list.set_defaults(func=cmd_list)
 
@@ -954,6 +982,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="out_of_scope_review",
         action="append",
         help="Item to skip during code review (repeatable)",
+    )
+    p_refine.add_argument(
+        "--owner",
+        dest="human_owner",
+        default=None,
+        help="Human owner of the task",
+    )
+    p_refine.add_argument(
+        "--reviewer",
+        dest="human_reviewer",
+        default=None,
+        help="Human reviewer of the task",
     )
     p_refine.add_argument(
         "--clear-acs",

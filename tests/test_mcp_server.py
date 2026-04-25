@@ -8,6 +8,7 @@ from hub.mcp_server import (
     hub_add_acceptance_criterion,
     hub_add_risk,
     hub_approve_task,
+    hub_create_task,
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
@@ -138,6 +139,8 @@ async def test_hub_propose(mock_api_post: AsyncMock) -> None:
             "source": "agent",
             "agent": "architect",
             "rationale": "Because",
+            "human_owner": "",
+            "human_reviewer": "",
             "parent_id": 7,
         },
     )
@@ -410,6 +413,54 @@ async def test_hub_get_readiness_compact_summary(mock_api_get: AsyncMock) -> Non
     assert "has_problem_statement" in msg
     assert "Add a problem" in msg
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness")
+
+
+async def test_hub_create_task_passes_owner_and_reviewer(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = {"id": 50, "status": "open"}
+    await hub_create_task("Test", human_owner="alice", human_reviewer="bob")
+    body = mock_api_post.await_args.args[1]
+    assert body["human_owner"] == "alice"
+    assert body["human_reviewer"] == "bob"
+
+
+async def test_hub_list_tasks_passes_owner_and_reviewer_filters(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.return_value = []
+    await hub_list_tasks(human_owner="alice", human_reviewer="bob")
+    mock_api_get.assert_awaited_once_with(
+        "/api/tasks?limit=20&human_owner=alice&human_reviewer=bob"
+    )
+
+
+async def test_hub_refine_task_passes_owner_and_reviewer(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = {"updated_columns": ["human_owner", "human_reviewer"]}
+    msg = await hub_refine_task(42, human_owner="alice", human_reviewer="bob")
+    assert "Task #42 refined" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"human_owner": "alice", "human_reviewer": "bob"},
+    )
+
+
+async def test_hub_propose_task_passes_owner_and_reviewer(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = {"id": 200}
+    await hub_propose_task(
+        "New thing",
+        "Do the thing",
+        agent="architect",
+        human_owner="alice",
+        human_reviewer="bob",
+    )
+    body = mock_api_post.await_args.args[1]
+    assert body["human_owner"] == "alice"
+    assert body["human_reviewer"] == "bob"
 
 
 async def test_hub_get_readiness_explain_returns_full_json(

@@ -195,6 +195,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_acceptance_criteria_task_id",
         "CREATE INDEX IF NOT EXISTS idx_acceptance_criteria_task_id ON acceptance_criteria(task_id)",
     ),
+    (
+        "add_human_owner_column",
+        "ALTER TABLE tasks ADD COLUMN human_owner TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_human_reviewer_column",
+        "ALTER TABLE tasks ADD COLUMN human_reviewer TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

@@ -267,6 +267,38 @@ async def test_task_context_api(client: AsyncClient):
     assert "context_text" in data
 
 
+async def test_create_task_with_owner_reviewer_api(client: AsyncClient):
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Owned task", "human_owner": "alice", "human_reviewer": "bob"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["human_owner"] == "alice"
+    assert data["human_reviewer"] == "bob"
+
+    fetched = (await client.get(f"/api/tasks/{data['id']}")).json()
+    assert fetched["human_owner"] == "alice"
+    assert fetched["human_reviewer"] == "bob"
+
+
+async def test_list_tasks_filtered_by_human_owner_api(client: AsyncClient):
+    await client.post(
+        "/api/tasks",
+        json={"title": "Alice task", "human_owner": "alice"},
+    )
+    await client.post(
+        "/api/tasks",
+        json={"title": "Bob task", "human_owner": "bob"},
+    )
+
+    resp = await client.get("/api/tasks", params={"human_owner": "alice"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) >= 1
+    assert all(t["human_owner"] == "alice" for t in data)
+
+
 async def test_reorder_task_api(client: AsyncClient):
     resp = await client.post("/api/tasks", json={"title": "Reorder me"})
     task_id = resp.json()["id"]

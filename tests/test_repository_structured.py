@@ -141,6 +141,22 @@ async def test_create_task_full_persists_structured_fields(db: aiosqlite.Connect
     assert fields["dor_passed"] is None
 
 
+async def test_create_task_full_persists_human_owner_and_reviewer(
+    db: aiosqlite.Connection,
+):
+    tc = TaskCreate(
+        title="Owner/reviewer task",
+        human_owner="alice",
+        human_reviewer="bob",
+    )
+    task_id = await repo.create_task_full(db, tc, status="draft")
+    await db.commit()
+    row = await repo.get_task(db, task_id)
+    assert row is not None
+    assert row["human_owner"] == "alice"
+    assert row["human_reviewer"] == "bob"
+
+
 async def test_create_task_full_works_with_minimal_payload(db: aiosqlite.Connection):
     tc = TaskCreate(title="minimal")
     task_id = await repo.create_task_full(db, tc, status="draft")
