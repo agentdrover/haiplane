@@ -79,3 +79,35 @@ class NotesIntegration:
         if isinstance(result, dict) and "pages" in result:
             return result["pages"]
         return []
+
+    async def save_decision(
+        self,
+        task_id: int,
+        action: str,
+        summary: str,
+        context: str = "",
+    ) -> dict[str, Any] | None:
+        """Persist a human decision record through n4l notes_decision_save."""
+        sid = N4L_SPACE_ID
+        if not sid:
+            result = await _n4l("spaces_list")
+            spaces = result if isinstance(result, list) else []
+            if spaces:
+                sid = spaces[0].get("id", "")
+        if not sid:
+            log.debug("save_decision skipped: no space_id available")
+            return None
+
+        title = f"Task #{task_id}: decision={action}"
+        payload: dict[str, Any] = {
+            "space_id": sid,
+            "title": title,
+            "decision": f"{action}: {summary}",
+            "why": context or summary,
+            "task_id": f"task-{task_id}",
+            "tags": ["hub-decision", f"task-{task_id}"],
+        }
+        result = await _n4l("notes_decision_save", payload)
+        if result is None:
+            log.warning("save_decision: n4l call returned None for task #%s", task_id)
+        return result if isinstance(result, dict) else None

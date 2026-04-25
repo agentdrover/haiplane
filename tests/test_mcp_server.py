@@ -9,6 +9,7 @@ from hub.mcp_server import (
     hub_add_risk,
     hub_approve_task,
     hub_create_task,
+    hub_decide_task,
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
@@ -461,6 +462,46 @@ async def test_hub_propose_task_passes_owner_and_reviewer(
     body = mock_api_post.await_args.args[1]
     assert body["human_owner"] == "alice"
     assert body["human_reviewer"] == "bob"
+
+
+async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "completed"}
+    msg = await hub_decide_task(
+        task_id=10,
+        action="accept",
+        instructions="",
+        decision_summary="Accepted after manual review.",
+        record_decision=True,
+    )
+    assert "Task #10" in msg
+    assert "accept" in msg
+    assert "decision recorded" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/10/decide",
+        {
+            "action": "accept",
+            "instructions": "",
+            "decision_summary": "Accepted after manual review.",
+            "record_decision": True,
+        },
+    )
+
+
+async def test_hub_decide_task_rework_without_summary(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "fix_requested"}
+    msg = await hub_decide_task(task_id=11, action="rework", instructions="Fix X")
+    assert "Task #11" in msg
+    assert "rework" in msg
+    assert "decision recorded" not in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/11/decide",
+        {
+            "action": "rework",
+            "instructions": "Fix X",
+            "decision_summary": "",
+            "record_decision": False,
+        },
+    )
 
 
 async def test_hub_get_readiness_explain_returns_full_json(

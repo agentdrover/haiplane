@@ -212,6 +212,16 @@
     {% endfor %}
     {% endif %}
     <form method="post" action="/tasks/{{ task.id }}/web-decide" class="u-mt-4">
+        <div class="form-group">
+            <label>Decision reason / summary (recommended)</label>
+            <textarea name="decision_summary" class="textarea--sm" placeholder="Why you are accepting or sending back for rework…"></textarea>
+        </div>
+        <div class="form-group">
+            <label class="u-flex u-gap-2">
+                <input type="checkbox" name="record_decision" value="true">
+                Save decision to notes (for future reference)
+            </label>
+        </div>
         <div class="u-row-end u-mb-4">
             <button class="btn btn-success" type="submit" name="action" value="accept">Accept as Completed</button>
         </div>
@@ -251,6 +261,11 @@
             {% elif u.kind == 'arbitration' %}
             <div class="qa-item qa-arbitration">
                 <div class="qa-label">Arbiter Assessment{% if u.agent %} by {{ u.agent }}{% endif %} &middot; {{ u.created_at }}</div>
+                <div class="u-pre-wrap">{{ u.content }}</div>
+            </div>
+            {% elif u.kind == 'decision' %}
+            <div class="qa-item qa-arbitration">
+                <div class="qa-label">Decision{% if u.agent %} by {{ u.agent }}{% endif %} &middot; {{ u.created_at }}</div>
                 <div class="u-pre-wrap">{{ u.content }}</div>
             </div>
             {% elif u.kind == 'alert' %}

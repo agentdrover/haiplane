@@ -501,6 +501,77 @@ def test_cmd_approve_passes_force_flag() -> None:
     )
 
 
+def test_cmd_decide_accept_with_summary() -> None:
+    result = {"id": 10, "status": "completed"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(
+        task_id=10,
+        accept=True,
+        rework=False,
+        message="",
+        summary="Accepted after review.",
+        record_decision=True,
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_decide(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/10/decide",
+        {
+            "action": "accept",
+            "instructions": "",
+            "decision_summary": "Accepted after review.",
+            "record_decision": True,
+        },
+    )
+
+
+def test_cmd_decide_rework_with_summary() -> None:
+    result = {"id": 11, "status": "fix_requested"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(
+        task_id=11,
+        accept=False,
+        rework=True,
+        message="Fix the bug.",
+        summary="Edge case in auth.",
+        record_decision=False,
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_decide(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/11/decide",
+        {
+            "action": "rework",
+            "instructions": "Fix the bug.",
+            "decision_summary": "Edge case in auth.",
+            "record_decision": False,
+        },
+    )
+
+
+def test_cmd_decide_without_summary() -> None:
+    result = {"id": 12, "status": "completed"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(
+        task_id=12,
+        accept=True,
+        rework=False,
+        message="",
+        summary="",
+        record_decision=False,
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_decide(args)
+    assert rc == 0
+    body = mock_api.call_args.args[2]
+    assert body["decision_summary"] == ""
+    assert body["record_decision"] is False
+
+
 def test_cmd_force_complete_passes_message() -> None:
     args = argparse.Namespace(task_id=9, message="reviewed manually")
     mock_api = MagicMock(return_value={"id": 9, "status": "completed"})

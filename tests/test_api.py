@@ -309,3 +309,81 @@ async def test_reorder_task_api(client: AsyncClient):
     )
     assert resp.status_code == 200
     assert resp.json()["position"] == 5
+
+
+async def test_decide_task_accept_api(client: AsyncClient, db):
+    resp = await client.post("/api/tasks", json={"title": "Decide me"})
+    task_id = resp.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "accept"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "completed"
+
+
+async def test_decide_task_with_summary_api(client: AsyncClient, db):
+    resp = await client.post("/api/tasks", json={"title": "Decide summary"})
+    task_id = resp.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={
+            "action": "accept",
+            "decision_summary": "Accepted: review comments are cosmetic.",
+            "record_decision": False,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "completed"
+    decision_updates = [u for u in data["updates"] if u["kind"] == "decision"]
+    assert len(decision_updates) == 1
+    assert "cosmetic" in decision_updates[0]["content"]
+
+
+async def test_decide_task_rework_with_summary_api(client: AsyncClient, db):
+    resp = await client.post("/api/tasks", json={"title": "Decide rework"})
+    task_id = resp.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={
+            "action": "rework",
+            "instructions": "Fix the auth bug.",
+            "decision_summary": "Auth bug must be resolved before merge.",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] in ("fix_requested", "open")
+    decision_updates = [u for u in data["updates"] if u["kind"] == "decision"]
+    assert len(decision_updates) == 1
+    assert "Auth bug must be resolved" in decision_updates[0]["content"]
+
+
+async def test_decide_task_record_decision_api(client: AsyncClient, db):
+    """record_decision=True should not break flow with noop notes adapter."""
+    resp = await client.post("/api/tasks", json={"title": "Record decision"})
+    task_id = resp.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={
+            "action": "accept",
+            "decision_summary": "Ship it.",
+            "record_decision": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"

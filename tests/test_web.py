@@ -111,6 +111,43 @@ async def test_web_approve_task(client: AsyncClient):
     assert f"/tasks/{task_id}" in resp.headers["location"]
 
 
+async def test_web_decide_task_with_summary(client: AsyncClient, db):
+    create = await client.post("/api/tasks", json={"title": "Decision task"})
+    task_id = create.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={
+            "action": "accept",
+            "decision_summary": "Cosmetic issues only.",
+            "record_decision": "false",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    detail = await client.get(f"/api/tasks/{task_id}")
+    data = detail.json()
+    assert data["status"] == "completed"
+    decision_updates = [u for u in data["updates"] if u["kind"] == "decision"]
+    assert len(decision_updates) == 1
+    assert "Cosmetic issues only" in decision_updates[0]["content"]
+
+
+async def test_web_decide_task_form_has_summary_field(client: AsyncClient, db):
+    create = await client.post("/api/tasks", json={"title": "Decision form"})
+    task_id = create.json()["id"]
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert 'name="decision_summary"' in page.text
+    assert 'name="record_decision"' in page.text
+
+
 async def test_web_force_complete_records_hx_prompt(client: AsyncClient, db):
     create = await client.post("/api/tasks", json={"title": "Pending report via web"})
     task_id = create.json()["id"]

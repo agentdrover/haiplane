@@ -140,6 +140,14 @@ class NotesPlugin(Protocol):
         self, space_id: str | None = None, limit: int = 10
     ) -> list[dict[str, Any]]: ...
 
+    async def save_decision(
+        self,
+        task_id: int,
+        action: str,
+        summary: str,
+        context: str = "",
+    ) -> dict[str, Any] | None: ...
+
 
 @runtime_checkable
 class VastPlugin(Protocol):

@@ -10,6 +10,7 @@ from hub.models import (
     TaskAnswer,
     TaskApprove,
     TaskCreate,
+    TaskDecide,
     TaskQuestion,
     TaskReorder,
     TaskStart,
@@ -617,6 +618,129 @@ async def test_list_tasks_with_filters(db: aiosqlite.Connection):
     open_tasks = await services.list_tasks(db, status="open", task_type="task")
     assert len(open_tasks) == 1
     assert open_tasks[0].title == "Task one"
+
+
+async def test_decide_task_accept(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Needs decision",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    body = TaskDecide(action="accept")
+    tv = await services.decide_task(db, task_id, body)
+    assert tv.status.value == "completed"
+    assert tv.updates
+    assert any(u.kind == "decision" for u in tv.updates)
+
+
+async def test_decide_task_accept_with_summary(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Decision with summary",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    body = TaskDecide(
+        action="accept",
+        decision_summary="Code quality is acceptable after review.",
+    )
+    tv = await services.decide_task(db, task_id, body)
+    assert tv.status.value == "completed"
+    assert tv.updates
+    decision_updates = [u for u in tv.updates if u.kind == "decision"]
+    assert len(decision_updates) == 1
+    assert "Code quality is acceptable" in decision_updates[0].content
+
+
+async def test_decide_task_rework_with_summary(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Rework decision",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    body = TaskDecide(
+        action="rework",
+        instructions="Fix the edge case in auth module.",
+        decision_summary="Edge case not handled for expired tokens.",
+    )
+    tv = await services.decide_task(db, task_id, body)
+    assert tv.status.value in ("fix_requested", "open")
+    decision_updates = [u for u in tv.updates if u.kind == "decision"]
+    assert len(decision_updates) == 1
+    assert "Edge case not handled" in decision_updates[0].content
+    assert "Fix the edge case" in decision_updates[0].content
+
+
+async def test_decide_task_record_decision_noop_does_not_break(
+    db: aiosqlite.Connection,
+):
+    """record_decision=True with noop notes adapter must not fail."""
+    task_id = await repo.create_task(
+        db,
+        title="Record noop",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    body = TaskDecide(
+        action="accept",
+        decision_summary="Accepted despite review noise.",
+        record_decision=True,
+    )
+    tv = await services.decide_task(db, task_id, body)
+    assert tv.status.value == "completed"
+
+
+async def test_decide_task_wrong_status(db: aiosqlite.Connection):
+    body = TaskCreate(title="Open task")
+    tv = await services.create_task(db, body)
+    assert tv.status.value == "open"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.decide_task(db, tv.id, TaskDecide(action="accept"))
+    assert exc_info.value.status_code == 400
+    assert "needs_decision" in str(exc_info.value.detail)
 
 
 async def test_noop_plugins_start_clean(db: aiosqlite.Connection):

@@ -178,6 +178,15 @@ class NoopNotes:
     ) -> list[dict[str, Any]]:
         return []
 
+    async def save_decision(
+        self,
+        task_id: int,
+        action: str,
+        summary: str,
+        context: str = "",
+    ) -> dict[str, Any] | None:
+        return None
+
 
 class NoopVast:
     async def has_active_vast_tasks(self, db: aiosqlite.Connection) -> bool:

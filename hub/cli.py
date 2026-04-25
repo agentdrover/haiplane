@@ -326,6 +326,8 @@ def cmd_decide(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "action": action,
         "instructions": args.message or "",
+        "decision_summary": getattr(args, "summary", "") or "",
+        "record_decision": getattr(args, "record_decision", False),
     }
     result = _api("POST", f"/api/tasks/{args.task_id}/decide", body)
     _print_json(result)
@@ -864,6 +866,17 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--accept", action="store_true", help="Accept task as completed")
     group.add_argument("--rework", action="store_true", help="Send back for rework")
     p_decide.add_argument("--message", default="", help="Instructions for rework")
+    p_decide.add_argument(
+        "--summary",
+        default="",
+        help="Short summary/reason for the decision (recorded in task updates)",
+    )
+    p_decide.add_argument(
+        "--record-decision",
+        dest="record_decision",
+        action="store_true",
+        help="Also persist the decision through the notes integration",
+    )
     p_decide.set_defaults(func=cmd_decide)
 
     # force-complete — human override of the completion gate

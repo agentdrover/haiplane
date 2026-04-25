@@ -427,8 +427,15 @@ async def web_decide_task(
     request: Request,
     action: str = Form("accept"),
     instructions: str = Form(""),
+    decision_summary: str = Form(""),
+    record_decision: bool = Form(False),
 ):
-    body = TaskDecide(action=action, instructions=instructions)
+    body = TaskDecide(
+        action=action,
+        instructions=instructions,
+        decision_summary=decision_summary,
+        record_decision=record_decision,
+    )
     await services.decide_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)

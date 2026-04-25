@@ -197,7 +197,19 @@ uv run pytest tests/test_models.py tests/test_repository_structured.py tests/tes
 uv run pytest tests/test_api.py tests/test_cli.py tests/test_mcp_server.py tests/test_web.py -q
 ```
 
-### 2.2. Decision capture flow
+### 2.2. Decision capture flow ✅ done (2026-04-25)
+
+**Итог**
+
+- `TaskDecide` расширен параметрами `decision_summary: str` и `record_decision: bool`.
+- `lifecycle.decide_task` записывает `decision_summary` в task update log (kind=`decision`) независимо от notes.
+- При `record_decision=True` summary сохраняется через `NotesPlugin.save_decision` (если доступен); noop adapter возвращает None, flow не ломается.
+- `NotesPlugin` protocol расширен методом `save_decision`; noop и concrete (`notes.py`) реализации добавлены.
+- MCP `hub_decide_task` принимает `decision_summary` и `record_decision`; docstring описывает Decision Gate.
+- CLI `oc-hub decide` принимает `--summary` и `--record-decision`.
+- Web UI для `needs_decision` содержит textarea для `decision_summary` и checkbox `record_decision`.
+- Template `task_detail.html` рендерит `decision` kind в updates thread.
+- Тесты: `test_services.py` (5 новых), `test_api.py` (4 новых), `test_mcp_server.py` (2 новых), `test_cli.py` (3 новых), `test_web.py` (2 новых), `test_notes_integration.py` (payload контракта `notes_decision_save`).
 
 **Проблема**
 
@@ -205,24 +217,24 @@ uv run pytest tests/test_api.py tests/test_cli.py tests/test_mcp_server.py tests
 
 **Изменения**
 
-- Добавить явный action/tool для сохранения решения:
-  - вариант A: расширить `hub_decide_task` параметром `record_decision: bool`;
-  - вариант B: добавить отдельный `hub_record_decision_for_task`.
-- Использовать existing notes plugin, не связывая core lifecycle с конкретной реализацией notes.
-- В task update писать ссылку/summary решения.
-- Обновить Web UI для `needs_decision`, если нужен human dashboard flow.
-
-**Затронутые файлы**
-
-- `hub/mcp_server.py`;
-- `hub/app.py` или `hub/services/lifecycle.py`, если решение становится API behavior;
-- `hub/integrations/protocols.py` и notes adapter только если текущего протокола недостаточно;
-- `tests/test_mcp_server.py`, `tests/test_api.py`, возможно `tests/test_web.py`.
+- `hub/models.py`: `TaskDecide` + `decision_summary`, `record_decision`.
+- `hub/services/lifecycle.py`: `decide_task` пишет decision update и опционально вызывает `plugins.notes.save_decision`.
+- `hub/integrations/protocols.py`: `NotesPlugin.save_decision`.
+- `hub/integrations/noop.py`: `NoopNotes.save_decision` → `None`.
+- `hub/integrations/notes.py`: `NotesIntegration.save_decision` → `notes_decision_save`.
+- `hub/mcp_server.py`: `hub_decide_task` + новые параметры и docstring.
+- `hub/cli.py`: `cmd_decide` + `--summary`, `--record-decision`; parser обновлён.
+- `hub/web.py`: `web_decide_task` принимает `decision_summary`, `record_decision`.
+- `hub/templates/task_detail.html`: форма с textarea для summary, checkbox; рендер `decision` kind.
+- `tests/test_notes_integration.py`: concrete notes adapter отправляет обязательные поля `decision` и `why`.
+- Тесты: `tests/test_services.py`, `tests/test_api.py`, `tests/test_mcp_server.py`, `tests/test_cli.py`, `tests/test_web.py`, `tests/test_notes_integration.py`.
 
 **Валидация**
 
 ```bash
 uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_web.py -q
+uv run pytest tests/test_cli.py tests/test_services.py -q
+uv run pytest -q
 ```
 
 ### 2.3. Workspace safety policy ✅ done (2026-04-24)

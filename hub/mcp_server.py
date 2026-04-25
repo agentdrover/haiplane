@@ -501,23 +501,44 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
 
 
 @mcp.tool()
-async def hub_decide_task(task_id: int, action: str, instructions: str = "") -> str:
-    """Human decision after arbiter review. Accept task as completed or send back for rework.
+async def hub_decide_task(
+    task_id: int,
+    action: str,
+    instructions: str = "",
+    decision_summary: str = "",
+    record_decision: bool = False,
+) -> str:
+    """Human decision after arbiter review — the Decision Gate.
+
+    When a task reaches needs_decision (review ambiguity, CI/review cycle
+    limit, or arbiter escalation), a human must explicitly accept or rework
+    it. This tool records the human decision and optionally persists it as
+    a reusable decision record through the notes integration.
+
+    The decision_summary is always written into the task update log so the
+    reasoning is visible even without a notes backend. When record_decision
+    is True the summary is additionally saved through the notes plugin (if
+    configured); if notes are unavailable, core flow continues unaffected.
 
     Args:
         task_id: The needs_decision task ID
         action: 'accept' to complete, 'rework' to send back for fixes
         instructions: When action='rework', what needs to be fixed
+        decision_summary: Short summary/reason for the decision (recorded in task updates)
+        record_decision: If True, also persist the decision through the notes integration
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/decide",
-        {
-            "action": action,
-            "instructions": instructions,
-        },
-    )
+    body: dict[str, Any] = {
+        "action": action,
+        "instructions": instructions,
+        "decision_summary": decision_summary,
+        "record_decision": record_decision,
+    }
+    result = await _api_post(f"/api/tasks/{task_id}/decide", body)
     status = result.get("status", "?")
-    return f"Task #{task_id}: decision '{action}' applied (status: {status})."
+    suffix = ""
+    if decision_summary:
+        suffix = " (decision recorded)"
+    return f"Task #{task_id}: decision '{action}' applied (status: {status}).{suffix}"
 
 
 # ---------------------------------------------------------------------------

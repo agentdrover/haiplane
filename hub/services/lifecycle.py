@@ -438,7 +438,16 @@ async def decide_task(
     task_id: int,
     body: TaskDecide,
 ) -> TaskView:
-    """Human decision after arbiter review: accept or rework."""
+    """Human decision after arbiter review: accept or rework.
+
+    When ``decision_summary`` is provided it is always recorded in the
+    task update log regardless of the ``record_decision`` flag, so the
+    context is visible even without a notes integration.
+
+    When ``record_decision`` is True the summary is additionally persisted
+    through the notes plugin (if configured). If the notes adapter is
+    unavailable or returns None the core lifecycle continues unaffected.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -449,14 +458,13 @@ async def decide_task(
             f"can only decide on needs_decision tasks, current status: {task['status']}",
         )
 
+    summary_text = body.decision_summary.strip() if body.decision_summary else ""
+
     if body.action == "accept":
-        await repo.add_task_update(
-            db,
-            task_id,
-            "human",
-            "status",
-            "Human accepted task after arbiter review.",
-        )
+        update_content = "Human accepted task after arbiter review."
+        if summary_text:
+            update_content += f"\nDecision: {summary_text}"
+        await repo.add_task_update(db, task_id, "human", "decision", update_content)
         await repo.update_task(db, task_id, status="completed")
         await db.commit()
         await log_activity(
@@ -466,13 +474,10 @@ async def decide_task(
         )
     else:
         instructions = body.instructions or "Fix remaining issues."
-        await repo.add_task_update(
-            db,
-            task_id,
-            "human",
-            "status",
-            f"Human requested rework after arbiter review: {instructions}",
-        )
+        update_content = f"Human requested rework after arbiter review: {instructions}"
+        if summary_text:
+            update_content += f"\nDecision: {summary_text}"
+        await repo.add_task_update(db, task_id, "human", "decision", update_content)
         await repo.update_task(db, task_id, review_cycle=0)
         await db.commit()
 
@@ -499,6 +504,21 @@ async def decide_task(
             "task_decided",
             f"Task #{task_id}: rework requested after arbitration",
         )
+
+    if body.record_decision and summary_text:
+        try:
+            await plugins.notes.save_decision(
+                task_id=task_id,
+                action=body.action,
+                summary=summary_text,
+                context=body.instructions or "",
+            )
+        except Exception:
+            log.warning(
+                "Failed to save decision to notes for task #%s (non-fatal)",
+                task_id,
+                exc_info=True,
+            )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
