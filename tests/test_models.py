@@ -134,6 +134,21 @@ def test_task_create_rejects_too_many_constraints():
         TaskCreate(title="x", constraints=[f"c-{i}" for i in range(11)])
 
 
+def test_task_create_review_checklist_default_empty():
+    tc = TaskCreate(title="x")
+    assert tc.review_checklist == []
+
+
+def test_task_create_accepts_review_checklist():
+    tc = TaskCreate(title="x", review_checklist=["check migration", "verify rollback"])
+    assert tc.review_checklist == ["check migration", "verify rollback"]
+
+
+def test_task_create_rejects_too_many_review_checklist_items():
+    with pytest.raises(ValidationError):
+        TaskCreate(title="x", review_checklist=[f"c-{i}" for i in range(11)])
+
+
 def test_task_create_backward_compatible_without_new_fields():
     """Existing clients sending only the legacy payload still validate."""
     tc = TaskCreate(title="x", description="d", priority="high")
@@ -196,6 +211,29 @@ def test_task_refine_human_owner_none_means_untouched():
 def test_task_refine_human_owner_max_length():
     with pytest.raises(ValidationError):
         TaskRefine(human_owner="a" * 101)
+
+
+def test_task_refine_review_checklist_omitted_means_untouched():
+    refine = TaskRefine()
+    dumped = refine.model_dump(exclude_unset=True)
+    assert "review_checklist" not in dumped
+
+
+def test_task_refine_review_checklist_replace():
+    refine = TaskRefine(review_checklist=["x", "y"])
+    dumped = refine.model_dump(exclude_unset=True)
+    assert dumped == {"review_checklist": ["x", "y"]}
+
+
+def test_task_refine_review_checklist_explicit_clear():
+    refine = TaskRefine(review_checklist=[])
+    dumped = refine.model_dump(exclude_unset=True)
+    assert dumped == {"review_checklist": []}
+
+
+def test_task_refine_rejects_too_many_review_checklist_items():
+    with pytest.raises(ValidationError):
+        TaskRefine(review_checklist=[f"x-{i}" for i in range(11)])
 
 
 def test_task_refine_accepts_acs_and_risks():
@@ -313,6 +351,7 @@ def test_task_view_defaults_for_structured_fields():
     view = TaskView(**_minimal_task_view_payload())
     assert view.work_type is None
     assert view.scope_in == []
+    assert view.review_checklist == []
     assert view.risks == []
     assert view.acceptance_criteria is None
     assert view.readiness_score is None
@@ -320,6 +359,13 @@ def test_task_view_defaults_for_structured_fields():
     assert view.ready_at is None
     assert view.started_at is None
     assert view.completed_at is None
+
+
+def test_task_view_accepts_review_checklist():
+    view = TaskView(
+        **_minimal_task_view_payload(review_checklist=["check A", "check B"])
+    )
+    assert view.review_checklist == ["check A", "check B"]
 
 
 def test_task_view_defaults_for_human_owner_reviewer():

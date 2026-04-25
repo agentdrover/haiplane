@@ -377,6 +377,7 @@ _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("constraint", "constraints"),
     ("assumption", "assumptions"),
     ("out_of_scope_review", "out_of_scope_for_review"),
+    ("review_check", "review_checklist"),
 )
 
 
@@ -986,6 +987,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="out_of_scope_review",
         action="append",
         help="Item to skip during code review (repeatable)",
+    )
+    p_refine.add_argument(
+        "--review-check",
+        dest="review_check",
+        action="append",
+        help="Reviewer checklist item — what to verify in diff (repeatable)",
     )
     p_refine.add_argument(
         "--owner",

@@ -820,6 +820,7 @@ async def hub_refine_task(
     constraints: list[str] | None = None,
     assumptions: list[str] | None = None,
     out_of_scope_for_review: list[str] | None = None,
+    review_checklist: list[str] | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
 ) -> str:
@@ -846,6 +847,7 @@ async def hub_refine_task(
         constraints: Hard constraints (REPLACES).
         assumptions: Assumptions made (REPLACES).
         out_of_scope_for_review: Things the reviewer should ignore (REPLACES).
+        review_checklist: Reviewer checklist — what to verify in diff (REPLACES).
         human_owner: Person who owns / is accountable for this task.
         human_reviewer: Person who will review and accept the result.
     """
@@ -867,6 +869,7 @@ async def hub_refine_task(
         ("constraints", constraints),
         ("assumptions", assumptions),
         ("out_of_scope_for_review", out_of_scope_for_review),
+        ("review_checklist", review_checklist),
         ("human_owner", human_owner),
         ("human_reviewer", human_reviewer),
     ):

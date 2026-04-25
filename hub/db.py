@@ -203,6 +203,10 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_human_reviewer_column",
         "ALTER TABLE tasks ADD COLUMN human_reviewer TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        "add_review_checklist_column",
+        "ALTER TABLE tasks ADD COLUMN review_checklist TEXT NOT NULL DEFAULT '[]'",
+    ),
 ]
 
 
@@ -267,6 +271,7 @@ LIST_STR_COLUMNS = frozenset(
         "assumptions",
         "validation_commands",
         "out_of_scope_for_review",
+        "review_checklist",
     }
 )
 
@@ -289,6 +294,7 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "assumptions",
     "validation_commands",
     "out_of_scope_for_review",
+    "review_checklist",
     "risks",
 )
 

@@ -115,6 +115,7 @@ async def _insert_full_task(db: aiosqlite.Connection, **overrides):
         assumptions=["sqlite stays default backend"],
         validation_commands=["uv run pytest -q"],
         out_of_scope_for_review=["docs"],
+        review_checklist=["check migration path", "verify rollback safety"],
         **overrides,
     )
     task_id = await repo.create_task_full(db, tc, status="draft")
@@ -136,6 +137,10 @@ async def test_create_task_full_persists_structured_fields(db: aiosqlite.Connect
     assert fields["affected_areas"] == ["hub/db.py"]
     assert fields["constraints"] == ["no breaking schema change"]
     assert fields["validation_commands"] == ["uv run pytest -q"]
+    assert fields["review_checklist"] == [
+        "check migration path",
+        "verify rollback safety",
+    ]
     assert fields["risks"] == []
     assert fields["readiness_score"] is None
     assert fields["dor_passed"] is None
@@ -239,6 +244,33 @@ async def test_update_task_structured_bumps_updated_at(
     assert final_row["updated_at"] == after_first, (
         "empty refine must not bump updated_at (no UPDATE issued)"
     )
+
+
+async def test_update_task_structured_review_checklist_patch_semantics(
+    db: aiosqlite.Connection,
+):
+    """Replace, omit-keeps, and explicit-clear semantics for review_checklist."""
+    task_id, _ = await _insert_full_task(db)
+
+    # Replace
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(review_checklist=["A", "B"])
+    )
+    await db.commit()
+    fields = structured_fields_from_row(await repo.get_task(db, task_id))
+    assert fields["review_checklist"] == ["A", "B"]
+
+    # Omitted -> untouched
+    await repo.update_task_structured(db, task_id, TaskRefine(size=TaskSize.S))
+    await db.commit()
+    fields = structured_fields_from_row(await repo.get_task(db, task_id))
+    assert fields["review_checklist"] == ["A", "B"]
+
+    # Explicit empty list -> cleared
+    await repo.update_task_structured(db, task_id, TaskRefine(review_checklist=[]))
+    await db.commit()
+    fields = structured_fields_from_row(await repo.get_task(db, task_id))
+    assert fields["review_checklist"] == []
 
 
 async def test_update_task_structured_writes_risks(db: aiosqlite.Connection):

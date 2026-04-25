@@ -187,6 +187,7 @@ class TaskCreate(BaseModel):
     assumptions: list[str] = Field(default_factory=list, max_length=10)
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
+    review_checklist: list[str] = Field(default_factory=list, max_length=10)
 
 
 class TaskApprove(BaseModel):
@@ -284,6 +285,7 @@ class TaskRefine(BaseModel):
     assumptions: list[str] | None = Field(default=None, max_length=10)
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
+    review_checklist: list[str] | None = Field(default=None, max_length=10)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     human_owner: str | None = Field(default=None, max_length=100)
@@ -434,6 +436,7 @@ class TaskView(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     validation_commands: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
+    review_checklist: list[str] = Field(default_factory=list)
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     readiness_score: int | None = None

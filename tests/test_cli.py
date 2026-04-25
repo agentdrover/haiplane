@@ -204,6 +204,7 @@ def _refine_args(**overrides) -> argparse.Namespace:
         "constraint": None,
         "assumption": None,
         "out_of_scope_review": None,
+        "review_check": None,
         "human_owner": None,
         "human_reviewer": None,
         "clear_acs": False,
@@ -274,6 +275,20 @@ def test_cmd_refine_with_owner_and_reviewer() -> None:
     payload = mock_api.call_args.args[2]
     assert payload["human_owner"] == "alice"
     assert payload["human_reviewer"] == "bob"
+
+
+def test_cmd_refine_review_check_repeatable_flag() -> None:
+    """--review-check is repeatable and lands as review_checklist list."""
+    args = _refine_args(review_check=["check migration", "verify rollback"])
+    mock_api = MagicMock(return_value={"updated_columns": ["review_checklist"]})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_refine(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/refine",
+        {"review_checklist": ["check migration", "verify rollback"]},
+    )
 
 
 def test_cmd_refine_clear_acs_sends_empty_list() -> None:

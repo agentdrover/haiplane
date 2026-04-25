@@ -304,7 +304,17 @@ MCP `hub_add_risk` сейчас делает read-modify-write через `/refi
 uv run pytest tests/test_api_refine.py tests/test_mcp_server.py tests/test_cli.py -q
 ```
 
-### 3.2. Review checklist field
+### 3.2. Review checklist field ✅ done (2026-04-25)
+
+**Итог**
+
+- Поле `review_checklist: list[str]` добавлено в `TaskCreate`, `TaskRefine` (PATCH-семантика: omit оставляет значение, `[]` явно очищает) и `TaskView` в `hub/models.py`.
+- `hub/db.py`: миграция `add_review_checklist_column` (TEXT NOT NULL DEFAULT '[]'), запись в `LIST_STR_COLUMNS` и `STRUCTURED_TASK_FIELDS`. Repository / lifecycle / refinement service не требовали явных правок — они автоматически подбирают новое поле через `structured_fields_to_db` / `structured_fields_from_row`.
+- CLI: `oc-hub refine --review-check "..."` (repeatable) через `_REFINE_LIST_FIELDS`.
+- MCP: `hub_refine_task(..., review_checklist=...)` форвардит поле только если оно не None.
+- Web: `hub/templates/task_detail.html` рендерит секцию `Review Checklist` только при непустом списке. UI создания задач не расширялся (минимальный паттерн).
+- DoR не менялся, `out_of_scope_for_review` остаётся независимым полем.
+- Тесты: `tests/test_models.py` (defaults / max_length / PATCH semantics), `tests/test_db_migrations.py` (column + default), `tests/test_repository_structured.py` (round-trip + replace/omit/clear), `tests/test_api_refine.py`, `tests/test_cli.py`, `tests/test_mcp_server.py`, `tests/test_web.py` (рендер при наличии и отсутствие при пустом списке). Полный `uv run pytest -q` — 390 passed.
 
 **Проблема**
 

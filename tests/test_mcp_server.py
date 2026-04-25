@@ -249,6 +249,22 @@ async def test_hub_refine_task_only_includes_provided_fields(
     )
 
 
+async def test_hub_refine_task_passes_review_checklist(
+    mock_api_post: AsyncMock,
+) -> None:
+    """review_checklist is forwarded as a list[str] body field; omission keeps key out."""
+    mock_api_post.return_value = {"updated_columns": ["review_checklist"]}
+    msg = await hub_refine_task(
+        42,
+        review_checklist=["check migration", "verify rollback"],
+    )
+    assert "Task #42 refined" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"review_checklist": ["check migration", "verify rollback"]},
+    )
+
+
 async def test_hub_refine_task_empty_payload_is_a_no_op(
     mock_api_post: AsyncMock,
 ) -> None:

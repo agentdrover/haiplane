@@ -30,6 +30,7 @@ STRUCTURED_TASK_COLUMNS = {
     "assumptions",
     "validation_commands",
     "out_of_scope_for_review",
+    "review_checklist",
     "risks",
     "readiness_score",
     "dor_passed",
@@ -81,6 +82,7 @@ async def test_structured_task_columns_present():
         ("assumptions", "'[]'"),
         ("validation_commands", "'[]'"),
         ("out_of_scope_for_review", "'[]'"),
+        ("review_checklist", "'[]'"),
         ("risks", "'[]'"),
     ],
 )

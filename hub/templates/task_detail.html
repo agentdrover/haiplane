@@ -97,6 +97,21 @@
     </div>
 </div>
 
+{% if task.review_checklist %}
+<section class="section">
+    <div class="section-header">
+        <h2 class="section-title">Review Checklist</h2>
+    </div>
+    <div class="card">
+        <ul class="u-pl-4">
+            {% for item in task.review_checklist %}
+            <li>{{ item }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+</section>
+{% endif %}
+
 {% if task.children %}
 <section class="section">
     <div class="section-header">

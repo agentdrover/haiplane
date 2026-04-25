@@ -92,6 +92,34 @@ async def test_task_detail_shows_owner_reviewer(client: AsyncClient):
     assert "bob" in resp.text
 
 
+async def test_task_detail_renders_review_checklist_when_present(
+    client: AsyncClient,
+):
+    create = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Detail with checklist",
+            "review_checklist": ["check migration path", "verify rollback safety"],
+        },
+    )
+    task_id = create.json()["id"]
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "Review Checklist" in resp.text
+    assert "check migration path" in resp.text
+    assert "verify rollback safety" in resp.text
+
+
+async def test_task_detail_omits_review_checklist_when_empty(
+    client: AsyncClient,
+):
+    create = await client.post("/api/tasks", json={"title": "Detail no checklist"})
+    task_id = create.json()["id"]
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "Review Checklist" not in resp.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",

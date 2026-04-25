@@ -173,6 +173,35 @@ async def test_refine_updates_human_owner_and_reviewer(client: AsyncClient):
     assert body2["human_reviewer"] == "bob"
 
 
+async def test_refine_review_checklist_replace_omit_clear(client: AsyncClient):
+    """PATCH semantics for review_checklist: replace, omit-keeps, []-clears."""
+    task = await _create_task(client)
+
+    # Replace
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"review_checklist": ["check migration", "verify rollback"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["review_checklist"] == ["check migration", "verify rollback"]
+
+    # Omitted -> untouched
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"size": "S"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["review_checklist"] == ["check migration", "verify rollback"]
+
+    # Explicit empty list -> cleared
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"review_checklist": []},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["review_checklist"] == []
+
+
 async def test_refine_unknown_task_returns_404(client: AsyncClient):
     resp = await client.post("/api/tasks/99999/refine", json={"size": "S"})
     assert resp.status_code == 404
