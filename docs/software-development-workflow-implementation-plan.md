@@ -264,7 +264,15 @@ uv run pytest -q
 
 ## Этап 3. Надежность параллельных агентов
 
-### 3.1. Dedicated risk endpoint
+### 3.1. Dedicated risk endpoint ✅ done (2026-04-25)
+
+**Итог**
+
+- Добавлен REST endpoint `POST /api/tasks/{task_id}/risks`, который принимает один `TaskRisk` и возвращает обновленный `TaskView`.
+- `hub.repository.append_task_risk` делает атомарный SQL append через `json_insert(... '$[#]' ...)`, без client-side read-modify-write.
+- `hub.services.refinement.add_risk` оборачивает append в SAVEPOINT и возвращает 404 для неизвестной задачи.
+- MCP `hub_add_risk` и CLI `oc-hub risk add` переведены на dedicated endpoint.
+- Тесты покрывают API success/404/422, CLI/MCP endpoint contract и repository append без замены существующих рисков.
 
 **Проблема**
 

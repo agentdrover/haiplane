@@ -33,6 +33,7 @@ from hub.models import (
     TaskRefine,
     TaskReject,
     TaskReorder,
+    TaskRisk,
     TaskSource,
     TaskStart,
     TaskTreeNode,
@@ -452,6 +453,25 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, 422) from exc
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    task_view = services.row_to_task(row, updates=updates)
+    return await services.enrich_task_view(db, task_view)
+
+
+@app.post(
+    "/api/tasks/{task_id}/risks",
+    response_model=TaskView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def api_add_risk(task_id: int, body: TaskRisk, request: Request):
+    """Atomically append one risk without replacing the existing risk list."""
+    db = _db(request)
+    try:
+        await services.add_risk(db, task_id, body)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)

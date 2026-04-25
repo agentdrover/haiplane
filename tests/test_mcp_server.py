@@ -346,12 +346,10 @@ async def test_hub_delete_acceptance_criterion_url_encodes_id(
     )
 
 
-async def test_hub_add_risk_appends_to_existing(
-    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+async def test_hub_add_risk_uses_dedicated_endpoint(
+    mock_api_post: AsyncMock,
 ) -> None:
-    """`hub_add_risk` is read-modify-write through /refine — existing
-    risks must be preserved, the new one appended."""
-    mock_api_get.return_value = {
+    mock_api_post.return_value = {
         "id": 7,
         "risks": [
             {
@@ -359,10 +357,15 @@ async def test_hub_add_risk_appends_to_existing(
                 "severity": "low",
                 "description": "x",
                 "mitigation": "y",
-            }
+            },
+            {
+                "kind": "performance",
+                "severity": "medium",
+                "description": "slow loop",
+                "mitigation": "add index",
+            },
         ],
     }
-    mock_api_post.return_value = {"updated_columns": ["risks"]}
     msg = await hub_add_risk(
         task_id=7,
         kind="performance",
@@ -372,24 +375,13 @@ async def test_hub_add_risk_appends_to_existing(
     )
     assert "performance:medium" in msg
     assert "total: 2" in msg
-    mock_api_get.assert_awaited_once_with("/api/tasks/7")
     mock_api_post.assert_awaited_once_with(
-        "/api/tasks/7/refine",
+        "/api/tasks/7/risks",
         {
-            "risks": [
-                {
-                    "kind": "security",
-                    "severity": "low",
-                    "description": "x",
-                    "mitigation": "y",
-                },
-                {
-                    "kind": "performance",
-                    "severity": "medium",
-                    "description": "slow loop",
-                    "mitigation": "add index",
-                },
-            ]
+            "kind": "performance",
+            "severity": "medium",
+            "description": "slow loop",
+            "mitigation": "add index",
         },
     )
 

@@ -398,20 +398,7 @@ def test_cmd_ac_replace_rejects_non_array(tmp_path: Path) -> None:
     assert "must contain a JSON/YAML array" in err.getvalue()
 
 
-def test_cmd_risk_add_appends_to_existing() -> None:
-    """`risk add` is read-modify-write through /refine: existing risks
-    must be preserved, the new one appended."""
-    existing = {
-        "id": 7,
-        "risks": [
-            {
-                "kind": "security",
-                "severity": "low",
-                "description": "x",
-                "mitigation": "y",
-            }
-        ],
-    }
+def test_cmd_risk_add_uses_dedicated_endpoint() -> None:
     args = argparse.Namespace(
         task_id=7,
         kind="performance",
@@ -420,31 +407,22 @@ def test_cmd_risk_add_appends_to_existing() -> None:
         mitigation="add index",
     )
 
-    def fake_api(method: str, path: str, body=None):
-        if method == "GET":
-            assert path == "/api/tasks/7"
-            return existing
-        assert method == "POST" and path == "/api/tasks/7/refine"
-        # Server-side semantics: full replacement of the risks list.
-        assert body == {
-            "risks": [
-                existing["risks"][0],
-                {
-                    "kind": "performance",
-                    "severity": "medium",
-                    "description": "slow loop",
-                    "mitigation": "add index",
-                },
-            ]
-        }
-        return {"updated_columns": ["risks"]}
-
     with (
-        patch.object(cli, "_api", side_effect=fake_api),
+        patch.object(cli, "_api", return_value={"id": 7, "risks": []}) as mock_api,
         patch("sys.stdout", new=StringIO()),
     ):
         rc = cli.cmd_risk_add(args)
     assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/7/risks",
+        {
+            "kind": "performance",
+            "severity": "medium",
+            "description": "slow loop",
+            "mitigation": "add index",
+        },
+    )
 
 
 def test_cmd_readiness_human_summary_includes_score_and_missing() -> None:

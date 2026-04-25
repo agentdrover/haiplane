@@ -966,12 +966,7 @@ async def hub_add_risk(
     description: str,
     mitigation: str,
 ) -> str:
-    """Append a risk to a task.
-
-    Implementation note: TaskRefine.risks fully REPLACES the list, so we
-    read-modify-write through /refine. There's a benign race window if
-    two callers add risks concurrently — last writer wins. A dedicated
-    POST endpoint would close it; revisit if it becomes a real problem.
+    """Append a risk to a task through the atomic dedicated endpoint.
 
     Args:
         task_id: Target task.
@@ -982,18 +977,18 @@ async def hub_add_risk(
         description: One-line risk description.
         mitigation: How we plan to handle / reduce it.
     """
-    task = await _api_get(f"/api/tasks/{task_id}")
-    current = list(task.get("risks") or [])
-    current.append(
+    result = await _api_post(
+        f"/api/tasks/{task_id}/risks",
         {
             "kind": kind,
             "severity": severity,
             "description": description,
             "mitigation": mitigation,
-        }
+        },
     )
-    await _api_post(f"/api/tasks/{task_id}/refine", {"risks": current})
-    return f"Risk '{kind}:{severity}' added to task #{task_id} (total: {len(current)})"
+    total = len(result.get("risks") or []) if isinstance(result, dict) else 0
+    suffix = f" (total: {total})" if total else ""
+    return f"Risk '{kind}:{severity}' added to task #{task_id}{suffix}"
 
 
 @mcp.tool()

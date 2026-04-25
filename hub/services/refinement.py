@@ -20,6 +20,7 @@ from hub.models import (
     AcceptanceCriterion,
     ReadinessReport,
     TaskRefine,
+    TaskRisk,
 )
 from hub.services.recommendations import calculate_readiness_with_recommendations
 
@@ -119,6 +120,19 @@ async def refine_task(
                 raise DuplicateAcceptanceCriterionError(str(exc)) from exc
 
     return {"updated_columns": updated_columns, "ac_count": ac_count}
+
+
+async def add_risk(
+    db: aiosqlite.Connection,
+    task_id: int,
+    risk: TaskRisk,
+) -> None:
+    """Append one risk atomically without replacing the existing list."""
+    await _ensure_task_exists(db, task_id)
+    async with _atomic(db, "add_risk"):
+        updated = await repo.append_task_risk(db, task_id, risk)
+        if not updated:
+            raise TaskNotFoundError(f"task {task_id} not found")
 
 
 # ---------------------------------------------------------------------------

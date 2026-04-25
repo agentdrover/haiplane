@@ -7,6 +7,7 @@ No Pydantic models, no business logic.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import aiosqlite
@@ -329,6 +330,28 @@ async def update_task_structured(
         return {}
     await update_task(db, task_id, **updates)
     return updates
+
+
+async def append_task_risk(
+    db: aiosqlite.Connection,
+    task_id: int,
+    risk: Any,
+) -> bool:
+    """Atomically append one TaskRisk payload to the JSON risks column.
+
+    This intentionally avoids the old read-modify-write pattern used by
+    clients through ``/refine``. SQLite's JSON append happens inside one
+    UPDATE statement, so concurrent callers do not overwrite each other.
+    """
+    payload = risk.model_dump(mode="json")
+    cur = await db.execute(
+        "UPDATE tasks "
+        "SET risks=json_insert(risks, '$[#]', json(?)), "
+        "updated_at=datetime('now') "
+        "WHERE id=?",
+        (json.dumps(payload, ensure_ascii=False), task_id),
+    )
+    return (cur.rowcount or 0) > 0
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,66 @@ async def test_refine_invalid_enum_returns_422(client: AsyncClient):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/tasks/{id}/risks
+# ---------------------------------------------------------------------------
+
+
+async def test_add_risk_appends_without_replacing_existing(client: AsyncClient):
+    task = await _create_task(client)
+    first = await client.post(
+        f"/api/tasks/{task['id']}/risks",
+        json={
+            "kind": "security",
+            "severity": "low",
+            "description": "first risk",
+            "mitigation": "watch logs",
+        },
+    )
+    assert first.status_code == 201, first.text
+
+    second = await client.post(
+        f"/api/tasks/{task['id']}/risks",
+        json={
+            "kind": "performance",
+            "severity": "medium",
+            "description": "slow loop",
+            "mitigation": "add index",
+        },
+    )
+    assert second.status_code == 201, second.text
+    body = second.json()
+    assert [r["kind"] for r in body["risks"]] == ["security", "performance"]
+    assert body["risks"][1]["mitigation"] == "add index"
+
+
+async def test_add_risk_unknown_task_returns_404(client: AsyncClient):
+    resp = await client.post(
+        "/api/tasks/99999/risks",
+        json={
+            "kind": "security",
+            "severity": "high",
+            "description": "unknown task",
+            "mitigation": "create task first",
+        },
+    )
+    assert resp.status_code == 404
+
+
+async def test_add_risk_invalid_payload_returns_422(client: AsyncClient):
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/risks",
+        json={
+            "kind": "security",
+            "severity": "invalid",
+            "description": "bad severity",
+            "mitigation": "fix payload",
+        },
+    )
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # CRUD: /api/tasks/{id}/acceptance_criteria
 # ---------------------------------------------------------------------------
 

@@ -261,6 +261,43 @@ async def test_update_task_structured_writes_risks(db: aiosqlite.Connection):
     assert fields["risks"][0]["kind"] == "large_scope"
 
 
+async def test_append_task_risk_preserves_existing_risks(db: aiosqlite.Connection):
+    task_id, _ = await _insert_full_task(db)
+    first = TaskRisk(
+        kind=RiskKind.security,
+        severity=RiskSeverity.low,
+        description="first",
+        mitigation="watch logs",
+    )
+    second = TaskRisk(
+        kind=RiskKind.performance,
+        severity=RiskSeverity.medium,
+        description="second",
+        mitigation="add index",
+    )
+
+    assert await repo.append_task_risk(db, task_id, first) is True
+    assert await repo.append_task_risk(db, task_id, second) is True
+    await db.commit()
+
+    row = await repo.get_task(db, task_id)
+    fields = structured_fields_from_row(row)
+    assert [risk["kind"] for risk in fields["risks"]] == ["security", "performance"]
+    assert fields["risks"][1]["mitigation"] == "add index"
+
+
+async def test_append_task_risk_unknown_task_returns_false(
+    db: aiosqlite.Connection,
+):
+    risk = TaskRisk(
+        kind=RiskKind.security,
+        severity=RiskSeverity.high,
+        description="unknown",
+        mitigation="create task first",
+    )
+    assert await repo.append_task_risk(db, 99999, risk) is False
+
+
 # --- AC CRUD ---
 
 

@@ -511,23 +511,14 @@ def cmd_risk_list(args: argparse.Namespace) -> int:
 
 
 def cmd_risk_add(args: argparse.Namespace) -> int:
-    """Append a risk via PATCH /refine.
-
-    TaskRefine.risks fully REPLACES the list, so we read-modify-write.
-    There's a benign race window between GET and PATCH, but the CLI is
-    interactive and the alternative (a dedicated endpoint) belongs to
-    a future iteration.
-    """
-    task = _api("GET", f"/api/tasks/{args.task_id}")
-    current = list(task.get("risks") or [])
-    new_risk: dict[str, Any] = {
+    """Append a risk through the atomic dedicated endpoint."""
+    body: dict[str, Any] = {
         "kind": args.kind,
         "severity": args.severity,
         "description": args.description,
         "mitigation": args.mitigation,
     }
-    current.append(new_risk)
-    result = _api("POST", f"/api/tasks/{args.task_id}/refine", {"risks": current})
+    result = _api("POST", f"/api/tasks/{args.task_id}/risks", body)
     _print_json(result)
     return 0
 
@@ -1069,7 +1060,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_risk_add = risk_sub.add_parser(
         "add",
-        help="Append a risk to a task (read-modify-write via /refine)",
+        help="Append a risk to a task atomically",
     )
     p_risk_add.add_argument("task_id", type=int)
     p_risk_add.add_argument(
