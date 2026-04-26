@@ -6,14 +6,15 @@
 с правами `sudo`.
 
 > Принципы работы агента:
+>
 > 1. **Идемпотентность.** Каждый шаг проверяет текущее состояние перед изменением.
 > 2. **Подтверждение деструктивных операций.** Удаление БД, перезапись конфигов,
->    `rm -rf`, изменение DNS, ротация секретов — только после явного подтверждения
+>   `rm -rf`, изменение DNS, ротация секретов — только после явного подтверждения
 >    оператора.
 > 3. **Аудит.** Все выполненные команды и их вывод сохраняются в журнал
->    `/var/log/openclaw-hub/deploy.log`.
+>   `/var/log/openclaw-hub/deploy.log`.
 > 4. **Секреты не печатать в чат.** Токены, пароли, приватные ключи — только в
->    переменные окружения и файлы с правами `0600`.
+>   переменные окружения и файлы с правами `0600`.
 
 ---
 
@@ -21,18 +22,20 @@
 
 Перед началом агент должен запросить у оператора и зафиксировать:
 
-| Параметр | Пример | Обязательность |
-|---|---|---|
-| `DEPLOY_HOST` | `hub.example.com` | да |
-| `DEPLOY_USER` | `deploy` (sudoer) | да |
-| `SSH_KEY_PATH` | `~/.ssh/id_ed25519_hub` | да |
-| `DOMAIN` | `hub.example.com` | да (для TLS) |
-| `ADMIN_EMAIL` | `ops@example.com` | да (для Let's Encrypt) |
-| `GITHUB_REPO` | `mrPDA/openclaw-hub` | да |
-| `OPENCLAW_HUB_REPO` | `owner/managed-repo` | опционально |
-| `GH_TOKEN` | `ghp_…` | если используется GitHub-интеграция |
-| `INITIAL_ADMIN_LOGIN` | `admin` | да |
-| `INITIAL_ADMIN_PASSWORD` | сгенерировать через `openssl rand -base64 24` | да |
+
+| Параметр                 | Пример                                        | Обязательность                      |
+| ------------------------ | --------------------------------------------- | ----------------------------------- |
+| `DEPLOY_HOST`            | `hub.example.com`                             | да                                  |
+| `DEPLOY_USER`            | `deploy` (sudoer)                             | да                                  |
+| `SSH_KEY_PATH`           | `~/.ssh/id_ed25519_hub`                       | да                                  |
+| `DOMAIN`                 | `hub.example.com`                             | да (для TLS)                        |
+| `ADMIN_EMAIL`            | `ops@example.com`                             | да (для Let's Encrypt)              |
+| `GITHUB_REPO`            | `mrPDA/openclaw-hub`                          | да                                  |
+| `OPENCLAW_HUB_REPO`      | `owner/managed-repo`                          | опционально                         |
+| `GH_TOKEN`               | `ghp_…`                                       | если используется GitHub-интеграция |
+| `INITIAL_ADMIN_LOGIN`    | `admin`                                       | да                                  |
+| `INITIAL_ADMIN_PASSWORD` | сгенерировать через `openssl rand -base64 24` | да                                  |
+
 
 Если хотя бы один обязательный параметр отсутствует — агент **останавливается**
 и запрашивает значение у оператора.
@@ -47,6 +50,7 @@ ssh -i "$SSH_KEY_PATH" -o BatchMode=yes -o ConnectTimeout=10 \
 ```
 
 Критерии успеха:
+
 - Код возврата `0`.
 - Вывод содержит `ok`.
 - `id` показывает членство в группе `sudo` либо `wheel`.
@@ -311,11 +315,13 @@ sudo ufw status verbose
 После старта сервиса агент создаёт администратора через bootstrap-токен.
 
 ```bash
-# С локального хоста (на сервере) — токен берётся из env-файла
-curl -fsS -X POST https://$DOMAIN/api/admin/bootstrap \
-    -H "X-Bootstrap-Token: $BOOTSTRAP" \
+# С локального хоста (на сервере). Токен из env: заголовок Authorization: Bearer
+# (не X-Bootstrap-Token). В теле JSON поле username, не login. Пароль должен
+# удовлетворять правилам сложности в hub/models.py (в т.ч. спецсимвол).
+curl -fsS -X POST "https://${DOMAIN}/api/admin/bootstrap" \
+    -H "Authorization: Bearer ${BOOTSTRAP}" \
     -H "Content-Type: application/json" \
-    -d "{\"login\":\"$INITIAL_ADMIN_LOGIN\",\"password\":\"$INITIAL_ADMIN_PASSWORD\"}"
+    -d "{\"username\":\"${INITIAL_ADMIN_LOGIN}\",\"password\":\"${INITIAL_ADMIN_PASSWORD}\"}"
 ```
 
 > Если эндпойнт отличается — агент сверяется с `hub/services/admin.py` и
@@ -324,10 +330,10 @@ curl -fsS -X POST https://$DOMAIN/api/admin/bootstrap \
 После успешного ответа:
 
 1. Закомментировать `OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN` в
-   `/etc/openclaw-hub/openclaw-hub.env`.
+  `/etc/openclaw-hub/openclaw-hub.env`.
 2. Перезапустить сервис: `sudo systemctl restart openclaw-hub`.
 3. Передать оператору учётные данные администратора по защищённому каналу
-   (1Password / Bitwarden / Vaultwarden) — **не в чат**.
+  (1Password / Bitwarden / Vaultwarden) — **не в чат**.
 
 ---
 
@@ -407,18 +413,18 @@ sudo journalctl -u openclaw-hub -f --since '1 min ago'
 
 Агент отчитывается оператору в виде заполненного чеклиста:
 
-- [ ] SSH-доступ проверен.
-- [ ] Системные пакеты установлены, Python ≥ 3.11.
-- [ ] Пользователь `openclaw` и каталоги созданы с правильными правами.
-- [ ] Код выкачен на тег `<TAG>`, venv собран.
-- [ ] Файлы `/etc/openclaw-hub/*.env` созданы, права `0640/0600`.
-- [ ] systemd-юнит установлен, сервис активен, рестартует автоматически.
-- [ ] nginx + Let's Encrypt настроены, HTTPS отвечает 200/301.
-- [ ] UFW активен, наружу открыты только 22/80/443.
-- [ ] Первый администратор создан, bootstrap-токен отозван.
-- [ ] Cron-бэкап работает, тестовое восстановление выполнено.
-- [ ] Smoke-тесты пройдены, логи без ошибок.
-- [ ] Учётные данные переданы оператору через защищённый канал.
+- SSH-доступ проверен.
+- Системные пакеты установлены, Python ≥ 3.11.
+- Пользователь `openclaw` и каталоги созданы с правильными правами.
+- Код выкачен на тег `<TAG>`, venv собран.
+- Файлы `/etc/openclaw-hub/*.env` созданы, права `0640/0600`.
+- systemd-юнит установлен, сервис активен, рестартует автоматически.
+- nginx + Let's Encrypt настроены, HTTPS отвечает 200/301.
+- UFW активен, наружу открыты только 22/80/443.
+- Первый администратор создан, bootstrap-токен отозван.
+- Cron-бэкап работает, тестовое восстановление выполнено.
+- Smoke-тесты пройдены, логи без ошибок.
+- Учётные данные переданы оператору через защищённый канал.
 
 ---
 
@@ -427,9 +433,9 @@ sudo journalctl -u openclaw-hub -f --since '1 min ago'
 - Удалять `/var/lib/openclaw-hub/hub.db` или каталог бэкапов.
 - Запускать `git reset --hard`, `git clean -fdx` в `/opt/openclaw-hub/src`.
 - Открывать порт `8080` наружу или менять `OPENCLAW_HUB_HOST` на `0.0.0.0`
-  без TLS-прокси.
+без TLS-прокси.
 - Отключать аутентификацию (`OPENCLAW_HUB_AUTH_DISABLED=1`,
-  `OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`).
+`OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`).
 - Менять DNS-записи или ротацию TLS-сертификата.
 - Передавать секреты в чат или в публичные репозитории.
 
