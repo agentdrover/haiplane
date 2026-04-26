@@ -3,6 +3,22 @@
 {% block title %}Audit Log — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>Audit Log</h1>
+
+<div class="admin-filter-bar">
+    <form method="get" action="/admin/audit" class="admin-filter-form">
+        <select name="action">
+            <option value="">All actions</option>
+            {% for a in all_actions %}
+            <option value="{{ a }}" {% if filter_action == a %}selected{% endif %}>{{ a }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="admin-btn">Filter</button>
+        {% if filter_action %}
+        <a href="/admin/audit" class="admin-btn">Clear</a>
+        {% endif %}
+    </form>
+</div>
+
 <table class="admin-table">
     <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Summary</th></tr></thead>
     <tbody>
@@ -10,14 +26,24 @@
     <tr>
         <td>{{ e.created_at }}</td>
         <td>{{ e.actor_username or '—' }}</td>
-        <td>{{ e.action }}</td>
-        <td>{{ e.target_type }} {{ e.target_id }}</td>
+        <td><code>{{ e.action }}</code></td>
+        <td>{{ e.target_type }}{% if e.target_id %} #{{ e.target_id }}{% endif %}</td>
         <td>{{ e.summary }}</td>
     </tr>
     {% endfor %}
     </tbody>
 </table>
 {% if not entries %}
-<p>No audit entries.</p>
+<p>No audit entries{% if filter_action %} matching "{{ filter_action }}"{% endif %}.</p>
 {% endif %}
+
+<div class="admin-pagination">
+    {% if page > 1 %}
+    <a href="/admin/audit?page={{ page - 1 }}{% if filter_action %}&action={{ filter_action }}{% endif %}" class="admin-btn">Previous</a>
+    {% endif %}
+    <span class="admin-page-info">Page {{ page }}</span>
+    {% if has_next %}
+    <a href="/admin/audit?page={{ page + 1 }}{% if filter_action %}&action={{ filter_action }}{% endif %}" class="admin-btn">Next</a>
+    {% endif %}
+</div>
 {% endblock %}

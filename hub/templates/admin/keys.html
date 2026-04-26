@@ -3,8 +3,58 @@
 {% block title %}API Keys — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>API Keys</h1>
+
+<details class="admin-form-wrap">
+    <summary>Create API Key</summary>
+    <form class="admin-form"
+          hx-post="/admin/keys/create"
+          hx-target="#key-reveal-area" hx-swap="innerHTML">
+        <div>
+            <label for="ck-principal">Owner</label>
+            <select id="ck-principal" name="principal_id" required>
+                {% for p in principals %}
+                <option value="{{ p.id }}">{{ p.username }} ({{ p.kind }})</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label for="ck-name">Key Name</label>
+            <input id="ck-name" name="name" type="text" required placeholder="my-api-key">
+        </div>
+        <div>
+            <label for="ck-expires">Expires (days, 0 = never)</label>
+            <input id="ck-expires" name="expires_days" type="number" value="0" min="0">
+        </div>
+        <div class="admin-form-actions">
+            <button type="submit" class="admin-btn admin-btn-primary">Create Key</button>
+        </div>
+    </form>
+</details>
+
+<div id="key-reveal-area"></div>
+
+<div class="admin-filter-bar">
+    <form method="get" action="/admin/keys" class="admin-filter-form">
+        <select name="status">
+            <option value="">All statuses</option>
+            <option value="active" {% if filter_status == 'active' %}selected{% endif %}>Active</option>
+            <option value="revoked" {% if filter_status == 'revoked' %}selected{% endif %}>Revoked</option>
+        </select>
+        <select name="owner">
+            <option value="">All owners</option>
+            {% for p in principals %}
+            <option value="{{ p.id }}" {% if filter_owner == p.id|string %}selected{% endif %}>{{ p.username }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="admin-btn">Filter</button>
+        {% if filter_status or filter_owner %}
+        <a href="/admin/keys" class="admin-btn">Clear</a>
+        {% endif %}
+    </form>
+</div>
+
 <table class="admin-table" id="keys-table">
-    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Expires</th><th>Last Used</th><th>Revoked</th><th>Actions</th></tr></thead>
+    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Expires</th><th>Last Used</th><th>Status</th><th>Actions</th></tr></thead>
     <tbody>
     {% for k in keys %}
     <tr id="key-row-{{ k.id }}" class="{% if k.revoked_at %}row-revoked{% endif %}">
@@ -12,17 +62,21 @@
         <td>{{ pid_to_name.get(k.principal_id, '?') }}</td>
         <td>{{ k.name }}</td>
         <td><code>{{ k.key_prefix }}…</code></td>
-        <td>{{ k.expires_at or '—' }}</td>
+        <td>{{ k.expires_at or 'Never' }}</td>
         <td>{{ k.last_used_at or '—' }}</td>
-        <td>{{ k.revoked_at or '—' }}</td>
+        <td>
+            {% if k.revoked_at %}
+            <span class="badge badge-disabled">Revoked</span>
+            {% else %}
+            <span class="badge badge-active">Active</span>
+            {% endif %}
+        </td>
         <td class="admin-actions">
             {% if not k.revoked_at %}
             <button class="admin-btn admin-btn-danger"
                     hx-post="/admin/keys/{{ k.id }}/revoke"
                     hx-target="#keys-table" hx-select="#keys-table" hx-swap="outerHTML"
                     hx-confirm="Are you sure you want to revoke this key?">Revoke</button>
-            {% else %}
-            <span style="color: var(--text-muted); font-size: 11px;">Revoked</span>
             {% endif %}
         </td>
     </tr>

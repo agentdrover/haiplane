@@ -9,10 +9,6 @@
         <div class="stat-label">Active Users</div>
     </div>
     <div class="stat-card">
-        <div class="stat-value">{{ summary.disabled_users }}</div>
-        <div class="stat-label">Disabled Users</div>
-    </div>
-    <div class="stat-card">
         <div class="stat-value">{{ summary.active_agents }}</div>
         <div class="stat-label">Active Agents</div>
     </div>
@@ -24,16 +20,31 @@
         <div class="stat-value">{{ summary.active_sessions }}</div>
         <div class="stat-label">Active Sessions</div>
     </div>
-    <div class="stat-card">
+    {% if summary.expiring_keys_7d %}
+    <div class="stat-card stat-card-warn">
+        <div class="stat-value">{{ summary.expiring_keys_7d }}</div>
+        <div class="stat-label">Keys Expiring (7d)</div>
+    </div>
+    {% endif %}
+    {% if summary.locked_users %}
+    <div class="stat-card stat-card-warn">
         <div class="stat-value">{{ summary.locked_users }}</div>
         <div class="stat-label">Locked Users</div>
     </div>
+    {% endif %}
+    {% if summary.disabled_users %}
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.disabled_users }}</div>
+        <div class="stat-label">Disabled Users</div>
+    </div>
+    {% endif %}
 </div>
 
 <div class="admin-quick-actions">
     <a href="/admin/users" class="admin-btn admin-btn-primary">Create User</a>
     <a href="/admin/agents" class="admin-btn admin-btn-primary">Create Agent</a>
     <a href="/admin/keys" class="admin-btn">Manage API Keys</a>
+    <a href="/admin/audit" class="admin-btn">View Audit Log</a>
 </div>
 
 {% if summary.admin_bootstrap_required %}
@@ -52,7 +63,7 @@
     <tr>
         <td>{{ e.created_at }}</td>
         <td>{{ e.actor_username or '—' }}</td>
-        <td>{{ e.action }}</td>
+        <td><code>{{ e.action }}</code></td>
         <td>{{ e.summary }}</td>
     </tr>
     {% endfor %}

@@ -23,7 +23,7 @@
         </div>
         <div>
             <label for="cu-password">Password</label>
-            <input id="cu-password" name="password" type="password" required minlength="8" placeholder="Min 8 chars">
+            <input id="cu-password" name="password" type="password" required minlength="8" placeholder="Letter + digit + special">
         </div>
         <div>
             <label for="cu-role">Role</label>
@@ -70,6 +70,26 @@
                     hx-post="/admin/users/{{ p.id }}/reset-password"
                     hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML"
                     hx-prompt="Enter new password (min 8 chars, letter + digit + special):">Reset Password</button>
+            <button class="admin-btn" onclick="document.getElementById('roles-form-{{ p.id }}').toggleAttribute('open')">Edit Roles</button>
+        </td>
+    </tr>
+    <tr id="roles-row-{{ p.id }}">
+        <td colspan="8">
+            <details id="roles-form-{{ p.id }}">
+                <summary class="sr-only">Edit roles</summary>
+                <form class="admin-roles-inline"
+                      hx-post="/admin/users/{{ p.id }}/edit-roles"
+                      hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">
+                    {% for r in roles %}
+                    <label class="admin-checkbox">
+                        <input type="checkbox" name="roles" value="{{ r.slug }}"
+                               {% if r.slug in p.roles %}checked{% endif %}>
+                        {{ r.name }}
+                    </label>
+                    {% endfor %}
+                    <button type="submit" class="admin-btn admin-btn-primary">Save Roles</button>
+                </form>
+            </details>
         </td>
     </tr>
     {% endfor %}

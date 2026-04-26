@@ -606,14 +606,35 @@ def _require_admin_web(request: Request) -> None:
         raise HTTPException(403, "admin access required")
 
 
+async def _admin_nav_counts(db) -> dict[str, int]:
+    from hub.services import admin as admin_svc
+
+    summary = await admin_svc.admin_summary(db)
+    return {
+        "nav_users": summary["active_users"],
+        "nav_agents": summary["active_agents"],
+        "nav_keys": summary["active_api_keys"],
+    }
+
+
+def _nav_from_summary(summary: dict) -> dict[str, int]:
+    return {
+        "nav_users": summary["active_users"],
+        "nav_agents": summary["active_agents"],
+        "nav_keys": summary["active_api_keys"],
+    }
+
+
 @router.get("/admin", response_class=HTMLResponse)
 async def web_admin_summary(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    summary = await admin_svc.admin_summary(_db(request))
+    db = _db(request)
+    summary = await admin_svc.admin_summary(db)
+    nav = _nav_from_summary(summary)
     return TEMPLATES.TemplateResponse(
-        request, "admin/summary.html", {"summary": summary, "active": "admin"}
+        request, "admin/summary.html", {"summary": summary, "active": "admin", **nav}
     )
 
 
@@ -622,12 +643,14 @@ async def web_admin_users(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    principals = await admin_svc.list_principals(_db(request), kind="human")
-    roles = await admin_svc.list_roles(_db(request))
+    db = _db(request)
+    principals = await admin_svc.list_principals(db, kind="human")
+    roles = await admin_svc.list_roles(db)
+    nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
         request,
         "admin/users.html",
-        {"principals": principals, "roles": roles, "active": "admin"},
+        {"principals": principals, "roles": roles, "active": "admin", **nav},
     )
 
 
@@ -636,9 +659,13 @@ async def web_admin_agents(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    principals = await admin_svc.list_principals(_db(request), kind="agent")
+    db = _db(request)
+    principals = await admin_svc.list_principals(db, kind="agent")
+    nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
-        request, "admin/agents.html", {"principals": principals, "active": "admin"}
+        request,
+        "admin/agents.html",
+        {"principals": principals, "active": "admin", **nav},
     )
 
 
@@ -647,9 +674,11 @@ async def web_admin_roles(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    roles = await admin_svc.list_roles(_db(request))
+    db = _db(request)
+    roles = await admin_svc.list_roles(db)
+    nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
-        request, "admin/roles.html", {"roles": roles, "active": "admin"}
+        request, "admin/roles.html", {"roles": roles, "active": "admin", **nav}
     )
 
 
@@ -658,13 +687,39 @@ async def web_admin_keys(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    keys = await admin_svc.list_api_keys(_db(request))
-    principals = await admin_svc.list_principals(_db(request))
+    db = _db(request)
+    filter_status = request.query_params.get("status", "")
+    filter_owner = request.query_params.get("owner", "")
+
+    keys = await admin_svc.list_api_keys(db)
+    principals = await admin_svc.list_principals(db)
     pid_to_name = {p["id"]: p["username"] for p in principals}
+
+    if filter_status == "active":
+        keys = [k for k in keys if not k.get("revoked_at")]
+    elif filter_status == "revoked":
+        keys = [k for k in keys if k.get("revoked_at")]
+
+    if filter_owner:
+        try:
+            owner_id = int(filter_owner)
+            keys = [k for k in keys if k["principal_id"] == owner_id]
+        except ValueError:
+            pass
+
+    nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
         request,
         "admin/keys.html",
-        {"keys": keys, "pid_to_name": pid_to_name, "active": "admin"},
+        {
+            "keys": keys,
+            "pid_to_name": pid_to_name,
+            "principals": principals,
+            "filter_status": filter_status,
+            "filter_owner": filter_owner,
+            "active": "admin",
+            **nav,
+        },
     )
 
 
@@ -673,9 +728,36 @@ async def web_admin_audit(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
-    entries = await admin_svc.list_audit(_db(request), limit=100)
+    db = _db(request)
+    page = int(request.query_params.get("page", "1"))
+    per_page = 50
+    offset = (page - 1) * per_page
+    filter_action = request.query_params.get("action", "")
+
+    entries = await admin_svc.list_audit(db, limit=per_page + 1, offset=offset)
+    has_next = len(entries) > per_page
+    entries = entries[:per_page]
+
+    if filter_action:
+        entries = [e for e in entries if e.get("action") == filter_action]
+
+    all_actions = sorted(
+        {e.get("action", "") for e in await admin_svc.list_audit(db, limit=500)}
+    )
+
+    nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
-        request, "admin/audit.html", {"entries": entries, "active": "admin"}
+        request,
+        "admin/audit.html",
+        {
+            "entries": entries,
+            "page": page,
+            "has_next": has_next,
+            "filter_action": filter_action,
+            "all_actions": all_actions,
+            "active": "admin",
+            **nav,
+        },
     )
 
 
@@ -708,10 +790,11 @@ async def _render_users_page(
     db = _db(request)
     principals = await admin_svc.list_principals(db, kind="human")
     roles = await admin_svc.list_roles(db)
+    nav = await _admin_nav_counts(db)
     resp = TEMPLATES.TemplateResponse(
         request,
         "admin/users.html",
-        {"principals": principals, "roles": roles, "active": "admin"},
+        {"principals": principals, "roles": roles, "active": "admin", **nav},
     )
     if flash_msg:
         resp.headers.update(_flash_headers(flash_msg, flash_level))
@@ -727,10 +810,11 @@ async def _render_agents_page(
 
     db = _db(request)
     principals = await admin_svc.list_principals(db, kind="agent")
+    nav = await _admin_nav_counts(db)
     resp = TEMPLATES.TemplateResponse(
         request,
         "admin/agents.html",
-        {"principals": principals, "active": "admin"},
+        {"principals": principals, "active": "admin", **nav},
     )
     if flash_msg:
         resp.headers.update(_flash_headers(flash_msg, flash_level))
@@ -748,10 +832,19 @@ async def _render_keys_page(
     keys = await admin_svc.list_api_keys(db)
     all_principals = await admin_svc.list_principals(db)
     pid_to_name = {p["id"]: p["username"] for p in all_principals}
+    nav = await _admin_nav_counts(db)
     resp = TEMPLATES.TemplateResponse(
         request,
         "admin/keys.html",
-        {"keys": keys, "pid_to_name": pid_to_name, "active": "admin"},
+        {
+            "keys": keys,
+            "pid_to_name": pid_to_name,
+            "principals": all_principals,
+            "filter_status": "",
+            "filter_owner": "",
+            "active": "admin",
+            **nav,
+        },
     )
     if flash_msg:
         resp.headers.update(_flash_headers(flash_msg, flash_level))
@@ -867,11 +960,23 @@ async def web_admin_reset_password(principal_id: int, request: Request):
 
     db = _db(request)
     actor_id = _admin_actor_id(request)
+    import re
+
     new_password = request.headers.get("HX-Prompt", "").strip()
     if not new_password or len(new_password) < 8:
         return await _render_users_page(
             request,
             flash_msg="Password must be at least 8 characters",
+            flash_level="error",
+        )
+    if (
+        not re.search(r"[a-zA-Z]", new_password)
+        or not re.search(r"\d", new_password)
+        or not re.search(r"[^a-zA-Z0-9]", new_password)
+    ):
+        return await _render_users_page(
+            request,
+            flash_msg="Password must contain letter, digit, and special character",
             flash_level="error",
         )
     p = await admin_svc.get_principal(db, principal_id)
@@ -891,6 +996,48 @@ async def web_admin_reset_password(principal_id: int, request: Request):
     return await _render_users_page(
         request, flash_msg=f"Password reset for '{p['username']}'"
     )
+
+
+@router.post("/admin/users/{principal_id}/edit-roles", response_class=HTMLResponse)
+async def web_admin_edit_roles(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    form = await request.form()
+    selected_roles = form.getlist("roles")
+    if not selected_roles:
+        return await _render_users_page(
+            request, flash_msg="At least one role must be selected", flash_level="error"
+        )
+    try:
+        new_slugs = await admin_svc.set_principal_roles(
+            db, principal_id, list(selected_roles), granted_by=actor_id
+        )
+        p = await admin_svc.get_principal(db, principal_id)
+        uname = p["username"] if p else f"#{principal_id}"
+        await admin_svc.write_audit(
+            db,
+            actor_id=actor_id,
+            action="set_roles",
+            target_type="principal",
+            target_id=str(principal_id),
+            summary=f"Set roles for {uname!r}: {', '.join(new_slugs)}",
+        )
+        return await _render_users_page(
+            request, flash_msg=f"Roles updated for '{uname}'"
+        )
+    except admin_svc.LastAdminError:
+        return await _render_users_page(
+            request,
+            flash_msg="Cannot remove admin role from the last active admin",
+            flash_level="error",
+        )
+    except ValueError as exc:
+        return await _render_users_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
 
 
 # -- Agents --
@@ -1028,6 +1175,54 @@ async def web_admin_create_agent_key(principal_id: int, request: Request):
 
 
 # -- Keys --
+
+
+@router.post("/admin/keys/create", response_class=HTMLResponse)
+async def web_admin_create_key(
+    request: Request,
+    principal_id: int = Form(...),
+    name: str = Form(...),
+    expires_days: int = Form(0),
+):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    p = await admin_svc.get_principal(db, principal_id)
+    if not p:
+        return await _render_keys_page(
+            request, flash_msg="Principal not found", flash_level="error"
+        )
+    key_info = await admin_svc.create_api_key(
+        db,
+        principal_id,
+        name=name.strip(),
+        expires_days=expires_days if expires_days > 0 else None,
+        created_by=actor_id,
+    )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="create_api_key",
+        target_type="api_key",
+        target_id=str(key_info["id"]),
+        summary=f"Created API key {name!r} for {p['username']!r}",
+    )
+    import html as html_mod
+
+    safe_key = html_mod.escape(key_info["plaintext_key"])
+    safe_name = html_mod.escape(name)
+    safe_user = html_mod.escape(p["username"])
+    key_banner = (
+        f'<div class="admin-key-reveal">'
+        f'<span class="warning">This key will not be shown again!</span><br>'
+        f"Key <b>{safe_name}</b> for <b>{safe_user}</b>:"
+        f"<code>{safe_key}</code>"
+        f"</div>"
+    )
+    headers = _flash_headers(f"API key '{name}' created for '{p['username']}'")
+    return HTMLResponse(key_banner, headers=headers)
 
 
 @router.post("/admin/keys/{key_id}/revoke", response_class=HTMLResponse)

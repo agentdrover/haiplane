@@ -729,6 +729,12 @@ async def admin_summary(db: aiosqlite.Connection) -> dict[str, Any]:
         "SELECT COUNT(*) FROM browser_sessions "
         "WHERE revoked_at IS NULL AND expires_at > datetime('now')"
     )
+    expiring_7d = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM api_keys "
+        "WHERE revoked_at IS NULL AND expires_at IS NOT NULL "
+        "AND expires_at > datetime('now') "
+        "AND expires_at <= datetime('now', '+7 days')"
+    )
     has_admin = await has_active_admin(db)
     audit_rows = await list_audit(db, limit=5)
 
@@ -738,8 +744,7 @@ async def admin_summary(db: aiosqlite.Connection) -> dict[str, Any]:
         "active_agents": active_agents[0][0],
         "active_api_keys": active_keys[0][0],
         "active_sessions": active_sessions[0][0],
-        "expiring_keys_7d": 0,
-        "expiring_keys_30d": 0,
+        "expiring_keys_7d": expiring_7d[0][0],
         "locked_users": locked_users[0][0],
         "recent_audit": audit_rows,
         "env_tokens_active": bool(config.HUB_TOKENS),

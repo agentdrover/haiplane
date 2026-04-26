@@ -3,18 +3,59 @@
 {% block title %}Roles — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>Roles</h1>
+
+<div class="admin-notice">System roles cannot be modified. Custom roles will be available in a future release.</div>
+
 <table class="admin-table">
-    <thead><tr><th>Slug</th><th>Name</th><th>Description</th><th>System</th><th>Permissions</th></tr></thead>
+    <thead><tr><th>Slug</th><th>Name</th><th>Description</th><th>Permissions</th></tr></thead>
     <tbody>
     {% for r in roles %}
     <tr>
         <td><code>{{ r.slug }}</code></td>
         <td>{{ r.name }}</td>
         <td>{{ r.description }}</td>
-        <td>{{ 'Yes' if r.system else 'No' }}</td>
-        <td class="admin-perms">{{ r.permissions|join(', ') }}</td>
+        <td class="admin-perms-badges">
+            {% for perm in r.permissions %}
+            {% if perm.startswith('admin.') %}
+            <span class="perm-badge perm-admin">{{ perm }}</span>
+            {% elif perm.startswith('integrations.') %}
+            <span class="perm-badge perm-integrations">{{ perm }}</span>
+            {% else %}
+            <span class="perm-badge perm-tasks">{{ perm }}</span>
+            {% endif %}
+            {% endfor %}
+            {% if not r.permissions %}
+            <span class="perm-badge perm-none">none</span>
+            {% endif %}
+        </td>
     </tr>
     {% endfor %}
     </tbody>
 </table>
+
+<h2>Permission Matrix</h2>
+<div class="admin-matrix-wrap">
+<table class="admin-table admin-matrix">
+    <thead>
+    <tr>
+        <th>Permission</th>
+        {% for r in roles %}
+        <th class="matrix-role">{{ r.slug }}</th>
+        {% endfor %}
+    </tr>
+    </thead>
+    <tbody>
+    {% set all_perms = [] %}
+    {% for r in roles %}{% for p in r.permissions %}{% if p not in all_perms %}{% if all_perms.append(p) %}{% endif %}{% endif %}{% endfor %}{% endfor %}
+    {% for perm in all_perms|sort %}
+    <tr>
+        <td><code>{{ perm }}</code></td>
+        {% for r in roles %}
+        <td class="matrix-cell">{% if perm in r.permissions %}<span class="matrix-check">&#10003;</span>{% endif %}</td>
+        {% endfor %}
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+</div>
 {% endblock %}

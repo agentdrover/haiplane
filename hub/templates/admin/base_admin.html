@@ -3,10 +3,10 @@
 <div class="admin-layout">
     <nav class="admin-nav">
         <a href="/admin" class="{% if admin_page == 'summary' %}active{% endif %}">Summary</a>
-        <a href="/admin/users" class="{% if admin_page == 'users' %}active{% endif %}">Users</a>
-        <a href="/admin/agents" class="{% if admin_page == 'agents' %}active{% endif %}">Agents</a>
+        <a href="/admin/users" class="{% if admin_page == 'users' %}active{% endif %}">Users{% if nav_users %} <span class="nav-badge">{{ nav_users }}</span>{% endif %}</a>
+        <a href="/admin/agents" class="{% if admin_page == 'agents' %}active{% endif %}">Agents{% if nav_agents %} <span class="nav-badge">{{ nav_agents }}</span>{% endif %}</a>
         <a href="/admin/roles" class="{% if admin_page == 'roles' %}active{% endif %}">Roles</a>
-        <a href="/admin/keys" class="{% if admin_page == 'keys' %}active{% endif %}">API Keys</a>
+        <a href="/admin/keys" class="{% if admin_page == 'keys' %}active{% endif %}">API Keys{% if nav_keys %} <span class="nav-badge">{{ nav_keys }}</span>{% endif %}</a>
         <a href="/admin/audit" class="{% if admin_page == 'audit' %}active{% endif %}">Audit</a>
     </nav>
     <div class="admin-content">
