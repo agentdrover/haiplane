@@ -7,6 +7,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from hub import config
+
 mcp = FastMCP(
     "openclaw-hub",
     instructions="MCP server for OpenClaw Hub — project state, tasks, proposals, decisions",
@@ -19,11 +21,24 @@ def _hub_url() -> str:
     return os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
 
 
+def _hub_token() -> str:
+    import os
+
+    return os.environ.get("OPENCLAW_HUB_TOKEN", "")
+
+
+def _auth_headers() -> dict[str, str]:
+    token = _hub_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 async def _api_get(path: str) -> Any:
     import httpx
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{_hub_url()}{path}")
+        resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
         resp.raise_for_status()
         return resp.json()
 
@@ -32,7 +47,9 @@ async def _api_post(path: str, body: dict[str, Any] | None = None) -> Any:
     import httpx
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{_hub_url()}{path}", json=body or {})
+        resp = await client.post(
+            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -41,20 +58,21 @@ async def _api_patch(path: str, body: dict[str, Any] | None = None) -> Any:
     import httpx
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.patch(f"{_hub_url()}{path}", json=body or {})
+        resp = await client.patch(
+            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+        )
         resp.raise_for_status()
         return resp.json()
 
 
 async def _api_put(path: str, body: Any) -> Any:
-    """PUT for collection-level replace (e.g. acceptance criteria).
-
-    Body may be a list (for replace_acceptance_criteria) or dict.
-    """
+    """PUT for collection-level replace (e.g. acceptance criteria)."""
     import httpx
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(f"{_hub_url()}{path}", json=body)
+        resp = await client.put(
+            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -64,7 +82,7 @@ async def _api_delete(path: str) -> None:
     import httpx
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(f"{_hub_url()}{path}")
+        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
         resp.raise_for_status()
 
 
@@ -174,7 +192,7 @@ async def hub_create_task(
         task_type: 'epic', 'feature', 'task', or 'subtask'
         parent_id: Parent task ID (required for feature/subtask, optional for task)
         priority: 'critical', 'high', 'medium', or 'low'
-        runtime: 'auto', 'openrouter', or 'vast'
+        runtime: 'auto' or 'openrouter'
         run_immediately: If True, dispatch immediately (not applicable for epic/feature)
         human_owner: Person who owns / is accountable for this task
         human_reviewer: Person who will review and accept the result
@@ -387,7 +405,7 @@ async def hub_approve_task(
         task_id: The draft task ID to approve
         comment: Optional reviewer comment
         run: If True, also dispatch the task immediately after approval
-        runtime: Override runtime: 'auto', 'openrouter', or 'vast'. Empty to keep existing.
+        runtime: Override runtime: 'auto' or 'openrouter'. Empty to keep existing.
         force: If True, override failed DoR checks. Use only as a human decision.
     """
     body: dict[str, Any] = {"comment": comment, "run": run, "force": force}
@@ -420,7 +438,7 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
     Args:
         task_id: The open task ID to start
         plan: Work plan (what will be done and how). Required if no plan update exists.
-        runtime: Override runtime: 'auto', 'openrouter', or 'vast'. Empty to keep existing.
+        runtime: Override runtime: 'auto' or 'openrouter'. Empty to keep existing.
     """
     body: dict[str, Any] = {}
     if plan:
@@ -637,96 +655,95 @@ async def hub_list_decisions(limit: int = 10) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Vast.ai instance management
+# Vast.ai instance management — registered only when OPENCLAW_VAST_ENABLED=1
 # ---------------------------------------------------------------------------
 
+if config.VAST_ENABLED:
 
-@mcp.tool()
-async def hub_vast_up() -> str:
-    """Create or reuse a Vast.ai GPU instance with vLLM model.
+    @mcp.tool()
+    async def hub_vast_up() -> str:
+        """Create or reuse a Vast.ai GPU instance with vLLM model.
 
-    Provisions a GPU instance, bootstraps vLLM with Qwen3-Coder, and waits
-    until the model is healthy. Takes 2-15 minutes depending on whether an
-    instance already exists.
+        Provisions a GPU instance, bootstraps vLLM with Qwen3-Coder, and waits
+        until the model is healthy. Takes 2-15 minutes depending on whether an
+        instance already exists.
 
-    Returns the OpenAI-compatible API endpoint. After this tool completes,
-    write the returned base_url to ~/.openclaw/vast-upstream.json on Mac
-    so the local proxy picks it up automatically.
-    """
-    import httpx
+        Returns the OpenAI-compatible API endpoint. After this tool completes,
+        write the returned base_url to ~/.openclaw/vast-upstream.json on Mac
+        so the local proxy picks it up automatically.
+        """
+        import httpx
 
-    async with httpx.AsyncClient(timeout=1200) as client:
-        resp = await client.post(f"{_hub_url()}/api/vast/up")
-        resp.raise_for_status()
-        result = resp.json()
+        async with httpx.AsyncClient(timeout=1200) as client:
+            resp = await client.post(f"{_hub_url()}/api/vast/up")
+            resp.raise_for_status()
+            result = resp.json()
 
-    if result.get("error"):
-        return f"Failed to create Vast instance: {result['error']}"
+        if result.get("error"):
+            return f"Failed to create Vast instance: {result['error']}"
 
-    public_ip = result.get("public_ip")
-    api_port = result.get("api_port")
-    model_id = result.get("model_id", "")
-    base_url = result.get("base_url") or (
-        f"http://{public_ip}:{api_port}/v1" if public_ip and api_port else "unknown"
-    )
-    # Strip /v1 suffix for proxy config — proxy forwards path as-is,
-    # so Cursor's requests to localhost:8741/v1/... go to upstream/v1/...
-    proxy_upstream = base_url.rstrip("/")
-    if proxy_upstream.endswith("/v1"):
-        proxy_upstream = proxy_upstream[:-3]
-    hourly = result.get("hourly_rate", "?")
-
-    parts = [
-        "Vast.ai instance is UP and healthy.",
-        f"  Instance:  #{result.get('instance_id', '?')}",
-        f"  Rate:      ${hourly}/hr",
-        f"  Model:     {model_id}",
-        f"  Endpoint:  {base_url}",
-        "",
-        "UPDATE LOCAL PROXY by running this command on Mac:",
-        f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.openclaw/vast-upstream.json',
-        "",
-        "Local proxy → http://localhost:8741/v1",
-        "Cursor model ready to use.",
-    ]
-    return "\n".join(parts)
-
-
-@mcp.tool()
-async def hub_vast_status() -> str:
-    """Check the status of the current Vast.ai GPU instance."""
-    result = await _api_get("/api/vast/status")
-
-    if not result.get("managed"):
-        return "No active Vast.ai instance."
-
-    parts = [
-        f"Vast instance #{result.get('instance_id')} — {result.get('status', 'unknown')}",
-        f"  Hourly rate: ${result.get('hourly_rate', '?')}/hr",
-        f"  Base URL:    {result.get('base_url', 'N/A')}",
-        f"  Public IP:   {result.get('public_ip', 'N/A')}",
-        f"  Last used:   {result.get('last_used_at', 'N/A')}",
-    ]
-    if result.get("degraded"):
-        parts.append(
-            "  WARNING: Status degraded (API lookup failed, using cached state)"
+        public_ip = result.get("public_ip")
+        api_port = result.get("api_port")
+        model_id = result.get("model_id", "")
+        base_url = result.get("base_url") or (
+            f"http://{public_ip}:{api_port}/v1" if public_ip and api_port else "unknown"
         )
-    return "\n".join(parts)
+        proxy_upstream = base_url.rstrip("/")
+        if proxy_upstream.endswith("/v1"):
+            proxy_upstream = proxy_upstream[:-3]
+        hourly = result.get("hourly_rate", "?")
 
+        parts = [
+            "Vast.ai instance is UP and healthy.",
+            f"  Instance:  #{result.get('instance_id', '?')}",
+            f"  Rate:      ${hourly}/hr",
+            f"  Model:     {model_id}",
+            f"  Endpoint:  {base_url}",
+            "",
+            "UPDATE LOCAL PROXY by running this command on Mac:",
+            f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.openclaw/vast-upstream.json',
+            "",
+            "Local proxy → http://localhost:8741/v1",
+            "Cursor model ready to use.",
+        ]
+        return "\n".join(parts)
 
-@mcp.tool()
-async def hub_vast_down() -> str:
-    """Destroy the active Vast.ai GPU instance to stop billing."""
-    import httpx
+    @mcp.tool()
+    async def hub_vast_status() -> str:
+        """Check the status of the current Vast.ai GPU instance."""
+        result = await _api_get("/api/vast/status")
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{_hub_url()}/api/vast/down")
-        resp.raise_for_status()
-        result = resp.json()
+        if not result.get("managed"):
+            return "No active Vast.ai instance."
 
-    if result.get("destroyed"):
-        return f"Vast instance #{result.get('instance_id', '?')} destroyed. Billing stopped."
-    return f"No instance to destroy. {result.get('reason', result.get('error', ''))}"
+        parts = [
+            f"Vast instance #{result.get('instance_id')} — {result.get('status', 'unknown')}",
+            f"  Hourly rate: ${result.get('hourly_rate', '?')}/hr",
+            f"  Base URL:    {result.get('base_url', 'N/A')}",
+            f"  Public IP:   {result.get('public_ip', 'N/A')}",
+            f"  Last used:   {result.get('last_used_at', 'N/A')}",
+        ]
+        if result.get("degraded"):
+            parts.append(
+                "  WARNING: Status degraded (API lookup failed, using cached state)"
+            )
+        return "\n".join(parts)
+
+    @mcp.tool()
+    async def hub_vast_down() -> str:
+        """Destroy the active Vast.ai GPU instance to stop billing."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{_hub_url()}/api/vast/down")
+            resp.raise_for_status()
+            result = resp.json()
+
+        if result.get("destroyed"):
+            return f"Vast instance #{result.get('instance_id', '?')} destroyed. Billing stopped."
+        return (
+            f"No instance to destroy. {result.get('reason', result.get('error', ''))}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1030,28 @@ async def hub_get_readiness(task_id: int, explain: bool = False) -> str:
     if explain:
         return json.dumps(report, ensure_ascii=False, indent=2)
     return _format_readiness(report, task_id)
+
+
+# ---------------------------------------------------------------------------
+# Admin: read-only identity diagnostic (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def hub_admin_my_identity() -> str:
+    """Diagnostic: show the current identity, roles, and permissions of the caller.
+
+    This is a read-only tool that helps agents verify their identity and
+    understand what operations they are authorized to perform.
+    """
+    try:
+        await _api_get("/api/tasks?limit=1")
+        return (
+            "Identity check: API access confirmed. "
+            "Use the Hub Web UI or CLI for detailed identity info."
+        )
+    except Exception as e:
+        return f"Identity check failed: {e}"
 
 
 def main():

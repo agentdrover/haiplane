@@ -313,6 +313,8 @@ async def maybe_destroy_vast(
     task: dict[str, Any],
 ) -> None:
     """Destroy Vast instance if no active Vast tasks remain."""
+    if not config.VAST_ENABLED:
+        return
     if await plugins.vast.has_active_vast_tasks(db):
         return
     status = await plugins.vast.vast_status()

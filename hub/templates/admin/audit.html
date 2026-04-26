@@ -1,0 +1,23 @@
+{% extends "admin/base_admin.html" %}
+{% set admin_page = "audit" %}
+{% block title %}Audit Log — Admin — OpenClaw Hub{% endblock %}
+{% block admin_content %}
+<h1>Audit Log</h1>
+<table class="admin-table">
+    <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Summary</th></tr></thead>
+    <tbody>
+    {% for e in entries %}
+    <tr>
+        <td>{{ e.created_at }}</td>
+        <td>{{ e.actor_username or '—' }}</td>
+        <td>{{ e.action }}</td>
+        <td>{{ e.target_type }} {{ e.target_id }}</td>
+        <td>{{ e.summary }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% if not entries %}
+<p>No audit entries.</p>
+{% endif %}
+{% endblock %}

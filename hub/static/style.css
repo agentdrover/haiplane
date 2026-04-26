@@ -2366,3 +2366,28 @@ body.htmx-request .htmx-progress {
     }
     .activity-timeline .activity-time { min-width: auto; }
 }
+
+/* ---- Admin section ---- */
+.nav-divider { border: none; border-top: 1px solid var(--clr-border); margin: var(--sp-3) var(--sp-4); }
+.admin-layout { display: flex; flex-direction: column; gap: var(--sp-4); }
+.admin-nav { display: flex; gap: var(--sp-2); flex-wrap: wrap; border-bottom: 1px solid var(--clr-border); padding-bottom: var(--sp-2); }
+.admin-nav a { padding: var(--sp-2) var(--sp-3); border-radius: var(--radius); font-size: 13px; color: var(--clr-muted); text-decoration: none; }
+.admin-nav a:hover { background: var(--clr-bg-accent); color: var(--clr-text); }
+.admin-nav a.active { background: var(--clr-accent); color: #fff; }
+.admin-content { }
+.admin-stats { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+.stat-card { background: var(--clr-bg-surface); border: 1px solid var(--clr-border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); min-width: 120px; }
+.stat-value { font-size: 1.5rem; font-weight: 700; color: var(--clr-text); }
+.stat-label { font-size: 12px; color: var(--clr-muted); }
+.admin-warning { background: #fef3cd; border: 1px solid #ffc107; color: #856404; padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
+.admin-notice { background: #d1ecf1; border: 1px solid #17a2b8; color: #0c5460; padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
+.admin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-table th, .admin-table td { padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--clr-border); text-align: left; }
+.admin-table th { font-weight: 600; color: var(--clr-muted); font-size: 11px; text-transform: uppercase; }
+.admin-perms { font-size: 11px; color: var(--clr-muted); max-width: 300px; word-break: break-all; }
+.row-revoked { opacity: 0.5; }
+.badge-active { background: #d4edda; color: #155724; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+.badge-disabled { background: #f8d7da; color: #721c24; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+.badge-locked { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+.login-legacy { margin-top: var(--sp-3); font-size: 13px; color: var(--clr-muted); }
+.login-legacy summary { cursor: pointer; }

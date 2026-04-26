@@ -1,32 +1,24 @@
 """Multi-user authentication for OpenClaw Hub.
 
-This is the **MVP** auth layer (epic: feat/multi-user-auth). It does the
-minimum needed to identify a user across UI, REST API and MCP, and to lock
-the Hub behind a token gate when configured. It deliberately does **not**:
+Auth sources (checked in order):
 
-- store users or roles in the database (env-driven, edit & restart);
-- support per-user permissions (everyone authenticated == full access);
-- implement OAuth/OIDC.
+1. ``Authorization: Bearer <token>`` — DB API key lookup, then env-token fallback.
+2. Session cookie ``HUB_COOKIE_NAME`` — DB browser session lookup, then
+   env-token fallback (legacy).
 
-Those will land in the production-grade follow-up. The contracts here are
-designed so the upgrade is mechanical: replace ``parse_tokens`` lookup with
-a DB query, add a role check in ``require_user``.
+When :data:`hub.config.HUB_TOKENS` is empty **and** no DB principals exist,
+the Hub runs in **open mode** (backward compat).
 
-Recognised credentials, in order:
-
-1. ``Authorization: Bearer <token>`` — used by REST API consumers and MCP
-   clients (HTTP transport).
-2. Session cookie ``HUB_COOKIE_NAME`` carrying the same token — set by the
-   browser-facing ``/login`` flow.
-
-When :data:`hub.config.HUB_TOKENS` is empty, the Hub runs in **open mode**:
-no token is required and the request user defaults to ``anonymous``. This
-preserves the previous single-user behaviour for existing deploys and
-keeps the test suite working without setting env vars.
+Roles: resolved from DB principal_roles or from env-token role field.
+Agent tokens are restricted from human-only operations.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import secrets
+import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 
@@ -35,9 +27,78 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from hub import config
+from hub.config import TokenIdentity
 
-# Public paths that must never require authentication. Anything else under
-# the protected prefixes (see ``_PROTECTED_PREFIXES``) is gated.
+log = logging.getLogger("hub.auth")
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (in-memory, per-IP)
+# ---------------------------------------------------------------------------
+
+
+class LoginRateLimiter:
+    """Sliding-window rate limiter for login attempts."""
+
+    __slots__ = ("_max_attempts", "_window_seconds", "_buckets")
+
+    def __init__(self, max_attempts: int = 10, window_seconds: int = 300) -> None:
+        self._max_attempts = max_attempts
+        self._window_seconds = window_seconds
+        self._buckets: dict[str, list[float]] = {}
+
+    def is_blocked(self, key: str) -> bool:
+        now = time.monotonic()
+        attempts = self._buckets.get(key, [])
+        attempts = [t for t in attempts if now - t < self._window_seconds]
+        self._buckets[key] = attempts
+        return len(attempts) >= self._max_attempts
+
+    def record(self, key: str) -> None:
+        now = time.monotonic()
+        bucket = self._buckets.setdefault(key, [])
+        bucket.append(now)
+        if len(bucket) > self._max_attempts * 2:
+            cutoff = now - self._window_seconds
+            self._buckets[key] = [t for t in bucket if t > cutoff]
+
+    def _cleanup(self) -> None:
+        """Remove stale entries. Called periodically from the session reaper."""
+        now = time.monotonic()
+        stale_keys = [
+            k
+            for k, v in self._buckets.items()
+            if all(now - t >= self._window_seconds for t in v)
+        ]
+        for k in stale_keys:
+            del self._buckets[k]
+
+
+login_limiter = LoginRateLimiter(max_attempts=10, window_seconds=300)
+
+
+# ---------------------------------------------------------------------------
+# CSRF protection (double-submit cookie)
+# ---------------------------------------------------------------------------
+
+CSRF_COOKIE_NAME = "openclaw_csrf"
+CSRF_FIELD_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+
+
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def verify_csrf(request_token: str | None, cookie_token: str | None) -> bool:
+    if not request_token or not cookie_token:
+        return False
+    return (
+        hashlib.sha256(request_token.encode()).hexdigest()
+        == hashlib.sha256(cookie_token.encode()).hexdigest()
+    )
+
+
 _PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/login",
@@ -46,20 +107,16 @@ _PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
         "/healthz",
         "/favicon.ico",
         "/robots.txt",
+        "/api/admin/bootstrap",
     }
 )
 
-# Static assets are public by prefix (CSS, JS, images served by /static).
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
-# Anything matching these prefixes is gated when tokens are configured.
-# Everything else (root, partials, custom paths) is also gated by default
-# unless explicitly listed in _PUBLIC_PATHS — auth is opt-out, not opt-in.
-_PROTECTED_PREFIXES: Final[tuple[str, ...]] = (
-    "/",  # dashboard + everything else
-)
+_PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
 
 ANONYMOUS_USER: Final[str] = "anonymous"
+ANONYMOUS_IDENTITY: Final[TokenIdentity] = TokenIdentity("anonymous", "human")
 
 
 def _looks_public(path: str) -> bool:
@@ -68,8 +125,7 @@ def _looks_public(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES)
 
 
-def _extract_token(request: Request) -> str | None:
-    """Pull a token from the Authorization header or the session cookie."""
+def _extract_bearer(request: Request) -> str | None:
     auth_header = request.headers.get("Authorization") or request.headers.get(
         "authorization"
     )
@@ -77,40 +133,88 @@ def _extract_token(request: Request) -> str | None:
         token = auth_header[len("Bearer ") :].strip()
         if token:
             return token
-
-    cookie_token = request.cookies.get(config.HUB_COOKIE_NAME)
-    if cookie_token:
-        return cookie_token.strip() or None
-
     return None
 
 
-def _resolve_user(token: str | None) -> str | None:
-    """Map a token to a username via :data:`hub.config.HUB_TOKENS`."""
+def _extract_cookie(request: Request) -> str | None:
+    cookie_token = request.cookies.get(config.HUB_COOKIE_NAME)
+    if cookie_token:
+        return cookie_token.strip() or None
+    return None
+
+
+def _resolve_env_token(token: str | None) -> TokenIdentity | None:
     if not token:
         return None
     return config.HUB_TOKENS.get(token)
 
 
 def _is_open_mode() -> bool:
-    """No tokens configured (or auth explicitly disabled) → open mode."""
     if config.HUB_AUTH_DISABLED:
         return True
     return not config.HUB_TOKENS
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Authenticate every request and stash the user in ``request.state``.
+async def _resolve_db_bearer(request: Request, token: str) -> TokenIdentity | None:
+    """Try to resolve a bearer token via DB api_keys."""
+    db = getattr(getattr(request, "app", None), "state", None)
+    if db is None:
+        return None
+    db_conn = getattr(db, "db", None)
+    if db_conn is None:
+        return None
+    try:
+        from hub.services.admin import resolve_api_key
 
-    The middleware is the single source of truth for "who is this request":
-    handlers and dependencies must read ``request.state.user`` rather than
-    parsing the header again. ``request.state.user`` is always populated
-    after this middleware runs — it is :data:`ANONYMOUS_USER` in open mode.
+        return await resolve_api_key(db_conn, token)
+    except Exception:
+        return None
 
-    For browser navigation (``Accept: text/html``) we redirect to ``/login``
-    instead of returning JSON 401; that gives a usable UX without requiring
-    JS to handle the auth flow.
+
+async def _resolve_db_session(request: Request, token: str) -> TokenIdentity | None:
+    """Try to resolve a session cookie via DB browser_sessions."""
+    db = getattr(getattr(request, "app", None), "state", None)
+    if db is None:
+        return None
+    db_conn = getattr(db, "db", None)
+    if db_conn is None:
+        return None
+    try:
+        from hub.services.admin import resolve_browser_session
+
+        return await resolve_browser_session(db_conn, token)
+    except Exception:
+        return None
+
+
+async def _resolve_identity(request: Request) -> TokenIdentity | None:
+    """Resolve identity from bearer header or session cookie.
+
+    Priority: bearer DB key > bearer env token > cookie DB session > cookie env token.
     """
+    bearer = _extract_bearer(request)
+    if bearer:
+        identity = await _resolve_db_bearer(request, bearer)
+        if identity:
+            return identity
+        identity = _resolve_env_token(bearer)
+        if identity:
+            return identity
+
+    cookie = _extract_cookie(request)
+    if cookie:
+        identity = await _resolve_db_session(request, cookie)
+        if identity:
+            return identity
+        identity = _resolve_env_token(cookie)
+        if identity:
+            return identity
+
+    return None
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Authenticate every request and stash identity in ``request.state``."""
 
     async def dispatch(
         self,
@@ -120,29 +224,28 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         if _looks_public(path):
-            request.state.user = (
-                _resolve_user(_extract_token(request)) or ANONYMOUS_USER
-            )
+            identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+            request.state.user = identity.username
+            request.state.identity = identity
             return await call_next(request)
 
         if _is_open_mode():
             request.state.user = ANONYMOUS_USER
+            request.state.identity = ANONYMOUS_IDENTITY
             return await call_next(request)
 
-        token = _extract_token(request)
-        user = _resolve_user(token)
-        if not user:
+        identity = await _resolve_identity(request)
+        if not identity:
             return _unauthorized(request)
-        request.state.user = user
+        request.state.user = identity.username
+        request.state.identity = identity
         return await call_next(request)
 
 
 def _unauthorized(request: Request) -> Response:
-    """401 for API clients, 303 redirect to /login for browsers."""
     accept = (request.headers.get("accept") or "").lower()
     wants_html = "text/html" in accept and "application/json" not in accept
     if wants_html and request.method in {"GET", "HEAD"}:
-        # Preserve the originally requested path so login can bounce back.
         from urllib.parse import quote
 
         next_url = quote(request.url.path)
@@ -160,13 +263,20 @@ def _unauthorized(request: Request) -> Response:
     )
 
 
-def current_user(request: Request) -> str:
-    """FastAPI dependency: returns the authenticated user (or anonymous).
+def _forbidden(detail: str = "insufficient permissions") -> Response:
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=f'{{"detail":"{detail}"}}',
+        media_type="application/json",
+    )
 
-    Always populated because :class:`AuthMiddleware` runs first. Raises
-    HTTP 500 if the middleware was not installed — that is a programming
-    error, not a runtime auth failure.
-    """
+
+# ---------------------------------------------------------------------------
+# FastAPI dependencies
+# ---------------------------------------------------------------------------
+
+
+def current_user(request: Request) -> str:
     user = getattr(request.state, "user", None)
     if user is None:
         raise HTTPException(
@@ -176,11 +286,52 @@ def current_user(request: Request) -> str:
     return user
 
 
-def require_user(request: Request) -> str:
-    """Like :func:`current_user` but rejects open-mode anonymous access.
+def current_identity(request: Request) -> TokenIdentity:
+    identity = getattr(request.state, "identity", None)
+    if identity is None:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "auth middleware not installed",
+        )
+    return identity
 
-    Use on endpoints that must record a real human author (e.g. decisions).
-    In open mode this still returns ``anonymous`` — that is fine for the
-    MVP; production-grade auth will switch this to 401.
-    """
+
+def require_human_or_admin(request: Request) -> TokenIdentity:
+    """Rejects agent tokens with 403."""
+    identity = current_identity(request)
+    if identity.is_agent:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this operation requires human or admin role",
+        )
+    return identity
+
+
+def require_admin(request: Request) -> TokenIdentity:
+    """Allows only admin tokens."""
+    identity = current_identity(request)
+    if not identity.is_admin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this operation requires admin role",
+        )
+    return identity
+
+
+def require_permission(perm: str):
+    """Factory: returns a FastAPI dependency that checks a specific permission."""
+
+    def _check(request: Request) -> TokenIdentity:
+        identity = current_identity(request)
+        if not identity.has_permission(perm):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"missing permission: {perm}",
+            )
+        return identity
+
+    return _check
+
+
+def require_user(request: Request) -> str:
     return current_user(request)

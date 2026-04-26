@@ -3,7 +3,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+import re
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TaskStatus(str, Enum):
@@ -141,6 +143,9 @@ ACTIVE_STATUSES = frozenset(
 )
 
 STALE_THRESHOLD_MINUTES = 30
+
+MAX_ACCEPTANCE_CRITERIA = 50
+MAX_RISKS = 50
 
 FINAL_STATUSES = frozenset(
     {
@@ -290,6 +295,24 @@ class TaskRefine(BaseModel):
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     human_owner: str | None = Field(default=None, max_length=100)
     human_reviewer: str | None = Field(default=None, max_length=100)
+
+    @field_validator("risks")
+    @classmethod
+    def _cap_risks(cls, v: list[TaskRisk] | None) -> list[TaskRisk] | None:
+        if v is not None and len(v) > MAX_RISKS:
+            raise ValueError(f"too many risks: {len(v)} exceeds limit of {MAX_RISKS}")
+        return v
+
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def _cap_acs(
+        cls, v: list[AcceptanceCriterion] | None
+    ) -> list[AcceptanceCriterion] | None:
+        if v is not None and len(v) > MAX_ACCEPTANCE_CRITERIA:
+            raise ValueError(
+                f"too many acceptance criteria: {len(v)} exceeds limit of {MAX_ACCEPTANCE_CRITERIA}"
+            )
+        return v
 
     @model_validator(mode="after")
     def _ac_ids_must_be_unique(self) -> "TaskRefine":
@@ -526,6 +549,157 @@ class DashboardData(BaseModel):
     recent_decisions: list[dict[str, Any]]
     recent_activity: list[ActivityItem] = []
     vast_status: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Admin section models (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+class PrincipalKind(str, Enum):
+    human = "human"
+    agent = "agent"
+    service = "service"
+
+
+class PrincipalStatus(str, Enum):
+    active = "active"
+    disabled = "disabled"
+    locked = "locked"
+
+
+def _check_password_complexity(v: str) -> str:
+    if not re.search(r"[a-zA-Z]", v):
+        raise ValueError("password must contain at least one letter")
+    if not re.search(r"\d", v):
+        raise ValueError("password must contain at least one digit")
+    if not re.search(r"[^a-zA-Z0-9]", v):
+        raise ValueError("password must contain at least one special character")
+    return v
+
+
+class PrincipalCreate(BaseModel):
+    kind: PrincipalKind
+    username: str = Field(
+        ..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_\-\.]+$"
+    )
+    display_name: str = Field("", max_length=200)
+    email: str = Field("", max_length=320)
+    password: str | None = Field(default=None, min_length=8, max_length=200)
+    role: str = Field("", max_length=50)
+    notes: str = Field("", max_length=2000)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str | None) -> str | None:
+        if v is not None:
+            _check_password_complexity(v)
+        return v
+
+
+class PrincipalUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=200)
+    email: str | None = Field(default=None, max_length=320)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class PrincipalView(BaseModel):
+    id: int
+    kind: PrincipalKind
+    username: str
+    display_name: str = ""
+    email: str = ""
+    status: PrincipalStatus = PrincipalStatus.active
+    notes: str = ""
+    roles: list[str] = Field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+    last_seen_at: str | None = None
+    created_by: int | None = None
+
+
+class RoleView(BaseModel):
+    id: int
+    slug: str
+    name: str
+    description: str = ""
+    system: bool = False
+    permissions: list[str] = Field(default_factory=list)
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    expires_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ApiKeyView(BaseModel):
+    id: int
+    principal_id: int
+    name: str
+    key_prefix: str
+    expires_at: str | None = None
+    last_used_at: str | None = None
+    revoked_at: str | None = None
+    created_at: str = ""
+    created_by: int | None = None
+
+
+class ApiKeyCreated(ApiKeyView):
+    """Returned only once at creation time — includes the plaintext key."""
+
+    plaintext_key: str
+
+
+class AuditEntry(BaseModel):
+    id: int
+    actor_principal_id: int | None = None
+    actor_username: str | None = ""
+    action: str
+    target_type: str
+    target_id: str = ""
+    summary: str
+    detail: str | None = None
+    created_at: str = ""
+
+
+class AdminSummary(BaseModel):
+    active_users: int = 0
+    disabled_users: int = 0
+    active_agents: int = 0
+    active_api_keys: int = 0
+    expiring_keys_7d: int = 0
+    expiring_keys_30d: int = 0
+    locked_users: int = 0
+    recent_audit: list[AuditEntry] = Field(default_factory=list)
+    env_tokens_active: bool = False
+    admin_bootstrap_required: bool = False
+
+
+class RolesUpdatePayload(BaseModel):
+    roles: list[str] = Field(..., min_length=1)
+
+
+class PasswordSetPayload(BaseModel):
+    password: str = Field(..., min_length=8, max_length=200)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        return _check_password_complexity(v)
+
+
+class AdminBootstrap(BaseModel):
+    username: str = Field(
+        ..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_\-\.]+$"
+    )
+    password: str = Field(..., min_length=8, max_length=200)
+    display_name: str = Field("", max_length=200)
+    email: str = Field("", max_length=320)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        return _check_password_complexity(v)
 
 
 # --- Deprecated aliases for backward compatibility ---

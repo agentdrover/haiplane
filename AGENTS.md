@@ -41,6 +41,7 @@
 - `agents/python-senior-developer.md`
 - `agents/testing-agent.md`
 - `agents/code-reviewer.md`
+- `agents/devsecops.md`
 
 ## Project Skills
 

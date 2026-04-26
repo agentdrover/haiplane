@@ -1,0 +1,20 @@
+{% extends "admin/base_admin.html" %}
+{% set admin_page = "roles" %}
+{% block title %}Roles — Admin — OpenClaw Hub{% endblock %}
+{% block admin_content %}
+<h1>Roles</h1>
+<table class="admin-table">
+    <thead><tr><th>Slug</th><th>Name</th><th>Description</th><th>System</th><th>Permissions</th></tr></thead>
+    <tbody>
+    {% for r in roles %}
+    <tr>
+        <td><code>{{ r.slug }}</code></td>
+        <td>{{ r.name }}</td>
+        <td>{{ r.description }}</td>
+        <td>{{ 'Yes' if r.system else 'No' }}</td>
+        <td class="admin-perms">{{ r.permissions|join(', ') }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

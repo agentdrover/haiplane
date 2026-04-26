@@ -9,7 +9,7 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -41,7 +41,7 @@ from hub.models import (
     TaskUpdateView,
     TaskView,
 )
-from hub.auth import AuthMiddleware
+from hub.auth import AuthMiddleware, require_human_or_admin, require_permission
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
@@ -82,7 +82,7 @@ def _register_plugins() -> None:
 
         plugins.notes = NotesIntegration()
 
-    if config.VAST_JOB_BIN:
+    if config.VAST_ENABLED and config.VAST_JOB_BIN:
         from hub.integrations.vast import VastIntegration
 
         plugins.vast = VastIntegration()
@@ -101,6 +101,7 @@ _mcp_streamable_app = mcp_server.streamable_http_app()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    config.validate_network_auth()
     _register_plugins()
     app.state.db = await get_db()
     log.info("Hub database ready at %s", config.HUB_DB_PATH)
@@ -120,6 +121,17 @@ async def lifespan(app: FastAPI):
                 log.info(
                     "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
                 )
+
+            # Bootstrap token guard
+            if config.HUB_BOOTSTRAP_TOKEN:
+                from hub.db import has_active_admin
+
+                if await has_active_admin(app.state.db):
+                    log.warning(
+                        "SECURITY: OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                        "but an admin already exists. Remove it from the environment "
+                        "to prevent unauthorized bootstrap attempts."
+                    )
             yield
     finally:
         poll_task.cancel()
@@ -354,20 +366,31 @@ async def api_reorder_task(task_id: int, body: TaskReorder, request: Request):
 
 @app.post("/api/tasks/{task_id}/approve", response_model=TaskView)
 async def api_approve_task(
-    task_id: int, request: Request, body: TaskApprove | None = None
+    task_id: int,
+    request: Request,
+    body: TaskApprove | None = None,
+    _identity=Depends(require_human_or_admin),
 ):
     return await services.approve_task(_db(request), task_id, body)
 
 
 @app.post("/api/tasks/{task_id}/reject", response_model=TaskView)
 async def api_reject_task(
-    task_id: int, request: Request, body: TaskReject | None = None
+    task_id: int,
+    request: Request,
+    body: TaskReject | None = None,
+    _identity=Depends(require_human_or_admin),
 ):
     return await services.reject_task(_db(request), task_id, body)
 
 
 @app.post("/api/tasks/{task_id}/start", response_model=TaskView)
-async def api_start_task(task_id: int, request: Request, body: TaskStart | None = None):
+async def api_start_task(
+    task_id: int,
+    request: Request,
+    body: TaskStart | None = None,
+    _identity=Depends(require_human_or_admin),
+):
     return await services.start_task(_db(request), task_id, body)
 
 
@@ -380,7 +403,12 @@ async def api_task_question(task_id: int, body: TaskQuestion, request: Request):
 
 
 @app.post("/api/tasks/{task_id}/answer", response_model=TaskView)
-async def api_task_answer(task_id: int, body: TaskAnswer, request: Request):
+async def api_task_answer(
+    task_id: int,
+    body: TaskAnswer,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
     return await services.answer_question(_db(request), task_id, body)
 
 
@@ -388,13 +416,21 @@ async def api_task_answer(task_id: int, body: TaskAnswer, request: Request):
 
 
 @app.post("/api/tasks/{task_id}/decide", response_model=TaskView)
-async def api_decide_task(task_id: int, body: TaskDecide, request: Request):
+async def api_decide_task(
+    task_id: int,
+    body: TaskDecide,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
     return await services.decide_task(_db(request), task_id, body)
 
 
 @app.post("/api/tasks/{task_id}/force-complete", response_model=TaskView)
 async def api_force_complete_task(
-    task_id: int, request: Request, body: TaskForceComplete | None = None
+    task_id: int,
+    request: Request,
+    body: TaskForceComplete | None = None,
+    _identity=Depends(require_human_or_admin),
 ):
     """Force-complete a pending_report task after explicit human acceptance."""
     return await services.force_complete_task(_db(request), task_id, body)
@@ -515,6 +551,13 @@ async def api_replace_acceptance_criteria(
     task_id: int, body: list[AcceptanceCriterion], request: Request
 ):
     """Atomic replace of the AC list. Returns 422 on duplicate ids in payload."""
+    from hub.models import MAX_ACCEPTANCE_CRITERIA
+
+    if len(body) > MAX_ACCEPTANCE_CRITERIA:
+        raise HTTPException(
+            422,
+            f"too many acceptance criteria: {len(body)} exceeds limit of {MAX_ACCEPTANCE_CRITERIA}",
+        )
     try:
         return await services.replace_acceptance_criteria(_db(request), task_id, body)
     except TaskNotFoundError as exc:
@@ -655,19 +698,368 @@ async def api_transcripts(limit: int = Query(default=10, le=30)):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/vast/up")
-async def api_vast_up():
-    return await plugins.vast.vast_up()
+if config.VAST_ENABLED:
+
+    @app.post("/api/vast/up")
+    async def api_vast_up(_identity=Depends(require_human_or_admin)):
+        return await plugins.vast.vast_up()
+
+    @app.get("/api/vast/status")
+    async def api_vast_status():
+        return await plugins.vast.vast_status()
+
+    @app.post("/api/vast/down")
+    async def api_vast_down(_identity=Depends(require_human_or_admin)):
+        return await plugins.vast.vast_down()
 
 
-@app.get("/api/vast/status")
-async def api_vast_status():
-    return await plugins.vast.vast_status()
+# ---------------------------------------------------------------------------
+# REST API — Admin section (Stage 4)
+# ---------------------------------------------------------------------------
 
 
-@app.post("/api/vast/down")
-async def api_vast_down():
-    return await plugins.vast.vast_down()
+@app.get("/api/admin/summary")
+async def api_admin_summary(
+    request: Request, _identity=Depends(require_permission("admin.read"))
+):
+    from hub.services import admin as admin_svc
+
+    return await admin_svc.admin_summary(_db(request))
+
+
+@app.get("/api/admin/principals")
+async def api_admin_list_principals(
+    request: Request,
+    kind: str | None = None,
+    status: str | None = None,
+    limit: int = Query(default=100, le=500),
+    _identity=Depends(require_permission("admin.read")),
+):
+    from hub.services import admin as admin_svc
+    from hub.models import PrincipalView
+
+    rows = await admin_svc.list_principals(
+        _db(request), kind=kind, status=status, limit=limit
+    )
+    return [PrincipalView(**r) for r in rows]
+
+
+@app.post("/api/admin/principals")
+async def api_admin_create_principal(
+    request: Request,
+    _identity=Depends(require_permission("admin.users.write")),
+):
+    from hub.models import PrincipalCreate, PrincipalView
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    body = PrincipalCreate(**(await request.json()))
+    p = await admin_svc.create_principal(
+        _db(request),
+        kind=body.kind.value,
+        username=body.username,
+        display_name=body.display_name,
+        email=body.email,
+        notes=body.notes,
+        password=body.password,
+        role_slug=body.role or None,
+        created_by=identity.principal_id,
+    )
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="create_principal",
+        target_type="principal",
+        target_id=str(p["id"]),
+        summary=f"Created {body.kind.value} principal {body.username!r}",
+    )
+    return PrincipalView(**p)
+
+
+@app.get("/api/admin/principals/{principal_id}")
+async def api_admin_get_principal(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.read")),
+):
+    from hub.models import PrincipalView
+    from hub.services import admin as admin_svc
+
+    p = await admin_svc.get_principal(_db(request), principal_id)
+    if not p:
+        raise HTTPException(404, "principal not found")
+    return PrincipalView(**p)
+
+
+@app.patch("/api/admin/principals/{principal_id}")
+async def api_admin_update_principal(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.users.write")),
+):
+    from hub.models import PrincipalUpdate, PrincipalView
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    body = PrincipalUpdate(**(await request.json()))
+    p = await admin_svc.update_principal(
+        _db(request),
+        principal_id,
+        display_name=body.display_name,
+        email=body.email,
+        notes=body.notes,
+    )
+    if not p:
+        raise HTTPException(404, "principal not found")
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="update_principal",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Updated principal #{principal_id}",
+    )
+    return PrincipalView(**p)
+
+
+@app.post("/api/admin/principals/{principal_id}/disable")
+async def api_admin_disable_principal(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.users.write")),
+):
+    from hub.models import PrincipalView
+    from hub.services import admin as admin_svc
+    from hub.services.admin import LastAdminError
+
+    identity = _identity
+    try:
+        p = await admin_svc.disable_principal(_db(request), principal_id)
+    except LastAdminError as e:
+        raise HTTPException(409, str(e)) from e
+    if not p:
+        raise HTTPException(404, "principal not found")
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="disable_principal",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Disabled principal #{principal_id}",
+    )
+    return PrincipalView(**p)
+
+
+@app.post("/api/admin/principals/{principal_id}/enable")
+async def api_admin_enable_principal(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.users.write")),
+):
+    from hub.models import PrincipalView
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    p = await admin_svc.enable_principal(_db(request), principal_id)
+    if not p:
+        raise HTTPException(404, "principal not found")
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="enable_principal",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Enabled principal #{principal_id}",
+    )
+    return PrincipalView(**p)
+
+
+@app.get("/api/admin/roles")
+async def api_admin_list_roles(
+    request: Request,
+    _identity=Depends(require_permission("admin.read")),
+):
+    from hub.models import RoleView
+    from hub.services import admin as admin_svc
+
+    rows = await admin_svc.list_roles(_db(request))
+    return [RoleView(**r) for r in rows]
+
+
+@app.put("/api/admin/principals/{principal_id}/roles")
+async def api_admin_set_roles(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.roles.write")),
+):
+    from hub.models import RolesUpdatePayload
+    from hub.services import admin as admin_svc
+    from hub.services.admin import LastAdminError
+
+    identity = _identity
+    body = RolesUpdatePayload(**(await request.json()))
+    try:
+        slugs = await admin_svc.set_principal_roles(
+            _db(request), principal_id, body.roles, granted_by=identity.principal_id
+        )
+    except LastAdminError as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="set_roles",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Set roles for principal #{principal_id}: {', '.join(slugs)}",
+    )
+    return {"principal_id": principal_id, "roles": slugs}
+
+
+@app.get("/api/admin/api-keys")
+async def api_admin_list_keys(
+    request: Request,
+    principal_id: int | None = None,
+    limit: int = Query(default=100, le=500),
+    _identity=Depends(require_permission("admin.read")),
+):
+    from hub.models import ApiKeyView
+    from hub.services import admin as admin_svc
+
+    rows = await admin_svc.list_api_keys(
+        _db(request), principal_id=principal_id, limit=limit
+    )
+    return [ApiKeyView(**r) for r in rows]
+
+
+@app.post("/api/admin/principals/{principal_id}/api-keys")
+async def api_admin_create_key(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.credentials.write")),
+):
+    from hub.models import ApiKeyCreate, ApiKeyCreated
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    body = ApiKeyCreate(**(await request.json()))
+    key_data = await admin_svc.create_api_key(
+        _db(request),
+        principal_id,
+        name=body.name,
+        expires_days=body.expires_days,
+        created_by=identity.principal_id,
+    )
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="create_api_key",
+        target_type="api_key",
+        target_id=str(key_data["id"]),
+        summary=f"Created API key {body.name!r} for principal #{principal_id}",
+    )
+    return ApiKeyCreated(**key_data)
+
+
+@app.post("/api/admin/api-keys/{key_id}/revoke")
+async def api_admin_revoke_key(
+    key_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.credentials.write")),
+):
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    revoked = await admin_svc.revoke_api_key(_db(request), key_id)
+    if not revoked:
+        raise HTTPException(404, "key not found or already revoked")
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="revoke_api_key",
+        target_type="api_key",
+        target_id=str(key_id),
+        summary=f"Revoked API key #{key_id}",
+    )
+    return {"revoked": True, "key_id": key_id}
+
+
+@app.post("/api/admin/principals/{principal_id}/password")
+async def api_admin_set_password(
+    principal_id: int,
+    request: Request,
+    _identity=Depends(require_permission("admin.credentials.write")),
+):
+    from hub.models import PasswordSetPayload
+    from hub.services import admin as admin_svc
+
+    identity = _identity
+    body = PasswordSetPayload(**(await request.json()))
+    await admin_svc.set_password(_db(request), principal_id, body.password)
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="set_password",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Password set for principal #{principal_id}",
+    )
+    return {"ok": True}
+
+
+@app.get("/api/admin/audit")
+async def api_admin_audit(
+    request: Request,
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    _identity=Depends(require_permission("admin.audit.read")),
+):
+    from hub.models import AuditEntry
+    from hub.services import admin as admin_svc
+
+    rows = await admin_svc.list_audit(_db(request), limit=limit, offset=offset)
+    return [AuditEntry(**r) for r in rows]
+
+
+@app.post("/api/admin/bootstrap")
+async def api_admin_bootstrap(request: Request):
+    """Bootstrap the first admin. Requires the bootstrap token or open mode."""
+    from hub.models import AdminBootstrap, PrincipalView
+    from hub.services import admin as admin_svc
+
+    if not _is_open_mode() and not _check_bootstrap_token(request):
+        raise HTTPException(
+            403, "bootstrap requires OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN or open mode"
+        )
+    body = AdminBootstrap(**(await request.json()))
+    try:
+        p = await admin_svc.bootstrap_admin(
+            _db(request),
+            username=body.username,
+            password=body.password,
+            display_name=body.display_name,
+            email=body.email,
+        )
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+    return PrincipalView(**p)
+
+
+def _is_open_mode() -> bool:
+    if config.HUB_AUTH_DISABLED:
+        return True
+    return not config.HUB_TOKENS
+
+
+def _check_bootstrap_token(request: Request) -> bool:
+    if not config.HUB_BOOTSTRAP_TOKEN:
+        return False
+    bearer = request.headers.get("Authorization", "")
+    if bearer.startswith("Bearer "):
+        token = bearer[7:].strip()
+        return token == config.HUB_BOOTSTRAP_TOKEN
+    return False
 
 
 # ---------------------------------------------------------------------------

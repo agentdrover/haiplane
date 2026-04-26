@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Sign in — OpenClaw Hub</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f980;</text></svg>">
-    <link rel="stylesheet" href="/static/style.css?v={{ asset_version|default('20260419a') }}">
+    <link rel="stylesheet" href="/static/style.css?v={{ asset_version|default('20260426b') }}">
 </head>
 <body class="login-body">
 <div class="login-card">
@@ -14,19 +14,28 @@
         <span class="login-logo-sub">Hub</span>
     </div>
     <h1 class="login-title">Sign in</h1>
-    <p class="login-hint">
-        Paste the personal token issued by the Hub admin. Tokens are stored in the
-        <code>OPENCLAW_HUB_TOKENS</code> environment variable on the server.
-    </p>
     {% if error %}
     <div class="login-error">{{ error }}</div>
     {% endif %}
     <form method="post" action="/login" class="login-form">
         <input type="hidden" name="next" value="{{ next or '/' }}">
-        <label for="token">Token</label>
-        <input type="password" id="token" name="token" autocomplete="current-password" autofocus required>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" autocomplete="username" autofocus>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password">
         <button type="submit">Sign in</button>
     </form>
+    <details class="login-legacy">
+        <summary>Sign in with token (legacy)</summary>
+        <form method="post" action="/login" class="login-form" style="margin-top: 0.5rem;">
+            <input type="hidden" name="next" value="{{ next or '/' }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label for="token">Token</label>
+            <input type="password" id="token" name="token" autocomplete="off">
+            <button type="submit">Sign in with token</button>
+        </form>
+    </details>
 </div>
 </body>
 </html>

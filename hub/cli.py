@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 HUB_URL = os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+HUB_TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN", "")
 
 
 def _api(method: str, path: str, body: Any | None = None) -> Any:
@@ -29,6 +30,8 @@ def _api(method: str, path: str, body: Any | None = None) -> Any:
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    if HUB_TOKEN:
+        req.add_header("Authorization", f"Bearer {HUB_TOKEN}")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode()
@@ -612,6 +615,133 @@ def cmd_template(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Admin commands (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+def cmd_admin_bootstrap(args: argparse.Namespace) -> int:
+    import getpass
+
+    password = getpass.getpass("Password: ") if args.password_prompt else ""
+    if not password:
+        print("Password is required for bootstrap.", file=sys.stderr)
+        return 1
+    body = {
+        "username": args.username,
+        "password": password,
+        "display_name": getattr(args, "display_name", "") or "",
+        "email": getattr(args, "email", "") or "",
+    }
+    result = _api("POST", "/api/admin/bootstrap", body)
+    print(f"Admin user '{args.username}' created (id={result.get('id')}).")
+    return 0
+
+
+def cmd_admin_users_list(args: argparse.Namespace) -> int:
+    result = _api("GET", "/api/admin/principals?kind=human")
+    for p in result:
+        roles = ", ".join(p.get("roles", []))
+        print(
+            f"#{p['id']} [{p['status']}] {p['username']} ({p.get('display_name', '')}) roles=[{roles}]"
+        )
+    return 0
+
+
+def cmd_admin_users_create(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "kind": "human",
+        "username": args.username,
+        "email": getattr(args, "email", "") or "",
+        "display_name": getattr(args, "display_name", "") or "",
+        "role": getattr(args, "role", "") or "",
+    }
+    if getattr(args, "password_prompt", False):
+        import getpass
+
+        body["password"] = getpass.getpass("Password: ")
+    result = _api("POST", "/api/admin/principals", body)
+    print(f"User '{args.username}' created (id={result.get('id')}).")
+    return 0
+
+
+def cmd_admin_users_disable(args: argparse.Namespace) -> int:
+    principals = _api("GET", "/api/admin/principals?kind=human")
+    target = None
+    for p in principals:
+        if p["username"] == args.username or str(p["id"]) == args.username:
+            target = p
+            break
+    if not target:
+        print(f"User '{args.username}' not found.", file=sys.stderr)
+        return 1
+    _api("POST", f"/api/admin/principals/{target['id']}/disable", {})
+    print(f"User '{args.username}' disabled.")
+    return 0
+
+
+def cmd_admin_agents_create(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "kind": "agent",
+        "username": args.name,
+        "display_name": getattr(args, "display_name", "") or args.name,
+        "role": "agent",
+    }
+    result = _api("POST", "/api/admin/principals", body)
+    print(f"Agent '{args.name}' created (id={result.get('id')}).")
+    return 0
+
+
+def cmd_admin_keys_create(args: argparse.Namespace) -> int:
+    principals = _api("GET", "/api/admin/principals")
+    target = None
+    for p in principals:
+        if p["username"] == args.principal or str(p["id"]) == args.principal:
+            target = p
+            break
+    if not target:
+        print(f"Principal '{args.principal}' not found.", file=sys.stderr)
+        return 1
+    body: dict[str, Any] = {"name": args.name}
+    if getattr(args, "expires_days", None):
+        body["expires_days"] = args.expires_days
+    result = _api("POST", f"/api/admin/principals/{target['id']}/api-keys", body)
+    print(
+        f"API key created (id={result.get('id')}, prefix={result.get('key_prefix')}…)"
+    )
+    print(f"Key: {result.get('plaintext_key')}")
+    print("Save this key now — it will not be shown again.")
+    return 0
+
+
+def cmd_admin_keys_revoke(args: argparse.Namespace) -> int:
+    _api("POST", f"/api/admin/api-keys/{args.key_id}/revoke", {})
+    print(f"API key #{args.key_id} revoked.")
+    return 0
+
+
+def cmd_admin_roles_list(args: argparse.Namespace) -> int:
+    result = _api("GET", "/api/admin/roles")
+    for r in result:
+        sys_tag = " [system]" if r.get("system") else ""
+        perms = ", ".join(r.get("permissions", []))
+        print(f"{r['slug']}{sys_tag}: {r['name']}")
+        if perms:
+            print(f"  permissions: {perms}")
+    return 0
+
+
+def cmd_admin_audit(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 50)
+    result = _api("GET", f"/api/admin/audit?limit={limit}")
+    for e in result:
+        actor = e.get("actor_username") or "—"
+        print(
+            f"[{e.get('created_at', '')}] {actor} {e['action']} {e.get('target_type', '')} {e.get('target_id', '')}: {e['summary']}"
+        )
+    return 0
+
+
 def cmd_readiness(args: argparse.Namespace) -> int:
     path = f"/api/tasks/{args.task_id}/readiness"
     if args.explain:
@@ -660,9 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_task.add_argument("--title", required=True)
     p_task.add_argument("--description", default="")
-    p_task.add_argument(
-        "--runtime", choices=["auto", "openrouter", "vast"], default="auto"
-    )
+    p_task.add_argument("--runtime", choices=["auto", "openrouter"], default="auto")
     p_task.add_argument("--run", action="store_true", help="Dispatch immediately")
     p_task.add_argument(
         "--no-review",
@@ -744,9 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_approve.add_argument(
         "--run", action="store_true", help="Also dispatch immediately"
     )
-    p_approve.add_argument(
-        "--runtime", choices=["auto", "openrouter", "vast"], default=None
-    )
+    p_approve.add_argument("--runtime", choices=["auto", "openrouter"], default=None)
     p_approve.add_argument(
         "--force",
         action="store_true",
@@ -766,9 +892,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument(
         "--plan", default="", help="Work plan (required if no plan update exists)"
     )
-    p_start.add_argument(
-        "--runtime", choices=["auto", "openrouter", "vast"], default=None
-    )
+    p_start.add_argument("--runtime", choices=["auto", "openrouter"], default=None)
     p_start.set_defaults(func=cmd_start)
 
     # question — agent asks a question (sets needs_info)
@@ -1105,6 +1229,92 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print full ReadinessReport JSON"
     )
     p_readiness.set_defaults(func=cmd_readiness)
+
+    # ---- Admin commands (Stage 4) ----------------------------------------
+
+    p_admin = sub.add_parser(
+        "admin", help="Admin commands: bootstrap, users, agents, keys, roles, audit"
+    )
+    admin_sub = p_admin.add_subparsers(dest="admin_command", required=True)
+
+    # admin bootstrap
+    p_bootstrap = admin_sub.add_parser("bootstrap", help="Create the first admin user")
+    p_bootstrap.add_argument("--username", required=True)
+    p_bootstrap.add_argument(
+        "--password-prompt",
+        dest="password_prompt",
+        action="store_true",
+        help="Prompt for password",
+    )
+    p_bootstrap.add_argument("--display-name", dest="display_name", default="")
+    p_bootstrap.add_argument("--email", default="")
+    p_bootstrap.set_defaults(func=cmd_admin_bootstrap)
+
+    # admin users
+    p_admin_users = admin_sub.add_parser("users", help="Manage human users")
+    users_sub = p_admin_users.add_subparsers(dest="users_command", required=True)
+
+    p_users_list = users_sub.add_parser("list", help="List human users")
+    p_users_list.set_defaults(func=cmd_admin_users_list)
+
+    p_users_create = users_sub.add_parser("create", help="Create a human user")
+    p_users_create.add_argument("--username", required=True)
+    p_users_create.add_argument("--email", default="")
+    p_users_create.add_argument("--display-name", dest="display_name", default="")
+    p_users_create.add_argument(
+        "--role",
+        default="operator",
+        help="Role slug (operator, developer, admin, etc.)",
+    )
+    p_users_create.add_argument(
+        "--password-prompt", dest="password_prompt", action="store_true"
+    )
+    p_users_create.set_defaults(func=cmd_admin_users_create)
+
+    p_users_disable = users_sub.add_parser("disable", help="Disable a human user")
+    p_users_disable.add_argument("username", help="Username or ID to disable")
+    p_users_disable.set_defaults(func=cmd_admin_users_disable)
+
+    # admin agents
+    p_admin_agents = admin_sub.add_parser("agents", help="Manage AI agents")
+    agents_sub = p_admin_agents.add_subparsers(dest="agents_command", required=True)
+
+    p_agents_create = agents_sub.add_parser(
+        "create", help="Create an AI agent identity"
+    )
+    p_agents_create.add_argument("--name", required=True, help="Agent slug/username")
+    p_agents_create.add_argument("--display-name", dest="display_name", default="")
+    p_agents_create.set_defaults(func=cmd_admin_agents_create)
+
+    # admin keys
+    p_admin_keys = admin_sub.add_parser("keys", help="Manage API keys")
+    keys_sub = p_admin_keys.add_subparsers(dest="keys_command", required=True)
+
+    p_keys_create = keys_sub.add_parser("create", help="Create an API key")
+    p_keys_create.add_argument("--principal", required=True, help="Username or ID")
+    p_keys_create.add_argument("--name", required=True, help="Key name/description")
+    p_keys_create.add_argument(
+        "--expires-days", dest="expires_days", type=int, default=None
+    )
+    p_keys_create.set_defaults(func=cmd_admin_keys_create)
+
+    p_keys_revoke = keys_sub.add_parser("revoke", help="Revoke an API key")
+    p_keys_revoke.add_argument("key_id", type=int)
+    p_keys_revoke.set_defaults(func=cmd_admin_keys_revoke)
+
+    # admin roles
+    p_admin_roles = admin_sub.add_parser("roles", help="Manage roles")
+    roles_sub = p_admin_roles.add_subparsers(dest="roles_command", required=True)
+
+    p_roles_list = roles_sub.add_parser("list", help="List all roles")
+    p_roles_list.set_defaults(func=cmd_admin_roles_list)
+
+    # admin audit
+    p_admin_audit = admin_sub.add_parser("audit", help="View audit log")
+    p_admin_audit.add_argument("--limit", type=int, default=50)
+    p_admin_audit.set_defaults(func=cmd_admin_audit)
+
+    # ---- Templates -------------------------------------------------------
 
     p_tpl = sub.add_parser(
         "template",

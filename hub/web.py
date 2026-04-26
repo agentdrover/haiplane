@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,13 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
-from hub.auth import current_user
+from hub.auth import (
+    CSRF_COOKIE_NAME,
+    current_user,
+    generate_csrf_token,
+    login_limiter,
+    verify_csrf,
+)
 from hub.integrations.registry import plugins
 from hub.models import (
     RuntimeChoice,
@@ -66,40 +73,129 @@ async def web_login_form(
     next: str = Query(default="/"),
     error: str = Query(default=""),
 ):
-    return TEMPLATES.TemplateResponse(
+    csrf_token = generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
         request,
         "login.html",
-        {"next": _safe_next(next), "error": error},
+        {"next": _safe_next(next), "error": error, "csrf_token": csrf_token},
     )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 @router.post("/login")
 async def web_login_submit(
     request: Request,
-    token: str = Form(...),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    token: str = Form(default=""),
+    csrf_token: str = Form(default=""),
     next: str = Form("/"),
 ):
-    if config.HUB_AUTH_DISABLED or not config.HUB_TOKENS:
-        # Open mode — accept anything, just bounce back. Useful when admins
-        # turn auth on/off without restarting clients.
-        return RedirectResponse(_safe_next(next), status_code=303)
-    user = config.HUB_TOKENS.get(token.strip())
-    if not user:
+    safe_next = _safe_next(next)
+
+    if config.HUB_AUTH_DISABLED or (
+        not config.HUB_TOKENS and not _has_db_principals(request)
+    ):
+        return RedirectResponse(safe_next, status_code=303)
+
+    # CSRF verification
+    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
+    if not verify_csrf(csrf_token, csrf_cookie):
         return RedirectResponse(
-            f"/login?error=Invalid%20token&next={_safe_next(next)}",
+            f"/login?error=Invalid%20form%20submission.%20Please%20try%20again.&next={safe_next}",
             status_code=303,
         )
-    response = RedirectResponse(_safe_next(next), status_code=303)
-    response.set_cookie(
-        key=config.HUB_COOKIE_NAME,
-        value=token.strip(),
-        max_age=config.HUB_COOKIE_MAX_AGE,
-        httponly=True,
-        samesite="lax",
-        # secure flag is left off so the cookie works on HTTP-only deploys
-        # behind Tailscale; production deploys with TLS should set it.
+
+    # Rate limiting
+    client_ip = _client_ip(request)
+    if login_limiter.is_blocked(client_ip):
+        return RedirectResponse(
+            f"/login?error=Too%20many%20login%20attempts.%20Please%20wait%20a%20few%20minutes.&next={safe_next}",
+            status_code=303,
+        )
+
+    # Username + password login (DB-backed)
+    if username and password:
+        from hub.services import admin as admin_svc
+
+        login_limiter.record(client_ip)
+        db = _db(request)
+        ip_hash = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
+        principal_id = await admin_svc.authenticate_password(
+            db, username.strip(), password
+        )
+        if not principal_id:
+            return RedirectResponse(
+                f"/login?error=Invalid%20credentials&next={safe_next}",
+                status_code=303,
+            )
+        session_token = await admin_svc.create_browser_session(
+            db,
+            principal_id,
+            ip_hash=ip_hash,
+            user_agent=request.headers.get("user-agent", "")[:200],
+            max_age_seconds=config.HUB_COOKIE_MAX_AGE,
+        )
+        response = RedirectResponse(safe_next, status_code=303)
+        response.set_cookie(
+            key=config.HUB_COOKIE_NAME,
+            value=session_token,
+            max_age=config.HUB_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            secure=config.HUB_COOKIE_SECURE,
+        )
+        response.delete_cookie(CSRF_COOKIE_NAME)
+        return response
+
+    # Legacy token login (env-based, deprecated)
+    if token:
+        login_limiter.record(client_ip)
+        identity = config.HUB_TOKENS.get(token.strip())
+        if not identity:
+            return RedirectResponse(
+                f"/login?error=Invalid%20token&next={safe_next}",
+                status_code=303,
+            )
+        response = RedirectResponse(safe_next, status_code=303)
+        response.set_cookie(
+            key=config.HUB_COOKIE_NAME,
+            value=token.strip(),
+            max_age=config.HUB_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            secure=config.HUB_COOKIE_SECURE,
+        )
+        response.delete_cookie(CSRF_COOKIE_NAME)
+        return response
+
+    return RedirectResponse(
+        f"/login?error=Please%20enter%20credentials&next={safe_next}",
+        status_code=303,
     )
-    return response
+
+
+def _has_db_principals(request: Request) -> bool:
+    """Quick check if DB principals exist (non-blocking heuristic)."""
+    try:
+        return hasattr(request.app.state, "db")
+    except Exception:
+        return False
 
 
 @router.post("/logout")
@@ -119,17 +215,21 @@ def _is_htmx(request: Request) -> bool:
 
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
+    import html as html_mod
+
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         return HTMLResponse("")
     t = services.row_to_task(row)
-    html = (
+    safe_title = html_mod.escape(t.title[:40])
+    safe_status = html_mod.escape(t.status.value)
+    fragment = (
         f'<div class="inbox-item-done" id="inbox-task-{t.id}">'
-        f'<span class="badge badge-{t.status.value}">{t.status.value}</span> '
-        f"#{t.id} {t.title[:40]}</div>"
+        f'<span class="badge badge-{safe_status}">{safe_status}</span> '
+        f"#{t.id} {safe_title}</div>"
     )
-    return HTMLResponse(html)
+    return HTMLResponse(fragment)
 
 
 # ---------------------------------------------------------------------------
@@ -493,3 +593,84 @@ async def web_reject_proposal_compat(
 async def web_proposals_compat(request: Request):
     """Deprecated: redirects to tasks filtered by agent source."""
     return RedirectResponse("/tasks?source=agent", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Admin web routes (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+def _require_admin_web(request: Request) -> None:
+    identity = getattr(request.state, "identity", None)
+    if not identity or not identity.is_admin:
+        raise HTTPException(403, "admin access required")
+
+
+@router.get("/admin", response_class=HTMLResponse)
+async def web_admin_summary(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    summary = await admin_svc.admin_summary(_db(request))
+    return TEMPLATES.TemplateResponse(
+        request, "admin/summary.html", {"summary": summary, "active": "admin"}
+    )
+
+
+@router.get("/admin/users", response_class=HTMLResponse)
+async def web_admin_users(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    principals = await admin_svc.list_principals(_db(request), kind="human")
+    return TEMPLATES.TemplateResponse(
+        request, "admin/users.html", {"principals": principals, "active": "admin"}
+    )
+
+
+@router.get("/admin/agents", response_class=HTMLResponse)
+async def web_admin_agents(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    principals = await admin_svc.list_principals(_db(request), kind="agent")
+    return TEMPLATES.TemplateResponse(
+        request, "admin/agents.html", {"principals": principals, "active": "admin"}
+    )
+
+
+@router.get("/admin/roles", response_class=HTMLResponse)
+async def web_admin_roles(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    roles = await admin_svc.list_roles(_db(request))
+    return TEMPLATES.TemplateResponse(
+        request, "admin/roles.html", {"roles": roles, "active": "admin"}
+    )
+
+
+@router.get("/admin/keys", response_class=HTMLResponse)
+async def web_admin_keys(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    keys = await admin_svc.list_api_keys(_db(request))
+    principals = await admin_svc.list_principals(_db(request))
+    pid_to_name = {p["id"]: p["username"] for p in principals}
+    return TEMPLATES.TemplateResponse(
+        request,
+        "admin/keys.html",
+        {"keys": keys, "pid_to_name": pid_to_name, "active": "admin"},
+    )
+
+
+@router.get("/admin/audit", response_class=HTMLResponse)
+async def web_admin_audit(request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    entries = await admin_svc.list_audit(_db(request), limit=100)
+    return TEMPLATES.TemplateResponse(
+        request, "admin/audit.html", {"entries": entries, "active": "admin"}
+    )

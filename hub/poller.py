@@ -491,8 +491,34 @@ def _extract_review_from_log(full_log: str) -> str:
     return ""
 
 
+SESSION_CLEANUP_INTERVAL = 3600  # 1 hour
+
+
+async def _session_reaper(app: FastAPI) -> None:
+    """Periodically purge expired browser sessions and clean up the login rate limiter."""
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+        try:
+            db = app.state.db
+            cursor = await db.execute(
+                "DELETE FROM browser_sessions WHERE expires_at < datetime('now') "
+                "OR revoked_at IS NOT NULL"
+            )
+            deleted = cursor.rowcount
+            await db.commit()
+            if deleted:
+                log.info("Session reaper: removed %d expired/revoked sessions", deleted)
+
+            from hub.auth import login_limiter
+
+            login_limiter._cleanup()
+        except Exception:
+            log.exception("Session reaper error")
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
     """Create and return the background poller task."""
     task = asyncio.create_task(_poll_running_tasks(app))
+    asyncio.create_task(_session_reaper(app))
     log.info("Background poller started (every %ds)", POLL_INTERVAL)
     return task

@@ -407,3 +407,54 @@ async def test_readiness_full_feature_returns_100(client: AsyncClient):
 async def test_readiness_unknown_task_returns_404(client: AsyncClient):
     resp = await client.get("/api/tasks/99999/readiness")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Collection payload limits
+# ---------------------------------------------------------------------------
+
+
+async def test_put_oversized_ac_list_returns_422(client: AsyncClient):
+    """PUT /acceptance_criteria with >50 items must be rejected."""
+    from hub.models import MAX_ACCEPTANCE_CRITERIA
+
+    task = await _create_task(client)
+    oversized = [_ac_payload(i) for i in range(MAX_ACCEPTANCE_CRITERIA + 1)]
+    resp = await client.put(
+        f"/api/tasks/{task['id']}/acceptance_criteria",
+        json=oversized,
+    )
+    assert resp.status_code == 422
+    assert "too many" in resp.text.lower()
+
+
+async def test_refine_oversized_acs_returns_422(client: AsyncClient):
+    from hub.models import MAX_ACCEPTANCE_CRITERIA
+
+    task = await _create_task(client)
+    oversized = [_ac_payload(i) for i in range(MAX_ACCEPTANCE_CRITERIA + 1)]
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"acceptance_criteria": oversized},
+    )
+    assert resp.status_code == 422
+
+
+async def test_refine_oversized_risks_returns_422(client: AsyncClient):
+    from hub.models import MAX_RISKS
+
+    task = await _create_task(client)
+    oversized = [
+        {
+            "kind": "security",
+            "severity": "low",
+            "description": f"r-{i}",
+            "mitigation": "m",
+        }
+        for i in range(MAX_RISKS + 1)
+    ]
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"risks": oversized},
+    )
+    assert resp.status_code == 422

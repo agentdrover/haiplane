@@ -6,7 +6,6 @@
 {% block content %}
 {% set _running_count = (data.active_tasks|selectattr("status.value", "equalto", "running")|list|length) + (data.active_tasks|selectattr("status.value", "equalto", "fix_requested")|list|length) %}
 {% set _open_count = data.active_tasks|selectattr("status.value", "equalto", "open")|list|length %}
-{% set _vast_offline = data.vast_status and ('no instance' in data.vast_status|lower or 'unknown' in data.vast_status|lower or 'not found' in data.vast_status|lower) %}
 <header class="topbar">
     <div class="topbar-brand">
         <span class="topbar-title">Dashboard</span>
@@ -38,13 +37,6 @@
             <span class="topbar-stat-value">{{ data.needs_decision_tasks|length }}</span>
         </a>
     </div>
-    {% if data.vast_status %}
-    <div class="topbar-vast{% if _vast_offline %} is-offline{% endif %}" title="Vast.ai: {{ data.vast_status }}">
-        <span class="topbar-vast-dot"></span>
-        <span class="topbar-vast-label">Vast.ai</span>
-        <span class="topbar-vast-state">{{ 'offline' if _vast_offline else 'online' }}</span>
-    </div>
-    {% endif %}
 </header>
 
 <!-- ═══════════ INBOX ═══════════ -->
@@ -197,7 +189,6 @@
                                 <select name="runtime" id="nt-runtime">
                                     <option value="auto">Auto</option>
                                     <option value="openrouter">OpenRouter</option>
-                                    <option value="vast">Vast.ai</option>
                                 </select>
                             </div>
                         </div>

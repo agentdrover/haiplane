@@ -17,6 +17,8 @@ For the recommended human + AI-agent software delivery flow, see
 [docs/software-development-workflow.md](docs/software-development-workflow.md).
 For repository branching, commit, validation, and review rules, see
 [docs/repository-rules.md](docs/repository-rules.md).
+For the planned admin section covering users, AI agents, roles, keys, and
+passwords, see [docs/admin-section-design.md](docs/admin-section-design.md).
 
 ## Quick Start
 

@@ -217,3 +217,20 @@ async def test_web_force_complete_falls_back_to_form_comment(client: AsyncClient
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
     assert done_updates[0]["content"] == "form-based override"
+
+
+async def test_htmx_done_fragment_escapes_xss_title(client: AsyncClient, db):
+    """Stored XSS in task title must be escaped in the HTMX done fragment."""
+    xss_title = "<img src=x onerror=alert(1)>"
+    create = await client.post("/api/tasks", json={"title": xss_title})
+    task_id = create.json()["id"]
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-force-complete",
+        headers={"HX-Request": "true", "HX-Prompt": "ok"},
+    )
+    assert resp.status_code == 200
+    assert "<img" not in resp.text
+    assert "&lt;img" in resp.text

@@ -207,6 +207,134 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_checklist_column",
         "ALTER TABLE tasks ADD COLUMN review_checklist TEXT NOT NULL DEFAULT '[]'",
     ),
+    # ---- Admin section (Stage 4) ----
+    (
+        "create_principals_table",
+        """CREATE TABLE IF NOT EXISTS principals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK(kind IN ('human','agent','service')),
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','locked')),
+            notes TEXT NOT NULL DEFAULT '',
+            created_by INTEGER REFERENCES principals(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at TEXT
+        )""",
+    ),
+    (
+        "create_roles_table",
+        """CREATE TABLE IF NOT EXISTS roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            system INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "create_principal_roles_table",
+        """CREATE TABLE IF NOT EXISTS principal_roles (
+            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+            granted_by INTEGER REFERENCES principals(id),
+            granted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (principal_id, role_id)
+        )""",
+    ),
+    (
+        "create_role_permissions_table",
+        """CREATE TABLE IF NOT EXISTS role_permissions (
+            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+            permission TEXT NOT NULL,
+            PRIMARY KEY (role_id, permission)
+        )""",
+    ),
+    (
+        "create_password_credentials_table",
+        """CREATE TABLE IF NOT EXISTS password_credentials (
+            principal_id INTEGER PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
+            password_hash TEXT NOT NULL,
+            hash_algorithm TEXT NOT NULL DEFAULT 'argon2id',
+            password_changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            must_rotate INTEGER NOT NULL DEFAULT 0,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
+            last_login_at TEXT
+        )""",
+    ),
+    (
+        "create_api_keys_table",
+        """CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            key_prefix TEXT NOT NULL,
+            key_hash TEXT NOT NULL UNIQUE,
+            scopes TEXT NOT NULL DEFAULT '[]',
+            expires_at TEXT,
+            last_used_at TEXT,
+            revoked_at TEXT,
+            created_by INTEGER REFERENCES principals(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "create_browser_sessions_table",
+        """CREATE TABLE IF NOT EXISTS browser_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            session_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            ip_hash TEXT NOT NULL DEFAULT '',
+            user_agent TEXT NOT NULL DEFAULT ''
+        )""",
+    ),
+    (
+        "create_admin_audit_log_table",
+        """CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_principal_id INTEGER REFERENCES principals(id),
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL,
+            detail TEXT,
+            ip_hash TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_principals_kind_status",
+        "CREATE INDEX IF NOT EXISTS idx_principals_kind_status ON principals(kind, status)",
+    ),
+    (
+        "idx_api_keys_principal_id",
+        "CREATE INDEX IF NOT EXISTS idx_api_keys_principal_id ON api_keys(principal_id)",
+    ),
+    (
+        "idx_api_keys_prefix",
+        "CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)",
+    ),
+    (
+        "idx_browser_sessions_principal_id",
+        "CREATE INDEX IF NOT EXISTS idx_browser_sessions_principal_id ON browser_sessions(principal_id)",
+    ),
+    (
+        "idx_admin_audit_actor",
+        "CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit_log(actor_principal_id)",
+    ),
+    (
+        "idx_admin_audit_target",
+        "CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_log(target_type, target_id)",
+    ),
 ]
 
 
@@ -482,6 +610,8 @@ async def get_db() -> aiosqlite.Connection:
     await db.executescript(_SCHEMA)
     await _migrate(db)
     await _fix_orphaned_parents(db)
+    if await _table_exists(db, "roles"):
+        await seed_system_roles(db)
     return db
 
 
@@ -660,3 +790,147 @@ async def log_activity(
         (kind, summary, detail),
     )
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Admin section: system roles, permissions, seed
+# ---------------------------------------------------------------------------
+
+ALL_PERMISSIONS: tuple[str, ...] = (
+    "admin.read",
+    "admin.users.write",
+    "admin.agents.write",
+    "admin.roles.write",
+    "admin.credentials.write",
+    "admin.audit.read",
+    "tasks.read",
+    "tasks.create",
+    "tasks.refine",
+    "tasks.update",
+    "tasks.human_gate",
+    "tasks.agent_report",
+    "tasks.decision",
+    "integrations.vast.manage",
+    "system.settings.write",
+)
+
+SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    (
+        "super_admin",
+        "Super Admin",
+        "Full access, bootstrap-only, cannot be deleted",
+        ALL_PERMISSIONS,
+    ),
+    (
+        "admin",
+        "Admin",
+        "Manage users, agents, keys, settings",
+        (
+            "admin.read",
+            "admin.users.write",
+            "admin.agents.write",
+            "admin.roles.write",
+            "admin.credentials.write",
+            "admin.audit.read",
+            "tasks.read",
+            "tasks.create",
+            "tasks.refine",
+            "tasks.update",
+            "tasks.human_gate",
+            "tasks.decision",
+            "integrations.vast.manage",
+        ),
+    ),
+    (
+        "operator",
+        "Operator",
+        "Human gates, task dispatch, decisions, force-complete",
+        (
+            "tasks.read",
+            "tasks.create",
+            "tasks.refine",
+            "tasks.update",
+            "tasks.human_gate",
+            "tasks.decision",
+            "integrations.vast.manage",
+        ),
+    ),
+    (
+        "developer",
+        "Developer",
+        "Create and manage tasks without admin access",
+        ("tasks.read", "tasks.create", "tasks.refine", "tasks.update"),
+    ),
+    (
+        "viewer",
+        "Viewer",
+        "Read-only dashboard and tasks",
+        ("tasks.read",),
+    ),
+    (
+        "agent",
+        "Agent",
+        "AI agent: propose, update, question, report done",
+        (
+            "tasks.read",
+            "tasks.create",
+            "tasks.refine",
+            "tasks.update",
+            "tasks.agent_report",
+        ),
+    ),
+    (
+        "reviewer_agent",
+        "Reviewer Agent",
+        "Agent with review/report permissions",
+        (
+            "tasks.read",
+            "tasks.create",
+            "tasks.refine",
+            "tasks.update",
+            "tasks.agent_report",
+        ),
+    ),
+    (
+        "security_admin",
+        "Security Admin",
+        "Audit and security settings only",
+        ("admin.read", "admin.audit.read"),
+    ),
+)
+
+
+async def seed_system_roles(db: aiosqlite.Connection) -> None:
+    """Ensure system roles and their permissions exist.
+
+    Idempotent: skips roles that already exist, adds missing permissions.
+    """
+    for slug, name, description, permissions in SYSTEM_ROLES:
+        rows = await db.execute_fetchall("SELECT id FROM roles WHERE slug = ?", (slug,))
+        if rows:
+            role_id = rows[0][0]
+        else:
+            cursor = await db.execute(
+                "INSERT INTO roles (slug, name, description, system) VALUES (?, ?, ?, 1)",
+                (slug, name, description),
+            )
+            role_id = cursor.lastrowid
+        for perm in permissions:
+            await db.execute(
+                "INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES (?, ?)",
+                (role_id, perm),
+            )
+    await db.commit()
+
+
+async def has_active_admin(db: aiosqlite.Connection) -> bool:
+    """Check if at least one active principal with admin or super_admin role exists."""
+    rows = await db.execute_fetchall(
+        """SELECT 1 FROM principals p
+           JOIN principal_roles pr ON p.id = pr.principal_id
+           JOIN roles r ON pr.role_id = r.id
+           WHERE p.status = 'active'
+             AND r.slug IN ('super_admin', 'admin')
+           LIMIT 1"""
+    )
+    return len(rows) > 0

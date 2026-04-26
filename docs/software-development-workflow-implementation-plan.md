@@ -337,6 +337,30 @@ uv run pytest tests/test_models.py tests/test_repository_structured.py tests/tes
 uv run pytest tests/test_api_refine.py tests/test_cli.py tests/test_mcp_server.py tests/test_web.py -q
 ```
 
+## Этап 4. Admin section, users, agents, roles, credentials
+
+Дизайн: `docs/admin-section-design.md`.
+
+Цель этапа - заменить env-only auth management на DB-backed раздел администрирования:
+
+- admins and human users;
+- AI-agent identities;
+- roles and permissions;
+- API/MCP keys;
+- passwords and browser sessions;
+- admin audit log.
+
+Рекомендуемый порядок:
+
+1. DB-backed identity foundation: `principals`, `roles`, `principal_roles`, `role_permissions`, `admin_audit_log`, bootstrap первого admin.
+2. API keys and permission checks: DB-backed bearer auth, env fallback, `require_permission`.
+3. Browser users and passwords: password credentials, opaque browser sessions, password reset.
+4. Admin UI: `/admin`, users, agents, roles, keys, audit.
+5. CLI emergency/admin commands: bootstrap, users, agents, keys, audit.
+
+Этап 4 является schema/API/security change. Реализовывать только с миграциями,
+admin/auth тестами и явной проверкой, что agent credentials не получают human/admin gates.
+
 ## Рекомендуемый порядок запуска доработки
 
 1. Этап 1.1: MCP `force` parity.
@@ -347,6 +371,7 @@ uv run pytest tests/test_api_refine.py tests/test_cli.py tests/test_mcp_server.p
 6. Этап 2.2: decision capture.
 7. Этап 3.1: dedicated risk endpoint.
 8. Этап 3.2: review checklist.
+9. Этап 4: admin section, users, agents, roles, credentials.
 
 ## Definition of Done для всего плана
 

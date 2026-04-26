@@ -1,0 +1,24 @@
+{% extends "admin/base_admin.html" %}
+{% set admin_page = "agents" %}
+{% block title %}Agents — Admin — OpenClaw Hub{% endblock %}
+{% block admin_content %}
+<h1>AI Agents</h1>
+<table class="admin-table">
+    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Roles</th><th>Status</th><th>Last Seen</th></tr></thead>
+    <tbody>
+    {% for p in principals %}
+    <tr>
+        <td>{{ p.id }}</td>
+        <td>{{ p.username }}</td>
+        <td>{{ p.display_name }}</td>
+        <td>{{ p.roles|join(', ') }}</td>
+        <td><span class="badge badge-{{ p.status }}">{{ p.status }}</span></td>
+        <td>{{ p.last_seen_at or '—' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% if not principals %}
+<p>No agents found.</p>
+{% endif %}
+{% endblock %}

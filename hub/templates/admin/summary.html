@@ -1,0 +1,52 @@
+{% extends "admin/base_admin.html" %}
+{% set admin_page = "summary" %}
+{% block title %}Admin — OpenClaw Hub{% endblock %}
+{% block admin_content %}
+<h1>Admin Summary</h1>
+<div class="admin-stats">
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.active_users }}</div>
+        <div class="stat-label">Active Users</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.disabled_users }}</div>
+        <div class="stat-label">Disabled Users</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.active_agents }}</div>
+        <div class="stat-label">Active Agents</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.active_api_keys }}</div>
+        <div class="stat-label">Active API Keys</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ summary.locked_users }}</div>
+        <div class="stat-label">Locked Users</div>
+    </div>
+</div>
+
+{% if summary.admin_bootstrap_required %}
+<div class="admin-warning">No active admin found. Run <code>oc-hub admin bootstrap</code> to create the first admin.</div>
+{% endif %}
+{% if summary.env_tokens_active %}
+<div class="admin-notice">Environment tokens are active (compatibility mode). Consider migrating to DB-backed credentials.</div>
+{% endif %}
+
+{% if summary.recent_audit %}
+<h2>Recent Audit Events</h2>
+<table class="admin-table">
+    <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Summary</th></tr></thead>
+    <tbody>
+    {% for e in summary.recent_audit %}
+    <tr>
+        <td>{{ e.created_at }}</td>
+        <td>{{ e.actor_username or '—' }}</td>
+        <td>{{ e.action }}</td>
+        <td>{{ e.summary }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+{% endblock %}

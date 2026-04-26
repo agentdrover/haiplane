@@ -260,6 +260,39 @@ def test_task_refine_accepts_acs_and_risks():
     assert refine.risks[0].kind == RiskKind.large_scope
 
 
+def test_task_refine_rejects_too_many_acs():
+    from hub.models import MAX_ACCEPTANCE_CRITERIA
+
+    acs = [
+        AcceptanceCriterion(
+            id=f"AC-{i}",
+            given="g",
+            when="w",
+            then="t",
+            verifiable_by=ACVerifiableBy.test,
+        )
+        for i in range(MAX_ACCEPTANCE_CRITERIA + 1)
+    ]
+    with pytest.raises(ValidationError, match="too many acceptance criteria"):
+        TaskRefine(acceptance_criteria=acs)
+
+
+def test_task_refine_rejects_too_many_risks():
+    from hub.models import MAX_RISKS
+
+    risks = [
+        TaskRisk(
+            kind=RiskKind.security,
+            severity=RiskSeverity.low,
+            description=f"risk {i}",
+            mitigation="handle it",
+        )
+        for i in range(MAX_RISKS + 1)
+    ]
+    with pytest.raises(ValidationError, match="too many risks"):
+        TaskRefine(risks=risks)
+
+
 # --- TaskApprove force flag ---
 
 

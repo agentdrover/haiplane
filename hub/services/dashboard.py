@@ -58,11 +58,14 @@ async def get_dashboard_data(db: aiosqlite.Connection) -> DashboardData:
 
     recent_activity = _parse_activity_rows(activity_rows)
 
-    vast_info = await plugins.vast.vast_status()
-    if vast_info.get("managed"):
-        vast_label = vast_info.get("instance", {}).get("label", "running")
+    if config.VAST_ENABLED:
+        vast_info = await plugins.vast.vast_status()
+        if vast_info.get("managed"):
+            vast_label = vast_info.get("instance", {}).get("label", "running")
+        else:
+            vast_label = "no instance"
     else:
-        vast_label = "no instance"
+        vast_label = None
 
     return DashboardData(
         recent_commits=commits,
