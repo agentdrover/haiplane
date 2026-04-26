@@ -2391,3 +2391,185 @@ body.htmx-request .htmx-progress {
 .badge-locked { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
 .login-legacy { margin-top: var(--sp-3); font-size: 13px; color: var(--clr-muted); }
 .login-legacy summary { cursor: pointer; }
+
+/* ---- Admin interactive UI ---- */
+
+/* Flash / toast notifications */
+.admin-flash-container {
+    position: fixed;
+    top: var(--sp-4);
+    right: var(--sp-4);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    max-width: 420px;
+}
+.admin-flash {
+    padding: var(--sp-3) var(--sp-5);
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--shadow-lg);
+    animation: flashIn 0.3s var(--ease) both;
+    cursor: pointer;
+    line-height: 1.5;
+}
+.admin-flash-success {
+    background: var(--green);
+    color: #fff;
+}
+.admin-flash-error {
+    background: var(--red);
+    color: #fff;
+}
+@keyframes flashIn {
+    from { opacity: 0; transform: translateX(40px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes flashOut {
+    from { opacity: 1; transform: translateX(0); }
+    to   { opacity: 0; transform: translateX(40px); }
+}
+
+/* Collapsible create forms */
+.admin-form-wrap {
+    margin-bottom: var(--sp-4);
+}
+.admin-form-wrap summary {
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent-light);
+    padding: var(--sp-2) 0;
+    user-select: none;
+    list-style: none;
+}
+.admin-form-wrap summary::-webkit-details-marker { display: none; }
+.admin-form-wrap summary::before { content: "+ "; }
+.admin-form-wrap[open] summary::before { content: "- "; }
+
+.admin-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: var(--sp-3);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-4);
+    margin-top: var(--sp-2);
+}
+.admin-form label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    display: block;
+    margin-bottom: var(--sp-1);
+}
+.admin-form input,
+.admin-form select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--sp-2) var(--sp-3);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    box-sizing: border-box;
+    transition: border-color var(--duration) var(--ease);
+}
+.admin-form input:focus,
+.admin-form select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.admin-form-actions {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: var(--sp-2);
+    justify-content: flex-end;
+    padding-top: var(--sp-2);
+}
+
+/* Action buttons for table rows */
+.admin-actions {
+    display: flex;
+    gap: var(--sp-1);
+    flex-wrap: wrap;
+}
+.admin-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all var(--duration) var(--ease);
+}
+.admin-btn:hover {
+    background: var(--surface-hover);
+    color: var(--text);
+    border-color: var(--text-muted);
+}
+.admin-btn-primary {
+    border-color: var(--accent);
+    color: var(--accent-light);
+}
+.admin-btn-primary:hover {
+    background: var(--accent-dim);
+    color: var(--accent-light);
+    border-color: var(--accent-light);
+}
+.admin-btn-danger {
+    border-color: rgba(231, 76, 60, 0.4);
+    color: var(--red);
+}
+.admin-btn-danger:hover {
+    background: var(--red-dim);
+    color: var(--red);
+    border-color: var(--red);
+}
+
+/* Plaintext key reveal box */
+.admin-key-reveal {
+    background: var(--yellow-dim);
+    border: 1px solid var(--yellow);
+    border-radius: var(--radius);
+    padding: var(--sp-3) var(--sp-4);
+    margin: var(--sp-3) 0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+.admin-key-reveal code {
+    display: block;
+    background: var(--bg);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-sm);
+    margin-top: var(--sp-2);
+    font-size: 12px;
+    word-break: break-all;
+    user-select: all;
+}
+.admin-key-reveal .warning {
+    color: var(--orange);
+    font-weight: 700;
+    font-size: 12px;
+}
+
+/* Quick actions on summary page */
+.admin-quick-actions {
+    display: flex;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    margin-bottom: var(--sp-4);
+}

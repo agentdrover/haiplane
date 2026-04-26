@@ -3,17 +3,59 @@
 {% block title %}Agents — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>AI Agents</h1>
-<table class="admin-table">
-    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Roles</th><th>Status</th><th>Last Seen</th></tr></thead>
+
+<details class="admin-form-wrap">
+    <summary>Create Agent</summary>
+    <form class="admin-form"
+          hx-post="/admin/agents/create"
+          hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML">
+        <div>
+            <label for="ca-username">Username</label>
+            <input id="ca-username" name="username" type="text" required placeholder="my-agent">
+        </div>
+        <div>
+            <label for="ca-display">Display Name</label>
+            <input id="ca-display" name="display_name" type="text" placeholder="My Agent">
+        </div>
+        <div>
+            <label for="ca-notes">Notes</label>
+            <input id="ca-notes" name="notes" type="text" placeholder="Optional notes">
+        </div>
+        <div class="admin-form-actions">
+            <button type="submit" class="admin-btn admin-btn-primary">Create Agent</button>
+        </div>
+    </form>
+</details>
+
+<div id="agent-key-reveal"></div>
+
+<table class="admin-table" id="agents-table">
+    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Roles</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
     <tbody>
     {% for p in principals %}
-    <tr>
+    <tr id="agent-row-{{ p.id }}">
         <td>{{ p.id }}</td>
         <td>{{ p.username }}</td>
         <td>{{ p.display_name }}</td>
         <td>{{ p.roles|join(', ') }}</td>
         <td><span class="badge badge-{{ p.status }}">{{ p.status }}</span></td>
         <td>{{ p.last_seen_at or '—' }}</td>
+        <td class="admin-actions">
+            {% if p.status == 'active' %}
+            <button class="admin-btn admin-btn-primary"
+                    hx-post="/admin/agents/{{ p.id }}/create-key"
+                    hx-target="#agent-key-reveal" hx-swap="innerHTML"
+                    hx-prompt="Key name:">Create Key</button>
+            <button class="admin-btn admin-btn-danger"
+                    hx-post="/admin/agents/{{ p.id }}/disable"
+                    hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML"
+                    hx-confirm="Are you sure you want to disable {{ p.username }}?">Disable</button>
+            {% elif p.status == 'disabled' %}
+            <button class="admin-btn admin-btn-primary"
+                    hx-post="/admin/agents/{{ p.id }}/enable"
+                    hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML">Enable</button>
+            {% endif %}
+        </td>
     </tr>
     {% endfor %}
     </tbody>

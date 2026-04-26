@@ -725,6 +725,10 @@ async def admin_summary(db: aiosqlite.Connection) -> dict[str, Any]:
     locked_users = await db.execute_fetchall(
         "SELECT COUNT(*) FROM principals WHERE status = 'locked'"
     )
+    active_sessions = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM browser_sessions "
+        "WHERE revoked_at IS NULL AND expires_at > datetime('now')"
+    )
     has_admin = await has_active_admin(db)
     audit_rows = await list_audit(db, limit=5)
 
@@ -733,6 +737,7 @@ async def admin_summary(db: aiosqlite.Connection) -> dict[str, Any]:
         "disabled_users": disabled_users[0][0],
         "active_agents": active_agents[0][0],
         "active_api_keys": active_keys[0][0],
+        "active_sessions": active_sessions[0][0],
         "expiring_keys_7d": 0,
         "expiring_keys_30d": 0,
         "locked_users": locked_users[0][0],

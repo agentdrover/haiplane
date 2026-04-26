@@ -3,11 +3,11 @@
 {% block title %}API Keys — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>API Keys</h1>
-<table class="admin-table">
-    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Expires</th><th>Last Used</th><th>Revoked</th></tr></thead>
+<table class="admin-table" id="keys-table">
+    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Expires</th><th>Last Used</th><th>Revoked</th><th>Actions</th></tr></thead>
     <tbody>
     {% for k in keys %}
-    <tr class="{% if k.revoked_at %}row-revoked{% endif %}">
+    <tr id="key-row-{{ k.id }}" class="{% if k.revoked_at %}row-revoked{% endif %}">
         <td>{{ k.id }}</td>
         <td>{{ pid_to_name.get(k.principal_id, '?') }}</td>
         <td>{{ k.name }}</td>
@@ -15,6 +15,16 @@
         <td>{{ k.expires_at or '—' }}</td>
         <td>{{ k.last_used_at or '—' }}</td>
         <td>{{ k.revoked_at or '—' }}</td>
+        <td class="admin-actions">
+            {% if not k.revoked_at %}
+            <button class="admin-btn admin-btn-danger"
+                    hx-post="/admin/keys/{{ k.id }}/revoke"
+                    hx-target="#keys-table" hx-select="#keys-table" hx-swap="outerHTML"
+                    hx-confirm="Are you sure you want to revoke this key?">Revoke</button>
+            {% else %}
+            <span style="color: var(--text-muted); font-size: 11px;">Revoked</span>
+            {% endif %}
+        </td>
     </tr>
     {% endfor %}
     </tbody>

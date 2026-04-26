@@ -10,7 +10,26 @@
         <a href="/admin/audit" class="{% if admin_page == 'audit' %}active{% endif %}">Audit</a>
     </nav>
     <div class="admin-content">
+        <div id="admin-flash" class="admin-flash-container"></div>
         {% block admin_content %}{% endblock %}
     </div>
 </div>
+<script>
+document.body.addEventListener("showFlash", function(e) {
+    var container = document.getElementById("admin-flash");
+    if (!container || !e.detail) return;
+    var msg = e.detail.message || "";
+    var level = e.detail.level || "success";
+    if (!msg) return;
+    var el = document.createElement("div");
+    el.className = "admin-flash admin-flash-" + level;
+    el.textContent = msg;
+    el.onclick = function() { el.remove(); };
+    container.appendChild(el);
+    setTimeout(function() {
+        el.style.animation = "flashOut 0.3s ease both";
+        setTimeout(function() { el.remove(); }, 300);
+    }, 4000);
+});
+</script>
 {% endblock %}

@@ -623,8 +623,11 @@ async def web_admin_users(request: Request):
     from hub.services import admin as admin_svc
 
     principals = await admin_svc.list_principals(_db(request), kind="human")
+    roles = await admin_svc.list_roles(_db(request))
     return TEMPLATES.TemplateResponse(
-        request, "admin/users.html", {"principals": principals, "active": "admin"}
+        request,
+        "admin/users.html",
+        {"principals": principals, "roles": roles, "active": "admin"},
     )
 
 
@@ -674,3 +677,379 @@ async def web_admin_audit(request: Request):
     return TEMPLATES.TemplateResponse(
         request, "admin/audit.html", {"entries": entries, "active": "admin"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin write actions (HTMX)
+# ---------------------------------------------------------------------------
+
+
+def _admin_actor_id(request: Request) -> int | None:
+    identity = getattr(request.state, "identity", None)
+    return getattr(identity, "principal_id", None) if identity else None
+
+
+def _flash_headers(message: str, level: str = "success") -> dict[str, str]:
+    """Return HX-Trigger header that fires a showFlash event."""
+    import json
+
+    payload = json.dumps({"showFlash": {"message": message, "level": level}})
+    return {"HX-Trigger": payload}
+
+
+async def _render_users_page(
+    request: Request,
+    flash_msg: str = "",
+    flash_level: str = "success",
+) -> HTMLResponse:
+    """Re-render the users page; HTMX callers use hx-select to pick the table."""
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    principals = await admin_svc.list_principals(db, kind="human")
+    roles = await admin_svc.list_roles(db)
+    resp = TEMPLATES.TemplateResponse(
+        request,
+        "admin/users.html",
+        {"principals": principals, "roles": roles, "active": "admin"},
+    )
+    if flash_msg:
+        resp.headers.update(_flash_headers(flash_msg, flash_level))
+    return resp
+
+
+async def _render_agents_page(
+    request: Request,
+    flash_msg: str = "",
+    flash_level: str = "success",
+) -> HTMLResponse:
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    principals = await admin_svc.list_principals(db, kind="agent")
+    resp = TEMPLATES.TemplateResponse(
+        request,
+        "admin/agents.html",
+        {"principals": principals, "active": "admin"},
+    )
+    if flash_msg:
+        resp.headers.update(_flash_headers(flash_msg, flash_level))
+    return resp
+
+
+async def _render_keys_page(
+    request: Request,
+    flash_msg: str = "",
+    flash_level: str = "success",
+) -> HTMLResponse:
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    keys = await admin_svc.list_api_keys(db)
+    all_principals = await admin_svc.list_principals(db)
+    pid_to_name = {p["id"]: p["username"] for p in all_principals}
+    resp = TEMPLATES.TemplateResponse(
+        request,
+        "admin/keys.html",
+        {"keys": keys, "pid_to_name": pid_to_name, "active": "admin"},
+    )
+    if flash_msg:
+        resp.headers.update(_flash_headers(flash_msg, flash_level))
+    return resp
+
+
+# -- Users --
+
+
+@router.post("/admin/users/create", response_class=HTMLResponse)
+async def web_admin_create_user(
+    request: Request,
+    username: str = Form(...),
+    display_name: str = Form(""),
+    email: str = Form(""),
+    password: str = Form(...),
+    role: str = Form("operator"),
+):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    try:
+        principal = await admin_svc.create_principal(
+            db,
+            kind="human",
+            username=username.strip(),
+            display_name=display_name.strip(),
+            email=email.strip(),
+            password=password,
+            role_slug=role,
+            created_by=actor_id,
+        )
+        await admin_svc.write_audit(
+            db,
+            actor_id=actor_id,
+            action="create_user",
+            target_type="principal",
+            target_id=str(principal["id"]),
+            summary=f"Created user {username!r} with role {role!r}",
+        )
+        return await _render_users_page(
+            request, flash_msg=f"User '{username}' created successfully"
+        )
+    except Exception as exc:
+        return await _render_users_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
+
+
+@router.post("/admin/users/{principal_id}/disable", response_class=HTMLResponse)
+async def web_admin_disable_user(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    try:
+        p = await admin_svc.disable_principal(db, principal_id)
+        if not p:
+            return await _render_users_page(
+                request, flash_msg="User not found", flash_level="error"
+            )
+        await admin_svc.write_audit(
+            db,
+            actor_id=actor_id,
+            action="disable_user",
+            target_type="principal",
+            target_id=str(principal_id),
+            summary=f"Disabled user {p['username']!r}",
+        )
+        return await _render_users_page(
+            request, flash_msg=f"User '{p['username']}' disabled"
+        )
+    except admin_svc.LastAdminError:
+        return await _render_users_page(
+            request,
+            flash_msg="Cannot disable the last active admin",
+            flash_level="error",
+        )
+
+
+@router.post("/admin/users/{principal_id}/enable", response_class=HTMLResponse)
+async def web_admin_enable_user(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    p = await admin_svc.enable_principal(db, principal_id)
+    if not p:
+        return await _render_users_page(
+            request, flash_msg="User not found", flash_level="error"
+        )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="enable_user",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Enabled user {p['username']!r}",
+    )
+    return await _render_users_page(
+        request, flash_msg=f"User '{p['username']}' enabled"
+    )
+
+
+@router.post("/admin/users/{principal_id}/reset-password", response_class=HTMLResponse)
+async def web_admin_reset_password(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    new_password = request.headers.get("HX-Prompt", "").strip()
+    if not new_password or len(new_password) < 8:
+        return await _render_users_page(
+            request,
+            flash_msg="Password must be at least 8 characters",
+            flash_level="error",
+        )
+    p = await admin_svc.get_principal(db, principal_id)
+    if not p:
+        return await _render_users_page(
+            request, flash_msg="User not found", flash_level="error"
+        )
+    await admin_svc.set_password(db, principal_id, new_password)
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="reset_password",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Reset password for user {p['username']!r}",
+    )
+    return await _render_users_page(
+        request, flash_msg=f"Password reset for '{p['username']}'"
+    )
+
+
+# -- Agents --
+
+
+@router.post("/admin/agents/create", response_class=HTMLResponse)
+async def web_admin_create_agent(
+    request: Request,
+    username: str = Form(...),
+    display_name: str = Form(""),
+    notes: str = Form(""),
+):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    try:
+        principal = await admin_svc.create_principal(
+            db,
+            kind="agent",
+            username=username.strip(),
+            display_name=display_name.strip(),
+            notes=notes.strip(),
+            role_slug="agent",
+            created_by=actor_id,
+        )
+        await admin_svc.write_audit(
+            db,
+            actor_id=actor_id,
+            action="create_agent",
+            target_type="principal",
+            target_id=str(principal["id"]),
+            summary=f"Created agent {username!r}",
+        )
+        return await _render_agents_page(
+            request, flash_msg=f"Agent '{username}' created successfully"
+        )
+    except Exception as exc:
+        return await _render_agents_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
+
+
+@router.post("/admin/agents/{principal_id}/disable", response_class=HTMLResponse)
+async def web_admin_disable_agent(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    p = await admin_svc.disable_principal(db, principal_id)
+    if not p:
+        return await _render_agents_page(
+            request, flash_msg="Agent not found", flash_level="error"
+        )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="disable_agent",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Disabled agent {p['username']!r}",
+    )
+    return await _render_agents_page(
+        request, flash_msg=f"Agent '{p['username']}' disabled"
+    )
+
+
+@router.post("/admin/agents/{principal_id}/enable", response_class=HTMLResponse)
+async def web_admin_enable_agent(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    p = await admin_svc.enable_principal(db, principal_id)
+    if not p:
+        return await _render_agents_page(
+            request, flash_msg="Agent not found", flash_level="error"
+        )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="enable_agent",
+        target_type="principal",
+        target_id=str(principal_id),
+        summary=f"Enabled agent {p['username']!r}",
+    )
+    return await _render_agents_page(
+        request, flash_msg=f"Agent '{p['username']}' enabled"
+    )
+
+
+@router.post("/admin/agents/{principal_id}/create-key", response_class=HTMLResponse)
+async def web_admin_create_agent_key(principal_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    key_name = request.headers.get("HX-Prompt", "").strip() or "default"
+    p = await admin_svc.get_principal(db, principal_id)
+    if not p:
+        headers = _flash_headers("Agent not found", "error")
+        return HTMLResponse("<div></div>", headers=headers)
+    key_info = await admin_svc.create_api_key(
+        db,
+        principal_id,
+        name=key_name,
+        created_by=actor_id,
+    )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="create_api_key",
+        target_type="api_key",
+        target_id=str(key_info["id"]),
+        summary=f"Created API key {key_name!r} for agent {p['username']!r}",
+    )
+    import html as html_mod
+
+    safe_key = html_mod.escape(key_info["plaintext_key"])
+    safe_name = html_mod.escape(key_name)
+    safe_user = html_mod.escape(p["username"])
+    fragment = (
+        f'<div class="admin-key-reveal">'
+        f'<span class="warning">This key will not be shown again!</span><br>'
+        f"Key <b>{safe_name}</b> for agent <b>{safe_user}</b>:"
+        f"<code>{safe_key}</code>"
+        f"</div>"
+    )
+    headers = _flash_headers(f"API key '{key_name}' created for '{p['username']}'")
+    return HTMLResponse(fragment, headers=headers)
+
+
+# -- Keys --
+
+
+@router.post("/admin/keys/{key_id}/revoke", response_class=HTMLResponse)
+async def web_admin_revoke_key(key_id: int, request: Request):
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    revoked = await admin_svc.revoke_api_key(db, key_id)
+    if not revoked:
+        return await _render_keys_page(
+            request,
+            flash_msg="Key not found or already revoked",
+            flash_level="error",
+        )
+    await admin_svc.write_audit(
+        db,
+        actor_id=actor_id,
+        action="revoke_api_key",
+        target_type="api_key",
+        target_id=str(key_id),
+        summary=f"Revoked API key #{key_id}",
+    )
+    return await _render_keys_page(request, flash_msg=f"API key #{key_id} revoked")

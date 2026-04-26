@@ -21,9 +21,19 @@
         <div class="stat-label">Active API Keys</div>
     </div>
     <div class="stat-card">
+        <div class="stat-value">{{ summary.active_sessions }}</div>
+        <div class="stat-label">Active Sessions</div>
+    </div>
+    <div class="stat-card">
         <div class="stat-value">{{ summary.locked_users }}</div>
         <div class="stat-label">Locked Users</div>
     </div>
+</div>
+
+<div class="admin-quick-actions">
+    <a href="/admin/users" class="admin-btn admin-btn-primary">Create User</a>
+    <a href="/admin/agents" class="admin-btn admin-btn-primary">Create Agent</a>
+    <a href="/admin/keys" class="admin-btn">Manage API Keys</a>
 </div>
 
 {% if summary.admin_bootstrap_required %}

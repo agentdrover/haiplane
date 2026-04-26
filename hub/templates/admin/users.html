@@ -3,11 +3,47 @@
 {% block title %}Users — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
 <h1>Users</h1>
-<table class="admin-table">
-    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Email</th><th>Roles</th><th>Status</th><th>Last Seen</th></tr></thead>
+
+<details class="admin-form-wrap">
+    <summary>Create User</summary>
+    <form class="admin-form"
+          hx-post="/admin/users/create"
+          hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">
+        <div>
+            <label for="cu-username">Username</label>
+            <input id="cu-username" name="username" type="text" required placeholder="jdoe">
+        </div>
+        <div>
+            <label for="cu-display">Display Name</label>
+            <input id="cu-display" name="display_name" type="text" placeholder="Jane Doe">
+        </div>
+        <div>
+            <label for="cu-email">Email</label>
+            <input id="cu-email" name="email" type="text" placeholder="jane@example.com">
+        </div>
+        <div>
+            <label for="cu-password">Password</label>
+            <input id="cu-password" name="password" type="password" required minlength="8" placeholder="Min 8 chars">
+        </div>
+        <div>
+            <label for="cu-role">Role</label>
+            <select id="cu-role" name="role">
+                {% for r in roles %}
+                <option value="{{ r.slug }}" {% if r.slug == 'operator' %}selected{% endif %}>{{ r.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="admin-form-actions">
+            <button type="submit" class="admin-btn admin-btn-primary">Create User</button>
+        </div>
+    </form>
+</details>
+
+<table class="admin-table" id="users-table">
+    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Email</th><th>Roles</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
     <tbody>
     {% for p in principals %}
-    <tr>
+    <tr id="user-row-{{ p.id }}">
         <td>{{ p.id }}</td>
         <td>{{ p.username }}</td>
         <td>{{ p.display_name }}</td>
@@ -15,6 +51,26 @@
         <td>{{ p.roles|join(', ') }}</td>
         <td><span class="badge badge-{{ p.status }}">{{ p.status }}</span></td>
         <td>{{ p.last_seen_at or '—' }}</td>
+        <td class="admin-actions">
+            {% if p.status == 'active' %}
+            <button class="admin-btn admin-btn-danger"
+                    hx-post="/admin/users/{{ p.id }}/disable"
+                    hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML"
+                    hx-confirm="Are you sure you want to disable {{ p.username }}?">Disable</button>
+            {% elif p.status == 'disabled' %}
+            <button class="admin-btn admin-btn-primary"
+                    hx-post="/admin/users/{{ p.id }}/enable"
+                    hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">Enable</button>
+            {% elif p.status == 'locked' %}
+            <button class="admin-btn admin-btn-primary"
+                    hx-post="/admin/users/{{ p.id }}/enable"
+                    hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML">Unlock</button>
+            {% endif %}
+            <button class="admin-btn"
+                    hx-post="/admin/users/{{ p.id }}/reset-password"
+                    hx-target="#users-table" hx-select="#users-table" hx-swap="outerHTML"
+                    hx-prompt="Enter new password (min 8 chars, letter + digit + special):">Reset Password</button>
+        </td>
     </tr>
     {% endfor %}
     </tbody>
