@@ -17,6 +17,19 @@ HUB_URL = os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
 HUB_TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN", "")
 
 
+def _validated_hub_base_url() -> str:
+    """Return a sanitized Hub base URL, allowing only http/https schemes."""
+    parsed = urllib.parse.urlsplit(HUB_URL)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        print(
+            "OPENCLAW_HUB_URL must use http/https and include host:port.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
 def _api(method: str, path: str, body: Any | None = None) -> Any:
     """Call the Hub HTTP API.
 
@@ -25,7 +38,8 @@ def _api(method: str, path: str, body: Any | None = None) -> Any:
     - On HTTP error, try to render server JSON nicely (especially the
       ``dor_failed`` 422 detail from /approve), then exit 1.
     """
-    url = f"{HUB_URL}{path}"
+    base_url = _validated_hub_base_url()
+    url = urllib.parse.urljoin(f"{base_url}/", path.lstrip("/"))
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:

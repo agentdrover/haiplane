@@ -18,6 +18,13 @@ from hub.db import (
     structured_fields_to_db,
 )
 
+ALLOWED_TASKS_ORDER_BY = frozenset(
+    {
+        "id DESC",
+        "updated_at ASC",
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Tasks — Read
 # ---------------------------------------------------------------------------
@@ -99,6 +106,8 @@ async def list_tasks_by_status(
     order_by: str = "id DESC",
     limit: int = 20,
 ) -> list[aiosqlite.Row]:
+    if order_by not in ALLOWED_TASKS_ORDER_BY:
+        raise ValueError(f"Unsupported order_by clause: {order_by!r}")
     return await db.execute_fetchall(
         f"SELECT * FROM tasks WHERE status=? ORDER BY {order_by} LIMIT ?",
         (status, limit),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 
@@ -265,6 +266,57 @@ async def test_list_tasks_by_statuses(db: aiosqlite.Connection):
     assert len(rows) == 2
     statuses = {dict(r)["status"] for r in rows}
     assert statuses == {"open", "running"}
+
+
+async def test_list_tasks_by_status_allows_known_order_by(db: aiosqlite.Connection):
+    await repo.create_task(
+        db,
+        title="Oldest pending report",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Newest pending report",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    rows = await repo.list_tasks_by_status(
+        db,
+        "pending_report",
+        order_by="updated_at ASC",
+        limit=20,
+    )
+    assert len(rows) == 2
+
+
+async def test_list_tasks_by_status_rejects_unsafe_order_by(
+    db: aiosqlite.Connection,
+):
+    with pytest.raises(ValueError, match="Unsupported order_by clause"):
+        await repo.list_tasks_by_status(
+            db,
+            "open",
+            order_by="id DESC; DROP TABLE tasks",
+        )
 
 
 async def test_list_agent_tasks(db: aiosqlite.Connection):

@@ -11,6 +11,40 @@ import pytest
 from hub import cli
 
 
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_api_rejects_non_http_scheme(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "HUB_URL", "file:///etc/passwd")
+    monkeypatch.setattr(cli, "HUB_TOKEN", "")
+    with pytest.raises(SystemExit) as exc:
+        cli._api("GET", "/api/tasks")
+    assert exc.value.code == 2
+    assert "OPENCLAW_HUB_URL must use http/https" in capsys.readouterr().err
+
+
+def test_api_uses_validated_base_url_for_requests(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "HUB_URL", "https://hub.example.test")
+    monkeypatch.setattr(cli, "HUB_TOKEN", "")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b'{"ok": true}'))
+    with patch("urllib.request.urlopen", mock_urlopen):
+        result = cli._api("GET", "/api/tasks")
+    assert result == {"ok": True}
+    request = mock_urlopen.call_args.args[0]
+    assert request.full_url == "https://hub.example.test/api/tasks"
+
+
 def test_cmd_list() -> None:
     tasks = [
         {
