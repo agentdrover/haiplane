@@ -2,9 +2,13 @@
     <a class="card-link" href="/tasks/{{ t.id }}" title="#{{ t.id }} {{ t.title }}">
         <span class="card-id">#{{ t.id }}</span>{{ t.title[:48] }}{% if t.title|length > 48 %}…{% endif %}
     </a>
-    {% set _has_meta = (t.task_type.value != 'task') or (t.priority.value in ('critical', 'high')) or (t.runtime.value != 'auto') or (t.progress and t.progress.total > 0) %}
+    {% set _analyst_ready = analyst_ready_by_id.get(t.id) if analyst_ready_by_id is defined else false %}
+    {% set _has_meta = _analyst_ready or (t.task_type.value != 'task') or (t.priority.value in ('critical', 'high')) or (t.runtime.value != 'auto') or (t.progress and t.progress.total > 0) %}
     {% if _has_meta %}
     <div class="card-meta">
+        {% if _analyst_ready %}
+        <span class="badge badge--xs badge-completed">Analyst Ready</span>
+        {% endif %}
         {% if t.task_type.value != 'task' %}
         <span class="badge badge--xs badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
         {% endif %}

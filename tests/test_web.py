@@ -312,6 +312,97 @@ async def test_task_detail_renders_analyst_handoff_fields(client: AsyncClient):
         assert item in resp.text
 
 
+async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Prepared analyst task", "description": "ready"},
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "As a reviewer I want a ready badge.",
+            "problem_statement": "Prepared tasks need a clear signal.",
+            "business_value": "Humans can trust prepared tasks faster.",
+            "scope_in": ["Show Analyst Ready"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "A task is prepared",
+                "when": "A human views it",
+                "then": "Analyst Ready is visible",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_web.py",
+            }
+        ],
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={
+            "agent": "analyst-agent",
+            "kind": "status",
+            "content": "Analyst preparation complete: ready for developer.",
+        },
+    )
+
+    detail = await client.get(f"/tasks/{task_id}")
+    table = await client.get("/tasks")
+    kanban = await client.get("/partials/kanban")
+
+    assert "Analyst Ready" in detail.text
+    assert "Prepared by analyst-agent" in detail.text
+    assert "Analyst Ready" in table.text
+    assert "Analyst Ready" in kanban.text
+
+
+async def test_task_detail_does_not_show_analyst_ready_without_preparation_update(
+    client: AsyncClient,
+):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Ready but not analyst prepared", "description": "raw"},
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "As a reviewer I want no false badge.",
+            "problem_statement": "DoR alone is not analyst preparation.",
+            "business_value": "Avoid misleading humans.",
+            "scope_in": ["Avoid false ready badge"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "No analyst update exists",
+                "when": "A human views the task",
+                "then": "The ready badge is not shown",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+
+    detail = await client.get(f"/tasks/{task_id}")
+
+    assert detail.status_code == 200
+    assert "Analyst Ready" not in detail.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",

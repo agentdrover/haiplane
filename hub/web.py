@@ -229,6 +229,44 @@ def _dispatch_available() -> bool:
     return plugins.dispatch.is_available()
 
 
+ANALYST_PREPARED_MARKER = "Analyst preparation complete"
+
+
+async def _analyst_ready_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+    readiness: Any | None = None,
+) -> dict[str, Any]:
+    """Derived UI signal: DoR passed and an analyst preparation update exists."""
+    if readiness is None:
+        readiness = await services.get_readiness(db, task_id, explain=False)
+    updates = await repo.get_task_updates(db, task_id)
+    prep_update = next(
+        (
+            dict(update)
+            for update in reversed(updates)
+            if ANALYST_PREPARED_MARKER in (dict(update).get("content") or "")
+        ),
+        None,
+    )
+    return {
+        "ready": bool(readiness.dor_passed and prep_update),
+        "agent": prep_update.get("agent", "") if prep_update else "",
+        "created_at": prep_update.get("created_at", "") if prep_update else "",
+    }
+
+
+async def _analyst_ready_map(
+    db: aiosqlite.Connection,
+    tasks: list[Any],
+) -> dict[int, bool]:
+    result: dict[int, bool] = {}
+    for task in tasks:
+        info = await _analyst_ready_info(db, task.id)
+        result[task.id] = bool(info["ready"])
+    return result
+
+
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
     import html as html_mod
@@ -271,10 +309,23 @@ async def web_partial_epics(request: Request):
 @router.get("/partials/kanban", response_class=HTMLResponse)
 async def web_partial_kanban(request: Request):
     data = await services.get_dashboard_data(_db(request))
+    tasks_for_badges = [
+        *data.active_tasks,
+        *data.draft_tasks,
+        *data.review_tasks,
+        *data.needs_decision_tasks,
+        *data.needs_info_tasks,
+    ]
     return TEMPLATES.TemplateResponse(
         request,
         "partials/kanban.html",
-        {"data": data, "dispatch_available": _dispatch_available()},
+        {
+            "data": data,
+            "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": await _analyst_ready_map(
+                _db(request), tasks_for_badges
+            ),
+        },
     )
 
 
@@ -306,7 +357,11 @@ async def web_tasks_list_partial(
     return TEMPLATES.TemplateResponse(
         request,
         "partials/task_table.html",
-        {"tasks": tasks, "dispatch_available": _dispatch_available()},
+        {
+            "tasks": tasks,
+            "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": await _analyst_ready_map(_db(request), tasks),
+        },
     )
 
 
@@ -336,6 +391,14 @@ async def web_dashboard(request: Request):
         "dispatch_available": _dispatch_available(),
     }
     ctx.update(inbox)
+    tasks_for_badges = [
+        *data.active_tasks,
+        *data.draft_tasks,
+        *data.review_tasks,
+        *data.needs_decision_tasks,
+        *data.needs_info_tasks,
+    ]
+    ctx["analyst_ready_by_id"] = await _analyst_ready_map(db, tasks_for_badges)
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
@@ -390,6 +453,7 @@ async def web_tasks(
             "all_types": all_types,
             "all_priorities": all_priorities,
             "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": await _analyst_ready_map(db, tasks),
         },
     )
 
@@ -405,6 +469,7 @@ async def web_task_detail(task_id: int, request: Request):
     task_view.acceptance_criteria = await services.list_acceptance_criteria(db, task_id)
     task = await services.enrich_task_view(db, task_view)
     readiness = await services.get_readiness(db, task_id, explain=False)
+    analyst_ready = await _analyst_ready_info(db, task_id, readiness)
     identity = current_identity(request)
     return TEMPLATES.TemplateResponse(
         request,
@@ -412,6 +477,7 @@ async def web_task_detail(task_id: int, request: Request):
         {
             "task": task,
             "readiness": readiness,
+            "analyst_ready": analyst_ready,
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),

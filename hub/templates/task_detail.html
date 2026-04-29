@@ -74,6 +74,13 @@
                         score={{ readiness.score }} dor={{ 'yes' if readiness.dor_passed else 'no' }}
                     </span>
                 </div>
+                {% if analyst_ready.ready %}
+                <div class="task-action-note">
+                    <strong>Analyst Ready</strong>
+                    {% if analyst_ready.agent %}<div>Prepared by {{ analyst_ready.agent }}</div>{% endif %}
+                    {% if analyst_ready.created_at %}<div class="u-text-muted">{{ analyst_ready.created_at }}</div>{% endif %}
+                </div>
+                {% endif %}
                 {% if readiness.missing_required %}
                 <div class="task-action-note">
                     Missing required: {{ readiness.missing_required | join(', ') }}
