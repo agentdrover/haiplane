@@ -592,6 +592,7 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
         {
             "work_type": "feature",
             "size": "M",
+            "wip_tag": "feature_work",
             "user_story": "As an operator I want one analyst handoff so that dev work is ready.",
             "problem_statement": "Analyst preparation takes too many manual calls.",
             "business_value": "Faster and safer developer handoff.",
@@ -629,3 +630,36 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
     assert update_call.args[1]["kind"] == "status"
     assert "Analyst preparation complete" in update_call.args[1]["content"]
     mock_api_get.assert_awaited_once_with("/api/tasks/25/readiness")
+
+
+async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_post.side_effect = [
+        {"updated_columns": ["wip_tag"]},
+        {"id": 89},
+    ]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": ["has_acceptance_criteria"],
+        "recommendations": [],
+        "risks": [],
+    }
+
+    await hub_prepare_developer_task(
+        task_id=25,
+        work_type="bug",
+        wip_tag="bugfix",
+        problem_statement="Bug needs detail.",
+    )
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {
+            "work_type": "bug",
+            "wip_tag": "bugfix",
+            "problem_statement": "Bug needs detail.",
+        },
+    )

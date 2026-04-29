@@ -920,6 +920,9 @@ async def hub_prepare_developer_task(
         risks: Risks to append. Omit or pass [] to add none.
         analyst: Agent name recorded in the preparation status update.
     """
+    if wip_tag is None and (work_type is None or work_type == "feature"):
+        wip_tag = "feature_work"
+
     refine_body: dict[str, Any] = {}
     for key, val in (
         ("work_type", work_type),
