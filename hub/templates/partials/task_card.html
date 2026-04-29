@@ -21,11 +21,6 @@
     {% endif %}
     {% if t.status.value == 'draft' %}
     <div class="card-actions">
-        <button class="btn btn-success btn-xs"
-                hx-post="/tasks/{{ t.id }}/web-approve"
-                hx-vals='{"run": "true"}'
-                hx-target="#kanban-card-{{ t.id }}"
-                hx-swap="outerHTML">Approve &amp; Run</button>
         <button class="btn btn-primary btn-xs"
                 hx-post="/tasks/{{ t.id }}/web-approve"
                 hx-target="#kanban-card-{{ t.id }}"

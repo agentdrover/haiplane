@@ -94,6 +94,24 @@ async def test_inbox_proposals_render_as_collapsible_details(client: AsyncClient
     assert "Proposals" in resp.text
 
 
+async def test_dashboard_hides_approve_and_run_for_drafts(client: AsyncClient):
+    await client.post(
+        "/api/tasks",
+        json={
+            "title": "Draft without runnable agent",
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+
+    resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert "Draft without runnable agent" in resp.text
+    assert "Approve &amp; Run" not in resp.text
+    assert '"run": "true"' not in resp.text
+
+
 async def test_kanban_partial(client: AsyncClient):
     resp = await client.get("/partials/kanban")
     assert resp.status_code == 200

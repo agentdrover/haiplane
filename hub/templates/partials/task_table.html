@@ -35,9 +35,8 @@
             <td>
                 <div class="task-table-actions">
                 {% if t.status.value == 'draft' %}
-                <button class="btn btn-success btn-xs task-table-action"
+                <button class="btn btn-primary btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-approve"
-                        hx-vals='{"run": "true"}'
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Approve</button>
                 <button class="btn btn-danger btn-xs task-table-action"

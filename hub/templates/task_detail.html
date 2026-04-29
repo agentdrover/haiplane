@@ -194,7 +194,6 @@
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
                         <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                     </select>
-                    <button class="btn btn-success task-action-btn" type="submit" name="run" value="true">Approve &amp; Run</button>
                     <button class="btn btn-primary task-action-btn" type="submit">Approve to Backlog</button>
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
