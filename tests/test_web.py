@@ -403,6 +403,64 @@ async def test_task_detail_does_not_show_analyst_ready_without_preparation_updat
     assert "Analyst Ready" not in detail.text
 
 
+async def test_tasks_page_filters_analyst_ready_tasks(client: AsyncClient):
+    prepared = await client.post(
+        "/api/tasks",
+        json={"title": "Prepared filter task", "description": "ready"},
+    )
+    prepared_id = prepared.json()["id"]
+    await client.post(
+        f"/api/tasks/{prepared_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "As a reviewer I want a ready filter.",
+            "problem_statement": "Prepared tasks need a list.",
+            "business_value": "Humans find ready work quickly.",
+            "scope_in": ["Filter Analyst Ready"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{prepared_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "A prepared task exists",
+                "when": "The ready filter is applied",
+                "then": "The task is listed",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+    await client.post(
+        f"/api/tasks/{prepared_id}/updates",
+        json={
+            "agent": "analyst-agent",
+            "kind": "status",
+            "content": "Analyst preparation complete: ready for developer.",
+        },
+    )
+    await client.post(
+        "/api/tasks",
+        json={"title": "Unprepared filter task", "description": "raw"},
+    )
+
+    page = await client.get("/tasks", params={"analyst_ready": "1"})
+    partial = await client.get("/tasks/list", params={"analyst_ready": "1"})
+
+    assert page.status_code == 200
+    assert partial.status_code == 200
+    assert 'name="analyst_ready"' in page.text
+    assert "Prepared filter task" in page.text
+    assert "Prepared filter task" in partial.text
+    assert "Unprepared filter task" not in page.text
+    assert "Unprepared filter task" not in partial.text
+    assert "Analyst Ready" in page.text
+    assert "Analyst Ready" in partial.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",

@@ -24,6 +24,10 @@
             <span class="topbar-stat-label">Open</span>
             <span class="topbar-stat-value">{{ _open_count }}</span>
         </a>
+        <a href="/tasks?analyst_ready=1" class="topbar-stat topbar-stat--open{% if analyst_ready_count == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Analyst Ready</span>
+            <span class="topbar-stat-value">{{ analyst_ready_count }}</span>
+        </a>
         <a href="/tasks?status=running" class="topbar-stat topbar-stat--running{% if _running_count == 0 %} is-zero{% endif %}">
             <span class="topbar-stat-label">Running</span>
             <span class="topbar-stat-value">{{ _running_count }}</span>

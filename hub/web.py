@@ -267,6 +267,18 @@ async def _analyst_ready_map(
     return result
 
 
+async def _apply_analyst_ready_filter(
+    db: aiosqlite.Connection,
+    tasks: list[Any],
+    *,
+    analyst_ready: bool = False,
+) -> tuple[list[Any], dict[int, bool]]:
+    ready_by_id = await _analyst_ready_map(db, tasks)
+    if analyst_ready:
+        tasks = [task for task in tasks if ready_by_id.get(task.id)]
+    return tasks, ready_by_id
+
+
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
     import html as html_mod
@@ -339,6 +351,7 @@ async def web_tasks_list_partial(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
     """HTML fragment: task table body for HTMX swap."""
@@ -354,13 +367,16 @@ async def web_tasks_list_partial(
         human_reviewer=human_reviewer,
         limit=limit,
     )
+    tasks, ready_by_id = await _apply_analyst_ready_filter(
+        _db(request), tasks, analyst_ready=analyst_ready
+    )
     return TEMPLATES.TemplateResponse(
         request,
         "partials/task_table.html",
         {
             "tasks": tasks,
             "dispatch_available": _dispatch_available(),
-            "analyst_ready_by_id": await _analyst_ready_map(_db(request), tasks),
+            "analyst_ready_by_id": ready_by_id,
         },
     )
 
@@ -398,7 +414,11 @@ async def web_dashboard(request: Request):
         *data.needs_decision_tasks,
         *data.needs_info_tasks,
     ]
-    ctx["analyst_ready_by_id"] = await _analyst_ready_map(db, tasks_for_badges)
+    analyst_ready_by_id = await _analyst_ready_map(db, tasks_for_badges)
+    ctx["analyst_ready_by_id"] = analyst_ready_by_id
+    ctx["analyst_ready_count"] = sum(
+        1 for ready in analyst_ready_by_id.values() if ready
+    )
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
@@ -412,6 +432,7 @@ async def web_tasks(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    analyst_ready: bool = Query(default=False),
 ):
     db = _db(request)
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
@@ -425,6 +446,9 @@ async def web_tasks(
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,
+    )
+    tasks, ready_by_id = await _apply_analyst_ready_filter(
+        db, tasks, analyst_ready=analyst_ready
     )
 
     parent_breadcrumb = None
@@ -448,12 +472,13 @@ async def web_tasks(
             "filter_parent_id": parsed_parent_id,
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
+            "filter_analyst_ready": analyst_ready,
             "parent_breadcrumb": parent_breadcrumb,
             "all_statuses": all_statuses,
             "all_types": all_types,
             "all_priorities": all_priorities,
             "dispatch_available": _dispatch_available(),
-            "analyst_ready_by_id": await _analyst_ready_map(db, tasks),
+            "analyst_ready_by_id": ready_by_id,
         },
     )
 
