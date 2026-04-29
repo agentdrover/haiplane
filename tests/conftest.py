@@ -21,6 +21,9 @@ from hub.integrations.registry import plugins
 class MockDispatch(NoopDispatch):
     """Dispatch mock that returns a predictable job_id on submit."""
 
+    def is_available(self):
+        return True
+
     async def submit_task(
         self, message, runtime="auto", repo_root=None, agent=None, task_id=None
     ):

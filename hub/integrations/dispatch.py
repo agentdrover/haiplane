@@ -24,6 +24,9 @@ def _read_job_file(path: Path) -> dict[str, Any] | None:
 class DispatchIntegration:
     """Concrete dispatch plugin backed by the oc-dev-dispatch CLI binary."""
 
+    def is_available(self) -> bool:
+        return Path(DISPATCH_BIN).exists()
+
     def list_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
         if not DISPATCH_JOBS_DIR.is_dir():
             return []

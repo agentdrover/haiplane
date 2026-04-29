@@ -21,6 +21,13 @@
     {% endif %}
     {% if t.status.value == 'draft' %}
     <div class="card-actions">
+        {% if dispatch_available %}
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-approve"
+                hx-vals='{"run": "true"}'
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Approve &amp; Run</button>
+        {% endif %}
         <button class="btn btn-primary btn-xs"
                 hx-post="/tasks/{{ t.id }}/web-approve"
                 hx-target="#kanban-card-{{ t.id }}"
@@ -32,10 +39,14 @@
     </div>
     {% elif t.status.value == 'open' %}
     <div class="card-actions">
+        {% if dispatch_available %}
         <button class="btn btn-primary btn-xs"
                 hx-post="/tasks/{{ t.id }}/web-start"
                 hx-target="#kanban-card-{{ t.id }}"
                 hx-swap="outerHTML">Start</button>
+        {% else %}
+        <span class="card-action-note">Dispatch unavailable</span>
+        {% endif %}
     </div>
     {% elif t.status.value == 'needs_decision' %}
     <div class="card-actions">

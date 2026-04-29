@@ -94,7 +94,33 @@ async def test_inbox_proposals_render_as_collapsible_details(client: AsyncClient
     assert "Proposals" in resp.text
 
 
-async def test_dashboard_hides_approve_and_run_for_drafts(client: AsyncClient):
+async def test_dashboard_shows_approve_and_run_when_dispatch_available(
+    client: AsyncClient,
+):
+    await client.post(
+        "/api/tasks",
+        json={
+            "title": "Draft with runnable agent",
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+
+    resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert "Draft with runnable agent" in resp.text
+    assert "Approve &amp; Run" in resp.text
+    assert '"run": "true"' in resp.text
+
+
+async def test_dashboard_hides_approve_and_run_when_dispatch_unavailable(
+    client: AsyncClient,
+):
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+
+    plugins.dispatch = NoopDispatch()
     await client.post(
         "/api/tasks",
         json={
@@ -216,6 +242,24 @@ async def test_web_approve_task(client: AsyncClient):
     )
     assert resp.status_code == 303
     assert f"/tasks/{task_id}" in resp.headers["location"]
+
+
+async def test_web_start_dispatches_without_manual_plan(client: AsyncClient):
+    create = await client.post("/api/tasks", json={"title": "Start from UI"})
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-start",
+        data={"runtime": "auto"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    detail = await client.get(f"/api/tasks/{task_id}")
+    task = detail.json()
+    assert task["status"] == "running"
+    assert task["job_id"] == "test-job-1"
+    assert task["assigned_agent"] == "developer-agent"
 
 
 async def test_web_decide_task_with_summary(client: AsyncClient, db):

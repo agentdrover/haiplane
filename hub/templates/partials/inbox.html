@@ -26,6 +26,14 @@
         <div class="inbox-item-desc">{{ t.description[:120] }}{% if t.description|length > 120 %}…{% endif %}</div>
         {% endif %}
         <div class="inbox-item-actions">
+            {% if dispatch_available %}
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-approve"
+                    hx-vals='{"run": "true"}'
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Approve and run #{{ t.id }}?">Approve &amp; Run</button>
+            {% endif %}
             <button class="btn btn-primary btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-approve"
                     hx-target="#inbox-task-{{ t.id }}"

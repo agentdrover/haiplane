@@ -12,6 +12,9 @@ import aiosqlite
 
 
 class NoopDispatch:
+    def is_available(self) -> bool:
+        return False
+
     def list_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
         return []
 

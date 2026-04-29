@@ -225,6 +225,10 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request") == "true"
 
 
+def _dispatch_available() -> bool:
+    return plugins.dispatch.is_available()
+
+
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
     import html as html_mod
@@ -252,6 +256,7 @@ async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLRespon
 @router.get("/partials/inbox", response_class=HTMLResponse)
 async def web_partial_inbox(request: Request):
     inbox = await services.get_inbox_data(_db(request))
+    inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
 
@@ -266,7 +271,11 @@ async def web_partial_epics(request: Request):
 @router.get("/partials/kanban", response_class=HTMLResponse)
 async def web_partial_kanban(request: Request):
     data = await services.get_dashboard_data(_db(request))
-    return TEMPLATES.TemplateResponse(request, "partials/kanban.html", {"data": data})
+    return TEMPLATES.TemplateResponse(
+        request,
+        "partials/kanban.html",
+        {"data": data, "dispatch_available": _dispatch_available()},
+    )
 
 
 @router.get("/tasks/list", response_class=HTMLResponse)
@@ -295,7 +304,9 @@ async def web_tasks_list_partial(
         limit=limit,
     )
     return TEMPLATES.TemplateResponse(
-        request, "partials/task_table.html", {"tasks": tasks}
+        request,
+        "partials/task_table.html",
+        {"tasks": tasks, "dispatch_available": _dispatch_available()},
     )
 
 
@@ -322,6 +333,7 @@ async def web_dashboard(request: Request):
         "epics_enriched": epics,
         "epics": epics,
         "inbox_total": inbox_total,
+        "dispatch_available": _dispatch_available(),
     }
     ctx.update(inbox)
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
@@ -377,6 +389,7 @@ async def web_tasks(
             "all_statuses": all_statuses,
             "all_types": all_types,
             "all_priorities": all_priorities,
+            "dispatch_available": _dispatch_available(),
         },
     )
 
@@ -398,6 +411,7 @@ async def web_task_detail(task_id: int, request: Request):
             "task": task,
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
+            "dispatch_available": _dispatch_available(),
         },
     )
 
@@ -523,7 +537,10 @@ async def web_start_task(
     request: Request,
     runtime: str = Form("auto"),
 ):
-    body = TaskStart(runtime=RuntimeChoice(runtime) if runtime else None)
+    body = TaskStart(
+        plan="Developer-agent dispatch requested from Hub UI.",
+        runtime=RuntimeChoice(runtime) if runtime else None,
+    )
     await services.start_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)

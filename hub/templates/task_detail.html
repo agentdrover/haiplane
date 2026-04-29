@@ -194,6 +194,9 @@
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
                         <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                     </select>
+                    {% if dispatch_available %}
+                    <button class="btn btn-success task-action-btn" type="submit" name="run" value="true">Approve &amp; Run</button>
+                    {% endif %}
                     <button class="btn btn-primary task-action-btn" type="submit">Approve to Backlog</button>
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
@@ -210,7 +213,11 @@
                         <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                         <option value="vast" {% if task.runtime.value == 'vast' %}selected{% endif %}>Vast.ai</option>
                     </select>
+                    {% if dispatch_available %}
                     <button class="btn btn-success task-action-btn" type="submit">Start Task</button>
+                    {% else %}
+                    <div class="task-action-note">Developer-agent dispatch is not configured on this Hub.</div>
+                    {% endif %}
                 </form>
 
                 {% elif task.status.value == 'needs_info' %}
