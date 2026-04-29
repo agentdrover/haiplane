@@ -247,6 +247,18 @@ class TaskReorder(BaseModel):
     position: int = Field(..., ge=0)
 
 
+class TaskArchive(BaseModel):
+    """Archive hides tasks from default lists; optional subtree cascade."""
+
+    cascade: bool = True
+
+
+class TaskUnarchive(BaseModel):
+    """Restore archived tasks; optional subtree cascade."""
+
+    cascade: bool = True
+
+
 # --- Structured task form: ACs, risks, refine, readiness (Epic #32) ---
 
 
@@ -438,6 +450,7 @@ class TaskView(BaseModel):
     breadcrumb: list[TaskBreadcrumb] | None = None
     children: list[TaskChildSummary] | None = None
     progress: TaskProgress | None = None
+    archived: bool = False
     created_at: str
     updated_at: str
 

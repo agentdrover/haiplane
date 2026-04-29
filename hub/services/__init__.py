@@ -44,9 +44,11 @@ from hub.services.lifecycle import (
     add_update,
     answer_question,
     approve_task,
+    archive_task,
     ask_question,
     create_task,
     decide_task,
+    delete_task_tree,
     enrich_task_view,
     force_complete_task,
     refresh_task,
@@ -54,6 +56,7 @@ from hub.services.lifecycle import (
     reorder_task,
     row_to_task,
     start_task,
+    unarchive_task,
 )
 from hub.services.orchestration import (
     dispatch_arbiter,
@@ -95,9 +98,11 @@ __all__ = [
     "parse_risks_from_row",
     "answer_question",
     "approve_task",
+    "archive_task",
     "ask_question",
     "create_task",
     "decide_task",
+    "delete_task_tree",
     "dispatch_arbiter",
     "dispatch_ci_fix",
     "dispatch_fix",
@@ -120,4 +125,5 @@ __all__ = [
     "row_to_task",
     "scan_text_for_verdict",
     "start_task",
+    "unarchive_task",
 ]

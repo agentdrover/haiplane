@@ -151,6 +151,7 @@ async def list_tasks(
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     limit: int = 50,
+    include_archived: bool = False,
 ) -> list[TaskView]:
     """List tasks with optional filters, returning TaskView models."""
     rows = await repo.list_tasks_filtered(
@@ -163,6 +164,7 @@ async def list_tasks(
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=limit,
+        include_archived=include_archived,
     )
     return [row_to_task(r) for r in rows]
 

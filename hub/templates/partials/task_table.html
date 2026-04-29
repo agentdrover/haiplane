@@ -18,10 +18,10 @@
         {% for t in tasks %}
         <tr id="task-row-{{ t.id }}">
             <td><code>{{ t.id }}</code></td>
-            <td><span class="badge badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span></td>
+            <td><span class="badge badge-type-{{ t.task_type.value }} task-table-badge task-table-badge--type">{{ t.task_type.value }}</span></td>
             <td><a href="/tasks/{{ t.id }}">{{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a></td>
-            <td><span class="badge badge-{{ t.status.value }}">{{ t.status.value }}</span></td>
-            <td><span class="badge badge-priority-{{ t.priority.value }}">{{ t.priority.value }}</span></td>
+            <td><span class="badge badge-{{ t.status.value }} task-table-badge task-table-badge--status">{{ t.status.value }}</span></td>
+            <td><span class="badge badge-priority-{{ t.priority.value }} task-table-badge task-table-badge--priority">{{ t.priority.value }}</span></td>
             <td>{{ t.human_owner or '—' }}</td>
             <td>{{ t.human_reviewer or '—' }}</td>
             <td>
@@ -33,30 +33,32 @@
             </td>
             <td class="u-nowrap">{{ t.created_at[:10] if t.created_at else '' }}</td>
             <td>
+                <div class="task-table-actions">
                 {% if t.status.value == 'draft' %}
-                <button class="btn btn-success btn-xs"
+                <button class="btn btn-success btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-approve"
                         hx-vals='{"run": "true"}'
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Approve</button>
-                <button class="btn btn-danger btn-xs"
+                <button class="btn btn-danger btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-reject"
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Reject</button>
                 {% elif t.status.value == 'open' %}
-                <button class="btn btn-primary btn-xs"
+                <button class="btn btn-primary btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-start"
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Start</button>
                 {% elif t.status.value == 'needs_info' %}
-                <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Answer</a>
+                <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs task-table-action">Answer</a>
                 {% elif t.status.value == 'needs_decision' %}
-                <button class="btn btn-success btn-xs"
+                <button class="btn btn-success btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-decide"
                         hx-vals='{"action": "accept"}'
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Accept</button>
                 {% endif %}
+                </div>
             </td>
         </tr>
         {% endfor %}

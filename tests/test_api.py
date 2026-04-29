@@ -387,3 +387,31 @@ async def test_decide_task_record_decision_api(client: AsyncClient, db):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "completed"
+
+
+async def test_archive_task_hidden_from_list(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Archivable"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(f"/api/tasks/{task_id}/archive", json={"cascade": True})
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+    listed = (await client.get("/api/tasks")).json()
+    assert all(t["id"] != task_id for t in listed)
+
+    with_arch = (
+        await client.get("/api/tasks", params={"include_archived": "true"})
+    ).json()
+    assert any(t["id"] == task_id for t in with_arch)
+
+
+async def test_delete_task_returns_204(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "To delete"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.delete(f"/api/tasks/{task_id}")
+    assert resp.status_code == 204
+
+    get_resp = await client.get(f"/api/tasks/{task_id}")
+    assert get_resp.status_code == 404

@@ -34,6 +34,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services.orchestration import dispatch_task
+from hub.services.refinement import TaskNotFoundError
 
 log = logging.getLogger("hub")
 
@@ -84,6 +85,7 @@ def row_to_task(
         pr_number=d.get("pr_number"),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
+        archived=bool(d.get("archived", 0)),
         **structured_clean,
     )
 
@@ -634,11 +636,68 @@ async def force_complete_task(
     await repo.add_task_update(db, task_id, "human", "done", comment)
     await repo.update_task(db, task_id, status="completed")
     await db.commit()
-    await log_activity(
-        db,
-        "task_force_completed",
-        f"Task #{task_id} force-completed without report",
-    )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def archive_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    cascade: bool = True,
+) -> TaskView:
+    """Mark task (and optionally subtree) archived — excluded from default lists."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise TaskNotFoundError(f"task {task_id} not found")
+    ids = await repo.collect_subtree_ids(db, task_id) if cascade else [task_id]
+    await repo.set_tasks_archived(db, ids, 1)
+    await db.commit()
+    await log_activity(
+        db,
+        "task_archived",
+        f"Task #{task_id} archived (cascade={cascade}, count={len(ids)})",
+    )
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    task_view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    return await enrich_task_view(db, task_view)
+
+
+async def unarchive_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    cascade: bool = True,
+) -> TaskView:
+    """Clear archived flag for task and optionally its subtree."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise TaskNotFoundError(f"task {task_id} not found")
+    ids = await repo.collect_subtree_ids(db, task_id) if cascade else [task_id]
+    await repo.set_tasks_archived(db, ids, 0)
+    await db.commit()
+    await log_activity(
+        db,
+        "task_unarchived",
+        f"Task #{task_id} unarchived (cascade={cascade}, count={len(ids)})",
+    )
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    task_view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    return await enrich_task_view(db, task_view)
+
+
+async def delete_task_tree(db: aiosqlite.Connection, task_id: int) -> None:
+    """Permanently remove a task and all descendants (DB rows and updates)."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise TaskNotFoundError(f"task {task_id} not found")
+    n = await repo.delete_task_subtree(db, task_id)
+    await db.commit()
+    await log_activity(
+        db,
+        "task_deleted",
+        f"Deleted task subtree rooted at #{task_id} ({n} tasks)",
+    )

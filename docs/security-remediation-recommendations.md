@@ -29,19 +29,19 @@ REST, Web, and `/mcp` to the LAN without authentication.
 
 - Change the default host to `127.0.0.1`.
 - Add a startup guard that rejects non-loopback binds when auth is open, unless
-  an explicit unsafe override is set, for example
-  `OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`.
+an explicit unsafe override is set, for example
+`OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`.
 - Keep Tailscale/team deployment documented, but require tokens for non-loopback
-  examples.
+examples.
 
 **Acceptance criteria:**
 
 - Default `openclaw-hub` binds to localhost only.
 - `OPENCLAW_HUB_HOST=0.0.0.0` with no tokens fails startup unless the explicit
-  unsafe override is set.
+unsafe override is set.
 - `OPENCLAW_HUB_HOST=0.0.0.0` with `OPENCLAW_HUB_TOKENS` configured starts.
 - Tests cover localhost default, guarded non-loopback open mode, and tokenized
-  non-loopback mode.
+non-loopback mode.
 
 **Suggested validation:**
 
@@ -72,27 +72,27 @@ force-complete, and Vast instance management.
 **Recommended fix:**
 
 - Extend token parsing to include roles/scopes, for example:
-  `alice:token:human`, `agent-ci:token:agent`, `admin:token:admin`.
+`alice:token:human`, `agent-ci:token:agent`, `admin:token:admin`.
 - Store authenticated identity on request state as a small structured object
-  instead of only a username.
+instead of only a username.
 - Add dependencies/helpers such as `require_human_or_admin` and
-  `require_admin`.
+`require_admin`.
 - Restrict human/admin operations:
   - approve/reject/start
   - answer/decide/force-complete
   - Vast up/down
   - any future admin/config endpoints
 - Leave agent-scoped operations available for propose/update/question/report
-  workflows.
+workflows.
 - Ensure MCP and CLI can send the configured token and surface 403 errors
-  clearly.
+clearly.
 
 **Acceptance criteria:**
 
 - Agent role cannot approve, force-complete, decide, start, or manage Vast.
 - Human/admin role can perform current human workflows.
 - Existing open-mode tests remain explicit and do not silently imply production
-  safety.
+safety.
 - REST, Web, MCP, and CLI behavior stays aligned.
 
 **Suggested validation:**
@@ -116,17 +116,17 @@ the fragment is returned after an HTMX action.
 **Recommended fix:**
 
 - Prefer rendering a Jinja partial for this fragment so Jinja autoescaping
-  applies.
+applies.
 - If keeping the f-string, escape all interpolated text with `html.escape()`.
 - Escape status text too, even if it currently comes from an enum, to keep the
-  fragment safe if fields change later.
+fragment safe if fields change later.
 
 **Acceptance criteria:**
 
 - A title such as `<img src=x onerror=alert(1)>` is returned escaped in the HTMX
-  fragment.
+fragment.
 - Existing HTMX approve/reject/start/answer/decide/force-complete flows still
-  render the done indicator.
+render the done indicator.
 
 **Suggested validation:**
 
@@ -177,13 +177,13 @@ uv run pytest tests/test_models.py tests/test_api_refine.py -q
 ## Additional Hardening
 
 - Add `OPENCLAW_HUB_COOKIE_SECURE=1` support and set the cookie `secure` flag
-  for TLS deployments.
+for TLS deployments.
 - Prefer opaque browser session IDs or signed session cookies instead of storing
-  the bearer token directly in the browser cookie.
+the bearer token directly in the browser cookie.
 - Add `OPENCLAW_HUB_TOKEN` support to MCP and CLI HTTP clients so authenticated
-  deployments are usable consistently.
+deployments are usable consistently.
 - Add optional dependency/security checks to CI if the project wants automated
-  coverage:
+coverage:
 
 ```bash
 uv run pip-audit

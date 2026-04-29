@@ -5,10 +5,12 @@
 {% else %}
 
 {% if drafts %}
-<section class="inbox-group inbox-drafts">
-    <h3 class="inbox-group-title">
+<details class="inbox-group inbox-drafts inbox-drafts--collapsible" id="inbox-proposals" open>
+    <summary class="inbox-group-title inbox-group-title--collapsible">
+        <span class="toggle-icon inbox-toggle-icon" aria-hidden="true">&#9654;</span>
         Proposals <span class="inbox-count">{{ drafts|length }}</span>
-    </h3>
+    </summary>
+    <div class="inbox-proposals-body">
     {% for t in drafts %}
     <article class="inbox-item" id="inbox-task-{{ t.id }}">
         <div class="inbox-item-header">
@@ -42,7 +44,8 @@
         </div>
     </article>
     {% endfor %}
-</section>
+    </div>
+</details>
 {% endif %}
 
 {% if questions %}

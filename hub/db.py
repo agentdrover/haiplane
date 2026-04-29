@@ -335,6 +335,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_admin_audit_target",
         "CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_log(target_type, target_id)",
     ),
+    (
+        "add_tasks_archived_column",
+        "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "idx_tasks_archived",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived)",
+    ),
 ]
 
 
@@ -712,7 +720,7 @@ async def get_children(
     """Get direct children of a task, ordered by position then id."""
     rows = await db.execute_fetchall(
         "SELECT id, title, task_type, status, priority FROM tasks "
-        "WHERE parent_id=? ORDER BY position ASC, id ASC",
+        "WHERE parent_id=? AND archived=0 ORDER BY position ASC, id ASC",
         (task_id,),
     )
     return [dict(r) for r in rows]
@@ -726,7 +734,7 @@ async def get_progress(
     from hub.models import ACTIVE_STATUSES
 
     rows = await db.execute_fetchall(
-        "SELECT status FROM tasks WHERE parent_id=?", (task_id,)
+        "SELECT status FROM tasks WHERE parent_id=? AND archived=0", (task_id,)
     )
     total = len(rows)
     if total == 0:
@@ -760,7 +768,8 @@ async def build_tree(
 
     task = dict(rows[0])
     children_rows = await db.execute_fetchall(
-        "SELECT id FROM tasks WHERE parent_id=? ORDER BY position ASC, id ASC",
+        "SELECT id FROM tasks WHERE parent_id=? AND archived=0 "
+        "ORDER BY position ASC, id ASC",
         (task_id,),
     )
     children = []
@@ -810,6 +819,8 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     "tasks.human_gate",
     "tasks.agent_report",
     "tasks.decision",
+    "tasks.archive",
+    "tasks.delete",
     "integrations.vast.manage",
     "system.settings.write",
 )
@@ -838,6 +849,8 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
             "tasks.update",
             "tasks.human_gate",
             "tasks.decision",
+            "tasks.archive",
+            "tasks.delete",
             "integrations.vast.manage",
         ),
     ),
@@ -852,6 +865,8 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
             "tasks.update",
             "tasks.human_gate",
             "tasks.decision",
+            "tasks.archive",
+            "tasks.delete",
             "integrations.vast.manage",
         ),
     ),
@@ -859,7 +874,13 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "developer",
         "Developer",
         "Create and manage tasks without admin access",
-        ("tasks.read", "tasks.create", "tasks.refine", "tasks.update"),
+        (
+            "tasks.read",
+            "tasks.create",
+            "tasks.refine",
+            "tasks.update",
+            "tasks.archive",
+        ),
     ),
     (
         "viewer",

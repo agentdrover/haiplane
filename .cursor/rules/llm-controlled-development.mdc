@@ -1,0 +1,16 @@
+---
+description: Controlled LLM development workflow for OpenClaw Hub
+alwaysApply: true
+---
+
+# Controlled LLM Development
+
+- Work from the repository root and keep changes narrow.
+- Before changing code, read `docs/repository-rules.md` and the relevant files in `docs/agent-context/`.
+- Do not commit, push, amend, rebase, force-push, or change remotes unless the user explicitly asks.
+- Use task branches: `task-<hub-task-id>/<short-slug>` when a Hub task exists, otherwise `fix/<short-slug>` or `chore/<short-slug>`.
+- Keep one executable task per branch. Do not mix unrelated features, fixes, and cleanup.
+- Use commit messages in the form `<type>: <short summary>` with types from `docs/repository-rules.md`.
+- Validate with repository commands only: `uv run ruff check hub tests`, `uv run ruff format --check hub tests`, and `uv run pytest -q`.
+- For API contract changes, update REST, CLI, MCP, Web, and tests in the same pass.
+- Never include secrets, real `.env` files, local databases, caches, or unrelated user changes.

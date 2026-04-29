@@ -17,6 +17,50 @@ async def test_tasks_page(client: AsyncClient):
     assert "text/html" in resp.headers["content-type"]
 
 
+async def test_tasks_page_filter_controls_have_consistent_markup(client: AsyncClient):
+    resp = await client.get("/tasks")
+    assert resp.status_code == 200
+    assert resp.text.count('class="filter-control"') >= 6
+    assert "filter-reset-btn" in resp.text
+
+
+async def test_tasks_list_filters_ignore_blank_parent_id(client: AsyncClient):
+    await client.post("/api/tasks", json={"title": "Open visible"})
+    await client.post(
+        "/api/tasks",
+        json={"title": "Draft visible", "source": "agent", "agent": "bot"},
+    )
+
+    resp = await client.get(
+        "/tasks/list",
+        params={"status": "draft", "parent_id": ""},
+    )
+
+    assert resp.status_code == 200
+    assert "Draft visible" in resp.text
+    assert "Open visible" not in resp.text
+
+
+async def test_tasks_table_actions_have_consistent_button_markup(client: AsyncClient):
+    await client.post(
+        "/api/tasks",
+        json={"title": "Draft action", "source": "agent", "agent": "bot"},
+    )
+    resp = await client.get("/tasks")
+    assert resp.status_code == 200
+    assert "task-table-actions" in resp.text
+    assert "task-table-action" in resp.text
+
+
+async def test_tasks_table_badges_have_consistent_markup(client: AsyncClient):
+    await client.post("/api/tasks", json={"title": "Badge row"})
+    resp = await client.get("/tasks")
+    assert resp.status_code == 200
+    assert "task-table-badge--type" in resp.text
+    assert "task-table-badge--status" in resp.text
+    assert "task-table-badge--priority" in resp.text
+
+
 async def test_task_detail_page(client: AsyncClient):
     create = await client.post("/api/tasks", json={"title": "Detail page task"})
     task_id = create.json()["id"]
@@ -25,12 +69,29 @@ async def test_task_detail_page(client: AsyncClient):
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "Detail page task" in resp.text
+    assert "task-hero" in resp.text
+    assert "task-detail-layout" in resp.text
+    assert "task-actions-card" in resp.text
+    assert "task-meta-list" in resp.text
 
 
 async def test_inbox_partial(client: AsyncClient):
     resp = await client.get("/partials/inbox")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
+
+
+async def test_inbox_proposals_render_as_collapsible_details(client: AsyncClient):
+    await client.post(
+        "/api/tasks",
+        json={"title": "Draft proposal", "source": "agent", "agent": "bot"},
+    )
+    resp = await client.get("/partials/inbox")
+    assert resp.status_code == 200
+    assert 'id="inbox-proposals"' in resp.text
+    assert "<details" in resp.text
+    assert "<summary" in resp.text
+    assert "Proposals" in resp.text
 
 
 async def test_kanban_partial(client: AsyncClient):
@@ -174,6 +235,17 @@ async def test_web_decide_task_form_has_summary_field(client: AsyncClient, db):
     assert page.status_code == 200
     assert 'name="decision_summary"' in page.text
     assert 'name="record_decision"' in page.text
+    assert "task-action-state--danger" in page.text
+
+
+async def test_task_detail_renders_archive_delete_controls(client: AsyncClient):
+    create = await client.post("/api/tasks", json={"title": "Danger controls"})
+    task_id = create.json()["id"]
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "task-danger-card" in resp.text
+    assert f'action="/tasks/{task_id}/web-archive"' in resp.text
+    assert f'action="/tasks/{task_id}/web-delete"' in resp.text
 
 
 async def test_web_force_complete_records_hx_prompt(client: AsyncClient, db):

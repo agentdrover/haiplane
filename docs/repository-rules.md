@@ -13,6 +13,8 @@
 - Для исправлений без задачи: `chore/<short-slug>` или `fix/<short-slug>`, но предпочтительно сначала создать задачу в хабе.
 - Одна исполняемая задача - одна ветка.
 - Не смешивать независимые изменения в одной ветке.
+- `main` защищается на GitHub: изменения должны проходить через PR и зеленый CI, кроме явно подтвержденных emergency-изменений владельцем репозитория.
+- Ветки агентов должны быть короткоживущими: после merge удалить remote branch и закрыть связанную задачу/отчет.
 
 ## Коммиты
 
@@ -41,6 +43,23 @@ docs: add human agent workflow implementation plan
 fix: pass force flag through mcp approve tool
 test: cover pending report force complete api
 ```
+
+Правила для LLM-агентов:
+
+- Не создавать commit без прямого запроса пользователя.
+- Перед commit показать `git status`, diff и выбранный список файлов.
+- Не добавлять чужие незакоммиченные изменения, секреты, локальные базы, cache artifacts.
+- Не использовать `--amend`, `rebase`, force-push или skip hooks без явного подтверждения пользователя.
+
+## Push / Pull Request
+
+- Remote по умолчанию: `origin` на приватный GitHub-репозиторий.
+- Первый push новой ветки: `git push -u origin HEAD`.
+- Push в `main` не является обычным рабочим процессом; предпочтительный путь - PR из рабочей ветки.
+- PR должен использовать `.github/pull_request_template.md`, указывать задачу/intent, LLM work log, validation commands и риски.
+- Перед merge проверить GitHub CI и review checklist ниже.
+- Локальная защита push хранится в `.githooks/pre-push`; для новой копии репозитория установить ее командой `cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push`.
+- Emergency push в `main` допускается только владельцем и только явно: `ALLOW_MAIN_PUSH=1 git push origin main`.
 
 ## Что хранить в git
 

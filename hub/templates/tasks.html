@@ -24,7 +24,7 @@
     <input type="hidden" name="source" value="{{ filter_source }}">
     <div class="filter-group">
         <label>Type</label>
-        <select name="type" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
+        <select class="filter-control" name="type" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
             <option value="">All</option>
             {% for tp in all_types %}
             <option value="{{ tp }}" {% if filter_type == tp %}selected{% endif %}>{{ tp | capitalize }}</option>
@@ -33,7 +33,7 @@
     </div>
     <div class="filter-group">
         <label>Status</label>
-        <select name="status" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
+        <select class="filter-control" name="status" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
             <option value="">All</option>
             {% for st in all_statuses %}
             <option value="{{ st }}" {% if filter_status == st %}selected{% endif %}>{{ st }}</option>
@@ -42,7 +42,7 @@
     </div>
     <div class="filter-group">
         <label>Priority</label>
-        <select name="priority" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
+        <select class="filter-control" name="priority" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
             <option value="">All</option>
             {% for p in all_priorities %}
             <option value="{{ p }}" {% if filter_priority == p %}selected{% endif %}>{{ p | capitalize }}</option>
@@ -52,7 +52,7 @@
     <div class="filter-group">
         <label>Parent</label>
         <input type="number" name="parent_id" placeholder="ID"
-               class="input--sm"
+               class="filter-control"
                value="{{ filter_parent_id or '' }}"
                hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]"
                hx-trigger="change, keyup changed delay:500ms"
@@ -61,7 +61,7 @@
     <div class="filter-group">
         <label>Owner</label>
         <input type="text" name="human_owner" placeholder="Owner"
-               class="input--sm"
+               class="filter-control"
                value="{{ filter_human_owner or '' }}"
                hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]"
                hx-trigger="change, keyup changed delay:500ms">
@@ -69,13 +69,13 @@
     <div class="filter-group">
         <label>Reviewer</label>
         <input type="text" name="human_reviewer" placeholder="Reviewer"
-               class="input--sm"
+               class="filter-control"
                value="{{ filter_human_reviewer or '' }}"
                hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]"
                hx-trigger="change, keyup changed delay:500ms">
     </div>
     <div class="filter-group filter-group--end">
-        <a href="/tasks" class="btn btn-ghost btn-sm">Reset</a>
+        <a href="/tasks" class="btn btn-ghost btn-sm filter-reset-btn">Reset</a>
     </div>
 </div>
 

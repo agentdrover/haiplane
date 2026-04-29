@@ -101,6 +101,33 @@ async def test_list_tasks_filtered(db: aiosqlite.Connection):
     assert dict(high[0])["title"] == "Running 1"
 
 
+async def test_list_tasks_filtered_respects_archived(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Soon archived",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await repo.update_task(db, task_id, archived=1)
+    await db.commit()
+
+    visible = await repo.list_tasks_filtered(db, status="open")
+    assert [dict(r)["id"] for r in visible] == []
+
+    all_rows = await repo.list_tasks_filtered(db, status="open", include_archived=True)
+    assert len(all_rows) == 1
+    assert dict(all_rows[0])["id"] == task_id
+
+
 async def test_update_task(db: aiosqlite.Connection):
     task_id = await repo.create_task(
         db,

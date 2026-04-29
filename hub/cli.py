@@ -135,8 +135,9 @@ def _print_task_short(t: dict[str, Any]) -> None:
         f" [reviewer:{t.get('human_reviewer')}]" if t.get("human_reviewer") else ""
     )
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
+    arch = " [archived]" if t.get("archived") else ""
     print(
-        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{owner}{reviewer}{parent} {t['title']}"
+        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){arch}{src}{owner}{reviewer}{parent} {t['title']}"
     )
 
 
@@ -302,6 +303,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         params += f"&human_owner={urllib.parse.quote(args.owner)}"
     if getattr(args, "reviewer", None):
         params += f"&human_reviewer={urllib.parse.quote(args.reviewer)}"
+    if getattr(args, "include_archived", False):
+        params += "&include_archived=true"
     result = _api("GET", f"/api/tasks{params}")
     for t in result:
         _print_task_short(t)
@@ -355,6 +358,34 @@ def cmd_force_complete(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {"comment": args.message or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/force-complete", body)
     _print_json(result)
+    return 0
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    cascade = not args.no_cascade
+    result = _api(
+        "POST",
+        f"/api/tasks/{args.task_id}/archive",
+        {"cascade": cascade},
+    )
+    _print_json(result)
+    return 0
+
+
+def cmd_unarchive(args: argparse.Namespace) -> int:
+    cascade = not args.no_cascade
+    result = _api(
+        "POST",
+        f"/api/tasks/{args.task_id}/unarchive",
+        {"cascade": cascade},
+    )
+    _print_json(result)
+    return 0
+
+
+def cmd_delete_task(args: argparse.Namespace) -> int:
+    _api("DELETE", f"/api/tasks/{args.task_id}")
+    print(f"Task #{args.task_id} deleted.")
     return 0
 
 
@@ -960,6 +991,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--owner", default=None, help="Filter by human_owner")
     p_list.add_argument("--reviewer", default=None, help="Filter by human_reviewer")
     p_list.add_argument("--limit", type=int, default=20)
+    p_list.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Include archived tasks (hidden from default lists)",
+    )
     p_list.set_defaults(func=cmd_list)
 
     # update — add status update to a task
@@ -1021,6 +1057,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reason for the override (recorded in audit trail)",
     )
     p_force_complete.set_defaults(func=cmd_force_complete)
+
+    p_archive = sub.add_parser(
+        "archive",
+        help="Archive a task (hide from default lists; optional subtree)",
+    )
+    p_archive.add_argument("task_id", type=int)
+    p_archive.add_argument(
+        "--no-cascade",
+        action="store_true",
+        help="Archive only this task, not descendants",
+    )
+    p_archive.set_defaults(func=cmd_archive)
+
+    p_unarchive = sub.add_parser(
+        "unarchive",
+        help="Restore archived task(s)",
+    )
+    p_unarchive.add_argument("task_id", type=int)
+    p_unarchive.add_argument(
+        "--no-cascade",
+        action="store_true",
+        help="Unarchive only this task",
+    )
+    p_unarchive.set_defaults(func=cmd_unarchive)
+
+    p_delete = sub.add_parser(
+        "delete",
+        help="Permanently delete a task and its subtree (irreversible)",
+    )
+    p_delete.add_argument("task_id", type=int)
+    p_delete.set_defaults(func=cmd_delete_task)
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Get dashboard data (JSON)")

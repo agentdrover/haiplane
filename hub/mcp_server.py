@@ -6,12 +6,18 @@ import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
 
+# FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
+# The hub mounts streamable HTTP under the main FastAPI app, so clients send the
+# public Host (e.g. agenthai.ru) — the SDK default rejects them with 421. Disable
+# MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
 mcp = FastMCP(
     "openclaw-hub",
     instructions="MCP server for OpenClaw Hub — project state, tasks, proposals, decisions",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
@@ -24,7 +30,14 @@ def _hub_url() -> str:
 def _hub_token() -> str:
     import os
 
-    return os.environ.get("OPENCLAW_HUB_TOKEN", "")
+    env_tok = (os.environ.get("OPENCLAW_HUB_TOKEN") or "").strip()
+    if env_tok:
+        return env_tok
+    # Streamable MCP mounted in the same process: reuse caller's Bearer (set by
+    # AuthMiddleware via hub.mcp_internal_auth) so tools work without OPENCLAW_HUB_TOKEN.
+    from hub.mcp_internal_auth import bearer_context_get
+
+    return (bearer_context_get() or "").strip()
 
 
 def _auth_headers() -> dict[str, str]:
@@ -95,7 +108,11 @@ def _format_task(t: dict[str, Any]) -> str:
     parent = f" (parent #{t['parent_id']})" if t.get("parent_id") else ""
     owner = f" [owner:{t['human_owner']}]" if t.get("human_owner") else ""
     reviewer = f" [reviewer:{t['human_reviewer']}]" if t.get("human_reviewer") else ""
-    return f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')}){src}{owner}{reviewer}{parent} {t['title']}"
+    arch = " [archived]" if t.get("archived") else ""
+    return (
+        f"#{t['id']} {tt_tag}[{t['status']}] ({t.get('runtime', 'auto')})"
+        f"{arch}{src}{owner}{reviewer}{parent} {t['title']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +243,7 @@ async def hub_list_tasks(
     human_owner: str = "",
     human_reviewer: str = "",
     limit: int = 20,
+    include_archived: bool = False,
 ) -> str:
     """List tasks with optional filters.
 
@@ -236,6 +254,7 @@ async def hub_list_tasks(
         human_owner: Filter by human_owner (exact match). Empty for all.
         human_reviewer: Filter by human_reviewer (exact match). Empty for all.
         limit: Max number of tasks to return
+        include_archived: When True, include archived tasks (hidden from boards by default).
     """
     from urllib.parse import urlencode
 
@@ -250,6 +269,8 @@ async def hub_list_tasks(
         params["human_owner"] = human_owner
     if human_reviewer:
         params["human_reviewer"] = human_reviewer
+    if include_archived:
+        params["include_archived"] = "true"
     tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
     if not tasks:
         return "No tasks found."
@@ -467,6 +488,49 @@ async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
     status = result.get("status", "?")
     return f"Task #{task_id} force-completed (status: {status})."
+
+
+@mcp.tool()
+async def hub_archive_task(task_id: int, cascade: bool = True) -> str:
+    """Hide a task from default lists (optional subtree cascade).
+
+    Args:
+        task_id: Task to archive
+        cascade: If True, archive the whole subtree. If False, only this row.
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/archive",
+        {"cascade": cascade},
+    )
+    st = result.get("status", "?")
+    return f"Task #{task_id} archived (status in response: {st})."
+
+
+@mcp.tool()
+async def hub_unarchive_task(task_id: int, cascade: bool = True) -> str:
+    """Restore archived tasks (optional subtree cascade).
+
+    Args:
+        task_id: Task to unarchive
+        cascade: If True, unarchive the whole subtree. If False, only this row.
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/unarchive",
+        {"cascade": cascade},
+    )
+    st = result.get("status", "?")
+    return f"Task #{task_id} unarchived (status in response: {st})."
+
+
+@mcp.tool()
+async def hub_delete_task(task_id: int) -> str:
+    """Permanently delete a task and all descendants (irreversible).
+
+    Args:
+        task_id: Root of the subtree to remove from the database.
+    """
+    await _api_delete(f"/api/tasks/{task_id}")
+    return f"Task #{task_id} and its descendants were deleted."
 
 
 # ---------------------------------------------------------------------------

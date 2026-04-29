@@ -20,7 +20,7 @@ import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import Any, Final
 
 from fastapi import HTTPException, Request, status
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -28,6 +28,7 @@ from starlette.responses import Response
 
 from hub import config
 from hub.config import TokenIdentity
+from hub.mcp_internal_auth import bearer_context_reset, bearer_context_set
 
 log = logging.getLogger("hub.auth")
 
@@ -222,24 +223,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         path = request.url.path
+        mcp_ctx: Any = None
+        if path.startswith("/mcp"):
+            br = _extract_bearer(request)
+            if br:
+                mcp_ctx = bearer_context_set(br)
 
-        if _looks_public(path):
-            identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+        try:
+            if _looks_public(path):
+                identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+                request.state.user = identity.username
+                request.state.identity = identity
+                return await call_next(request)
+
+            if _is_open_mode():
+                request.state.user = ANONYMOUS_USER
+                request.state.identity = ANONYMOUS_IDENTITY
+                return await call_next(request)
+
+            identity = await _resolve_identity(request)
+            if not identity:
+                return _unauthorized(request)
             request.state.user = identity.username
             request.state.identity = identity
             return await call_next(request)
-
-        if _is_open_mode():
-            request.state.user = ANONYMOUS_USER
-            request.state.identity = ANONYMOUS_IDENTITY
-            return await call_next(request)
-
-        identity = await _resolve_identity(request)
-        if not identity:
-            return _unauthorized(request)
-        request.state.user = identity.username
-        request.state.identity = identity
-        return await call_next(request)
+        finally:
+            if mcp_ctx is not None:
+                bearer_context_reset(mcp_ctx)
 
 
 def _unauthorized(request: Request) -> Response:

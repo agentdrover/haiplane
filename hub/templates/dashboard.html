@@ -381,4 +381,25 @@ function toggleRefine() {
     });
 })();
 </script>
+
+<script>
+(function() {
+    var KEY = 'inbox_proposals_open';
+    function apply() {
+        var panel = document.getElementById('inbox-proposals');
+        if (!panel) return;
+        var v = localStorage.getItem(KEY);
+        panel.open = v !== '0';
+    }
+    function save(e) {
+        if (!e.target || e.target.id !== 'inbox-proposals') return;
+        localStorage.setItem(KEY, e.target.open ? '1' : '0');
+    }
+    document.addEventListener('DOMContentLoaded', apply);
+    document.addEventListener('toggle', save, true);
+    document.body.addEventListener('htmx:afterSwap', function(e) {
+        if (e.detail.target.id === 'inbox-content') apply();
+    });
+})();
+</script>
 {% endblock %}

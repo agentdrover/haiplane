@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from fastapi import APIRouter, Form, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -18,8 +18,10 @@ from hub import services
 from hub.auth import (
     CSRF_COOKIE_NAME,
     current_user,
+    current_identity,
     generate_csrf_token,
     login_limiter,
+    require_permission,
     verify_csrf,
 )
 from hub.integrations.registry import plugins
@@ -51,6 +53,16 @@ TEMPLATES = Jinja2Templates(
 )
 
 router = APIRouter()
+
+
+def _optional_int_query(value: str | int | None, field: str) -> int | None:
+    """Treat empty HTMX form values as omitted optional integer query params."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"{field} must be an integer") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -264,19 +276,20 @@ async def web_tasks_list_partial(
     task_type: str | None = Query(default=None, alias="type"),
     priority: str | None = None,
     source: str | None = None,
-    parent_id: int | None = None,
+    parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     limit: int = Query(default=100, le=200),
 ):
     """HTML fragment: task table body for HTMX swap."""
+    parsed_parent_id = _optional_int_query(parent_id, "parent_id")
     tasks = await services.list_tasks(
         _db(request),
         status=status,
         task_type=task_type,
         priority=priority,
         source=source,
-        parent_id=parent_id,
+        parent_id=parsed_parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=limit,
@@ -321,26 +334,27 @@ async def web_tasks(
     task_type: str | None = Query(default=None, alias="type"),
     priority: str | None = None,
     source: str | None = None,
-    parent_id: int | None = None,
+    parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
 ):
     db = _db(request)
+    parsed_parent_id = _optional_int_query(parent_id, "parent_id")
     tasks = await services.list_tasks(
         db,
         status=status,
         task_type=task_type,
         priority=priority,
         source=source,
-        parent_id=parent_id,
+        parent_id=parsed_parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,
     )
 
     parent_breadcrumb = None
-    if parent_id is not None:
-        crumbs = await db_module.get_breadcrumb(db, parent_id)
+    if parsed_parent_id is not None:
+        crumbs = await db_module.get_breadcrumb(db, parsed_parent_id)
         parent_breadcrumb = crumbs
 
     all_statuses = [s.value for s in TaskStatus]
@@ -356,7 +370,7 @@ async def web_tasks(
             "filter_type": task_type or "",
             "filter_priority": priority or "",
             "filter_source": source or "",
-            "filter_parent_id": parent_id,
+            "filter_parent_id": parsed_parent_id,
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
             "parent_breadcrumb": parent_breadcrumb,
@@ -376,7 +390,16 @@ async def web_task_detail(task_id: int, request: Request):
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     task = await services.enrich_task_view(db, task_view)
-    return TEMPLATES.TemplateResponse(request, "task_detail.html", {"task": task})
+    identity = current_identity(request)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "task_detail.html",
+        {
+            "task": task,
+            "can_archive": identity.has_permission("tasks.archive"),
+            "can_delete": identity.has_permission("tasks.delete"),
+        },
+    )
 
 
 @router.get("/tasks/{task_id}/log", response_class=HTMLResponse)
@@ -559,6 +582,47 @@ async def web_force_complete_task(
     await services.force_complete_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-delete")
+async def web_delete_task(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_permission("tasks.delete")),
+):
+    """Permanently remove a task subtree from the Web UI."""
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    parent_id = dict(row).get("parent_id")
+    await services.delete_task_tree(db, task_id)
+    dest = f"/tasks/{parent_id}" if parent_id else "/tasks"
+    return RedirectResponse(dest, status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-archive")
+async def web_archive_task(
+    task_id: int,
+    request: Request,
+    cascade: str = Form("true"),
+    _identity=Depends(require_permission("tasks.archive")),
+):
+    cascade_flag = cascade.lower() in ("1", "true", "yes", "on")
+    await services.archive_task(_db(request), task_id, cascade=cascade_flag)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-unarchive")
+async def web_unarchive_task(
+    task_id: int,
+    request: Request,
+    cascade: str = Form("true"),
+    _identity=Depends(require_permission("tasks.archive")),
+):
+    cascade_flag = cascade.lower() in ("1", "true", "yes", "on")
+    await services.unarchive_task(_db(request), task_id, cascade=cascade_flag)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 

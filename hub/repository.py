@@ -52,9 +52,13 @@ async def list_tasks_filtered(
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     limit: int = 50,
+    include_archived: bool = False,
 ) -> list[aiosqlite.Row]:
     conditions: list[str] = []
     params: list[Any] = []
+
+    if not include_archived:
+        conditions.append("archived=0")
 
     if status:
         conditions.append("status=?")
@@ -91,10 +95,13 @@ async def list_tasks_by_statuses(
     statuses: list[str],
     *,
     limit: int = 20,
+    include_archived: bool = False,
 ) -> list[aiosqlite.Row]:
     placeholders = ",".join("?" for _ in statuses)
+    archived_sql = "" if include_archived else " AND archived=0"
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+        f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql} "
+        "ORDER BY id DESC LIMIT ?",
         (*statuses, limit),
     )
 
@@ -105,11 +112,13 @@ async def list_tasks_by_status(
     *,
     order_by: str = "id DESC",
     limit: int = 20,
+    include_archived: bool = False,
 ) -> list[aiosqlite.Row]:
     if order_by not in ALLOWED_TASKS_ORDER_BY:
         raise ValueError(f"Unsupported order_by clause: {order_by!r}")
+    archived_sql = "" if include_archived else " AND archived=0"
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status=? ORDER BY {order_by} LIMIT ?",
+        f"SELECT * FROM tasks WHERE status=?{archived_sql} ORDER BY {order_by} LIMIT ?",
         (status, limit),
     )
 
@@ -118,7 +127,7 @@ async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE status IN ('running', 'fix_requested') "
+        "SELECT * FROM tasks WHERE archived=0 AND status IN ('running', 'fix_requested') "
         "AND job_id IS NOT NULL",
     )
 
@@ -127,7 +136,8 @@ async def list_review_tasks(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE status='review' AND review_job_id IS NOT NULL",
+        "SELECT * FROM tasks WHERE archived=0 AND status='review' "
+        "AND review_job_id IS NOT NULL",
     )
 
 
@@ -135,7 +145,7 @@ async def list_ci_check_tasks(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE status='ci_check'",
+        "SELECT * FROM tasks WHERE archived=0 AND status='ci_check'",
     )
 
 
@@ -144,7 +154,7 @@ async def list_stale_running(
     threshold_minutes: int,
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE status='running' "
+        "SELECT * FROM tasks WHERE archived=0 AND status='running' "
         "AND updated_at < datetime('now', ?)",
         (f"-{threshold_minutes} minutes",),
     )
@@ -156,7 +166,7 @@ async def list_active_epics(
     limit: int = 20,
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE task_type='epic' "
+        "SELECT * FROM tasks WHERE archived=0 AND task_type='epic' "
         "AND status NOT IN ('completed','failed','rejected') "
         "ORDER BY position ASC, id DESC LIMIT ?",
         (limit,),
@@ -171,12 +181,12 @@ async def list_agent_tasks(
 ) -> list[aiosqlite.Row]:
     if status:
         return await db.execute_fetchall(
-            "SELECT * FROM tasks WHERE source='agent' AND status=? "
+            "SELECT * FROM tasks WHERE archived=0 AND source='agent' AND status=? "
             "ORDER BY id DESC LIMIT ?",
             (status, limit),
         )
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE source='agent' ORDER BY id DESC LIMIT ?",
+        "SELECT * FROM tasks WHERE archived=0 AND source='agent' ORDER BY id DESC LIMIT ?",
         (limit,),
     )
 
@@ -188,7 +198,7 @@ async def get_siblings(
 ) -> list[aiosqlite.Row]:
     return await db.execute_fetchall(
         "SELECT id, title, task_type, status FROM tasks "
-        "WHERE parent_id=? AND id!=? ORDER BY position ASC, id ASC",
+        "WHERE parent_id=? AND id!=? AND archived=0 ORDER BY position ASC, id ASC",
         (parent_id, exclude_id),
     )
 
@@ -464,6 +474,75 @@ async def delete_acceptance_criterion(
         (task_id, ac_id),
     )
     return cur.rowcount > 0
+
+
+async def collect_subtree_ids(
+    db: aiosqlite.Connection,
+    root_id: int,
+) -> list[int]:
+    """All task ids in the subtree rooted at ``root_id`` (root first, BFS)."""
+    out: list[int] = []
+    queue: list[int] = [root_id]
+    seen: set[int] = set()
+    while queue:
+        tid = queue.pop(0)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+        rows = await db.execute_fetchall(
+            "SELECT id FROM tasks WHERE parent_id=? ORDER BY id ASC",
+            (tid,),
+        )
+        for r in rows:
+            queue.append(r[0])
+    return out
+
+
+async def subtree_ids_deepest_first(
+    db: aiosqlite.Connection,
+    root_id: int,
+) -> list[int]:
+    """Subtree ids ordered so children always precede their ancestors."""
+    rows = await db.execute_fetchall(
+        """
+        WITH RECURSIVE sub(id, depth) AS (
+          SELECT id, 0 FROM tasks WHERE id = ?
+          UNION ALL
+          SELECT t.id, sub.depth + 1 FROM tasks t
+          INNER JOIN sub ON t.parent_id = sub.id
+        )
+        SELECT id FROM sub ORDER BY depth DESC, id DESC
+        """,
+        (root_id,),
+    )
+    return [r[0] for r in rows]
+
+
+async def set_tasks_archived(
+    db: aiosqlite.Connection,
+    task_ids: list[int],
+    archived: int,
+) -> None:
+    if not task_ids:
+        return
+    ph = ",".join("?" * len(task_ids))
+    await db.execute(
+        f"UPDATE tasks SET archived=?, updated_at=datetime('now') WHERE id IN ({ph})",
+        (archived, *task_ids),
+    )
+
+
+async def delete_task_subtree(db: aiosqlite.Connection, root_id: int) -> int:
+    """Delete ``root_id`` and all descendants. Returns number of ``tasks`` rows removed."""
+    ids = await subtree_ids_deepest_first(db, root_id)
+    if not ids:
+        return 0
+    ph = ",".join("?" * len(ids))
+    await db.execute(f"DELETE FROM task_updates WHERE task_id IN ({ph})", ids)
+    for tid in ids:
+        await db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    return len(ids)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+set -eu
+
+remote_name="${1:-}"
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ "$local_ref" = "delete" ] && continue
+
+  case "$local_ref" in
+    refs/heads/main)
+      if [ "${ALLOW_MAIN_PUSH:-}" != "1" ]; then
+        echo "Blocked push to main. Use a PR branch, or set ALLOW_MAIN_PUSH=1 for an explicit owner-approved emergency push." >&2
+        exit 1
+      fi
+      ;;
+    refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*)
+      ;;
+    *)
+      echo "Blocked push from branch '${local_ref#refs/heads/}' to ${remote_name}." >&2
+      echo "Use task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
+      exit 1
+      ;;
+  esac
+
+  if [ -n "$(git status --porcelain)" ] && [ "${ALLOW_DIRTY_PUSH:-}" != "1" ]; then
+    echo "Blocked push with a dirty working tree. Commit/stash unrelated changes, or set ALLOW_DIRTY_PUSH=1 intentionally." >&2
+    exit 1
+  fi
+done

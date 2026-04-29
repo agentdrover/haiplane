@@ -145,6 +145,8 @@ _HUMAN_DEFAULT_PERMS = frozenset(
         "tasks.update",
         "tasks.human_gate",
         "tasks.decision",
+        "tasks.archive",
+        "tasks.delete",
         "integrations.vast.manage",
     }
 )

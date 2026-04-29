@@ -66,6 +66,19 @@ async def test_structured_task_columns_present():
         await conn.close()
 
 
+async def test_tasks_archived_column_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "archived" in cols
+        assert (
+            cols["archived"]["dflt_value"] is not None
+            or cols["archived"]["notnull"] == 1
+        )
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "column, expected_default",
     [

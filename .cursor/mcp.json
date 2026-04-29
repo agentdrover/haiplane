@@ -6,6 +6,14 @@
       "env": {
         "OPENCLAW_HUB_URL": "http://127.0.0.1:8080"
       }
+    },
+    "openclaw-hub": {
+      "type": "streamable-http",
+      "url": "https://agenthai.ru/mcp/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:OPENCLAW_HUB_MCP_TOKEN}",
+        "Accept": "application/json, text/event-stream"
+      }
     }
   }
 }

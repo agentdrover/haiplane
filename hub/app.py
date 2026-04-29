@@ -25,6 +25,7 @@ from hub.models import (
     ReadinessReport,
     TaskAnswer,
     TaskApprove,
+    TaskArchive,
     TaskContextView,
     TaskCreate,
     TaskDecide,
@@ -37,11 +38,13 @@ from hub.models import (
     TaskSource,
     TaskStart,
     TaskTreeNode,
+    TaskUnarchive,
     TaskUpdateCreate,
     TaskUpdateView,
     TaskView,
 )
 from hub.auth import AuthMiddleware, require_human_or_admin, require_permission
+from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
@@ -140,6 +143,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="OpenClaw Hub", version="0.2.0", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
+# After Auth: runs first on the request — fixes MCP clients that omit Accept.
+app.add_middleware(McpStreamableAcceptCompatMiddleware)
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 # MCP transport for remote agents (Cursor, etc.). Bearer token enforced by
 # AuthMiddleware — see deploy/TAILSCALE.md for the client-side config.
@@ -177,6 +182,7 @@ async def api_list_tasks(
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     limit: int = Query(default=50, le=200),
+    include_archived: bool = Query(default=False, alias="include_archived"),
 ):
     return await services.list_tasks(
         _db(request),
@@ -187,6 +193,7 @@ async def api_list_tasks(
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=limit,
+        include_archived=include_archived,
     )
 
 
@@ -199,6 +206,51 @@ async def api_get_task(task_id: int, request: Request):
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
+
+
+@app.post("/api/tasks/{task_id}/archive", response_model=TaskView)
+async def api_archive_task(
+    task_id: int,
+    request: Request,
+    body: TaskArchive | None = None,
+    _identity=Depends(require_permission("tasks.archive")),
+):
+    cascade = body.cascade if body else True
+    try:
+        return await services.archive_task(_db(request), task_id, cascade=cascade)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/unarchive", response_model=TaskView)
+async def api_unarchive_task(
+    task_id: int,
+    request: Request,
+    body: TaskUnarchive | None = None,
+    _identity=Depends(require_permission("tasks.archive")),
+):
+    cascade = body.cascade if body else True
+    try:
+        return await services.unarchive_task(_db(request), task_id, cascade=cascade)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+
+
+@app.delete(
+    "/api/tasks/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def api_delete_task(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_permission("tasks.delete")),
+):
+    try:
+        await services.delete_task_tree(_db(request), task_id)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- Hierarchy endpoints ---
