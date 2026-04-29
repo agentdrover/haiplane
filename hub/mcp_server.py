@@ -885,8 +885,10 @@ def _format_readiness(report: dict[str, Any], task_id: int) -> str:
 def _prepare_quality_warnings(
     acceptance_criteria: list[dict[str, Any]] | None,
     risks: list[dict[str, Any]] | None,
+    duplicate_risks: list[dict[str, Any]] | None,
     affected_areas: list[str] | None,
     validation_commands: list[str] | None,
+    risk_mode: str,
 ) -> list[str]:
     warnings: list[str] = []
     if acceptance_criteria is not None:
@@ -899,7 +901,17 @@ def _prepare_quality_warnings(
                     f"acceptance criterion {ac.get('id', '<unknown>')} has no test_ref"
                 )
     if risks:
-        warnings.append("risks are appended; repeated apply can duplicate risks")
+        if risk_mode == "append":
+            warnings.append("risks are appended; repeated apply can duplicate risks")
+        elif risk_mode == "dedupe":
+            warnings.append("risks are deduped by kind/severity/description/mitigation")
+        elif risk_mode == "replace":
+            warnings.append("risks replace existing risk list")
+    for risk in duplicate_risks or []:
+        warnings.append(
+            "duplicate risk skipped: "
+            f"{risk.get('kind')}:{risk.get('severity')} {risk.get('description')}"
+        )
     if affected_areas == []:
         warnings.append("affected_areas is empty")
     if validation_commands == []:
@@ -956,10 +968,20 @@ def _developer_handoff_text(
     return "\n".join(lines)
 
 
+def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(risk.get("kind", "")),
+        str(risk.get("severity", "")),
+        str(risk.get("description", "")),
+        str(risk.get("mitigation", "")),
+    )
+
+
 @mcp.tool()
 async def hub_prepare_developer_task(
     task_id: int,
     mode: str = "apply",
+    risk_mode: str = "dedupe",
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -992,12 +1014,15 @@ async def hub_prepare_developer_task(
     Args:
         task_id: Target task.
         mode: apply writes changes; preview returns planned operations without writes.
+        risk_mode: dedupe skips existing identical risks; append always appends; replace replaces the full risk list through refine.
         acceptance_criteria: Full replacement list of AC dictionaries. Omit to keep existing ACs.
         risks: Risks to append. Omit or pass [] to add none.
         analyst: Agent name recorded in the preparation status update.
     """
     if mode not in {"apply", "preview"}:
         raise ValueError("mode must be 'apply' or 'preview'")
+    if risk_mode not in {"dedupe", "append", "replace"}:
+        raise ValueError("risk_mode must be 'dedupe', 'append', or 'replace'")
 
     if wip_tag is None and (work_type is None or work_type == "feature"):
         wip_tag = "feature_work"
@@ -1027,6 +1052,32 @@ async def hub_prepare_developer_task(
         if val is not None:
             refine_body[key] = val
 
+    current_task = await _api_get(f"/api/tasks/{task_id}")
+    existing_acs: list[dict[str, Any]] = []
+    if acceptance_criteria is not None:
+        existing_acs = await _api_get(f"/api/tasks/{task_id}/acceptance_criteria")
+
+    existing_risks = current_task.get("risks") or []
+    existing_risk_keys = {_risk_key(risk) for risk in existing_risks}
+    incoming_risks = risks or []
+    duplicate_risks = [
+        risk for risk in incoming_risks if _risk_key(risk) in existing_risk_keys
+    ]
+    if risk_mode == "dedupe":
+        risks_to_add = [
+            risk for risk in incoming_risks if _risk_key(risk) not in existing_risk_keys
+        ]
+    elif risk_mode == "append":
+        risks_to_add = incoming_risks
+    else:
+        risks_to_add = []
+        if risks is not None:
+            refine_body["risks"] = risks
+
+    structured_fields_to_change = [
+        key for key, val in refine_body.items() if current_task.get(key) != val
+    ]
+
     handoff_text = _developer_handoff_text(
         task_id,
         problem_statement=problem_statement,
@@ -1040,16 +1091,36 @@ async def hub_prepare_developer_task(
         review_checklist=review_checklist,
     )
     quality_warnings = _prepare_quality_warnings(
-        acceptance_criteria, risks, affected_areas, validation_commands
+        acceptance_criteria,
+        risks,
+        duplicate_risks if risk_mode == "dedupe" else [],
+        affected_areas,
+        validation_commands,
+        risk_mode,
     )
     planned_operations: list[str] = []
     if refine_body:
         planned_operations.append("refine_task")
     if acceptance_criteria is not None:
         planned_operations.append("replace_acceptance_criteria")
-    if risks:
-        planned_operations.extend("add_risk" for _ in risks)
+    if risk_mode == "replace" and risks is not None:
+        planned_operations.append("replace_risks")
+    elif risks_to_add:
+        planned_operations.extend("add_risk" for _ in risks_to_add)
     planned_operations.append("write_analyst_update")
+    diff = {
+        "structured_fields_to_change": sorted(structured_fields_to_change),
+        "will_replace_acceptance_criteria": acceptance_criteria is not None,
+        "existing_acceptance_criteria_count": len(existing_acs),
+        "new_acceptance_criteria_count": len(acceptance_criteria)
+        if acceptance_criteria is not None
+        else None,
+        "risk_mode": risk_mode,
+        "existing_risks_count": len(existing_risks),
+        "incoming_risks_count": len(incoming_risks),
+        "duplicate_risks_count": len(duplicate_risks),
+        "risks_to_add_count": len(risks_to_add),
+    }
 
     if mode == "preview":
         return json.dumps(
@@ -1057,6 +1128,7 @@ async def hub_prepare_developer_task(
                 "mode": "preview",
                 "task_id": task_id,
                 "planned_operations": planned_operations,
+                "diff": diff,
                 "quality_warnings": quality_warnings,
                 "developer_handoff_text": handoff_text,
                 "next_action": "preview_only",
@@ -1082,7 +1154,7 @@ async def hub_prepare_developer_task(
         )
 
     risks_added = 0
-    for risk in risks or []:
+    for risk in risks_to_add:
         await _api_post(f"/api/tasks/{task_id}/risks", risk)
         risks_added += 1
 
@@ -1096,7 +1168,7 @@ async def hub_prepare_developer_task(
         "Analyst preparation complete: "
         f"readiness score={score}, dor_passed={'yes' if dor_passed else 'no'}, "
         f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
-        f"risks_added={risks_added}.\n\n"
+        f"risks_added={risks_added}, duplicate_risks={len(duplicate_risks)}.\n\n"
         f"Developer handoff:\n{handoff_text}"
     )
     if missing_required:
@@ -1117,10 +1189,12 @@ async def hub_prepare_developer_task(
             "updated_columns": updated_columns,
             "acceptance_criteria_count": ac_count,
             "risks_added": risks_added,
+            "duplicate_risks_count": len(duplicate_risks),
             "readiness_score": score,
             "dor_passed": dor_passed,
             "missing_required": missing_required,
             "recommendations_count": len(readiness.get("recommendations") or []),
+            "diff": diff,
             "quality_warnings": quality_warnings,
             "developer_handoff_text": handoff_text,
             "next_action": next_action,

@@ -540,12 +540,25 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
         {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"}
     ]
     mock_api_get.return_value = {
-        "score": 91,
-        "dor_passed": True,
-        "missing_required": [],
-        "recommendations": [],
-        "risks": [{"kind": "security", "severity": "medium"}],
+        "id": 25,
+        "risks": [],
     }
+    mock_api_get.side_effect = [
+        {
+            "id": 25,
+            "risks": [],
+            "problem_statement": "old",
+            "scope_in": [],
+        },
+        [],
+        {
+            "score": 91,
+            "dor_passed": True,
+            "missing_required": [],
+            "recommendations": [],
+            "risks": [{"kind": "security", "severity": "medium"}],
+        },
+    ]
 
     msg = await hub_prepare_developer_task(
         task_id=25,
@@ -585,14 +598,19 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
     assert summary["readiness_score"] == 91
     assert summary["acceptance_criteria_count"] == 1
     assert summary["risks_added"] == 1
+    assert summary["duplicate_risks_count"] == 0
     assert summary["next_action"] == "ready_for_developer"
     assert "developer_handoff_text" in summary
     assert "Add MCP tool" in summary["developer_handoff_text"]
     assert summary["quality_warnings"] == [
         "acceptance_criteria replace existing criteria; review before apply",
         "acceptance criterion AC-1 has no test_ref",
-        "risks are appended; repeated apply can duplicate risks",
+        "risks are deduped by kind/severity/description/mitigation",
     ]
+    assert summary["diff"]["will_replace_acceptance_criteria"] is True
+    assert summary["diff"]["existing_acceptance_criteria_count"] == 0
+    assert summary["diff"]["new_acceptance_criteria_count"] == 1
+    assert "problem_statement" in summary["diff"]["structured_fields_to_change"]
 
     mock_api_post.assert_any_await(
         "/api/tasks/25/refine",
@@ -637,7 +655,91 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
     assert update_call.args[1]["kind"] == "status"
     assert "Analyst preparation complete" in update_call.args[1]["content"]
     assert "Developer handoff:" in update_call.args[1]["content"]
-    mock_api_get.assert_awaited_once_with("/api/tasks/25/readiness")
+    assert "risks_added=1" in update_call.args[1]["content"]
+    assert mock_api_get.await_args_list[0].args[0] == "/api/tasks/25"
+    assert (
+        mock_api_get.await_args_list[1].args[0] == "/api/tasks/25/acceptance_criteria"
+    )
+    assert mock_api_get.await_args_list[2].args[0] == "/api/tasks/25/readiness"
+
+
+async def test_hub_prepare_developer_task_dedupes_existing_risks(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    duplicate_risk = {
+        "kind": "security",
+        "severity": "medium",
+        "description": "duplicate risk",
+        "mitigation": "same mitigation",
+    }
+    mock_api_post.side_effect = [
+        {"updated_columns": ["problem_statement"]},
+        {"id": 90},
+    ]
+    mock_api_get.side_effect = [
+        {"id": 25, "risks": [duplicate_risk], "problem_statement": ""},
+        {
+            "score": 88,
+            "dor_passed": True,
+            "missing_required": [],
+            "recommendations": [],
+            "risks": [duplicate_risk],
+        },
+    ]
+
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        problem_statement="Updated problem",
+        risks=[duplicate_risk],
+    )
+
+    summary = json.loads(msg)
+    assert summary["risks_added"] == 0
+    assert summary["duplicate_risks_count"] == 1
+    assert summary["diff"]["risks_to_add_count"] == 0
+    assert summary["quality_warnings"] == [
+        "risks are deduped by kind/severity/description/mitigation",
+        "duplicate risk skipped: security:medium duplicate risk",
+    ]
+    assert all(
+        call.args[0] != "/api/tasks/25/risks" for call in mock_api_post.await_args_list
+    )
+
+
+async def test_hub_prepare_developer_task_risk_replace_uses_refine(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    risk = {
+        "kind": "security",
+        "severity": "medium",
+        "description": "replace risk",
+        "mitigation": "replace mitigation",
+    }
+    mock_api_post.side_effect = [
+        {"updated_columns": ["risks"]},
+        {"id": 91},
+    ]
+    mock_api_get.side_effect = [
+        {"id": 25, "risks": [], "problem_statement": ""},
+        {
+            "score": 80,
+            "dor_passed": False,
+            "missing_required": [],
+            "recommendations": [],
+        },
+    ]
+
+    await hub_prepare_developer_task(task_id=25, risk_mode="replace", risks=[risk])
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {"wip_tag": "feature_work", "risks": [risk]},
+    )
+    assert all(
+        call.args[0] != "/api/tasks/25/risks" for call in mock_api_post.await_args_list
+    )
 
 
 async def test_hub_prepare_developer_task_preview_does_not_write(
@@ -645,6 +747,24 @@ async def test_hub_prepare_developer_task_preview_does_not_write(
     mock_api_put: AsyncMock,
     mock_api_get: AsyncMock,
 ) -> None:
+    mock_api_get.side_effect = [
+        {
+            "id": 25,
+            "risks": [],
+            "problem_statement": "",
+            "scope_in": [],
+        },
+        [
+            {
+                "id": "AC-0",
+                "given": "old",
+                "when": "old",
+                "then": "old",
+                "verifiable_by": "manual",
+            }
+        ],
+    ]
+
     msg = await hub_prepare_developer_task(
         task_id=25,
         mode="preview",
@@ -670,6 +790,9 @@ async def test_hub_prepare_developer_task_preview_does_not_write(
     assert summary["next_action"] == "preview_only"
     assert "developer_handoff_text" in summary
     assert "Need a safer analyst workflow" in summary["developer_handoff_text"]
+    assert summary["diff"]["existing_acceptance_criteria_count"] == 1
+    assert summary["diff"]["new_acceptance_criteria_count"] == 1
+    assert summary["diff"]["risk_mode"] == "dedupe"
     assert summary["planned_operations"] == [
         "refine_task",
         "replace_acceptance_criteria",
@@ -677,7 +800,10 @@ async def test_hub_prepare_developer_task_preview_does_not_write(
     ]
     mock_api_post.assert_not_called()
     mock_api_put.assert_not_called()
-    mock_api_get.assert_not_called()
+    assert mock_api_get.await_args_list[0].args[0] == "/api/tasks/25"
+    assert (
+        mock_api_get.await_args_list[1].args[0] == "/api/tasks/25/acceptance_criteria"
+    )
 
 
 async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
