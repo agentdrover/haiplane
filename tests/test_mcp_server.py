@@ -586,6 +586,13 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
     assert summary["acceptance_criteria_count"] == 1
     assert summary["risks_added"] == 1
     assert summary["next_action"] == "ready_for_developer"
+    assert "developer_handoff_text" in summary
+    assert "Add MCP tool" in summary["developer_handoff_text"]
+    assert summary["quality_warnings"] == [
+        "acceptance_criteria replace existing criteria; review before apply",
+        "acceptance criterion AC-1 has no test_ref",
+        "risks are appended; repeated apply can duplicate risks",
+    ]
 
     mock_api_post.assert_any_await(
         "/api/tasks/25/refine",
@@ -629,7 +636,48 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
     assert update_call.args[1]["agent"] == "analyst-agent"
     assert update_call.args[1]["kind"] == "status"
     assert "Analyst preparation complete" in update_call.args[1]["content"]
+    assert "Developer handoff:" in update_call.args[1]["content"]
     mock_api_get.assert_awaited_once_with("/api/tasks/25/readiness")
+
+
+async def test_hub_prepare_developer_task_preview_does_not_write(
+    mock_api_post: AsyncMock,
+    mock_api_put: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        mode="preview",
+        work_type="feature",
+        problem_statement="Need a safer analyst workflow.",
+        scope_in=["Add preview mode"],
+        acceptance_criteria=[
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_mcp_server.py::test_preview",
+            }
+        ],
+        risks=[],
+    )
+
+    summary = json.loads(msg)
+    assert summary["mode"] == "preview"
+    assert summary["task_id"] == 25
+    assert summary["next_action"] == "preview_only"
+    assert "developer_handoff_text" in summary
+    assert "Need a safer analyst workflow" in summary["developer_handoff_text"]
+    assert summary["planned_operations"] == [
+        "refine_task",
+        "replace_acceptance_criteria",
+        "write_analyst_update",
+    ]
+    mock_api_post.assert_not_called()
+    mock_api_put.assert_not_called()
+    mock_api_get.assert_not_called()
 
 
 async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(

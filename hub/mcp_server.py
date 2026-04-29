@@ -882,9 +882,84 @@ def _format_readiness(report: dict[str, Any], task_id: int) -> str:
     return "\n".join(parts)
 
 
+def _prepare_quality_warnings(
+    acceptance_criteria: list[dict[str, Any]] | None,
+    risks: list[dict[str, Any]] | None,
+    affected_areas: list[str] | None,
+    validation_commands: list[str] | None,
+) -> list[str]:
+    warnings: list[str] = []
+    if acceptance_criteria is not None:
+        warnings.append(
+            "acceptance_criteria replace existing criteria; review before apply"
+        )
+        for ac in acceptance_criteria:
+            if ac.get("verifiable_by") == "test" and not ac.get("test_ref"):
+                warnings.append(
+                    f"acceptance criterion {ac.get('id', '<unknown>')} has no test_ref"
+                )
+    if risks:
+        warnings.append("risks are appended; repeated apply can duplicate risks")
+    if affected_areas == []:
+        warnings.append("affected_areas is empty")
+    if validation_commands == []:
+        warnings.append("validation_commands is empty")
+    return warnings
+
+
+def _developer_handoff_text(
+    task_id: int,
+    *,
+    problem_statement: str | None,
+    business_value: str | None,
+    scope_in: list[str] | None,
+    scope_out: list[str] | None,
+    affected_areas: list[str] | None,
+    validation_commands: list[str] | None,
+    acceptance_criteria: list[dict[str, Any]] | None,
+    risks: list[dict[str, Any]] | None,
+    review_checklist: list[str] | None,
+) -> str:
+    lines = [f"Developer handoff for task #{task_id}"]
+    if problem_statement:
+        lines.append(f"Problem: {problem_statement}")
+    if business_value:
+        lines.append(f"Value: {business_value}")
+    if scope_in:
+        lines.append("Scope in:")
+        lines.extend(f"- {item}" for item in scope_in)
+    if scope_out:
+        lines.append("Scope out:")
+        lines.extend(f"- {item}" for item in scope_out)
+    if affected_areas:
+        lines.append("Affected areas: " + ", ".join(affected_areas))
+    if acceptance_criteria:
+        lines.append("Acceptance criteria:")
+        lines.extend(
+            f"- {ac.get('id', '?')}: Given {ac.get('given', '')}; "
+            f"When {ac.get('when', '')}; Then {ac.get('then', '')}"
+            for ac in acceptance_criteria
+        )
+    if risks:
+        lines.append("Risks:")
+        lines.extend(
+            f"- {risk.get('kind', '?')}:{risk.get('severity', '?')} — "
+            f"{risk.get('description', '')}; mitigation: {risk.get('mitigation', '')}"
+            for risk in risks
+        )
+    if validation_commands:
+        lines.append("Validation:")
+        lines.extend(f"- {cmd}" for cmd in validation_commands)
+    if review_checklist:
+        lines.append("Review checklist:")
+        lines.extend(f"- {item}" for item in review_checklist)
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def hub_prepare_developer_task(
     task_id: int,
+    mode: str = "apply",
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -916,10 +991,14 @@ async def hub_prepare_developer_task(
 
     Args:
         task_id: Target task.
+        mode: apply writes changes; preview returns planned operations without writes.
         acceptance_criteria: Full replacement list of AC dictionaries. Omit to keep existing ACs.
         risks: Risks to append. Omit or pass [] to add none.
         analyst: Agent name recorded in the preparation status update.
     """
+    if mode not in {"apply", "preview"}:
+        raise ValueError("mode must be 'apply' or 'preview'")
+
     if wip_tag is None and (work_type is None or work_type == "feature"):
         wip_tag = "feature_work"
 
@@ -947,6 +1026,44 @@ async def hub_prepare_developer_task(
     ):
         if val is not None:
             refine_body[key] = val
+
+    handoff_text = _developer_handoff_text(
+        task_id,
+        problem_statement=problem_statement,
+        business_value=business_value,
+        scope_in=scope_in,
+        scope_out=scope_out,
+        affected_areas=affected_areas,
+        validation_commands=validation_commands,
+        acceptance_criteria=acceptance_criteria,
+        risks=risks,
+        review_checklist=review_checklist,
+    )
+    quality_warnings = _prepare_quality_warnings(
+        acceptance_criteria, risks, affected_areas, validation_commands
+    )
+    planned_operations: list[str] = []
+    if refine_body:
+        planned_operations.append("refine_task")
+    if acceptance_criteria is not None:
+        planned_operations.append("replace_acceptance_criteria")
+    if risks:
+        planned_operations.extend("add_risk" for _ in risks)
+    planned_operations.append("write_analyst_update")
+
+    if mode == "preview":
+        return json.dumps(
+            {
+                "mode": "preview",
+                "task_id": task_id,
+                "planned_operations": planned_operations,
+                "quality_warnings": quality_warnings,
+                "developer_handoff_text": handoff_text,
+                "next_action": "preview_only",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     updated_columns: list[str] = []
     if refine_body:
@@ -979,7 +1096,8 @@ async def hub_prepare_developer_task(
         "Analyst preparation complete: "
         f"readiness score={score}, dor_passed={'yes' if dor_passed else 'no'}, "
         f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
-        f"risks_added={risks_added}."
+        f"risks_added={risks_added}.\n\n"
+        f"Developer handoff:\n{handoff_text}"
     )
     if missing_required:
         update_message += " Missing required: " + ", ".join(missing_required) + "."
@@ -994,6 +1112,7 @@ async def hub_prepare_developer_task(
 
     return json.dumps(
         {
+            "mode": "apply",
             "task_id": task_id,
             "updated_columns": updated_columns,
             "acceptance_criteria_count": ac_count,
@@ -1002,6 +1121,8 @@ async def hub_prepare_developer_task(
             "dor_passed": dor_passed,
             "missing_required": missing_required,
             "recommendations_count": len(readiness.get("recommendations") or []),
+            "quality_warnings": quality_warnings,
+            "developer_handoff_text": handoff_text,
             "next_action": next_action,
         },
         ensure_ascii=False,
