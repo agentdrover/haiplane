@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import json
 
 from hub.mcp_server import (
     hub_add_acceptance_criterion,
@@ -15,6 +16,7 @@ from hub.mcp_server import (
     hub_get_readiness,
     hub_list_acceptance_criteria,
     hub_list_tasks,
+    hub_prepare_developer_task,
     hub_propose_task,
     hub_refine_task,
     hub_replace_acceptance_criteria,
@@ -522,3 +524,108 @@ async def test_hub_get_readiness_explain_returns_full_json(
 
     assert _json.loads(msg) == payload
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
+
+
+async def test_hub_prepare_developer_task_batches_analyst_handoff(
+    mock_api_post: AsyncMock,
+    mock_api_put: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_post.side_effect = [
+        {"updated_columns": ["problem_statement", "scope_in"]},
+        {"risks": [{"kind": "security", "severity": "medium"}]},
+        {"id": 88},
+    ]
+    mock_api_put.return_value = [
+        {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"}
+    ]
+    mock_api_get.return_value = {
+        "score": 91,
+        "dor_passed": True,
+        "missing_required": [],
+        "recommendations": [],
+        "risks": [{"kind": "security", "severity": "medium"}],
+    }
+
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        work_type="feature",
+        size="M",
+        user_story="As an operator I want one analyst handoff so that dev work is ready.",
+        problem_statement="Analyst preparation takes too many manual calls.",
+        business_value="Faster and safer developer handoff.",
+        scope_in=["Add MCP tool", "Return readiness summary"],
+        scope_out=["Change database schema"],
+        affected_areas=["hub/mcp_server.py", "tests/test_mcp_server.py"],
+        validation_commands=["uv run pytest tests/test_mcp_server.py -q"],
+        review_checklist=["Verify AC replacement is atomic"],
+        acceptance_criteria=[
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+        risks=[
+            {
+                "kind": "security",
+                "severity": "medium",
+                "description": "tool can overwrite ACs",
+                "mitigation": "document replace semantics",
+            }
+        ],
+        analyst="analyst-agent",
+    )
+
+    summary = json.loads(msg)
+    assert summary["task_id"] == 25
+    assert summary["dor_passed"] is True
+    assert summary["readiness_score"] == 91
+    assert summary["acceptance_criteria_count"] == 1
+    assert summary["risks_added"] == 1
+    assert summary["next_action"] == "ready_for_developer"
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {
+            "work_type": "feature",
+            "size": "M",
+            "user_story": "As an operator I want one analyst handoff so that dev work is ready.",
+            "problem_statement": "Analyst preparation takes too many manual calls.",
+            "business_value": "Faster and safer developer handoff.",
+            "scope_in": ["Add MCP tool", "Return readiness summary"],
+            "scope_out": ["Change database schema"],
+            "affected_areas": ["hub/mcp_server.py", "tests/test_mcp_server.py"],
+            "validation_commands": ["uv run pytest tests/test_mcp_server.py -q"],
+            "review_checklist": ["Verify AC replacement is atomic"],
+        },
+    )
+    mock_api_put.assert_awaited_once_with(
+        "/api/tasks/25/acceptance_criteria",
+        [
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/risks",
+        {
+            "kind": "security",
+            "severity": "medium",
+            "description": "tool can overwrite ACs",
+            "mitigation": "document replace semantics",
+        },
+    )
+    update_call = mock_api_post.await_args_list[-1]
+    assert update_call.args[0] == "/api/tasks/25/updates"
+    assert update_call.args[1]["agent"] == "analyst-agent"
+    assert update_call.args[1]["kind"] == "status"
+    assert "Analyst preparation complete" in update_call.args[1]["content"]
+    mock_api_get.assert_awaited_once_with("/api/tasks/25/readiness")

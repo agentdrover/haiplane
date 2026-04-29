@@ -883,6 +883,130 @@ def _format_readiness(report: dict[str, Any], task_id: int) -> str:
 
 
 @mcp.tool()
+async def hub_prepare_developer_task(
+    task_id: int,
+    work_type: str | None = None,
+    class_of_service: str | None = None,
+    size: str | None = None,
+    wip_tag: str | None = None,
+    due_date: str | None = None,
+    user_story: str | None = None,
+    problem_statement: str | None = None,
+    business_value: str | None = None,
+    technical_hints: str | None = None,
+    scope_in: list[str] | None = None,
+    scope_out: list[str] | None = None,
+    affected_areas: list[str] | None = None,
+    validation_commands: list[str] | None = None,
+    constraints: list[str] | None = None,
+    assumptions: list[str] | None = None,
+    out_of_scope_for_review: list[str] | None = None,
+    review_checklist: list[str] | None = None,
+    acceptance_criteria: list[dict[str, Any]] | None = None,
+    risks: list[dict[str, Any]] | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
+    analyst: str = "analyst-agent",
+) -> str:
+    """Prepare a raw task for developer handoff in one analyst operation.
+
+    This combines the existing REST semantics:
+    refine structured DoR fields, atomically replace acceptance criteria,
+    append risks, compute readiness, and write an analyst status update.
+
+    Args:
+        task_id: Target task.
+        acceptance_criteria: Full replacement list of AC dictionaries. Omit to keep existing ACs.
+        risks: Risks to append. Omit or pass [] to add none.
+        analyst: Agent name recorded in the preparation status update.
+    """
+    refine_body: dict[str, Any] = {}
+    for key, val in (
+        ("work_type", work_type),
+        ("class_of_service", class_of_service),
+        ("size", size),
+        ("wip_tag", wip_tag),
+        ("due_date", due_date),
+        ("user_story", user_story),
+        ("problem_statement", problem_statement),
+        ("business_value", business_value),
+        ("technical_hints", technical_hints),
+        ("scope_in", scope_in),
+        ("scope_out", scope_out),
+        ("affected_areas", affected_areas),
+        ("validation_commands", validation_commands),
+        ("constraints", constraints),
+        ("assumptions", assumptions),
+        ("out_of_scope_for_review", out_of_scope_for_review),
+        ("review_checklist", review_checklist),
+        ("human_owner", human_owner),
+        ("human_reviewer", human_reviewer),
+    ):
+        if val is not None:
+            refine_body[key] = val
+
+    updated_columns: list[str] = []
+    if refine_body:
+        refine_result = await _api_post(f"/api/tasks/{task_id}/refine", refine_body)
+        cols = refine_result.get("updated_columns") or []
+        updated_columns = sorted(cols) if isinstance(cols, list) else sorted(cols)
+
+    ac_count: int | None = None
+    if acceptance_criteria is not None:
+        ac_result = await _api_put(
+            f"/api/tasks/{task_id}/acceptance_criteria",
+            acceptance_criteria,
+        )
+        ac_count = (
+            len(ac_result) if isinstance(ac_result, list) else len(acceptance_criteria)
+        )
+
+    risks_added = 0
+    for risk in risks or []:
+        await _api_post(f"/api/tasks/{task_id}/risks", risk)
+        risks_added += 1
+
+    readiness = await _api_get(f"/api/tasks/{task_id}/readiness")
+    dor_passed = bool(readiness.get("dor_passed"))
+    missing_required = readiness.get("missing_required") or []
+    next_action = "ready_for_developer" if dor_passed else "needs_analyst_followup"
+    score = readiness.get("score")
+
+    update_message = (
+        "Analyst preparation complete: "
+        f"readiness score={score}, dor_passed={'yes' if dor_passed else 'no'}, "
+        f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
+        f"risks_added={risks_added}."
+    )
+    if missing_required:
+        update_message += " Missing required: " + ", ".join(missing_required) + "."
+    await _api_post(
+        f"/api/tasks/{task_id}/updates",
+        {
+            "agent": analyst,
+            "kind": "status",
+            "content": update_message,
+        },
+    )
+
+    return json.dumps(
+        {
+            "task_id": task_id,
+            "updated_columns": updated_columns,
+            "acceptance_criteria_count": ac_count,
+            "risks_added": risks_added,
+            "readiness_score": score,
+            "dor_passed": dor_passed,
+            "missing_required": missing_required,
+            "recommendations_count": len(readiness.get("recommendations") or []),
+            "next_action": next_action,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
 async def hub_refine_task(
     task_id: int,
     work_type: str | None = None,
