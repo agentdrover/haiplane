@@ -225,6 +225,93 @@ async def test_task_detail_omits_review_checklist_when_empty(
     assert "Review Checklist" not in resp.text
 
 
+async def test_task_detail_renders_analyst_handoff_fields(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Analyst handoff detail",
+            "description": "Detail description",
+        },
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "class_of_service": "standard",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "Detail user story",
+            "problem_statement": "Detail problem statement",
+            "business_value": "Detail business value",
+            "technical_hints": "Detail technical hints",
+            "scope_in": ["Detail scope in"],
+            "scope_out": ["Detail scope out"],
+            "affected_areas": ["hub/templates/task_detail.html"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+            "constraints": ["Detail constraint"],
+            "assumptions": ["Detail assumption"],
+            "out_of_scope_for_review": ["Detail ignored review item"],
+            "review_checklist": ["Detail review check"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "Detail AC given",
+                "when": "Detail AC when",
+                "then": "Detail AC then",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_web.py::test_task_detail_renders_analyst_handoff_fields",
+            }
+        ],
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/risks",
+        json={
+            "kind": "security",
+            "severity": "medium",
+            "description": "Detail risk description",
+            "mitigation": "Detail risk mitigation",
+        },
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    expected = [
+        "Readiness",
+        "score=",
+        "Developer Brief",
+        "Detail user story",
+        "Detail problem statement",
+        "Detail business value",
+        "Detail technical hints",
+        "Detail scope in",
+        "Detail scope out",
+        "hub/templates/task_detail.html",
+        "uv run pytest tests/test_web.py -q",
+        "Detail constraint",
+        "Detail assumption",
+        "Detail ignored review item",
+        "Acceptance Criteria",
+        "AC-1",
+        "Detail AC given",
+        "Detail AC when",
+        "Detail AC then",
+        "tests/test_web.py::test_task_detail_renders_analyst_handoff_fields",
+        "Risks",
+        "security",
+        "medium",
+        "Detail risk description",
+        "Detail risk mitigation",
+    ]
+    for item in expected:
+        assert item in resp.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",

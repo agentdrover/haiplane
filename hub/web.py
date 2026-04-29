@@ -402,13 +402,16 @@ async def web_task_detail(task_id: int, request: Request):
         raise HTTPException(404, "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
+    task_view.acceptance_criteria = await services.list_acceptance_criteria(db, task_id)
     task = await services.enrich_task_view(db, task_view)
+    readiness = await services.get_readiness(db, task_id, explain=False)
     identity = current_identity(request)
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
+            "readiness": readiness,
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),
