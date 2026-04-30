@@ -324,6 +324,8 @@ async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient
             "work_type": "feature",
             "size": "S",
             "wip_tag": "feature_work",
+            "prepared_by": "analyst-agent",
+            "prepared_at": "2026-04-30 00:00:00",
             "user_story": "As a reviewer I want a ready badge.",
             "problem_statement": "Prepared tasks need a clear signal.",
             "business_value": "Humans can trust prepared tasks faster.",
@@ -344,15 +346,6 @@ async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient
             }
         ],
     )
-    await client.post(
-        f"/api/tasks/{task_id}/updates",
-        json={
-            "agent": "analyst-agent",
-            "kind": "status",
-            "content": "Analyst preparation complete: ready for developer.",
-        },
-    )
-
     detail = await client.get(f"/tasks/{task_id}")
     table = await client.get("/tasks")
     kanban = await client.get("/partials/kanban")

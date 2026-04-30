@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -1026,6 +1027,7 @@ async def hub_prepare_developer_task(
 
     if wip_tag is None and (work_type is None or work_type == "feature"):
         wip_tag = "feature_work"
+    prepared_at = datetime.now(UTC).replace(microsecond=0).isoformat()
 
     refine_body: dict[str, Any] = {}
     for key, val in (
@@ -1048,6 +1050,8 @@ async def hub_prepare_developer_task(
         ("review_checklist", review_checklist),
         ("human_owner", human_owner),
         ("human_reviewer", human_reviewer),
+        ("prepared_by", analyst),
+        ("prepared_at", prepared_at),
     ):
         if val is not None:
             refine_body[key] = val

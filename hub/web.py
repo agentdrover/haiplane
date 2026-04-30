@@ -236,10 +236,19 @@ async def _analyst_ready_info(
     db: aiosqlite.Connection,
     task_id: int,
     readiness: Any | None = None,
+    task: Any | None = None,
 ) -> dict[str, Any]:
     """Derived UI signal: DoR passed and an analyst preparation update exists."""
     if readiness is None:
         readiness = await services.get_readiness(db, task_id, explain=False)
+    prepared_by = getattr(task, "prepared_by", "") if task is not None else ""
+    prepared_at = getattr(task, "prepared_at", "") if task is not None else ""
+    if readiness.dor_passed and prepared_by:
+        return {
+            "ready": True,
+            "agent": prepared_by,
+            "created_at": prepared_at or "",
+        }
     updates = await repo.get_task_updates(db, task_id)
     prep_update = next(
         (
@@ -262,7 +271,7 @@ async def _analyst_ready_map(
 ) -> dict[int, bool]:
     result: dict[int, bool] = {}
     for task in tasks:
-        info = await _analyst_ready_info(db, task.id)
+        info = await _analyst_ready_info(db, task.id, task=task)
         result[task.id] = bool(info["ready"])
     return result
 
@@ -494,7 +503,7 @@ async def web_task_detail(task_id: int, request: Request):
     task_view.acceptance_criteria = await services.list_acceptance_criteria(db, task_id)
     task = await services.enrich_task_view(db, task_view)
     readiness = await services.get_readiness(db, task_id, explain=False)
-    analyst_ready = await _analyst_ready_info(db, task_id, readiness)
+    analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
     return TEMPLATES.TemplateResponse(
         request,

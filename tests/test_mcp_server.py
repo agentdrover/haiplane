@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import json
@@ -626,6 +626,8 @@ async def test_hub_prepare_developer_task_batches_analyst_handoff(
             "affected_areas": ["hub/mcp_server.py", "tests/test_mcp_server.py"],
             "validation_commands": ["uv run pytest tests/test_mcp_server.py -q"],
             "review_checklist": ["Verify AC replacement is atomic"],
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
         },
     )
     mock_api_put.assert_awaited_once_with(
@@ -735,7 +737,12 @@ async def test_hub_prepare_developer_task_risk_replace_uses_refine(
 
     mock_api_post.assert_any_await(
         "/api/tasks/25/refine",
-        {"wip_tag": "feature_work", "risks": [risk]},
+        {
+            "wip_tag": "feature_work",
+            "risks": [risk],
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
+        },
     )
     assert all(
         call.args[0] != "/api/tasks/25/risks" for call in mock_api_post.await_args_list
@@ -835,5 +842,7 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
             "work_type": "bug",
             "wip_tag": "bugfix",
             "problem_statement": "Bug needs detail.",
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
         },
     )
