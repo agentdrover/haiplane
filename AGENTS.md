@@ -5,6 +5,9 @@
 - Work from this repository root only.
 - Keep changes narrow and intentional.
 - Follow repository workflow rules in `docs/repository-rules.md`.
+- **Merge into `main` auto-deploys to the production-like server** via
+  `.github/workflows/ci.yml` (job `deploy`, runs after tests pass on push to
+  `main`). Treat any merge to `main` as a release. See `deploy/CD.md`.
 - Use `uv run pytest`; do not use `python -m pytest`.
 - Use `uv add <package>` for dependencies.
 - If a change touches API contracts, update `hub/cli.py`, `hub/mcp_server.py`, and affected tests in the same pass.
