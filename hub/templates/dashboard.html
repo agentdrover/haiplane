@@ -24,6 +24,10 @@
             <span class="topbar-stat-label">Open</span>
             <span class="topbar-stat-value">{{ _open_count }}</span>
         </a>
+        <a href="/tasks?analyst_ready=1" class="topbar-stat topbar-stat--open{% if analyst_ready_count == 0 %} is-zero{% endif %}">
+            <span class="topbar-stat-label">Analyst Ready</span>
+            <span class="topbar-stat-value">{{ analyst_ready_count }}</span>
+        </a>
         <a href="/tasks?status=running" class="topbar-stat topbar-stat--running{% if _running_count == 0 %} is-zero{% endif %}">
             <span class="topbar-stat-label">Running</span>
             <span class="topbar-stat-value">{{ _running_count }}</span>
@@ -234,7 +238,9 @@
                             <div class="nt-footer-actions">
                                 <button class="btn btn-ghost" type="submit" name="after_create" value="backlog">Save Draft</button>
                                 <button class="btn btn-primary" type="submit" name="after_create" value="refine">Save &amp; Refine →</button>
+                                {% if dispatch_available %}
                                 <button class="btn btn-success" type="submit" name="run_immediately" value="on" id="nt-run-now">Run Now</button>
+                                {% endif %}
                             </div>
                         </div>
                     </form>
@@ -346,7 +352,7 @@ function toggleRefine() {
         // Epic / Feature don't run on agents directly
         var hideRun = (v === 'epic' || v === 'feature');
         rt.style.display = hideRun ? 'none' : '';
-        run.style.display = hideRun ? 'none' : '';
+        if (run) run.style.display = hideRun ? 'none' : '';
     }
     document.querySelectorAll('input[name="task_type"]').forEach(function(el) {
         el.addEventListener('change', applyTypeRules);

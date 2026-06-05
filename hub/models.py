@@ -305,6 +305,8 @@ class TaskRefine(BaseModel):
     review_checklist: list[str] | None = Field(default=None, max_length=10)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
+    prepared_by: str | None = Field(default=None, max_length=100)
+    prepared_at: str | None = Field(default=None, max_length=100)
     human_owner: str | None = Field(default=None, max_length=100)
     human_reviewer: str | None = Field(default=None, max_length=100)
 
@@ -478,6 +480,8 @@ class TaskView(BaseModel):
     readiness_score: int | None = None
     dor_passed: bool | None = None
     ready_at: str | None = None
+    prepared_by: str = ""
+    prepared_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
 

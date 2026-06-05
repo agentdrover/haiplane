@@ -2,9 +2,13 @@
     <a class="card-link" href="/tasks/{{ t.id }}" title="#{{ t.id }} {{ t.title }}">
         <span class="card-id">#{{ t.id }}</span>{{ t.title[:48] }}{% if t.title|length > 48 %}…{% endif %}
     </a>
-    {% set _has_meta = (t.task_type.value != 'task') or (t.priority.value in ('critical', 'high')) or (t.runtime.value != 'auto') or (t.progress and t.progress.total > 0) %}
+    {% set _analyst_ready = analyst_ready_by_id.get(t.id) if analyst_ready_by_id is defined else false %}
+    {% set _has_meta = _analyst_ready or (t.task_type.value != 'task') or (t.priority.value in ('critical', 'high')) or (t.runtime.value != 'auto') or (t.progress and t.progress.total > 0) %}
     {% if _has_meta %}
     <div class="card-meta">
+        {% if _analyst_ready %}
+        <span class="badge badge--xs badge-completed">Analyst Ready</span>
+        {% endif %}
         {% if t.task_type.value != 'task' %}
         <span class="badge badge--xs badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
         {% endif %}
@@ -21,6 +25,13 @@
     {% endif %}
     {% if t.status.value == 'draft' %}
     <div class="card-actions">
+        {% if dispatch_available %}
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/{{ t.id }}/web-approve"
+                hx-vals='{"run": "true"}'
+                hx-target="#kanban-card-{{ t.id }}"
+                hx-swap="outerHTML">Approve &amp; Run</button>
+        {% endif %}
         <button class="btn btn-primary btn-xs"
                 hx-post="/tasks/{{ t.id }}/web-approve"
                 hx-target="#kanban-card-{{ t.id }}"
@@ -32,10 +43,14 @@
     </div>
     {% elif t.status.value == 'open' %}
     <div class="card-actions">
+        {% if dispatch_available %}
         <button class="btn btn-primary btn-xs"
                 hx-post="/tasks/{{ t.id }}/web-start"
                 hx-target="#kanban-card-{{ t.id }}"
                 hx-swap="outerHTML">Start</button>
+        {% else %}
+        <span class="card-action-note">Dispatch unavailable</span>
+        {% endif %}
     </div>
     {% elif t.status.value == 'needs_decision' %}
     <div class="card-actions">

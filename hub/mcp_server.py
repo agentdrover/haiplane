@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -880,6 +881,331 @@ def _format_readiness(report: dict[str, Any], task_id: int) -> str:
             f"  ({len(recs)} non-blocking suggestions; call hub_get_readiness with explain=true for full JSON)"
         )
     return "\n".join(parts)
+
+
+def _prepare_quality_warnings(
+    acceptance_criteria: list[dict[str, Any]] | None,
+    risks: list[dict[str, Any]] | None,
+    duplicate_risks: list[dict[str, Any]] | None,
+    affected_areas: list[str] | None,
+    validation_commands: list[str] | None,
+    risk_mode: str,
+) -> list[str]:
+    warnings: list[str] = []
+    if acceptance_criteria is not None:
+        warnings.append(
+            "acceptance_criteria replace existing criteria; review before apply"
+        )
+        for ac in acceptance_criteria:
+            if ac.get("verifiable_by") == "test" and not ac.get("test_ref"):
+                warnings.append(
+                    f"acceptance criterion {ac.get('id', '<unknown>')} has no test_ref"
+                )
+    if risks:
+        if risk_mode == "append":
+            warnings.append("risks are appended; repeated apply can duplicate risks")
+        elif risk_mode == "dedupe":
+            warnings.append("risks are deduped by kind/severity/description/mitigation")
+        elif risk_mode == "replace":
+            warnings.append("risks replace existing risk list")
+    for risk in duplicate_risks or []:
+        warnings.append(
+            "duplicate risk skipped: "
+            f"{risk.get('kind')}:{risk.get('severity')} {risk.get('description')}"
+        )
+    if affected_areas == []:
+        warnings.append("affected_areas is empty")
+    if validation_commands == []:
+        warnings.append("validation_commands is empty")
+    return warnings
+
+
+def _developer_handoff_text(
+    task_id: int,
+    *,
+    problem_statement: str | None,
+    business_value: str | None,
+    scope_in: list[str] | None,
+    scope_out: list[str] | None,
+    affected_areas: list[str] | None,
+    validation_commands: list[str] | None,
+    acceptance_criteria: list[dict[str, Any]] | None,
+    risks: list[dict[str, Any]] | None,
+    review_checklist: list[str] | None,
+) -> str:
+    lines = [f"Developer handoff for task #{task_id}"]
+    if problem_statement:
+        lines.append(f"Problem: {problem_statement}")
+    if business_value:
+        lines.append(f"Value: {business_value}")
+    if scope_in:
+        lines.append("Scope in:")
+        lines.extend(f"- {item}" for item in scope_in)
+    if scope_out:
+        lines.append("Scope out:")
+        lines.extend(f"- {item}" for item in scope_out)
+    if affected_areas:
+        lines.append("Affected areas: " + ", ".join(affected_areas))
+    if acceptance_criteria:
+        lines.append("Acceptance criteria:")
+        lines.extend(
+            f"- {ac.get('id', '?')}: Given {ac.get('given', '')}; "
+            f"When {ac.get('when', '')}; Then {ac.get('then', '')}"
+            for ac in acceptance_criteria
+        )
+    if risks:
+        lines.append("Risks:")
+        lines.extend(
+            f"- {risk.get('kind', '?')}:{risk.get('severity', '?')} — "
+            f"{risk.get('description', '')}; mitigation: {risk.get('mitigation', '')}"
+            for risk in risks
+        )
+    if validation_commands:
+        lines.append("Validation:")
+        lines.extend(f"- {cmd}" for cmd in validation_commands)
+    if review_checklist:
+        lines.append("Review checklist:")
+        lines.extend(f"- {item}" for item in review_checklist)
+    return "\n".join(lines)
+
+
+def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(risk.get("kind", "")),
+        str(risk.get("severity", "")),
+        str(risk.get("description", "")),
+        str(risk.get("mitigation", "")),
+    )
+
+
+@mcp.tool()
+async def hub_prepare_developer_task(
+    task_id: int,
+    mode: str = "apply",
+    risk_mode: str = "dedupe",
+    work_type: str | None = None,
+    class_of_service: str | None = None,
+    size: str | None = None,
+    wip_tag: str | None = None,
+    due_date: str | None = None,
+    user_story: str | None = None,
+    problem_statement: str | None = None,
+    business_value: str | None = None,
+    technical_hints: str | None = None,
+    scope_in: list[str] | None = None,
+    scope_out: list[str] | None = None,
+    affected_areas: list[str] | None = None,
+    validation_commands: list[str] | None = None,
+    constraints: list[str] | None = None,
+    assumptions: list[str] | None = None,
+    out_of_scope_for_review: list[str] | None = None,
+    review_checklist: list[str] | None = None,
+    acceptance_criteria: list[dict[str, Any]] | None = None,
+    risks: list[dict[str, Any]] | None = None,
+    human_owner: str | None = None,
+    human_reviewer: str | None = None,
+    analyst: str = "analyst-agent",
+) -> str:
+    """Prepare a raw task for developer handoff in one analyst operation.
+
+    This combines the existing REST semantics:
+    refine structured DoR fields, atomically replace acceptance criteria,
+    append risks, compute readiness, and write an analyst status update.
+
+    Args:
+        task_id: Target task.
+        mode: apply writes changes; preview returns planned operations without writes.
+        risk_mode: dedupe skips existing identical risks; append always appends; replace replaces the full risk list through refine.
+        acceptance_criteria: Full replacement list of AC dictionaries. Omit to keep existing ACs.
+        risks: Risks to append. Omit or pass [] to add none.
+        analyst: Agent name recorded in the preparation status update.
+    """
+    if mode not in {"apply", "preview"}:
+        raise ValueError("mode must be 'apply' or 'preview'")
+    if risk_mode not in {"dedupe", "append", "replace"}:
+        raise ValueError("risk_mode must be 'dedupe', 'append', or 'replace'")
+
+    if wip_tag is None and (work_type is None or work_type == "feature"):
+        wip_tag = "feature_work"
+    prepared_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+
+    refine_body: dict[str, Any] = {}
+    for key, val in (
+        ("work_type", work_type),
+        ("class_of_service", class_of_service),
+        ("size", size),
+        ("wip_tag", wip_tag),
+        ("due_date", due_date),
+        ("user_story", user_story),
+        ("problem_statement", problem_statement),
+        ("business_value", business_value),
+        ("technical_hints", technical_hints),
+        ("scope_in", scope_in),
+        ("scope_out", scope_out),
+        ("affected_areas", affected_areas),
+        ("validation_commands", validation_commands),
+        ("constraints", constraints),
+        ("assumptions", assumptions),
+        ("out_of_scope_for_review", out_of_scope_for_review),
+        ("review_checklist", review_checklist),
+        ("human_owner", human_owner),
+        ("human_reviewer", human_reviewer),
+        ("prepared_by", analyst),
+        ("prepared_at", prepared_at),
+    ):
+        if val is not None:
+            refine_body[key] = val
+
+    current_task = await _api_get(f"/api/tasks/{task_id}")
+    existing_acs: list[dict[str, Any]] = []
+    if acceptance_criteria is not None:
+        existing_acs = await _api_get(f"/api/tasks/{task_id}/acceptance_criteria")
+
+    existing_risks = current_task.get("risks") or []
+    existing_risk_keys = {_risk_key(risk) for risk in existing_risks}
+    incoming_risks = risks or []
+    duplicate_risks = [
+        risk for risk in incoming_risks if _risk_key(risk) in existing_risk_keys
+    ]
+    if risk_mode == "dedupe":
+        risks_to_add = [
+            risk for risk in incoming_risks if _risk_key(risk) not in existing_risk_keys
+        ]
+    elif risk_mode == "append":
+        risks_to_add = incoming_risks
+    else:
+        risks_to_add = []
+        if risks is not None:
+            refine_body["risks"] = risks
+
+    structured_fields_to_change = [
+        key for key, val in refine_body.items() if current_task.get(key) != val
+    ]
+
+    handoff_text = _developer_handoff_text(
+        task_id,
+        problem_statement=problem_statement,
+        business_value=business_value,
+        scope_in=scope_in,
+        scope_out=scope_out,
+        affected_areas=affected_areas,
+        validation_commands=validation_commands,
+        acceptance_criteria=acceptance_criteria,
+        risks=risks,
+        review_checklist=review_checklist,
+    )
+    quality_warnings = _prepare_quality_warnings(
+        acceptance_criteria,
+        risks,
+        duplicate_risks if risk_mode == "dedupe" else [],
+        affected_areas,
+        validation_commands,
+        risk_mode,
+    )
+    planned_operations: list[str] = []
+    if refine_body:
+        planned_operations.append("refine_task")
+    if acceptance_criteria is not None:
+        planned_operations.append("replace_acceptance_criteria")
+    if risk_mode == "replace" and risks is not None:
+        planned_operations.append("replace_risks")
+    elif risks_to_add:
+        planned_operations.extend("add_risk" for _ in risks_to_add)
+    planned_operations.append("write_analyst_update")
+    diff = {
+        "structured_fields_to_change": sorted(structured_fields_to_change),
+        "will_replace_acceptance_criteria": acceptance_criteria is not None,
+        "existing_acceptance_criteria_count": len(existing_acs),
+        "new_acceptance_criteria_count": len(acceptance_criteria)
+        if acceptance_criteria is not None
+        else None,
+        "risk_mode": risk_mode,
+        "existing_risks_count": len(existing_risks),
+        "incoming_risks_count": len(incoming_risks),
+        "duplicate_risks_count": len(duplicate_risks),
+        "risks_to_add_count": len(risks_to_add),
+    }
+
+    if mode == "preview":
+        return json.dumps(
+            {
+                "mode": "preview",
+                "task_id": task_id,
+                "planned_operations": planned_operations,
+                "diff": diff,
+                "quality_warnings": quality_warnings,
+                "developer_handoff_text": handoff_text,
+                "next_action": "preview_only",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    updated_columns: list[str] = []
+    if refine_body:
+        refine_result = await _api_post(f"/api/tasks/{task_id}/refine", refine_body)
+        cols = refine_result.get("updated_columns") or []
+        updated_columns = sorted(cols) if isinstance(cols, list) else sorted(cols)
+
+    ac_count: int | None = None
+    if acceptance_criteria is not None:
+        ac_result = await _api_put(
+            f"/api/tasks/{task_id}/acceptance_criteria",
+            acceptance_criteria,
+        )
+        ac_count = (
+            len(ac_result) if isinstance(ac_result, list) else len(acceptance_criteria)
+        )
+
+    risks_added = 0
+    for risk in risks_to_add:
+        await _api_post(f"/api/tasks/{task_id}/risks", risk)
+        risks_added += 1
+
+    readiness = await _api_get(f"/api/tasks/{task_id}/readiness")
+    dor_passed = bool(readiness.get("dor_passed"))
+    missing_required = readiness.get("missing_required") or []
+    next_action = "ready_for_developer" if dor_passed else "needs_analyst_followup"
+    score = readiness.get("score")
+
+    update_message = (
+        "Analyst preparation complete: "
+        f"readiness score={score}, dor_passed={'yes' if dor_passed else 'no'}, "
+        f"acceptance_criteria={'unchanged' if ac_count is None else ac_count}, "
+        f"risks_added={risks_added}, duplicate_risks={len(duplicate_risks)}.\n\n"
+        f"Developer handoff:\n{handoff_text}"
+    )
+    if missing_required:
+        update_message += " Missing required: " + ", ".join(missing_required) + "."
+    await _api_post(
+        f"/api/tasks/{task_id}/updates",
+        {
+            "agent": analyst,
+            "kind": "status",
+            "content": update_message,
+        },
+    )
+
+    return json.dumps(
+        {
+            "mode": "apply",
+            "task_id": task_id,
+            "updated_columns": updated_columns,
+            "acceptance_criteria_count": ac_count,
+            "risks_added": risks_added,
+            "duplicate_risks_count": len(duplicate_risks),
+            "readiness_score": score,
+            "dor_passed": dor_passed,
+            "missing_required": missing_required,
+            "recommendations_count": len(readiness.get("recommendations") or []),
+            "diff": diff,
+            "quality_warnings": quality_warnings,
+            "developer_handoff_text": handoff_text,
+            "next_action": next_action,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()

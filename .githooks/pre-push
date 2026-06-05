@@ -13,11 +13,13 @@ while read -r local_ref local_oid remote_ref remote_oid; do
         exit 1
       fi
       ;;
+    refs/heads/develop)
+      ;;
     refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*)
       ;;
     *)
       echo "Blocked push from branch '${local_ref#refs/heads/}' to ${remote_name}." >&2
-      echo "Use task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
+      echo "Use develop, task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
       exit 1
       ;;
   esac

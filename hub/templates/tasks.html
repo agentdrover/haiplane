@@ -23,6 +23,20 @@
 <div class="filter-bar">
     <input type="hidden" name="source" value="{{ filter_source }}">
     <div class="filter-group">
+        <label>Analyst</label>
+        <label class="filter-checkbox">
+            <input type="checkbox"
+                   name="analyst_ready"
+                   value="1"
+                   {% if filter_analyst_ready %}checked{% endif %}
+                   hx-get="/tasks/list"
+                   hx-target="#task-table-wrap"
+                   hx-swap="innerHTML"
+                   hx-include=".filter-bar [name]">
+            Ready
+        </label>
+    </div>
+    <div class="filter-group">
         <label>Type</label>
         <select class="filter-control" name="type" hx-get="/tasks/list" hx-target="#task-table-wrap" hx-swap="innerHTML" hx-include=".filter-bar [name]">
             <option value="">All</option>

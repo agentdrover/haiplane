@@ -67,6 +67,130 @@
                 {% endif %}
             </section>
 
+            <section class="task-content-card">
+                <div class="task-card-header">
+                    <h2>Readiness</h2>
+                    <span class="badge badge-{{ 'completed' if readiness.dor_passed else 'needs_info' }}">
+                        score={{ readiness.score }} dor={{ 'yes' if readiness.dor_passed else 'no' }}
+                    </span>
+                </div>
+                {% if analyst_ready.ready %}
+                <div class="task-action-note">
+                    <strong>Analyst Ready</strong>
+                    {% if analyst_ready.agent %}<div>Prepared by {{ analyst_ready.agent }}</div>{% endif %}
+                    {% if analyst_ready.created_at %}<div class="u-text-muted">{{ analyst_ready.created_at }}</div>{% endif %}
+                </div>
+                {% endif %}
+                {% if readiness.missing_required %}
+                <div class="task-action-note">
+                    Missing required: {{ readiness.missing_required | join(', ') }}
+                </div>
+                {% endif %}
+                {% if readiness.recommendations %}
+                <ul class="task-checklist">
+                    {% for rec in readiness.recommendations[:5] %}
+                    <li><strong>{{ rec.field }}:</strong> {{ rec.message }}</li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <div class="u-text-muted">No blocking readiness recommendations.</div>
+                {% endif %}
+            </section>
+
+            {% set has_brief = task.user_story or task.problem_statement or task.business_value or task.technical_hints or task.scope_in or task.scope_out or task.affected_areas or task.validation_commands or task.constraints or task.assumptions or task.out_of_scope_for_review %}
+            {% if has_brief %}
+            <section class="task-content-card">
+                <div class="task-card-header">
+                    <h2>Developer Brief</h2>
+                </div>
+                <dl class="task-meta-list task-detail-brief-list">
+                    {% if task.user_story %}
+                    <dt>User Story</dt>
+                    <dd class="u-pre-wrap">{{ task.user_story }}</dd>
+                    {% endif %}
+                    {% if task.problem_statement %}
+                    <dt>Problem</dt>
+                    <dd class="u-pre-wrap">{{ task.problem_statement }}</dd>
+                    {% endif %}
+                    {% if task.business_value %}
+                    <dt>Value</dt>
+                    <dd class="u-pre-wrap">{{ task.business_value }}</dd>
+                    {% endif %}
+                    {% if task.technical_hints %}
+                    <dt>Technical Hints</dt>
+                    <dd class="u-pre-wrap">{{ task.technical_hints }}</dd>
+                    {% endif %}
+                    {% if task.scope_in %}
+                    <dt>Scope In</dt>
+                    <dd><ul class="task-checklist">{% for item in task.scope_in %}<li>{{ item }}</li>{% endfor %}</ul></dd>
+                    {% endif %}
+                    {% if task.scope_out %}
+                    <dt>Scope Out</dt>
+                    <dd><ul class="task-checklist">{% for item in task.scope_out %}<li>{{ item }}</li>{% endfor %}</ul></dd>
+                    {% endif %}
+                    {% if task.affected_areas %}
+                    <dt>Affected Areas</dt>
+                    <dd>{% for item in task.affected_areas %}<code class="code-sm">{{ item }}</code>{% if not loop.last %} {% endif %}{% endfor %}</dd>
+                    {% endif %}
+                    {% if task.validation_commands %}
+                    <dt>Validation</dt>
+                    <dd><ul class="task-checklist">{% for item in task.validation_commands %}<li><code class="code-sm">{{ item }}</code></li>{% endfor %}</ul></dd>
+                    {% endif %}
+                    {% if task.constraints %}
+                    <dt>Constraints</dt>
+                    <dd><ul class="task-checklist">{% for item in task.constraints %}<li>{{ item }}</li>{% endfor %}</ul></dd>
+                    {% endif %}
+                    {% if task.assumptions %}
+                    <dt>Assumptions</dt>
+                    <dd><ul class="task-checklist">{% for item in task.assumptions %}<li>{{ item }}</li>{% endfor %}</ul></dd>
+                    {% endif %}
+                    {% if task.out_of_scope_for_review %}
+                    <dt>Review Ignore</dt>
+                    <dd><ul class="task-checklist">{% for item in task.out_of_scope_for_review %}<li>{{ item }}</li>{% endfor %}</ul></dd>
+                    {% endif %}
+                </dl>
+            </section>
+            {% endif %}
+
+            {% if task.acceptance_criteria %}
+            <section class="task-content-card">
+                <div class="task-card-header">
+                    <h2>Acceptance Criteria</h2>
+                    <span class="section-count">{{ task.acceptance_criteria | length }}</span>
+                </div>
+                <div class="task-ac-list">
+                    {% for ac in task.acceptance_criteria %}
+                    <article class="task-action-note">
+                        <strong>{{ ac.id }}</strong>
+                        <div><span class="u-text-muted">Given</span> {{ ac.given }}</div>
+                        <div><span class="u-text-muted">When</span> {{ ac.when }}</div>
+                        <div><span class="u-text-muted">Then</span> {{ ac.then }}</div>
+                        <div><span class="badge badge--xs badge-{{ ac.verifiable_by.value }}">{{ ac.verifiable_by.value }}</span>{% if ac.test_ref %} <code class="code-sm">{{ ac.test_ref }}</code>{% endif %}</div>
+                    </article>
+                    {% endfor %}
+                </div>
+            </section>
+            {% endif %}
+
+            {% if task.risks %}
+            <section class="task-content-card">
+                <div class="task-card-header">
+                    <h2>Risks</h2>
+                    <span class="section-count">{{ task.risks | length }}</span>
+                </div>
+                <div class="task-ac-list">
+                    {% for risk in task.risks %}
+                    <article class="task-action-note">
+                        <strong>{{ risk.kind.value }}</strong>
+                        <span class="badge badge--xs badge-priority-{{ risk.severity.value }}">{{ risk.severity.value }}</span>
+                        <div class="u-pre-wrap">{{ risk.description }}</div>
+                        <div><span class="u-text-muted">Mitigation</span> {{ risk.mitigation }}</div>
+                    </article>
+                    {% endfor %}
+                </div>
+            </section>
+            {% endif %}
+
             {% if task.review_checklist %}
             <section class="task-content-card">
                 <div class="task-card-header">
@@ -194,6 +318,9 @@
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
                         <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                     </select>
+                    {% if dispatch_available %}
+                    <button class="btn btn-success task-action-btn" type="submit" name="run" value="true">Approve &amp; Run</button>
+                    {% endif %}
                     <button class="btn btn-primary task-action-btn" type="submit">Approve to Backlog</button>
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
@@ -210,7 +337,11 @@
                         <option value="openrouter" {% if task.runtime.value == 'openrouter' %}selected{% endif %}>OpenRouter</option>
                         <option value="vast" {% if task.runtime.value == 'vast' %}selected{% endif %}>Vast.ai</option>
                     </select>
+                    {% if dispatch_available %}
                     <button class="btn btn-success task-action-btn" type="submit">Start Task</button>
+                    {% else %}
+                    <div class="task-action-note">Developer-agent dispatch is not configured on this Hub.</div>
+                    {% endif %}
                 </form>
 
                 {% elif task.status.value == 'needs_info' %}

@@ -94,7 +94,33 @@ async def test_inbox_proposals_render_as_collapsible_details(client: AsyncClient
     assert "Proposals" in resp.text
 
 
-async def test_dashboard_hides_approve_and_run_for_drafts(client: AsyncClient):
+async def test_dashboard_shows_approve_and_run_when_dispatch_available(
+    client: AsyncClient,
+):
+    await client.post(
+        "/api/tasks",
+        json={
+            "title": "Draft with runnable agent",
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+
+    resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert "Draft with runnable agent" in resp.text
+    assert "Approve &amp; Run" in resp.text
+    assert '"run": "true"' in resp.text
+
+
+async def test_dashboard_hides_approve_and_run_when_dispatch_unavailable(
+    client: AsyncClient,
+):
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+
+    plugins.dispatch = NoopDispatch()
     await client.post(
         "/api/tasks",
         json={
@@ -199,6 +225,235 @@ async def test_task_detail_omits_review_checklist_when_empty(
     assert "Review Checklist" not in resp.text
 
 
+async def test_task_detail_renders_analyst_handoff_fields(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Analyst handoff detail",
+            "description": "Detail description",
+        },
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "class_of_service": "standard",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "Detail user story",
+            "problem_statement": "Detail problem statement",
+            "business_value": "Detail business value",
+            "technical_hints": "Detail technical hints",
+            "scope_in": ["Detail scope in"],
+            "scope_out": ["Detail scope out"],
+            "affected_areas": ["hub/templates/task_detail.html"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+            "constraints": ["Detail constraint"],
+            "assumptions": ["Detail assumption"],
+            "out_of_scope_for_review": ["Detail ignored review item"],
+            "review_checklist": ["Detail review check"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "Detail AC given",
+                "when": "Detail AC when",
+                "then": "Detail AC then",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_web.py::test_task_detail_renders_analyst_handoff_fields",
+            }
+        ],
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/risks",
+        json={
+            "kind": "security",
+            "severity": "medium",
+            "description": "Detail risk description",
+            "mitigation": "Detail risk mitigation",
+        },
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    expected = [
+        "Readiness",
+        "score=",
+        "Developer Brief",
+        "Detail user story",
+        "Detail problem statement",
+        "Detail business value",
+        "Detail technical hints",
+        "Detail scope in",
+        "Detail scope out",
+        "hub/templates/task_detail.html",
+        "uv run pytest tests/test_web.py -q",
+        "Detail constraint",
+        "Detail assumption",
+        "Detail ignored review item",
+        "Acceptance Criteria",
+        "AC-1",
+        "Detail AC given",
+        "Detail AC when",
+        "Detail AC then",
+        "tests/test_web.py::test_task_detail_renders_analyst_handoff_fields",
+        "Risks",
+        "security",
+        "medium",
+        "Detail risk description",
+        "Detail risk mitigation",
+    ]
+    for item in expected:
+        assert item in resp.text
+
+
+async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Prepared analyst task", "description": "ready"},
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "prepared_by": "analyst-agent",
+            "prepared_at": "2026-04-30 00:00:00",
+            "user_story": "As a reviewer I want a ready badge.",
+            "problem_statement": "Prepared tasks need a clear signal.",
+            "business_value": "Humans can trust prepared tasks faster.",
+            "scope_in": ["Show Analyst Ready"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "A task is prepared",
+                "when": "A human views it",
+                "then": "Analyst Ready is visible",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_web.py",
+            }
+        ],
+    )
+    detail = await client.get(f"/tasks/{task_id}")
+    table = await client.get("/tasks")
+    kanban = await client.get("/partials/kanban")
+
+    assert "Analyst Ready" in detail.text
+    assert "Prepared by analyst-agent" in detail.text
+    assert "Analyst Ready" in table.text
+    assert "Analyst Ready" in kanban.text
+
+
+async def test_task_detail_does_not_show_analyst_ready_without_preparation_update(
+    client: AsyncClient,
+):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Ready but not analyst prepared", "description": "raw"},
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "As a reviewer I want no false badge.",
+            "problem_statement": "DoR alone is not analyst preparation.",
+            "business_value": "Avoid misleading humans.",
+            "scope_in": ["Avoid false ready badge"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "No analyst update exists",
+                "when": "A human views the task",
+                "then": "The ready badge is not shown",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+
+    detail = await client.get(f"/tasks/{task_id}")
+
+    assert detail.status_code == 200
+    assert "Analyst Ready" not in detail.text
+
+
+async def test_tasks_page_filters_analyst_ready_tasks(client: AsyncClient):
+    prepared = await client.post(
+        "/api/tasks",
+        json={"title": "Prepared filter task", "description": "ready"},
+    )
+    prepared_id = prepared.json()["id"]
+    await client.post(
+        f"/api/tasks/{prepared_id}/refine",
+        json={
+            "work_type": "feature",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "user_story": "As a reviewer I want a ready filter.",
+            "problem_statement": "Prepared tasks need a list.",
+            "business_value": "Humans find ready work quickly.",
+            "scope_in": ["Filter Analyst Ready"],
+            "validation_commands": ["uv run pytest tests/test_web.py -q"],
+        },
+    )
+    await client.put(
+        f"/api/tasks/{prepared_id}/acceptance_criteria",
+        json=[
+            {
+                "id": "AC-1",
+                "given": "A prepared task exists",
+                "when": "The ready filter is applied",
+                "then": "The task is listed",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+    await client.post(
+        f"/api/tasks/{prepared_id}/updates",
+        json={
+            "agent": "analyst-agent",
+            "kind": "status",
+            "content": "Analyst preparation complete: ready for developer.",
+        },
+    )
+    await client.post(
+        "/api/tasks",
+        json={"title": "Unprepared filter task", "description": "raw"},
+    )
+
+    page = await client.get("/tasks", params={"analyst_ready": "1"})
+    partial = await client.get("/tasks/list", params={"analyst_ready": "1"})
+
+    assert page.status_code == 200
+    assert partial.status_code == 200
+    assert 'name="analyst_ready"' in page.text
+    assert "Prepared filter task" in page.text
+    assert "Prepared filter task" in partial.text
+    assert "Unprepared filter task" not in page.text
+    assert "Unprepared filter task" not in partial.text
+    assert "Analyst Ready" in page.text
+    assert "Analyst Ready" in partial.text
+
+
 async def test_web_approve_task(client: AsyncClient):
     create = await client.post(
         "/api/tasks",
@@ -216,6 +471,24 @@ async def test_web_approve_task(client: AsyncClient):
     )
     assert resp.status_code == 303
     assert f"/tasks/{task_id}" in resp.headers["location"]
+
+
+async def test_web_start_dispatches_without_manual_plan(client: AsyncClient):
+    create = await client.post("/api/tasks", json={"title": "Start from UI"})
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-start",
+        data={"runtime": "auto"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    detail = await client.get(f"/api/tasks/{task_id}")
+    task = detail.json()
+    assert task["status"] == "running"
+    assert task["job_id"] == "test-job-1"
+    assert task["assigned_agent"] == "developer-agent"
 
 
 async def test_web_decide_task_with_summary(client: AsyncClient, db):

@@ -46,10 +46,35 @@ async def dispatch_task(
     job_id = result.get("job_id")
 
     if job_id:
-        await repo.update_task(db, task_id, status="running", job_id=job_id)
+        assigned_agent = (
+            result.get("assigned_agent")
+            or result.get("agent")
+            or task.get("assigned_agent")
+            or "developer-agent"
+        )
+        await repo.update_task(
+            db,
+            task_id,
+            status="running",
+            job_id=job_id,
+            assigned_agent=assigned_agent,
+        )
     else:
         error = result.get("error", "dispatch returned no job_id")
-        await repo.update_task(db, task_id, status="failed", result_text=error)
+        await repo.update_task(
+            db,
+            task_id,
+            status="open",
+            job_id=None,
+            result_text=error,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Developer-agent dispatch unavailable: {error}",
+        )
     await db.commit()
     return result
 

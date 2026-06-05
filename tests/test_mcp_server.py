@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
+import json
 
 from hub.mcp_server import (
     hub_add_acceptance_criterion,
@@ -15,6 +16,7 @@ from hub.mcp_server import (
     hub_get_readiness,
     hub_list_acceptance_criteria,
     hub_list_tasks,
+    hub_prepare_developer_task,
     hub_propose_task,
     hub_refine_task,
     hub_replace_acceptance_criteria,
@@ -522,3 +524,325 @@ async def test_hub_get_readiness_explain_returns_full_json(
 
     assert _json.loads(msg) == payload
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
+
+
+async def test_hub_prepare_developer_task_batches_analyst_handoff(
+    mock_api_post: AsyncMock,
+    mock_api_put: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_post.side_effect = [
+        {"updated_columns": ["problem_statement", "scope_in"]},
+        {"risks": [{"kind": "security", "severity": "medium"}]},
+        {"id": 88},
+    ]
+    mock_api_put.return_value = [
+        {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"}
+    ]
+    mock_api_get.return_value = {
+        "id": 25,
+        "risks": [],
+    }
+    mock_api_get.side_effect = [
+        {
+            "id": 25,
+            "risks": [],
+            "problem_statement": "old",
+            "scope_in": [],
+        },
+        [],
+        {
+            "score": 91,
+            "dor_passed": True,
+            "missing_required": [],
+            "recommendations": [],
+            "risks": [{"kind": "security", "severity": "medium"}],
+        },
+    ]
+
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        work_type="feature",
+        size="M",
+        user_story="As an operator I want one analyst handoff so that dev work is ready.",
+        problem_statement="Analyst preparation takes too many manual calls.",
+        business_value="Faster and safer developer handoff.",
+        scope_in=["Add MCP tool", "Return readiness summary"],
+        scope_out=["Change database schema"],
+        affected_areas=["hub/mcp_server.py", "tests/test_mcp_server.py"],
+        validation_commands=["uv run pytest tests/test_mcp_server.py -q"],
+        review_checklist=["Verify AC replacement is atomic"],
+        acceptance_criteria=[
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+        risks=[
+            {
+                "kind": "security",
+                "severity": "medium",
+                "description": "tool can overwrite ACs",
+                "mitigation": "document replace semantics",
+            }
+        ],
+        analyst="analyst-agent",
+    )
+
+    summary = json.loads(msg)
+    assert summary["task_id"] == 25
+    assert summary["dor_passed"] is True
+    assert summary["readiness_score"] == 91
+    assert summary["acceptance_criteria_count"] == 1
+    assert summary["risks_added"] == 1
+    assert summary["duplicate_risks_count"] == 0
+    assert summary["next_action"] == "ready_for_developer"
+    assert "developer_handoff_text" in summary
+    assert "Add MCP tool" in summary["developer_handoff_text"]
+    assert summary["quality_warnings"] == [
+        "acceptance_criteria replace existing criteria; review before apply",
+        "acceptance criterion AC-1 has no test_ref",
+        "risks are deduped by kind/severity/description/mitigation",
+    ]
+    assert summary["diff"]["will_replace_acceptance_criteria"] is True
+    assert summary["diff"]["existing_acceptance_criteria_count"] == 0
+    assert summary["diff"]["new_acceptance_criteria_count"] == 1
+    assert "problem_statement" in summary["diff"]["structured_fields_to_change"]
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {
+            "work_type": "feature",
+            "size": "M",
+            "wip_tag": "feature_work",
+            "user_story": "As an operator I want one analyst handoff so that dev work is ready.",
+            "problem_statement": "Analyst preparation takes too many manual calls.",
+            "business_value": "Faster and safer developer handoff.",
+            "scope_in": ["Add MCP tool", "Return readiness summary"],
+            "scope_out": ["Change database schema"],
+            "affected_areas": ["hub/mcp_server.py", "tests/test_mcp_server.py"],
+            "validation_commands": ["uv run pytest tests/test_mcp_server.py -q"],
+            "review_checklist": ["Verify AC replacement is atomic"],
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
+        },
+    )
+    mock_api_put.assert_awaited_once_with(
+        "/api/tasks/25/acceptance_criteria",
+        [
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+    )
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/risks",
+        {
+            "kind": "security",
+            "severity": "medium",
+            "description": "tool can overwrite ACs",
+            "mitigation": "document replace semantics",
+        },
+    )
+    update_call = mock_api_post.await_args_list[-1]
+    assert update_call.args[0] == "/api/tasks/25/updates"
+    assert update_call.args[1]["agent"] == "analyst-agent"
+    assert update_call.args[1]["kind"] == "status"
+    assert "Analyst preparation complete" in update_call.args[1]["content"]
+    assert "Developer handoff:" in update_call.args[1]["content"]
+    assert "risks_added=1" in update_call.args[1]["content"]
+    assert mock_api_get.await_args_list[0].args[0] == "/api/tasks/25"
+    assert (
+        mock_api_get.await_args_list[1].args[0] == "/api/tasks/25/acceptance_criteria"
+    )
+    assert mock_api_get.await_args_list[2].args[0] == "/api/tasks/25/readiness"
+
+
+async def test_hub_prepare_developer_task_dedupes_existing_risks(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    duplicate_risk = {
+        "kind": "security",
+        "severity": "medium",
+        "description": "duplicate risk",
+        "mitigation": "same mitigation",
+    }
+    mock_api_post.side_effect = [
+        {"updated_columns": ["problem_statement"]},
+        {"id": 90},
+    ]
+    mock_api_get.side_effect = [
+        {"id": 25, "risks": [duplicate_risk], "problem_statement": ""},
+        {
+            "score": 88,
+            "dor_passed": True,
+            "missing_required": [],
+            "recommendations": [],
+            "risks": [duplicate_risk],
+        },
+    ]
+
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        problem_statement="Updated problem",
+        risks=[duplicate_risk],
+    )
+
+    summary = json.loads(msg)
+    assert summary["risks_added"] == 0
+    assert summary["duplicate_risks_count"] == 1
+    assert summary["diff"]["risks_to_add_count"] == 0
+    assert summary["quality_warnings"] == [
+        "risks are deduped by kind/severity/description/mitigation",
+        "duplicate risk skipped: security:medium duplicate risk",
+    ]
+    assert all(
+        call.args[0] != "/api/tasks/25/risks" for call in mock_api_post.await_args_list
+    )
+
+
+async def test_hub_prepare_developer_task_risk_replace_uses_refine(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    risk = {
+        "kind": "security",
+        "severity": "medium",
+        "description": "replace risk",
+        "mitigation": "replace mitigation",
+    }
+    mock_api_post.side_effect = [
+        {"updated_columns": ["risks"]},
+        {"id": 91},
+    ]
+    mock_api_get.side_effect = [
+        {"id": 25, "risks": [], "problem_statement": ""},
+        {
+            "score": 80,
+            "dor_passed": False,
+            "missing_required": [],
+            "recommendations": [],
+        },
+    ]
+
+    await hub_prepare_developer_task(task_id=25, risk_mode="replace", risks=[risk])
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {
+            "wip_tag": "feature_work",
+            "risks": [risk],
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
+        },
+    )
+    assert all(
+        call.args[0] != "/api/tasks/25/risks" for call in mock_api_post.await_args_list
+    )
+
+
+async def test_hub_prepare_developer_task_preview_does_not_write(
+    mock_api_post: AsyncMock,
+    mock_api_put: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.side_effect = [
+        {
+            "id": 25,
+            "risks": [],
+            "problem_statement": "",
+            "scope_in": [],
+        },
+        [
+            {
+                "id": "AC-0",
+                "given": "old",
+                "when": "old",
+                "then": "old",
+                "verifiable_by": "manual",
+            }
+        ],
+    ]
+
+    msg = await hub_prepare_developer_task(
+        task_id=25,
+        mode="preview",
+        work_type="feature",
+        problem_statement="Need a safer analyst workflow.",
+        scope_in=["Add preview mode"],
+        acceptance_criteria=[
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+                "test_ref": "tests/test_mcp_server.py::test_preview",
+            }
+        ],
+        risks=[],
+    )
+
+    summary = json.loads(msg)
+    assert summary["mode"] == "preview"
+    assert summary["task_id"] == 25
+    assert summary["next_action"] == "preview_only"
+    assert "developer_handoff_text" in summary
+    assert "Need a safer analyst workflow" in summary["developer_handoff_text"]
+    assert summary["diff"]["existing_acceptance_criteria_count"] == 1
+    assert summary["diff"]["new_acceptance_criteria_count"] == 1
+    assert summary["diff"]["risk_mode"] == "dedupe"
+    assert summary["planned_operations"] == [
+        "refine_task",
+        "replace_acceptance_criteria",
+        "write_analyst_update",
+    ]
+    mock_api_post.assert_not_called()
+    mock_api_put.assert_not_called()
+    assert mock_api_get.await_args_list[0].args[0] == "/api/tasks/25"
+    assert (
+        mock_api_get.await_args_list[1].args[0] == "/api/tasks/25/acceptance_criteria"
+    )
+
+
+async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_post.side_effect = [
+        {"updated_columns": ["wip_tag"]},
+        {"id": 89},
+    ]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": ["has_acceptance_criteria"],
+        "recommendations": [],
+        "risks": [],
+    }
+
+    await hub_prepare_developer_task(
+        task_id=25,
+        work_type="bug",
+        wip_tag="bugfix",
+        problem_statement="Bug needs detail.",
+    )
+
+    mock_api_post.assert_any_await(
+        "/api/tasks/25/refine",
+        {
+            "work_type": "bug",
+            "wip_tag": "bugfix",
+            "problem_statement": "Bug needs detail.",
+            "prepared_by": "analyst-agent",
+            "prepared_at": ANY,
+        },
+    )

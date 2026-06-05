@@ -19,7 +19,12 @@
         <tr id="task-row-{{ t.id }}">
             <td><code>{{ t.id }}</code></td>
             <td><span class="badge badge-type-{{ t.task_type.value }} task-table-badge task-table-badge--type">{{ t.task_type.value }}</span></td>
-            <td><a href="/tasks/{{ t.id }}">{{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a></td>
+            <td>
+                <a href="/tasks/{{ t.id }}">{{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+                {% if analyst_ready_by_id is defined and analyst_ready_by_id.get(t.id) %}
+                <span class="badge badge--xs badge-completed task-table-badge">Analyst Ready</span>
+                {% endif %}
+            </td>
             <td><span class="badge badge-{{ t.status.value }} task-table-badge task-table-badge--status">{{ t.status.value }}</span></td>
             <td><span class="badge badge-priority-{{ t.priority.value }} task-table-badge task-table-badge--priority">{{ t.priority.value }}</span></td>
             <td>{{ t.human_owner or '—' }}</td>
@@ -35,6 +40,13 @@
             <td>
                 <div class="task-table-actions">
                 {% if t.status.value == 'draft' %}
+                {% if dispatch_available %}
+                <button class="btn btn-success btn-xs task-table-action"
+                        hx-post="/tasks/{{ t.id }}/web-approve"
+                        hx-vals='{"run": "true"}'
+                        hx-target="#task-row-{{ t.id }}"
+                        hx-swap="outerHTML">Approve &amp; Run</button>
+                {% endif %}
                 <button class="btn btn-primary btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-approve"
                         hx-target="#task-row-{{ t.id }}"
@@ -44,10 +56,14 @@
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Reject</button>
                 {% elif t.status.value == 'open' %}
+                {% if dispatch_available %}
                 <button class="btn btn-primary btn-xs task-table-action"
                         hx-post="/tasks/{{ t.id }}/web-start"
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Start</button>
+                {% else %}
+                <span class="task-table-action u-text-muted">Dispatch unavailable</span>
+                {% endif %}
                 {% elif t.status.value == 'needs_info' %}
                 <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs task-table-action">Answer</a>
                 {% elif t.status.value == 'needs_decision' %}

@@ -225,6 +225,69 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request") == "true"
 
 
+def _dispatch_available() -> bool:
+    return plugins.dispatch.is_available()
+
+
+ANALYST_PREPARED_MARKER = "Analyst preparation complete"
+
+
+async def _analyst_ready_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+    readiness: Any | None = None,
+    task: Any | None = None,
+) -> dict[str, Any]:
+    """Derived UI signal: DoR passed and an analyst preparation update exists."""
+    if readiness is None:
+        readiness = await services.get_readiness(db, task_id, explain=False)
+    prepared_by = getattr(task, "prepared_by", "") if task is not None else ""
+    prepared_at = getattr(task, "prepared_at", "") if task is not None else ""
+    if readiness.dor_passed and prepared_by:
+        return {
+            "ready": True,
+            "agent": prepared_by,
+            "created_at": prepared_at or "",
+        }
+    updates = await repo.get_task_updates(db, task_id)
+    prep_update = next(
+        (
+            dict(update)
+            for update in reversed(updates)
+            if ANALYST_PREPARED_MARKER in (dict(update).get("content") or "")
+        ),
+        None,
+    )
+    return {
+        "ready": bool(readiness.dor_passed and prep_update),
+        "agent": prep_update.get("agent", "") if prep_update else "",
+        "created_at": prep_update.get("created_at", "") if prep_update else "",
+    }
+
+
+async def _analyst_ready_map(
+    db: aiosqlite.Connection,
+    tasks: list[Any],
+) -> dict[int, bool]:
+    result: dict[int, bool] = {}
+    for task in tasks:
+        info = await _analyst_ready_info(db, task.id, task=task)
+        result[task.id] = bool(info["ready"])
+    return result
+
+
+async def _apply_analyst_ready_filter(
+    db: aiosqlite.Connection,
+    tasks: list[Any],
+    *,
+    analyst_ready: bool = False,
+) -> tuple[list[Any], dict[int, bool]]:
+    ready_by_id = await _analyst_ready_map(db, tasks)
+    if analyst_ready:
+        tasks = [task for task in tasks if ready_by_id.get(task.id)]
+    return tasks, ready_by_id
+
+
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
     import html as html_mod
@@ -252,6 +315,7 @@ async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLRespon
 @router.get("/partials/inbox", response_class=HTMLResponse)
 async def web_partial_inbox(request: Request):
     inbox = await services.get_inbox_data(_db(request))
+    inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
 
@@ -266,7 +330,24 @@ async def web_partial_epics(request: Request):
 @router.get("/partials/kanban", response_class=HTMLResponse)
 async def web_partial_kanban(request: Request):
     data = await services.get_dashboard_data(_db(request))
-    return TEMPLATES.TemplateResponse(request, "partials/kanban.html", {"data": data})
+    tasks_for_badges = [
+        *data.active_tasks,
+        *data.draft_tasks,
+        *data.review_tasks,
+        *data.needs_decision_tasks,
+        *data.needs_info_tasks,
+    ]
+    return TEMPLATES.TemplateResponse(
+        request,
+        "partials/kanban.html",
+        {
+            "data": data,
+            "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": await _analyst_ready_map(
+                _db(request), tasks_for_badges
+            ),
+        },
+    )
 
 
 @router.get("/tasks/list", response_class=HTMLResponse)
@@ -279,6 +360,7 @@ async def web_tasks_list_partial(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
     """HTML fragment: task table body for HTMX swap."""
@@ -294,8 +376,17 @@ async def web_tasks_list_partial(
         human_reviewer=human_reviewer,
         limit=limit,
     )
+    tasks, ready_by_id = await _apply_analyst_ready_filter(
+        _db(request), tasks, analyst_ready=analyst_ready
+    )
     return TEMPLATES.TemplateResponse(
-        request, "partials/task_table.html", {"tasks": tasks}
+        request,
+        "partials/task_table.html",
+        {
+            "tasks": tasks,
+            "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": ready_by_id,
+        },
     )
 
 
@@ -322,8 +413,21 @@ async def web_dashboard(request: Request):
         "epics_enriched": epics,
         "epics": epics,
         "inbox_total": inbox_total,
+        "dispatch_available": _dispatch_available(),
     }
     ctx.update(inbox)
+    tasks_for_badges = [
+        *data.active_tasks,
+        *data.draft_tasks,
+        *data.review_tasks,
+        *data.needs_decision_tasks,
+        *data.needs_info_tasks,
+    ]
+    analyst_ready_by_id = await _analyst_ready_map(db, tasks_for_badges)
+    ctx["analyst_ready_by_id"] = analyst_ready_by_id
+    ctx["analyst_ready_count"] = sum(
+        1 for ready in analyst_ready_by_id.values() if ready
+    )
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
@@ -337,6 +441,7 @@ async def web_tasks(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    analyst_ready: bool = Query(default=False),
 ):
     db = _db(request)
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
@@ -350,6 +455,9 @@ async def web_tasks(
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,
+    )
+    tasks, ready_by_id = await _apply_analyst_ready_filter(
+        db, tasks, analyst_ready=analyst_ready
     )
 
     parent_breadcrumb = None
@@ -373,10 +481,13 @@ async def web_tasks(
             "filter_parent_id": parsed_parent_id,
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
+            "filter_analyst_ready": analyst_ready,
             "parent_breadcrumb": parent_breadcrumb,
             "all_statuses": all_statuses,
             "all_types": all_types,
             "all_priorities": all_priorities,
+            "dispatch_available": _dispatch_available(),
+            "analyst_ready_by_id": ready_by_id,
         },
     )
 
@@ -389,15 +500,21 @@ async def web_task_detail(task_id: int, request: Request):
         raise HTTPException(404, "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
+    task_view.acceptance_criteria = await services.list_acceptance_criteria(db, task_id)
     task = await services.enrich_task_view(db, task_view)
+    readiness = await services.get_readiness(db, task_id, explain=False)
+    analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
+            "readiness": readiness,
+            "analyst_ready": analyst_ready,
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
+            "dispatch_available": _dispatch_available(),
         },
     )
 
@@ -523,7 +640,10 @@ async def web_start_task(
     request: Request,
     runtime: str = Form("auto"),
 ):
-    body = TaskStart(runtime=RuntimeChoice(runtime) if runtime else None)
+    body = TaskStart(
+        plan="Developer-agent dispatch requested from Hub UI.",
+        runtime=RuntimeChoice(runtime) if runtime else None,
+    )
     await services.start_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)

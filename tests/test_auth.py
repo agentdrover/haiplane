@@ -123,6 +123,20 @@ async def test_html_get_redirects_to_login(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_root_html_get_redirects_to_clean_login_url(client, monkeypatch):
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.get(
+        "/",
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["Location"] == "/login"
+
+
+@pytest.mark.asyncio
 async def test_login_page_is_public(client, monkeypatch):
     """/login itself must be reachable even without a session."""
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens())

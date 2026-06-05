@@ -340,6 +340,11 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     ),
     (
+        "add_prepared_by_column",
+        "ALTER TABLE tasks ADD COLUMN prepared_by TEXT NOT NULL DEFAULT ''",
+    ),
+    ("add_prepared_at_column", "ALTER TABLE tasks ADD COLUMN prepared_at TEXT"),
+    (
         "idx_tasks_archived",
         "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived)",
     ),
@@ -432,6 +437,8 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "out_of_scope_for_review",
     "review_checklist",
     "risks",
+    "prepared_by",
+    "prepared_at",
 )
 
 

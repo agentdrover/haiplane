@@ -126,6 +126,31 @@ async def test_start_task_with_prior_plan_update(db: aiosqlite.Connection):
     assert started.status.value == "running"
 
 
+async def test_start_task_dispatch_failure_keeps_task_recoverable(
+    db: aiosqlite.Connection,
+):
+    from hub.integrations.noop import NoopDispatch, NoopGitOps
+    from hub.integrations.registry import plugins
+
+    plugins.dispatch = NoopDispatch()
+    plugins.git_ops = NoopGitOps()
+
+    body = TaskCreate(title="Unavailable dispatch")
+    tv = await services.create_task(db, body)
+    await repo.add_task_update(db, tv.id, "human", "status", "Plan: hand off to dev")
+    await db.commit()
+
+    started = await services.start_task(db, tv.id)
+
+    assert started.status.value == "open"
+    assert started.result_text
+    assert "dispatch plugin not configured" in started.result_text
+    assert started.updates
+    assert any(
+        "dispatch plugin not configured" in update.content for update in started.updates
+    )
+
+
 async def test_ask_question(db: aiosqlite.Connection):
     task_id = await repo.create_task(
         db,

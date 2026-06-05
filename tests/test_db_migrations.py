@@ -37,6 +37,8 @@ STRUCTURED_TASK_COLUMNS = {
     "ready_at",
     "started_at",
     "completed_at",
+    "prepared_by",
+    "prepared_at",
     "human_owner",
     "human_reviewer",
 }
@@ -122,6 +124,7 @@ async def test_structured_columns_have_safe_defaults(
         "ready_at",
         "started_at",
         "completed_at",
+        "prepared_at",
     ],
 )
 async def test_optional_columns_are_nullable(column: str):
@@ -129,6 +132,17 @@ async def test_optional_columns_are_nullable(column: str):
     try:
         cols = await _table_columns(conn, "tasks")
         assert cols[column]["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_prepared_by_column_present_with_default():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "prepared_by" in cols
+        assert cols["prepared_by"]["dflt_value"] == "''"
+        assert cols["prepared_by"]["notnull"] == 1
     finally:
         await conn.close()
 
