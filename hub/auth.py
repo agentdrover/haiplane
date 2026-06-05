@@ -261,6 +261,11 @@ def _unauthorized(request: Request) -> Response:
         next_url = quote(request.url.path)
         if request.url.query:
             next_url += "?" + quote(request.url.query, safe="=&")
+        if next_url == "/":
+            return Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Location": "/login"},
+            )
         return Response(
             status_code=status.HTTP_303_SEE_OTHER,
             headers={"Location": f"/login?next={next_url}"},
