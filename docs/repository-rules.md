@@ -173,10 +173,31 @@ uv run pytest -q
 - docs обновлены, если меняется workflow или публичный контракт;
 - нет секретов и локальных артефактов.
 
+## CI/CD и авто-деплой
+
+- CI и CD описаны в `.github/workflows/ci.yml`.
+- На каждый `pull_request` в `main` и `push` в `main` запускается job `test`:
+  `ruff check`, `ruff format --check`, `pytest`.
+- **Любой merge в `main` автоматически выкатывается на сервер.** Job `deploy`
+  стартует только после успешного `test` и только на `push` в `main`
+  (на pull_request деплой не идёт).
+- Деплой повторяет ручной процесс из `docs/agent-deploy-runbook.md` раздел 4:
+  `rsync` в staging → `deploy/remote-deploy.sh` (промоут в `/opt/openclaw-hub/src`,
+  `pip install -e`, restart systemd, проверка `/healthz`).
+- Логика деплоя версионируется в `deploy/remote-deploy.sh`; её правят там, а не в YAML.
+- Доступы деплоя — это GitHub Actions secrets `DEPLOY_HOST`, `DEPLOY_USER`,
+  `DEPLOY_SSH_KEY` (см. `deploy/CD.md`). Секреты не хранятся в git.
+- Практический вывод для агентов: merge в `main` — это релиз в прод. Сначала
+  merge в `develop` и проверка, и только потом продвижение в `main`. Не вливать
+  непроверенный код прямо в `main`.
+
 ## Релизы
 
-Пока нет отдельного release process. До его появления:
+Отдельного версионируемого release process пока нет, релиз = merge в `main`
+(авто-деплой выше). До появления формального процесса:
 
-- все production-relevant изменения проходят через PR/review;
+- все production-relevant изменения проходят через PR/review и проходят CI;
 - release notes собирать из merged commits и task done reports;
-- перед релизом запускать полный `uv run pytest -q` и ruff check.
+- перед merge в `main` запускать полный `uv run pytest -q` и ruff check;
+- ручной деплой и откат — по `docs/agent-deploy-runbook.md` раздел 4 (тот же
+  `deploy/remote-deploy.sh`).

@@ -14,3 +14,4 @@ alwaysApply: true
 - Validate with repository commands only: `uv run ruff check hub tests`, `uv run ruff format --check hub tests`, and `uv run pytest -q`.
 - For API contract changes, update REST, CLI, MCP, Web, and tests in the same pass.
 - Never include secrets, real `.env` files, local databases, caches, or unrelated user changes.
+- Merge into `main` auto-deploys to production via `.github/workflows/ci.yml`. Treat any merge to `main` as a release: land work in `develop` first, and only promote verified code to `main`. See `deploy/CD.md` and `docs/agent-deploy-runbook.md`.
