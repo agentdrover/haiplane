@@ -35,7 +35,7 @@ Environment `production`):
 |--------|------------|--------|
 | `DEPLOY_HOST` | хост/IP сервера | `194.113.34.33` |
 | `DEPLOY_USER` | SSH-пользователь с passwordless sudo для шагов деплоя | `user1` |
-| `DEPLOY_SSH_KEY` | приватный SSH-ключ целиком (PEM), без пароля | `-----BEGIN OPENSSH PRIVATE KEY-----\n...` |
+| `DEPLOY_SSH_KEY` | приватный SSH-ключ целиком (OpenSSH/PEM), без пароля | содержимое файла приватного ключа целиком, включая строки `BEGIN`/`END` |
 
 Требования к ключу/доступу:
 
