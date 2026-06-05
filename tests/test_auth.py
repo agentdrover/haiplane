@@ -21,6 +21,11 @@ import pytest
 from hub import config
 from hub.config import TokenIdentity
 
+PASSWORD_WITHOUT_DIGIT = "abcdefgh!"  # pragma: allowlist secret
+PASSWORD_WITHOUT_LETTER = "12345678!"  # pragma: allowlist secret
+PASSWORD_WITHOUT_SPECIAL = "abcdefg1"  # pragma: allowlist secret
+VALID_ADMIN_PASSWORD = "s3cur3pw!"  # pragma: allowlist secret
+
 
 def _tokens(role: str = "human") -> dict[str, TokenIdentity]:
     """Helper to build a HUB_TOKENS dict with the given role."""
@@ -471,7 +476,7 @@ def test_password_complexity_rejects_no_digit():
     from hub.models import AdminBootstrap
 
     with pytest.raises(ValidationError, match="digit"):
-        AdminBootstrap(username="admin", password="abcdefgh!")
+        AdminBootstrap(username="admin", password=PASSWORD_WITHOUT_DIGIT)
 
 
 def test_password_complexity_rejects_no_letter():
@@ -480,7 +485,7 @@ def test_password_complexity_rejects_no_letter():
     from hub.models import AdminBootstrap
 
     with pytest.raises(ValidationError, match="letter"):
-        AdminBootstrap(username="admin", password="12345678!")
+        AdminBootstrap(username="admin", password=PASSWORD_WITHOUT_LETTER)
 
 
 def test_password_complexity_rejects_no_special():
@@ -489,11 +494,14 @@ def test_password_complexity_rejects_no_special():
     from hub.models import AdminBootstrap
 
     with pytest.raises(ValidationError, match="special"):
-        AdminBootstrap(username="admin", password="abcdefg1")
+        AdminBootstrap(username="admin", password=PASSWORD_WITHOUT_SPECIAL)
 
 
 def test_password_complexity_accepts_valid():
     from hub.models import AdminBootstrap
 
-    b = AdminBootstrap(username="admin", password="s3cur3pw!")
-    assert b.password == "s3cur3pw!"
+    b = AdminBootstrap(
+        username="admin",
+        password=VALID_ADMIN_PASSWORD,
+    )
+    assert b.password == VALID_ADMIN_PASSWORD

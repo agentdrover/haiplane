@@ -8,6 +8,8 @@ from hub import config
 from hub.config import TokenIdentity
 from hub.services import admin as admin_svc
 
+TEST_ADMIN_PASSWORD = "s3cur3pw!"  # pragma: allowlist secret
+
 
 def _admin_tokens() -> dict[str, TokenIdentity]:
     return {"admin-token": TokenIdentity("admin-user", "admin")}
@@ -31,7 +33,7 @@ async def test_bootstrap_in_open_mode(client, db, monkeypatch):
         "/api/admin/bootstrap",
         json={
             "username": "first-admin",
-            "password": "s3cur3pw!",
+            "password": TEST_ADMIN_PASSWORD,
             "display_name": "First Admin",
         },
     )
@@ -48,11 +50,17 @@ async def test_bootstrap_rejects_duplicate(client, db, monkeypatch):
 
     await client.post(
         "/api/admin/bootstrap",
-        json={"username": "admin1", "password": "s3cur3pw!"},
+        json={
+            "username": "admin1",
+            "password": TEST_ADMIN_PASSWORD,
+        },
     )
     resp = await client.post(
         "/api/admin/bootstrap",
-        json={"username": "admin2", "password": "s3cur3pw!"},
+        json={
+            "username": "admin2",
+            "password": TEST_ADMIN_PASSWORD,
+        },
     )
     assert resp.status_code == 409
 
@@ -65,7 +73,10 @@ async def test_bootstrap_with_token(client, db, monkeypatch):
 
     resp = await client.post(
         "/api/admin/bootstrap",
-        json={"username": "admin1", "password": "s3cur3pw!"},
+        json={
+            "username": "admin1",
+            "password": TEST_ADMIN_PASSWORD,
+        },
         headers={"Authorization": "Bearer boot-secret"},
     )
     assert resp.status_code == 200, resp.text
@@ -149,7 +160,11 @@ async def test_disable_and_enable_principal(client, db, monkeypatch):
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
 
     # Ensure at least one admin exists so we can disable others
-    await admin_svc.bootstrap_admin(db, username="super", password="s3cur3pw!")
+    await admin_svc.bootstrap_admin(
+        db,
+        username="super",
+        password=TEST_ADMIN_PASSWORD,
+    )
 
     resp = await client.post(
         "/api/admin/principals",
@@ -311,7 +326,11 @@ async def test_cannot_disable_last_admin_via_api(client, db, monkeypatch):
     monkeypatch.setattr(config, "HUB_TOKENS", _admin_tokens())
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
 
-    admin = await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    admin = await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     resp = await client.post(
         f"/api/admin/principals/{admin['id']}/disable",
         headers={"Authorization": "Bearer admin-token"},

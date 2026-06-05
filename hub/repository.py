@@ -85,7 +85,7 @@ async def list_tasks_filtered(
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE {where} ORDER BY position ASC, id DESC LIMIT ?",
+        f"SELECT * FROM tasks WHERE {where} ORDER BY position ASC, id DESC LIMIT ?",  # nosec B608
         tuple(params),
     )
 
@@ -100,7 +100,7 @@ async def list_tasks_by_statuses(
     placeholders = ",".join("?" for _ in statuses)
     archived_sql = "" if include_archived else " AND archived=0"
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql} "
+        f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql} "  # nosec B608
         "ORDER BY id DESC LIMIT ?",
         (*statuses, limit),
     )
@@ -118,7 +118,7 @@ async def list_tasks_by_status(
         raise ValueError(f"Unsupported order_by clause: {order_by!r}")
     archived_sql = "" if include_archived else " AND archived=0"
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status=?{archived_sql} ORDER BY {order_by} LIMIT ?",
+        f"SELECT * FROM tasks WHERE status=?{archived_sql} ORDER BY {order_by} LIMIT ?",  # nosec B608
         (status, limit),
     )
 
@@ -257,7 +257,7 @@ async def update_task(
     values = list(fields.values())
     values.append(task_id)
     await db.execute(
-        f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",
+        f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
         tuple(values),
     )
 
@@ -327,7 +327,7 @@ async def create_task_full(
     ]
     placeholders = ", ".join("?" for _ in columns)
     cur = await db.execute(
-        f"INSERT INTO tasks ({', '.join(columns)}) VALUES ({placeholders})",
+        f"INSERT INTO tasks ({', '.join(columns)}) VALUES ({placeholders})",  # nosec B608
         tuple(values),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -528,7 +528,7 @@ async def set_tasks_archived(
         return
     ph = ",".join("?" * len(task_ids))
     await db.execute(
-        f"UPDATE tasks SET archived=?, updated_at=datetime('now') WHERE id IN ({ph})",
+        f"UPDATE tasks SET archived=?, updated_at=datetime('now') WHERE id IN ({ph})",  # nosec B608
         (archived, *task_ids),
     )
 
@@ -539,7 +539,7 @@ async def delete_task_subtree(db: aiosqlite.Connection, root_id: int) -> int:
     if not ids:
         return 0
     ph = ",".join("?" * len(ids))
-    await db.execute(f"DELETE FROM task_updates WHERE task_id IN ({ph})", ids)
+    await db.execute(f"DELETE FROM task_updates WHERE task_id IN ({ph})", ids)  # nosec B608
     for tid in ids:
         await db.execute("DELETE FROM tasks WHERE id=?", (tid,))
     return len(ids)

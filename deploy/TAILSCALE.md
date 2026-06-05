@@ -62,6 +62,7 @@ Pick a random token per developer (`openssl rand -hex 24`), build the env:
 ```bash
 cat > ~/.openclaw-hub.env <<'EOF'
 OPENCLAW_HUB_TOKENS=denis:dXX...,alice:aYY...,bob:bZZ...
+OPENCLAW_HUB_ALLOWED_HOSTS=openclaw-hub:8080,openclaw-hub.tailXXXX.ts.net
 OPENCLAW_HUB_DB_PATH=/home/openclaw/hub.db
 OPENCLAW_HUB_PORT=8080
 EOF
@@ -71,6 +72,9 @@ chmod 600 ~/.openclaw-hub.env
 Tokens are environment-driven on purpose for the MVP — to add or revoke a
 user, edit the file and restart the service. A future task will move this
 into the database.
+
+`OPENCLAW_HUB_ALLOWED_HOSTS` is the Host header allowlist. Include every name
+developers will use for the Hub, with ports when they must match exactly.
 
 ## 5. systemd service
 
@@ -142,9 +146,9 @@ In each developer's `.cursor/mcp.json`:
 }
 ```
 
-Cursor will negotiate Streamable-HTTP transport against the mounted
-`/mcp` endpoint. Multiple developers connect concurrently; each request
-is attributed to their token via `request.state.user`.
+Cursor will negotiate Streamable-HTTP transport against the mounted `/mcp`
+endpoint. Multiple developers connect concurrently; each request is attributed
+to their token via `request.state.user`.
 
 > The previous stdio-over-SSH transport keeps working for emergency
 > single-user access. Both can coexist.

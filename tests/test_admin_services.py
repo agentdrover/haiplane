@@ -7,6 +7,9 @@ import pytest
 from hub.services import admin as admin_svc
 from hub.services.admin import LastAdminError
 
+TEST_ADMIN_PASSWORD = "s3cur3pw!"  # pragma: allowlist secret
+SECOND_ADMIN_PASSWORD = "s3cur3pw2"  # pragma: allowlist secret
+
 
 # ---------------------------------------------------------------------------
 # Password hashing
@@ -52,7 +55,10 @@ def test_generate_session_token():
 @pytest.mark.asyncio
 async def test_bootstrap_creates_first_admin(db):
     p = await admin_svc.bootstrap_admin(
-        db, username="admin1", password="s3cur3pw!", display_name="Admin One"
+        db,
+        username="admin1",
+        password=TEST_ADMIN_PASSWORD,
+        display_name="Admin One",
     )
     assert p["username"] == "admin1"
     assert p["kind"] == "human"
@@ -61,9 +67,17 @@ async def test_bootstrap_creates_first_admin(db):
 
 @pytest.mark.asyncio
 async def test_bootstrap_fails_if_admin_exists(db):
-    await admin_svc.bootstrap_admin(db, username="admin1", password="s3cur3pw!")
+    await admin_svc.bootstrap_admin(
+        db,
+        username="admin1",
+        password=TEST_ADMIN_PASSWORD,
+    )
     with pytest.raises(ValueError, match="admin already exists"):
-        await admin_svc.bootstrap_admin(db, username="admin2", password="s3cur3pw2")
+        await admin_svc.bootstrap_admin(
+            db,
+            username="admin2",
+            password=SECOND_ADMIN_PASSWORD,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +127,11 @@ async def test_update_principal(db):
 
 @pytest.mark.asyncio
 async def test_disable_and_enable_principal(db):
-    await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     p = await admin_svc.create_principal(
         db, kind="human", username="bob", role_slug="operator"
     )
@@ -127,7 +145,11 @@ async def test_disable_and_enable_principal(db):
 
 @pytest.mark.asyncio
 async def test_cannot_disable_last_admin(db):
-    admin = await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    admin = await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     with pytest.raises(LastAdminError):
         await admin_svc.disable_principal(db, admin["id"])
 
@@ -146,7 +168,11 @@ async def test_set_principal_roles(db):
 
 @pytest.mark.asyncio
 async def test_cannot_remove_last_admin_role(db):
-    admin = await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    admin = await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     with pytest.raises(LastAdminError):
         await admin_svc.set_principal_roles(db, admin["id"], ["viewer"])
 
@@ -185,7 +211,11 @@ async def test_revoked_key_not_resolved(db):
 
 @pytest.mark.asyncio
 async def test_disabled_principal_key_not_resolved(db):
-    await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     p = await admin_svc.create_principal(
         db, kind="agent", username="bot", role_slug="agent"
     )
@@ -204,7 +234,11 @@ async def test_disabled_principal_key_not_resolved(db):
 @pytest.mark.asyncio
 async def test_create_and_resolve_session(db):
     p = await admin_svc.create_principal(
-        db, kind="human", username="alice", password="s3cur3pw!", role_slug="operator"
+        db,
+        kind="human",
+        username="alice",
+        password=TEST_ADMIN_PASSWORD,
+        role_slug="operator",
     )
     session_token = await admin_svc.create_browser_session(db, p["id"])
     assert len(session_token) > 20
@@ -228,9 +262,17 @@ async def test_invalid_session_returns_none(db):
 @pytest.mark.asyncio
 async def test_authenticate_password(db):
     await admin_svc.create_principal(
-        db, kind="human", username="alice", password="s3cur3pw!", role_slug="operator"
+        db,
+        kind="human",
+        username="alice",
+        password=TEST_ADMIN_PASSWORD,
+        role_slug="operator",
     )
-    pid = await admin_svc.authenticate_password(db, "alice", "s3cur3pw!")
+    pid = await admin_svc.authenticate_password(
+        db,
+        "alice",
+        TEST_ADMIN_PASSWORD,
+    )
     assert pid is not None
 
     pid_wrong = await admin_svc.authenticate_password(db, "alice", "wrong")
@@ -285,7 +327,11 @@ async def test_agent_key_lacks_human_gate_permission(db):
 
 @pytest.mark.asyncio
 async def test_admin_key_has_admin_permissions(db):
-    p = await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    p = await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     key_data = await admin_svc.create_api_key(db, p["id"], name="admin-key")
     identity = await admin_svc.resolve_api_key(db, key_data["plaintext_key"])
     assert identity is not None
@@ -296,7 +342,11 @@ async def test_admin_key_has_admin_permissions(db):
 
 @pytest.mark.asyncio
 async def test_operator_can_human_gate_but_not_admin(db):
-    await admin_svc.bootstrap_admin(db, username="admin", password="s3cur3pw!")
+    await admin_svc.bootstrap_admin(
+        db,
+        username="admin",
+        password=TEST_ADMIN_PASSWORD,
+    )
     p = await admin_svc.create_principal(
         db, kind="human", username="operator1", role_slug="operator"
     )

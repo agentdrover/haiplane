@@ -41,3 +41,26 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
+
+      - name: Dependency vulnerability audit
+        run: uv run pip-audit --progress-spinner off
+
+      - name: Static security scan
+        run: uv run bandit -r hub -q
+
+      - name: Secret scan
+        run: |
+          uv run detect-secrets scan \
+            --exclude-files '(^uv\.lock$|^\.pytest_cache/|^\.ruff_cache/)' \
+            > /tmp/detect-secrets.json
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("/tmp/detect-secrets.json").read_text())
+          results = report.get("results", {})
+          if results:
+              print(json.dumps(results, indent=2))
+              raise SystemExit(1)
+          print("No secrets detected")
+          PY

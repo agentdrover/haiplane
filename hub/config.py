@@ -70,6 +70,7 @@ HUB_AUTH_DISABLED = os.environ.get("OPENCLAW_HUB_AUTH_DISABLED", "0") == "1"
 HUB_ALLOW_UNAUTH_NETWORK = (
     os.environ.get("OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK", "0") == "1"
 )
+HUB_ALLOWED_HOSTS_RAW = os.environ.get("OPENCLAW_HUB_ALLOWED_HOSTS", "")
 HUB_COOKIE_NAME = os.environ.get("OPENCLAW_HUB_COOKIE", "openclaw_hub_session")
 # 30 days by default — Hub is an internal tool, long-lived sessions are fine.
 HUB_COOKIE_MAX_AGE = int(
@@ -192,6 +193,22 @@ def parse_tokens(raw: str) -> dict[str, TokenIdentity]:
 
 
 HUB_TOKENS: dict[str, TokenIdentity] = parse_tokens(HUB_TOKENS_RAW)
+
+
+def parse_allowed_hosts(raw: str) -> frozenset[str]:
+    """Parse comma-separated Host allowlist values.
+
+    Values may include ports. A host entry without a port matches any port for
+    that hostname; a host:port entry must match exactly.
+    """
+    return frozenset(
+        item.lower().rstrip(".")
+        for item in (part.strip() for part in (raw or "").split(","))
+        if item
+    )
+
+
+HUB_ALLOWED_HOSTS: frozenset[str] = parse_allowed_hosts(HUB_ALLOWED_HOSTS_RAW)
 
 
 def _is_loopback(host: str) -> bool:

@@ -44,6 +44,7 @@ from hub.models import (
     TaskView,
 )
 from hub.auth import AuthMiddleware, require_human_or_admin, require_permission
+from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
@@ -145,10 +146,10 @@ app = FastAPI(title="OpenClaw Hub", version="0.2.0", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
+# Added last so it runs first. Empty allowlist preserves local/dev behavior;
+# production deployments can set OPENCLAW_HUB_ALLOWED_HOSTS.
+app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
-# MCP transport for remote agents (Cursor, etc.). Bearer token enforced by
-# AuthMiddleware — see deploy/TAILSCALE.md for the client-side config.
-app.mount("/mcp", _mcp_streamable_app)
 app.include_router(web_router)
 
 
@@ -1112,6 +1113,12 @@ def _check_bootstrap_token(request: Request) -> bool:
         token = bearer[7:].strip()
         return token == config.HUB_BOOTSTRAP_TOKEN
     return False
+
+
+# MCP transport for remote agents (Cursor, etc.). FastMCP's streamable HTTP app
+# already owns the /mcp route, so mount it at root and keep this mount last so
+# Hub REST/Web routes above continue to take precedence.
+app.mount("/", _mcp_streamable_app)
 
 
 # ---------------------------------------------------------------------------

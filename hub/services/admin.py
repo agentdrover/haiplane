@@ -214,7 +214,7 @@ async def update_principal(
         sets.append("notes = ?")
         params.append(notes)
     params.append(principal_id)
-    await db.execute(f"UPDATE principals SET {', '.join(sets)} WHERE id = ?", params)
+    await db.execute(f"UPDATE principals SET {', '.join(sets)} WHERE id = ?", params)  # nosec B608
     await db.commit()
     return await get_principal(db, principal_id)
 
@@ -476,8 +476,8 @@ async def resolve_api_key(
             (row["principal_id"],),
         )
         await db.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("best-effort api key last_used update failed: %s", exc)
 
     perms = await get_principal_permissions(db, row["principal_id"])
     role = await get_effective_role(db, row["principal_id"])
@@ -559,8 +559,8 @@ async def resolve_browser_session(
             (row["principal_id"],),
         )
         await db.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("best-effort browser session last_seen update failed: %s", exc)
 
     perms = await get_principal_permissions(db, row["principal_id"])
     role = await get_effective_role(db, row["principal_id"])

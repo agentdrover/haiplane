@@ -78,7 +78,7 @@ class VastIntegration:
     async def has_active_vast_tasks(self, db: aiosqlite.Connection) -> bool:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         cursor = await db.execute(
-            f"SELECT count(*) FROM tasks WHERE archived=0 "
+            f"SELECT count(*) FROM tasks WHERE archived=0 "  # nosec B608
             f"AND runtime IN ('vast','auto') AND status IN ({placeholders})",
             ACTIVE_STATUSES,
         )

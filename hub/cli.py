@@ -47,7 +47,9 @@ def _api(method: str, path: str, body: Any | None = None) -> Any:
     if HUB_TOKEN:
         req.add_header("Authorization", f"Bearer {HUB_TOKEN}")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # URL is built from _validated_hub_base_url(), which only permits
+        # explicit http/https Hub endpoints.
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
             raw = resp.read().decode()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
