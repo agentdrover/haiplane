@@ -81,6 +81,16 @@ async def test_tasks_archived_column_present():
         await conn.close()
 
 
+async def test_claim_columns_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        for name in ("claimed_by", "claim_session_id", "claimed_at"):
+            assert name in cols, f"missing column {name}"
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "column, expected_default",
     [

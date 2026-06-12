@@ -26,6 +26,7 @@ from hub.models import (
     TaskAnswer,
     TaskApprove,
     TaskArchive,
+    TaskClaim,
     TaskContextView,
     TaskCreate,
     TaskDecide,
@@ -34,6 +35,7 @@ from hub.models import (
     TaskRefine,
     TaskPairStart,
     TaskReject,
+    TaskRelease,
     TaskReorder,
     TaskRisk,
     TaskSource,
@@ -467,6 +469,32 @@ async def api_pair_start_task(
         body,
         caller=identity.username,
     )
+
+
+@app.post("/api/tasks/{task_id}/claim", response_model=TaskView)
+async def api_claim_task(
+    task_id: int,
+    body: TaskClaim,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Claim an open task for one Cursor agent/session."""
+    if not body.agent.strip():
+        body = TaskClaim(agent=identity.username, session_id=body.session_id)
+    return await services.claim_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/release", response_model=TaskView)
+async def api_release_task(
+    task_id: int,
+    body: TaskRelease,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Release a claimed task back to open."""
+    if not body.agent.strip():
+        body = TaskRelease(agent=identity.username, session_id=body.session_id)
+    return await services.release_task(_db(request), task_id, body)
 
 
 # --- Q&A: Question / Answer ---

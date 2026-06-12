@@ -348,6 +348,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_tasks_archived",
         "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived)",
     ),
+    ("add_claimed_by_column", "ALTER TABLE tasks ADD COLUMN claimed_by TEXT"),
+    (
+        "add_claim_session_id_column",
+        "ALTER TABLE tasks ADD COLUMN claim_session_id TEXT",
+    ),
+    ("add_claimed_at_column", "ALTER TABLE tasks ADD COLUMN claimed_at TEXT"),
 ]
 
 

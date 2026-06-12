@@ -9,10 +9,12 @@ from hub import services
 from hub.models import (
     TaskAnswer,
     TaskApprove,
+    TaskClaim,
     TaskCreate,
     TaskDecide,
     TaskPairStart,
     TaskQuestion,
+    TaskRelease,
     TaskReorder,
     TaskStart,
     TaskUpdateCreate,
@@ -1018,6 +1020,82 @@ async def test_decide_task_wrong_status(db: aiosqlite.Connection):
         await services.decide_task(db, tv.id, TaskDecide(action="accept"))
     assert exc_info.value.status_code == 400
     assert "needs_decision" in str(exc_info.value.detail)
+
+
+async def test_claim_task_from_open(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Claim me",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    tv = await services.claim_task(
+        db, task_id, TaskClaim(agent="composer", session_id="sess-1")
+    )
+    assert tv.status.value == "claimed"
+    assert tv.claimed_by == "composer"
+    assert tv.claim_session_id == "sess-1"
+    assert tv.assigned_agent == "composer"
+
+
+async def test_claim_task_conflict(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Taken",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await services.claim_task(db, task_id, TaskClaim(agent="agent-a", session_id="s1"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.claim_task(
+            db, task_id, TaskClaim(agent="agent-b", session_id="s2")
+        )
+    assert exc_info.value.status_code == 409
+
+
+async def test_release_task(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Release me",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await services.claim_task(db, task_id, TaskClaim(agent="composer", session_id="s1"))
+
+    tv = await services.release_task(
+        db, task_id, TaskRelease(agent="composer", session_id="s1")
+    )
+    assert tv.status.value == "open"
+    assert tv.claimed_by is None
 
 
 async def test_noop_plugins_start_clean(db: aiosqlite.Connection):

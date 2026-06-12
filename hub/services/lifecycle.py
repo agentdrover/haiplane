@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -17,6 +18,7 @@ from hub.integrations.registry import plugins
 from hub.models import (
     TaskAnswer,
     TaskApprove,
+    TaskClaim,
     TaskBreadcrumb,
     TaskChildSummary,
     TaskCreate,
@@ -26,6 +28,7 @@ from hub.models import (
     TaskProgress,
     TaskQuestion,
     TaskReject,
+    TaskRelease,
     TaskReorder,
     TaskSource,
     TaskStart,
@@ -89,6 +92,9 @@ def row_to_task(
         review_job_id=d.get("review_job_id"),
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
+        claimed_by=d.get("claimed_by"),
+        claim_session_id=d.get("claim_session_id"),
+        claimed_at=d.get("claimed_at"),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         archived=bool(d.get("archived", 0)),
@@ -386,10 +392,21 @@ async def pair_start_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
-    if task["status"] != "open":
+    assigned_agent = (body.assigned_agent or "").strip() if body else ""
+    if not assigned_agent:
+        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
+
+    if task["status"] == "claimed":
+        holder = (task.get("claimed_by") or "").strip()
+        if holder and assigned_agent and holder != assigned_agent:
+            raise HTTPException(
+                409,
+                f"Task #{task_id} is claimed by {holder}; pair-start denied",
+            )
+    elif task["status"] != "open":
         raise HTTPException(
             400,
-            f"can only pair-start open tasks, current status: {task['status']}",
+            f"can only pair-start open or own-claimed tasks, current status: {task['status']}",
         )
 
     body = body or TaskPairStart()
@@ -441,12 +458,135 @@ async def pair_start_task(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def claim_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskClaim,
+) -> TaskView:
+    """Claim an open task for a single Cursor agent/session."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+
+    if task["status"] == "claimed":
+        if (
+            task.get("claimed_by") == body.agent
+            and (task.get("claim_session_id") or "") == body.session_id
+        ):
+            row = await repo.get_task(db, task_id)
+            updates = await repo.get_task_updates(db, task_id)
+            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+        holder = task.get("claimed_by") or "unknown"
+        raise HTTPException(
+            409,
+            f"Task #{task_id} already claimed by {holder}",
+        )
+
+    if task["status"] != "open":
+        raise HTTPException(
+            400,
+            f"can only claim open tasks, current status: {task['status']}",
+        )
+
+    if not await repo.transition_status_if(
+        db, task_id, expected_from="open", new_status="claimed"
+    ):
+        row = await repo.get_task(db, task_id)
+        task = dict(row)
+        if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
+            updates = await repo.get_task_updates(db, task_id)
+            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+        raise HTTPException(409, f"Task #{task_id} claim conflict")
+
+    session_note = f" session={body.session_id}" if body.session_id else ""
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=body.agent,
+        claim_session_id=body.session_id or None,
+        claimed_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        assigned_agent=body.agent,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        body.agent,
+        "status",
+        f"Claimed by {body.agent}{session_note}",
+    )
+    await db.commit()
+    await log_activity(db, "task_claimed", f"Task #{task_id} claimed by {body.agent}")
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def release_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskRelease,
+) -> TaskView:
+    """Release an active claim and return the task to open."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+
+    if task["status"] != "claimed":
+        raise HTTPException(
+            400,
+            f"can only release claimed tasks, current status: {task['status']}",
+        )
+
+    holder = task.get("claimed_by") or ""
+    if holder != body.agent:
+        raise HTTPException(
+            409,
+            f"Task #{task_id} is claimed by {holder}, not {body.agent}",
+        )
+    if body.session_id and (task.get("claim_session_id") or "") != body.session_id:
+        raise HTTPException(
+            409,
+            f"Task #{task_id} claim session mismatch",
+        )
+
+    if not await repo.transition_status_if(
+        db, task_id, expected_from="claimed", new_status="open"
+    ):
+        raise HTTPException(409, f"Task #{task_id} release conflict")
+
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        body.agent,
+        "status",
+        f"Claim released by {body.agent}",
+    )
+    await db.commit()
+    await log_activity(db, "task_released", f"Task #{task_id} claim released")
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
 def _can_ask_question(task: dict) -> bool:
     """Pair agents may ask from ``open`` (pre pair-start) or ``running``."""
     status = task["status"]
     if status == "running":
         return True
     if status == "open" and not task.get("job_id"):
+        return True
+    if status == "claimed" and not task.get("job_id"):
         return True
     return False
 

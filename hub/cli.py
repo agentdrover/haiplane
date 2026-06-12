@@ -280,6 +280,20 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_claim(args: argparse.Namespace) -> int:
+    body = {"agent": args.agent, "session_id": args.session_id or ""}
+    result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    body = {"agent": args.agent, "session_id": args.session_id or ""}
+    result = _api("POST", f"/api/tasks/{args.task_id}/release", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_question(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "agent": args.agent or "",
@@ -973,6 +987,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
+    p_claim.add_argument("task_id", type=int)
+    p_claim.add_argument("--agent", required=True, help="Agent taking the claim")
+    p_claim.add_argument(
+        "--session-id", dest="session_id", default="", help="Cursor session id"
+    )
+    p_claim.set_defaults(func=cmd_claim)
+
+    p_release = sub.add_parser("release", help="Release a claimed task")
+    p_release.add_argument("task_id", type=int)
+    p_release.add_argument("--agent", required=True, help="Agent releasing the claim")
+    p_release.add_argument(
+        "--session-id", dest="session_id", default="", help="Cursor session id"
+    )
+    p_release.set_defaults(func=cmd_release)
 
     # question — agent asks a question (sets needs_info)
     p_question = sub.add_parser(

@@ -108,28 +108,28 @@
         <td>B7 — ask из <code>open</code></td>
         <td>#39</td>
         <td><span class="badge ok">develop</span></td>
-        <td><span class="badge pending">open</span></td>
+        <td><span class="badge ok">completed</span></td>
         <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
       </tr>
       <tr>
         <td>B8 — answer без dispatch</td>
         <td>#40</td>
         <td><span class="badge ok">develop</span></td>
-        <td><span class="badge pending">open</span></td>
+        <td><span class="badge ok">completed</span></td>
         <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
-      </tr>
-      <tr>
-        <td>Claim / release Cursor-сессии</td>
-        <td>#41</td>
-        <td><span class="badge todo">draft</span></td>
-        <td><span class="badge todo">draft</span></td>
-        <td>—</td>
       </tr>
       <tr>
         <td><code>hub_report_done</code> MCP message</td>
         <td>#44</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/10">#10 merged</a></td>
+      </tr>
+      <tr>
+        <td>Claim / release Cursor-сессии</td>
+        <td>#41</td>
         <td><span class="badge pending">in progress</span></td>
-        <td><span class="badge todo">draft</span></td>
+        <td><span class="badge pending">open</span></td>
         <td>—</td>
       </tr>
     </tbody>
@@ -208,11 +208,20 @@
   </ol>
 
   <h2 id="pair-report-done-mcp">Pair: MCP <code>hub_report_done</code> (B9)</h2>
-  <p>Gap <strong>#44</strong> <span class="badge pending">in progress</span>: ответ MCP отражает фактический status, без «should now be completed».</p>
+  <p>Gap <strong>#44</strong> <span class="badge ok">закрыт</span>: ответ MCP отражает фактический status, без «should now be completed».</p>
   <ul>
     <li><code>open</code>/<code>running</code> → status unchanged или <code>ci_check</code> (pair conveyor).</li>
     <li><code>pending_report</code> → <code>completed</code> с явным текстом.</li>
   </ul>
+
+  <h2 id="pair-claim">Pair: claim / release (B10)</h2>
+  <p>Gap <strong>#41</strong> <span class="badge pending">in progress</span>: один активный исполнитель на задачу.</p>
+  <ol class="checklist">
+    <li><code>hub_claim_task(task_id, agent=..., session_id=...)</code> — <code>open</code> → <code>claimed</code>.</li>
+    <li>Повторный claim другим agent/session → <strong>409</strong>.</li>
+    <li><code>hub_release_task</code> — <code>claimed</code> → <code>open</code>, audit update.</li>
+    <li>Далее <code>hub_pair_start</code> (свой claim) или release.</li>
+  </ol>
 
   <h2>Ссылки</h2>
   <ul>

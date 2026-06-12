@@ -11,6 +11,7 @@ from hub.mcp_server import (
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
+    hub_claim_task,
     hub_create_task,
     hub_decide_task,
     hub_delete_acceptance_criterion,
@@ -22,6 +23,7 @@ from hub.mcp_server import (
     hub_propose_task,
     hub_pair_start,
     hub_refine_task,
+    hub_release_task,
     hub_replace_acceptance_criteria,
     hub_report_done,
     hub_start_task,
@@ -198,6 +200,29 @@ async def test_hub_answer_question(mock_api_post: AsyncMock) -> None:
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/40/answer",
         {"answer": "Use REST", "resume": True},
+    )
+
+
+async def test_hub_claim_task(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {
+        "status": "claimed",
+        "claimed_by": "composer",
+    }
+    msg = await hub_claim_task(41, "composer", session_id="sess-1")
+    assert "claimed" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/41/claim",
+        {"agent": "composer", "session_id": "sess-1"},
+    )
+
+
+async def test_hub_release_task(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "open"}
+    msg = await hub_release_task(41, "composer", session_id="sess-1")
+    assert "released" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/41/release",
+        {"agent": "composer", "session_id": "sess-1"},
     )
 
 

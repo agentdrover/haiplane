@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class TaskStatus(str, Enum):
     draft = "draft"
     open = "open"
+    claimed = "claimed"
     running = "running"
     needs_info = "needs_info"
     review = "review"
@@ -132,6 +133,7 @@ HIERARCHY_RULES: dict[TaskType, TaskType | None] = {
 ACTIVE_STATUSES = frozenset(
     {
         TaskStatus.open,
+        TaskStatus.claimed,
         TaskStatus.running,
         TaskStatus.fix_requested,
         TaskStatus.ci_check,
@@ -221,6 +223,16 @@ class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
     branch_slug: str = Field("", max_length=80)
+
+
+class TaskClaim(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=100)
+    session_id: str = Field("", max_length=200)
+
+
+class TaskRelease(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=100)
+    session_id: str = Field("", max_length=200)
 
 
 class TaskQuestion(BaseModel):
@@ -455,6 +467,9 @@ class TaskView(BaseModel):
     review_job_id: str | None = None
     branch: str | None = None
     pr_number: int | None = None
+    claimed_by: str | None = None
+    claim_session_id: str | None = None
+    claimed_at: str | None = None
     breadcrumb: list[TaskBreadcrumb] | None = None
     children: list[TaskChildSummary] | None = None
     progress: TaskProgress | None = None

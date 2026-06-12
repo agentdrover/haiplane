@@ -530,6 +530,49 @@ async def hub_pair_start(
 
 
 @mcp.tool()
+async def hub_claim_task(
+    task_id: int,
+    agent: str,
+    session_id: str = "",
+) -> str:
+    """Claim an open task for one Cursor agent/session (409 if already claimed).
+
+    Args:
+        task_id: The open task ID
+        agent: Agent name taking the claim
+        session_id: Optional Cursor session id for conflict detection
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/claim",
+        {"agent": agent, "session_id": session_id},
+    )
+    status = result.get("status", "?")
+    holder = result.get("claimed_by") or agent
+    return f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
+
+
+@mcp.tool()
+async def hub_release_task(
+    task_id: int,
+    agent: str,
+    session_id: str = "",
+) -> str:
+    """Release a claimed task back to open.
+
+    Args:
+        task_id: The claimed task ID
+        agent: Agent that holds the claim
+        session_id: Optional session id that must match the claim
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/release",
+        {"agent": agent, "session_id": session_id},
+    )
+    status = result.get("status", "?")
+    return f"Task #{task_id} claim released (status: {status})."
+
+
+@mcp.tool()
 async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     """Human force-completes a pending_report task without an agent done report.
 
