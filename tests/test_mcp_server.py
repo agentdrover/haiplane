@@ -259,7 +259,31 @@ async def test_hub_report_done(
     )
     assert "Done report #77 submitted for task #9" in msg
     assert "status: ci_check" in msg
+    assert "Task entered ci_check" in msg
+    assert "should now be completed" not in msg.lower()
     mock_api_get.assert_awaited_once_with("/api/tasks/9")
+
+
+async def test_hub_report_done_open_status(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 88}
+    mock_api_get.return_value = {"id": 5, "status": "open"}
+    msg = await hub_report_done(5, "Changed: docs only")
+    assert "status: open" in msg
+    assert "Status unchanged" in msg
+    assert "Task completed" not in msg
+    assert "should now be completed" not in msg.lower()
+
+
+async def test_hub_report_done_completed_from_pending(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 99}
+    mock_api_get.return_value = {"id": 3, "status": "completed"}
+    msg = await hub_report_done(3, "Changed: feature. Validation: pytest -q")
+    assert "status: completed" in msg
+    assert "Task completed" in msg
 
 
 # ---------------------------------------------------------------------------

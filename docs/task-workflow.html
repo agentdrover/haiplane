@@ -77,7 +77,7 @@
   <p>Краткая схема для Cursor pair mode. Полный lifecycle: <a href="software-development-workflow.md">software-development-workflow.md</a>.</p>
 
   <h2 id="gap-status">Статус gaps (группа #36)</h2>
-  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · local hub <code>127.0.0.1:8080</code></p>
+  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · PR #9 merged</p>
   <table>
     <thead>
       <tr><th>Gap</th><th>Task</th><th>Код</th><th>Hub</th><th>PR</th></tr>
@@ -87,7 +87,7 @@
         <td>Pair-start (<code>hub_pair_start</code>)</td>
         <td>#37</td>
         <td><span class="badge ok">develop</span></td>
-        <td><span class="badge warn">needs_decision</span></td>
+        <td><span class="badge ok">completed</span></td>
         <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/7">#7 merged</a></td>
       </tr>
       <tr>
@@ -107,16 +107,16 @@
       <tr>
         <td>B7 — ask из <code>open</code></td>
         <td>#39</td>
-        <td><span class="badge pending">PR #9</span></td>
+        <td><span class="badge ok">develop</span></td>
         <td><span class="badge pending">open</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 open</a></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
       </tr>
       <tr>
         <td>B8 — answer без dispatch</td>
         <td>#40</td>
-        <td><span class="badge pending">PR #9</span></td>
+        <td><span class="badge ok">develop</span></td>
         <td><span class="badge pending">open</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 open</a></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
       </tr>
       <tr>
         <td>Claim / release Cursor-сессии</td>
@@ -128,7 +128,7 @@
       <tr>
         <td><code>hub_report_done</code> MCP message</td>
         <td>#44</td>
-        <td><span class="badge todo">draft</span></td>
+        <td><span class="badge pending">in progress</span></td>
         <td><span class="badge todo">draft</span></td>
         <td>—</td>
       </tr>
@@ -189,23 +189,30 @@
   </ul>
 
   <h2 id="pair-ask-question">Pair: вопрос до pair-start (B7)</h2>
-  <p>Gap <strong>#39</strong> <span class="badge pending">PR #9</span>: агент в Cursor может уточнить требования, пока задача ещё в <code>open</code>.</p>
+  <p>Gap <strong>#39</strong> <span class="badge ok">закрыт</span>: агент в Cursor может уточнить требования, пока задача ещё в <code>open</code>.</p>
   <ol class="checklist">
     <li>После approve задача в <code>open</code>, <code>job_id</code> пустой.</li>
     <li><code>hub_ask_question(task_id, question=...)</code> → <code>needs_info</code> (не 400).</li>
-    <li>Человек: <code>hub_answer_question</code> — <code>resume=true</code> без dispatch <span class="badge pending">#40 PR #9</span>.</li>
+    <li>Человек: <code>hub_answer_question</code> — <code>resume=true</code> без dispatch <span class="badge ok">#40 ✓</span>.</li>
     <li>Далее <code>hub_pair_start</code> или работа по обновлённому scope.</li>
   </ol>
   <p>На headless <code>running</code> с <code>job_id</code> поведение <code>hub_ask_question</code> без изменений.</p>
 
   <h2 id="pair-answer-question">Pair: ответ без headless dispatch (B8)</h2>
-  <p>Gap <strong>#40</strong> <span class="badge pending">PR #9</span>: после <code>needs_info</code> pair-задача не уходит в <code>oc-dev-dispatch</code>.</p>
+  <p>Gap <strong>#40</strong> <span class="badge ok">закрыт</span>: после <code>needs_info</code> pair-задача не уходит в <code>oc-dev-dispatch</code>.</p>
   <ol class="checklist">
     <li>Pair = пустой <code>job_id</code> (до или после <code>hub_pair_start</code>).</li>
     <li><code>hub_answer_question(..., resume=true)</code> → <code>open</code> (до pair-start) или <code>running</code> (если есть <code>branch</code>), без <code>job_id</code>.</li>
     <li><code>resume=false</code> → только answer update, статус <code>open</code>.</li>
     <li>Headless с <code>job_id</code>: <code>resume=true</code> по-прежнему re-dispatch.</li>
   </ol>
+
+  <h2 id="pair-report-done-mcp">Pair: MCP <code>hub_report_done</code> (B9)</h2>
+  <p>Gap <strong>#44</strong> <span class="badge pending">in progress</span>: ответ MCP отражает фактический status, без «should now be completed».</p>
+  <ul>
+    <li><code>open</code>/<code>running</code> → status unchanged или <code>ci_check</code> (pair conveyor).</li>
+    <li><code>pending_report</code> → <code>completed</code> с явным текстом.</li>
+  </ul>
 
   <h2>Ссылки</h2>
   <ul>

@@ -335,22 +335,39 @@ async def hub_task_update(
     return f"Update #{result['id']} added to task #{task_id}."
 
 
+def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
+    """Return MCP text that reflects the actual post-report task status."""
+    base = (
+        f"Done report #{report_id} submitted for task #{task_id}. "
+        f"Task status: {status}."
+    )
+    if status == "completed":
+        return f"{base} Task completed."
+    if status == "pending_report":
+        return f"{base} Awaiting human review before completion."
+    if status in ("ci_check", "review", "needs_decision"):
+        return f"{base} Task entered {status}."
+    if status in ("open", "running"):
+        return (
+            f"{base} Status unchanged for this report "
+            "(pair/open path; use pair-start or done conveyor as applicable)."
+        )
+    return base
+
+
 @mcp.tool()
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
-    """Submit a completion report for a task — the normal agent path out of pending_report.
+    """Submit a done report and return the task's actual status after lifecycle handling.
 
-    After an agent finishes work it must submit a done report describing what was changed
-    and how it was validated; the report transitions the task from pending_report to
-    completed. This is the standard close-out path for agents.
-
-    The explicit human exception is `hub_force_complete_task`, which is reserved for cases
-    where a human has inspected the result and accepts that the agent report is missing or
-    unacceptably weak. Agents should not use `hub_force_complete_task` as a fallback —
-    they should always submit a real done report through this tool.
+    From ``pending_report``, a valid done report typically moves the task to
+    ``completed``. In pair mode (``open``/``running`` without ``job_id``), the
+    same tool may leave the task unchanged or advance it to ``ci_check`` — the
+    response always states the real status and never implies ``completed`` unless
+    the task is actually completed.
 
     Args:
         task_id: The task ID to report on
-        summary: What was changed and how it was validated (e.g. 'Changed: X, Y. Validation: tests pass, ruff clean.')
+        summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
     """
     result = await _api_post(
@@ -363,10 +380,7 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     )
     task = await _api_get(f"/api/tasks/{task_id}")
     status = task.get("status", "?")
-    return (
-        f"Done report #{result['id']} submitted for task #{task_id}. "
-        f"Task status: {status}."
-    )
+    return _format_hub_report_done_message(task_id, result["id"], status)
 
 
 # ---------------------------------------------------------------------------
