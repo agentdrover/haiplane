@@ -32,6 +32,7 @@ from hub.models import (
     TaskForceComplete,
     TaskQuestion,
     TaskRefine,
+    TaskPairStart,
     TaskReject,
     TaskReorder,
     TaskRisk,
@@ -43,7 +44,12 @@ from hub.models import (
     TaskUpdateView,
     TaskView,
 )
-from hub.auth import AuthMiddleware, require_human_or_admin, require_permission
+from hub.auth import (
+    AuthMiddleware,
+    current_identity,
+    require_human_or_admin,
+    require_permission,
+)
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
@@ -445,6 +451,22 @@ async def api_start_task(
     _identity=Depends(require_human_or_admin),
 ):
     return await services.start_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/pair-start", response_model=TaskView)
+async def api_pair_start_task(
+    task_id: int,
+    request: Request,
+    body: TaskPairStart | None = None,
+    identity=Depends(current_identity),
+):
+    """Start pair mode: running without headless dispatch (human or agent)."""
+    return await services.pair_start_task(
+        _db(request),
+        task_id,
+        body,
+        caller=identity.username,
+    )
 
 
 # --- Q&A: Question / Answer ---

@@ -22,6 +22,7 @@ from hub.models import (
     TaskCreate,
     TaskDecide,
     TaskForceComplete,
+    TaskPairStart,
     TaskProgress,
     TaskQuestion,
     TaskReject,
@@ -33,7 +34,12 @@ from hub.models import (
     TaskUpdateView,
     TaskView,
 )
-from hub.services.orchestration import dispatch_task
+from hub.integrations.git_ops import PairBranchConflictError
+from hub.services.orchestration import (
+    dispatch_task,
+    prepare_pair_branch,
+    transition_after_agent_done,
+)
 from hub.services.refinement import TaskNotFoundError
 
 log = logging.getLogger("hub")
@@ -368,6 +374,73 @@ async def start_task(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def pair_start_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskPairStart | None = None,
+    *,
+    caller: str = "",
+) -> TaskView:
+    """Start an open task in pair mode: running without headless dispatch."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    if task["status"] != "open":
+        raise HTTPException(
+            400,
+            f"can only pair-start open tasks, current status: {task['status']}",
+        )
+
+    body = body or TaskPairStart()
+
+    if body.plan:
+        await repo.add_task_update(
+            db,
+            task_id,
+            task.get("assigned_agent", ""),
+            "status",
+            f"Plan: {body.plan}",
+        )
+
+    if not await repo.has_plan_updates(db, task_id):
+        raise HTTPException(
+            400,
+            "Plan required before pair-start. "
+            "Either pass 'plan' field in pair-start request or create an update "
+            "with kind='status' and content starting with 'Plan:'.",
+        )
+
+    try:
+        branch = await prepare_pair_branch(
+            db, task_id, task, branch_slug=(body.branch_slug or "").strip()
+        )
+    except PairBranchConflictError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if branch:
+        task["branch"] = branch
+
+    assigned_agent = (body.assigned_agent or "").strip()
+    if not assigned_agent:
+        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
+
+    update_fields: dict[str, Any] = {
+        "status": "running",
+        "job_id": None,
+        "assigned_agent": assigned_agent,
+    }
+    if branch:
+        update_fields["branch"] = branch
+
+    await repo.update_task(db, task_id, **update_fields)
+    await db.commit()
+    await log_activity(db, "task_pair_started", f"Task #{task_id} pair session started")
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
 async def ask_question(
     db: aiosqlite.Connection,
     task_id: int,
@@ -532,7 +605,7 @@ async def add_update(
     task_id: int,
     body: TaskUpdateCreate,
 ) -> TaskUpdateView:
-    """Add an update to a task, auto-completing pending_report tasks on done."""
+    """Add an update to a task; route done reports through shared post-done logic."""
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -540,15 +613,30 @@ async def add_update(
     update_id = await repo.add_task_update(
         db, task_id, body.agent, body.kind, body.content
     )
-    await repo.update_task(db, task_id)
 
-    if body.kind == "done" and task["status"] == "pending_report":
-        await repo.update_task(db, task_id, status="completed")
-        await log_activity(
-            db,
-            "task_completed",
-            f"Task #{task_id} completed with report from {body.agent}",
-        )
+    if body.kind == "done":
+        if task["status"] == "pending_report":
+            await repo.update_task(db, task_id, status="completed")
+            await log_activity(
+                db,
+                "task_completed",
+                f"Task #{task_id} completed with report from {body.agent}",
+            )
+        elif task["status"] == "running" and not task.get("job_id"):
+            updates_rows = await repo.get_task_updates(db, task_id)
+            updates_list = [dict(r) for r in updates_rows]
+            if any(u.get("kind") == "blocker" for u in updates_list):
+                await repo.update_task(db, task_id, status="needs_decision")
+                await log_activity(
+                    db,
+                    "task_needs_decision",
+                    f"Task #{task_id} → needs_decision (blocker in done flow)",
+                )
+            else:
+                await transition_after_agent_done(db, task, has_done=True)
+        # open + done without pair-start: keep status (AC-2)
+    else:
+        await repo.update_task(db, task_id)
 
     await db.commit()
     await log_activity(

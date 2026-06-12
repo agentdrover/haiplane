@@ -51,6 +51,7 @@ from hub.services.lifecycle import (
     delete_task_tree,
     enrich_task_view,
     force_complete_task,
+    pair_start_task,
     refresh_task,
     reject_task,
     reorder_task,
@@ -67,7 +68,9 @@ from hub.services.orchestration import (
     extract_review_verdict,
     get_breadcrumb_str,
     maybe_destroy_vast,
+    prepare_pair_branch,
     scan_text_for_verdict,
+    transition_after_agent_done,
 )
 
 __all__ = [
@@ -120,10 +123,13 @@ __all__ = [
     "list_tasks",
     "maybe_destroy_vast",
     "reorder_task",
+    "pair_start_task",
+    "prepare_pair_branch",
     "refresh_task",
     "reject_task",
     "row_to_task",
     "scan_text_for_verdict",
     "start_task",
+    "transition_after_agent_done",
     "unarchive_task",
 ]

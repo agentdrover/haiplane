@@ -149,6 +149,25 @@ async def test_approve_non_draft_returns_400(client: AsyncClient):
     assert resp.status_code == 400
 
 
+async def test_pair_start_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Pair API task"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "plan": "Plan: implement in Cursor",
+            "assigned_agent": "composer-analyst",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "running"
+    assert data["job_id"] is None
+    assert data["branch"] == f"task-{task_id}/test"
+    assert data["assigned_agent"] == "composer-analyst"
+
+
 async def test_force_complete_api(client: AsyncClient, db):
     create_resp = await client.post("/api/tasks", json={"title": "Pending report"})
     task_id = create_resp.json()["id"]

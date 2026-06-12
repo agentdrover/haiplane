@@ -267,6 +267,19 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pair_start(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {}
+    if args.plan:
+        body["plan"] = args.plan
+    if args.agent:
+        body["assigned_agent"] = args.agent
+    if getattr(args, "branch_slug", None):
+        body["branch_slug"] = args.branch_slug
+    result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_question(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "agent": args.agent or "",
@@ -941,6 +954,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_start.add_argument("--runtime", choices=["auto", "openrouter"], default=None)
     p_start.set_defaults(func=cmd_start)
+
+    p_pair_start = sub.add_parser(
+        "pair-start",
+        help="Start pair mode (running without headless dispatch)",
+    )
+    p_pair_start.add_argument("task_id", type=int)
+    p_pair_start.add_argument(
+        "--plan", default="", help="Work plan (required if no plan update exists)"
+    )
+    p_pair_start.add_argument(
+        "--agent", default="", help="Assigned agent name to record on the task"
+    )
+    p_pair_start.add_argument(
+        "--branch-slug",
+        dest="branch_slug",
+        default="",
+        help="Git branch slug (task-<id>/<slug>); default from task title",
+    )
+    p_pair_start.set_defaults(func=cmd_pair_start)
 
     # question — agent asks a question (sets needs_info)
     p_question = sub.add_parser(

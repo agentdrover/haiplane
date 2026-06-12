@@ -217,6 +217,12 @@ class TaskStart(BaseModel):
     plan: str = Field("", max_length=10000)
 
 
+class TaskPairStart(BaseModel):
+    plan: str = Field("", max_length=10000)
+    assigned_agent: str = Field("", max_length=100)
+    branch_slug: str = Field("", max_length=80)
+
+
 class TaskQuestion(BaseModel):
     agent: str = Field("", max_length=100)
     question: str = Field(..., min_length=1, max_length=10000)

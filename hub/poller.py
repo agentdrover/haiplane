@@ -93,60 +93,23 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             "Poll: task #%d — synthetic done from dispatch log",
                             task["id"],
                         )
-                if (
-                    task.get("auto_review")
-                    and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
-                    and has_done
-                ):
-                    branch = task.get("branch")
-                    if branch:
-                        await plugins.git_ops.checkout(branch)
-                        await plugins.git_ops.auto_commit(
-                            task["id"], title=task.get("title", "")
-                        )
-                        squashed = await plugins.git_ops.squash_branch(
-                            task["id"],
-                            task.get("title", ""),
-                            branch,
-                        )
-                        await plugins.git_ops.push_branch(branch, force=squashed)
-                        if not task.get("pr_number"):
-                            pr_num = await plugins.git_ops.create_pr(
-                                task["id"],
-                                task["title"],
-                                task.get("description", ""),
-                                branch,
-                            )
-                            if pr_num:
-                                await repo.update_task(db, task["id"], pr_number=pr_num)
-                                task["pr_number"] = pr_num
-                    await repo.update_task(
-                        db,
-                        task["id"],
-                        status="ci_check",
-                        exit_code=job.get("exit_code"),
-                        result_text=job.get("result_text"),
-                    )
-                    await db.commit()
+                next_status = await services.transition_after_agent_done(
+                    db,
+                    task,
+                    has_done=has_done,
+                    exit_code=job.get("exit_code"),
+                    result_text=job.get("result_text"),
+                )
+                if next_status == "ci_check":
                     _ci_pushed_at[task["id"]] = time.monotonic()
-                    log.info("Poll: task #%d → ci_check (waiting for CI)", task["id"])
-                else:
-                    next_status = "completed" if has_done else "pending_report"
-                    await repo.update_task(
-                        db,
-                        task["id"],
-                        status=next_status,
-                        exit_code=job.get("exit_code"),
-                        result_text=job.get("result_text"),
-                    )
-                    await db.commit()
-                    log.info(
-                        "Poll: task #%d → %s (exit=%s)",
-                        task["id"],
-                        next_status,
-                        job.get("exit_code"),
-                    )
-                    await services.maybe_destroy_vast(db, task)
+                log.info(
+                    "Poll: task #%d → %s (exit=%s)",
+                    task["id"],
+                    next_status,
+                    job.get("exit_code"),
+                )
+                await db.commit()
+                await services.maybe_destroy_vast(db, task)
 
             review_rows = await repo.list_review_tasks(db)
             for row in review_rows:

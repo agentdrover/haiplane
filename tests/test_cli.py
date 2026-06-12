@@ -147,6 +147,20 @@ def test_cmd_start() -> None:
     )
 
 
+def test_cmd_pair_start() -> None:
+    result = {"id": 37, "status": "running", "branch": "task-37/pair-start"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(task_id=37, plan="Plan: pair", agent="composer-analyst")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_pair_start(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/37/pair-start",
+        {"plan": "Plan: pair", "assigned_agent": "composer-analyst"},
+    )
+
+
 def test_cmd_update() -> None:
     upd = {"id": 1, "kind": "status", "content": "Done X"}
     mock_api = MagicMock(return_value=upd)

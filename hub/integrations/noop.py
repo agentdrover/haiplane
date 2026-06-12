@@ -111,6 +111,17 @@ class NoopGitOps:
     ) -> str:
         return ""
 
+    async def pair_prepare_branch(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+    ) -> str:
+        slug = branch_slug or "test"
+        return f"task-{task_id}/{slug}"
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 

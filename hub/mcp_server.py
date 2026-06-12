@@ -361,7 +361,12 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
             "content": summary,
         },
     )
-    return f"Done report #{result['id']} submitted for task #{task_id}. Task should now be completed."
+    task = await _api_get(f"/api/tasks/{task_id}")
+    status = task.get("status", "?")
+    return (
+        f"Done report #{result['id']} submitted for task #{task_id}. "
+        f"Task status: {status}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +476,43 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
     status = result.get("status", "?")
     job_id = result.get("job_id", "-")
     return f"Task #{task_id} dispatched (status: {status}, job: {job_id})."
+
+
+@mcp.tool()
+async def hub_pair_start(
+    task_id: int,
+    plan: str = "",
+    assigned_agent: str = "",
+    branch_slug: str = "",
+) -> str:
+    """Start pair mode: move an open task to running without headless dispatch.
+
+    Use this when a human works with a Cursor agent locally instead of
+    ``hub_start_task``, which always calls oc-dev-dispatch.
+
+    Args:
+        task_id: The open task ID to pair-start
+        plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
+        assigned_agent: Agent name to record on the task. Empty uses caller identity.
+        branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
+    """
+    body: dict[str, Any] = {}
+    if plan:
+        body["plan"] = plan
+    if assigned_agent:
+        body["assigned_agent"] = assigned_agent
+    if branch_slug:
+        body["branch_slug"] = branch_slug
+    result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
+    status = result.get("status", "?")
+    branch = result.get("branch") or "-"
+    agent = result.get("assigned_agent") or "-"
+    job_id = result.get("job_id")
+    job_note = "no dispatch job" if not job_id else f"job: {job_id}"
+    return (
+        f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
+        f"agent: {agent}, {job_note})."
+    )
 
 
 @mcp.tool()

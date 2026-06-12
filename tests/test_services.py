@@ -11,6 +11,7 @@ from hub.models import (
     TaskApprove,
     TaskCreate,
     TaskDecide,
+    TaskPairStart,
     TaskQuestion,
     TaskReorder,
     TaskStart,
@@ -124,6 +125,125 @@ async def test_start_task_with_prior_plan_update(db: aiosqlite.Connection):
 
     started = await services.start_task(db, tv.id)
     assert started.status.value == "running"
+
+
+async def test_pair_start_requires_plan(db: aiosqlite.Connection):
+    body = TaskCreate(title="Pair no plan")
+    tv = await services.create_task(db, body)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.pair_start_task(db, tv.id)
+    assert exc_info.value.status_code == 400
+    assert "Plan required" in str(exc_info.value.detail)
+
+
+async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    submit_mock = AsyncMock(return_value={"job_id": "must-not-run"})
+    plugins.dispatch.submit_task = submit_mock
+
+    body = TaskCreate(title="Pair task")
+    tv = await services.create_task(db, body)
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: pair in Cursor")
+    await db.commit()
+
+    started = await services.pair_start_task(
+        db,
+        tv.id,
+        TaskPairStart(assigned_agent="composer-analyst"),
+        caller="denis",
+    )
+
+    assert started.status.value == "running"
+    assert started.job_id is None
+    assert started.branch == f"task-{tv.id}/test"
+    assert started.assigned_agent == "composer-analyst"
+    submit_mock.assert_not_called()
+
+
+async def test_pair_start_uses_caller_when_agent_unset(db: aiosqlite.Connection):
+    body = TaskCreate(title="Pair caller")
+    tv = await services.create_task(db, body)
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work locally")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="cursor-dev")
+
+    assert started.status.value == "running"
+    assert started.assigned_agent == "cursor-dev"
+
+
+async def test_pair_done_from_running_completes_without_auto_review(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Pair done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-99/test")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Shipped docs"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "completed"
+
+
+async def test_pair_done_from_running_enters_ci_check_with_auto_review(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Pair CI",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-100/test")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Ready for CI"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check"
+
+
+async def test_done_from_open_without_pair_start_keeps_open(db: aiosqlite.Connection):
+    body = TaskCreate(title="Open pair legacy")
+    tv = await services.create_task(db, body)
+    await services.add_update(
+        db,
+        tv.id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Report without start"),
+    )
+    row = await repo.get_task(db, tv.id)
+    assert row["status"] == "open"
 
 
 async def test_start_task_dispatch_failure_keeps_task_recoverable(

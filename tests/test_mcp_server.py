@@ -18,6 +18,7 @@ from hub.mcp_server import (
     hub_list_tasks,
     hub_prepare_developer_task,
     hub_propose_task,
+    hub_pair_start,
     hub_refine_task,
     hub_replace_acceptance_criteria,
     hub_report_done,
@@ -160,6 +161,24 @@ async def test_hub_start_task(mock_api_post: AsyncMock) -> None:
     )
 
 
+async def test_hub_pair_start(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {
+        "status": "running",
+        "branch": "task-37/pair-start",
+        "assigned_agent": "composer-analyst",
+        "job_id": None,
+    }
+    msg = await hub_pair_start(
+        37, plan="Plan: pair work", assigned_agent="composer-analyst"
+    )
+    assert "Task #37 pair-started" in msg
+    assert "no dispatch job" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/37/pair-start",
+        {"plan": "Plan: pair work", "assigned_agent": "composer-analyst"},
+    )
+
+
 async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
     mock_api_post.return_value = {"status": "open"}
     msg = await hub_approve_task(
@@ -206,22 +225,19 @@ async def test_hub_update(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_report_done(mock_api_post: AsyncMock) -> None:
+async def test_hub_report_done(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"id": 77}
+    mock_api_get.return_value = {"id": 9, "status": "ci_check"}
     msg = await hub_report_done(
         9,
         "Changed: tests. Validation: pytest -q",
         agent="qa",
     )
     assert "Done report #77 submitted for task #9" in msg
-    call_args = mock_api_post.await_args
-    assert call_args is not None
-    assert call_args.args[0] == "/api/tasks/9/updates"
-    assert call_args.args[1] == {
-        "agent": "qa",
-        "kind": "done",
-        "content": "Changed: tests. Validation: pytest -q",
-    }
+    assert "status: ci_check" in msg
+    mock_api_get.assert_awaited_once_with("/api/tasks/9")
 
 
 # ---------------------------------------------------------------------------
