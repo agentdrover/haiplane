@@ -197,6 +197,29 @@ class TaskCreate(BaseModel):
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
 
 
+MAX_BULK_CHILD_TASKS = 20
+
+
+class BulkChildTaskItem(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    description: str = Field("", max_length=10000)
+    priority: TaskPriority = TaskPriority.medium
+
+
+class BulkChildTasksCreate(BaseModel):
+    """Atomic bulk create of child tasks under one parent."""
+
+    items: list[BulkChildTaskItem] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_BULK_CHILD_TASKS,
+    )
+    task_type: TaskType = TaskType.subtask
+    source: TaskSource = TaskSource.agent
+    agent: str = Field("", max_length=100)
+    auto_review: bool = True
+
+
 class TaskApprove(BaseModel):
     comment: str = ""
     run: bool = False

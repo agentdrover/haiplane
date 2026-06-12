@@ -13,6 +13,7 @@ from hub.mcp_server import (
     hub_answer_question,
     hub_claim_task,
     hub_create_task,
+    hub_create_subtasks,
     hub_decide_task,
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
@@ -511,6 +512,27 @@ async def test_hub_get_readiness_compact_summary(mock_api_get: AsyncMock) -> Non
     assert "has_problem_statement" in msg
     assert "Add a problem" in msg
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness")
+
+
+async def test_hub_create_subtasks_posts_bulk_payload(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = [
+        {"id": 10, "status": "draft", "title": "Sub A"},
+        {"id": 11, "status": "draft", "title": "Sub B"},
+    ]
+    items = [{"title": "Sub A"}, {"title": "Sub B", "priority": "high"}]
+    msg = await hub_create_subtasks(42, items, task_type="subtask", agent="bot")
+    assert "Created 2 subtask(s) under #42" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/subtasks",
+        {
+            "items": items,
+            "task_type": "subtask",
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
 
 
 async def test_hub_create_task_passes_owner_and_reviewer(

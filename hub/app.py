@@ -19,6 +19,7 @@ from hub import repository as repo
 from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.models import (
+    BulkChildTasksCreate,
     AcceptanceCriterion,
     ActivityItem,
     DashboardData,
@@ -179,6 +180,16 @@ async def healthz() -> str:
 @app.post("/api/tasks", response_model=TaskView)
 async def api_create_task(body: TaskCreate, request: Request):
     return await services.create_task(_db(request), body)
+
+
+@app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
+async def api_create_subtasks_bulk(
+    parent_id: int,
+    body: BulkChildTasksCreate,
+    request: Request,
+):
+    """Atomically create multiple child tasks under ``parent_id``."""
+    return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 
 @app.get("/api/tasks", response_model=list[TaskView])

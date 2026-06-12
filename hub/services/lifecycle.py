@@ -16,6 +16,7 @@ from hub import repository as repo
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.models import (
+    BulkChildTasksCreate,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -173,6 +174,78 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
 
     row = await repo.get_task(db, task_id)
     return row_to_task(row)  # type: ignore[arg-type]
+
+
+async def create_subtasks_bulk(
+    db: aiosqlite.Connection,
+    parent_id: int,
+    body: BulkChildTasksCreate,
+) -> list[TaskView]:
+    """Create multiple child tasks under ``parent_id`` in one transaction."""
+    if body.task_type in (TaskType.epic, TaskType.feature):
+        raise HTTPException(
+            400,
+            "bulk create supports task_type task or subtask only",
+        )
+
+    err = await db_module.validate_hierarchy(db, body.task_type.value, parent_id)
+    if err:
+        raise HTTPException(400, err)
+
+    if await repo.get_task(db, parent_id) is None:
+        raise HTTPException(404, "parent task not found")
+
+    if body.source == TaskSource.agent:
+        initial_status = "draft"
+    else:
+        initial_status = "open"
+
+    auto_review = body.auto_review
+    if body.task_type == TaskType.subtask:
+        auto_review = False
+
+    created_ids: list[int] = []
+    await db.execute("SAVEPOINT bulk_child_tasks")
+    try:
+        for idx, item in enumerate(body.items):
+            payload = TaskCreate(
+                title=item.title,
+                description=item.description,
+                task_type=body.task_type,
+                parent_id=parent_id,
+                priority=item.priority,
+                source=body.source,
+                agent=body.agent,
+                auto_review=auto_review,
+                run_immediately=False,
+            )
+            task_id = await repo.create_task_full(
+                db,
+                payload,
+                status=initial_status,
+                position=idx,
+            )
+            created_ids.append(task_id)
+    except Exception:
+        await db.execute("ROLLBACK TO SAVEPOINT bulk_child_tasks")
+        await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
+        raise
+    else:
+        await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
+        await db.commit()
+
+    titles = ", ".join(f"#{tid}" for tid in created_ids)
+    await log_activity(
+        db,
+        "tasks_bulk_created",
+        f"{body.task_type.value}: {len(created_ids)} under #{parent_id} ({titles})",
+    )
+
+    views: list[TaskView] = []
+    for task_id in created_ids:
+        row = await repo.get_task(db, task_id)
+        views.append(row_to_task(row))  # type: ignore[arg-type]
+    return views
 
 
 async def approve_task(

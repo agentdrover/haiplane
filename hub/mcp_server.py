@@ -237,6 +237,41 @@ async def hub_create_task(
 
 
 @mcp.tool()
+async def hub_create_subtasks(
+    parent_id: int,
+    items: list[dict[str, Any]],
+    task_type: str = "subtask",
+    source: str = "agent",
+    agent: str = "",
+) -> str:
+    """Create multiple child tasks under one parent in a single atomic call.
+
+    Args:
+        parent_id: Parent task ID (must match hierarchy rules for task_type).
+        items: List of dicts with title, optional description and priority.
+        task_type: task or subtask (default subtask).
+        source: agent (draft) or human (open).
+        agent: Assigned agent name when source is agent.
+    """
+    if not items:
+        return "Nothing to create: items list is empty."
+    body: dict[str, Any] = {
+        "items": items,
+        "task_type": task_type,
+        "source": source,
+        "agent": agent,
+    }
+    created = await _api_post(f"/api/tasks/{parent_id}/subtasks", body)
+    if not created:
+        return f"No subtasks created under #{parent_id}."
+    lines = [
+        f"Created {len(created)} {task_type}(s) under #{parent_id}:",
+        *[f"  #{t['id']} [{t['status']}] {t['title']}" for t in created],
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def hub_list_tasks(
     status: str = "",
     task_type: str = "",

@@ -7,16 +7,21 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub import services
 from hub.models import (
+    BulkChildTaskItem,
+    BulkChildTasksCreate,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
     TaskCreate,
     TaskDecide,
     TaskPairStart,
+    TaskPriority,
     TaskQuestion,
     TaskRelease,
     TaskReorder,
+    TaskSource,
     TaskStart,
+    TaskType,
     TaskUpdateCreate,
 )
 
@@ -27,6 +32,40 @@ async def test_create_task(db: aiosqlite.Connection):
     assert tv.id > 0
     assert tv.title == "Service test"
     assert tv.status.value == "open"
+
+
+async def test_create_subtasks_bulk(db: aiosqlite.Connection):
+    parent = TaskCreate(title="Parent", source=TaskSource.human)
+    parent_view = await services.create_task(db, parent)
+    body = BulkChildTasksCreate(
+        items=[
+            BulkChildTaskItem(title="Child 1"),
+            BulkChildTaskItem(title="Child 2", priority=TaskPriority.high),
+        ],
+        source=TaskSource.agent,
+        agent="bot",
+    )
+    created = await services.create_subtasks_bulk(db, parent_view.id, body)
+    assert len(created) == 2
+    assert all(t.task_type.value == "subtask" for t in created)
+    assert all(t.status.value == "draft" for t in created)
+    assert created[1].priority.value == "high"
+
+
+async def test_create_subtasks_bulk_invalid_hierarchy(db: aiosqlite.Connection):
+    parent = TaskCreate(title="Parent", source=TaskSource.human)
+    parent_view = await services.create_task(db, parent)
+    sub = TaskCreate(
+        title="Sub",
+        task_type=TaskType.subtask,
+        parent_id=parent_view.id,
+        source=TaskSource.human,
+    )
+    sub_view = await services.create_task(db, sub)
+    body = BulkChildTasksCreate(items=[BulkChildTaskItem(title="Nope")])
+    with pytest.raises(HTTPException) as exc:
+        await services.create_subtasks_bulk(db, sub_view.id, body)
+    assert exc.value.status_code == 400
 
 
 async def test_create_epic(db: aiosqlite.Connection):

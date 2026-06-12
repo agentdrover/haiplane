@@ -328,6 +328,70 @@ async def test_create_task_with_type_api(client: AsyncClient):
     assert data["status"] == "open"
 
 
+async def test_create_subtasks_bulk_api(client: AsyncClient):
+    parent = await client.post(
+        "/api/tasks",
+        json={"title": "Parent task", "task_type": "task"},
+    )
+    assert parent.status_code == 200
+    parent_id = parent.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={
+            "items": [
+                {"title": "Sub A", "description": "first"},
+                {"title": "Sub B", "priority": "high"},
+            ],
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data) == 2
+    assert all(t["task_type"] == "subtask" for t in data)
+    assert all(t["status"] == "draft" for t in data)
+    assert all(t["parent_id"] == parent_id for t in data)
+    assert data[0]["title"] == "Sub A"
+    assert data[1]["priority"] == "high"
+
+
+async def test_create_subtasks_bulk_rejects_invalid_parent(client: AsyncClient):
+    leaf = await client.post(
+        "/api/tasks",
+        json={"title": "Leaf", "task_type": "task"},
+    )
+    parent_id = leaf.json()["id"]
+    sub = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Sub",
+            "task_type": "subtask",
+            "parent_id": parent_id,
+        },
+    )
+    assert sub.status_code == 200
+    sub_id = sub.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{sub_id}/subtasks",
+        json={"items": [{"title": "Nope"}]},
+    )
+    assert resp.status_code == 400
+
+
+async def test_create_subtasks_bulk_rejects_too_many_items(client: AsyncClient):
+    parent = await client.post("/api/tasks", json={"title": "Parent"})
+    parent_id = parent.json()["id"]
+    items = [{"title": f"Item {i}"} for i in range(21)]
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={"items": items},
+    )
+    assert resp.status_code == 422
+
+
 async def test_task_tree_api(client: AsyncClient):
     epic_resp = await client.post(
         "/api/tasks",

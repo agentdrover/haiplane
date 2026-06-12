@@ -512,6 +512,33 @@ def cmd_refine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_subtasks_bulk(args: argparse.Namespace) -> int:
+    payload = _load_payload_file(args.from_file)
+    if not isinstance(payload, dict):
+        print(
+            f"--from-file must contain a JSON/YAML object, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    if "items" not in payload or not isinstance(payload["items"], list):
+        print("--from-file must include an items array.", file=sys.stderr)
+        return 2
+    if getattr(args, "task_type", None):
+        payload["task_type"] = args.task_type
+    elif "task_type" not in payload:
+        payload["task_type"] = "subtask"
+    if getattr(args, "source", None):
+        payload["source"] = args.source
+    elif "source" not in payload:
+        payload["source"] = "agent"
+    if getattr(args, "agent", None):
+        payload["agent"] = args.agent
+    result = _api("POST", f"/api/tasks/{args.parent_id}/subtasks", payload)
+    for task in result:
+        _print_task_short(task)
+    return 0
+
+
 # --- ac --------------------------------------------------------------------
 
 
@@ -920,6 +947,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_subtask.add_argument("--owner", default="", help="Human owner")
     p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
+
+    p_subtasks_bulk = sub.add_parser(
+        "subtasks-bulk",
+        help="Create multiple child tasks under a parent atomically",
+    )
+    p_subtasks_bulk.add_argument("parent_id", type=int)
+    p_subtasks_bulk.add_argument(
+        "--from-file",
+        required=True,
+        help="JSON/YAML with items: [{title, description?, priority?}, ...]",
+    )
+    p_subtasks_bulk.add_argument(
+        "--task-type",
+        dest="task_type",
+        choices=["task", "subtask"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument(
+        "--source",
+        choices=["agent", "human"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument("--agent", default="")
+    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
 
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
