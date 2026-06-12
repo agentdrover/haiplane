@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw Hub — task workflow (pair git policy)</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --warn: #d29922;
+      --ok: #3fb950;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.35rem; }
+    h3 { font-size: 1rem; color: var(--accent); margin-top: 1.25rem; }
+    p, li { color: var(--muted); }
+    strong, b { color: var(--text); }
+    a { color: var(--accent); }
+    code {
+      background: var(--surface);
+      padding: 0.1em 0.35em;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      padding: 0.15em 0.5em;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .badge.ok { background: #23863633; color: var(--ok); }
+    .badge.warn { background: #9e6a0333; color: var(--warn); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      font-size: 0.9rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 0.5rem 0.65rem;
+      text-align: left;
+    }
+    th { background: var(--surface); color: var(--text); }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.1rem;
+      margin: 1rem 0;
+    }
+    .panel.warn { border-color: #9e6a0355; }
+    ol.checklist li { margin: 0.35rem 0; }
+  </style>
+</head>
+<body>
+  <h1>Task workflow — Pair path B</h1>
+  <p>Краткая схема для Cursor pair mode. Полный lifecycle: <a href="software-development-workflow.md">software-development-workflow.md</a>.</p>
+
+  <h2>Два пути после approve</h2>
+  <table>
+    <thead>
+      <tr><th>Путь</th><th>Старт</th><th>Кто пишет код</th><th><code>job_id</code></th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>A — headless</strong></td>
+        <td><code>hub_start_task</code></td>
+        <td><code>oc-dev-dispatch</code> на сервере</td>
+        <td>есть</td>
+      </tr>
+      <tr>
+        <td><strong>B — pair</strong></td>
+        <td><code>hub_pair_start</code> <span class="badge ok">#37</span></td>
+        <td>человек + Cursor-агент</td>
+        <td>нет</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="pair-git-policy">Pair mode: git policy</h2>
+  <p>Gap, закрытый задачей <strong>#43</strong>: где живёт git, кто push, что делает hub при <code>hub_pair_start</code>.</p>
+
+  <h3>Сценарий 1 — Local clone (hub и Cursor на одном каталоге)</h3>
+  <div class="panel warn">
+    <p><span class="badge warn">риск</span> <code>OPENCLAW_WORKSPACE_REPO</code> = каталог в Cursor. При pair-start hub вызывает <code>create_branch</code>: checkout <code>main</code>, при dirty worktree — <code>git clean -fd</code>. <strong>Незакоммиченные файлы могут быть удалены.</strong></p>
+  </div>
+  <ol class="checklist">
+    <li>Commit или stash <em>до</em> <code>hub_pair_start</code>.</li>
+    <li>Plan: update или поле <code>plan</code> в pair-start.</li>
+    <li><code>hub_pair_start(task_id, assigned_agent=...)</code> → статус <code>running</code>, в задаче поле <code>branch</code>.</li>
+    <li>Сверить <code>git branch</code> с <code>branch</code> в хабе; при расхождении — merge/checkout вручную.</li>
+    <li>Коммиты в <code>task-&lt;id&gt;/&lt;slug&gt;</code>, push, PR в <code>develop</code>.</li>
+    <li><code>hub_report_done</code>; human gate / CI — см. gap #38.</li>
+  </ol>
+
+  <h3>Сценарий 2 — Server workspace (hub на agenthai, Cursor на ноутбуке)</h3>
+  <p><code>OPENCLAW_WORKSPACE_REPO</code> на сервере; pair-start создаёт branch <em>там</em>. Локальный Cursor не переключается сам.</p>
+  <ol class="checklist">
+    <li>Локально: <code>git fetch</code>, <code>git checkout -b task-&lt;id&gt;/&lt;slug&gt;</code> (имя из задачи в hub).</li>
+    <li>Работа и коммиты на ноутбуке.</li>
+    <li><code>git push -u origin HEAD</code> — CI видит код только после push.</li>
+    <li>PR → review → merge по <a href="repository-rules.md">repository-rules.md</a>.</li>
+  </ol>
+
+  <h3>Что hub не делает в pair mode</h3>
+  <ul>
+    <li>Не вызывает <code>oc-dev-dispatch</code> (<code>job_id</code> остаётся пустым).</li>
+    <li>Не синхронизирует автоматически server clone ↔ laptop (out of scope #43).</li>
+    <li>Не заменяет push/PR человека или агента в Cursor.</li>
+  </ul>
+
+  <h2>Ссылки</h2>
+  <ul>
+    <li><a href="software-development-workflow.md#pair-mode-git-policy">Pair mode: git policy (markdown)</a></li>
+    <li><a href="workspace-safety-policy.md">Workspace safety policy</a> — § Pair mode P1–P4</li>
+    <li><a href="agent-deploy-runbook.md">Agent deploy runbook</a> — §9 локальный hub и <code>OPENCLAW_WORKSPACE_REPO</code></li>
+  </ul>
+</body>
+</html>
