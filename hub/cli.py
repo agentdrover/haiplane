@@ -983,8 +983,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_question.add_argument("--agent", default="", help="Agent name")
     p_question.set_defaults(func=cmd_question)
 
-    # answer — human answers a question (re-dispatches by default)
-    p_answer = sub.add_parser("answer", help="Answer agent question and re-dispatch")
+    # answer — human answers a question (re-dispatches headless by default)
+    p_answer = sub.add_parser(
+        "answer",
+        help="Answer agent question; pair tasks resume without dispatch",
+    )
     p_answer.add_argument("task_id", type=int)
     p_answer.add_argument("--message", required=True, help="The answer text")
     p_answer.add_argument(

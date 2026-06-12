@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenClaw Hub — task workflow (pair git policy)</title>
+  <title>OpenClaw Hub — task workflow (pair path B)</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -46,6 +46,9 @@
     }
     .badge.ok { background: #23863633; color: var(--ok); }
     .badge.warn { background: #9e6a0333; color: var(--warn); }
+    .badge.pending { background: #58a6ff33; color: var(--accent); }
+    .badge.todo { background: #30363d; color: var(--muted); }
+    .status-meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -73,6 +76,65 @@
   <h1>Task workflow — Pair path B</h1>
   <p>Краткая схема для Cursor pair mode. Полный lifecycle: <a href="software-development-workflow.md">software-development-workflow.md</a>.</p>
 
+  <h2 id="gap-status">Статус gaps (группа #36)</h2>
+  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · local hub <code>127.0.0.1:8080</code></p>
+  <table>
+    <thead>
+      <tr><th>Gap</th><th>Task</th><th>Код</th><th>Hub</th><th>PR</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Pair-start (<code>hub_pair_start</code>)</td>
+        <td>#37</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge warn">needs_decision</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/7">#7 merged</a></td>
+      </tr>
+      <tr>
+        <td>Done → CI (<code>hub_report_done</code>)</td>
+        <td>#38</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/7">#7 merged</a></td>
+      </tr>
+      <tr>
+        <td>Git policy path B</td>
+        <td>#43</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/6">#6 merged</a></td>
+      </tr>
+      <tr>
+        <td>B7 — ask из <code>open</code></td>
+        <td>#39</td>
+        <td><span class="badge pending">PR #9</span></td>
+        <td><span class="badge pending">open</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 open</a></td>
+      </tr>
+      <tr>
+        <td>B8 — answer без dispatch</td>
+        <td>#40</td>
+        <td><span class="badge pending">PR #9</span></td>
+        <td><span class="badge pending">open</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 open</a></td>
+      </tr>
+      <tr>
+        <td>Claim / release Cursor-сессии</td>
+        <td>#41</td>
+        <td><span class="badge todo">draft</span></td>
+        <td><span class="badge todo">draft</span></td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td><code>hub_report_done</code> MCP message</td>
+        <td>#44</td>
+        <td><span class="badge todo">draft</span></td>
+        <td><span class="badge todo">draft</span></td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+
   <h2>Два пути после approve</h2>
   <table>
     <thead>
@@ -87,7 +149,7 @@
       </tr>
       <tr>
         <td><strong>B — pair</strong></td>
-        <td><code>hub_pair_start</code> <span class="badge ok">#37</span></td>
+        <td><code>hub_pair_start</code> <span class="badge ok">#37 ✓</span></td>
         <td>человек + Cursor-агент</td>
         <td>нет</td>
       </tr>
@@ -95,11 +157,11 @@
   </table>
 
   <h2 id="pair-git-policy">Pair mode: git policy</h2>
-  <p>Gap, закрытый задачей <strong>#43</strong>: где живёт git, кто push, что делает hub при <code>hub_pair_start</code>.</p>
+  <p>Gap <strong>#43</strong> <span class="badge ok">закрыт</span>: где живёт git, кто push, что делает hub при <code>hub_pair_start</code>.</p>
 
   <h3>Сценарий 1 — Local clone (hub и Cursor на одном каталоге)</h3>
   <div class="panel warn">
-    <p><span class="badge warn">риск</span> <code>OPENCLAW_WORKSPACE_REPO</code> = каталог в Cursor. При pair-start hub вызывает <code>create_branch</code>: checkout <code>main</code>, при dirty worktree — <code>git clean -fd</code>. <strong>Незакоммиченные файлы могут быть удалены.</strong></p>
+    <p><span class="badge warn">риск</span> <code>OPENCLAW_WORKSPACE_REPO</code> = каталог в Cursor. При dirty worktree <code>hub_pair_start</code> вернёт 422 — commit/stash до старта. См. <code>pair_prepare_branch</code> в коде.</p>
   </div>
   <ol class="checklist">
     <li>Commit или stash <em>до</em> <code>hub_pair_start</code>.</li>
@@ -107,7 +169,7 @@
     <li><code>hub_pair_start(task_id, assigned_agent=...)</code> → статус <code>running</code>, в задаче поле <code>branch</code>.</li>
     <li>Сверить <code>git branch</code> с <code>branch</code> в хабе; при расхождении — merge/checkout вручную.</li>
     <li>Коммиты в <code>task-&lt;id&gt;/&lt;slug&gt;</code>, push, PR в <code>develop</code>.</li>
-    <li><code>hub_report_done</code>; human gate / CI — см. gap #38.</li>
+    <li><code>hub_report_done</code>; human gate / CI <span class="badge ok">#38 ✓</span>.</li>
   </ol>
 
   <h3>Сценарий 2 — Server workspace (hub на agenthai, Cursor на ноутбуке)</h3>
@@ -125,6 +187,25 @@
     <li>Не синхронизирует автоматически server clone ↔ laptop (out of scope #43).</li>
     <li>Не заменяет push/PR человека или агента в Cursor.</li>
   </ul>
+
+  <h2 id="pair-ask-question">Pair: вопрос до pair-start (B7)</h2>
+  <p>Gap <strong>#39</strong> <span class="badge pending">PR #9</span>: агент в Cursor может уточнить требования, пока задача ещё в <code>open</code>.</p>
+  <ol class="checklist">
+    <li>После approve задача в <code>open</code>, <code>job_id</code> пустой.</li>
+    <li><code>hub_ask_question(task_id, question=...)</code> → <code>needs_info</code> (не 400).</li>
+    <li>Человек: <code>hub_answer_question</code> — <code>resume=true</code> без dispatch <span class="badge pending">#40 PR #9</span>.</li>
+    <li>Далее <code>hub_pair_start</code> или работа по обновлённому scope.</li>
+  </ol>
+  <p>На headless <code>running</code> с <code>job_id</code> поведение <code>hub_ask_question</code> без изменений.</p>
+
+  <h2 id="pair-answer-question">Pair: ответ без headless dispatch (B8)</h2>
+  <p>Gap <strong>#40</strong> <span class="badge pending">PR #9</span>: после <code>needs_info</code> pair-задача не уходит в <code>oc-dev-dispatch</code>.</p>
+  <ol class="checklist">
+    <li>Pair = пустой <code>job_id</code> (до или после <code>hub_pair_start</code>).</li>
+    <li><code>hub_answer_question(..., resume=true)</code> → <code>open</code> (до pair-start) или <code>running</code> (если есть <code>branch</code>), без <code>job_id</code>.</li>
+    <li><code>resume=false</code> → только answer update, статус <code>open</code>.</li>
+    <li>Headless с <code>job_id</code>: <code>resume=true</code> по-прежнему re-dispatch.</li>
+  </ol>
 
   <h2>Ссылки</h2>
   <ul>

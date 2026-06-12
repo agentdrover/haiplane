@@ -149,6 +149,40 @@ async def test_approve_non_draft_returns_400(client: AsyncClient):
     assert resp.status_code == 400
 
 
+async def test_ask_question_from_open_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Open pair task"})
+    task_id = create_resp.json()["id"]
+    assert create_resp.json()["status"] == "open"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/question",
+        json={"agent": "composer", "question": "Which API surface first?"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_info"
+    assert any(u["kind"] == "question" for u in data["updates"])
+
+
+async def test_answer_question_pair_resume_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Pair Q&A API"})
+    task_id = create_resp.json()["id"]
+
+    await client.post(
+        f"/api/tasks/{task_id}/question",
+        json={"agent": "composer", "question": "Scope?"},
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/answer",
+        json={"answer": "REST first", "resume": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "open"
+    assert data["job_id"] is None
+
+
 async def test_pair_start_api(client: AsyncClient):
     create_resp = await client.post("/api/tasks", json={"title": "Pair API task"})
     task_id = create_resp.json()["id"]

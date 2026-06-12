@@ -9,6 +9,8 @@ from hub.mcp_server import (
     hub_add_acceptance_criterion,
     hub_add_risk,
     hub_approve_task,
+    hub_ask_question,
+    hub_answer_question,
     hub_create_task,
     hub_decide_task,
     hub_delete_acceptance_criterion,
@@ -176,6 +178,26 @@ async def test_hub_pair_start(mock_api_post: AsyncMock) -> None:
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/37/pair-start",
         {"plan": "Plan: pair work", "assigned_agent": "composer-analyst"},
+    )
+
+
+async def test_hub_ask_question(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "needs_info"}
+    msg = await hub_ask_question(39, "Which scope first?", agent="composer")
+    assert "needs_info" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/39/question",
+        {"agent": "composer", "question": "Which scope first?"},
+    )
+
+
+async def test_hub_answer_question(mock_api_post: AsyncMock) -> None:
+    mock_api_post.return_value = {"status": "open", "job_id": None}
+    msg = await hub_answer_question(40, "Use REST", resume=True)
+    assert "status: open" in msg
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/40/answer",
+        {"answer": "Use REST", "resume": True},
     )
 
 

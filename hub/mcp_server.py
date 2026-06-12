@@ -583,10 +583,14 @@ async def hub_delete_task(task_id: int) -> str:
 
 @mcp.tool()
 async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
-    """Agent asks a clarifying question on a running task. Task pauses until human answers.
+    """Agent asks a clarifying question. Task moves to needs_info until human answers.
+
+    Allowed when the task is ``running``, or ``open`` with no ``job_id`` (pair path
+    before ``hub_pair_start``). Headless ``running`` tasks with a ``job_id`` are
+    unchanged.
 
     Args:
-        task_id: The running task ID
+        task_id: The task ID
         question: The question text
         agent: Name of the agent asking
     """
@@ -602,12 +606,16 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
 
 @mcp.tool()
 async def hub_answer_question(task_id: int, answer: str, resume: bool = True) -> str:
-    """Human answers agent's question. By default re-dispatches the task.
+    """Human answers agent's question on a needs_info task.
+
+    For pair tasks (no ``job_id``), ``resume=true`` returns to ``open`` or ``running``
+    without headless dispatch. Headless tasks with a ``job_id`` re-dispatch when
+    ``resume=true``.
 
     Args:
         task_id: The needs_info task ID
         answer: The answer text
-        resume: If True, re-dispatch the task with context. If False, just save the answer.
+        resume: If True, resume work after the answer. Pair: no dispatch; headless: re-dispatch.
     """
     result = await _api_post(
         f"/api/tasks/{task_id}/answer",

@@ -441,6 +441,16 @@ async def pair_start_task(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+def _can_ask_question(task: dict) -> bool:
+    """Pair agents may ask from ``open`` (pre pair-start) or ``running``."""
+    status = task["status"]
+    if status == "running":
+        return True
+    if status == "open" and not task.get("job_id"):
+        return True
+    return False
+
+
 async def ask_question(
     db: aiosqlite.Connection,
     task_id: int,
@@ -451,10 +461,11 @@ async def ask_question(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
-    if task["status"] != "running":
+    if not _can_ask_question(task):
         raise HTTPException(
             400,
-            f"can only ask questions on running tasks, current status: {task['status']}",
+            "can only ask questions on running tasks or open pair tasks "
+            f"(no job_id), current status: {task['status']}",
         )
 
     await repo.add_task_update(db, task_id, body.agent, "question", body.question)
@@ -465,6 +476,18 @@ async def ask_question(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+def _is_pair_task(task: dict) -> bool:
+    """Pair tasks have no headless dispatch ``job_id``."""
+    return not task.get("job_id")
+
+
+def _pair_resume_status(task: dict) -> str:
+    """After needs_info, return to ``running`` if pair-start ran, else ``open``."""
+    if task.get("branch"):
+        return "running"
+    return "open"
 
 
 async def answer_question(
@@ -487,13 +510,23 @@ async def answer_question(
     await db.commit()
 
     if body.resume:
-        row = await repo.get_task(db, task_id)
-        await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
-        await log_activity(
-            db,
-            "task_answered",
-            f"Task #{task_id}: answered and re-dispatched",
-        )
+        if _is_pair_task(task):
+            resume_status = _pair_resume_status(task)
+            await repo.update_task(db, task_id, status=resume_status, job_id=None)
+            await db.commit()
+            await log_activity(
+                db,
+                "task_answered",
+                f"Task #{task_id}: answered, pair resumed to {resume_status}",
+            )
+        else:
+            row = await repo.get_task(db, task_id)
+            await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+            await log_activity(
+                db,
+                "task_answered",
+                f"Task #{task_id}: answered and re-dispatched",
+            )
     else:
         await repo.update_task(db, task_id, status="open")
         await db.commit()
