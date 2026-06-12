@@ -29,16 +29,6 @@
                 <input type="password" id="password" name="password" autocomplete="current-password">
                 <button type="submit">Sign in</button>
             </form>
-            <details class="login-legacy">
-                <summary>Sign in with token (legacy)</summary>
-                <form method="post" action="/login" class="login-form login-form--legacy">
-                    <input type="hidden" name="next" value="{{ next or '/' }}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <label for="token">Token</label>
-                    <input type="password" id="token" name="token" autocomplete="off">
-                    <button type="submit">Sign in with token</button>
-                </form>
-            </details>
         </div>
     </section>
 </main>
