@@ -1346,11 +1346,15 @@ async def hub_refine_task(
     review_checklist: list[str] | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    acceptance_criteria: list[dict[str, Any]] | None = None,
+    risks: list[dict[str, Any]] | None = None,
 ) -> str:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written. Omit a parameter to leave the
     existing value untouched. Lists fully replace the existing list.
+    ``acceptance_criteria`` and ``risks`` mirror POST /api/tasks/{id}/refine:
+    AC list replaces all criteria; risks list replaces the JSON risks column.
 
     Args:
         task_id: Task to refine.
@@ -1374,6 +1378,8 @@ async def hub_refine_task(
         review_checklist: Reviewer checklist — what to verify in diff (REPLACES).
         human_owner: Person who owns / is accountable for this task.
         human_reviewer: Person who will review and accept the result.
+        acceptance_criteria: Full AC replacement list (same shape as REST refine).
+        risks: Full risks list replacement (same shape as REST refine / TaskRisk).
     """
     body: dict[str, Any] = {}
     for key, val in (
@@ -1400,10 +1406,14 @@ async def hub_refine_task(
     ):
         if val is not None:
             body[key] = val
+    if acceptance_criteria is not None:
+        body["acceptance_criteria"] = acceptance_criteria
+    if risks is not None:
+        body["risks"] = risks
     if not body:
         return (
-            "Nothing to refine: pass at least one structured field. "
-            "Use hub_replace_acceptance_criteria for AC changes."
+            "Nothing to refine: pass at least one structured field, "
+            "acceptance_criteria, or risks."
         )
     result = await _api_post(f"/api/tasks/{task_id}/refine", body)
     cols = result.get("updated_columns") or {}

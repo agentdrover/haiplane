@@ -566,6 +566,34 @@ async def test_hub_refine_task_passes_title(
     )
 
 
+async def test_hub_refine_task_passes_acceptance_criteria_and_risks(
+    mock_api_post: AsyncMock,
+) -> None:
+    ac = [
+        {
+            "id": "AC-1",
+            "given": "Task open",
+            "when": "refine with AC",
+            "then": "criteria stored",
+            "verifiable_by": "test",
+        }
+    ]
+    risks = [
+        {
+            "kind": "security",
+            "severity": "low",
+            "description": "Agents can replace risks",
+            "mitigation": "Audit updates",
+        }
+    ]
+    mock_api_post.return_value = {"updated_columns": ["risks"], "ac_count": 1}
+    await hub_refine_task(42, acceptance_criteria=ac, risks=risks)
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"acceptance_criteria": ac, "risks": risks},
+    )
+
+
 async def test_hub_propose_task_passes_owner_and_reviewer(
     mock_api_post: AsyncMock,
 ) -> None:
