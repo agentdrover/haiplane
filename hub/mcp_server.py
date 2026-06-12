@@ -1326,6 +1326,7 @@ async def hub_prepare_developer_task(
 @mcp.tool()
 async def hub_refine_task(
     task_id: int,
+    title: str | None = None,
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -1353,6 +1354,7 @@ async def hub_refine_task(
 
     Args:
         task_id: Task to refine.
+        title: New task title (1–500 chars). Omit to leave unchanged.
         work_type: feature | bug | refactor | chore | docs | spike | incident
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
@@ -1375,6 +1377,7 @@ async def hub_refine_task(
     """
     body: dict[str, Any] = {}
     for key, val in (
+        ("title", title),
         ("work_type", work_type),
         ("class_of_service", class_of_service),
         ("size", size),

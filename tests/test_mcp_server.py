@@ -555,6 +555,17 @@ async def test_hub_refine_task_passes_owner_and_reviewer(
     )
 
 
+async def test_hub_refine_task_passes_title(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = {"title": "New title"}
+    await hub_refine_task(42, title="New title")
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"title": "New title"},
+    )
+
+
 async def test_hub_propose_task_passes_owner_and_reviewer(
     mock_api_post: AsyncMock,
 ) -> None:

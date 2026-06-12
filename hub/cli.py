@@ -438,6 +438,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 # wasn't given at all, we don't include the key in the payload, and the
 # field on the server stays untouched.
 _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
+    ("title", "title"),
     ("work_type", "work_type"),
     ("class_of_service", "class_of_service"),
     ("size", "size"),
@@ -1178,6 +1179,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refine a task: PATCH structured fields (work_type, scope, value, ...)",
     )
     p_refine.add_argument("task_id", type=int)
+    p_refine.add_argument(
+        "--title",
+        dest="title",
+        default=None,
+        help="New task title",
+    )
     p_refine.add_argument(
         "--from-file",
         dest="from_file",

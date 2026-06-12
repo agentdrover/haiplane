@@ -304,6 +304,7 @@ class TaskRefine(BaseModel):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
 
+    title: str | None = Field(default=None, min_length=1, max_length=500)
     work_type: WorkType | None = None
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
