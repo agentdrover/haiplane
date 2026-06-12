@@ -79,6 +79,35 @@ async def test_inbox_partial(client: AsyncClient):
     resp = await client.get("/partials/inbox")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
+    assert "inbox-filter-bar" in resp.text
+
+
+async def test_inbox_partial_mine_filter(client: AsyncClient):
+    await client.post(
+        "/api/tasks",
+        json={
+            "title": "Alice inbox draft",
+            "source": "agent",
+            "agent": "bot",
+            "human_owner": "alice",
+        },
+    )
+    await client.post(
+        "/api/tasks",
+        json={
+            "title": "Bob inbox draft",
+            "source": "agent",
+            "agent": "bot",
+            "human_owner": "bob",
+        },
+    )
+
+    resp = await client.get("/partials/inbox", params={"mine": "alice"})
+    assert resp.status_code == 200
+    assert "Alice inbox draft" in resp.text
+    assert "Bob inbox draft" not in resp.text
+    assert 'name="mine"' in resp.text
+    assert 'setAttribute("hx-get", "/partials/inbox?mine=alice")' in resp.text
 
 
 async def test_inbox_proposals_render_as_collapsible_details(client: AsyncClient):

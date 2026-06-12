@@ -190,6 +190,8 @@ async def api_list_tasks(
     parent_id: int | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = Query(default=None, description="Filter owner OR claim holder"),
     limit: int = Query(default=50, le=200),
     include_archived: bool = Query(default=False, alias="include_archived"),
 ):
@@ -201,6 +203,8 @@ async def api_list_tasks(
         parent_id=parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
+        claimed_by=claimed_by,
+        mine=mine,
         limit=limit,
         include_archived=include_archived,
     )

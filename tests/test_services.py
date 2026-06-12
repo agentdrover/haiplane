@@ -845,6 +845,72 @@ async def test_get_inbox_data(db: aiosqlite.Connection):
     assert "pending_reports" in inbox
 
 
+async def test_get_inbox_data_filters_by_mine(db: aiosqlite.Connection):
+    alice_draft = await repo.create_task(
+        db,
+        title="Alice draft",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, alice_draft, human_owner="alice")
+
+    bob_draft = await repo.create_task(
+        db,
+        title="Bob draft",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, bob_draft, human_owner="bob")
+
+    claimed = await repo.create_task(
+        db,
+        title="Claimed by alice",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        claimed,
+        human_owner="bob",
+        claimed_by="alice",
+    )
+    await db.commit()
+
+    all_inbox = await services.get_inbox_data(db)
+    assert len(all_inbox["drafts"]) >= 2
+
+    mine = await services.get_inbox_data(db, mine="alice")
+    draft_ids = {t.id for t in mine["drafts"]}
+    decision_ids = {t.id for t in mine["decisions"]}
+    assert alice_draft in draft_ids
+    assert bob_draft not in draft_ids
+    assert claimed in decision_ids
+
+
 async def test_list_tasks_with_filters(db: aiosqlite.Connection):
     await repo.create_task(
         db,

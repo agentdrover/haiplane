@@ -291,8 +291,18 @@ async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLRespon
 
 
 @router.get("/partials/inbox", response_class=HTMLResponse)
-async def web_partial_inbox(request: Request):
-    inbox = await services.get_inbox_data(_db(request))
+async def web_partial_inbox(
+    request: Request,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+):
+    inbox = await services.get_inbox_data(
+        _db(request),
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+    )
     inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
@@ -338,6 +348,8 @@ async def web_tasks_list_partial(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
     analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
@@ -352,6 +364,8 @@ async def web_tasks_list_partial(
         parent_id=parsed_parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
+        claimed_by=claimed_by,
+        mine=mine,
         limit=limit,
     )
     tasks, ready_by_id = await _apply_analyst_ready_filter(

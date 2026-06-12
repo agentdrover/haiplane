@@ -533,6 +533,16 @@ async def test_hub_list_tasks_passes_owner_and_reviewer_filters(
     )
 
 
+async def test_hub_list_tasks_passes_claimed_by_and_mine_filters(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.return_value = []
+    await hub_list_tasks(claimed_by="composer", mine="alice")
+    mock_api_get.assert_awaited_once_with(
+        "/api/tasks?limit=20&claimed_by=composer&mine=alice"
+    )
+
+
 async def test_hub_refine_task_passes_owner_and_reviewer(
     mock_api_post: AsyncMock,
 ) -> None:

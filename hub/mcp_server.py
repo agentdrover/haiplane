@@ -243,6 +243,8 @@ async def hub_list_tasks(
     parent_id: int | None = None,
     human_owner: str = "",
     human_reviewer: str = "",
+    claimed_by: str = "",
+    mine: str = "",
     limit: int = 20,
     include_archived: bool = False,
 ) -> str:
@@ -254,6 +256,8 @@ async def hub_list_tasks(
         parent_id: Filter by parent task ID. None for all.
         human_owner: Filter by human_owner (exact match). Empty for all.
         human_reviewer: Filter by human_reviewer (exact match). Empty for all.
+        claimed_by: Filter by claim holder (exact match). Empty for all.
+        mine: Shorthand for human_owner OR claimed_by (same person). Empty for all.
         limit: Max number of tasks to return
         include_archived: When True, include archived tasks (hidden from boards by default).
     """
@@ -270,6 +274,10 @@ async def hub_list_tasks(
         params["human_owner"] = human_owner
     if human_reviewer:
         params["human_reviewer"] = human_reviewer
+    if claimed_by:
+        params["claimed_by"] = claimed_by
+    if mine:
+        params["mine"] = mine
     if include_archived:
         params["include_archived"] = "true"
     tasks = await _api_get(f"/api/tasks?{urlencode(params)}")

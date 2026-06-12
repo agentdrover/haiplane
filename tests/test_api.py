@@ -388,6 +388,63 @@ async def test_list_tasks_filtered_by_human_owner_api(client: AsyncClient):
     assert all(t["human_owner"] == "alice" for t in data)
 
 
+async def test_list_tasks_filtered_by_claimed_by_api(client: AsyncClient):
+    owned = await client.post(
+        "/api/tasks",
+        json={"title": "Claimed task", "human_owner": "bob"},
+    )
+    task_id = owned.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "composer", "session_id": "sess-1"},
+    )
+
+    other = await client.post(
+        "/api/tasks",
+        json={"title": "Other claim", "human_owner": "bob"},
+    )
+    other_id = other.json()["id"]
+    await client.post(
+        f"/api/tasks/{other_id}/claim",
+        json={"agent": "other-agent", "session_id": "sess-2"},
+    )
+
+    resp = await client.get("/api/tasks", params={"claimed_by": "composer"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert any(t["id"] == task_id for t in data)
+    assert all(t.get("claimed_by") == "composer" for t in data)
+
+
+async def test_list_tasks_filtered_by_mine_api(client: AsyncClient):
+    owned = await client.post(
+        "/api/tasks",
+        json={"title": "Alice owned", "human_owner": "alice"},
+    )
+    owned_id = owned.json()["id"]
+
+    claimed = await client.post(
+        "/api/tasks",
+        json={"title": "Bob owned claimed by alice", "human_owner": "bob"},
+    )
+    claimed_id = claimed.json()["id"]
+    await client.post(
+        f"/api/tasks/{claimed_id}/claim",
+        json={"agent": "alice", "session_id": "sess-a"},
+    )
+
+    await client.post(
+        "/api/tasks",
+        json={"title": "Charlie only", "human_owner": "charlie"},
+    )
+
+    resp = await client.get("/api/tasks", params={"mine": "alice"})
+    assert resp.status_code == 200
+    ids = {t["id"] for t in resp.json()}
+    assert owned_id in ids
+    assert claimed_id in ids
+
+
 async def test_reorder_task_api(client: AsyncClient):
     resp = await client.post("/api/tasks", json={"title": "Reorder me"})
     task_id = resp.json()["id"]

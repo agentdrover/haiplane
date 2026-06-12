@@ -332,6 +332,10 @@ def cmd_list(args: argparse.Namespace) -> int:
         params += f"&human_owner={urllib.parse.quote(args.owner)}"
     if getattr(args, "reviewer", None):
         params += f"&human_reviewer={urllib.parse.quote(args.reviewer)}"
+    if getattr(args, "claimed_by", None):
+        params += f"&claimed_by={urllib.parse.quote(args.claimed_by)}"
+    if getattr(args, "mine", None):
+        params += f"&mine={urllib.parse.quote(args.mine)}"
     if getattr(args, "include_archived", False):
         params += "&include_archived=true"
     result = _api("GET", f"/api/tasks{params}")
@@ -1057,6 +1061,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--parent", type=int, default=None, help="Filter by parent ID")
     p_list.add_argument("--owner", default=None, help="Filter by human_owner")
     p_list.add_argument("--reviewer", default=None, help="Filter by human_reviewer")
+    p_list.add_argument("--claimed-by", default=None, help="Filter by claim holder")
+    p_list.add_argument(
+        "--mine",
+        default=None,
+        help="Filter by human_owner OR claimed_by (same person)",
+    )
     p_list.add_argument("--limit", type=int, default=20)
     p_list.add_argument(
         "--include-archived",
