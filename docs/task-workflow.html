@@ -77,7 +77,7 @@
   <p>Краткая схема для Cursor pair mode. Полный lifecycle: <a href="software-development-workflow.md">software-development-workflow.md</a>.</p>
 
   <h2 id="gap-status">Статус gaps (группа #36)</h2>
-  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · PR #9 merged</p>
+  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · gaps #37–#44 закрыты · группа #36 ✓</p>
   <table>
     <thead>
       <tr><th>Gap</th><th>Task</th><th>Код</th><th>Hub</th><th>PR</th></tr>
@@ -128,12 +128,24 @@
       <tr>
         <td>Claim / release Cursor-сессии</td>
         <td>#41</td>
-        <td><span class="badge pending">in progress</span></td>
-        <td><span class="badge pending">open</span></td>
-        <td>—</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/11">#11 merged</a></td>
+      </tr>
+      <tr>
+        <td>Inbox filter owner/claim</td>
+        <td>#42</td>
+        <td><span class="badge ok">develop</span></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/13">#13 merged</a></td>
       </tr>
     </tbody>
   </table>
+
+  <div class="panel">
+    <p><span class="badge ok">группа #36</span> Индексная задача закрыта: все gap-задачи pair path B (#37–#44) в <code>develop</code> и <code>completed</code> в hub.</p>
+    <p>Отдельно в backlog: #45 (<code>hub_refine_task</code> title) — не входит в pair lifecycle gaps.</p>
+  </div>
 
   <h2>Два пути после approve</h2>
   <table>
@@ -215,12 +227,21 @@
   </ul>
 
   <h2 id="pair-claim">Pair: claim / release (B10)</h2>
-  <p>Gap <strong>#41</strong> <span class="badge pending">in progress</span>: один активный исполнитель на задачу.</p>
+  <p>Gap <strong>#41</strong> <span class="badge ok">закрыт</span>: один активный исполнитель на задачу.</p>
   <ol class="checklist">
     <li><code>hub_claim_task(task_id, agent=..., session_id=...)</code> — <code>open</code> → <code>claimed</code>.</li>
     <li>Повторный claim другим agent/session → <strong>409</strong>.</li>
     <li><code>hub_release_task</code> — <code>claimed</code> → <code>open</code>, audit update.</li>
     <li>Далее <code>hub_pair_start</code> (свой claim) или release.</li>
+  </ol>
+
+  <h2 id="inbox-filter">Inbox: «мои задачи» (B11)</h2>
+  <p>Gap <strong>#42</strong> <span class="badge ok">закрыт</span>: персональный фильтр Inbox и list API.</p>
+  <ol class="checklist">
+    <li>Web Inbox: поле <strong>My tasks</strong> → query <code>mine=&lt;person&gt;</code> (owner <em>или</em> claim holder).</li>
+    <li>REST: <code>GET /api/tasks?human_owner=</code>, <code>claimed_by=</code>, <code>mine=</code>.</li>
+    <li>MCP: <code>hub_list_tasks(human_owner=..., claimed_by=..., mine=...)</code>.</li>
+    <li>CLI: <code>oc-hub list --owner</code>, <code>--claimed-by</code>, <code>--mine</code>.</li>
   </ol>
 
   <h2>Ссылки</h2>
