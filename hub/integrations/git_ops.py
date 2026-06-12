@@ -12,7 +12,7 @@ import logging
 import re
 from typing import Any
 
-from hub.config import GH_BIN, REPO_NAME, WORKSPACE_REPO_LINK
+from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 
 log = logging.getLogger(__name__)
 
@@ -272,7 +272,19 @@ class GitOpsIntegration:
             log.info("pair_prepare_branch: checked out existing %s", branch)
             return branch
 
-        await _git("checkout", base, repo=repo, check=False)
+        rc, _, err = await _git("checkout", base, repo=repo, check=False)
+        if rc != 0:
+            raise PairBranchConflictError(
+                f"Failed to checkout base branch {base!r}: "
+                f"{(err or '').strip() or 'git checkout failed'}"
+            )
+        rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        current = (current or "").strip()
+        if rc != 0 or current != base:
+            raise PairBranchConflictError(
+                f"Expected base branch {base!r}, currently on {current!r}"
+            )
+
         await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
 
         rc, _, err = await _git("checkout", "-b", branch, repo=repo, check=False)
@@ -434,7 +446,7 @@ class GitOpsIntegration:
             "--repo",
             REPO_NAME,
             "--base",
-            "main",
+            PAIR_BASE_BRANCH,
             "--head",
             branch,
             "--title",
