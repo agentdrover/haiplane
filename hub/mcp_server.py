@@ -10,6 +10,15 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
+from hub.mcp_structured import (
+    HubCreateTaskResult,
+    HubCreateTaskStructured,
+    HubRefineTaskResult,
+    HubRefineTaskStructured,
+    HubTaskStatusResult,
+    HubTaskStatusStructured,
+    structured_tool_result,
+)
 
 # FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
 # The hub mounts streamable HTTP under the main FastAPI app, so clients send the
@@ -201,7 +210,7 @@ async def hub_create_task(
     run_immediately: bool = False,
     human_owner: str = "",
     human_reviewer: str = "",
-) -> str:
+) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask.
 
     Args:
@@ -230,10 +239,8 @@ async def hub_create_task(
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
     status = result.get("status", "?")
-    return (
-        f"{task_type.capitalize()} #{result['id']} created (status: {status}).\n"
-        + json.dumps(result, ensure_ascii=False, indent=2)
-    )
+    summary = f"{task_type.capitalize()} #{result['id']} created (status: {status})."
+    return structured_tool_result(summary, HubCreateTaskStructured(task=result))
 
 
 @mcp.tool()
@@ -323,7 +330,7 @@ async def hub_list_tasks(
 
 
 @mcp.tool()
-async def hub_task_status(task_id: int) -> str:
+async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     """Get detailed status of a specific task including updates and log tail.
 
     Args:
@@ -352,7 +359,8 @@ async def hub_task_status(task_id: int) -> str:
         parts.append(f"\nResult:\n{task['result_text']}")
     if task.get("log_tail"):
         parts.append("\nLog tail:\n" + "\n".join(task["log_tail"][-20:]))
-    return "\n".join(parts)
+    summary = "\n".join(parts)
+    return structured_tool_result(summary, HubTaskStatusStructured(task=task))
 
 
 @mcp.tool()
@@ -1383,7 +1391,7 @@ async def hub_refine_task(
     human_reviewer: str | None = None,
     acceptance_criteria: list[dict[str, Any]] | None = None,
     risks: list[dict[str, Any]] | None = None,
-) -> str:
+) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written. Omit a parameter to leave the
@@ -1446,15 +1454,36 @@ async def hub_refine_task(
     if risks is not None:
         body["risks"] = risks
     if not body:
-        return (
+        summary = (
             "Nothing to refine: pass at least one structured field, "
             "acceptance_criteria, or risks."
         )
+        return structured_tool_result(
+            summary,
+            HubRefineTaskStructured(task_id=task_id, no_op=True),
+        )
     result = await _api_post(f"/api/tasks/{task_id}/refine", body)
     cols = result.get("updated_columns") or {}
-    if cols:
-        return f"Task #{task_id} refined. Updated: {', '.join(sorted(cols))}"
-    return f"Task #{task_id} refine accepted (no column changes detected)"
+    if isinstance(cols, dict):
+        updated_columns = cols
+    elif isinstance(cols, list):
+        updated_columns = {name: None for name in cols}
+    else:
+        updated_columns = {}
+    if updated_columns:
+        summary = (
+            f"Task #{task_id} refined. Updated: {', '.join(sorted(updated_columns))}"
+        )
+    else:
+        summary = f"Task #{task_id} refine accepted (no column changes detected)"
+    return structured_tool_result(
+        summary,
+        HubRefineTaskStructured(
+            task_id=task_id,
+            updated_columns=updated_columns,
+            refine_result=result,
+        ),
+    )
 
 
 @mcp.tool()

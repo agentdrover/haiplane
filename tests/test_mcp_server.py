@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from unittest.mock import ANY, AsyncMock, patch
 
+from typing import Any
+
 import pytest
 import json
+from mcp.types import CallToolResult, TextContent
 
+from hub.mcp_structured import MCP_STRUCTURED_SCHEMA_VERSION
 from hub.mcp_server import (
     hub_add_acceptance_criterion,
     hub_add_risk,
@@ -31,6 +35,20 @@ from hub.mcp_server import (
     hub_task_status,
     hub_task_update,
 )
+
+
+def _mcp_text(result: CallToolResult | str) -> str:
+    if isinstance(result, CallToolResult):
+        return "\n".join(
+            block.text for block in result.content if isinstance(block, TextContent)
+        )
+    return result
+
+
+def _mcp_structured(result: CallToolResult | str) -> dict[str, Any] | None:
+    if isinstance(result, CallToolResult):
+        return result.structuredContent
+    return None
 
 
 @pytest.fixture
@@ -120,12 +138,17 @@ async def test_hub_task_detail(
         "log_tail": ["line1", "line2"],
     }
     out = await hub_task_status(42)
-    assert "Task #42: Inspect me" in out
-    assert "Status: running" in out
-    assert "Agent: tester" in out
-    assert "Job ID: job-9" in out
-    assert "[2026-01-02T00:00:00Z] (status) a1: Started" in out
-    assert "Log tail:" in out and "line1" in out and "line2" in out
+    text = _mcp_text(out)
+    assert "Task #42: Inspect me" in text
+    assert "Status: running" in text
+    assert "Agent: tester" in text
+    assert "Job ID: job-9" in text
+    assert "[2026-01-02T00:00:00Z] (status) a1: Started" in text
+    assert "Log tail:" in text and "line1" in text and "line2" in text
+    structured = _mcp_structured(out)
+    assert structured is not None
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["task"]["id"] == 42
     mock_api_post.assert_awaited_once_with("/api/tasks/42/refresh")
     mock_api_get.assert_awaited_once_with("/api/tasks/42")
 
@@ -327,8 +350,8 @@ async def test_hub_refine_task_only_includes_provided_fields(
         scope_in=["auth", "session"],
         problem_statement="login fails",
     )
-    assert "Task #42 refined" in msg
-    assert "work_type" in msg and "scope_in" in msg
+    assert "Task #42 refined" in _mcp_text(msg)
+    assert "work_type" in _mcp_text(msg) and "scope_in" in _mcp_text(msg)
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/42/refine",
         {
@@ -348,7 +371,7 @@ async def test_hub_refine_task_passes_review_checklist(
         42,
         review_checklist=["check migration", "verify rollback"],
     )
-    assert "Task #42 refined" in msg
+    assert "Task #42 refined" in _mcp_text(msg)
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/42/refine",
         {"review_checklist": ["check migration", "verify rollback"]},
@@ -359,8 +382,70 @@ async def test_hub_refine_task_empty_payload_is_a_no_op(
     mock_api_post: AsyncMock,
 ) -> None:
     msg = await hub_refine_task(42)
-    assert "Nothing to refine" in msg
+    assert "Nothing to refine" in _mcp_text(msg)
+    structured = _mcp_structured(msg)
+    assert structured is not None
+    assert structured["no_op"] is True
+    assert structured["task_id"] == 42
     mock_api_post.assert_not_called()
+
+
+async def test_hub_create_task_structured_content_matches_rest(
+    mock_api_post: AsyncMock,
+) -> None:
+    rest_task = {"id": 99, "status": "open", "title": "New", "task_type": "task"}
+    mock_api_post.return_value = rest_task
+    out = await hub_create_task("New", task_type="task")
+    assert isinstance(out, CallToolResult)
+    structured = _mcp_structured(out)
+    assert structured is not None
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["task"] == rest_task
+    assert "Task #99 created" in _mcp_text(out)
+
+
+async def test_hub_refine_task_structured_content_matches_rest(
+    mock_api_post: AsyncMock,
+) -> None:
+    rest_result = {
+        "updated_columns": {"work_type": "bug", "scope_in": ["auth"]},
+        "ac_count": None,
+    }
+    mock_api_post.return_value = rest_result
+    out = await hub_refine_task(42, work_type="bug", scope_in=["auth"])
+    structured = _mcp_structured(out)
+    assert structured is not None
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["task_id"] == 42
+    assert structured["updated_columns"] == rest_result["updated_columns"]
+    assert structured["refine_result"] == rest_result
+
+
+async def test_hub_task_status_structured_content_matches_rest(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    rest_task = {
+        "id": 42,
+        "title": "Inspect me",
+        "status": "running",
+        "source": "human",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": "job-9",
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updates": [],
+        "result_text": "",
+        "log_tail": [],
+    }
+    mock_api_get.return_value = rest_task
+    out = await hub_task_status(42)
+    structured = _mcp_structured(out)
+    assert structured is not None
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["task"] == rest_task
 
 
 async def test_hub_list_acceptance_criteria_empty(mock_api_get: AsyncMock) -> None:
@@ -570,7 +655,7 @@ async def test_hub_refine_task_passes_owner_and_reviewer(
 ) -> None:
     mock_api_post.return_value = {"updated_columns": ["human_owner", "human_reviewer"]}
     msg = await hub_refine_task(42, human_owner="alice", human_reviewer="bob")
-    assert "Task #42 refined" in msg
+    assert "Task #42 refined" in _mcp_text(msg)
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/42/refine",
         {"human_owner": "alice", "human_reviewer": "bob"},
