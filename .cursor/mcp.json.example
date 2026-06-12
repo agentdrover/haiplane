@@ -9,7 +9,7 @@
     },
     "openclaw-hub": {
       "type": "streamable-http",
-      "url": "https://agenthai.ru/mcp/mcp",
+      "url": "https://agenthai.ru/mcp",
       "headers": {
         "Authorization": "Bearer ${env:OPENCLAW_HUB_MCP_TOKEN}",
         "Accept": "application/json, text/event-stream"

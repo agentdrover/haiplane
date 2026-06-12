@@ -6,8 +6,9 @@ Covers:
    and the user is reported as ``anonymous``.
 2. **Bearer auth** — with tokens configured, API/JSON requests must
    present ``Authorization: Bearer <token>`` and are rejected 401 otherwise.
-3. **Cookie auth + /login flow** — browsers POST the token to ``/login``,
-   receive a session cookie, and can then GET HTML pages.
+3. **Cookie auth + /login flow** — browsers POST username/password to
+   ``/login``, receive a session cookie, and can then GET HTML pages. An
+   env-token presented as a cookie is still resolved by the middleware.
 4. **Browser redirect** — an unauthenticated HTML GET returns 303 to
    ``/login?next=...`` (not 401).
 5. **Role boundaries** — agent tokens get 403 on human-only endpoints.
@@ -159,7 +160,7 @@ async def test_healthz_is_public(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# /login flow — submit token, receive cookie, browse with cookie
+# /login flow — submit username/password, receive cookie, browse with cookie
 # ---------------------------------------------------------------------------
 
 
@@ -174,49 +175,18 @@ async def _get_csrf_token(client) -> str:
 
 
 @pytest.mark.asyncio
-async def test_login_with_valid_token_sets_cookie(client, monkeypatch):
-    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
-    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
-
-    csrf = await _get_csrf_token(client)
-    resp = await client.post(
-        "/login",
-        data={"token": "secret-token", "next": "/tasks", "csrf_token": csrf},
-        follow_redirects=False,
-    )
-    assert resp.status_code == 303
-    assert resp.headers["Location"] == "/tasks"
-    assert config.HUB_COOKIE_NAME in resp.cookies
-    assert resp.cookies[config.HUB_COOKIE_NAME] == "secret-token"
-
-
-@pytest.mark.asyncio
-async def test_login_with_wrong_token_redirects_with_error(client, monkeypatch):
-    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
-    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
-
-    csrf = await _get_csrf_token(client)
-    resp = await client.post(
-        "/login",
-        data={"token": "WRONG", "next": "/", "csrf_token": csrf},
-        follow_redirects=False,
-    )
-    assert resp.status_code == 303
-    location = resp.headers["Location"]
-    assert location.startswith("/login?")
-    assert "error=" in location
-    assert config.HUB_COOKIE_NAME not in resp.cookies
-
-
-@pytest.mark.asyncio
 async def test_login_without_csrf_is_rejected(client, monkeypatch):
-    """POST /login without CSRF token is rejected."""
+    """POST /login without a CSRF token is rejected before credential checks."""
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
 
     resp = await client.post(
         "/login",
-        data={"token": "secret-token", "next": "/tasks"},
+        data={
+            "username": "alice",
+            "password": VALID_ADMIN_PASSWORD,
+            "next": "/tasks",
+        },
         follow_redirects=False,
     )
     assert resp.status_code == 303

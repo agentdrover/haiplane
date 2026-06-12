@@ -114,7 +114,6 @@ async def web_login_submit(
     request: Request,
     username: str = Form(default=""),
     password: str = Form(default=""),
-    token: str = Form(default=""),
     csrf_token: str = Form(default=""),
     next: str = Form("/"),
 ):
@@ -167,27 +166,6 @@ async def web_login_submit(
         response.set_cookie(
             key=config.HUB_COOKIE_NAME,
             value=session_token,
-            max_age=config.HUB_COOKIE_MAX_AGE,
-            httponly=True,
-            samesite="lax",
-            secure=config.HUB_COOKIE_SECURE,
-        )
-        response.delete_cookie(CSRF_COOKIE_NAME)
-        return response
-
-    # Legacy token login (env-based, deprecated)
-    if token:
-        login_limiter.record(client_ip)
-        identity = config.HUB_TOKENS.get(token.strip())
-        if not identity:
-            return RedirectResponse(
-                f"/login?error=Invalid%20token&next={safe_next}",
-                status_code=303,
-            )
-        response = RedirectResponse(safe_next, status_code=303)
-        response.set_cookie(
-            key=config.HUB_COOKIE_NAME,
-            value=token.strip(),
             max_age=config.HUB_COOKIE_MAX_AGE,
             httponly=True,
             samesite="lax",
