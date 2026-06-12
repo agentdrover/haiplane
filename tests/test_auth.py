@@ -182,7 +182,11 @@ async def test_login_without_csrf_is_rejected(client, monkeypatch):
 
     resp = await client.post(
         "/login",
-        data={"username": "alice", "password": "whatever!1", "next": "/tasks"},
+        data={
+            "username": "alice",
+            "password": VALID_ADMIN_PASSWORD,
+            "next": "/tasks",
+        },
         follow_redirects=False,
     )
     assert resp.status_code == 303
