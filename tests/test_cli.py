@@ -461,6 +461,33 @@ def test_cmd_ac_add_sends_full_body() -> None:
     )
 
 
+def test_cmd_ac_upsert_puts_by_id() -> None:
+    args = argparse.Namespace(
+        task_id=7,
+        id="AC-1",
+        given="g",
+        when="w",
+        then="t",
+        by="manual",
+        test_ref="",
+    )
+    mock_api = MagicMock(return_value={"id": "AC-1"})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_ac_upsert(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "PUT",
+        "/api/tasks/7/acceptance_criteria/AC-1",
+        {
+            "id": "AC-1",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "verifiable_by": "manual",
+        },
+    )
+
+
 def test_cmd_ac_delete_url_encodes_id() -> None:
     """ac_id can contain spaces or slashes; the URL must be percent-encoded."""
     args = argparse.Namespace(task_id=7, id="AC 1/v2")

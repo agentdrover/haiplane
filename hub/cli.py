@@ -599,6 +599,22 @@ def cmd_ac_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ac_upsert(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "id": args.id,
+        "given": args.given,
+        "when": args.when,
+        "then": args.then,
+        "verifiable_by": args.by,
+    }
+    if args.test_ref:
+        body["test_ref"] = args.test_ref
+    ac_id = urllib.parse.quote(args.id, safe="")
+    result = _api("PUT", f"/api/tasks/{args.task_id}/acceptance_criteria/{ac_id}", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_ac_delete(args: argparse.Namespace) -> int:
     ac_id = urllib.parse.quote(args.id, safe="")
     _api("DELETE", f"/api/tasks/{args.task_id}/acceptance_criteria/{ac_id}")
@@ -1409,6 +1425,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ac_add.add_argument("--test-ref", dest="test_ref", default="")
     p_ac_add.set_defaults(func=cmd_ac_add)
+
+    p_ac_upsert = ac_sub.add_parser(
+        "upsert",
+        help="Idempotent upsert of one AC by id (create or overwrite, no 409)",
+    )
+    p_ac_upsert.add_argument("task_id", type=int)
+    p_ac_upsert.add_argument("--id", required=True, help="AC id (e.g. AC-1)")
+    p_ac_upsert.add_argument("--given", required=True)
+    p_ac_upsert.add_argument("--when", required=True)
+    p_ac_upsert.add_argument("--then", required=True)
+    p_ac_upsert.add_argument(
+        "--by",
+        choices=["test", "manual", "log_check", "ui_check"],
+        default="test",
+        help="How this AC will be verified",
+    )
+    p_ac_upsert.add_argument("--test-ref", dest="test_ref", default="")
+    p_ac_upsert.set_defaults(func=cmd_ac_upsert)
 
     p_ac_del = ac_sub.add_parser("delete", help="Delete an acceptance criterion")
     p_ac_del.add_argument("task_id", type=int)

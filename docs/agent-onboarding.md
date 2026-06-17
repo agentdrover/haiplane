@@ -208,8 +208,12 @@ curl -sS \
 - `hub_propose_task` — draft-предложение (вне scope)
 - `hub_refine_task` — PATCH структурных полей DoR (включая `title`, AC, risks) *(structuredContent)*
 - `hub_refine_tasks` — батч-refine многих задач за один атомарный вызов *(structuredContent)*
-- `hub_add_acceptance_criterion` / `hub_replace_acceptance_criteria` /
-  `hub_list_acceptance_criteria` / `hub_delete_acceptance_criterion`
+- `hub_add_acceptance_criterion` / `hub_upsert_acceptance_criterion` /
+  `hub_replace_acceptance_criteria` / `hub_list_acceptance_criteria` /
+  `hub_delete_acceptance_criterion`
+  > `add` возвращает 409 на дубликат `ac_id`; `upsert` идемпотентен —
+  > создаёт или перезаписывает по `ac_id`, повтор безопасен. Запись в Hub
+  > сериализуется, поэтому параллельные add/upsert не дают спорадических 500.
 - `hub_add_risk`
 
 **Жизненный цикл**

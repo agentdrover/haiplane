@@ -10,6 +10,7 @@ translation) live in exactly one place.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -36,29 +37,49 @@ class DuplicateAcceptanceCriterionError(ValueError):
     """Raised when ac_id collides with an existing one for the same task."""
 
 
+def get_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
+    """Return a per-connection write lock, created lazily on the running loop.
+
+    The Hub uses a single shared aiosqlite connection across requests. Two
+    concurrent mutations would otherwise interleave their SAVEPOINT/commit
+    pairs on that one connection, so one coroutine's ``commit()`` flushes
+    another's half-written rows — surfacing as sporadic HTTP 500s where the
+    write "sometimes still landed" (feedback #3). Serializing the critical
+    section makes list-append writes (e.g. parallel add_acceptance_criterion)
+    atomic and predictable. The lock is stored on the connection (not a module
+    global) so it always binds to the event loop that owns the connection,
+    which keeps per-test loops happy.
+    """
+    lock: asyncio.Lock | None = getattr(db, "_oc_write_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        db._oc_write_lock = lock  # type: ignore[attr-defined]
+    return lock
+
+
 @asynccontextmanager
 async def _atomic(db: aiosqlite.Connection, name: str):
-    """SAVEPOINT-scoped atomic block (review I6).
+    """SAVEPOINT-scoped atomic block, serialized by the per-connection lock.
 
-    The Hub historically uses one shared aiosqlite connection across
-    requests. Without an explicit SAVEPOINT, a partial failure inside
-    a multi-step mutation (e.g. ``update_task_structured`` then
+    Without an explicit SAVEPOINT, a partial failure inside a multi-step
+    mutation (e.g. ``update_task_structured`` then
     ``replace_acceptance_criteria``) leaves dirty rows in the implicit
-    transaction; the next handler's ``commit()`` then promotes them.
-    Wrapping mutations in a SAVEPOINT gives us per-operation atomicity
-    that's safe under shared, pooled, or per-request connections.
+    transaction; the next handler's ``commit()`` then promotes them. The
+    SAVEPOINT gives per-operation atomicity; the write lock prevents
+    concurrent mutations from interleaving on the shared connection.
     """
     sp = name.replace("-", "_").replace(" ", "_")
-    await db.execute(f"SAVEPOINT {sp}")
-    try:
-        yield
-    except BaseException:
-        await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-        await db.execute(f"RELEASE SAVEPOINT {sp}")
-        raise
-    else:
-        await db.execute(f"RELEASE SAVEPOINT {sp}")
-        await db.commit()
+    async with get_write_lock(db):
+        await db.execute(f"SAVEPOINT {sp}")
+        try:
+            yield
+        except BaseException:
+            await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            await db.execute(f"RELEASE SAVEPOINT {sp}")
+            raise
+        else:
+            await db.execute(f"RELEASE SAVEPOINT {sp}")
+            await db.commit()
 
 
 def row_to_ac(row: aiosqlite.Row) -> AcceptanceCriterion:
@@ -249,6 +270,22 @@ async def add_acceptance_criterion(
                 f"acceptance criterion {ac.id!r} already exists for task {task_id}"
             ) from exc
     return ac
+
+
+async def upsert_acceptance_criterion(
+    db: aiosqlite.Connection,
+    task_id: int,
+    ac: AcceptanceCriterion,
+) -> tuple[AcceptanceCriterion, bool]:
+    """Insert or update an AC by ``ac_id`` (idempotent, no 409 on resend).
+
+    Returns ``(ac, created)`` where ``created`` is True for a fresh insert
+    and False when an existing criterion was overwritten.
+    """
+    await _ensure_task_exists(db, task_id)
+    async with _atomic(db, "upsert_ac"):
+        created = await repo.upsert_acceptance_criterion(db, task_id, ac)
+    return ac, created
 
 
 async def replace_acceptance_criteria(

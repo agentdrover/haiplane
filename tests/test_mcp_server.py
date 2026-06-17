@@ -29,6 +29,7 @@ from hub.mcp_server import (
     hub_pair_start,
     hub_refine_task,
     hub_refine_tasks,
+    hub_upsert_acceptance_criterion,
     hub_release_task,
     hub_replace_acceptance_criteria,
     hub_report_done,
@@ -566,6 +567,24 @@ async def test_hub_replace_acceptance_criteria_sends_array(
     msg = await hub_replace_acceptance_criteria(7, items)
     assert "Task #7 now has 2 acceptance criteria" in msg
     mock_api_put.assert_awaited_once_with("/api/tasks/7/acceptance_criteria", items)
+
+
+async def test_hub_upsert_acceptance_criterion_puts_by_id(
+    mock_api_put: AsyncMock,
+) -> None:
+    mock_api_put.return_value = {
+        "id": "AC-1",
+        "given": "g",
+        "when": "w",
+        "then": "t",
+        "verifiable_by": "test",
+    }
+    msg = await hub_upsert_acceptance_criterion(7, "AC-1", "g", "w", "t")
+    assert "Upserted AC-1 on task #7" in msg
+    mock_api_put.assert_awaited_once_with(
+        "/api/tasks/7/acceptance_criteria/AC-1",
+        {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"},
+    )
 
 
 async def test_hub_delete_acceptance_criterion_url_encodes_id(

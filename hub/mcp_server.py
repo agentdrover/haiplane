@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
 
@@ -1583,6 +1584,46 @@ async def hub_add_acceptance_criterion(
         body["test_ref"] = test_ref
     await _api_post(f"/api/tasks/{task_id}/acceptance_criteria", body)
     return f"Added {ac_id} to task #{task_id}"
+
+
+@mcp.tool()
+async def hub_upsert_acceptance_criterion(
+    task_id: int,
+    ac_id: str,
+    given: str,
+    when: str,
+    then: str,
+    verifiable_by: str = "test",
+    test_ref: str = "",
+) -> str:
+    """Idempotent upsert of one acceptance criterion by ``ac_id``.
+
+    Unlike ``hub_add_acceptance_criterion`` (which returns 409 on a
+    duplicate id), this overwrites an existing AC with the same ``ac_id``
+    and re-sending the same payload is a safe no-op. Use it when a retry
+    might have already landed, so you don't have to guess the state.
+
+    Args:
+        task_id: Target task.
+        ac_id: Stable identifier (e.g. "AC-1"). Created if new, updated if present.
+        given: Precondition / context.
+        when: Action / event.
+        then: Observable outcome.
+        verifiable_by: test | manual | log_check | ui_check.
+        test_ref: Optional pointer to the test.
+    """
+    body: dict[str, Any] = {
+        "id": ac_id,
+        "given": given,
+        "when": when,
+        "then": then,
+        "verifiable_by": verifiable_by,
+    }
+    if test_ref:
+        body["test_ref"] = test_ref
+    safe_id = urllib.parse.quote(ac_id, safe="")
+    await _api_put(f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}", body)
+    return f"Upserted {ac_id} on task #{task_id}"
 
 
 @mcp.tool()

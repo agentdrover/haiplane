@@ -702,6 +702,35 @@ async def api_replace_acceptance_criteria(
         raise _duplicate_to_http(exc, 422) from exc
 
 
+@app.put(
+    "/api/tasks/{task_id}/acceptance_criteria/{ac_id}",
+    response_model=AcceptanceCriterion,
+)
+async def api_upsert_acceptance_criterion(
+    task_id: int,
+    ac_id: str,
+    body: AcceptanceCriterion,
+    request: Request,
+    response: Response,
+):
+    """Idempotent upsert of one AC by ``ac_id``.
+
+    Re-sending the same payload is a no-op; a changed payload overwrites the
+    row instead of returning 409. The body ``id`` must match the path ``ac_id``.
+    Returns 201 when a new criterion was created, 200 when one was updated.
+    """
+    if body.id != ac_id:
+        raise HTTPException(422, f"ac id mismatch: path {ac_id!r} != body {body.id!r}")
+    try:
+        ac, created = await services.upsert_acceptance_criterion(
+            _db(request), task_id, body
+        )
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return ac
+
+
 @app.delete(
     "/api/tasks/{task_id}/acceptance_criteria/{ac_id}",
     status_code=status.HTTP_204_NO_CONTENT,

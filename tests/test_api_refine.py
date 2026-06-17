@@ -8,6 +8,8 @@ so that future refactors in the service layer cannot silently change it.
 
 from __future__ import annotations
 
+import asyncio
+
 from httpx import AsyncClient
 
 
@@ -598,3 +600,82 @@ async def test_create_subtasks_bulk_accepts_acceptance_criteria(client: AsyncCli
         await client.get(f"/api/tasks/{created[1]['id']}/acceptance_criteria")
     ).json()
     assert acs2 == []
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/tasks/{id}/acceptance_criteria/{ac_id} — idempotent upsert
+# ---------------------------------------------------------------------------
+
+
+async def test_upsert_ac_creates_then_updates_idempotently(client: AsyncClient):
+    task = await _create_task(client)
+    tid = task["id"]
+    url = f"/api/tasks/{tid}/acceptance_criteria/AC-1"
+
+    # First call creates (201).
+    r1 = await client.put(url, json=_ac_payload(1, then="then-original"))
+    assert r1.status_code == 201, r1.text
+
+    # Re-sending a changed payload updates in place (200), no 409.
+    r2 = await client.put(url, json=_ac_payload(1, then="then-updated"))
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["then"] == "then-updated"
+
+    # Exactly one AC remains, with the updated value.
+    acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+    assert len(acs) == 1
+    assert acs[0]["then"] == "then-updated"
+
+
+async def test_upsert_ac_rejects_id_mismatch(client: AsyncClient):
+    task = await _create_task(client)
+    resp = await client.put(
+        f"/api/tasks/{task['id']}/acceptance_criteria/AC-9",
+        json=_ac_payload(1),
+    )
+    assert resp.status_code == 422
+
+
+async def test_upsert_ac_missing_task_returns_404(client: AsyncClient):
+    resp = await client.put(
+        "/api/tasks/999999/acceptance_criteria/AC-1",
+        json=_ac_payload(1),
+    )
+    assert resp.status_code == 404
+
+
+async def test_parallel_ac_writes_do_not_500(client: AsyncClient):
+    """Regression for feedback #3: concurrent list-append writes on the shared
+    connection must serialize, not return sporadic HTTP 500s."""
+    task = await _create_task(client)
+    tid = task["id"]
+
+    # 12 distinct ACs added concurrently — the write lock serializes them.
+    adds = [
+        client.post(
+            f"/api/tasks/{tid}/acceptance_criteria",
+            json=_ac_payload(i),
+        )
+        for i in range(1, 13)
+    ]
+    results = await asyncio.gather(*adds)
+    assert all(r.status_code in (201, 409) for r in results), [
+        r.status_code for r in results
+    ]
+    assert not any(r.status_code >= 500 for r in results)
+
+    acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+    assert len(acs) == 12
+
+    # Concurrent upserts of the SAME id stay idempotent and never 500.
+    upserts = [
+        client.put(
+            f"/api/tasks/{tid}/acceptance_criteria/AC-1",
+            json=_ac_payload(1, then=f"v{i}"),
+        )
+        for i in range(8)
+    ]
+    up_results = await asyncio.gather(*upserts)
+    assert not any(r.status_code >= 500 for r in up_results)
+    acs_after = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+    assert len(acs_after) == 12  # no duplicates created
