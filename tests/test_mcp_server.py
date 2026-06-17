@@ -407,18 +407,58 @@ async def test_hub_create_task_structured_content_matches_rest(
 async def test_hub_refine_task_structured_content_matches_rest(
     mock_api_post: AsyncMock,
 ) -> None:
-    rest_result = {
-        "updated_columns": {"work_type": "bug", "scope_in": ["auth"]},
-        "ac_count": None,
+    # REST /refine returns the full TaskView, not an audit dict.
+    rest_task = {
+        "id": 42,
+        "work_type": "bug",
+        "scope_in": ["auth"],
+        "acceptance_criteria": [],
+        "risks": [],
+        "readiness_score": 70,
+        "dor_passed": False,
     }
-    mock_api_post.return_value = rest_result
+    mock_api_post.return_value = rest_task
     out = await hub_refine_task(42, work_type="bug", scope_in=["auth"])
     structured = _mcp_structured(out)
     assert structured is not None
     assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
     assert structured["task_id"] == 42
-    assert structured["updated_columns"] == rest_result["updated_columns"]
-    assert structured["refine_result"] == rest_result
+    assert structured["fields_set"] == ["scope_in", "work_type"]
+    assert structured["readiness_score"] == 70
+    assert structured["dor_passed"] is False
+    assert structured["task"] == rest_task
+
+
+async def test_hub_refine_task_reports_ac_changes_without_false_no_op(
+    mock_api_post: AsyncMock,
+) -> None:
+    """Regression: passing only acceptance_criteria must not report 'no changes'."""
+    rest_task = {
+        "id": 42,
+        "acceptance_criteria": [
+            {"id": "AC-1", "given": "g", "when": "w", "then": "t"},
+            {"id": "AC-2", "given": "g", "when": "w", "then": "t"},
+        ],
+        "risks": [],
+        "readiness_score": 90,
+        "dor_passed": True,
+    }
+    mock_api_post.return_value = rest_task
+    out = await hub_refine_task(
+        42,
+        acceptance_criteria=[
+            {"id": "AC-1", "given": "g", "when": "w", "then": "t"},
+            {"id": "AC-2", "given": "g", "when": "w", "then": "t"},
+        ],
+    )
+    text = _mcp_text(out)
+    assert "Task #42 refined" in text
+    assert "no column changes" not in text
+    assert "2 acceptance criteria" in text
+    assert "readiness 90" in text
+    structured = _mcp_structured(out)
+    assert structured["acceptance_criteria_count"] == 2
+    assert structured["fields_set"] == ["acceptance_criteria"]
 
 
 async def test_hub_task_status_structured_content_matches_rest(

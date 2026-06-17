@@ -1462,26 +1462,40 @@ async def hub_refine_task(
             summary,
             HubRefineTaskStructured(task_id=task_id, no_op=True),
         )
+    # REST /refine returns the full TaskView. We report what changed from the
+    # PATCH keys we actually sent (not a column diff), and surface AC/risks
+    # counts + readiness from the returned task so the summary never claims
+    # "no changes" when acceptance_criteria or risks were replaced.
     result = await _api_post(f"/api/tasks/{task_id}/refine", body)
-    cols = result.get("updated_columns") or {}
-    if isinstance(cols, dict):
-        updated_columns = cols
-    elif isinstance(cols, list):
-        updated_columns = {name: None for name in cols}
-    else:
-        updated_columns = {}
-    if updated_columns:
-        summary = (
-            f"Task #{task_id} refined. Updated: {', '.join(sorted(updated_columns))}"
-        )
-    else:
-        summary = f"Task #{task_id} refine accepted (no column changes detected)"
+    fields_set = sorted(body.keys())
+    ac_count = (
+        len(result.get("acceptance_criteria") or [])
+        if "acceptance_criteria" in body
+        else None
+    )
+    risks_count = len(result.get("risks") or []) if "risks" in body else None
+    readiness_score = result.get("readiness_score")
+    dor_passed = result.get("dor_passed")
+
+    parts = [f"Set: {', '.join(fields_set)}"]
+    if ac_count is not None:
+        parts.append(f"{ac_count} acceptance criteria")
+    if risks_count is not None:
+        parts.append(f"{risks_count} risks")
+    if readiness_score is not None:
+        parts.append(f"readiness {readiness_score}")
+    summary = f"Task #{task_id} refined. " + "; ".join(parts) + "."
+
     return structured_tool_result(
         summary,
         HubRefineTaskStructured(
             task_id=task_id,
-            updated_columns=updated_columns,
-            refine_result=result,
+            fields_set=fields_set,
+            acceptance_criteria_count=ac_count,
+            risks_count=risks_count,
+            readiness_score=readiness_score,
+            dor_passed=dor_passed,
+            task=result,
         ),
     )
 
