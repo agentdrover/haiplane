@@ -29,9 +29,9 @@ async def _create_task(client: AsyncClient, **overrides) -> dict:
 def _ac_payload(idx: int = 1, **overrides) -> dict:
     base = {
         "id": f"AC-{idx}",
-        "given": f"given-{idx}",
-        "when": f"when-{idx}",
-        "then": f"then-{idx}",
+        "given": f"a logged-in user in context {idx}",
+        "when": f"the user triggers action {idx}",
+        "then": f"the system returns outcome {idx}",
         "verifiable_by": "test",
         "test_ref": f"tests/test_ac.py::test_{idx}",
     }
