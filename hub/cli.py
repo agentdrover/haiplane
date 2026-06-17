@@ -512,6 +512,25 @@ def cmd_refine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refine_bulk(args: argparse.Namespace) -> int:
+    payload = _load_payload_file(args.from_file)
+    if not isinstance(payload, dict):
+        print(
+            f"--from-file must contain a JSON/YAML object, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    if "items" not in payload or not isinstance(payload["items"], list):
+        print(
+            "--from-file must include an items array of {task_id, ...refine fields}.",
+            file=sys.stderr,
+        )
+        return 2
+    result = _api("POST", "/api/tasks/refine-bulk", payload)
+    _print_json(result)
+    return 0
+
+
 def cmd_subtasks_bulk(args: argparse.Namespace) -> int:
     payload = _load_payload_file(args.from_file)
     if not isinstance(payload, dict):
@@ -576,6 +595,22 @@ def cmd_ac_add(args: argparse.Namespace) -> int:
     if args.test_ref:
         body["test_ref"] = args.test_ref
     result = _api("POST", f"/api/tasks/{args.task_id}/acceptance_criteria", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_ac_upsert(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "id": args.id,
+        "given": args.given,
+        "when": args.when,
+        "then": args.then,
+        "verifiable_by": args.by,
+    }
+    if args.test_ref:
+        body["test_ref"] = args.test_ref
+    ac_id = urllib.parse.quote(args.id, safe="")
+    result = _api("PUT", f"/api/tasks/{args.task_id}/acceptance_criteria/{ac_id}", body)
     _print_json(result)
     return 0
 
@@ -1354,6 +1389,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_refine.set_defaults(func=cmd_refine)
 
+    # refine-bulk — apply a refine PATCH to many tasks atomically
+    p_refine_bulk = sub.add_parser(
+        "refine-bulk",
+        help="Refine many tasks in one atomic request (--from-file with items[])",
+    )
+    p_refine_bulk.add_argument(
+        "--from-file",
+        dest="from_file",
+        required=True,
+        help="JSON/YAML object with items: [{task_id, ...refine fields}]",
+    )
+    p_refine_bulk.set_defaults(func=cmd_refine_bulk)
+
     # ac — CRUD for acceptance criteria
     p_ac = sub.add_parser("ac", help="Manage acceptance criteria")
     ac_sub = p_ac.add_subparsers(dest="ac_command", required=True)
@@ -1377,6 +1425,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ac_add.add_argument("--test-ref", dest="test_ref", default="")
     p_ac_add.set_defaults(func=cmd_ac_add)
+
+    p_ac_upsert = ac_sub.add_parser(
+        "upsert",
+        help="Idempotent upsert of one AC by id (create or overwrite, no 409)",
+    )
+    p_ac_upsert.add_argument("task_id", type=int)
+    p_ac_upsert.add_argument("--id", required=True, help="AC id (e.g. AC-1)")
+    p_ac_upsert.add_argument("--given", required=True)
+    p_ac_upsert.add_argument("--when", required=True)
+    p_ac_upsert.add_argument("--then", required=True)
+    p_ac_upsert.add_argument(
+        "--by",
+        choices=["test", "manual", "log_check", "ui_check"],
+        default="test",
+        help="How this AC will be verified",
+    )
+    p_ac_upsert.add_argument("--test-ref", dest="test_ref", default="")
+    p_ac_upsert.set_defaults(func=cmd_ac_upsert)
 
     p_ac_del = ac_sub.add_parser("delete", help="Delete an acceptance criterion")
     p_ac_del.add_argument("task_id", type=int)

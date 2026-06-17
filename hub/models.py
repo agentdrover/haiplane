@@ -204,6 +204,11 @@ class BulkChildTaskItem(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     description: str = Field("", max_length=10000)
     priority: TaskPriority = TaskPriority.medium
+    # Optional structured form set at creation so a child can be born closer to
+    # DoR without a follow-up refine round-trip. Forward refs are resolved by
+    # ``BulkChildTaskItem.model_rebuild()`` after AcceptanceCriterion/TaskRisk.
+    acceptance_criteria: list["AcceptanceCriterion"] | None = None
+    risks: list["TaskRisk"] | None = None
 
 
 class BulkChildTasksCreate(BaseModel):
@@ -388,6 +393,40 @@ class TaskRefine(BaseModel):
         if dups:
             raise ValueError(f"duplicate acceptance criterion ids: {sorted(set(dups))}")
         return self
+
+
+# Bulk child items may carry AC/risks defined later in this module.
+BulkChildTaskItem.model_rebuild()
+
+
+MAX_BULK_REFINE = 50
+
+
+class BulkRefineItem(TaskRefine):
+    """One task's refine payload inside a bulk request (TaskRefine + task_id)."""
+
+    task_id: int
+
+
+class BulkRefine(BaseModel):
+    """Atomic bulk refine: apply a TaskRefine PATCH to many tasks at once."""
+
+    items: list[BulkRefineItem] = Field(..., min_length=1, max_length=MAX_BULK_REFINE)
+
+
+class TaskRefineOutcome(BaseModel):
+    """Per-task audit of what a (bulk) refine applied."""
+
+    task_id: int
+    fields_set: list[str] = Field(default_factory=list)
+    acceptance_criteria_count: int | None = None
+    risks_count: int | None = None
+    readiness_score: int | None = None
+    dor_passed: bool | None = None
+
+
+class BulkRefineResult(BaseModel):
+    results: list[TaskRefineOutcome] = Field(default_factory=list)
 
 
 class DoRCheckItem(BaseModel):

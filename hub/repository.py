@@ -503,6 +503,55 @@ async def add_acceptance_criterion(
     return cur.lastrowid  # type: ignore[return-value]
 
 
+async def upsert_acceptance_criterion(
+    db: aiosqlite.Connection,
+    task_id: int,
+    ac: Any,
+) -> bool:
+    """Insert an AC or update it in place when ``(task_id, ac_id)`` exists.
+
+    Idempotent by ``ac_id``: re-sending the same payload is a no-op write,
+    and a changed payload overwrites the row without a 409. New rows get the
+    next position; existing rows keep their position. Returns ``True`` when a
+    new row was inserted, ``False`` when an existing one was updated.
+    Caller owns the commit.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
+        (task_id, ac.id),
+    )
+    existed = bool(rows)
+
+    pos_rows = await db.execute_fetchall(
+        "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
+        "FROM acceptance_criteria WHERE task_id=?",
+        (task_id,),
+    )
+    next_pos = int(pos_rows[0]["next_pos"]) if pos_rows else 0
+
+    kwargs = ac_to_row_kwargs(ac)
+    await db.execute(
+        "INSERT INTO acceptance_criteria "
+        "(task_id, ac_id, given, when_clause, then_clause, verifiable_by, "
+        "test_ref, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(task_id, ac_id) DO UPDATE SET "
+        "given=excluded.given, when_clause=excluded.when_clause, "
+        "then_clause=excluded.then_clause, verifiable_by=excluded.verifiable_by, "
+        "test_ref=excluded.test_ref",
+        (
+            task_id,
+            kwargs["ac_id"],
+            kwargs["given"],
+            kwargs["when_clause"],
+            kwargs["then_clause"],
+            kwargs["verifiable_by"],
+            kwargs["test_ref"],
+            next_pos,
+        ),
+    )
+    return not existed
+
+
 async def replace_acceptance_criteria(
     db: aiosqlite.Connection,
     task_id: int,

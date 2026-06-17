@@ -28,6 +28,7 @@ from hub.models import (
     TaskPairStart,
     TaskProgress,
     TaskQuestion,
+    TaskRefine,
     TaskReject,
     TaskRelease,
     TaskReorder,
@@ -44,7 +45,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     transition_after_agent_done,
 )
-from hub.services.refinement import TaskNotFoundError
+from hub.services.refinement import TaskNotFoundError, get_write_lock
 
 log = logging.getLogger("hub")
 
@@ -205,34 +206,43 @@ async def create_subtasks_bulk(
         auto_review = False
 
     created_ids: list[int] = []
-    await db.execute("SAVEPOINT bulk_child_tasks")
-    try:
-        for idx, item in enumerate(body.items):
-            payload = TaskCreate(
-                title=item.title,
-                description=item.description,
-                task_type=body.task_type,
-                parent_id=parent_id,
-                priority=item.priority,
-                source=body.source,
-                agent=body.agent,
-                auto_review=auto_review,
-                run_immediately=False,
-            )
-            task_id = await repo.create_task_full(
-                db,
-                payload,
-                status=initial_status,
-                position=idx,
-            )
-            created_ids.append(task_id)
-    except Exception:
-        await db.execute("ROLLBACK TO SAVEPOINT bulk_child_tasks")
-        await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
-        raise
-    else:
-        await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
-        await db.commit()
+    async with get_write_lock(db):
+        await db.execute("SAVEPOINT bulk_child_tasks")
+        try:
+            for idx, item in enumerate(body.items):
+                payload = TaskCreate(
+                    title=item.title,
+                    description=item.description,
+                    task_type=body.task_type,
+                    parent_id=parent_id,
+                    priority=item.priority,
+                    source=body.source,
+                    agent=body.agent,
+                    auto_review=auto_review,
+                    run_immediately=False,
+                )
+                task_id = await repo.create_task_full(
+                    db,
+                    payload,
+                    status=initial_status,
+                    position=idx,
+                )
+                if item.risks is not None:
+                    await repo.update_task_structured(
+                        db, task_id, TaskRefine(risks=item.risks)
+                    )
+                if item.acceptance_criteria is not None:
+                    await repo.replace_acceptance_criteria(
+                        db, task_id, item.acceptance_criteria
+                    )
+                created_ids.append(task_id)
+        except Exception:
+            await db.execute("ROLLBACK TO SAVEPOINT bulk_child_tasks")
+            await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
+            raise
+        else:
+            await db.execute("RELEASE SAVEPOINT bulk_child_tasks")
+            await db.commit()
 
     titles = ", ".join(f"#{tid}" for tid in created_ids)
     await log_activity(

@@ -130,6 +130,68 @@ SEVERITY_ORDER: dict[RecommendationSeverity, int] = {
     "low": 3,
 }
 
+# Acceptance-criteria quality heuristics (feedback #6). DoR only checks that
+# ACs EXIST, not whether they say anything meaningful — so a task can pass DoR
+# with formally-valid but empty-by-meaning criteria. These warnings are
+# strictly NON-blocking (severity="low", expected_score_delta=0): they never
+# change the score or dor_passed, they just nudge the author. Final quality
+# judgement still belongs to the reviewer.
+AC_QUALITY_MIN_LEN = 12
+_AC_PLACEHOLDER_TOKENS = {
+    "tbd",
+    "tba",
+    "todo",
+    "na",
+    "n/a",
+    "-",
+    "--",
+    "xxx",
+    "?",
+    "...",
+    "none",
+}
+
+
+def _ac_clause_is_thin(text: str | None) -> bool:
+    """True when a Given/When/Then clause is too short or a placeholder."""
+    t = (text or "").strip().lower()
+    if len(t) < AC_QUALITY_MIN_LEN:
+        return True
+    return t in _AC_PLACEHOLDER_TOKENS
+
+
+def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+    """Emit at most one low-severity warning when some ACs look hollow.
+
+    ``ac_rows`` are rows from ``repo.list_acceptance_criteria`` (columns
+    ``ac_id``/``given``/``when_clause``/``then_clause``). Returns an empty
+    list when every AC has substantive clauses.
+    """
+    weak: list[str] = []
+    for row in ac_rows:
+        if (
+            _ac_clause_is_thin(row["given"])
+            or _ac_clause_is_thin(row["when_clause"])
+            or _ac_clause_is_thin(row["then_clause"])
+        ):
+            weak.append(row["ac_id"])
+    if not weak:
+        return []
+    return [
+        Recommendation(
+            field="acceptance_criteria",
+            severity="low",
+            message=(
+                f"Acceptance criteria {', '.join(weak)} look thin (very short "
+                "or placeholder Given/When/Then). The Definition of Ready only "
+                "checks that criteria exist, not their quality — strengthen "
+                "them so a reviewer can actually sign off."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=5,
+        )
+    ]
+
 
 def _recommendation_for(
     check: DoRCheckItem,
@@ -213,6 +275,10 @@ async def calculate_readiness_with_recommendations(
 
     score, components = calculate_score_from_data(dor=dor, risks=risks, config=config)
     recs = build_recommendations(dor, config=config)
+    # Non-blocking AC-quality nudge (#6): does not affect score/dor_passed.
+    ac_rows = await repo.list_acceptance_criteria(db, task_id)
+    recs.extend(build_ac_quality_warnings(ac_rows))
+    recs.sort(key=lambda r: SEVERITY_ORDER[r.severity])
 
     return ReadinessReport(
         score=score,
@@ -228,6 +294,7 @@ async def calculate_readiness_with_recommendations(
 __all__ = [
     "CHECK_RECOMMENDATIONS",
     "SEVERITY_ORDER",
+    "build_ac_quality_warnings",
     "build_for_task",
     "build_recommendations",
     "calculate_readiness_with_recommendations",

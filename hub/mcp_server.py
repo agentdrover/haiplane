@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,6 +16,8 @@ from hub.mcp_structured import (
     HubCreateTaskStructured,
     HubRefineTaskResult,
     HubRefineTaskStructured,
+    HubRefineTasksResult,
+    HubRefineTasksStructured,
     HubTaskStatusResult,
     HubTaskStatusStructured,
     structured_tool_result,
@@ -255,7 +258,9 @@ async def hub_create_subtasks(
 
     Args:
         parent_id: Parent task ID (must match hierarchy rules for task_type).
-        items: List of dicts with title, optional description and priority.
+        items: List of dicts with title, optional description, priority, and
+            optional acceptance_criteria (list of Given/When/Then dicts) and
+            risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
         source: agent (draft) or human (open).
         agent: Assigned agent name when source is agent.
@@ -1462,27 +1467,78 @@ async def hub_refine_task(
             summary,
             HubRefineTaskStructured(task_id=task_id, no_op=True),
         )
+    # REST /refine returns the full TaskView. We report what changed from the
+    # PATCH keys we actually sent (not a column diff), and surface AC/risks
+    # counts + readiness from the returned task so the summary never claims
+    # "no changes" when acceptance_criteria or risks were replaced.
     result = await _api_post(f"/api/tasks/{task_id}/refine", body)
-    cols = result.get("updated_columns") or {}
-    if isinstance(cols, dict):
-        updated_columns = cols
-    elif isinstance(cols, list):
-        updated_columns = {name: None for name in cols}
-    else:
-        updated_columns = {}
-    if updated_columns:
-        summary = (
-            f"Task #{task_id} refined. Updated: {', '.join(sorted(updated_columns))}"
-        )
-    else:
-        summary = f"Task #{task_id} refine accepted (no column changes detected)"
+    fields_set = sorted(body.keys())
+    ac_count = (
+        len(result.get("acceptance_criteria") or [])
+        if "acceptance_criteria" in body
+        else None
+    )
+    risks_count = len(result.get("risks") or []) if "risks" in body else None
+    readiness_score = result.get("readiness_score")
+    dor_passed = result.get("dor_passed")
+
+    parts = [f"Set: {', '.join(fields_set)}"]
+    if ac_count is not None:
+        parts.append(f"{ac_count} acceptance criteria")
+    if risks_count is not None:
+        parts.append(f"{risks_count} risks")
+    if readiness_score is not None:
+        parts.append(f"readiness {readiness_score}")
+    summary = f"Task #{task_id} refined. " + "; ".join(parts) + "."
+
     return structured_tool_result(
         summary,
         HubRefineTaskStructured(
             task_id=task_id,
-            updated_columns=updated_columns,
-            refine_result=result,
+            fields_set=fields_set,
+            acceptance_criteria_count=ac_count,
+            risks_count=risks_count,
+            readiness_score=readiness_score,
+            dor_passed=dor_passed,
+            task=result,
         ),
+    )
+
+
+@mcp.tool()
+async def hub_refine_tasks(items: list[dict[str, Any]]) -> HubRefineTasksResult:
+    """Bulk-refine many tasks in ONE atomic call (replaces N hub_refine_task).
+
+    Either every item lands or none does. Use this to bring a batch of tasks
+    to DoR without a request per task.
+
+    Args:
+        items: List of dicts, each with ``task_id`` plus any TaskRefine fields
+            (e.g. work_type, scope_in, problem_statement, size,
+            acceptance_criteria, risks). ``acceptance_criteria``/``risks``
+            replace the full list for that task.
+    """
+    if not items:
+        return structured_tool_result(
+            "Nothing to refine: items list is empty.",
+            HubRefineTasksStructured(no_op=True),
+        )
+    result = await _api_post("/api/tasks/refine-bulk", {"items": items})
+    results = result.get("results") or []
+    lines = [f"Refined {len(results)} task(s):"]
+    for r in results:
+        detail = [f"set {', '.join(r.get('fields_set') or []) or '-'}"]
+        if r.get("acceptance_criteria_count") is not None:
+            detail.append(f"{r['acceptance_criteria_count']} AC")
+        if r.get("risks_count") is not None:
+            detail.append(f"{r['risks_count']} risks")
+        if r.get("readiness_score") is not None:
+            dor = " DoR✓" if r.get("dor_passed") else ""
+            detail.append(f"readiness {r['readiness_score']}{dor}")
+        lines.append(f"  #{r.get('task_id')}: " + "; ".join(detail))
+    return structured_tool_result(
+        "\n".join(lines),
+        HubRefineTasksStructured(results=results),
     )
 
 
@@ -1528,6 +1584,46 @@ async def hub_add_acceptance_criterion(
         body["test_ref"] = test_ref
     await _api_post(f"/api/tasks/{task_id}/acceptance_criteria", body)
     return f"Added {ac_id} to task #{task_id}"
+
+
+@mcp.tool()
+async def hub_upsert_acceptance_criterion(
+    task_id: int,
+    ac_id: str,
+    given: str,
+    when: str,
+    then: str,
+    verifiable_by: str = "test",
+    test_ref: str = "",
+) -> str:
+    """Idempotent upsert of one acceptance criterion by ``ac_id``.
+
+    Unlike ``hub_add_acceptance_criterion`` (which returns 409 on a
+    duplicate id), this overwrites an existing AC with the same ``ac_id``
+    and re-sending the same payload is a safe no-op. Use it when a retry
+    might have already landed, so you don't have to guess the state.
+
+    Args:
+        task_id: Target task.
+        ac_id: Stable identifier (e.g. "AC-1"). Created if new, updated if present.
+        given: Precondition / context.
+        when: Action / event.
+        then: Observable outcome.
+        verifiable_by: test | manual | log_check | ui_check.
+        test_ref: Optional pointer to the test.
+    """
+    body: dict[str, Any] = {
+        "id": ac_id,
+        "given": given,
+        "when": when,
+        "then": then,
+        "verifiable_by": verifiable_by,
+    }
+    if test_ref:
+        body["test_ref"] = test_ref
+    safe_id = urllib.parse.quote(ac_id, safe="")
+    await _api_put(f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}", body)
+    return f"Upserted {ac_id} on task #{task_id}"
 
 
 @mcp.tool()

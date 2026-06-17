@@ -28,6 +28,8 @@ from hub.mcp_server import (
     hub_propose_task,
     hub_pair_start,
     hub_refine_task,
+    hub_refine_tasks,
+    hub_upsert_acceptance_criterion,
     hub_release_task,
     hub_replace_acceptance_criteria,
     hub_report_done,
@@ -407,18 +409,58 @@ async def test_hub_create_task_structured_content_matches_rest(
 async def test_hub_refine_task_structured_content_matches_rest(
     mock_api_post: AsyncMock,
 ) -> None:
-    rest_result = {
-        "updated_columns": {"work_type": "bug", "scope_in": ["auth"]},
-        "ac_count": None,
+    # REST /refine returns the full TaskView, not an audit dict.
+    rest_task = {
+        "id": 42,
+        "work_type": "bug",
+        "scope_in": ["auth"],
+        "acceptance_criteria": [],
+        "risks": [],
+        "readiness_score": 70,
+        "dor_passed": False,
     }
-    mock_api_post.return_value = rest_result
+    mock_api_post.return_value = rest_task
     out = await hub_refine_task(42, work_type="bug", scope_in=["auth"])
     structured = _mcp_structured(out)
     assert structured is not None
     assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
     assert structured["task_id"] == 42
-    assert structured["updated_columns"] == rest_result["updated_columns"]
-    assert structured["refine_result"] == rest_result
+    assert structured["fields_set"] == ["scope_in", "work_type"]
+    assert structured["readiness_score"] == 70
+    assert structured["dor_passed"] is False
+    assert structured["task"] == rest_task
+
+
+async def test_hub_refine_task_reports_ac_changes_without_false_no_op(
+    mock_api_post: AsyncMock,
+) -> None:
+    """Regression: passing only acceptance_criteria must not report 'no changes'."""
+    rest_task = {
+        "id": 42,
+        "acceptance_criteria": [
+            {"id": "AC-1", "given": "g", "when": "w", "then": "t"},
+            {"id": "AC-2", "given": "g", "when": "w", "then": "t"},
+        ],
+        "risks": [],
+        "readiness_score": 90,
+        "dor_passed": True,
+    }
+    mock_api_post.return_value = rest_task
+    out = await hub_refine_task(
+        42,
+        acceptance_criteria=[
+            {"id": "AC-1", "given": "g", "when": "w", "then": "t"},
+            {"id": "AC-2", "given": "g", "when": "w", "then": "t"},
+        ],
+    )
+    text = _mcp_text(out)
+    assert "Task #42 refined" in text
+    assert "no column changes" not in text
+    assert "2 acceptance criteria" in text
+    assert "readiness 90" in text
+    structured = _mcp_structured(out)
+    assert structured["acceptance_criteria_count"] == 2
+    assert structured["fields_set"] == ["acceptance_criteria"]
 
 
 async def test_hub_task_status_structured_content_matches_rest(
@@ -527,6 +569,24 @@ async def test_hub_replace_acceptance_criteria_sends_array(
     mock_api_put.assert_awaited_once_with("/api/tasks/7/acceptance_criteria", items)
 
 
+async def test_hub_upsert_acceptance_criterion_puts_by_id(
+    mock_api_put: AsyncMock,
+) -> None:
+    mock_api_put.return_value = {
+        "id": "AC-1",
+        "given": "g",
+        "when": "w",
+        "then": "t",
+        "verifiable_by": "test",
+    }
+    msg = await hub_upsert_acceptance_criterion(7, "AC-1", "g", "w", "t")
+    assert "Upserted AC-1 on task #7" in msg
+    mock_api_put.assert_awaited_once_with(
+        "/api/tasks/7/acceptance_criteria/AC-1",
+        {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"},
+    )
+
+
 async def test_hub_delete_acceptance_criterion_url_encodes_id(
     mock_api_delete: AsyncMock,
 ) -> None:
@@ -618,6 +678,72 @@ async def test_hub_create_subtasks_posts_bulk_payload(
             "agent": "bot",
         },
     )
+
+
+async def test_hub_create_subtasks_forwards_acceptance_criteria(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = [{"id": 10, "status": "draft", "title": "Sub"}]
+    items = [
+        {
+            "title": "Sub",
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                }
+            ],
+        }
+    ]
+    await hub_create_subtasks(42, items, agent="bot")
+    forwarded = mock_api_post.await_args.args[1]
+    assert forwarded["items"][0]["acceptance_criteria"][0]["id"] == "AC-1"
+
+
+async def test_hub_refine_tasks_bulk_summarizes_results(
+    mock_api_post: AsyncMock,
+) -> None:
+    mock_api_post.return_value = {
+        "results": [
+            {
+                "task_id": 1,
+                "fields_set": ["problem_statement", "acceptance_criteria"],
+                "acceptance_criteria_count": 2,
+                "risks_count": None,
+                "readiness_score": 90,
+                "dor_passed": True,
+            },
+            {
+                "task_id": 2,
+                "fields_set": ["user_story"],
+                "acceptance_criteria_count": None,
+                "risks_count": None,
+                "readiness_score": 40,
+                "dor_passed": False,
+            },
+        ]
+    }
+    items = [
+        {"task_id": 1, "problem_statement": "ps"},
+        {"task_id": 2, "user_story": "us"},
+    ]
+    out = await hub_refine_tasks(items)
+    text = _mcp_text(out)
+    assert "Refined 2 task(s)" in text
+    assert "#1" in text and "2 AC" in text and "readiness 90" in text and "DoR" in text
+    structured = _mcp_structured(out)
+    assert len(structured["results"]) == 2
+    mock_api_post.assert_awaited_once_with("/api/tasks/refine-bulk", {"items": items})
+
+
+async def test_hub_refine_tasks_empty_is_no_op(mock_api_post: AsyncMock) -> None:
+    out = await hub_refine_tasks([])
+    assert "Nothing to refine" in _mcp_text(out)
+    assert _mcp_structured(out)["no_op"] is True
+    mock_api_post.assert_not_called()
 
 
 async def test_hub_create_task_passes_owner_and_reviewer(

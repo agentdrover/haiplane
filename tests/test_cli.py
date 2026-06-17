@@ -315,6 +315,40 @@ def test_cmd_refine_only_includes_provided_fields() -> None:
     )
 
 
+def test_cmd_refine_bulk_posts_items_from_file(tmp_path: Path) -> None:
+    f = tmp_path / "bulk.json"
+    f.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {"task_id": 1, "problem_statement": "ps"},
+                    {"task_id": 2, "user_story": "us"},
+                ]
+            }
+        )
+    )
+    args = argparse.Namespace(from_file=str(f))
+    mock_api = MagicMock(return_value={"results": []})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_refine_bulk(args)
+    assert rc == 0
+    method, path, payload = mock_api.call_args.args
+    assert method == "POST"
+    assert path == "/api/tasks/refine-bulk"
+    assert payload["items"][0]["task_id"] == 1
+
+
+def test_cmd_refine_bulk_requires_items_array(tmp_path: Path) -> None:
+    f = tmp_path / "bad.json"
+    f.write_text(json.dumps({"nope": 1}))
+    args = argparse.Namespace(from_file=str(f))
+    mock_api = MagicMock()
+    with patch.object(cli, "_api", mock_api), patch("sys.stderr", new=StringIO()):
+        rc = cli.cmd_refine_bulk(args)
+    assert rc == 2
+    mock_api.assert_not_called()
+
+
 def test_cmd_refine_with_owner_and_reviewer() -> None:
     args = _refine_args(human_owner="alice", human_reviewer="bob")
     mock_api = MagicMock(return_value={})
@@ -423,6 +457,33 @@ def test_cmd_ac_add_sends_full_body() -> None:
             "then": "t",
             "verifiable_by": "test",
             "test_ref": "tests/x.py",
+        },
+    )
+
+
+def test_cmd_ac_upsert_puts_by_id() -> None:
+    args = argparse.Namespace(
+        task_id=7,
+        id="AC-1",
+        given="g",
+        when="w",
+        then="t",
+        by="manual",
+        test_ref="",
+    )
+    mock_api = MagicMock(return_value={"id": "AC-1"})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_ac_upsert(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "PUT",
+        "/api/tasks/7/acceptance_criteria/AC-1",
+        {
+            "id": "AC-1",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "verifiable_by": "manual",
         },
     )
 

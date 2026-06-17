@@ -10,6 +10,7 @@ translation) live in exactly one place.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -18,8 +19,11 @@ import aiosqlite
 from hub import repository as repo
 from hub.models import (
     AcceptanceCriterion,
+    BulkRefine,
+    BulkRefineResult,
     ReadinessReport,
     TaskRefine,
+    TaskRefineOutcome,
     TaskRisk,
 )
 from hub.services.recommendations import calculate_readiness_with_recommendations
@@ -33,29 +37,49 @@ class DuplicateAcceptanceCriterionError(ValueError):
     """Raised when ac_id collides with an existing one for the same task."""
 
 
+def get_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
+    """Return a per-connection write lock, created lazily on the running loop.
+
+    The Hub uses a single shared aiosqlite connection across requests. Two
+    concurrent mutations would otherwise interleave their SAVEPOINT/commit
+    pairs on that one connection, so one coroutine's ``commit()`` flushes
+    another's half-written rows — surfacing as sporadic HTTP 500s where the
+    write "sometimes still landed" (feedback #3). Serializing the critical
+    section makes list-append writes (e.g. parallel add_acceptance_criterion)
+    atomic and predictable. The lock is stored on the connection (not a module
+    global) so it always binds to the event loop that owns the connection,
+    which keeps per-test loops happy.
+    """
+    lock: asyncio.Lock | None = getattr(db, "_oc_write_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        db._oc_write_lock = lock  # type: ignore[attr-defined]
+    return lock
+
+
 @asynccontextmanager
 async def _atomic(db: aiosqlite.Connection, name: str):
-    """SAVEPOINT-scoped atomic block (review I6).
+    """SAVEPOINT-scoped atomic block, serialized by the per-connection lock.
 
-    The Hub historically uses one shared aiosqlite connection across
-    requests. Without an explicit SAVEPOINT, a partial failure inside
-    a multi-step mutation (e.g. ``update_task_structured`` then
+    Without an explicit SAVEPOINT, a partial failure inside a multi-step
+    mutation (e.g. ``update_task_structured`` then
     ``replace_acceptance_criteria``) leaves dirty rows in the implicit
-    transaction; the next handler's ``commit()`` then promotes them.
-    Wrapping mutations in a SAVEPOINT gives us per-operation atomicity
-    that's safe under shared, pooled, or per-request connections.
+    transaction; the next handler's ``commit()`` then promotes them. The
+    SAVEPOINT gives per-operation atomicity; the write lock prevents
+    concurrent mutations from interleaving on the shared connection.
     """
     sp = name.replace("-", "_").replace(" ", "_")
-    await db.execute(f"SAVEPOINT {sp}")
-    try:
-        yield
-    except BaseException:
-        await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-        await db.execute(f"RELEASE SAVEPOINT {sp}")
-        raise
-    else:
-        await db.execute(f"RELEASE SAVEPOINT {sp}")
-        await db.commit()
+    async with get_write_lock(db):
+        await db.execute(f"SAVEPOINT {sp}")
+        try:
+            yield
+        except BaseException:
+            await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            await db.execute(f"RELEASE SAVEPOINT {sp}")
+            raise
+        else:
+            await db.execute(f"RELEASE SAVEPOINT {sp}")
+            await db.commit()
 
 
 def row_to_ac(row: aiosqlite.Row) -> AcceptanceCriterion:
@@ -107,34 +131,99 @@ async def refine_task(
     await _ensure_task_exists(db, task_id)
     old_row = await repo.get_task(db, task_id)
 
-    ac_count: int | None = None
     async with _atomic(db, "refine_task"):
-        updated_columns = await repo.update_task_structured(db, task_id, payload)
-
-        if (
-            old_row
-            and payload.title is not None
-            and "title" in updated_columns
-            and old_row["title"] != updated_columns["title"]
-        ):
-            await repo.add_task_update(
-                db,
-                task_id,
-                "",
-                "status",
-                f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
-            )
-
-        if payload.acceptance_criteria is not None:
-            try:
-                ac_count = await repo.replace_acceptance_criteria(
-                    db, task_id, payload.acceptance_criteria
-                )
-            except ValueError as exc:
-                # SAVEPOINT rolls back the structured-fields write too.
-                raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+        updated_columns, ac_count = await _apply_refine_writes(
+            db, task_id, payload, old_row
+        )
 
     return {"updated_columns": updated_columns, "ac_count": ac_count}
+
+
+async def _apply_refine_writes(
+    db: aiosqlite.Connection,
+    task_id: int,
+    payload: TaskRefine,
+    old_row: aiosqlite.Row | None,
+) -> tuple[dict[str, Any], int | None]:
+    """Write a refine PATCH WITHOUT opening its own transaction.
+
+    The caller is responsible for the surrounding SAVEPOINT/commit so this
+    helper is reusable by both single (`refine_task`) and bulk
+    (`refine_tasks_bulk`) flows. Returns ``(updated_columns, ac_count)``.
+    """
+    updated_columns = await repo.update_task_structured(db, task_id, payload)
+
+    if (
+        old_row
+        and payload.title is not None
+        and "title" in updated_columns
+        and old_row["title"] != updated_columns["title"]
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "",
+            "status",
+            f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
+        )
+
+    ac_count: int | None = None
+    if payload.acceptance_criteria is not None:
+        try:
+            ac_count = await repo.replace_acceptance_criteria(
+                db, task_id, payload.acceptance_criteria
+            )
+        except ValueError as exc:
+            # SAVEPOINT rolls back the structured-fields write too.
+            raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+
+    return updated_columns, ac_count
+
+
+async def refine_tasks_bulk(
+    db: aiosqlite.Connection,
+    payload: BulkRefine,
+) -> BulkRefineResult:
+    """Apply a TaskRefine PATCH to many tasks in ONE transaction.
+
+    Either every item lands or none does: any error (missing task, duplicate
+    AC id) rolls back the whole batch via the single SAVEPOINT. This collapses
+    the previous "~28 refine calls" into one request.
+    """
+    for item in payload.items:
+        await _ensure_task_exists(db, item.task_id)
+
+    outcomes: list[TaskRefineOutcome] = []
+    async with _atomic(db, "refine_bulk"):
+        for item in payload.items:
+            old_row = await repo.get_task(db, item.task_id)
+            refine = TaskRefine.model_validate(
+                item.model_dump(exclude={"task_id"}, exclude_unset=True)
+            )
+            updated_columns, ac_count = await _apply_refine_writes(
+                db, item.task_id, refine, old_row
+            )
+            fields_set = list(updated_columns.keys())
+            if refine.acceptance_criteria is not None:
+                fields_set.append("acceptance_criteria")
+            fields_set = sorted(set(fields_set))
+            risks_count = len(refine.risks) if refine.risks is not None else None
+            outcomes.append(
+                TaskRefineOutcome(
+                    task_id=item.task_id,
+                    fields_set=fields_set,
+                    acceptance_criteria_count=ac_count,
+                    risks_count=risks_count,
+                )
+            )
+
+    # Readiness is computed after commit so each report reflects the final row.
+    for outcome in outcomes:
+        report = await calculate_readiness_with_recommendations(db, outcome.task_id)
+        outcome.readiness_score = report.score
+        outcome.dor_passed = report.dor_passed
+
+    return BulkRefineResult(results=outcomes)
 
 
 async def add_risk(
@@ -181,6 +270,22 @@ async def add_acceptance_criterion(
                 f"acceptance criterion {ac.id!r} already exists for task {task_id}"
             ) from exc
     return ac
+
+
+async def upsert_acceptance_criterion(
+    db: aiosqlite.Connection,
+    task_id: int,
+    ac: AcceptanceCriterion,
+) -> tuple[AcceptanceCriterion, bool]:
+    """Insert or update an AC by ``ac_id`` (idempotent, no 409 on resend).
+
+    Returns ``(ac, created)`` where ``created`` is True for a fresh insert
+    and False when an existing criterion was overwritten.
+    """
+    await _ensure_task_exists(db, task_id)
+    async with _atomic(db, "upsert_ac"):
+        created = await repo.upsert_acceptance_criterion(db, task_id, ac)
+    return ac, created
 
 
 async def replace_acceptance_criteria(

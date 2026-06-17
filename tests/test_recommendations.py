@@ -21,6 +21,7 @@ from hub.services.readiness import DEFAULT_CONFIG, ReadinessConfig
 from hub.services.recommendations import (
     CHECK_RECOMMENDATIONS,
     SEVERITY_ORDER,
+    build_ac_quality_warnings,
     build_for_task,
     build_recommendations,
     calculate_readiness_with_recommendations,
@@ -47,6 +48,17 @@ def _empty_dor_kwargs(**overrides):
 
 
 def _ac(idx: int = 1) -> AcceptanceCriterion:
+    return AcceptanceCriterion(
+        id=f"AC-{idx}",
+        given="a logged-in user on the dashboard",
+        when="they click the export button",
+        then="a CSV download starts within 2 seconds",
+        verifiable_by=ACVerifiableBy.test,
+    )
+
+
+def _thin_ac(idx: int = 1) -> AcceptanceCriterion:
+    """Formally valid but empty-by-meaning AC (placeholder clauses)."""
     return AcceptanceCriterion(
         id=f"AC-{idx}",
         given="g",
@@ -287,6 +299,62 @@ async def test_calculate_readiness_with_recommendations_includes_risks(
     # Risk lowers score but does not generate a recommendation.
     assert report.score == 100 - DEFAULT_CONFIG.risk_penalties[RiskSeverity.high]
     assert report.recommendations == []
+
+
+async def test_ac_quality_warning_for_thin_ac_is_non_blocking(
+    db: aiosqlite.Connection,
+):
+    """A task with hollow ACs still passes DoR (presence-only), but gets a
+    low-severity, score-neutral nudge about AC quality (#6)."""
+    payload = TaskCreate(
+        title="t",
+        user_story="us",
+        problem_statement="ps",
+        business_value="bv",
+        scope_in=["a"],
+        validation_commands=["pytest"],
+        size=TaskSize.S,
+        wip_tag=WipTag.feature_work,
+    )
+    task_id = await repo.create_task_full(db, payload, status="draft")
+    await repo.add_acceptance_criterion(db, task_id, _thin_ac(1))
+    await db.commit()
+
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    # Presence-only DoR is unaffected.
+    assert report.score == 100
+    assert report.dor_passed is True
+    quality = [
+        r
+        for r in report.recommendations
+        if r.field == "acceptance_criteria" and r.severity == "low"
+    ]
+    assert len(quality) == 1
+    assert "AC-1" in quality[0].message
+    assert quality[0].expected_score_delta == 0
+
+
+async def test_no_ac_quality_warning_for_substantive_ac(db: aiosqlite.Connection):
+    task_id = await _make_full_task(db)
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    assert report.recommendations == []
+
+
+def test_build_ac_quality_warnings_unit():
+    thin_rows = [
+        {"ac_id": "AC-1", "given": "g", "when_clause": "w", "then_clause": "t"}
+    ]
+    good_rows = [
+        {
+            "ac_id": "AC-2",
+            "given": "a logged-in user on the dashboard",
+            "when_clause": "they click the export button",
+            "then_clause": "a CSV download starts within 2 seconds",
+        }
+    ]
+    assert len(build_ac_quality_warnings(thin_rows)) == 1
+    assert build_ac_quality_warnings(good_rows) == []
+    assert build_ac_quality_warnings([]) == []
 
 
 async def test_score_after_applying_all_recommendations_returns_to_max(

@@ -18,9 +18,16 @@ class HubCreateTaskStructured(BaseModel):
 class HubRefineTaskStructured(BaseModel):
     schema_version: str = Field(default=MCP_STRUCTURED_SCHEMA_VERSION)
     task_id: int
-    updated_columns: dict[str, Any] = Field(default_factory=dict)
-    refine_result: dict[str, Any] | None = None
+    # Request fields actually sent (the PATCH keys), so callers know exactly
+    # what was applied without guessing from a TaskView diff.
+    fields_set: list[str] = Field(default_factory=list)
+    acceptance_criteria_count: int | None = None
+    risks_count: int | None = None
+    readiness_score: int | None = None
+    dor_passed: bool | None = None
     no_op: bool = False
+    # Full task as returned by REST /refine (TaskView), for machine consumers.
+    task: dict[str, Any] | None = None
 
 
 class HubTaskStatusStructured(BaseModel):
@@ -28,8 +35,17 @@ class HubTaskStatusStructured(BaseModel):
     task: dict[str, Any]
 
 
+class HubRefineTasksStructured(BaseModel):
+    schema_version: str = Field(default=MCP_STRUCTURED_SCHEMA_VERSION)
+    # One entry per task: {task_id, fields_set, acceptance_criteria_count,
+    # risks_count, readiness_score, dor_passed}.
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    no_op: bool = False
+
+
 HubCreateTaskResult = Annotated[CallToolResult, HubCreateTaskStructured]
 HubRefineTaskResult = Annotated[CallToolResult, HubRefineTaskStructured]
+HubRefineTasksResult = Annotated[CallToolResult, HubRefineTasksStructured]
 HubTaskStatusResult = Annotated[CallToolResult, HubTaskStatusStructured]
 
 

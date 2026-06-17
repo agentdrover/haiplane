@@ -20,6 +20,8 @@ from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.models import (
     BulkChildTasksCreate,
+    BulkRefine,
+    BulkRefineResult,
     AcceptanceCriterion,
     ActivityItem,
     DashboardData,
@@ -614,6 +616,22 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
     return await services.enrich_task_view(db, task_view)
 
 
+@app.post("/api/tasks/refine-bulk", response_model=BulkRefineResult)
+async def api_refine_tasks_bulk(body: BulkRefine, request: Request):
+    """Apply a TaskRefine PATCH to many tasks in one atomic request.
+
+    Either all items land or none do. Returns a per-task audit
+    (fields set, AC/risks counts, readiness).
+    """
+    db = _db(request)
+    try:
+        return await services.refine_tasks_bulk(db, body)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+    except DuplicateAcceptanceCriterionError as exc:
+        raise _duplicate_to_http(exc, 422) from exc
+
+
 @app.post(
     "/api/tasks/{task_id}/risks",
     response_model=TaskView,
@@ -682,6 +700,35 @@ async def api_replace_acceptance_criteria(
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, 422) from exc
+
+
+@app.put(
+    "/api/tasks/{task_id}/acceptance_criteria/{ac_id}",
+    response_model=AcceptanceCriterion,
+)
+async def api_upsert_acceptance_criterion(
+    task_id: int,
+    ac_id: str,
+    body: AcceptanceCriterion,
+    request: Request,
+    response: Response,
+):
+    """Idempotent upsert of one AC by ``ac_id``.
+
+    Re-sending the same payload is a no-op; a changed payload overwrites the
+    row instead of returning 409. The body ``id`` must match the path ``ac_id``.
+    Returns 201 when a new criterion was created, 200 when one was updated.
+    """
+    if body.id != ac_id:
+        raise HTTPException(422, f"ac id mismatch: path {ac_id!r} != body {body.id!r}")
+    try:
+        ac, created = await services.upsert_acceptance_criterion(
+            _db(request), task_id, body
+        )
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return ac
 
 
 @app.delete(
