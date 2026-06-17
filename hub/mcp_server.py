@@ -10,6 +10,15 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
+from hub.mcp_structured import (
+    HubCreateTaskResult,
+    HubCreateTaskStructured,
+    HubRefineTaskResult,
+    HubRefineTaskStructured,
+    HubTaskStatusResult,
+    HubTaskStatusStructured,
+    structured_tool_result,
+)
 
 # FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
 # The hub mounts streamable HTTP under the main FastAPI app, so clients send the
@@ -201,7 +210,7 @@ async def hub_create_task(
     run_immediately: bool = False,
     human_owner: str = "",
     human_reviewer: str = "",
-) -> str:
+) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask.
 
     Args:
@@ -230,10 +239,43 @@ async def hub_create_task(
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
     status = result.get("status", "?")
-    return (
-        f"{task_type.capitalize()} #{result['id']} created (status: {status}).\n"
-        + json.dumps(result, ensure_ascii=False, indent=2)
-    )
+    summary = f"{task_type.capitalize()} #{result['id']} created (status: {status})."
+    return structured_tool_result(summary, HubCreateTaskStructured(task=result))
+
+
+@mcp.tool()
+async def hub_create_subtasks(
+    parent_id: int,
+    items: list[dict[str, Any]],
+    task_type: str = "subtask",
+    source: str = "agent",
+    agent: str = "",
+) -> str:
+    """Create multiple child tasks under one parent in a single atomic call.
+
+    Args:
+        parent_id: Parent task ID (must match hierarchy rules for task_type).
+        items: List of dicts with title, optional description and priority.
+        task_type: task or subtask (default subtask).
+        source: agent (draft) or human (open).
+        agent: Assigned agent name when source is agent.
+    """
+    if not items:
+        return "Nothing to create: items list is empty."
+    body: dict[str, Any] = {
+        "items": items,
+        "task_type": task_type,
+        "source": source,
+        "agent": agent,
+    }
+    created = await _api_post(f"/api/tasks/{parent_id}/subtasks", body)
+    if not created:
+        return f"No subtasks created under #{parent_id}."
+    lines = [
+        f"Created {len(created)} {task_type}(s) under #{parent_id}:",
+        *[f"  #{t['id']} [{t['status']}] {t['title']}" for t in created],
+    ]
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -243,6 +285,8 @@ async def hub_list_tasks(
     parent_id: int | None = None,
     human_owner: str = "",
     human_reviewer: str = "",
+    claimed_by: str = "",
+    mine: str = "",
     limit: int = 20,
     include_archived: bool = False,
 ) -> str:
@@ -254,6 +298,8 @@ async def hub_list_tasks(
         parent_id: Filter by parent task ID. None for all.
         human_owner: Filter by human_owner (exact match). Empty for all.
         human_reviewer: Filter by human_reviewer (exact match). Empty for all.
+        claimed_by: Filter by claim holder (exact match). Empty for all.
+        mine: Shorthand for human_owner OR claimed_by (same person). Empty for all.
         limit: Max number of tasks to return
         include_archived: When True, include archived tasks (hidden from boards by default).
     """
@@ -270,6 +316,10 @@ async def hub_list_tasks(
         params["human_owner"] = human_owner
     if human_reviewer:
         params["human_reviewer"] = human_reviewer
+    if claimed_by:
+        params["claimed_by"] = claimed_by
+    if mine:
+        params["mine"] = mine
     if include_archived:
         params["include_archived"] = "true"
     tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
@@ -280,7 +330,7 @@ async def hub_list_tasks(
 
 
 @mcp.tool()
-async def hub_task_status(task_id: int) -> str:
+async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     """Get detailed status of a specific task including updates and log tail.
 
     Args:
@@ -309,7 +359,8 @@ async def hub_task_status(task_id: int) -> str:
         parts.append(f"\nResult:\n{task['result_text']}")
     if task.get("log_tail"):
         parts.append("\nLog tail:\n" + "\n".join(task["log_tail"][-20:]))
-    return "\n".join(parts)
+    summary = "\n".join(parts)
+    return structured_tool_result(summary, HubTaskStatusStructured(task=task))
 
 
 @mcp.tool()
@@ -335,22 +386,39 @@ async def hub_task_update(
     return f"Update #{result['id']} added to task #{task_id}."
 
 
+def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
+    """Return MCP text that reflects the actual post-report task status."""
+    base = (
+        f"Done report #{report_id} submitted for task #{task_id}. "
+        f"Task status: {status}."
+    )
+    if status == "completed":
+        return f"{base} Task completed."
+    if status == "pending_report":
+        return f"{base} Awaiting human review before completion."
+    if status in ("ci_check", "review", "needs_decision"):
+        return f"{base} Task entered {status}."
+    if status in ("open", "running"):
+        return (
+            f"{base} Status unchanged for this report "
+            "(pair/open path; use pair-start or done conveyor as applicable)."
+        )
+    return base
+
+
 @mcp.tool()
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
-    """Submit a completion report for a task — the normal agent path out of pending_report.
+    """Submit a done report and return the task's actual status after lifecycle handling.
 
-    After an agent finishes work it must submit a done report describing what was changed
-    and how it was validated; the report transitions the task from pending_report to
-    completed. This is the standard close-out path for agents.
-
-    The explicit human exception is `hub_force_complete_task`, which is reserved for cases
-    where a human has inspected the result and accepts that the agent report is missing or
-    unacceptably weak. Agents should not use `hub_force_complete_task` as a fallback —
-    they should always submit a real done report through this tool.
+    From ``pending_report``, a valid done report typically moves the task to
+    ``completed``. In pair mode (``open``/``running`` without ``job_id``), the
+    same tool may leave the task unchanged or advance it to ``ci_check`` — the
+    response always states the real status and never implies ``completed`` unless
+    the task is actually completed.
 
     Args:
         task_id: The task ID to report on
-        summary: What was changed and how it was validated (e.g. 'Changed: X, Y. Validation: tests pass, ruff clean.')
+        summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
     """
     result = await _api_post(
@@ -361,7 +429,9 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
             "content": summary,
         },
     )
-    return f"Done report #{result['id']} submitted for task #{task_id}. Task should now be completed."
+    task = await _api_get(f"/api/tasks/{task_id}")
+    status = task.get("status", "?")
+    return _format_hub_report_done_message(task_id, result["id"], status)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +544,86 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
 
 
 @mcp.tool()
+async def hub_pair_start(
+    task_id: int,
+    plan: str = "",
+    assigned_agent: str = "",
+    branch_slug: str = "",
+) -> str:
+    """Start pair mode: move an open task to running without headless dispatch.
+
+    Use this when a human works with a Cursor agent locally instead of
+    ``hub_start_task``, which always calls oc-dev-dispatch.
+
+    Args:
+        task_id: The open task ID to pair-start
+        plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
+        assigned_agent: Agent name to record on the task. Empty uses caller identity.
+        branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
+    """
+    body: dict[str, Any] = {}
+    if plan:
+        body["plan"] = plan
+    if assigned_agent:
+        body["assigned_agent"] = assigned_agent
+    if branch_slug:
+        body["branch_slug"] = branch_slug
+    result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
+    status = result.get("status", "?")
+    branch = result.get("branch") or "-"
+    agent = result.get("assigned_agent") or "-"
+    job_id = result.get("job_id")
+    job_note = "no dispatch job" if not job_id else f"job: {job_id}"
+    return (
+        f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
+        f"agent: {agent}, {job_note})."
+    )
+
+
+@mcp.tool()
+async def hub_claim_task(
+    task_id: int,
+    agent: str,
+    session_id: str = "",
+) -> str:
+    """Claim an open task for one Cursor agent/session (409 if already claimed).
+
+    Args:
+        task_id: The open task ID
+        agent: Agent name taking the claim
+        session_id: Optional Cursor session id for conflict detection
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/claim",
+        {"agent": agent, "session_id": session_id},
+    )
+    status = result.get("status", "?")
+    holder = result.get("claimed_by") or agent
+    return f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
+
+
+@mcp.tool()
+async def hub_release_task(
+    task_id: int,
+    agent: str,
+    session_id: str = "",
+) -> str:
+    """Release a claimed task back to open.
+
+    Args:
+        task_id: The claimed task ID
+        agent: Agent that holds the claim
+        session_id: Optional session id that must match the claim
+    """
+    result = await _api_post(
+        f"/api/tasks/{task_id}/release",
+        {"agent": agent, "session_id": session_id},
+    )
+    status = result.get("status", "?")
+    return f"Task #{task_id} claim released (status: {status})."
+
+
+@mcp.tool()
 async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     """Human force-completes a pending_report task without an agent done report.
 
@@ -541,10 +691,14 @@ async def hub_delete_task(task_id: int) -> str:
 
 @mcp.tool()
 async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
-    """Agent asks a clarifying question on a running task. Task pauses until human answers.
+    """Agent asks a clarifying question. Task moves to needs_info until human answers.
+
+    Allowed when the task is ``running``, or ``open`` with no ``job_id`` (pair path
+    before ``hub_pair_start``). Headless ``running`` tasks with a ``job_id`` are
+    unchanged.
 
     Args:
-        task_id: The running task ID
+        task_id: The task ID
         question: The question text
         agent: Name of the agent asking
     """
@@ -560,12 +714,16 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
 
 @mcp.tool()
 async def hub_answer_question(task_id: int, answer: str, resume: bool = True) -> str:
-    """Human answers agent's question. By default re-dispatches the task.
+    """Human answers agent's question on a needs_info task.
+
+    For pair tasks (no ``job_id``), ``resume=true`` returns to ``open`` or ``running``
+    without headless dispatch. Headless tasks with a ``job_id`` re-dispatch when
+    ``resume=true``.
 
     Args:
         task_id: The needs_info task ID
         answer: The answer text
-        resume: If True, re-dispatch the task with context. If False, just save the answer.
+        resume: If True, resume work after the answer. Pair: no dispatch; headless: re-dispatch.
     """
     result = await _api_post(
         f"/api/tasks/{task_id}/answer",
@@ -1211,6 +1369,7 @@ async def hub_prepare_developer_task(
 @mcp.tool()
 async def hub_refine_task(
     task_id: int,
+    title: str | None = None,
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -1230,14 +1389,19 @@ async def hub_refine_task(
     review_checklist: list[str] | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
-) -> str:
+    acceptance_criteria: list[dict[str, Any]] | None = None,
+    risks: list[dict[str, Any]] | None = None,
+) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written. Omit a parameter to leave the
     existing value untouched. Lists fully replace the existing list.
+    ``acceptance_criteria`` and ``risks`` mirror POST /api/tasks/{id}/refine:
+    AC list replaces all criteria; risks list replaces the JSON risks column.
 
     Args:
         task_id: Task to refine.
+        title: New task title (1–500 chars). Omit to leave unchanged.
         work_type: feature | bug | refactor | chore | docs | spike | incident
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
@@ -1257,9 +1421,12 @@ async def hub_refine_task(
         review_checklist: Reviewer checklist — what to verify in diff (REPLACES).
         human_owner: Person who owns / is accountable for this task.
         human_reviewer: Person who will review and accept the result.
+        acceptance_criteria: Full AC replacement list (same shape as REST refine).
+        risks: Full risks list replacement (same shape as REST refine / TaskRisk).
     """
     body: dict[str, Any] = {}
     for key, val in (
+        ("title", title),
         ("work_type", work_type),
         ("class_of_service", class_of_service),
         ("size", size),
@@ -1282,16 +1449,41 @@ async def hub_refine_task(
     ):
         if val is not None:
             body[key] = val
+    if acceptance_criteria is not None:
+        body["acceptance_criteria"] = acceptance_criteria
+    if risks is not None:
+        body["risks"] = risks
     if not body:
-        return (
-            "Nothing to refine: pass at least one structured field. "
-            "Use hub_replace_acceptance_criteria for AC changes."
+        summary = (
+            "Nothing to refine: pass at least one structured field, "
+            "acceptance_criteria, or risks."
+        )
+        return structured_tool_result(
+            summary,
+            HubRefineTaskStructured(task_id=task_id, no_op=True),
         )
     result = await _api_post(f"/api/tasks/{task_id}/refine", body)
     cols = result.get("updated_columns") or {}
-    if cols:
-        return f"Task #{task_id} refined. Updated: {', '.join(sorted(cols))}"
-    return f"Task #{task_id} refine accepted (no column changes detected)"
+    if isinstance(cols, dict):
+        updated_columns = cols
+    elif isinstance(cols, list):
+        updated_columns = {name: None for name in cols}
+    else:
+        updated_columns = {}
+    if updated_columns:
+        summary = (
+            f"Task #{task_id} refined. Updated: {', '.join(sorted(updated_columns))}"
+        )
+    else:
+        summary = f"Task #{task_id} refine accepted (no column changes detected)"
+    return structured_tool_result(
+        summary,
+        HubRefineTaskStructured(
+            task_id=task_id,
+            updated_columns=updated_columns,
+            refine_result=result,
+        ),
+    )
 
 
 @mcp.tool()

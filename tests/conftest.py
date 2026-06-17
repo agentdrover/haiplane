@@ -39,6 +39,10 @@ class MockGitOps(NoopGitOps):
     async def create_branch(self, task_id, title, repo=None):
         return f"task-{task_id}/test"
 
+    async def pair_prepare_branch(self, task_id, title, *, branch_slug="", repo=None):
+        slug = branch_slug or "test"
+        return f"task-{task_id}/{slug}"
+
     async def checkout(self, branch, repo=None):
         return True
 

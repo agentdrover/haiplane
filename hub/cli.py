@@ -267,6 +267,33 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pair_start(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {}
+    if args.plan:
+        body["plan"] = args.plan
+    if args.agent:
+        body["assigned_agent"] = args.agent
+    if getattr(args, "branch_slug", None):
+        body["branch_slug"] = args.branch_slug
+    result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    body = {"agent": args.agent, "session_id": args.session_id or ""}
+    result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    body = {"agent": args.agent, "session_id": args.session_id or ""}
+    result = _api("POST", f"/api/tasks/{args.task_id}/release", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_question(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "agent": args.agent or "",
@@ -305,6 +332,10 @@ def cmd_list(args: argparse.Namespace) -> int:
         params += f"&human_owner={urllib.parse.quote(args.owner)}"
     if getattr(args, "reviewer", None):
         params += f"&human_reviewer={urllib.parse.quote(args.reviewer)}"
+    if getattr(args, "claimed_by", None):
+        params += f"&claimed_by={urllib.parse.quote(args.claimed_by)}"
+    if getattr(args, "mine", None):
+        params += f"&mine={urllib.parse.quote(args.mine)}"
     if getattr(args, "include_archived", False):
         params += "&include_archived=true"
     result = _api("GET", f"/api/tasks{params}")
@@ -407,6 +438,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 # wasn't given at all, we don't include the key in the payload, and the
 # field on the server stays untouched.
 _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
+    ("title", "title"),
     ("work_type", "work_type"),
     ("class_of_service", "class_of_service"),
     ("size", "size"),
@@ -477,6 +509,33 @@ def cmd_refine(args: argparse.Namespace) -> int:
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/refine", payload)
     _print_json(result)
+    return 0
+
+
+def cmd_subtasks_bulk(args: argparse.Namespace) -> int:
+    payload = _load_payload_file(args.from_file)
+    if not isinstance(payload, dict):
+        print(
+            f"--from-file must contain a JSON/YAML object, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    if "items" not in payload or not isinstance(payload["items"], list):
+        print("--from-file must include an items array.", file=sys.stderr)
+        return 2
+    if getattr(args, "task_type", None):
+        payload["task_type"] = args.task_type
+    elif "task_type" not in payload:
+        payload["task_type"] = "subtask"
+    if getattr(args, "source", None):
+        payload["source"] = args.source
+    elif "source" not in payload:
+        payload["source"] = "agent"
+    if getattr(args, "agent", None):
+        payload["agent"] = args.agent
+    result = _api("POST", f"/api/tasks/{args.parent_id}/subtasks", payload)
+    for task in result:
+        _print_task_short(task)
     return 0
 
 
@@ -889,6 +948,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
 
+    p_subtasks_bulk = sub.add_parser(
+        "subtasks-bulk",
+        help="Create multiple child tasks under a parent atomically",
+    )
+    p_subtasks_bulk.add_argument("parent_id", type=int)
+    p_subtasks_bulk.add_argument(
+        "--from-file",
+        required=True,
+        help="JSON/YAML with items: [{title, description?, priority?}, ...]",
+    )
+    p_subtasks_bulk.add_argument(
+        "--task-type",
+        dest="task_type",
+        choices=["task", "subtask"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument(
+        "--source",
+        choices=["agent", "human"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument("--agent", default="")
+    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
+
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
     p_tree.add_argument("task_id", type=int)
@@ -942,6 +1025,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--runtime", choices=["auto", "openrouter"], default=None)
     p_start.set_defaults(func=cmd_start)
 
+    p_pair_start = sub.add_parser(
+        "pair-start",
+        help="Start pair mode (running without headless dispatch)",
+    )
+    p_pair_start.add_argument("task_id", type=int)
+    p_pair_start.add_argument(
+        "--plan", default="", help="Work plan (required if no plan update exists)"
+    )
+    p_pair_start.add_argument(
+        "--agent", default="", help="Assigned agent name to record on the task"
+    )
+    p_pair_start.add_argument(
+        "--branch-slug",
+        dest="branch_slug",
+        default="",
+        help="Git branch slug (task-<id>/<slug>); default from task title",
+    )
+    p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
+    p_claim.add_argument("task_id", type=int)
+    p_claim.add_argument("--agent", required=True, help="Agent taking the claim")
+    p_claim.add_argument(
+        "--session-id", dest="session_id", default="", help="Cursor session id"
+    )
+    p_claim.set_defaults(func=cmd_claim)
+
+    p_release = sub.add_parser("release", help="Release a claimed task")
+    p_release.add_argument("task_id", type=int)
+    p_release.add_argument("--agent", required=True, help="Agent releasing the claim")
+    p_release.add_argument(
+        "--session-id", dest="session_id", default="", help="Cursor session id"
+    )
+    p_release.set_defaults(func=cmd_release)
+
     # question — agent asks a question (sets needs_info)
     p_question = sub.add_parser(
         "question", help="Agent asks a question on a running task"
@@ -951,8 +1069,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_question.add_argument("--agent", default="", help="Agent name")
     p_question.set_defaults(func=cmd_question)
 
-    # answer — human answers a question (re-dispatches by default)
-    p_answer = sub.add_parser("answer", help="Answer agent question and re-dispatch")
+    # answer — human answers a question (re-dispatches headless by default)
+    p_answer = sub.add_parser(
+        "answer",
+        help="Answer agent question; pair tasks resume without dispatch",
+    )
     p_answer.add_argument("task_id", type=int)
     p_answer.add_argument("--message", required=True, help="The answer text")
     p_answer.add_argument(
@@ -992,6 +1113,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--parent", type=int, default=None, help="Filter by parent ID")
     p_list.add_argument("--owner", default=None, help="Filter by human_owner")
     p_list.add_argument("--reviewer", default=None, help="Filter by human_reviewer")
+    p_list.add_argument("--claimed-by", default=None, help="Filter by claim holder")
+    p_list.add_argument(
+        "--mine",
+        default=None,
+        help="Filter by human_owner OR claimed_by (same person)",
+    )
     p_list.add_argument("--limit", type=int, default=20)
     p_list.add_argument(
         "--include-archived",
@@ -1103,6 +1230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refine a task: PATCH structured fields (work_type, scope, value, ...)",
     )
     p_refine.add_argument("task_id", type=int)
+    p_refine.add_argument(
+        "--title",
+        dest="title",
+        default=None,
+        help="New task title",
+    )
     p_refine.add_argument(
         "--from-file",
         dest="from_file",

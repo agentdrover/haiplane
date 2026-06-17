@@ -173,6 +173,23 @@ async def test_refine_updates_human_owner_and_reviewer(client: AsyncClient):
     assert body2["human_reviewer"] == "bob"
 
 
+async def test_refine_updates_title(client: AsyncClient):
+    task = await _create_task(client)
+    old_title = task["title"]
+
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"title": "Renamed via refine"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["title"] == "Renamed via refine"
+    assert body["title"] != old_title
+
+    updates = (await client.get(f"/api/tasks/{task['id']}")).json()["updates"]
+    assert any("Title refined" in u["content"] for u in updates)
+
+
 async def test_refine_review_checklist_replace_omit_clear(client: AsyncClient):
     """PATCH semantics for review_checklist: replace, omit-keeps, []-clears."""
     task = await _create_task(client)

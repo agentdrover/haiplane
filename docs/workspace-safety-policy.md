@@ -3,7 +3,8 @@
 Эта политика фиксирует инварианты, при которых несколько людей и AI-агентов могут безопасно работать в одном workspace repo через OpenClaw Hub. Цель — исключить тихое перетирание чужой работы, размывание scope и ложное завершение задач при конфликтах в git/CI.
 
 Связанные документы:
-- [software-development-workflow.md](software-development-workflow.md) — общий жизненный цикл задачи.
+- [software-development-workflow.md](software-development-workflow.md) — общий жизненный цикл задачи и [Pair mode: git policy](software-development-workflow.md#pair-mode-git-policy).
+- [task-workflow.html](task-workflow.html#pair-git-policy) — краткая схема path B и git-сценарии.
 - [cursor-agent-rules.md](cursor-agent-rules.md) — короткий checklist для Cursor-агентов.
 
 ## Scope
@@ -56,6 +57,28 @@ Agent не делает commit, push, rebase, force-push, merge или branch de
 - **Code Reviewer agent**: при неразрешимой неоднозначности оставляет задачу в `needs_decision`, не вызывает `hub_decide_task` сам.
 - **Architect Analyst agent**: при обнаружении scope creep оформляет новый draft через `hub_propose_task`, не расширяет текущую задачу.
 - **Человек**: единственный, кто может (a) авторизовать касание чужого branch через `hub_decide_task`, (b) принять решение в `needs_decision`, (c) выполнить `hub_approve_task(..., force=true)` или `hub_force_complete_task`.
+
+## Pair mode (path B) — дополнительные правила git
+
+Применяется, когда задача стартовала через `hub_pair_start` (running **без** `job_id`), а код пишется в Cursor на локальном clone.
+
+### P1. Commit before pair-start на shared workspace
+
+Если `OPENCLAW_WORKSPACE_REPO` совпадает с каталогом, открытым в Cursor, **не вызывайте `hub_pair_start` с незакоммиченными изменениями**. Git ops plugin при создании branch может выполнить `git clean -fd` на dirty worktree. Это не баг политики безопасности задач, а текущее поведение `create_branch`; обход — commit/stash до pair-start.
+
+### P2. Имя branch в хабе ≠ автоматически текущая ветка IDE
+
+Hub записывает `task-<id>/<slug>` в поле задачи и может checkout эту ветку в workspace repo. Ветка разработчика в Cursor (например `task-37/pair-start`) может отличаться от slug из title. Разрешение — явное: checkout branch из задачи, merge/cherry-pick, или update в хабе после согласования с human owner. **Не** делать force-push чужих веток.
+
+### P3. CI/review только после push
+
+Pair mode не запускает headless dispatch. GitHub CI и reviewer agent ориентируются на **remote** branch. До `git push` задача может быть `running` в хабе, но CI не увидит код — это ожидаемо.
+
+### P4. Server workspace vs local clone
+
+Если hub на сервере, а Cursor на ноутбуке — два clone. Invariant «один branch на задачу» сохраняется по **имени** на remote; локально создайте matching branch и push. Не редактируйте server clone вручную без runbook и human gate.
+
+Подробные шаги: [software-development-workflow.md § Pair mode: git policy](software-development-workflow.md#pair-mode-git-policy).
 
 ## Аудит
 

@@ -79,6 +79,82 @@ async def dispatch_task(
     return result
 
 
+async def prepare_pair_branch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    *,
+    branch_slug: str = "",
+) -> str:
+    """Create or checkout a task branch without dispatching a headless agent."""
+    branch = (task.get("branch") or "").strip()
+    if branch:
+        await plugins.git_ops.checkout(branch)
+        return branch
+    return await plugins.git_ops.pair_prepare_branch(
+        task_id,
+        task["title"],
+        branch_slug=branch_slug,
+    )
+
+
+async def transition_after_agent_done(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    has_done: bool,
+    exit_code: int | None = None,
+    result_text: str | None = None,
+) -> str:
+    """Post-done lifecycle shared by headless poller and pair mode."""
+    task_id = task["id"]
+    if (
+        task.get("auto_review")
+        and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
+        and has_done
+    ):
+        branch = task.get("branch")
+        if branch:
+            await plugins.git_ops.checkout(branch)
+            await plugins.git_ops.auto_commit(task_id, title=task.get("title", ""))
+            squashed = await plugins.git_ops.squash_branch(
+                task_id,
+                task.get("title", ""),
+                branch,
+            )
+            await plugins.git_ops.push_branch(branch, force=squashed)
+            if not task.get("pr_number"):
+                pr_num = await plugins.git_ops.create_pr(
+                    task_id,
+                    task["title"],
+                    task.get("description", ""),
+                    branch,
+                )
+                if pr_num:
+                    await repo.update_task(db, task_id, pr_number=pr_num)
+                    task["pr_number"] = pr_num
+        await repo.update_task(
+            db,
+            task_id,
+            status="ci_check",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        log.info("Task #%d → ci_check after done report", task_id)
+        return "ci_check"
+
+    next_status = "completed" if has_done else "pending_report"
+    await repo.update_task(
+        db,
+        task_id,
+        status=next_status,
+        exit_code=exit_code,
+        result_text=result_text,
+    )
+    log.info("Task #%d → %s after done report", task_id, next_status)
+    return next_status
+
+
 async def dispatch_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],

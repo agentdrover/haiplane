@@ -19,6 +19,7 @@ from hub import repository as repo
 from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.models import (
+    BulkChildTasksCreate,
     AcceptanceCriterion,
     ActivityItem,
     DashboardData,
@@ -26,13 +27,16 @@ from hub.models import (
     TaskAnswer,
     TaskApprove,
     TaskArchive,
+    TaskClaim,
     TaskContextView,
     TaskCreate,
     TaskDecide,
     TaskForceComplete,
     TaskQuestion,
     TaskRefine,
+    TaskPairStart,
     TaskReject,
+    TaskRelease,
     TaskReorder,
     TaskRisk,
     TaskSource,
@@ -43,7 +47,12 @@ from hub.models import (
     TaskUpdateView,
     TaskView,
 )
-from hub.auth import AuthMiddleware, require_human_or_admin, require_permission
+from hub.auth import (
+    AuthMiddleware,
+    current_identity,
+    require_human_or_admin,
+    require_permission,
+)
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
@@ -173,6 +182,16 @@ async def api_create_task(body: TaskCreate, request: Request):
     return await services.create_task(_db(request), body)
 
 
+@app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
+async def api_create_subtasks_bulk(
+    parent_id: int,
+    body: BulkChildTasksCreate,
+    request: Request,
+):
+    """Atomically create multiple child tasks under ``parent_id``."""
+    return await services.create_subtasks_bulk(_db(request), parent_id, body)
+
+
 @app.get("/api/tasks", response_model=list[TaskView])
 async def api_list_tasks(
     request: Request,
@@ -182,6 +201,8 @@ async def api_list_tasks(
     parent_id: int | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = Query(default=None, description="Filter owner OR claim holder"),
     limit: int = Query(default=50, le=200),
     include_archived: bool = Query(default=False, alias="include_archived"),
 ):
@@ -193,6 +214,8 @@ async def api_list_tasks(
         parent_id=parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
+        claimed_by=claimed_by,
+        mine=mine,
         limit=limit,
         include_archived=include_archived,
     )
@@ -445,6 +468,48 @@ async def api_start_task(
     _identity=Depends(require_human_or_admin),
 ):
     return await services.start_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/pair-start", response_model=TaskView)
+async def api_pair_start_task(
+    task_id: int,
+    request: Request,
+    body: TaskPairStart | None = None,
+    identity=Depends(current_identity),
+):
+    """Start pair mode: running without headless dispatch (human or agent)."""
+    return await services.pair_start_task(
+        _db(request),
+        task_id,
+        body,
+        caller=identity.username,
+    )
+
+
+@app.post("/api/tasks/{task_id}/claim", response_model=TaskView)
+async def api_claim_task(
+    task_id: int,
+    body: TaskClaim,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Claim an open task for one Cursor agent/session."""
+    if not body.agent.strip():
+        body = TaskClaim(agent=identity.username, session_id=body.session_id)
+    return await services.claim_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/release", response_model=TaskView)
+async def api_release_task(
+    task_id: int,
+    body: TaskRelease,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Release a claimed task back to open."""
+    if not body.agent.strip():
+        body = TaskRelease(agent=identity.username, session_id=body.session_id)
+    return await services.release_task(_db(request), task_id, body)
 
 
 # --- Q&A: Question / Answer ---

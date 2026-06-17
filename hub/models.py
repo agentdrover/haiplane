@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class TaskStatus(str, Enum):
     draft = "draft"
     open = "open"
+    claimed = "claimed"
     running = "running"
     needs_info = "needs_info"
     review = "review"
@@ -132,6 +133,7 @@ HIERARCHY_RULES: dict[TaskType, TaskType | None] = {
 ACTIVE_STATUSES = frozenset(
     {
         TaskStatus.open,
+        TaskStatus.claimed,
         TaskStatus.running,
         TaskStatus.fix_requested,
         TaskStatus.ci_check,
@@ -195,6 +197,29 @@ class TaskCreate(BaseModel):
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
 
 
+MAX_BULK_CHILD_TASKS = 20
+
+
+class BulkChildTaskItem(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    description: str = Field("", max_length=10000)
+    priority: TaskPriority = TaskPriority.medium
+
+
+class BulkChildTasksCreate(BaseModel):
+    """Atomic bulk create of child tasks under one parent."""
+
+    items: list[BulkChildTaskItem] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_BULK_CHILD_TASKS,
+    )
+    task_type: TaskType = TaskType.subtask
+    source: TaskSource = TaskSource.agent
+    agent: str = Field("", max_length=100)
+    auto_review: bool = True
+
+
 class TaskApprove(BaseModel):
     comment: str = ""
     run: bool = False
@@ -215,6 +240,22 @@ class TaskForceComplete(BaseModel):
 class TaskStart(BaseModel):
     runtime: RuntimeChoice | None = None
     plan: str = Field("", max_length=10000)
+
+
+class TaskPairStart(BaseModel):
+    plan: str = Field("", max_length=10000)
+    assigned_agent: str = Field("", max_length=100)
+    branch_slug: str = Field("", max_length=80)
+
+
+class TaskClaim(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=100)
+    session_id: str = Field("", max_length=200)
+
+
+class TaskRelease(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=100)
+    session_id: str = Field("", max_length=200)
 
 
 class TaskQuestion(BaseModel):
@@ -286,6 +327,7 @@ class TaskRefine(BaseModel):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
 
+    title: str | None = Field(default=None, min_length=1, max_length=500)
     work_type: WorkType | None = None
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
@@ -449,6 +491,9 @@ class TaskView(BaseModel):
     review_job_id: str | None = None
     branch: str | None = None
     pr_number: int | None = None
+    claimed_by: str | None = None
+    claim_session_id: str | None = None
+    claimed_at: str | None = None
     breadcrumb: list[TaskBreadcrumb] | None = None
     children: list[TaskChildSummary] | None = None
     progress: TaskProgress | None = None

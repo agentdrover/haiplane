@@ -1,7 +1,34 @@
 {% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + stale_tasks|length %}
+{% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
+
+<div class="inbox-filter-bar">
+    <span class="inbox-filter-label">Inbox:</span>
+    <a class="inbox-filter-link{% if not filter_active %} is-active{% endif %}"
+       href="/partials/inbox"
+       hx-get="/partials/inbox"
+       hx-target="#inbox-content"
+       hx-swap="innerHTML">All</a>
+    <form class="inbox-filter-form"
+          hx-get="/partials/inbox"
+          hx-target="#inbox-content"
+          hx-swap="innerHTML">
+        <input type="text"
+               name="mine"
+               value="{{ filter_mine }}"
+               placeholder="My tasks (owner or claim)"
+               class="inbox-filter-input"
+               aria-label="Filter inbox by owner or claim">
+        <button type="submit" class="btn btn-sm">Apply</button>
+    </form>
+    {% if filter_active %}
+    <span class="inbox-filter-active">
+        filtered{% if filter_mine %} · mine={{ filter_mine }}{% endif %}{% if filter_human_owner %} · owner={{ filter_human_owner }}{% endif %}{% if filter_claimed_by %} · claim={{ filter_claimed_by }}{% endif %}
+    </span>
+    {% endif %}
+</div>
 
 {% if total_inbox == 0 %}
-<div class="inbox-clear">All clear — nothing needs your attention right now.</div>
+<div class="inbox-clear">All clear — nothing needs your attention right now.{% if filter_active %} (with current filter){% endif %}</div>
 {% else %}
 
 {% if drafts %}
@@ -156,3 +183,12 @@
 {% endif %}
 
 {% endif %}
+
+<script>
+(function () {
+    var el = document.getElementById("inbox-content");
+    if (el) {
+        el.setAttribute("hx-get", "/partials/inbox{{ inbox_query|safe }}");
+    }
+})();
+</script>

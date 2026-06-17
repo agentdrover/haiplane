@@ -84,20 +84,38 @@ async def get_dashboard_data(db: aiosqlite.Connection) -> DashboardData:
     )
 
 
-async def get_inbox_data(db: aiosqlite.Connection) -> dict[str, Any]:
+async def get_inbox_data(
+    db: aiosqlite.Connection,
+    *,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+) -> dict[str, Any]:
     """Gather inbox items: drafts, questions, decisions, pending reports, stale."""
-    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=20)
-    needs_info_rows = await repo.list_tasks_by_status(db, "needs_info", limit=20)
+    person = {
+        "human_owner": human_owner,
+        "claimed_by": claimed_by,
+        "mine": mine,
+    }
+    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=20, **person)
+    needs_info_rows = await repo.list_tasks_by_status(
+        db, "needs_info", limit=20, **person
+    )
     needs_decision_rows = await repo.list_tasks_by_status(
-        db, "needs_decision", limit=20
+        db, "needs_decision", limit=20, **person
     )
     pending_report_rows = await repo.list_tasks_by_status(
         db,
         "pending_report",
         order_by="updated_at ASC",
         limit=20,
+        **person,
     )
-    stale_rows = await repo.list_stale_running(db, config.STALE_THRESHOLD_MINUTES)
+    stale_rows = await repo.list_stale_running(
+        db,
+        config.STALE_THRESHOLD_MINUTES,
+        **person,
+    )
 
     questions: list[dict[str, Any]] = []
     for r in needs_info_rows:
@@ -113,6 +131,14 @@ async def get_inbox_data(db: aiosqlite.Connection) -> dict[str, Any]:
         "decisions": [row_to_task(r) for r in needs_decision_rows],
         "pending_reports": [row_to_task(r) for r in pending_report_rows],
         "stale_tasks": [row_to_task(r) for r in stale_rows],
+        "filter_human_owner": human_owner or "",
+        "filter_claimed_by": claimed_by or "",
+        "filter_mine": mine or "",
+        "inbox_query": repo.inbox_query_string(
+            human_owner=human_owner,
+            claimed_by=claimed_by,
+            mine=mine,
+        ),
     }
 
 
@@ -150,6 +176,8 @@ async def list_tasks(
     parent_id: int | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
     limit: int = 50,
     include_archived: bool = False,
 ) -> list[TaskView]:
@@ -163,6 +191,8 @@ async def list_tasks(
         parent_id=parent_id,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
+        claimed_by=claimed_by,
+        mine=mine,
         limit=limit,
         include_archived=include_archived,
     )

@@ -105,10 +105,25 @@ async def refine_task(
     so callers / tests can assert without re-reading the row.
     """
     await _ensure_task_exists(db, task_id)
+    old_row = await repo.get_task(db, task_id)
 
     ac_count: int | None = None
     async with _atomic(db, "refine_task"):
         updated_columns = await repo.update_task_structured(db, task_id, payload)
+
+        if (
+            old_row
+            and payload.title is not None
+            and "title" in updated_columns
+            and old_row["title"] != updated_columns["title"]
+        ):
+            await repo.add_task_update(
+                db,
+                task_id,
+                "",
+                "status",
+                f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
+            )
 
         if payload.acceptance_criteria is not None:
             try:

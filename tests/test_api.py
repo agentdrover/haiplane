@@ -149,6 +149,95 @@ async def test_approve_non_draft_returns_400(client: AsyncClient):
     assert resp.status_code == 400
 
 
+async def test_ask_question_from_open_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Open pair task"})
+    task_id = create_resp.json()["id"]
+    assert create_resp.json()["status"] == "open"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/question",
+        json={"agent": "composer", "question": "Which API surface first?"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_info"
+    assert any(u["kind"] == "question" for u in data["updates"])
+
+
+async def test_answer_question_pair_resume_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Pair Q&A API"})
+    task_id = create_resp.json()["id"]
+
+    await client.post(
+        f"/api/tasks/{task_id}/question",
+        json={"agent": "composer", "question": "Scope?"},
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/answer",
+        json={"answer": "REST first", "resume": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "open"
+    assert data["job_id"] is None
+
+
+async def test_pair_start_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Pair API task"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "plan": "Plan: implement in Cursor",
+            "assigned_agent": "composer-analyst",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "running"
+    assert data["job_id"] is None
+    assert data["branch"] == f"task-{task_id}/test"
+    assert data["assigned_agent"] == "composer-analyst"
+
+
+async def test_claim_task_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Claim API"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "composer", "session_id": "sess-a"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "claimed"
+    assert data["claimed_by"] == "composer"
+
+    conflict = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "other", "session_id": "sess-b"},
+    )
+    assert conflict.status_code == 409
+
+
+async def test_release_task_api(client: AsyncClient):
+    create_resp = await client.post("/api/tasks", json={"title": "Release API"})
+    task_id = create_resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "composer", "session_id": "sess-a"},
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/release",
+        json={"agent": "composer", "session_id": "sess-a"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"
+
+
 async def test_force_complete_api(client: AsyncClient, db):
     create_resp = await client.post("/api/tasks", json={"title": "Pending report"})
     task_id = create_resp.json()["id"]
@@ -239,6 +328,70 @@ async def test_create_task_with_type_api(client: AsyncClient):
     assert data["status"] == "open"
 
 
+async def test_create_subtasks_bulk_api(client: AsyncClient):
+    parent = await client.post(
+        "/api/tasks",
+        json={"title": "Parent task", "task_type": "task"},
+    )
+    assert parent.status_code == 200
+    parent_id = parent.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={
+            "items": [
+                {"title": "Sub A", "description": "first"},
+                {"title": "Sub B", "priority": "high"},
+            ],
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data) == 2
+    assert all(t["task_type"] == "subtask" for t in data)
+    assert all(t["status"] == "draft" for t in data)
+    assert all(t["parent_id"] == parent_id for t in data)
+    assert data[0]["title"] == "Sub A"
+    assert data[1]["priority"] == "high"
+
+
+async def test_create_subtasks_bulk_rejects_invalid_parent(client: AsyncClient):
+    leaf = await client.post(
+        "/api/tasks",
+        json={"title": "Leaf", "task_type": "task"},
+    )
+    parent_id = leaf.json()["id"]
+    sub = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Sub",
+            "task_type": "subtask",
+            "parent_id": parent_id,
+        },
+    )
+    assert sub.status_code == 200
+    sub_id = sub.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{sub_id}/subtasks",
+        json={"items": [{"title": "Nope"}]},
+    )
+    assert resp.status_code == 400
+
+
+async def test_create_subtasks_bulk_rejects_too_many_items(client: AsyncClient):
+    parent = await client.post("/api/tasks", json={"title": "Parent"})
+    parent_id = parent.json()["id"]
+    items = [{"title": f"Item {i}"} for i in range(21)]
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={"items": items},
+    )
+    assert resp.status_code == 422
+
+
 async def test_task_tree_api(client: AsyncClient):
     epic_resp = await client.post(
         "/api/tasks",
@@ -297,6 +450,63 @@ async def test_list_tasks_filtered_by_human_owner_api(client: AsyncClient):
     data = resp.json()
     assert len(data) >= 1
     assert all(t["human_owner"] == "alice" for t in data)
+
+
+async def test_list_tasks_filtered_by_claimed_by_api(client: AsyncClient):
+    owned = await client.post(
+        "/api/tasks",
+        json={"title": "Claimed task", "human_owner": "bob"},
+    )
+    task_id = owned.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "composer", "session_id": "sess-1"},
+    )
+
+    other = await client.post(
+        "/api/tasks",
+        json={"title": "Other claim", "human_owner": "bob"},
+    )
+    other_id = other.json()["id"]
+    await client.post(
+        f"/api/tasks/{other_id}/claim",
+        json={"agent": "other-agent", "session_id": "sess-2"},
+    )
+
+    resp = await client.get("/api/tasks", params={"claimed_by": "composer"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert any(t["id"] == task_id for t in data)
+    assert all(t.get("claimed_by") == "composer" for t in data)
+
+
+async def test_list_tasks_filtered_by_mine_api(client: AsyncClient):
+    owned = await client.post(
+        "/api/tasks",
+        json={"title": "Alice owned", "human_owner": "alice"},
+    )
+    owned_id = owned.json()["id"]
+
+    claimed = await client.post(
+        "/api/tasks",
+        json={"title": "Bob owned claimed by alice", "human_owner": "bob"},
+    )
+    claimed_id = claimed.json()["id"]
+    await client.post(
+        f"/api/tasks/{claimed_id}/claim",
+        json={"agent": "alice", "session_id": "sess-a"},
+    )
+
+    await client.post(
+        "/api/tasks",
+        json={"title": "Charlie only", "human_owner": "charlie"},
+    )
+
+    resp = await client.get("/api/tasks", params={"mine": "alice"})
+    assert resp.status_code == 200
+    ids = {t["id"] for t in resp.json()}
+    assert owned_id in ids
+    assert claimed_id in ids
 
 
 async def test_reorder_task_api(client: AsyncClient):

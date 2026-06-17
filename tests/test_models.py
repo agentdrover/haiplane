@@ -201,6 +201,23 @@ def test_task_refine_accepts_human_owner_and_reviewer():
     assert dumped == {"human_owner": "alice", "human_reviewer": "bob"}
 
 
+def test_task_refine_accepts_title():
+    refine = TaskRefine(title="Renamed task")
+    dumped = refine.model_dump(exclude_unset=True)
+    assert dumped == {"title": "Renamed task"}
+
+
+def test_task_refine_title_omitted_means_untouched():
+    refine = TaskRefine()
+    dumped = refine.model_dump(exclude_unset=True)
+    assert "title" not in dumped
+
+
+def test_task_refine_title_max_length():
+    with pytest.raises(ValidationError):
+        TaskRefine(title="a" * 501)
+
+
 def test_task_refine_human_owner_none_means_untouched():
     refine = TaskRefine()
     dumped = refine.model_dump(exclude_unset=True)

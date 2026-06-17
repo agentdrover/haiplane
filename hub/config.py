@@ -50,6 +50,9 @@ ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
 
+# Pair mode: base branch for safe branch creation (default develop per repo-rules).
+PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
+
 # ---------------------------------------------------------------------------
 # Authentication (multi-user)
 # ---------------------------------------------------------------------------

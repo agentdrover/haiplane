@@ -7,13 +7,21 @@ from fastapi import HTTPException
 from hub import repository as repo
 from hub import services
 from hub.models import (
+    BulkChildTaskItem,
+    BulkChildTasksCreate,
     TaskAnswer,
     TaskApprove,
+    TaskClaim,
     TaskCreate,
     TaskDecide,
+    TaskPairStart,
+    TaskPriority,
     TaskQuestion,
+    TaskRelease,
     TaskReorder,
+    TaskSource,
     TaskStart,
+    TaskType,
     TaskUpdateCreate,
 )
 
@@ -24,6 +32,40 @@ async def test_create_task(db: aiosqlite.Connection):
     assert tv.id > 0
     assert tv.title == "Service test"
     assert tv.status.value == "open"
+
+
+async def test_create_subtasks_bulk(db: aiosqlite.Connection):
+    parent = TaskCreate(title="Parent", source=TaskSource.human)
+    parent_view = await services.create_task(db, parent)
+    body = BulkChildTasksCreate(
+        items=[
+            BulkChildTaskItem(title="Child 1"),
+            BulkChildTaskItem(title="Child 2", priority=TaskPriority.high),
+        ],
+        source=TaskSource.agent,
+        agent="bot",
+    )
+    created = await services.create_subtasks_bulk(db, parent_view.id, body)
+    assert len(created) == 2
+    assert all(t.task_type.value == "subtask" for t in created)
+    assert all(t.status.value == "draft" for t in created)
+    assert created[1].priority.value == "high"
+
+
+async def test_create_subtasks_bulk_invalid_hierarchy(db: aiosqlite.Connection):
+    parent = TaskCreate(title="Parent", source=TaskSource.human)
+    parent_view = await services.create_task(db, parent)
+    sub = TaskCreate(
+        title="Sub",
+        task_type=TaskType.subtask,
+        parent_id=parent_view.id,
+        source=TaskSource.human,
+    )
+    sub_view = await services.create_task(db, sub)
+    body = BulkChildTasksCreate(items=[BulkChildTaskItem(title="Nope")])
+    with pytest.raises(HTTPException) as exc:
+        await services.create_subtasks_bulk(db, sub_view.id, body)
+    assert exc.value.status_code == 400
 
 
 async def test_create_epic(db: aiosqlite.Connection):
@@ -126,6 +168,125 @@ async def test_start_task_with_prior_plan_update(db: aiosqlite.Connection):
     assert started.status.value == "running"
 
 
+async def test_pair_start_requires_plan(db: aiosqlite.Connection):
+    body = TaskCreate(title="Pair no plan")
+    tv = await services.create_task(db, body)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.pair_start_task(db, tv.id)
+    assert exc_info.value.status_code == 400
+    assert "Plan required" in str(exc_info.value.detail)
+
+
+async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    submit_mock = AsyncMock(return_value={"job_id": "must-not-run"})
+    plugins.dispatch.submit_task = submit_mock
+
+    body = TaskCreate(title="Pair task")
+    tv = await services.create_task(db, body)
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: pair in Cursor")
+    await db.commit()
+
+    started = await services.pair_start_task(
+        db,
+        tv.id,
+        TaskPairStart(assigned_agent="composer-analyst"),
+        caller="denis",
+    )
+
+    assert started.status.value == "running"
+    assert started.job_id is None
+    assert started.branch == f"task-{tv.id}/test"
+    assert started.assigned_agent == "composer-analyst"
+    submit_mock.assert_not_called()
+
+
+async def test_pair_start_uses_caller_when_agent_unset(db: aiosqlite.Connection):
+    body = TaskCreate(title="Pair caller")
+    tv = await services.create_task(db, body)
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work locally")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="cursor-dev")
+
+    assert started.status.value == "running"
+    assert started.assigned_agent == "cursor-dev"
+
+
+async def test_pair_done_from_running_completes_without_auto_review(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Pair done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-99/test")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Shipped docs"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "completed"
+
+
+async def test_pair_done_from_running_enters_ci_check_with_auto_review(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Pair CI",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-100/test")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Ready for CI"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check"
+
+
+async def test_done_from_open_without_pair_start_keeps_open(db: aiosqlite.Connection):
+    body = TaskCreate(title="Open pair legacy")
+    tv = await services.create_task(db, body)
+    await services.add_update(
+        db,
+        tv.id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Report without start"),
+    )
+    row = await repo.get_task(db, tv.id)
+    assert row["status"] == "open"
+
+
 async def test_start_task_dispatch_failure_keeps_task_recoverable(
     db: aiosqlite.Connection,
 ):
@@ -175,13 +336,73 @@ async def test_ask_question(db: aiosqlite.Connection):
     assert any(u.kind == "question" for u in tv.updates)
 
 
+async def test_ask_question_from_open_pair(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Open pair task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    q_body = TaskQuestion(agent="dev", question="Clarify scope before pair-start?")
+    tv = await services.ask_question(db, task_id, q_body)
+    assert tv.status.value == "needs_info"
+    assert any(u.kind == "question" for u in tv.updates)
+
+
+async def test_ask_question_running_with_job_id_regression(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Headless running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-123")
+    await db.commit()
+
+    q_body = TaskQuestion(agent="dev", question="Need clarification on X")
+    tv = await services.ask_question(db, task_id, q_body)
+    assert tv.status.value == "needs_info"
+
+
 async def test_ask_question_on_non_running_fails(db: aiosqlite.Connection):
-    body = TaskCreate(title="Open task")
-    tv = await services.create_task(db, body)
+    task_id = await repo.create_task(
+        db,
+        title="Open headless with job",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-456")
+    await db.commit()
 
     q_body = TaskQuestion(agent="dev", question="?")
     with pytest.raises(HTTPException) as exc_info:
-        await services.ask_question(db, tv.id, q_body)
+        await services.ask_question(db, task_id, q_body)
     assert exc_info.value.status_code == 400
 
 
@@ -207,7 +428,7 @@ async def test_answer_question_no_resume(db: aiosqlite.Connection):
     assert tv.status.value == "open"
 
 
-async def test_answer_question_with_resume(db: aiosqlite.Connection):
+async def test_answer_question_with_resume_headless(db: aiosqlite.Connection):
     task_id = await repo.create_task(
         db,
         title="Resume task",
@@ -222,11 +443,83 @@ async def test_answer_question_with_resume(db: aiosqlite.Connection):
         parent_id=None,
         priority="medium",
     )
+    await repo.update_task(db, task_id, job_id="headless-job-1")
     await db.commit()
 
     a_body = TaskAnswer(answer="Here is the answer", resume=True)
     tv = await services.answer_question(db, task_id, a_body)
     assert tv.status.value == "running"
+
+
+async def test_answer_question_pair_resume_to_open_without_dispatch(
+    db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    dispatch_called = False
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        nonlocal dispatch_called
+        dispatch_called = True
+
+    monkeypatch.setattr(services, "dispatch_task", _fake_dispatch)
+
+    task_id = await repo.create_task(
+        db,
+        title="Pair pre-start",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    tv = await services.answer_question(
+        db, task_id, TaskAnswer(answer="Clarified", resume=True)
+    )
+    assert tv.status.value == "open"
+    assert tv.job_id is None
+    assert not dispatch_called
+
+
+async def test_answer_question_pair_resume_to_running_without_dispatch(
+    db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    dispatch_called = False
+
+    async def _fake_dispatch(*_args, **_kwargs):
+        nonlocal dispatch_called
+        dispatch_called = True
+
+    monkeypatch.setattr(services, "dispatch_task", _fake_dispatch)
+
+    task_id = await repo.create_task(
+        db,
+        title="Pair running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-99/pair-slug")
+    await db.commit()
+
+    tv = await services.answer_question(
+        db, task_id, TaskAnswer(answer="Continue", resume=True)
+    )
+    assert tv.status.value == "running"
+    assert tv.job_id is None
+    assert not dispatch_called
 
 
 async def test_answer_non_needs_info_fails(db: aiosqlite.Connection):
@@ -591,6 +884,72 @@ async def test_get_inbox_data(db: aiosqlite.Connection):
     assert "pending_reports" in inbox
 
 
+async def test_get_inbox_data_filters_by_mine(db: aiosqlite.Connection):
+    alice_draft = await repo.create_task(
+        db,
+        title="Alice draft",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, alice_draft, human_owner="alice")
+
+    bob_draft = await repo.create_task(
+        db,
+        title="Bob draft",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, bob_draft, human_owner="bob")
+
+    claimed = await repo.create_task(
+        db,
+        title="Claimed by alice",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        claimed,
+        human_owner="bob",
+        claimed_by="alice",
+    )
+    await db.commit()
+
+    all_inbox = await services.get_inbox_data(db)
+    assert len(all_inbox["drafts"]) >= 2
+
+    mine = await services.get_inbox_data(db, mine="alice")
+    draft_ids = {t.id for t in mine["drafts"]}
+    decision_ids = {t.id for t in mine["decisions"]}
+    assert alice_draft in draft_ids
+    assert bob_draft not in draft_ids
+    assert claimed in decision_ids
+
+
 async def test_list_tasks_with_filters(db: aiosqlite.Connection):
     await repo.create_task(
         db,
@@ -766,6 +1125,82 @@ async def test_decide_task_wrong_status(db: aiosqlite.Connection):
         await services.decide_task(db, tv.id, TaskDecide(action="accept"))
     assert exc_info.value.status_code == 400
     assert "needs_decision" in str(exc_info.value.detail)
+
+
+async def test_claim_task_from_open(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Claim me",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    tv = await services.claim_task(
+        db, task_id, TaskClaim(agent="composer", session_id="sess-1")
+    )
+    assert tv.status.value == "claimed"
+    assert tv.claimed_by == "composer"
+    assert tv.claim_session_id == "sess-1"
+    assert tv.assigned_agent == "composer"
+
+
+async def test_claim_task_conflict(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Taken",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await services.claim_task(db, task_id, TaskClaim(agent="agent-a", session_id="s1"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.claim_task(
+            db, task_id, TaskClaim(agent="agent-b", session_id="s2")
+        )
+    assert exc_info.value.status_code == 409
+
+
+async def test_release_task(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Release me",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await services.claim_task(db, task_id, TaskClaim(agent="composer", session_id="s1"))
+
+    tv = await services.release_task(
+        db, task_id, TaskRelease(agent="composer", session_id="s1")
+    )
+    assert tv.status.value == "open"
+    assert tv.claimed_by is None
 
 
 async def test_noop_plugins_start_clean(db: aiosqlite.Connection):

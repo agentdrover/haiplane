@@ -12,9 +12,13 @@ import logging
 import re
 from typing import Any
 
-from hub.config import GH_BIN, REPO_NAME, WORKSPACE_REPO_LINK
+from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 
 log = logging.getLogger(__name__)
+
+
+class PairBranchConflictError(Exception):
+    """Pair-start cannot proceed without risking loss of uncommitted work."""
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +225,78 @@ class GitOpsIntegration:
             log.info("Created and checked out branch %s", branch)
         return branch
 
+    async def pair_prepare_branch(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+    ) -> str:
+        """Safe branch setup for pair mode: never git-clean a dirty worktree."""
+        from hub import config
+
+        repo = repo or _repo_root()
+        base = config.PAIR_BASE_BRANCH
+
+        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        if dirty.strip():
+            raise PairBranchConflictError(
+                "Uncommitted changes in workspace; commit or stash before pair-start"
+            )
+
+        rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        current = (current or "").strip()
+        prefix = f"task-{task_id}/"
+        if current.startswith(prefix):
+            log.info("pair_prepare_branch: reusing current branch %s", current)
+            return current
+
+        if current.startswith("task-"):
+            head = current.split("/", 1)[0]
+            try:
+                other_id = int(head.removeprefix("task-"))
+            except ValueError:
+                other_id = -1
+            if other_id != task_id:
+                raise PairBranchConflictError(
+                    f"Currently on {current}; switch away before pair-start for #{task_id}"
+                )
+
+        slug = (branch_slug or "").strip() or _slugify(title)
+        branch = f"task-{task_id}/{slug}"
+
+        rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+        if rc == 0:
+            await _git("checkout", branch, repo=repo)
+            log.info("pair_prepare_branch: checked out existing %s", branch)
+            return branch
+
+        rc, _, err = await _git("checkout", base, repo=repo, check=False)
+        if rc != 0:
+            raise PairBranchConflictError(
+                f"Failed to checkout base branch {base!r}: "
+                f"{(err or '').strip() or 'git checkout failed'}"
+            )
+        rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        current = (current or "").strip()
+        if rc != 0 or current != base:
+            raise PairBranchConflictError(
+                f"Expected base branch {base!r}, currently on {current!r}"
+            )
+
+        await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
+
+        rc, _, err = await _git("checkout", "-b", branch, repo=repo, check=False)
+        if rc != 0:
+            if "already exists" in err:
+                await _git("checkout", branch, repo=repo)
+                return branch
+            log.error("pair_prepare_branch: failed to create %s: %s", branch, err)
+            raise PairBranchConflictError(f"Failed to create branch {branch}: {err}")
+        log.info("pair_prepare_branch: created %s from %s", branch, base)
+        return branch
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         rc, _, _ = await _git("checkout", branch, repo=repo, check=False)
         return rc == 0
@@ -370,7 +446,7 @@ class GitOpsIntegration:
             "--repo",
             REPO_NAME,
             "--base",
-            "main",
+            PAIR_BASE_BRANCH,
             "--head",
             branch,
             "--title",

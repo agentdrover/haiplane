@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import urlencode
 
 import aiosqlite
 
@@ -24,6 +25,46 @@ ALLOWED_TASKS_ORDER_BY = frozenset(
         "updated_at ASC",
     }
 )
+
+
+def _append_person_filters(
+    conditions: list[str],
+    params: list[Any],
+    *,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+) -> None:
+    """Apply inbox/list person filters: mine = owner OR claim holder."""
+    if mine:
+        conditions.append("(human_owner=? OR claimed_by=?)")
+        params.extend([mine, mine])
+        return
+    if human_owner:
+        conditions.append("human_owner=?")
+        params.append(human_owner)
+    if claimed_by:
+        conditions.append("claimed_by=?")
+        params.append(claimed_by)
+
+
+def inbox_query_string(
+    *,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+) -> str:
+    params: dict[str, str] = {}
+    if mine:
+        params["mine"] = mine
+    if human_owner:
+        params["human_owner"] = human_owner
+    if claimed_by:
+        params["claimed_by"] = claimed_by
+    if not params:
+        return ""
+    return f"?{urlencode(params)}"
+
 
 # ---------------------------------------------------------------------------
 # Tasks — Read
@@ -51,6 +92,8 @@ async def list_tasks_filtered(
     parent_id: int | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
     limit: int = 50,
     include_archived: bool = False,
 ) -> list[aiosqlite.Row]:
@@ -75,12 +118,16 @@ async def list_tasks_filtered(
     if parent_id is not None:
         conditions.append("parent_id=?")
         params.append(parent_id)
-    if human_owner:
-        conditions.append("human_owner=?")
-        params.append(human_owner)
     if human_reviewer:
         conditions.append("human_reviewer=?")
         params.append(human_reviewer)
+    _append_person_filters(
+        conditions,
+        params,
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+    )
 
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
@@ -113,13 +160,27 @@ async def list_tasks_by_status(
     order_by: str = "id DESC",
     limit: int = 20,
     include_archived: bool = False,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
 ) -> list[aiosqlite.Row]:
     if order_by not in ALLOWED_TASKS_ORDER_BY:
         raise ValueError(f"Unsupported order_by clause: {order_by!r}")
-    archived_sql = "" if include_archived else " AND archived=0"
+    conditions = ["status=?"]
+    params: list[Any] = [status]
+    if not include_archived:
+        conditions.append("archived=0")
+    _append_person_filters(
+        conditions,
+        params,
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+    )
+    where = " AND ".join(conditions)
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status=?{archived_sql} ORDER BY {order_by} LIMIT ?",  # nosec B608
-        (status, limit),
+        f"SELECT * FROM tasks WHERE {where} ORDER BY {order_by} LIMIT ?",  # nosec B608
+        (*params, limit),
     )
 
 
@@ -152,11 +213,28 @@ async def list_ci_check_tasks(
 async def list_stale_running(
     db: aiosqlite.Connection,
     threshold_minutes: int,
+    *,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
 ) -> list[aiosqlite.Row]:
+    conditions = [
+        "archived=0",
+        "status='running'",
+        "updated_at < datetime('now', ?)",
+    ]
+    params: list[Any] = [f"-{threshold_minutes} minutes"]
+    _append_person_filters(
+        conditions,
+        params,
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+    )
+    where = " AND ".join(conditions)
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE archived=0 AND status='running' "
-        "AND updated_at < datetime('now', ?)",
-        (f"-{threshold_minutes} minutes",),
+        f"SELECT * FROM tasks WHERE {where}",  # nosec B608
+        tuple(params),
     )
 
 

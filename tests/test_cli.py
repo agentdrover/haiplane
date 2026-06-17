@@ -147,6 +147,20 @@ def test_cmd_start() -> None:
     )
 
 
+def test_cmd_pair_start() -> None:
+    result = {"id": 37, "status": "running", "branch": "task-37/pair-start"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(task_id=37, plan="Plan: pair", agent="composer-analyst")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_pair_start(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/37/pair-start",
+        {"plan": "Plan: pair", "assigned_agent": "composer-analyst"},
+    )
+
+
 def test_cmd_update() -> None:
     upd = {"id": 1, "kind": "status", "content": "Done X"}
     mock_api = MagicMock(return_value=upd)
@@ -241,6 +255,7 @@ def _refine_args(**overrides) -> argparse.Namespace:
         "review_check": None,
         "human_owner": None,
         "human_reviewer": None,
+        "title": None,
         "clear_acs": False,
     }
     base.update(overrides)
@@ -309,6 +324,19 @@ def test_cmd_refine_with_owner_and_reviewer() -> None:
     payload = mock_api.call_args.args[2]
     assert payload["human_owner"] == "alice"
     assert payload["human_reviewer"] == "bob"
+
+
+def test_cmd_refine_with_title() -> None:
+    args = _refine_args(title="Renamed task")
+    mock_api = MagicMock(return_value={"updated_columns": ["title"]})
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_refine(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/refine",
+        {"title": "Renamed task"},
+    )
 
 
 def test_cmd_refine_review_check_repeatable_flag() -> None:

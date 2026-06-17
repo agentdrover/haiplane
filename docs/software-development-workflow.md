@@ -153,7 +153,8 @@ flowchart TD
 - `hub_add_risk` - фиксация рисков;
 - `hub_get_readiness` - проверка DoR;
 - `hub_approve_task` / `hub_reject_task` - человеческий gate;
-- `hub_start_task` - запуск только после плана;
+- `hub_start_task` - headless dispatch (path A) только после плана;
+- `hub_pair_start` - pair mode (path B): `running` без `oc-dev-dispatch`, см. [Pair mode: git policy](#pair-mode-git-policy);
 - `hub_task_update`, `hub_ask_question`, `hub_report_done` - отчетность агента;
 - `hub_decide_task` - человеческое решение после арбитража.
 
@@ -200,6 +201,63 @@ Force approve доступен единым контрактом через MCP 
 
 Формальные инварианты (один branch на задачу, запрет касания чужого branch, out-of-scope — только draft proposal, конфликт → `needs_decision`) описаны в [workspace-safety-policy.md](workspace-safety-policy.md).
 
+## Pair mode: git policy
+
+Path B — человек + Cursor-агент без headless dispatch (`hub_pair_start`). Хаб переводит задачу в `running` и может создать branch через git ops plugin в каталоге `OPENCLAW_WORKSPACE_REPO`. **Исходный код и коммиты остаются ответственностью разработчика в git**, не хаба.
+
+### Два типичных сценария
+
+| Сценарий | `OPENCLAW_WORKSPACE_REPO` | Кто коммитит | Где CI видит код |
+|----------|---------------------------|--------------|------------------|
+| **Local clone** | тот же каталог, что открыт в Cursor на ноутбуке | человек/агент в Cursor | после `git push origin task-<id>/<slug>` |
+| **Server workspace** | clone на сервере (например `/opt/openclaw-hub/src`) | headless auto-commit после done **или** ручной push с ноутбука | remote branch после push с любой машины |
+
+В обоих случаях каноническое имя branch задачи: `task-<hub-task-id>/<slug>` (slug из title). Поле `branch` в задаче хаба — источник правды для **имени**, не для содержимого коммитов.
+
+### Старт pair-сессии
+
+1. DoR пройден, задача `open`.
+2. Есть update с `Plan:` (или plan в теле `hub_pair_start`).
+3. **`hub_pair_start(task_id, ...)`** — не `hub_start_task` (последний всегда вызывает `oc-dev-dispatch`).
+4. Статус → `running`, `job_id` пустой, в задаче записаны `branch` и `assigned_agent`.
+
+### Checklist: human + agent (local clone)
+
+Используйте, когда hub и Cursor работают с одним локальным репозиторием:
+
+1. **Закоммитьте или stash** все незакоммиченные изменения **до** `hub_pair_start`. Git ops при создании branch делает `checkout main`, при dirty worktree — `git checkout .` и **`git clean -fd`** (см. `hub/integrations/git_ops.py`). Незакоммиченная работа может быть потеряна.
+2. После pair-start проверьте `git branch --show-current` и поле `branch` в задаче. Если вы уже на своей dev-ветке (`task-37/pair-start`), а хаб создал другую (`task-37/<slug-from-title>`), **согласуйте вручную**: checkout ветки задачи, cherry-pick/merge или переименование — и зафиксируйте update в хабе.
+3. Работайте только в branch этой задачи (см. [workspace-safety-policy.md](workspace-safety-policy.md)).
+4. Коммиты — с ноутбука по [repository-rules.md](repository-rules.md): `feat|fix: ...`, узкие diff.
+5. **`git push -u origin HEAD`** когда готовы к CI/review.
+6. PR в `develop` (или согласованный base), ссылка на hub task id в описании.
+7. **`hub_report_done`** с validation commands и результатами; человек принимает через UI / `hub_force_complete_task` / CI flow (см. gap #38 для полного path B без dispatch).
+
+### Checklist: server workspace
+
+Когда `OPENCLAW_WORKSPACE_REPO` указывает на clone **на сервере**, а Cursor открыт на **другом** clone:
+
+1. Pair-start на сервере создаёт branch в server clone; локальный Cursor **не переключается** автоматически.
+2. Локально создайте ту же ветку от актуального `develop`: `git checkout -b task-<id>/<slug>`.
+3. Push с ноутбука — единственный обязательный шаг, чтобы GitHub CI увидел код.
+4. Не полагайтесь на server auto-commit для pair mode, если код пишется только локально.
+
+### Push / PR (общий порядок)
+
+1. `git fetch origin`
+2. Rebase или merge от `develop`, если ветка устарела.
+3. `git push -u origin task-<id>/<slug>`
+4. `gh pr create` (или UI) → base `develop`
+5. Дождаться CI; блокеры — `hub_task_update(..., kind="blocker")`.
+
+Автоматический sync между локальным clone и server workspace **не входит** в scope path B; при необходимости — отдельная feature.
+
+### MCP для path B
+
+- `hub_pair_start` — старт без dispatch;
+- `hub_my_context`, `hub_task_update`, `hub_report_done` — работа и отчёт;
+- `hub_start_task` — только path A (headless).
+
 ## Режимы работы команды
 
 **Solo with agents**
@@ -209,6 +267,8 @@ Force approve доступен единым контрактом через MCP 
 **Pair human + agent**
 
 Человек держит Cursor-сессию открытой, агент работает по одной задаче, все вопросы и отчеты фиксируются в хабе. Это режим для рискованных изменений.
+
+Git-политика path B (локальный clone vs server workspace, push/PR, риски `git clean`) — в разделе [Pair mode: git policy](#pair-mode-git-policy) ниже и в [task-workflow.html](task-workflow.html#pair-git-policy).
 
 **Team queue**
 
@@ -249,6 +309,8 @@ Force approve доступен единым контрактом через MCP 
 1. Перед работой вызвать `hub_my_context(task_id)`.
 2. Если задача не готова, не писать код, а предложить refine/AC/risk.
 3. Перед dispatch или началом работы оставить `Plan:`.
+   - Path A (headless): `hub_start_task(..., plan="...")`.
+   - Path B (pair в Cursor): `hub_pair_start(...)` после Plan; git checklist — [Pair mode: git policy](#pair-mode-git-policy).
 4. Все блокеры фиксировать через `hub_task_update(..., kind="blocker")` или `hub_ask_question`.
 5. В done report указывать changed files, behavior change и validation commands.
 6. Не закрывать задачу напрямую, если есть неразрешенный blocker, failed CI или review changes.

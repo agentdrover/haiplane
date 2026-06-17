@@ -192,7 +192,47 @@ ssh user1@194.113.34.33 '
 
 Для обычных правок кода и UI используйте этот runbook.
 
-## 8. Чеклист для следующего агента
+## 9. Локальный hub на ноутбуке (pair / dev)
+
+Для проверки задач до merge в `main`:
+
+```bash
+# один раз: .env.local из deploy/local-hub.env.example
+./deploy/run-local-hub.sh
+# UI: http://127.0.0.1:8080/
+```
+
+Типичный `.env.local` (файл в `.gitignore`):
+
+```bash
+OPENCLAW_HUB_DB=/absolute/path/.local/state/hub.db
+OPENCLAW_HUB_TOKENS=name:token:human,agent-name:token:agent
+OPENCLAW_WORKSPACE_REPO=/absolute/path/to/workspace-clone
+OPENCLAW_HUB_REPO=org/repo-name
+```
+
+### `OPENCLAW_WORKSPACE_REPO` и pair mode
+
+| Переменная | Назначение |
+|------------|------------|
+| `OPENCLAW_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при `hub_start_task` и **`hub_pair_start`** |
+| `OPENCLAW_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
+
+**Production (agenthai.ru):** `OPENCLAW_WORKSPACE_REPO` обычно указывает на server clone (`/opt/openclaw-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**.
+
+**Local dev:** часто `OPENCLAW_WORKSPACE_REPO` = тот же каталог, что открыт в Cursor. Тогда pair-start **переключает и чистит этот clone** — см. [Pair mode: git policy](../software-development-workflow.md#pair-mode-git-policy).
+
+Ожидания для pair path B:
+
+1. Hub DB и lifecycle — локально или на agenthai; git push — в общий `origin`.
+2. Перед `hub_pair_start` — commit или stash в workspace repo.
+3. После pair-start сверить `tasks.branch` в UI/API с `git branch --show-current`.
+4. Push и PR — с машины, где написан код; server hub не заменяет push с ноутбука.
+5. Не копировать production `hub.db` на laptop без понимания, что approve/running state общий snapshot, а git remote один.
+
+Подробнее: [software-development-workflow.md](../software-development-workflow.md#pair-mode-git-policy), [task-workflow.html](task-workflow.html#pair-git-policy).
+
+## 10. Чеклист для следующего агента
 
 1. Прочитать задачу пользователя.
 2. Проверить область изменения и тесты.

@@ -338,6 +338,38 @@ async def test_agent_token_cannot_force_complete(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_token_can_pair_start(client, monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "human-token": TokenIdentity("denis", "human"),
+            "agent-token": TokenIdentity("bot", "agent"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "pair target"},
+        headers={"Authorization": "Bearer human-token"},
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: work in Cursor"},
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "running"
+    assert data["assigned_agent"] == "bot"
+    assert data["job_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_agent_token_can_create_and_update(client, monkeypatch):
     """Agent role can still create tasks and post updates."""
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
