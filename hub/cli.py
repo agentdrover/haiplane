@@ -512,6 +512,25 @@ def cmd_refine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refine_bulk(args: argparse.Namespace) -> int:
+    payload = _load_payload_file(args.from_file)
+    if not isinstance(payload, dict):
+        print(
+            f"--from-file must contain a JSON/YAML object, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    if "items" not in payload or not isinstance(payload["items"], list):
+        print(
+            "--from-file must include an items array of {task_id, ...refine fields}.",
+            file=sys.stderr,
+        )
+        return 2
+    result = _api("POST", "/api/tasks/refine-bulk", payload)
+    _print_json(result)
+    return 0
+
+
 def cmd_subtasks_bulk(args: argparse.Namespace) -> int:
     payload = _load_payload_file(args.from_file)
     if not isinstance(payload, dict):
@@ -1353,6 +1372,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop all acceptance criteria for this task",
     )
     p_refine.set_defaults(func=cmd_refine)
+
+    # refine-bulk — apply a refine PATCH to many tasks atomically
+    p_refine_bulk = sub.add_parser(
+        "refine-bulk",
+        help="Refine many tasks in one atomic request (--from-file with items[])",
+    )
+    p_refine_bulk.add_argument(
+        "--from-file",
+        dest="from_file",
+        required=True,
+        help="JSON/YAML object with items: [{task_id, ...refine fields}]",
+    )
+    p_refine_bulk.set_defaults(func=cmd_refine_bulk)
 
     # ac — CRUD for acceptance criteria
     p_ac = sub.add_parser("ac", help="Manage acceptance criteria")

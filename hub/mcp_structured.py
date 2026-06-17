@@ -35,8 +35,17 @@ class HubTaskStatusStructured(BaseModel):
     task: dict[str, Any]
 
 
+class HubRefineTasksStructured(BaseModel):
+    schema_version: str = Field(default=MCP_STRUCTURED_SCHEMA_VERSION)
+    # One entry per task: {task_id, fields_set, acceptance_criteria_count,
+    # risks_count, readiness_score, dor_passed}.
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    no_op: bool = False
+
+
 HubCreateTaskResult = Annotated[CallToolResult, HubCreateTaskStructured]
 HubRefineTaskResult = Annotated[CallToolResult, HubRefineTaskStructured]
+HubRefineTasksResult = Annotated[CallToolResult, HubRefineTasksStructured]
 HubTaskStatusResult = Annotated[CallToolResult, HubTaskStatusStructured]
 
 

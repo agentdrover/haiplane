@@ -15,6 +15,8 @@ from hub.mcp_structured import (
     HubCreateTaskStructured,
     HubRefineTaskResult,
     HubRefineTaskStructured,
+    HubRefineTasksResult,
+    HubRefineTasksStructured,
     HubTaskStatusResult,
     HubTaskStatusStructured,
     structured_tool_result,
@@ -255,7 +257,9 @@ async def hub_create_subtasks(
 
     Args:
         parent_id: Parent task ID (must match hierarchy rules for task_type).
-        items: List of dicts with title, optional description and priority.
+        items: List of dicts with title, optional description, priority, and
+            optional acceptance_criteria (list of Given/When/Then dicts) and
+            risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
         source: agent (draft) or human (open).
         agent: Assigned agent name when source is agent.
@@ -1497,6 +1501,43 @@ async def hub_refine_task(
             dor_passed=dor_passed,
             task=result,
         ),
+    )
+
+
+@mcp.tool()
+async def hub_refine_tasks(items: list[dict[str, Any]]) -> HubRefineTasksResult:
+    """Bulk-refine many tasks in ONE atomic call (replaces N hub_refine_task).
+
+    Either every item lands or none does. Use this to bring a batch of tasks
+    to DoR without a request per task.
+
+    Args:
+        items: List of dicts, each with ``task_id`` plus any TaskRefine fields
+            (e.g. work_type, scope_in, problem_statement, size,
+            acceptance_criteria, risks). ``acceptance_criteria``/``risks``
+            replace the full list for that task.
+    """
+    if not items:
+        return structured_tool_result(
+            "Nothing to refine: items list is empty.",
+            HubRefineTasksStructured(no_op=True),
+        )
+    result = await _api_post("/api/tasks/refine-bulk", {"items": items})
+    results = result.get("results") or []
+    lines = [f"Refined {len(results)} task(s):"]
+    for r in results:
+        detail = [f"set {', '.join(r.get('fields_set') or []) or '-'}"]
+        if r.get("acceptance_criteria_count") is not None:
+            detail.append(f"{r['acceptance_criteria_count']} AC")
+        if r.get("risks_count") is not None:
+            detail.append(f"{r['risks_count']} risks")
+        if r.get("readiness_score") is not None:
+            dor = " DoR✓" if r.get("dor_passed") else ""
+            detail.append(f"readiness {r['readiness_score']}{dor}")
+        lines.append(f"  #{r.get('task_id')}: " + "; ".join(detail))
+    return structured_tool_result(
+        "\n".join(lines),
+        HubRefineTasksStructured(results=results),
     )
 
 

@@ -28,6 +28,7 @@ from hub.models import (
     TaskPairStart,
     TaskProgress,
     TaskQuestion,
+    TaskRefine,
     TaskReject,
     TaskRelease,
     TaskReorder,
@@ -225,6 +226,14 @@ async def create_subtasks_bulk(
                 status=initial_status,
                 position=idx,
             )
+            if item.risks is not None:
+                await repo.update_task_structured(
+                    db, task_id, TaskRefine(risks=item.risks)
+                )
+            if item.acceptance_criteria is not None:
+                await repo.replace_acceptance_criteria(
+                    db, task_id, item.acceptance_criteria
+                )
             created_ids.append(task_id)
     except Exception:
         await db.execute("ROLLBACK TO SAVEPOINT bulk_child_tasks")

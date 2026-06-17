@@ -37,6 +37,7 @@ from hub.services.refinement import (
     get_readiness,
     list_acceptance_criteria,
     refine_task,
+    refine_tasks_bulk,
     replace_acceptance_criteria,
     row_to_ac,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "get_readiness",
     "list_acceptance_criteria",
     "refine_task",
+    "refine_tasks_bulk",
     "replace_acceptance_criteria",
     "row_to_ac",
     "build_for_task",

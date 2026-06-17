@@ -475,3 +475,126 @@ async def test_refine_oversized_risks_returns_422(client: AsyncClient):
         json={"risks": oversized},
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /api/tasks/refine-bulk
+# ---------------------------------------------------------------------------
+
+
+async def test_refine_bulk_applies_to_many_tasks(client: AsyncClient):
+    t1 = await _create_task(client)
+    t2 = await _create_task(client)
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {
+                    "task_id": t1["id"],
+                    "problem_statement": "ps-1",
+                    "size": "M",
+                    "acceptance_criteria": [_ac_payload(1)],
+                },
+                {"task_id": t2["id"], "user_story": "us-2"},
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 2
+    by_id = {r["task_id"]: r for r in results}
+    assert "problem_statement" in by_id[t1["id"]]["fields_set"]
+    assert "acceptance_criteria" in by_id[t1["id"]]["fields_set"]
+    assert by_id[t1["id"]]["acceptance_criteria_count"] == 1
+    assert by_id[t1["id"]]["readiness_score"] is not None
+
+    # Persisted: re-reading the tasks shows the applied fields.
+    got1 = (await client.get(f"/api/tasks/{t1['id']}")).json()
+    assert got1["problem_statement"] == "ps-1"
+    assert got1["size"] == "M"
+    got2 = (await client.get(f"/api/tasks/{t2['id']}")).json()
+    assert got2["user_story"] == "us-2"
+
+
+async def test_refine_bulk_is_atomic_on_missing_task(client: AsyncClient):
+    t1 = await _create_task(client)
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {"task_id": t1["id"], "problem_statement": "should-rollback"},
+                {"task_id": 999999, "user_story": "missing"},
+            ]
+        },
+    )
+    assert resp.status_code == 404, resp.text
+    # The first item must NOT have landed (whole batch rolled back).
+    got1 = (await client.get(f"/api/tasks/{t1['id']}")).json()
+    assert got1["problem_statement"] in (None, "")
+
+
+async def test_refine_bulk_duplicate_ac_id_returns_422(client: AsyncClient):
+    task = await _create_task(client)
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {
+                    "task_id": task["id"],
+                    "acceptance_criteria": [_ac_payload(1), _ac_payload(1)],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 422
+
+
+async def test_refine_bulk_empty_items_returns_422(client: AsyncClient):
+    resp = await client.post("/api/tasks/refine-bulk", json={"items": []})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# acceptance_criteria / risks at child-task creation
+# ---------------------------------------------------------------------------
+
+
+async def test_create_subtasks_bulk_accepts_acceptance_criteria(client: AsyncClient):
+    parent = await _create_task(client, task_type="task")
+    resp = await client.post(
+        f"/api/tasks/{parent['id']}/subtasks",
+        json={
+            "items": [
+                {
+                    "title": "Sub with AC",
+                    "acceptance_criteria": [_ac_payload(1), _ac_payload(2)],
+                    "risks": [
+                        {
+                            "kind": "security",
+                            "severity": "low",
+                            "description": "r",
+                            "mitigation": "m",
+                        }
+                    ],
+                },
+                {"title": "Sub without AC"},
+            ],
+            "source": "agent",
+            "agent": "bot",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert len(created) == 2
+
+    acs = (
+        await client.get(f"/api/tasks/{created[0]['id']}/acceptance_criteria")
+    ).json()
+    assert {ac["id"] for ac in acs} == {"AC-1", "AC-2"}
+    full = (await client.get(f"/api/tasks/{created[0]['id']}")).json()
+    assert len(full["risks"]) == 1
+    # Second child has none.
+    acs2 = (
+        await client.get(f"/api/tasks/{created[1]['id']}/acceptance_criteria")
+    ).json()
+    assert acs2 == []

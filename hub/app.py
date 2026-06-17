@@ -20,6 +20,8 @@ from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.models import (
     BulkChildTasksCreate,
+    BulkRefine,
+    BulkRefineResult,
     AcceptanceCriterion,
     ActivityItem,
     DashboardData,
@@ -612,6 +614,22 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
+
+
+@app.post("/api/tasks/refine-bulk", response_model=BulkRefineResult)
+async def api_refine_tasks_bulk(body: BulkRefine, request: Request):
+    """Apply a TaskRefine PATCH to many tasks in one atomic request.
+
+    Either all items land or none do. Returns a per-task audit
+    (fields set, AC/risks counts, readiness).
+    """
+    db = _db(request)
+    try:
+        return await services.refine_tasks_bulk(db, body)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+    except DuplicateAcceptanceCriterionError as exc:
+        raise _duplicate_to_http(exc, 422) from exc
 
 
 @app.post(

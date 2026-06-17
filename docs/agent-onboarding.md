@@ -179,7 +179,8 @@ curl -sS \
 | Tool | structuredContent | Текст |
 |---|---|---|
 | `hub_create_task` | `task` (полный REST-ответ) | «Task #N created …» |
-| `hub_refine_task` | `task_id`, `updated_columns`, `refine_result` | список изменённых полей или no-op |
+| `hub_refine_task` | `task_id`, `fields_set`, `acceptance_criteria_count`, `risks_count`, `readiness_score`, `dor_passed`, `task` | какие поля применены + счётчики/readiness |
+| `hub_refine_tasks` | `results[]` (по задаче: `fields_set`, счётчики, `readiness_score`, `dor_passed`) | «Refined N task(s) …» |
 | `hub_task_status` | `task` (REST GET после refresh) | многострочный статус |
 
 Для надёжной автоматизации проверяй `structuredContent`, а не парси текст.
@@ -202,9 +203,11 @@ curl -sS \
 
 **Создание / уточнение**
 - `hub_create_task` — новая задача/epic/feature/subtask *(structuredContent)*
-- `hub_create_subtasks` — пачка подзадач под одним родителем (атомарно)
+- `hub_create_subtasks` — пачка подзадач под одним родителем (атомарно);
+  каждый item принимает `acceptance_criteria` и `risks`, чтобы родить подзадачу ближе к DoR
 - `hub_propose_task` — draft-предложение (вне scope)
 - `hub_refine_task` — PATCH структурных полей DoR (включая `title`, AC, risks) *(structuredContent)*
+- `hub_refine_tasks` — батч-refine многих задач за один атомарный вызов *(structuredContent)*
 - `hub_add_acceptance_criterion` / `hub_replace_acceptance_criteria` /
   `hub_list_acceptance_criteria` / `hub_delete_acceptance_criterion`
 - `hub_add_risk`

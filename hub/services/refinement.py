@@ -18,8 +18,11 @@ import aiosqlite
 from hub import repository as repo
 from hub.models import (
     AcceptanceCriterion,
+    BulkRefine,
+    BulkRefineResult,
     ReadinessReport,
     TaskRefine,
+    TaskRefineOutcome,
     TaskRisk,
 )
 from hub.services.recommendations import calculate_readiness_with_recommendations
@@ -107,34 +110,99 @@ async def refine_task(
     await _ensure_task_exists(db, task_id)
     old_row = await repo.get_task(db, task_id)
 
-    ac_count: int | None = None
     async with _atomic(db, "refine_task"):
-        updated_columns = await repo.update_task_structured(db, task_id, payload)
-
-        if (
-            old_row
-            and payload.title is not None
-            and "title" in updated_columns
-            and old_row["title"] != updated_columns["title"]
-        ):
-            await repo.add_task_update(
-                db,
-                task_id,
-                "",
-                "status",
-                f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
-            )
-
-        if payload.acceptance_criteria is not None:
-            try:
-                ac_count = await repo.replace_acceptance_criteria(
-                    db, task_id, payload.acceptance_criteria
-                )
-            except ValueError as exc:
-                # SAVEPOINT rolls back the structured-fields write too.
-                raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+        updated_columns, ac_count = await _apply_refine_writes(
+            db, task_id, payload, old_row
+        )
 
     return {"updated_columns": updated_columns, "ac_count": ac_count}
+
+
+async def _apply_refine_writes(
+    db: aiosqlite.Connection,
+    task_id: int,
+    payload: TaskRefine,
+    old_row: aiosqlite.Row | None,
+) -> tuple[dict[str, Any], int | None]:
+    """Write a refine PATCH WITHOUT opening its own transaction.
+
+    The caller is responsible for the surrounding SAVEPOINT/commit so this
+    helper is reusable by both single (`refine_task`) and bulk
+    (`refine_tasks_bulk`) flows. Returns ``(updated_columns, ac_count)``.
+    """
+    updated_columns = await repo.update_task_structured(db, task_id, payload)
+
+    if (
+        old_row
+        and payload.title is not None
+        and "title" in updated_columns
+        and old_row["title"] != updated_columns["title"]
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "",
+            "status",
+            f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
+        )
+
+    ac_count: int | None = None
+    if payload.acceptance_criteria is not None:
+        try:
+            ac_count = await repo.replace_acceptance_criteria(
+                db, task_id, payload.acceptance_criteria
+            )
+        except ValueError as exc:
+            # SAVEPOINT rolls back the structured-fields write too.
+            raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+
+    return updated_columns, ac_count
+
+
+async def refine_tasks_bulk(
+    db: aiosqlite.Connection,
+    payload: BulkRefine,
+) -> BulkRefineResult:
+    """Apply a TaskRefine PATCH to many tasks in ONE transaction.
+
+    Either every item lands or none does: any error (missing task, duplicate
+    AC id) rolls back the whole batch via the single SAVEPOINT. This collapses
+    the previous "~28 refine calls" into one request.
+    """
+    for item in payload.items:
+        await _ensure_task_exists(db, item.task_id)
+
+    outcomes: list[TaskRefineOutcome] = []
+    async with _atomic(db, "refine_bulk"):
+        for item in payload.items:
+            old_row = await repo.get_task(db, item.task_id)
+            refine = TaskRefine.model_validate(
+                item.model_dump(exclude={"task_id"}, exclude_unset=True)
+            )
+            updated_columns, ac_count = await _apply_refine_writes(
+                db, item.task_id, refine, old_row
+            )
+            fields_set = list(updated_columns.keys())
+            if refine.acceptance_criteria is not None:
+                fields_set.append("acceptance_criteria")
+            fields_set = sorted(set(fields_set))
+            risks_count = len(refine.risks) if refine.risks is not None else None
+            outcomes.append(
+                TaskRefineOutcome(
+                    task_id=item.task_id,
+                    fields_set=fields_set,
+                    acceptance_criteria_count=ac_count,
+                    risks_count=risks_count,
+                )
+            )
+
+    # Readiness is computed after commit so each report reflects the final row.
+    for outcome in outcomes:
+        report = await calculate_readiness_with_recommendations(db, outcome.task_id)
+        outcome.readiness_score = report.score
+        outcome.dor_passed = report.dor_passed
+
+    return BulkRefineResult(results=outcomes)
 
 
 async def add_risk(
