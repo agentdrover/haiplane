@@ -77,7 +77,7 @@
   <p>Краткая схема для Cursor pair mode. Полный lifecycle: <a href="software-development-workflow.md">software-development-workflow.md</a>.</p>
 
   <h2 id="gap-status">Статус gaps (группа #36)</h2>
-  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · gaps #37–#44 закрыты · группа #36 ✓</p>
+  <p class="status-meta">Обновлено: 2026-06-12 · ветка <code>develop</code> · gaps #37–#44 и #45 ✓ · feature #12 (MCP контракт) ✓ · группа #36 ✓</p>
   <table>
     <thead>
       <tr><th>Gap</th><th>Task</th><th>Код</th><th>Hub</th><th>PR</th></tr>
@@ -144,7 +144,7 @@
 
   <div class="panel">
     <p><span class="badge ok">группа #36</span> Индексная задача закрыта: все gap-задачи pair path B (#37–#44) в <code>develop</code> и <code>completed</code> в hub.</p>
-    <p>Отдельно в backlog: #45 (<code>hub_refine_task</code> title) — не входит в pair lifecycle gaps.</p>
+    <p><span class="badge ok">#45</span> <code>hub_refine_task(title=...)</code> — закрыта отдельно (<a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/18">PR #18</a>), не входит в pair lifecycle gaps, но входит в roadmap MCP (#12).</p>
   </div>
 
   <h2>Два пути после approve</h2>
@@ -245,44 +245,76 @@
   </ol>
 
   <h2 id="feature-12">Feature #12 — MCP контракт (parent)</h2>
-  <p class="status-meta">Feature <strong>#12</strong> · parent epic #11 · <span class="badge ok">completed</span> (дочерние #13–#15 закрыты, PR #22–#24)</p>
+  <p class="status-meta">Feature <strong>#12</strong> · parent epic #11 · <span class="badge ok">completed</span> · PR <a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/20">#20</a>–<a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/24">#24</a></p>
   <table>
     <thead>
-      <tr><th>Task</th><th>Тема</th><th>Hub</th><th>Блокирует #12</th></tr>
+      <tr><th>Task</th><th>Тема</th><th>Hub</th><th>PR</th></tr>
     </thead>
     <tbody>
       <tr>
         <td>#13</td>
         <td><code>hub_refine_task</code> + AC/risks</td>
         <td><span class="badge ok">completed</span></td>
-        <td>нет</td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/20">#20</a></td>
       </tr>
       <tr>
         <td>#14</td>
-        <td>bulk subtasks</td>
+        <td><code>hub_create_subtasks</code> bulk</td>
         <td><span class="badge ok">completed</span></td>
-        <td>нет</td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/22">#22</a></td>
       </tr>
       <tr>
         <td>#15</td>
         <td>StructuredContent MCP</td>
         <td><span class="badge ok">completed</span></td>
-        <td>нет</td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/24">#24</a></td>
+      </tr>
+      <tr>
+        <td>#45</td>
+        <td><code>hub_refine_task(title=...)</code></td>
+        <td><span class="badge ok">completed</span></td>
+        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/18">#18</a></td>
       </tr>
       <tr>
         <td>#35</td>
         <td>Team execution umbrella</td>
         <td><span class="badge todo">draft</span></td>
-        <td>нет (→ #36)</td>
+        <td>—</td>
       </tr>
       <tr>
-        <td>#36–#45</td>
+        <td>#36–#44</td>
         <td>Pair path B gaps</td>
         <td><span class="badge ok">completed</span></td>
-        <td>нет</td>
+        <td><a href="#gap-status">§ gaps</a> · <a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/15">#15 docs</a></td>
       </tr>
     </tbody>
   </table>
+
+  <h3 id="structured-content">MCP StructuredContent pilot (#15)</h3>
+  <p>Gap <strong>#15</strong> <span class="badge ok">закрыт</span>: ключевые tools возвращают <code>CallToolResult</code> с текстовым резюме и <code>structuredContent</code> (<code>schema_version: "1"</code>).</p>
+  <table>
+    <thead>
+      <tr><th>Tool</th><th>structuredContent</th><th>Текст для человека</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>hub_create_task</code></td>
+        <td><code>task</code> — полный REST POST /api/tasks</td>
+        <td>«Task #N created (status: …)»</td>
+      </tr>
+      <tr>
+        <td><code>hub_refine_task</code></td>
+        <td><code>task_id</code>, <code>updated_columns</code>, <code>refine_result</code></td>
+        <td>список обновлённых полей или no-op</td>
+      </tr>
+      <tr>
+        <td><code>hub_task_status</code></td>
+        <td><code>task</code> — REST GET после refresh</td>
+        <td>многострочный статус (как раньше)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="status-meta">Остальные MCP tools пока без structuredContent (scope out #15). Схема: <code>hub/mcp_structured.py</code>, <code>outputSchema</code> в <code>tools/list</code>.</p>
 
   <h2>Ссылки</h2>
   <ul>
