@@ -200,7 +200,7 @@ async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
 
     assert started.status.value == "running"
     assert started.job_id is None
-    assert started.branch == f"task-{tv.id}/test"
+    assert started.branch == f"task-{tv.id}/pair-task"
     assert started.assigned_agent == "composer-analyst"
     submit_mock.assert_not_called()
 
@@ -275,16 +275,20 @@ async def test_pair_done_from_running_enters_ci_check_with_auto_review(
     assert row["status"] == "ci_check"
 
 
-async def test_done_from_open_without_pair_start_keeps_open(db: aiosqlite.Connection):
+async def test_done_from_open_without_pair_start_rejects_done(db: aiosqlite.Connection):
     body = TaskCreate(title="Open pair legacy")
     tv = await services.create_task(db, body)
-    await services.add_update(
-        db,
-        tv.id,
-        TaskUpdateCreate(agent="dev", kind="done", content="Report without start"),
-    )
-    row = await repo.get_task(db, tv.id)
-    assert row["status"] == "open"
+    with pytest.raises(HTTPException) as exc_info:
+        await services.add_update(
+            db,
+            tv.id,
+            TaskUpdateCreate(agent="dev", kind="done", content="Report without start"),
+        )
+    assert exc_info.value.status_code == 400
+    detail = exc_info.value.detail
+    assert detail["reason"] == "pair_start_required"
+    updates = await repo.get_task_updates(db, tv.id)
+    assert not any(u["kind"] == "done" for u in updates)
 
 
 async def test_start_task_dispatch_failure_keeps_task_recoverable(
@@ -1189,7 +1193,7 @@ async def test_done_report_on_claimed_completes_when_no_auto_review(
     assert row["claim_session_id"] in (None, "")
 
 
-async def test_done_report_on_claimed_auto_review_goes_ci_check(
+async def test_done_report_on_claimed_auto_review_completes_without_branch(
     db: aiosqlite.Connection,
 ):
     task_id = await _make_claimed(db, auto_review=True)
@@ -1199,9 +1203,8 @@ async def test_done_report_on_claimed_auto_review_goes_ci_check(
         TaskUpdateCreate(agent="composer", kind="done", content="Done"),
     )
     row = await repo.get_task(db, task_id)
-    # auto_review + done routes through the shared transition; no branch on a
-    # claimed task means no git ops, just the ci_check gate.
-    assert row["status"] == "ci_check"
+    # No branch on a claimed-only task: skip meaningless ci_check dead-end.
+    assert row["status"] == "completed"
     assert row["claimed_by"] in (None, "")
 
 
@@ -1232,6 +1235,52 @@ async def test_force_complete_from_claimed(db: aiosqlite.Connection):
         update.kind == "done" and "Force-completed by human" in update.content
         for update in tv.updates
     )
+
+
+async def test_force_complete_from_pair_running(db: aiosqlite.Connection):
+    """Pair running (no job_id) is in the allowed force-complete set."""
+    task_id = await repo.create_task(
+        db,
+        title="Pair running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()  # job_id stays NULL → pair task
+    tv = await services.force_complete_task(db, task_id)
+    assert tv.status.value == "completed"
+
+
+async def test_force_complete_rejected_for_headless_running(db: aiosqlite.Connection):
+    """Headless running (job_id set) is poller-owned and must NOT force-complete."""
+    task_id = await repo.create_task(
+        db,
+        title="Headless running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-xyz")
+    await db.commit()
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, task_id)
+    assert exc_info.value.status_code == 400
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "running"
 
 
 async def test_claim_task_conflict(db: aiosqlite.Connection):
@@ -1299,3 +1348,100 @@ async def test_noop_plugins_start_clean(db: aiosqlite.Connection):
 
     inbox = await services.get_inbox_data(db)
     assert isinstance(inbox, dict)
+
+
+async def test_parent_rollup_cascade_task_feature_epic(db: aiosqlite.Connection):
+    epic_id = await repo.create_task(
+        db,
+        title="Epic rollup",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    feature_id = await repo.create_task(
+        db,
+        title="Feature rollup",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Task A",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    task_b = await repo.create_task(
+        db,
+        title="Task B",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_b,
+        TaskUpdateCreate(agent="dev", kind="done", content="Finished B"),
+    )
+    feature_row = await repo.get_task(db, feature_id)
+    epic_row = await repo.get_task(db, epic_id)
+    assert feature_row["status"] == "completed"
+    assert epic_row["status"] == "completed"
+
+
+async def test_done_report_idempotent_from_completed_rejected(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Already done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    with pytest.raises(HTTPException) as exc_info:
+        await services.add_update(
+            db,
+            task_id,
+            TaskUpdateCreate(agent="dev", kind="done", content="Again"),
+        )
+    assert exc_info.value.status_code == 409
+    updates = await repo.get_task_updates(db, task_id)
+    assert not any(u["kind"] == "done" for u in updates)

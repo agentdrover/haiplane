@@ -108,31 +108,31 @@ async def transition_after_agent_done(
 ) -> str:
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
+    branch = task.get("branch")
     if (
         task.get("auto_review")
         and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
         and has_done
+        and branch
     ):
-        branch = task.get("branch")
-        if branch:
-            await plugins.git_ops.checkout(branch)
-            await plugins.git_ops.auto_commit(task_id, title=task.get("title", ""))
-            squashed = await plugins.git_ops.squash_branch(
+        await plugins.git_ops.checkout(branch)
+        await plugins.git_ops.auto_commit(task_id, title=task.get("title", ""))
+        squashed = await plugins.git_ops.squash_branch(
+            task_id,
+            task.get("title", ""),
+            branch,
+        )
+        await plugins.git_ops.push_branch(branch, force=squashed)
+        if not task.get("pr_number"):
+            pr_num = await plugins.git_ops.create_pr(
                 task_id,
-                task.get("title", ""),
+                task["title"],
+                task.get("description", ""),
                 branch,
             )
-            await plugins.git_ops.push_branch(branch, force=squashed)
-            if not task.get("pr_number"):
-                pr_num = await plugins.git_ops.create_pr(
-                    task_id,
-                    task["title"],
-                    task.get("description", ""),
-                    branch,
-                )
-                if pr_num:
-                    await repo.update_task(db, task_id, pr_number=pr_num)
-                    task["pr_number"] = pr_num
+            if pr_num:
+                await repo.update_task(db, task_id, pr_number=pr_num)
+                task["pr_number"] = pr_num
         await repo.update_task(
             db,
             task_id,

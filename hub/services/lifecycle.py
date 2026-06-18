@@ -17,6 +17,7 @@ from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.models import (
     BulkChildTasksCreate,
+    FINAL_STATUSES,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -45,9 +46,183 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     transition_after_agent_done,
 )
-from hub.services.refinement import TaskNotFoundError, get_write_lock
+from hub.services.refinement import (
+    TaskNotFoundError,
+    get_write_lock,
+    list_acceptance_criteria,
+)
 
 log = logging.getLogger("hub")
+
+_ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+def compute_lifecycle_hint(task: dict[str, Any]) -> str | None:
+    """Human-readable explanation for non-obvious lifecycle waits."""
+    status = task.get("status")
+    if status != "ci_check":
+        return None
+    if task.get("job_id"):
+        return (
+            "Headless task in ci_check: background poller watches PR CI and "
+            "dispatches review when checks pass."
+        )
+    branch = task.get("branch") or ""
+    pr = task.get("pr_number")
+    if not branch:
+        return (
+            "Pair task skipped ci_check (no branch). If you still see ci_check, "
+            "await human decision or force-complete."
+        )
+    if not pr:
+        return (
+            "Awaiting CI conveyor: pair task in ci_check without PR yet. "
+            "Poller will create PR from branch or escalate to needs_decision "
+            "after retries."
+        )
+    return (
+        f"Awaiting CI conveyor: PR #{pr} on branch {branch}. "
+        "Poller advances to review when CI passes."
+    )
+
+
+async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
+    """Auto-complete feature/epic when all direct children are completed."""
+    row = await repo.get_task(db, child_id)
+    if not row:
+        return
+    parent_id = dict(row).get("parent_id")
+    if not parent_id:
+        return
+
+    parent_row = await repo.get_task(db, parent_id)
+    if not parent_row:
+        return
+    parent = dict(parent_row)
+    if parent.get("task_type") not in _ROLLUP_PARENT_TYPES:
+        return
+    if parent["status"] in {s.value for s in FINAL_STATUSES}:
+        return
+
+    children = await db_module.get_children(db, parent_id)
+    if not children:
+        return
+    if not all(c["status"] == "completed" for c in children):
+        return
+
+    if not await repo.transition_status_if(
+        db,
+        parent_id,
+        expected_from=parent["status"],
+        new_status="completed",
+    ):
+        refreshed = await repo.get_task(db, parent_id)
+        if refreshed and dict(refreshed)["status"] == "completed":
+            await maybe_rollup_parent(db, parent_id)
+        return
+
+    await log_activity(
+        db,
+        "task_completed",
+        f"Task #{parent_id} auto-completed: all children done",
+    )
+    await maybe_rollup_parent(db, parent_id)
+
+
+async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
+    """Repair feature/epic rows left open while all children are completed."""
+    rows = await db.execute_fetchall(
+        "SELECT id FROM tasks WHERE archived=0 AND task_type IN ('feature','epic') "
+        "AND status NOT IN ('completed','failed','rejected') "
+        "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC"
+    )
+    repaired = 0
+    for row in rows:
+        parent_id = row["id"]
+        parent_row = await repo.get_task(db, parent_id)
+        if not parent_row:
+            continue
+        children = await db_module.get_children(db, parent_id)
+        if children and all(c["status"] == "completed" for c in children):
+            await repo.update_task(db, parent_id, status="completed")
+            repaired += 1
+    if repaired:
+        await db.commit()
+        log.info("Repaired %d stale parent task(s) to completed", repaired)
+    return repaired
+
+
+def _done_report_error(
+    task: dict[str, Any],
+    *,
+    reason: str,
+    hint: str,
+    required_status: str,
+) -> dict[str, Any]:
+    return {
+        "reason": reason,
+        "hint": hint,
+        "required_status": required_status,
+        "current_status": task["status"],
+    }
+
+
+def _validate_done_report(task: dict[str, Any]) -> None:
+    """Raise HTTPException when a done report must not be recorded."""
+    status = task["status"]
+    if status == "pending_report":
+        return
+    if status in ("running", "claimed") and not task.get("job_id"):
+        return
+    if status in {s.value for s in FINAL_STATUSES}:
+        raise HTTPException(
+            409,
+            detail=_done_report_error(
+                task,
+                reason="task_already_terminal",
+                hint="Task is already finished; no further done report is needed.",
+                required_status=status,
+            ),
+        )
+    if status == "open" and not task.get("job_id"):
+        raise HTTPException(
+            400,
+            detail=_done_report_error(
+                task,
+                reason="pair_start_required",
+                hint="Call hub_pair_start (or hub_claim_task then pair-start) before hub_report_done.",
+                required_status="running",
+            ),
+        )
+    if status == "ci_check":
+        raise HTTPException(
+            400,
+            detail=_done_report_error(
+                task,
+                reason="awaiting_ci_conveyor",
+                hint="Task is in ci_check; wait for poller or use hub_decide_task / human gate.",
+                required_status="ci_check",
+            ),
+        )
+    if status == "needs_decision":
+        raise HTTPException(
+            400,
+            detail=_done_report_error(
+                task,
+                reason="human_decision_required",
+                hint="Task awaits hub_decide_task or human Decision Gate.",
+                required_status="needs_decision",
+            ),
+        )
+    raise HTTPException(
+        400,
+        detail=_done_report_error(
+            task,
+            reason="invalid_status_for_done",
+            hint="Start work via hub_pair_start or hub_start_task before reporting done.",
+            required_status="running",
+        ),
+    )
 
 
 def row_to_task(
@@ -130,6 +305,14 @@ async def enrich_task_view(
         ]
         progress_data = await db_module.get_progress(db, task_view.id)
         task_view.progress = TaskProgress(**progress_data)
+
+    acs = await list_acceptance_criteria(db, task_view.id)
+    if acs:
+        task_view.acceptance_criteria = acs
+
+    row = await repo.get_task(db, task_view.id)
+    if row:
+        task_view.lifecycle_hint = compute_lifecycle_hint(dict(row))
 
     return task_view
 
@@ -798,6 +981,7 @@ async def decide_task(
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
         await repo.update_task(db, task_id, status="completed")
         await db.commit()
+        await maybe_rollup_parent(db, task_id)
         await log_activity(
             db,
             "task_decided",
@@ -866,50 +1050,65 @@ async def add_update(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
-    update_id = await repo.add_task_update(
-        db, task_id, body.agent, body.kind, body.content
-    )
 
     if body.kind == "done":
-        if task["status"] == "pending_report":
-            await repo.update_task(db, task_id, status="completed")
-            await log_activity(
-                db,
-                "task_completed",
-                f"Task #{task_id} completed with report from {body.agent}",
-            )
-        elif task["status"] in ("running", "claimed") and not task.get("job_id"):
-            # A done report on a pair-running task OR on a reserved (claimed)
-            # task must never be silently dropped: route both through the
-            # shared post-done transition. A claimed task never pair-started,
-            # so it has no branch — transition_after_agent_done then routes it
-            # to ci_check (auto_review) or completed without git ops.
-            was_claimed = task["status"] == "claimed"
-            updates_rows = await repo.get_task_updates(db, task_id)
-            updates_list = [dict(r) for r in updates_rows]
-            if any(u.get("kind") == "blocker" for u in updates_list):
-                await repo.update_task(db, task_id, status="needs_decision")
+        _validate_done_report(task)
+
+    # Serialize the whole mutation (insert + status transition + commits) on the
+    # shared connection so it cannot interleave with a refinement ``_atomic``
+    # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
+    # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
+    # which is why it must run under the same lock.
+    async with get_write_lock(db):
+        update_id = await repo.add_task_update(
+            db, task_id, body.agent, body.kind, body.content
+        )
+
+        if body.kind == "done":
+            if task["status"] == "pending_report":
+                await repo.update_task(db, task_id, status="completed")
                 await log_activity(
                     db,
-                    "task_needs_decision",
-                    f"Task #{task_id} → needs_decision (blocker in done flow)",
+                    "task_completed",
+                    f"Task #{task_id} completed with report from {body.agent}",
                 )
-            else:
-                await transition_after_agent_done(db, task, has_done=True)
-            if was_claimed:
-                await repo.update_task(
-                    db, task_id, claimed_by=None, claim_session_id=None
-                )
-        # open + done without pair-start: keep status (AC-2)
-    else:
-        await repo.update_task(db, task_id)
+                await maybe_rollup_parent(db, task_id)
+            elif task["status"] in ("running", "claimed") and not task.get("job_id"):
+                # A done report on a pair-running task OR on a reserved (claimed)
+                # task must never be silently dropped: route both through the
+                # shared post-done transition. A claimed task never pair-started,
+                # so it has no branch — transition_after_agent_done then routes
+                # it to completed (no branch ⇒ ci_check is skipped).
+                was_claimed = task["status"] == "claimed"
+                updates_rows = await repo.get_task_updates(db, task_id)
+                updates_list = [dict(r) for r in updates_rows]
+                if any(u.get("kind") == "blocker" for u in updates_list):
+                    await repo.update_task(db, task_id, status="needs_decision")
+                    await log_activity(
+                        db,
+                        "task_needs_decision",
+                        f"Task #{task_id} → needs_decision (blocker in done flow)",
+                    )
+                else:
+                    await transition_after_agent_done(db, task, has_done=True)
+                if was_claimed:
+                    await repo.update_task(
+                        db, task_id, claimed_by=None, claim_session_id=None
+                    )
+                refreshed = await repo.get_task(db, task_id)
+                if refreshed and dict(refreshed)["status"] == "completed":
+                    await maybe_rollup_parent(db, task_id)
+            # open + done without pair-start: rejected before insert (AC-2)
+        else:
+            await repo.update_task(db, task_id)
 
-    await db.commit()
-    await log_activity(
-        db,
-        "task_update",
-        f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
-    )
+        await db.commit()
+        await log_activity(
+            db,
+            "task_update",
+            f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
+        )
+
     update_row = await repo.get_task_update_by_id(db, update_id)
     return TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
 
@@ -996,14 +1195,17 @@ async def force_complete_task(
     comment = (body.comment.strip() if body else "") or (
         "Force-completed by human without agent report."
     )
-    await repo.add_task_update(db, task_id, "human", "done", comment)
-    if status == "claimed":
-        await repo.update_task(
-            db, task_id, status="completed", claimed_by=None, claim_session_id=None
-        )
-    else:
-        await repo.update_task(db, task_id, status="completed")
-    await db.commit()
+    # Serialize against refinement _atomic savepoints on the shared connection.
+    async with get_write_lock(db):
+        await repo.add_task_update(db, task_id, "human", "done", comment)
+        if status == "claimed":
+            await repo.update_task(
+                db, task_id, status="completed", claimed_by=None, claim_session_id=None
+            )
+        else:
+            await repo.update_task(db, task_id, status="completed")
+        await db.commit()
+        await maybe_rollup_parent(db, task_id)
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]

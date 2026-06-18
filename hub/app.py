@@ -669,15 +669,20 @@ async def api_list_acceptance_criteria(task_id: int, request: Request):
     status_code=status.HTTP_201_CREATED,
 )
 async def api_add_acceptance_criterion(
-    task_id: int, body: AcceptanceCriterion, request: Request
+    task_id: int, body: AcceptanceCriterion, request: Request, response: Response
 ):
-    """Append one AC. Returns 409 if ``id`` collides with an existing one."""
+    """Append one AC. Idempotent by ``id``: duplicate ac_id returns existing row."""
     try:
-        return await services.add_acceptance_criterion(_db(request), task_id, body)
+        ac, created = await services.add_acceptance_criterion(
+            _db(request), task_id, body
+        )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, status.HTTP_409_CONFLICT) from exc
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return ac
 
 
 @app.put(

@@ -304,8 +304,18 @@
       </tr>
       <tr>
         <td><code>hub_refine_task</code></td>
-        <td><code>task_id</code>, <code>updated_columns</code>, <code>refine_result</code></td>
-        <td>список обновлённых полей или no-op</td>
+        <td><code>task_id</code>, <code>fields_set</code>, <code>acceptance_criteria_count</code>, <code>risks_count</code>, <code>readiness_score</code>, <code>dor_passed</code>, <code>no_op</code>, <code>task</code></td>
+        <td>список применённых полей (<code>fields_set</code>) или no-op</td>
+      </tr>
+      <tr>
+        <td><code>hub_refine_tasks</code></td>
+        <td><code>results[]</code> (по записи на задачу: <code>task_id</code>, <code>fields_set</code>, …), <code>no_op</code></td>
+        <td>сводка по каждой задаче пачки</td>
+      </tr>
+      <tr>
+        <td><code>hub_readiness_tree</code></td>
+        <td><code>report</code> — <code>{root_id, total, ready, not_ready, nodes[]}</code></td>
+        <td>DoR-сводка по поддереву</td>
       </tr>
       <tr>
         <td><code>hub_task_status</code></td>

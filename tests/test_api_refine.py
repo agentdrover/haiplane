@@ -317,7 +317,7 @@ async def test_add_ac_returns_201_and_persists(client: AsyncClient):
     assert [ac["id"] for ac in listed.json()] == ["AC-1"]
 
 
-async def test_add_ac_duplicate_returns_409(client: AsyncClient):
+async def test_add_ac_duplicate_returns_200_idempotent(client: AsyncClient):
     task = await _create_task(client)
     await client.post(
         f"/api/tasks/{task['id']}/acceptance_criteria", json=_ac_payload(1)
@@ -325,8 +325,10 @@ async def test_add_ac_duplicate_returns_409(client: AsyncClient):
     resp = await client.post(
         f"/api/tasks/{task['id']}/acceptance_criteria", json=_ac_payload(1)
     )
-    assert resp.status_code == 409
-    assert "AC-1" in resp.text
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "AC-1"
+    listed = await client.get(f"/api/tasks/{task['id']}/acceptance_criteria")
+    assert len(listed.json()) == 1
 
 
 async def test_put_replaces_acs_atomically(client: AsyncClient):
@@ -492,6 +494,45 @@ async def test_readiness_tree_include_root(client: AsyncClient):
     ids = {n["id"] for n in body["nodes"]}
     assert feature["id"] in ids
     assert body["total"] == 2
+
+
+async def test_readiness_tree_collects_multiple_levels(client: AsyncClient):
+    """BFS reaches grandchildren: epic -> feature -> task -> subtask."""
+    epic = await _create_task(client, task_type="epic")
+    feature = await _create_task(client, task_type="feature", parent_id=epic["id"])
+    task = await _create_task(client, task_type="task", parent_id=feature["id"])
+    subtask = await _create_task(client, task_type="subtask", parent_id=task["id"])
+
+    resp = await client.get(f"/api/tasks/{epic['id']}/readiness-tree")
+    assert resp.status_code == 200, resp.text
+    ids = {n["id"] for n in resp.json()["nodes"]}
+    # All descendants are still actionable (open) → present; root excluded.
+    assert {feature["id"], task["id"], subtask["id"]} <= ids
+    assert epic["id"] not in ids
+
+
+async def test_readiness_tree_excludes_non_actionable_statuses(client: AsyncClient):
+    """A completed child must not be counted as not_ready (DoR is a pre-gate)."""
+    feature = await _make_feature(client)
+    open_task = await _create_task(client, parent_id=feature["id"])
+    done_task = await _create_task(client, parent_id=feature["id"])
+    # Drive done_task to completed via pair-start + report done.
+    await client.post(
+        f"/api/tasks/{done_task['id']}/pair-start",
+        json={"plan": "Plan: do it", "assigned_agent": "dev"},
+    )
+    await client.post(
+        f"/api/tasks/{done_task['id']}/updates",
+        json={"agent": "dev", "kind": "done", "content": "done"},
+    )
+
+    body = (await client.get(f"/api/tasks/{feature['id']}/readiness-tree")).json()
+    ids = {n["id"] for n in body["nodes"]}
+    # Only the still-open task is scored; the completed one is skipped.
+    assert open_task["id"] in ids
+    assert done_task["id"] not in ids
+    assert body["total"] == 1
+    assert body["not_ready"] == 1
 
 
 async def test_readiness_tree_unknown_task_returns_404(client: AsyncClient):
@@ -730,7 +771,7 @@ async def test_parallel_ac_writes_do_not_500(client: AsyncClient):
         for i in range(1, 13)
     ]
     results = await asyncio.gather(*adds)
-    assert all(r.status_code in (201, 409) for r in results), [
+    assert all(r.status_code in (200, 201, 409) for r in results), [
         r.status_code for r in results
     ]
     assert not any(r.status_code >= 500 for r in results)
@@ -750,3 +791,19 @@ async def test_parallel_ac_writes_do_not_500(client: AsyncClient):
     assert not any(r.status_code >= 500 for r in up_results)
     acs_after = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
     assert len(acs_after) == 12  # no duplicates created
+
+
+async def test_add_ac_duplicate_ac_id_is_idempotent(client: AsyncClient):
+    task = await _create_task(client)
+    tid = task["id"]
+    payload = _ac_payload(1)
+
+    first = await client.post(f"/api/tasks/{tid}/acceptance_criteria", json=payload)
+    assert first.status_code == 201
+
+    second = await client.post(f"/api/tasks/{tid}/acceptance_criteria", json=payload)
+    assert second.status_code == 200
+    assert second.json()["id"] == "AC-1"
+
+    acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+    assert len(acs) == 1

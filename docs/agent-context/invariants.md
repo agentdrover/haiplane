@@ -14,13 +14,22 @@ These are the rules most likely to be broken by “small” changes.
 - Status values are defined in `hub/models.py:TaskStatus`.
 - Final statuses are `completed`, `failed`, `rejected`.
 - Active statuses are tracked by `ACTIVE_STATUSES` in `hub/models.py`; progress math depends on them.
-- A `done` report must never be silently dropped: on a pair `running` (no
-  `job_id`) **or** a `claimed` task it routes through the shared post-done
-  transition (blocker → `needs_decision`, else `auto_review` → `ci_check` /
-  no review → `completed`); completing a `claimed` task clears the claim.
+- A `done` report from a disallowed status must not create a duplicate done row;
+  the API returns HTTP 400/409 with `{reason, hint, required_status}`.
+- On pair `running` (no `job_id`) or `claimed`, a valid done report routes through
+  the shared post-done transition (blocker → `needs_decision`, else `auto_review`
+  → `ci_check` only when a `branch` exists, else `completed`); completing
+  `claimed` clears the claim.
+- Parent rollup: completing the last child `task` under a `feature` (or the last
+  `feature` under an `epic`) auto-completes the parent when all siblings are
+  `completed` (idempotent).
 - `force_complete` is the audited human override and is allowed from
   `pending_report`, `claimed`, or pair `running` (no `job_id`); headless
   `running` (with `job_id`) is owned by the poller and is excluded.
+- Write serialization (`get_write_lock`) covers refinement/AC paths,
+  `create_subtasks_bulk`, and the lifecycle completion paths (`add_update`
+  done-flow, `force_complete_task`). It is NOT yet a full per-connection
+  commit lock; broad commit serialization is tracked as hardening work.
 - Approval is only valid from `draft`.
 - Approval uses an atomic conditional transition to avoid double-processing races.
 - If required DoR checks fail and `force` is not set, approval must fail with HTTP 422.
