@@ -1153,6 +1153,87 @@ async def test_claim_task_from_open(db: aiosqlite.Connection):
     assert tv.assigned_agent == "composer"
 
 
+async def _make_claimed(db: aiosqlite.Connection, *, auto_review: bool) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="Reserved",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=auto_review,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+    await services.claim_task(db, task_id, TaskClaim(agent="composer", session_id="s1"))
+    return task_id
+
+
+async def test_done_report_on_claimed_completes_when_no_auto_review(
+    db: aiosqlite.Connection,
+):
+    task_id = await _make_claimed(db, auto_review=False)
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="composer", kind="done", content="Work landed in main"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "completed"
+    # Claim is released so the task no longer looks reserved.
+    assert row["claimed_by"] in (None, "")
+    assert row["claim_session_id"] in (None, "")
+
+
+async def test_done_report_on_claimed_auto_review_goes_ci_check(
+    db: aiosqlite.Connection,
+):
+    task_id = await _make_claimed(db, auto_review=True)
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="composer", kind="done", content="Done"),
+    )
+    row = await repo.get_task(db, task_id)
+    # auto_review + done routes through the shared transition; no branch on a
+    # claimed task means no git ops, just the ci_check gate.
+    assert row["status"] == "ci_check"
+    assert row["claimed_by"] in (None, "")
+
+
+async def test_done_report_on_claimed_with_blocker_needs_decision(
+    db: aiosqlite.Connection,
+):
+    task_id = await _make_claimed(db, auto_review=False)
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="composer", kind="blocker", content="Stuck on infra"),
+    )
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="composer", kind="done", content="Partial"),
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "needs_decision"
+
+
+async def test_force_complete_from_claimed(db: aiosqlite.Connection):
+    task_id = await _make_claimed(db, auto_review=True)
+    tv = await services.force_complete_task(db, task_id)
+    assert tv.status.value == "completed"
+    assert tv.claimed_by in (None, "")
+    assert any(
+        update.kind == "done" and "Force-completed by human" in update.content
+        for update in tv.updates
+    )
+
+
 async def test_claim_task_conflict(db: aiosqlite.Connection):
     task_id = await repo.create_task(
         db,

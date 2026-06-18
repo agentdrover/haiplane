@@ -878,7 +878,13 @@ async def add_update(
                 "task_completed",
                 f"Task #{task_id} completed with report from {body.agent}",
             )
-        elif task["status"] == "running" and not task.get("job_id"):
+        elif task["status"] in ("running", "claimed") and not task.get("job_id"):
+            # A done report on a pair-running task OR on a reserved (claimed)
+            # task must never be silently dropped: route both through the
+            # shared post-done transition. A claimed task never pair-started,
+            # so it has no branch — transition_after_agent_done then routes it
+            # to ci_check (auto_review) or completed without git ops.
+            was_claimed = task["status"] == "claimed"
             updates_rows = await repo.get_task_updates(db, task_id)
             updates_list = [dict(r) for r in updates_rows]
             if any(u.get("kind") == "blocker" for u in updates_list):
@@ -890,6 +896,10 @@ async def add_update(
                 )
             else:
                 await transition_after_agent_done(db, task, has_done=True)
+            if was_claimed:
+                await repo.update_task(
+                    db, task_id, claimed_by=None, claim_session_id=None
+                )
         # open + done without pair-start: keep status (AC-2)
     else:
         await repo.update_task(db, task_id)
@@ -960,7 +970,13 @@ async def force_complete_task(
     task_id: int,
     body: TaskForceComplete | None = None,
 ) -> TaskView:
-    """Force-complete a pending_report task without a done report.
+    """Force-complete a stuck task without going through review.
+
+    Human override escape hatch for non-headless tasks that cannot otherwise
+    reach a terminal state: ``pending_report`` (agent never reported),
+    ``claimed`` (reserved but no pair-start), and pair ``running`` (no
+    headless ``job_id``). Headless ``running`` tasks (with a ``job_id``) are
+    excluded — the poller owns those.
 
     The optional ``body.comment`` is recorded as the audit-trail message; if
     omitted, a default human-override message is used.
@@ -969,16 +985,24 @@ async def force_complete_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
-    if task["status"] != "pending_report":
+    status = task["status"]
+    is_pair_running = status == "running" and not task.get("job_id")
+    if status not in ("pending_report", "claimed") and not is_pair_running:
         raise HTTPException(
             400,
-            f"can only force-complete pending_report tasks, current: {task['status']}",
+            "can only force-complete pending_report, claimed, or pair-running "
+            f"tasks, current: {status}",
         )
     comment = (body.comment.strip() if body else "") or (
         "Force-completed by human without agent report."
     )
     await repo.add_task_update(db, task_id, "human", "done", comment)
-    await repo.update_task(db, task_id, status="completed")
+    if status == "claimed":
+        await repo.update_task(
+            db, task_id, status="completed", claimed_by=None, claim_session_id=None
+        )
+    else:
+        await repo.update_task(db, task_id, status="completed")
     await db.commit()
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)

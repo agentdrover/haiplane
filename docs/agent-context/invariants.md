@@ -14,6 +14,13 @@ These are the rules most likely to be broken by “small” changes.
 - Status values are defined in `hub/models.py:TaskStatus`.
 - Final statuses are `completed`, `failed`, `rejected`.
 - Active statuses are tracked by `ACTIVE_STATUSES` in `hub/models.py`; progress math depends on them.
+- A `done` report must never be silently dropped: on a pair `running` (no
+  `job_id`) **or** a `claimed` task it routes through the shared post-done
+  transition (blocker → `needs_decision`, else `auto_review` → `ci_check` /
+  no review → `completed`); completing a `claimed` task clears the claim.
+- `force_complete` is the audited human override and is allowed from
+  `pending_report`, `claimed`, or pair `running` (no `job_id`); headless
+  `running` (with `job_id`) is owned by the poller and is excluded.
 - Approval is only valid from `draft`.
 - Approval uses an atomic conditional transition to avoid double-processing races.
 - If required DoR checks fail and `force` is not set, approval must fail with HTTP 422.

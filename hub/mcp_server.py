@@ -632,14 +632,16 @@ async def hub_release_task(
 
 @mcp.tool()
 async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
-    """Human force-completes a pending_report task without an agent done report.
+    """Human force-completes a stuck task without an agent done report.
 
-    Use this only when a human has inspected the result and intentionally accepts
-    responsibility for completing a task that lacks a normal done report. The
-    comment is recorded as the audit-trail message on the task update.
+    Works from pending_report, claimed (reserved but never pair-started), and
+    pair-running (no headless job) tasks. Use this only when a human has
+    inspected the result and intentionally accepts responsibility for completing
+    a task that lacks a normal done report. The comment is recorded as the
+    audit-trail message on the task update.
 
     Args:
-        task_id: The pending_report task ID to complete
+        task_id: The task ID to complete (pending_report / claimed / pair-running)
         comment: Reason for the override; recorded as the audit-trail message
     """
     body = {"comment": comment} if comment else None

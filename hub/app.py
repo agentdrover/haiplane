@@ -553,7 +553,7 @@ async def api_force_complete_task(
     body: TaskForceComplete | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    """Force-complete a pending_report task after explicit human acceptance."""
+    """Force-complete a stuck task (pending_report/claimed/pair-running)."""
     return await services.force_complete_task(_db(request), task_id, body)
 
 

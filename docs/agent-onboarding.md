@@ -231,11 +231,17 @@ curl -sS \
 **Жизненный цикл**
 - `hub_approve_task` / `hub_reject_task`
 - `hub_start_task` (path A, headless) / `hub_pair_start` (path B, pair)
-- `hub_claim_task` / `hub_release_task` — захват/освобождение сессией
+- `hub_claim_task` / `hub_release_task` — захват/освобождение сессией.
+  > `claim` — это **резервирование**, а не старт работы. Чтобы довести задачу до
+  > завершения, веди её через `hub_pair_start` (ставит `running`). Но если задача
+  > всё же в `claimed`, `hub_report_done` теперь не теряется: отчёт уводит её в
+  > `completed` (или `ci_check` при `auto_review`/`needs_decision` при блокере) и
+  > снимает claim. Прямой человеческий выход — `hub_force_complete_task`.
 - `hub_task_update` — статус/блокер/отчёт
 - `hub_ask_question` / `hub_answer_question`
 - `hub_report_done`
-- `hub_force_complete_task` (человеческий override)
+- `hub_force_complete_task` — человеческий override; работает из
+  `pending_report`, `claimed` и pair-`running` (без job)
 - `hub_decide_task` (решение после арбитража)
 - `hub_archive_task` / `hub_unarchive_task` / `hub_delete_task`
 
