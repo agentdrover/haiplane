@@ -26,6 +26,7 @@ from hub.models import (
     ActivityItem,
     DashboardData,
     ReadinessReport,
+    ReadinessTreeReport,
     TaskAnswer,
     TaskApprove,
     TaskArchive,
@@ -552,7 +553,7 @@ async def api_force_complete_task(
     body: TaskForceComplete | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    """Force-complete a pending_report task after explicit human acceptance."""
+    """Force-complete a stuck task (pending_report/claimed/pair-running)."""
     return await services.force_complete_task(_db(request), task_id, body)
 
 
@@ -759,6 +760,27 @@ async def api_task_readiness(
 ):
     try:
         return await services.get_readiness(_db(request), task_id, explain=explain)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+
+
+@app.get(
+    "/api/tasks/{task_id}/readiness-tree",
+    response_model=ReadinessTreeReport,
+)
+async def api_task_readiness_tree(
+    task_id: int,
+    request: Request,
+    include_root: bool = Query(default=False),
+):
+    """DoR rollup for a subtree: which descendants are not ready and why.
+
+    Set ``include_root=true`` to include the queried task itself.
+    """
+    try:
+        return await services.readiness_tree(
+            _db(request), task_id, include_root=include_root
+        )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
 

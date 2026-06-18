@@ -450,6 +450,33 @@ class Recommendation(BaseModel):
     estimated_minutes: int = 0
 
 
+class ReadinessTreeNode(BaseModel):
+    """One task's DoR status inside a subtree readiness report."""
+
+    id: int
+    title: str
+    task_type: TaskType = TaskType.task
+    status: TaskStatus
+    score: int = Field(..., ge=0, le=100)
+    dor_passed: bool
+    missing_required: list[str] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+
+
+class ReadinessTreeReport(BaseModel):
+    """DoR rollup for a subtree (epic/feature and its descendants).
+
+    Lets a caller see, in ONE request, which tasks under a root are not
+    DoR-ready and why — instead of calling ``/readiness`` per task.
+    """
+
+    root_id: int
+    total: int = 0
+    ready: int = 0
+    not_ready: int = 0
+    nodes: list[ReadinessTreeNode] = Field(default_factory=list)
+
+
 class ReadinessReport(BaseModel):
     """Result of a deterministic (non-LLM) readiness analysis for a task.
 

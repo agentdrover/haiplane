@@ -916,6 +916,31 @@ def cmd_readiness(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_readiness_tree(args: argparse.Namespace) -> int:
+    path = f"/api/tasks/{args.task_id}/readiness-tree"
+    if args.include_root:
+        path += "?include_root=true"
+    result = _api("GET", path)
+    if args.json:
+        _print_json(result)
+        return 0
+    print(
+        f"Subtree #{args.task_id}: {result.get('ready', 0)}/{result.get('total', 0)} "
+        f"ready, {result.get('not_ready', 0)} not ready"
+    )
+    for n in result.get("nodes") or []:
+        flag = "OK " if n.get("dor_passed") else "XX "
+        line = (
+            f"  {flag}#{n['id']} [{n.get('status', '?')}] "
+            f"score={n.get('score', 0)} {n.get('title', '')}"
+        )
+        missing = n.get("missing_required") or []
+        if missing:
+            line += "  missing: " + ", ".join(missing)
+        print(line)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -1212,7 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
         "force-complete",
-        help="Force-complete a pending_report task without an agent done report (audited human override)",
+        help="Force-complete a stuck task (pending_report/claimed/pair-running) without a done report (audited human override)",
     )
     p_force_complete.add_argument("task_id", type=int)
     p_force_complete.add_argument(
@@ -1511,6 +1536,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print full ReadinessReport JSON"
     )
     p_readiness.set_defaults(func=cmd_readiness)
+
+    # readiness-tree — DoR rollup for a subtree (epic/feature)
+    p_readiness_tree = sub.add_parser(
+        "readiness-tree",
+        help="DoR readiness rollup for a subtree (which tasks aren't ready)",
+    )
+    p_readiness_tree.add_argument("task_id", type=int)
+    p_readiness_tree.add_argument(
+        "--include-root",
+        dest="include_root",
+        action="store_true",
+        help="Include the root task itself in the report",
+    )
+    p_readiness_tree.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_readiness_tree.set_defaults(func=cmd_readiness_tree)
 
     # ---- Admin commands (Stage 4) ----------------------------------------
 

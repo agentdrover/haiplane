@@ -429,6 +429,77 @@ async def test_readiness_unknown_task_returns_404(client: AsyncClient):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/tasks/{id}/readiness-tree
+# ---------------------------------------------------------------------------
+
+
+async def _make_dor_ready(client: AsyncClient, task_id: int) -> None:
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "user_story": "us",
+            "problem_statement": "ps",
+            "business_value": "bv",
+            "scope_in": ["a"],
+            "validation_commands": ["uv run pytest"],
+            "size": "S",
+            "wip_tag": "feature_work",
+            "acceptance_criteria": [_ac_payload(1)],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def _make_feature(client: AsyncClient) -> dict:
+    """epic -> feature, returning the feature so tasks can hang under it."""
+    epic = await _create_task(client, task_type="epic")
+    return await _create_task(client, task_type="feature", parent_id=epic["id"])
+
+
+async def test_readiness_tree_rolls_up_descendants(client: AsyncClient):
+    feature = await _make_feature(client)
+    ready = await _create_task(client, parent_id=feature["id"])
+    not_ready = await _create_task(client, parent_id=feature["id"])
+    await _make_dor_ready(client, ready["id"])
+
+    resp = await client.get(f"/api/tasks/{feature['id']}/readiness-tree")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["root_id"] == feature["id"]
+    assert body["total"] == 2
+    assert body["ready"] == 1
+    assert body["not_ready"] == 1
+    ids = {n["id"] for n in body["nodes"]}
+    assert ids == {ready["id"], not_ready["id"]}
+    # Root is excluded by default.
+    assert feature["id"] not in ids
+    by_id = {n["id"]: n for n in body["nodes"]}
+    assert by_id[ready["id"]]["dor_passed"] is True
+    assert by_id[not_ready["id"]]["dor_passed"] is False
+    assert by_id[not_ready["id"]]["missing_required"]
+
+
+async def test_readiness_tree_include_root(client: AsyncClient):
+    feature = await _make_feature(client)
+    await _create_task(client, parent_id=feature["id"])
+
+    resp = await client.get(
+        f"/api/tasks/{feature['id']}/readiness-tree",
+        params={"include_root": "true"},
+    )
+    body = resp.json()
+    ids = {n["id"] for n in body["nodes"]}
+    assert feature["id"] in ids
+    assert body["total"] == 2
+
+
+async def test_readiness_tree_unknown_task_returns_404(client: AsyncClient):
+    resp = await client.get("/api/tasks/99999/readiness-tree")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Collection payload limits
 # ---------------------------------------------------------------------------
 

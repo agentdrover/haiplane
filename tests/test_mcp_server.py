@@ -22,6 +22,7 @@ from hub.mcp_server import (
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
+    hub_readiness_tree,
     hub_list_acceptance_criteria,
     hub_list_tasks,
     hub_prepare_developer_task,
@@ -657,6 +658,85 @@ async def test_hub_get_readiness_compact_summary(mock_api_get: AsyncMock) -> Non
     assert "has_problem_statement" in msg
     assert "Add a problem" in msg
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness")
+
+
+async def test_hub_readiness_tree_summarizes_not_ready(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.return_value = {
+        "root_id": 46,
+        "total": 3,
+        "ready": 1,
+        "not_ready": 2,
+        "nodes": [
+            {
+                "id": 47,
+                "title": "Ready one",
+                "status": "draft",
+                "score": 100,
+                "dor_passed": True,
+                "missing_required": [],
+                "blocking_reasons": [],
+            },
+            {
+                "id": 48,
+                "title": "Needs problem",
+                "status": "draft",
+                "score": 40,
+                "dor_passed": False,
+                "missing_required": ["has_problem_statement"],
+                "blocking_reasons": ["Add a problem statement"],
+            },
+            {
+                "id": 49,
+                "title": "Needs AC",
+                "status": "draft",
+                "score": 55,
+                "dor_passed": False,
+                "missing_required": ["has_acceptance_criteria"],
+                "blocking_reasons": [],
+            },
+        ],
+    }
+    result = await hub_readiness_tree(46)
+    msg = _mcp_text(result)
+    assert "1/3 ready" in msg
+    assert "2 not ready" in msg
+    assert "#48" in msg and "has_problem_statement" in msg
+    assert "#49" in msg
+    # The ready task is not listed under "Not ready".
+    assert "#47" not in msg
+    structured = _mcp_structured(result)
+    assert structured["report"]["not_ready"] == 2
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    mock_api_get.assert_awaited_once_with("/api/tasks/46/readiness-tree")
+
+
+async def test_hub_readiness_tree_include_root_query(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.return_value = {
+        "root_id": 46,
+        "total": 1,
+        "ready": 1,
+        "not_ready": 0,
+        "nodes": [
+            {
+                "id": 46,
+                "title": "Root",
+                "status": "draft",
+                "score": 100,
+                "dor_passed": True,
+                "missing_required": [],
+                "blocking_reasons": [],
+            }
+        ],
+    }
+    result = await hub_readiness_tree(46, include_root=True)
+    assert "All tasks in the subtree pass DoR." in _mcp_text(result)
+    mock_api_get.assert_awaited_once_with(
+        "/api/tasks/46/readiness-tree?include_root=true"
+    )
 
 
 async def test_hub_create_subtasks_posts_bulk_payload(

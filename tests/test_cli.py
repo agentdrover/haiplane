@@ -602,6 +602,65 @@ def test_cmd_readiness_explain_passes_query_param() -> None:
     mock_api.assert_called_once_with("GET", "/api/tasks/12/readiness?explain=true")
 
 
+def test_cmd_readiness_tree_lists_nodes() -> None:
+    args = argparse.Namespace(task_id=46, include_root=False, json=False)
+    payload = {
+        "root_id": 46,
+        "total": 2,
+        "ready": 1,
+        "not_ready": 1,
+        "nodes": [
+            {
+                "id": 47,
+                "title": "Ready",
+                "status": "draft",
+                "score": 100,
+                "dor_passed": True,
+                "missing_required": [],
+            },
+            {
+                "id": 48,
+                "title": "Not ready",
+                "status": "draft",
+                "score": 40,
+                "dor_passed": False,
+                "missing_required": ["has_problem_statement"],
+            },
+        ],
+    }
+    mock_api = MagicMock(return_value=payload)
+    with (
+        patch.object(cli, "_api", mock_api),
+        patch("sys.stdout", new=StringIO()) as out,
+    ):
+        rc = cli.cmd_readiness_tree(args)
+    assert rc == 0
+    mock_api.assert_called_once_with("GET", "/api/tasks/46/readiness-tree")
+    text = out.getvalue()
+    assert "1/2 ready" in text
+    assert "1 not ready" in text
+    assert "#48" in text
+    assert "has_problem_statement" in text
+
+
+def test_cmd_readiness_tree_include_root_query() -> None:
+    args = argparse.Namespace(task_id=46, include_root=True, json=True)
+    mock_api = MagicMock(
+        return_value={
+            "root_id": 46,
+            "total": 0,
+            "ready": 0,
+            "not_ready": 0,
+            "nodes": [],
+        }
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        cli.cmd_readiness_tree(args)
+    mock_api.assert_called_once_with(
+        "GET", "/api/tasks/46/readiness-tree?include_root=true"
+    )
+
+
 def test_cmd_approve_passes_force_flag() -> None:
     args = argparse.Namespace(
         task_id=5, comment="hot fix", run=True, runtime="vast", force=True

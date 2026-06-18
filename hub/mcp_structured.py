@@ -43,9 +43,16 @@ class HubRefineTasksStructured(BaseModel):
     no_op: bool = False
 
 
+class HubReadinessTreeStructured(BaseModel):
+    schema_version: str = Field(default=MCP_STRUCTURED_SCHEMA_VERSION)
+    # Full ReadinessTreeReport: {root_id, total, ready, not_ready, nodes[]}.
+    report: dict[str, Any]
+
+
 HubCreateTaskResult = Annotated[CallToolResult, HubCreateTaskStructured]
 HubRefineTaskResult = Annotated[CallToolResult, HubRefineTaskStructured]
 HubRefineTasksResult = Annotated[CallToolResult, HubRefineTasksStructured]
+HubReadinessTreeResult = Annotated[CallToolResult, HubReadinessTreeStructured]
 HubTaskStatusResult = Annotated[CallToolResult, HubTaskStatusStructured]
 
 
