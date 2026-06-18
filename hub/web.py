@@ -580,7 +580,7 @@ async def web_create_task(
         human_reviewer=human_reviewer,
         agent=user,
     )
-    created = await services.create_task(_db(request), body)
+    created = (await services.create_task(_db(request), body)).task
     if after_create == "refine":
         return RedirectResponse(f"/tasks/{created.id}", status_code=303)
     return RedirectResponse("/tasks", status_code=303)

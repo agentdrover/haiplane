@@ -354,6 +354,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN claim_session_id TEXT",
     ),
     ("add_claimed_at_column", "ALTER TABLE tasks ADD COLUMN claimed_at TEXT"),
+    (
+        "create_task_idempotency_keys_table",
+        """
+        CREATE TABLE IF NOT EXISTS task_idempotency_keys (
+            client_request_id TEXT PRIMARY KEY,
+            task_id INTEGER NOT NULL REFERENCES tasks(id),
+            request_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """,
+    ),
 ]
 
 

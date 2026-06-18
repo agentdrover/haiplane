@@ -91,6 +91,17 @@ async def test_claim_columns_present():
         await conn.close()
 
 
+async def test_task_idempotency_keys_table_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "task_idempotency_keys")
+        assert "client_request_id" in cols
+        assert "task_id" in cols
+        assert "request_hash" in cols
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "column, expected_default",
     [

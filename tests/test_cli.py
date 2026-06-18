@@ -85,6 +85,7 @@ def test_cmd_create() -> None:
         priority="high",
         owner="",
         reviewer="",
+        request_id="",
     )
     with (
         patch.object(cli, "_api", mock_api),
@@ -106,6 +107,7 @@ def test_cmd_create() -> None:
             "priority": "high",
             "parent_id": 5,
         },
+        extra_headers=None,
     )
     assert json.loads(out.getvalue()) == created
 
@@ -124,6 +126,7 @@ def test_cmd_create_with_owner_and_reviewer() -> None:
         priority="medium",
         owner="alice",
         reviewer="bob",
+        request_id="",
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_task(args)

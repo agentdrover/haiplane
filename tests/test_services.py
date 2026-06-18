@@ -28,7 +28,7 @@ from hub.models import (
 
 async def test_create_task(db: aiosqlite.Connection):
     body = TaskCreate(title="Service test", description="desc")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.id > 0
     assert tv.title == "Service test"
     assert tv.status.value == "open"
@@ -36,7 +36,7 @@ async def test_create_task(db: aiosqlite.Connection):
 
 async def test_create_subtasks_bulk(db: aiosqlite.Connection):
     parent = TaskCreate(title="Parent", source=TaskSource.human)
-    parent_view = await services.create_task(db, parent)
+    parent_view = (await services.create_task(db, parent)).task
     body = BulkChildTasksCreate(
         items=[
             BulkChildTaskItem(title="Child 1"),
@@ -54,14 +54,14 @@ async def test_create_subtasks_bulk(db: aiosqlite.Connection):
 
 async def test_create_subtasks_bulk_invalid_hierarchy(db: aiosqlite.Connection):
     parent = TaskCreate(title="Parent", source=TaskSource.human)
-    parent_view = await services.create_task(db, parent)
+    parent_view = (await services.create_task(db, parent)).task
     sub = TaskCreate(
         title="Sub",
         task_type=TaskType.subtask,
         parent_id=parent_view.id,
         source=TaskSource.human,
     )
-    sub_view = await services.create_task(db, sub)
+    sub_view = (await services.create_task(db, sub)).task
     body = BulkChildTasksCreate(items=[BulkChildTaskItem(title="Nope")])
     with pytest.raises(HTTPException) as exc:
         await services.create_subtasks_bulk(db, sub_view.id, body)
@@ -70,21 +70,21 @@ async def test_create_subtasks_bulk_invalid_hierarchy(db: aiosqlite.Connection):
 
 async def test_create_epic(db: aiosqlite.Connection):
     body = TaskCreate(title="Big epic", task_type="epic")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.task_type.value == "epic"
     assert tv.status.value == "open"
 
 
 async def test_create_agent_task_is_draft(db: aiosqlite.Connection):
     body = TaskCreate(title="Agent idea", source="agent", agent="bot")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "draft"
     assert tv.source.value == "agent"
 
 
 async def test_approve_task(db: aiosqlite.Connection):
     body = TaskCreate(title="Draft task", source="agent", agent="bot")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "draft"
 
     # force=True bypasses the DoR gate so this test keeps focus on
@@ -95,7 +95,7 @@ async def test_approve_task(db: aiosqlite.Connection):
 
 async def test_approve_with_comment(db: aiosqlite.Connection):
     body = TaskCreate(title="With comment", source="agent")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     # Force-approvals record the comment inside the 'Approve override' alert
     # instead of a separate 'Approved: ...' status update, so assert on the
@@ -109,7 +109,7 @@ async def test_approve_with_comment(db: aiosqlite.Connection):
 
 async def test_reject_task(db: aiosqlite.Connection):
     body = TaskCreate(title="To reject", source="agent")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     rejected = await services.reject_task(db, tv.id)
     assert rejected.status.value == "rejected"
@@ -117,7 +117,7 @@ async def test_reject_task(db: aiosqlite.Connection):
 
 async def test_reject_non_draft_fails(db: aiosqlite.Connection):
     body = TaskCreate(title="Open task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "open"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -128,7 +128,7 @@ async def test_reject_non_draft_fails(db: aiosqlite.Connection):
 
 async def test_approve_non_draft_fails(db: aiosqlite.Connection):
     body = TaskCreate(title="Open task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     with pytest.raises(HTTPException) as exc_info:
         await services.approve_task(db, tv.id)
@@ -137,7 +137,7 @@ async def test_approve_non_draft_fails(db: aiosqlite.Connection):
 
 async def test_start_task_requires_plan(db: aiosqlite.Connection):
     body = TaskCreate(title="No plan task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "open"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -148,7 +148,7 @@ async def test_start_task_requires_plan(db: aiosqlite.Connection):
 
 async def test_start_task_with_plan(db: aiosqlite.Connection):
     body = TaskCreate(title="With plan")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     start_body = TaskStart(plan="Plan: implement feature X")
     started = await services.start_task(db, tv.id, start_body)
@@ -157,7 +157,7 @@ async def test_start_task_with_plan(db: aiosqlite.Connection):
 
 async def test_start_task_with_prior_plan_update(db: aiosqlite.Connection):
     body = TaskCreate(title="Plan via update")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     await repo.add_task_update(
         db, tv.id, "dev", "status", "Plan: step-by-step approach"
@@ -170,7 +170,7 @@ async def test_start_task_with_prior_plan_update(db: aiosqlite.Connection):
 
 async def test_pair_start_requires_plan(db: aiosqlite.Connection):
     body = TaskCreate(title="Pair no plan")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     with pytest.raises(HTTPException) as exc_info:
         await services.pair_start_task(db, tv.id)
@@ -187,7 +187,7 @@ async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
     plugins.dispatch.submit_task = submit_mock
 
     body = TaskCreate(title="Pair task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     await repo.add_task_update(db, tv.id, "dev", "status", "Plan: pair in Cursor")
     await db.commit()
 
@@ -207,7 +207,7 @@ async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
 
 async def test_pair_start_uses_caller_when_agent_unset(db: aiosqlite.Connection):
     body = TaskCreate(title="Pair caller")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work locally")
     await db.commit()
 
@@ -277,7 +277,7 @@ async def test_pair_done_from_running_enters_ci_check_with_auto_review(
 
 async def test_done_from_open_without_pair_start_rejects_done(db: aiosqlite.Connection):
     body = TaskCreate(title="Open pair legacy")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     with pytest.raises(HTTPException) as exc_info:
         await services.add_update(
             db,
@@ -301,7 +301,7 @@ async def test_start_task_dispatch_failure_keeps_task_recoverable(
     plugins.git_ops = NoopGitOps()
 
     body = TaskCreate(title="Unavailable dispatch")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     await repo.add_task_update(db, tv.id, "human", "status", "Plan: hand off to dev")
     await db.commit()
 
@@ -528,7 +528,7 @@ async def test_answer_question_pair_resume_to_running_without_dispatch(
 
 async def test_answer_non_needs_info_fails(db: aiosqlite.Connection):
     body = TaskCreate(title="Open task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
 
     a_body = TaskAnswer(answer="answer")
     with pytest.raises(HTTPException) as exc_info:
@@ -725,7 +725,7 @@ async def test_force_complete_task(db: aiosqlite.Connection):
 
 async def test_force_complete_wrong_status(db: aiosqlite.Connection):
     body = TaskCreate(title="Still open")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "open"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -1122,7 +1122,7 @@ async def test_decide_task_record_decision_noop_does_not_break(
 
 async def test_decide_task_wrong_status(db: aiosqlite.Connection):
     body = TaskCreate(title="Open task")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.status.value == "open"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -1342,7 +1342,7 @@ async def test_noop_plugins_start_clean(db: aiosqlite.Connection):
     plugins.git_ops = NoopGitOps()
 
     body = TaskCreate(title="Noop test", description="created with noop plugins")
-    tv = await services.create_task(db, body)
+    tv = (await services.create_task(db, body)).task
     assert tv.id > 0
     assert tv.status.value == "open"
 
