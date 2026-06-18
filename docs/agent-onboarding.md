@@ -205,7 +205,10 @@ curl -sS \
 - `hub_task_status` — детальный статус задачи *(structuredContent)*
 - `hub_task_tree` — дерево подзадач
 - `hub_my_context` — контекст для старта работы
-- `hub_get_readiness` — Definition of Ready / рекомендации
+- `hub_get_readiness` — Definition of Ready / рекомендации (одна задача)
+- `hub_readiness_tree` — DoR по всему поддереву epic/feature за один вызов:
+  какие задачи не проходят DoR и почему (`not_ready`, `missing_required`).
+  Не зови `hub_get_readiness` по задаче в цикле — используй этот обзор *(structuredContent)*
 - `hub_admin_my_identity` — кто я (токен/роль)
 
 **Создание / уточнение**
@@ -214,7 +217,9 @@ curl -sS \
   каждый item принимает `acceptance_criteria` и `risks`, чтобы родить подзадачу ближе к DoR
 - `hub_propose_task` — draft-предложение (вне scope)
 - `hub_refine_task` — PATCH структурных полей DoR (включая `title`, AC, risks) *(structuredContent)*
-- `hub_refine_tasks` — батч-refine многих задач за один атомарный вызов *(structuredContent)*
+- `hub_refine_tasks` — батч-refine многих задач за один атомарный вызов; каждый
+  item — это `TaskRefine`, поэтому `acceptance_criteria`/`risks` ставятся пачкой
+  сразу для N задач (не нужно по одной) *(structuredContent)*
 - `hub_add_acceptance_criterion` / `hub_upsert_acceptance_criterion` /
   `hub_replace_acceptance_criteria` / `hub_list_acceptance_criteria` /
   `hub_delete_acceptance_criterion`

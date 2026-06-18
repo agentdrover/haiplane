@@ -22,6 +22,8 @@ from hub.models import (
     BulkRefine,
     BulkRefineResult,
     ReadinessReport,
+    ReadinessTreeNode,
+    ReadinessTreeReport,
     TaskRefine,
     TaskRefineOutcome,
     TaskRisk,
@@ -329,6 +331,58 @@ async def get_readiness(
 ) -> ReadinessReport:
     await _ensure_task_exists(db, task_id)
     return await calculate_readiness_with_recommendations(db, task_id, explain=explain)
+
+
+async def readiness_tree(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    include_root: bool = False,
+) -> ReadinessTreeReport:
+    """DoR rollup for a root task and its descendants in one pass.
+
+    For each node we reuse the same calculator as ``/readiness`` so the
+    subtree report can never drift from the per-task view. ``blocking_reasons``
+    surfaces the actionable "why" (blocking recommendation messages) so a
+    caller sees what to fix without a second round-trip.
+    """
+    await _ensure_task_exists(db, task_id)
+    ids = await repo.collect_subtree_ids(db, task_id)
+    if not include_root:
+        ids = [tid for tid in ids if tid != task_id]
+
+    nodes: list[ReadinessTreeNode] = []
+    ready = 0
+    for tid in ids:
+        row = await repo.get_task(db, tid)
+        if row is None:
+            continue
+        report = await calculate_readiness_with_recommendations(db, tid)
+        blocking = [
+            rec.message for rec in report.recommendations if rec.severity == "blocking"
+        ]
+        nodes.append(
+            ReadinessTreeNode(
+                id=tid,
+                title=row["title"],
+                task_type=row["task_type"],
+                status=row["status"],
+                score=report.score,
+                dor_passed=report.dor_passed,
+                missing_required=report.missing_required,
+                blocking_reasons=blocking,
+            )
+        )
+        if report.dor_passed:
+            ready += 1
+
+    return ReadinessTreeReport(
+        root_id=task_id,
+        total=len(nodes),
+        ready=ready,
+        not_ready=len(nodes) - ready,
+        nodes=nodes,
+    )
 
 
 __all__ = [

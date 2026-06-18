@@ -14,6 +14,8 @@ from hub import config
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
+    HubReadinessTreeResult,
+    HubReadinessTreeStructured,
     HubRefineTaskResult,
     HubRefineTaskStructured,
     HubRefineTasksResult,
@@ -1708,6 +1710,46 @@ async def hub_get_readiness(task_id: int, explain: bool = False) -> str:
     if explain:
         return json.dumps(report, ensure_ascii=False, indent=2)
     return _format_readiness(report, task_id)
+
+
+@mcp.tool()
+async def hub_readiness_tree(
+    task_id: int, include_root: bool = False
+) -> HubReadinessTreeResult:
+    """DoR readiness for a whole subtree (epic/feature) in ONE call.
+
+    Instead of calling hub_get_readiness per task, get a single report of
+    which descendants of ``task_id`` are not DoR-ready and why.
+
+    Args:
+        task_id: Root task (epic/feature) whose descendants to check.
+        include_root: If true, include the root task itself in the report.
+    """
+    path = f"/api/tasks/{task_id}/readiness-tree"
+    if include_root:
+        path += "?include_root=true"
+    report = await _api_get(path)
+    nodes = report.get("nodes") or []
+    not_ready = [n for n in nodes if not n.get("dor_passed")]
+    lines = [
+        f"Readiness of subtree #{task_id}: "
+        f"{report.get('ready', 0)}/{report.get('total', 0)} ready, "
+        f"{report.get('not_ready', 0)} not ready."
+    ]
+    if not_ready:
+        lines.append("Not ready:")
+        for n in not_ready:
+            reason = ", ".join(n.get("missing_required") or []) or "see recommendations"
+            lines.append(
+                f"  #{n['id']} [{n.get('status', '?')}] {n.get('title', '')} "
+                f"(score {n.get('score', 0)}): missing {reason}"
+            )
+    else:
+        lines.append("All tasks in the subtree pass DoR.")
+    return structured_tool_result(
+        "\n".join(lines),
+        HubReadinessTreeStructured(report=report),
+    )
 
 
 # ---------------------------------------------------------------------------
