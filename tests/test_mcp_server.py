@@ -12,6 +12,7 @@ from hub.mcp_structured import MCP_STRUCTURED_SCHEMA_VERSION
 from hub.mcp_server import (
     hub_add_acceptance_criterion,
     hub_add_risk,
+    hub_admin_my_identity,
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
@@ -22,6 +23,7 @@ from hub.mcp_server import (
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
+    hub_health,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
     hub_list_tasks,
@@ -37,6 +39,7 @@ from hub.mcp_server import (
     hub_start_task,
     hub_task_status,
     hub_task_update,
+    hub_whoami,
 )
 
 
@@ -1345,3 +1348,66 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
             "prepared_at": ANY,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_hub_whoami_formats_identity(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = {
+        "username": "bot",
+        "role": "agent",
+        "permissions_summary": ["tasks.read", "tasks.agent_report"],
+        "permissions_count": 2,
+        "auth_source": "db",
+        "api_key_id": 7,
+        "principal_id": 3,
+        "app_version": "0.1.0",
+    }
+
+    text = _mcp_text(await hub_whoami())
+
+    mock_api_get.assert_awaited_once_with("/api/whoami")
+    assert "User: bot (role: agent)" in text
+    assert "Auth source: db" in text
+    assert "API key id: 7" in text
+
+
+@pytest.mark.asyncio
+async def test_hub_health_formats_config(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = {
+        "status": "ok",
+        "app_version": "0.1.0",
+        "bind_host": "127.0.0.1",
+        "bind_port": 8080,
+        "auth_required": True,
+        "auth_disabled": False,
+        "env_tokens_configured": True,
+        "vast_enabled": False,
+    }
+
+    text = _mcp_text(await hub_health())
+
+    mock_api_get.assert_awaited_once_with("/health")
+    assert "Bind: 127.0.0.1:8080" in text
+    assert "Auth required: True" in text
+    assert "Vast enabled: False" in text
+
+
+@pytest.mark.asyncio
+async def test_hub_admin_my_identity_delegates_to_whoami(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.return_value = {
+        "username": "alice",
+        "role": "human",
+        "permissions_summary": ["tasks.read"],
+        "permissions_count": 1,
+        "auth_source": "env",
+        "api_key_id": None,
+        "principal_id": None,
+        "app_version": "0.1.0",
+    }
+
+    text = _mcp_text(await hub_admin_my_identity())
+
+    mock_api_get.assert_awaited_once_with("/api/whoami")
+    assert "User: alice (role: human)" in text

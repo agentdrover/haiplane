@@ -25,6 +25,7 @@ from hub.models import (
     AcceptanceCriterion,
     ActivityItem,
     DashboardData,
+    HealthView,
     ReadinessReport,
     ReadinessTreeReport,
     TaskAnswer,
@@ -49,6 +50,7 @@ from hub.models import (
     TaskUpdateCreate,
     TaskUpdateView,
     TaskView,
+    WhoamiView,
 )
 from hub.auth import (
     AuthMiddleware,
@@ -63,6 +65,7 @@ from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
     TaskNotFoundError,
 )
+from hub.services.diagnostics import build_health, build_whoami
 from hub.poller import start_poller
 from hub.web import router as web_router
 
@@ -173,6 +176,18 @@ def _db(request: Request) -> aiosqlite.Connection:
 async def healthz() -> str:
     """Liveness probe — always public, used by VPN / load balancer health checks."""
     return "ok"
+
+
+@app.get("/health", response_model=HealthView)
+async def health() -> HealthView:
+    """Public service health snapshot without secrets or subprocess checks."""
+    return build_health()
+
+
+@app.get("/api/whoami", response_model=WhoamiView)
+async def api_whoami(request: Request) -> WhoamiView:
+    """Return the authenticated caller identity and permission summary."""
+    return build_whoami(current_identity(request))
 
 
 # ---------------------------------------------------------------------------

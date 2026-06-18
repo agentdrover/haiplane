@@ -831,6 +831,28 @@ class AdminBootstrap(BaseModel):
         return _check_password_complexity(v)
 
 
+class WhoamiView(BaseModel):
+    username: str
+    role: str
+    permissions_summary: list[str] = Field(default_factory=list)
+    permissions_count: int = 0
+    auth_source: str
+    api_key_id: int | None = None
+    principal_id: int | None = None
+    app_version: str
+
+
+class HealthView(BaseModel):
+    status: str = "ok"
+    app_version: str
+    bind_host: str
+    bind_port: int
+    auth_required: bool
+    auth_disabled: bool
+    env_tokens_configured: bool
+    vast_enabled: bool
+
+
 # --- Deprecated aliases for backward compatibility ---
 
 ProposalStatus = TaskStatus

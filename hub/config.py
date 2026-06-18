@@ -94,7 +94,14 @@ class TokenIdentity:
     from role_permissions, and role is the effective legacy role.
     """
 
-    __slots__ = ("username", "role", "principal_id", "permissions")
+    __slots__ = (
+        "username",
+        "role",
+        "principal_id",
+        "permissions",
+        "auth_source",
+        "api_key_id",
+    )
 
     def __init__(
         self,
@@ -102,11 +109,15 @@ class TokenIdentity:
         role: str = "human",
         principal_id: int | None = None,
         permissions: frozenset[str] | None = None,
+        auth_source: str | None = None,
+        api_key_id: int | None = None,
     ) -> None:
         self.username = username
         self.role = role
         self.principal_id = principal_id
         self.permissions = permissions or frozenset()
+        self.auth_source = auth_source
+        self.api_key_id = api_key_id
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"
