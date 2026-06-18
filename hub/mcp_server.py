@@ -11,6 +11,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
+from hub.services.tree_output import (
+    TreeOutputOptions,
+    render_task_tree,
+    truncate_text,
+    TRUNCATION_NOTICE,
+)
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -315,6 +321,27 @@ async def hub_project_status() -> str:
     return "\n".join(parts) if parts else "No activity found."
 
 
+def _tree_query_string(
+    *,
+    depth: int | None = None,
+    max_nodes: int | None = None,
+    max_chars: int | None = None,
+    mode: str = "full",
+) -> str:
+    params: dict[str, str] = {}
+    if depth is not None:
+        params["depth"] = str(depth)
+    if max_nodes is not None:
+        params["max_nodes"] = str(max_nodes)
+    if max_chars is not None:
+        params["max_chars"] = str(max_chars)
+    if mode and mode != "full":
+        params["mode"] = mode
+    if not params:
+        return ""
+    return "?" + urllib.parse.urlencode(params)
+
+
 # ---------------------------------------------------------------------------
 # Task CRUD
 # ---------------------------------------------------------------------------
@@ -602,42 +629,71 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
 
 
 @mcp.tool()
-async def hub_task_tree(task_id: int) -> str:
+async def hub_task_tree(
+    task_id: int,
+    depth: int | None = None,
+    max_nodes: int | None = None,
+    max_chars: int | None = None,
+    mode: str = "full",
+) -> str:
     """Get the hierarchy tree for a task/epic/feature with all descendants and progress.
+
+    Without limit parameters the full tree is returned (backward compatible).
+    ``mode=summary`` applies defaults ``depth=2`` and ``max_nodes=50``.
+    When output is cut, the text ends with ``[truncated]``.
 
     Args:
         task_id: The root task ID to build tree from
+        depth: Maximum depth from root (0 = root only)
+        max_nodes: Maximum number of nodes to include
+        max_chars: Maximum UTF-8 character length of rendered text
+        mode: ``full`` (default) or ``summary`` (soft caps for large epics)
     """
-    tree = await _api_get(f"/api/tasks/{task_id}/tree")
-
-    def _fmt(node: dict[str, Any], indent: int = 0) -> list[str]:
-        prefix = "  " * indent
-        tt = node.get("task_type", "task")
-        progress = node.get("progress")
-        prog_str = ""
-        if progress and progress.get("total", 0) > 0:
-            prog_str = f" ({progress['completed']}/{progress['total']} = {progress['percent']}%)"
-        lines = [
-            f"{prefix}[{tt}] #{node['id']} {node['title']} — {node['status']}{prog_str}"
-        ]
-        for child in node.get("children", []):
-            lines.extend(_fmt(child, indent + 1))
-        return lines
-
-    return "\n".join(_fmt(tree))
+    query = _tree_query_string(
+        depth=depth,
+        max_nodes=max_nodes,
+        mode=mode,
+    )
+    tree = await _api_get(f"/api/tasks/{task_id}/tree{query}")
+    options = TreeOutputOptions(
+        depth=depth,
+        max_nodes=max_nodes,
+        max_chars=max_chars,
+        mode=mode if mode in ("full", "summary") else "full",
+    )
+    rendered = render_task_tree(tree, options)
+    return rendered.text
 
 
 @mcp.tool()
-async def hub_my_context(task_id: int) -> str:
+async def hub_my_context(
+    task_id: int,
+    max_chars: int | None = None,
+    mode: str = "full",
+) -> str:
     """Get full work context for an agent: hierarchy breadcrumb, siblings, progress, children.
 
     Use this before starting work on a task to understand its place in the project.
+    Without ``max_chars`` the full digest is returned (backward compatible).
+    ``mode=summary`` caps the digest to 4000 chars unless ``max_chars`` is set
+    explicitly. Truncated output ends with ``[truncated]``.
 
     Args:
         task_id: The task ID to get context for
+        max_chars: Maximum UTF-8 character length of the digest
+        mode: ``full`` (default) or ``summary``
     """
-    ctx = await _api_get(f"/api/tasks/{task_id}/context")
-    return ctx.get("context_text", f"Context for task #{task_id} not available.")
+    query = _tree_query_string(max_chars=max_chars, mode=mode)
+    ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
+    text = ctx.get("context_text", f"Context for task #{task_id} not available.")
+    effective_max = max_chars
+    if mode == "summary" and effective_max is None:
+        effective_max = 4000
+    if effective_max is not None:
+        text, truncated = truncate_text(text, effective_max)
+        if truncated and TRUNCATION_NOTICE not in text:
+            text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
+    return text
 
 
 # ---------------------------------------------------------------------------

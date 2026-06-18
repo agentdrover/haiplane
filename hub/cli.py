@@ -195,7 +195,15 @@ def _cmd_create_typed(task_type: str) -> Any:
 
 
 def cmd_tree(args: argparse.Namespace) -> int:
-    result = _api("GET", f"/api/tasks/{args.task_id}/tree")
+    params: dict[str, str] = {}
+    if getattr(args, "depth", None) is not None:
+        params["depth"] = str(args.depth)
+    if getattr(args, "max_nodes", None) is not None:
+        params["max_nodes"] = str(args.max_nodes)
+    if getattr(args, "mode", "full") != "full":
+        params["mode"] = args.mode
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/tasks/{args.task_id}/tree{query}")
     _print_tree(result, indent=0)
     return 0
 
@@ -216,7 +224,13 @@ def _print_tree(node: dict[str, Any], indent: int = 0) -> None:
 
 
 def cmd_context(args: argparse.Namespace) -> int:
-    result = _api("GET", f"/api/tasks/{args.task_id}/context")
+    params: dict[str, str] = {}
+    if getattr(args, "max_chars", None) is not None:
+        params["max_chars"] = str(args.max_chars)
+    if getattr(args, "mode", "full") != "full":
+        params["mode"] = args.mode
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/tasks/{args.task_id}/context{query}")
     print(result.get("context_text", ""))
     return 0
 
@@ -1035,6 +1049,14 @@ def build_parser() -> argparse.ArgumentParser:
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
     p_tree.add_argument("task_id", type=int)
+    p_tree.add_argument("--depth", type=int, default=None, help="Max depth from root")
+    p_tree.add_argument("--max-nodes", dest="max_nodes", type=int, default=None)
+    p_tree.add_argument(
+        "--mode",
+        choices=["full", "summary"],
+        default="full",
+        help="summary applies depth=2 and max_nodes=50 by default",
+    )
     p_tree.set_defaults(func=cmd_tree)
 
     # context — get agent work context
@@ -1042,6 +1064,13 @@ def build_parser() -> argparse.ArgumentParser:
         "context", help="Get full work context (breadcrumb, siblings, progress)"
     )
     p_context.add_argument("task_id", type=int)
+    p_context.add_argument("--max-chars", dest="max_chars", type=int, default=None)
+    p_context.add_argument(
+        "--mode",
+        choices=["full", "summary"],
+        default="full",
+        help="summary caps digest to 4000 chars unless --max-chars is set",
+    )
     p_context.set_defaults(func=cmd_context)
 
     # propose — agent proposes a task (creates draft)
