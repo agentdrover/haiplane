@@ -38,7 +38,10 @@ openclaw-hub
 ## Cursor + Hub Workflow
 
 Run the hub, connect Cursor to its MCP endpoint, and treat OpenClaw Hub as the
-task state source. The delivery process is documented in
+task state source. Step-by-step MCP setup (streamable URL, headers, stdio vs
+HTTP, troubleshooting) is in
+[docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).
+The delivery process is documented in
 [docs/software-development-workflow.md](docs/software-development-workflow.md);
 the staged rollout lives in
 [docs/software-development-workflow-implementation-plan.md](docs/software-development-workflow-implementation-plan.md).
