@@ -63,6 +63,11 @@ from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
     TaskNotFoundError,
 )
+from hub.services.tree_output import (
+    TreeOutputOptions,
+    apply_tree_limits,
+    truncate_text,
+)
 from hub.poller import start_poller
 from hub.web import router as web_router
 
@@ -284,17 +289,38 @@ async def api_delete_task(
 
 
 @app.get("/api/tasks/{task_id}/tree", response_model=TaskTreeNode)
-async def api_task_tree(task_id: int, request: Request):
-    """Get recursive tree of a task and all descendants."""
+async def api_task_tree(
+    task_id: int,
+    request: Request,
+    response: Response,
+    depth: int | None = Query(default=None, ge=0),
+    max_nodes: int | None = Query(default=None, ge=1),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
+):
+    """Get recursive tree of a task and all descendants.
+
+    Without limit parameters the full tree is returned (backward compatible).
+    Use ``mode=summary`` or explicit ``depth`` / ``max_nodes`` to cap output size.
+    """
     db = _db(request)
     tree = await db_module.build_tree(db, task_id)
     if not tree:
         raise HTTPException(404, "task not found")
-    return tree
+    options = TreeOutputOptions(depth=depth, max_nodes=max_nodes, mode=mode)  # type: ignore[arg-type]
+    limited, truncated = apply_tree_limits(tree, options)
+    if truncated:
+        response.headers["X-Hub-Truncated"] = "true"
+    return limited
 
 
 @app.get("/api/tasks/{task_id}/context", response_model=TaskContextView)
-async def api_task_context(task_id: int, request: Request):
+async def api_task_context(
+    task_id: int,
+    request: Request,
+    response: Response,
+    max_chars: int | None = Query(default=None, ge=1),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
+):
     """Full developer contract for a task (#41).
 
     Returns a single envelope covering:
@@ -422,13 +448,21 @@ async def api_task_context(task_id: int, request: Request):
     if missing_required:
         lines.append(f"  Missing required: {', '.join(missing_required)}")
 
+    effective_max_chars = max_chars
+    if mode == "summary" and effective_max_chars is None:
+        effective_max_chars = 4000
+
+    context_text, char_truncated = truncate_text("\n".join(lines), effective_max_chars)
+    if char_truncated:
+        response.headers["X-Hub-Truncated"] = "true"
+
     return {
         "task_id": task_id,
         "breadcrumb": breadcrumb,
         "siblings": siblings,
         "children": children,
         "progress": progress,
-        "context_text": "\n".join(lines),
+        "context_text": context_text,
         "task": task_view,
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
