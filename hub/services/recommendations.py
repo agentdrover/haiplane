@@ -153,11 +153,23 @@ _AC_PLACEHOLDER_TOKENS = {
 
 
 def _ac_clause_is_thin(text: str | None) -> bool:
-    """True when a Given/When/Then clause is too short or a placeholder."""
+    """True when a Given/When/Then clause is too short or a placeholder.
+
+    Placeholder tokens are checked BEFORE the length cutoff: every token in
+    ``_AC_PLACEHOLDER_TOKENS`` is shorter than ``AC_QUALITY_MIN_LEN``, so a
+    length-first check would short-circuit and the set would be dead code. We
+    also treat a clause built only from placeholder tokens (e.g. "n/a n/a n/a")
+    as thin even though it clears the length cutoff.
+    """
     t = (text or "").strip().lower()
-    if len(t) < AC_QUALITY_MIN_LEN:
+    if not t:
         return True
-    return t in _AC_PLACEHOLDER_TOKENS
+    tokens = t.split()
+    if t in _AC_PLACEHOLDER_TOKENS or all(
+        tok in _AC_PLACEHOLDER_TOKENS for tok in tokens
+    ):
+        return True
+    return len(t) < AC_QUALITY_MIN_LEN
 
 
 def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:

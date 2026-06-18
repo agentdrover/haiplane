@@ -62,12 +62,72 @@ def _auth_headers() -> dict[str, str]:
     return {}
 
 
+class HubApiError(Exception):
+    """Structured Hub REST error for MCP consumers."""
+
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload
+        super().__init__(payload.get("message", "hub api error"))
+
+    def as_json(self) -> str:
+        return json.dumps(self.payload, ensure_ascii=False)
+
+
+def _strip_internal_urls(text: str) -> str:
+    import re
+
+    cleaned = re.sub(r"https?://127\.0\.0\.1:\d+[^\s]*", "", text)
+    cleaned = re.sub(r"for url '[^']*'", "", cleaned)
+    return cleaned.strip()
+
+
+def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
+    detail: Any = None
+    try:
+        body = resp.json()
+        detail = body.get("detail", body)
+    except Exception:
+        detail = getattr(resp, "text", "") or ""
+
+    if isinstance(detail, dict) and detail.get("reason"):
+        msg = _strip_internal_urls(str(detail.get("message", detail.get("hint", ""))))
+        return {**detail, "message": msg or detail.get("hint", "")}
+
+    msg = _strip_internal_urls(str(detail))
+    if status_code == 403 and "human or admin" in msg.lower():
+        return {
+            "reason": "human_only_gate",
+            "hint": "This operation requires a human or admin token, not an agent token.",
+            "required_status": None,
+            "message": msg or "Forbidden: human or admin role required.",
+        }
+    if status_code == 403:
+        return {
+            "reason": "forbidden",
+            "hint": msg,
+            "required_status": None,
+            "message": msg or "Forbidden.",
+        }
+    return {
+        "reason": "api_error",
+        "hint": msg,
+        "required_status": None,
+        "message": msg or f"HTTP {status_code}",
+        "status_code": status_code,
+    }
+
+
 async def _api_get(path: str) -> Any:
     import httpx
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
         return resp.json()
 
 
@@ -78,7 +138,12 @@ async def _api_post(path: str, body: dict[str, Any] | None = None) -> Any:
         resp = await client.post(
             f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
         return resp.json()
 
 
@@ -89,7 +154,12 @@ async def _api_patch(path: str, body: dict[str, Any] | None = None) -> Any:
         resp = await client.patch(
             f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
         return resp.json()
 
 
@@ -101,7 +171,12 @@ async def _api_put(path: str, body: Any) -> Any:
         resp = await client.put(
             f"{_hub_url()}{path}", json=body, headers=_auth_headers()
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
         return resp.json()
 
 
@@ -111,7 +186,48 @@ async def _api_delete(path: str) -> None:
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
+
+
+async def _api_post_with_status(
+    path: str, body: dict[str, Any] | None = None
+) -> tuple[Any, int]:
+    """POST that also returns the HTTP status (e.g. 201 created vs 200 existing)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
+        return resp.json(), resp.status_code
+
+
+async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
+    """PUT that also returns the HTTP status (201 created vs 200 updated)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.put(
+            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
+        return resp.json(), resp.status_code
 
 
 def _format_task(t: dict[str, Any]) -> str:
@@ -356,6 +472,35 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         f"Review: {'enabled' if task.get('auto_review', True) else 'disabled'}, cycle {task.get('review_cycle', 0)}",
         f"Created: {task['created_at']}",
     ]
+    if task.get("description"):
+        parts.append(f"\nDescription:\n{task['description']}")
+    if task.get("technical_hints"):
+        parts.append(f"\nTechnical hints:\n{task['technical_hints']}")
+    scope_in = task.get("scope_in") or []
+    scope_out = task.get("scope_out") or []
+    if scope_in or scope_out:
+        parts.append("\nScope:")
+        if scope_in:
+            parts.append("  In: " + "; ".join(scope_in))
+        if scope_out:
+            parts.append("  Out: " + "; ".join(scope_out))
+    validation = task.get("validation_commands") or []
+    if validation:
+        parts.append("\nValidation commands:")
+        for cmd in validation:
+            parts.append(f"  - {cmd}")
+    if task.get("lifecycle_hint"):
+        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    acs = task.get("acceptance_criteria") or []
+    if acs:
+        parts.append("\nAcceptance criteria:")
+        for ac in acs:
+            parts.append(
+                f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]\n"
+                f"    Given: {ac.get('given', '')}\n"
+                f"    When: {ac.get('when', '')}\n"
+                f"    Then: {ac.get('then', '')}"
+            )
     if task.get("updates"):
         parts.append("\nUpdates:")
         for u in task["updates"]:
@@ -413,6 +558,10 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
     return base
 
 
+def _format_hub_api_error(err: HubApiError) -> str:
+    return err.as_json()
+
+
 @mcp.tool()
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
@@ -428,17 +577,23 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/updates",
-        {
-            "agent": agent,
-            "kind": "done",
-            "content": summary,
-        },
-    )
-    task = await _api_get(f"/api/tasks/{task_id}")
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/updates",
+            {
+                "agent": agent,
+                "kind": "done",
+                "content": summary,
+            },
+        )
+        task = await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
     status = task.get("status", "?")
-    return _format_hub_report_done_message(task_id, result["id"], status)
+    msg = _format_hub_report_done_message(task_id, result["id"], status)
+    if task.get("lifecycle_hint"):
+        msg += f"\nLifecycle: {task['lifecycle_hint']}"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +800,10 @@ async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
         comment: Reason for the override; recorded as the audit-trail message
     """
     body = {"comment": comment} if comment else None
-    result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
     status = result.get("status", "?")
     return f"Task #{task_id} force-completed (status: {status})."
 
@@ -783,7 +941,10 @@ async def hub_decide_task(
         "decision_summary": decision_summary,
         "record_decision": record_decision,
     }
-    result = await _api_post(f"/api/tasks/{task_id}/decide", body)
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/decide", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
     status = result.get("status", "?")
     suffix = ""
     if decision_summary:
@@ -1567,10 +1728,14 @@ async def hub_add_acceptance_criterion(
 ) -> str:
     """Add a single Given/When/Then acceptance criterion to a task.
 
+    Idempotent by ``ac_id``: re-sending the same id is a safe no-op (HTTP 200),
+    not a 409. Use ``hub_upsert_acceptance_criterion`` when you want a repeat to
+    overwrite the stored payload.
+
     Args:
         task_id: Target task.
-        ac_id: Stable identifier for this AC (e.g. "AC-1"). Must be
-            unique within the task — duplicate ids return HTTP 409.
+        ac_id: Stable identifier for this AC (e.g. "AC-1"). Re-using an
+            existing id returns the existing criterion unchanged.
         given: Precondition / context.
         when: Action / event.
         then: Observable outcome.
@@ -1586,7 +1751,11 @@ async def hub_add_acceptance_criterion(
     }
     if test_ref:
         body["test_ref"] = test_ref
-    await _api_post(f"/api/tasks/{task_id}/acceptance_criteria", body)
+    _, status_code = await _api_post_with_status(
+        f"/api/tasks/{task_id}/acceptance_criteria", body
+    )
+    if status_code == 200:
+        return f"{ac_id} already exists on task #{task_id} (no change)"
     return f"Added {ac_id} to task #{task_id}"
 
 
@@ -1602,10 +1771,10 @@ async def hub_upsert_acceptance_criterion(
 ) -> str:
     """Idempotent upsert of one acceptance criterion by ``ac_id``.
 
-    Unlike ``hub_add_acceptance_criterion`` (which returns 409 on a
-    duplicate id), this overwrites an existing AC with the same ``ac_id``
-    and re-sending the same payload is a safe no-op. Use it when a retry
-    might have already landed, so you don't have to guess the state.
+    Overwrites an existing AC with the same ``ac_id`` (a changed payload is
+    applied; an identical payload is a safe no-op). ``hub_add_acceptance_criterion``
+    is also idempotent now but never overwrites — use upsert when you want a
+    retry to apply the latest payload.
 
     Args:
         task_id: Target task.
@@ -1626,8 +1795,11 @@ async def hub_upsert_acceptance_criterion(
     if test_ref:
         body["test_ref"] = test_ref
     safe_id = urllib.parse.quote(ac_id, safe="")
-    await _api_put(f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}", body)
-    return f"Upserted {ac_id} on task #{task_id}"
+    _, status_code = await _api_put_with_status(
+        f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}", body
+    )
+    verb = "Created" if status_code == 201 else "Updated"
+    return f"{verb} {ac_id} on task #{task_id}"
 
 
 @mcp.tool()

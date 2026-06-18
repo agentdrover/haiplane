@@ -119,7 +119,9 @@ class NoopGitOps:
         branch_slug: str = "",
         repo: str | None = None,
     ) -> str:
-        slug = branch_slug or "test"
+        from hub.integrations.git_ops import _slugify
+
+        slug = (branch_slug or "").strip() or _slugify(title)
         return f"task-{task_id}/{slug}"
 
     async def checkout(self, branch: str, repo: str | None = None) -> bool:

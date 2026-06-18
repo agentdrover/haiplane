@@ -316,16 +316,41 @@ async def test_hub_report_done(
     mock_api_get.assert_awaited_once_with("/api/tasks/9")
 
 
-async def test_hub_report_done_open_status(
+async def test_hub_force_complete_human_only_error(mock_api_post: AsyncMock) -> None:
+    from hub.mcp_server import HubApiError
+
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "human_only_gate",
+            "hint": "This operation requires a human or admin token, not an agent token.",
+            "required_status": None,
+            "message": "this operation requires human or admin role",
+        }
+    )
+    msg = await hub_force_complete_task(9)
+    payload = json.loads(msg)
+    assert payload["reason"] == "human_only_gate"
+    assert "127.0.0.1" not in msg
+
+
+async def test_hub_report_done_open_status_returns_structured_error(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
-    mock_api_post.return_value = {"id": 88}
-    mock_api_get.return_value = {"id": 5, "status": "open"}
+    from hub.mcp_server import HubApiError
+
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "pair_start_required",
+            "hint": "Call hub_pair_start before hub_report_done.",
+            "required_status": "running",
+            "current_status": "open",
+            "message": "Call hub_pair_start before hub_report_done.",
+        }
+    )
     msg = await hub_report_done(5, "Changed: docs only")
-    assert "status: open" in msg
-    assert "Status unchanged" in msg
-    assert "Task completed" not in msg
-    assert "should now be completed" not in msg.lower()
+    assert "pair_start_required" in msg
+    assert "127.0.0.1" not in msg
+    mock_api_get.assert_not_called()
 
 
 async def test_hub_report_done_completed_from_pending(
@@ -525,9 +550,10 @@ async def test_hub_list_acceptance_criteria_renders_items(
 
 
 async def test_hub_add_acceptance_criterion_sends_full_body(
-    mock_api_post: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mock_api_post.return_value = {"id": "AC-1"}
+    mock = AsyncMock(return_value=({"id": "AC-1"}, 201))
+    monkeypatch.setattr("hub.mcp_server._api_post_with_status", mock)
     msg = await hub_add_acceptance_criterion(
         task_id=7,
         ac_id="AC-1",
@@ -538,7 +564,7 @@ async def test_hub_add_acceptance_criterion_sends_full_body(
         test_ref="docs/x.md",
     )
     assert "Added AC-1 to task #7" in msg
-    mock_api_post.assert_awaited_once_with(
+    mock.assert_awaited_once_with(
         "/api/tasks/7/acceptance_criteria",
         {
             "id": "AC-1",
@@ -549,6 +575,18 @@ async def test_hub_add_acceptance_criterion_sends_full_body(
             "test_ref": "docs/x.md",
         },
     )
+
+
+async def test_hub_add_acceptance_criterion_duplicate_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock = AsyncMock(return_value=({"id": "AC-1"}, 200))
+    monkeypatch.setattr("hub.mcp_server._api_post_with_status", mock)
+    msg = await hub_add_acceptance_criterion(
+        task_id=7, ac_id="AC-1", given="g", when="w", then="t"
+    )
+    assert "already exists" in msg
+    assert "no change" in msg
 
 
 async def test_hub_replace_acceptance_criteria_sends_array(
@@ -571,21 +609,33 @@ async def test_hub_replace_acceptance_criteria_sends_array(
 
 
 async def test_hub_upsert_acceptance_criterion_puts_by_id(
-    mock_api_put: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mock_api_put.return_value = {
+    ac = {
         "id": "AC-1",
         "given": "g",
         "when": "w",
         "then": "t",
         "verifiable_by": "test",
     }
+    mock = AsyncMock(return_value=(ac, 201))
+    monkeypatch.setattr("hub.mcp_server._api_put_with_status", mock)
     msg = await hub_upsert_acceptance_criterion(7, "AC-1", "g", "w", "t")
-    assert "Upserted AC-1 on task #7" in msg
-    mock_api_put.assert_awaited_once_with(
+    assert "Created AC-1 on task #7" in msg
+    mock.assert_awaited_once_with(
         "/api/tasks/7/acceptance_criteria/AC-1",
         {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"},
     )
+
+
+async def test_hub_upsert_acceptance_criterion_update_says_updated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ac = {"id": "AC-1", "given": "g", "when": "w", "then": "t", "verifiable_by": "test"}
+    mock = AsyncMock(return_value=(ac, 200))
+    monkeypatch.setattr("hub.mcp_server._api_put_with_status", mock)
+    msg = await hub_upsert_acceptance_criterion(7, "AC-1", "g", "w", "t")
+    assert "Updated AC-1 on task #7" in msg
 
 
 async def test_hub_delete_acceptance_criterion_url_encodes_id(

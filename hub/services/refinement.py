@@ -31,6 +31,12 @@ from hub.models import (
 from hub.services.recommendations import calculate_readiness_with_recommendations
 
 
+# Statuses where the Definition of Ready gate still applies. DoR is a
+# pre-execution check, so once a task has started or finished its readiness is
+# no longer the relevant question — those nodes are excluded from subtree rollups.
+_DOR_RELEVANT_STATUSES = frozenset({"draft", "open", "needs_info"})
+
+
 class TaskNotFoundError(LookupError):
     """Raised when an operation targets a non-existent task."""
 
@@ -51,6 +57,16 @@ def get_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
     atomic and predictable. The lock is stored on the connection (not a module
     global) so it always binds to the event loop that owns the connection,
     which keeps per-test loops happy.
+
+    Serialization boundary (important): the lock is acquired by ``_atomic``
+    (refine / AC add / upsert / replace / bulk refine), ``create_subtasks_bulk``,
+    and the lifecycle completion paths (``add_update`` done-flow,
+    ``force_complete_task``) — i.e. the writers that contend over the same task
+    rows. Short single-statement lifecycle transitions and ``log_activity``
+    calls elsewhere are NOT lock-guarded; under high cross-path concurrency a
+    stray commit could still flush an open SAVEPOINT. Fully serializing every
+    commit on the shared connection (or moving to per-request connections /
+    ``BEGIN IMMEDIATE``) is tracked as separate hardening work.
     """
     lock: asyncio.Lock | None = getattr(db, "_oc_write_lock", None)
     if lock is None:
@@ -202,13 +218,14 @@ async def refine_tasks_bulk(
             refine = TaskRefine.model_validate(
                 item.model_dump(exclude={"task_id"}, exclude_unset=True)
             )
-            updated_columns, ac_count = await _apply_refine_writes(
+            _updated_columns, ac_count = await _apply_refine_writes(
                 db, item.task_id, refine, old_row
             )
-            fields_set = list(updated_columns.keys())
-            if refine.acceptance_criteria is not None:
-                fields_set.append("acceptance_criteria")
-            fields_set = sorted(set(fields_set))
+            # Unify with hub_refine_task: report the fields actually SENT in the
+            # request (PATCH keys), not a post-write column diff. model_fields_set
+            # reflects the keys provided (refine was validated with exclude_unset),
+            # and includes acceptance_criteria / risks when present.
+            fields_set = sorted(refine.model_fields_set)
             risks_count = len(refine.risks) if refine.risks is not None else None
             outcomes.append(
                 TaskRefineOutcome(
@@ -259,19 +276,33 @@ async def add_acceptance_criterion(
     db: aiosqlite.Connection,
     task_id: int,
     ac: AcceptanceCriterion,
-) -> AcceptanceCriterion:
-    """Insert one AC, raising ``DuplicateAcceptanceCriterionError`` on
-    a unique-constraint violation so the API can map it to HTTP 409.
+) -> tuple[AcceptanceCriterion, bool]:
+    """Insert one AC idempotently by ``(task_id, ac_id)``.
+
+    Returns ``(ac, created)`` where ``created`` is False when the same
+    ``ac_id`` already exists (deterministic no-op, no 409).
     """
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "add_ac"):
+        rows = await db.execute_fetchall(
+            "SELECT * FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
+            (task_id, ac.id),
+        )
+        if rows:
+            return row_to_ac(rows[0]), False
         try:
             await repo.add_acceptance_criterion(db, task_id, ac)
         except aiosqlite.IntegrityError as exc:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
+                (task_id, ac.id),
+            )
+            if rows:
+                return row_to_ac(rows[0]), False
             raise DuplicateAcceptanceCriterionError(
                 f"acceptance criterion {ac.id!r} already exists for task {task_id}"
             ) from exc
-    return ac
+    return ac, True
 
 
 async def upsert_acceptance_criterion(
@@ -345,6 +376,12 @@ async def readiness_tree(
     subtree report can never drift from the per-task view. ``blocking_reasons``
     surfaces the actionable "why" (blocking recommendation messages) so a
     caller sees what to fix without a second round-trip.
+
+    Only DoR-relevant statuses are scored (see ``_DOR_RELEVANT_STATUSES``):
+    DoR is a pre-execution gate, so already-started (running/claimed/…) and
+    terminal (completed/failed/rejected) descendants are skipped — otherwise a
+    finished task that no longer satisfies presence-DoR would inflate
+    ``not_ready`` and make a done backlog look unready.
     """
     await _ensure_task_exists(db, task_id)
     ids = await repo.collect_subtree_ids(db, task_id)
@@ -356,6 +393,8 @@ async def readiness_tree(
     for tid in ids:
         row = await repo.get_task(db, tid)
         if row is None:
+            continue
+        if row["status"] not in _DOR_RELEVANT_STATUSES:
             continue
         report = await calculate_readiness_with_recommendations(db, tid)
         blocking = [

@@ -198,7 +198,7 @@ async def test_pair_start_api(client: AsyncClient):
     data = resp.json()
     assert data["status"] == "running"
     assert data["job_id"] is None
-    assert data["branch"] == f"task-{task_id}/test"
+    assert data["branch"] == f"task-{task_id}/pair-api-task"
     assert data["assigned_agent"] == "composer-analyst"
 
 

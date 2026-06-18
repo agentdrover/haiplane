@@ -631,6 +631,9 @@ async def get_db() -> aiosqlite.Connection:
     await db.executescript(_SCHEMA)
     await _migrate(db)
     await _fix_orphaned_parents(db)
+    from hub.services.lifecycle import repair_stale_parent_completions
+
+    await repair_stale_parent_completions(db)
     if await _table_exists(db, "roles"):
         await seed_system_roles(db)
     return db

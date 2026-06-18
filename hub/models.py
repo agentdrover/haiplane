@@ -588,6 +588,7 @@ class TaskView(BaseModel):
     review_checklist: list[str] = Field(default_factory=list)
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
+    lifecycle_hint: str | None = None
     readiness_score: int | None = None
     dor_passed: bool | None = None
     ready_at: str | None = None

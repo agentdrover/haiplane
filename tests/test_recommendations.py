@@ -357,6 +357,23 @@ def test_build_ac_quality_warnings_unit():
     assert build_ac_quality_warnings([]) == []
 
 
+def test_build_ac_quality_warnings_detects_long_placeholder():
+    """A clause longer than the length cutoff but made only of placeholder
+    tokens (e.g. 'n/a n/a n/a') must still be flagged — guards against the
+    previously-dead placeholder check."""
+    placeholder_rows = [
+        {
+            "ac_id": "AC-9",
+            "given": "n/a n/a n/a",
+            "when_clause": "a substantive precondition clause here",
+            "then_clause": "a substantive outcome clause here too",
+        }
+    ]
+    warnings = build_ac_quality_warnings(placeholder_rows)
+    assert len(warnings) == 1
+    assert "AC-9" in warnings[0].message
+
+
 async def test_score_after_applying_all_recommendations_returns_to_max(
     db: aiosqlite.Connection,
 ):

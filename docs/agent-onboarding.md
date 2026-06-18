@@ -26,8 +26,47 @@
 изменение контракта затрагивает REST + CLI + MCP + тесты в одном проходе.
 
 Иерархия задач: `epic → feature → task → subtask`.
-Жизненный цикл: `draft → open → running → ci_check/review/fix_requested → completed`
-(плюс `needs_info`, `needs_decision`, `pending_report`, `failed`, `rejected`).
+Жизненный цикл: `draft → open → running/claimed → pending_report → ci_check/review/fix_requested → completed`
+(плюс `needs_info`, `needs_decision`, `failed`, `rejected`).
+
+### Машина состояний (task/subtask)
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: agent create
+    [*] --> open: human create
+    draft --> open: hub_approve_task
+    draft --> rejected: hub_reject_task
+    open --> claimed: hub_claim_task
+    open --> running: hub_pair_start / hub_start_task
+    claimed --> open: hub_release_task
+    claimed --> running: hub_pair_start (holder)
+    claimed --> completed: hub_report_done / hub_force_complete
+    running --> needs_info: hub_ask_question
+    needs_info --> open: hub_answer_question (pair, pre-start)
+    needs_info --> running: hub_answer_question (pair, post-start)
+    running --> ci_check: hub_report_done (auto_review + branch)
+    running --> completed: hub_report_done (no review / no branch)
+    running --> needs_decision: hub_report_done + blocker
+    pending_report --> completed: hub_report_done
+    ci_check --> review: CI pass (poller)
+    ci_check --> needs_decision: CI/review stall (poller)
+    review --> completed: accept
+    review --> fix_requested: rework
+    needs_decision --> completed: hub_decide_task accept
+    needs_decision --> fix_requested: hub_decide_task rework
+    completed --> [*]
+    failed --> [*]
+    rejected --> [*]
+```
+
+**Иерархия:** `epic → feature → task → subtask`. В `hub_create_task` / `hub_create_subtasks`
+указывай `parent_id` и `task_type`; epic/feature создаются как `open` и не auto-run.
+
+**Роллап:** при завершении последней дочерней `task` feature переходит в `completed`;
+когда все features эпика завершены — epic тоже `completed` (идемпотентно).
+
+**Pair branch:** дефолт `task-<id>/<slug-from-title>` (без суффикса `test`).
 
 ---
 
@@ -93,13 +132,12 @@ curl -sS \
    Дорабатывай через `hub_refine_task`, `hub_add_acceptance_criterion`,
    `hub_replace_acceptance_criteria`, `hub_add_risk`, затем `hub_get_readiness`.
 
-   > **Не делай 80 отдельных вызовов.** `hub_refine_task` принимает
-   > `acceptance_criteria=[...]` и `risks=[...]` прямо в одном вызове (полная
-   > замена списков). Это дешевле, чем серия `hub_add_acceptance_criterion`.
-   > Ответ инструмента честно показывает, что применилось: список изменённых
-   > полей, число AC/risks и итоговый `readiness`. Если видишь старое
-   > «no column changes detected» — переподключи MCP-сессию: набор инструментов
-   > кэшируется на стороне клиента.
+   > **Скаляр vs list в `hub_refine_task`:** скалярные поля (`title`, `description`,
+   > `technical_hints`, …) — PATCH: передай только то, что меняешь. Списки
+   > `acceptance_criteria=[...]` и `risks=[...]` — **полная замена** списка при
+   > передаче (включая `[]` для очистки). Для одного AC без замены всего списка
+   > используй `hub_upsert_acceptance_criterion` или идемпотентный
+   > `hub_add_acceptance_criterion` (повтор `ac_id` — no-op, не 409).
 
    > **Граница DoR: наличие ≠ качество.** `readiness`/DoR проверяет, что поля
    > и AC *заполнены*, а не что они осмысленны. `score=100` можно получить с
@@ -169,8 +207,10 @@ curl -sS \
 жизненного цикла, а не «должно быть completed»:
 
 - `pending_report` → обычно `completed`;
-- pair (`open`/`running` без `job_id`) → статус может остаться прежним или
-  перейти в `ci_check` (pair-конвейер);
+- pair (`open`/`running` без `job_id`) → `completed` или `ci_check` (только при
+  наличии `branch` и `auto_review`);
+- из `open` без pair-start — **ошибка** `pair_start_required`, done-запись не
+  создаётся;
 - текст ответа всегда отражает реальный статус.
 
 Не считай задачу завершённой только потому, что отправил отчёт.
@@ -202,7 +242,9 @@ curl -sS \
 - `hub_project_status` — сводка по проекту
 - `hub_list_tasks` — список с фильтрами (`status`, `task_type`, `parent_id`,
   `human_owner`, `claimed_by`, `mine`, `include_archived`)
-- `hub_task_status` — детальный статус задачи *(structuredContent)*
+- `hub_task_status` — детальный статус задачи *(structuredContent)*: описание,
+  `technical_hints`, scope, `validation_commands`, acceptance-criteria и
+  `lifecycle_hint` (ожидание ci_check и т.п.) — одним вызовом для ревью ТЗ
 - `hub_task_tree` — дерево подзадач
 - `hub_my_context` — контекст для старта работы
 - `hub_get_readiness` — Definition of Ready / рекомендации (одна задача)
@@ -223,10 +265,15 @@ curl -sS \
 - `hub_add_acceptance_criterion` / `hub_upsert_acceptance_criterion` /
   `hub_replace_acceptance_criteria` / `hub_list_acceptance_criteria` /
   `hub_delete_acceptance_criterion`
-  > `add` возвращает 409 на дубликат `ac_id`; `upsert` идемпотентен —
-  > создаёт или перезаписывает по `ac_id`, повтор безопасен. Запись в Hub
-  > сериализуется, поэтому параллельные add/upsert не дают спорадических 500.
+  > `add` возвращает 200 на повтор того же `ac_id` (идемпотентный no-op);
+  > `upsert` создаёт или перезаписывает по `ac_id`. Запись в Hub сериализуется,
+  > поэтому параллельные add/upsert не дают спорадических 500.
 - `hub_add_risk`
+
+**Ошибки MCP (human gates):** `hub_force_complete_task` и `hub_decide_task` при
+403 отдают JSON `{reason: human_only_gate, hint, required_status}` без URL
+`127.0.0.1`. `hub_report_done` из недопустимого статуса — JSON с `reason` и
+подсказкой (`pair_start_required` → вызови `hub_pair_start`).
 
 **Жизненный цикл**
 - `hub_approve_task` / `hub_reject_task`
