@@ -502,6 +502,52 @@ async def test_web_approve_task(client: AsyncClient):
     assert f"/tasks/{task_id}" in resp.headers["location"]
 
 
+async def test_web_approve_dor_failed_form_redirects_with_flag(client: AsyncClient):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Unready draft", "source": "agent", "agent": "bot"},
+    )
+    task_id = create.json()["id"]
+
+    # Plain approve (no force) on a draft that fails DoR must not surface a
+    # raw 422 JSON error. The form flow redirects back with a flag instead.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-approve",
+        data={"comment": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "approve_error=dor_failed" in resp.headers["location"]
+
+    page = await client.get(f"/tasks/{task_id}?approve_error=dor_failed")
+    assert "не готова к одобрению" in page.text
+    assert "Не хватает" in page.text
+    assert "Force Approve" not in page.text
+
+
+async def test_web_approve_dor_failed_htmx_returns_force_fragment(
+    client: AsyncClient,
+):
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "Unready htmx draft", "source": "agent", "agent": "bot"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-approve",
+        data={"comment": ""},
+        headers={"HX-Request": "true"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 200
+    assert "DoR не пройден" in resp.text
+    # Shows what's missing to move further, not an override affordance.
+    assert "acceptance_criteria" in resp.text or "user_story" in resp.text
+    assert "override" not in resp.text.lower()
+    assert "force" not in resp.text.lower()
+
+
 async def test_web_start_dispatches_without_manual_plan(client: AsyncClient):
     create = await client.post("/api/tasks", json={"title": "Start from UI"})
     task_id = create.json()["id"]

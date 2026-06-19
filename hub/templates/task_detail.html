@@ -312,6 +312,15 @@
 
                 {% if task.status.value == 'draft' %}
                 <div class="task-action-state">Approval Required</div>
+                {% if approve_error == 'dor_failed' %}
+                <div class="task-action-note task-action-note--warning">
+                    <strong>Задача не готова к одобрению (DoR не пройден).</strong>
+                    {% if readiness.missing_required %}
+                    <div>Не хватает: {{ readiness.missing_required | join(', ') }}.</div>
+                    {% endif %}
+                    <div>Заполните недостающие поля (см. раздел «Readiness») и повторите одобрение.</div>
+                </div>
+                {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-approve" class="task-action-stack">
                     <label class="task-action-label" for="task-runtime-approve">Runtime</label>
                     <select id="task-runtime-approve" name="runtime" class="task-action-control">
