@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 from pathlib import Path
 from typing import Any
 
@@ -268,21 +269,54 @@ async def _apply_analyst_ready_filter(
 
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
-    import html as html_mod
-
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         return HTMLResponse("")
     t = services.row_to_task(row)
-    safe_title = html_mod.escape(t.title[:40])
-    safe_status = html_mod.escape(t.status.value)
+    safe_title = html.escape(t.title[:40])
+    safe_status = html.escape(t.status.value)
     fragment = (
         f'<div class="inbox-item-done" id="inbox-task-{t.id}">'
         f'<span class="badge badge-{safe_status}">{safe_status}</span> '
         f"#{t.id} {safe_title}</div>"
     )
     return HTMLResponse(fragment)
+
+
+def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLResponse:
+    """Self-contained HTMX block shown when plain Approve hits the DoR gate.
+
+    Explains exactly what the task is missing to move further along the
+    route (the unmet Definition of Ready fields and their recommendations)
+    so the human knows what to fill in next. Returned with HTTP 200 so HTMX
+    swaps it in place instead of erroring.
+    """
+    missing = detail.get("missing_required") or []
+    recommendations = detail.get("recommendations") or []
+    score = detail.get("score")
+    score_text = f" (score {html.escape(str(score))})" if score is not None else ""
+    if recommendations:
+        items = "".join(
+            f"<li><b>{html.escape(str(rec.get('field', '')))}:</b> "
+            f"{html.escape(str(rec.get('message', '')))}</li>"
+            for rec in recommendations
+        )
+        what_missing = f"<ul class='dor-gate-list'>{items}</ul>"
+    elif missing:
+        what_missing = f"<p>Не хватает: <b>{html.escape(', '.join(missing))}</b>.</p>"
+    else:
+        what_missing = "<p>Не заполнены обязательные поля Definition of Ready.</p>"
+    fragment = (
+        f'<div class="dor-gate-warning" id="dor-warn-{task_id}">'
+        f'<span class="badge badge-draft">DoR не пройден</span>'
+        f"<p>Задача #{task_id}{score_text} ещё не готова к одобрению. "
+        f"Заполните недостающее, чтобы двигаться дальше по маршруту:</p>"
+        f"{what_missing}"
+        f'<a class="btn btn-secondary btn-xs" href="/tasks/{task_id}">Открыть задачу</a>'
+        f"</div>"
+    )
+    return HTMLResponse(fragment, status_code=200)
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +519,11 @@ async def web_tasks(
 
 
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)
-async def web_task_detail(task_id: int, request: Request):
+async def web_task_detail(
+    task_id: int,
+    request: Request,
+    approve_error: str = Query(""),
+):
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
@@ -507,6 +545,7 @@ async def web_task_detail(task_id: int, request: Request):
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),
+            "approve_error": approve_error,
         },
     )
 
@@ -607,7 +646,22 @@ async def web_approve_task(
         runtime=RuntimeChoice(runtime) if runtime else None,
         force=force,
     )
-    await services.approve_task(_db(request), task_id, body)
+    try:
+        await services.approve_task(_db(request), task_id, body)
+    except HTTPException as exc:
+        detail = exc.detail
+        is_dor = (
+            exc.status_code == 422
+            and isinstance(detail, dict)
+            and detail.get("error") == "dor_failed"
+        )
+        if not is_dor:
+            raise
+        if _is_htmx(request):
+            return _htmx_dor_failed_fragment(task_id, detail)
+        return RedirectResponse(
+            f"/tasks/{task_id}?approve_error=dor_failed", status_code=303
+        )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

@@ -2153,6 +2153,29 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
     margin-bottom: var(--sp-3);
 }
 
+.task-action-note--warning {
+    background: rgba(251, 176, 52, 0.12);
+    border-color: var(--orange);
+    color: var(--text);
+}
+
+.btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border-subtle); }
+.btn-secondary:hover { background: var(--border-subtle); }
+
+.dor-gate-warning {
+    background: rgba(251, 176, 52, 0.12);
+    border: 1px solid var(--orange);
+    border-radius: var(--radius);
+    padding: var(--sp-3);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.dor-gate-warning p { margin: var(--sp-2) 0; }
+
+.dor-gate-list { margin: var(--sp-2) 0; padding-left: var(--sp-4); }
+.dor-gate-list li { margin-bottom: var(--sp-2); }
+
 .task-meta-list {
     display: grid;
     grid-template-columns: 96px minmax(0, 1fr);
