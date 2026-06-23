@@ -14,6 +14,7 @@ from hub import config
 from hub import db as db_module
 from hub.actionable_errors import done_report_error_detail, hierarchy_error_detail
 from hub import repository as repo
+from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.models import (
@@ -1122,6 +1123,7 @@ async def add_update(
             db,
             "task_update",
             f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
+            detail=mutation_activity_detail(),
         )
 
     update_row = await repo.get_task_update_by_id(db, update_id)

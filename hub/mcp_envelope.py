@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+from hub.hub_instance import with_instance_echo
+
 Awaiting = Literal["none", "human_decision", "ci", "review"]
 ActorHint = Literal["agent", "human", "ci", "none"]
 
 MUTATION_ENVELOPE_FIELDS = (
+    "instance",
+    "base_url",
     "status",
     "awaiting",
     "transition",
@@ -141,10 +145,17 @@ def merge_mutation_response(
     extra: dict[str, Any] | None = None,
 ) -> str:
     """Return JSON text with human message plus envelope fields (backward-compatible parse)."""
-    payload: dict[str, Any] = {"message": message, **envelope}
+    payload: dict[str, Any] = with_instance_echo(
+        {"message": message, **envelope}
+    )
     if extra:
         payload.update(extra)
     return json.dumps(payload, ensure_ascii=False)
+
+
+def format_echo_response(message: str, **extra: Any) -> str:
+    """JSON text response for read-only MCP tools with instance echo."""
+    return json.dumps(with_instance_echo({"message": message, **extra}), ensure_ascii=False)
 
 
 def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -160,7 +171,7 @@ def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
         envelope["actor_hint"] = "human"
         envelope["awaiting"] = "none"
         envelope["transition"] = None
-    merged = {**payload, **envelope}
+    merged = with_instance_echo({**payload, **envelope})
     if "message" not in merged:
         merged["message"] = payload.get("hint") or payload.get("message") or ""
     return merged

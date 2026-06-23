@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 from fastapi import HTTPException
@@ -583,6 +585,13 @@ async def test_add_update(db: aiosqlite.Connection):
     uv = await services.add_update(db, task_id, body)
     assert uv.kind == "status"
     assert uv.content == "Progress update"
+    rows = await db.execute_fetchall(
+        "SELECT detail FROM activity_log WHERE kind='task_update' ORDER BY id DESC LIMIT 1"
+    )
+    assert rows
+    detail = json.loads(rows[0][0])
+    assert detail["instance"] in ("prod", "local")
+    assert detail["base_url"]
 
 
 async def test_add_done_update_completes_pending_report(db: aiosqlite.Connection):
