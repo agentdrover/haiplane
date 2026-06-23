@@ -27,6 +27,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from hub import config
+from hub.actionable_errors import human_only_gate_detail, permission_denied_detail
 from hub.config import TokenIdentity
 from hub.mcp_internal_auth import bearer_context_reset, bearer_context_set
 
@@ -317,7 +318,7 @@ def require_human_or_admin(request: Request) -> TokenIdentity:
     if identity.is_agent:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "this operation requires human or admin role",
+            detail=human_only_gate_detail(),
         )
     return identity
 
@@ -341,7 +342,7 @@ def require_permission(perm: str):
         if not identity.has_permission(perm):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
-                f"missing permission: {perm}",
+                detail=permission_denied_detail(perm),
             )
         return identity
 
