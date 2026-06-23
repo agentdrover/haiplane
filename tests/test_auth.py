@@ -338,6 +338,31 @@ async def test_agent_token_cannot_force_complete(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_token_archive_actionable_error(client, monkeypatch):
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "drafty", "source": "agent"},
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/archive",
+        json={"cascade": False},
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "permission_denied"
+    assert detail["required_role"] == "human"
+    assert detail["suggested_tool"] == "hub_withdraw_own_draft"
+    assert detail["hint"]
+
+
+@pytest.mark.asyncio
 async def test_agent_token_can_pair_start(client, monkeypatch):
     monkeypatch.setattr(
         config,
