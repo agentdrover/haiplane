@@ -200,18 +200,31 @@ async def test_hub_start_task(
     )
 
 
-async def test_hub_pair_start(mock_api_post: AsyncMock) -> None:
+async def test_hub_pair_start(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {
         "status": "running",
         "branch": "task-37/pair-start",
         "assigned_agent": "composer-analyst",
         "job_id": None,
     }
+    mock_api_get.side_effect = [
+        {"id": 37, "status": "open"},
+        {
+            "id": 37,
+            "status": "running",
+            "branch": "task-37/pair-start",
+            "assigned_agent": "composer-analyst",
+        },
+    ]
     msg = await hub_pair_start(
         37, plan="Plan: pair work", assigned_agent="composer-analyst"
     )
-    assert "Task #37 pair-started" in msg
-    assert "no dispatch job" in msg
+    payload = json.loads(msg)
+    assert "Task #37 pair-started" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["transition"] == {"from": "open", "to": "running"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/37/pair-start",
         {"plan": "Plan: pair work", "assigned_agent": "composer-analyst"},
@@ -238,31 +251,53 @@ async def test_hub_answer_question(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_claim_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_claim_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {
         "status": "claimed",
         "claimed_by": "composer",
     }
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {"id": 41, "status": "claimed", "claimed_by": "composer"},
+    ]
     msg = await hub_claim_task(41, "composer", session_id="sess-1")
-    assert "claimed" in msg
+    payload = json.loads(msg)
+    assert "claimed" in payload["message"]
+    assert payload["status"] == "claimed"
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/41/claim",
         {"agent": "composer", "session_id": "sess-1"},
     )
 
 
-async def test_hub_release_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_release_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "open"}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "claimed"},
+        {"id": 41, "status": "open"},
+    ]
     msg = await hub_release_task(41, "composer", session_id="sess-1")
-    assert "released" in msg
+    payload = json.loads(msg)
+    assert "released" in payload["message"]
+    assert payload["transition"] == {"from": "claimed", "to": "open"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/41/release",
         {"agent": "composer", "session_id": "sess-1"},
     )
 
 
-async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
+async def test_hub_approve_task_passes_force(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "open"}
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "draft"},
+        {"id": 5, "status": "open"},
+    ]
     msg = await hub_approve_task(
         5,
         comment="human override",
@@ -270,7 +305,9 @@ async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
         runtime="vast",
         force=True,
     )
-    assert "Task #5 approved" in msg
+    payload = json.loads(msg)
+    assert "Task #5 approved" in payload["message"]
+    assert payload["transition"] == {"from": "draft", "to": "open"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/5/approve",
         {
@@ -282,19 +319,55 @@ async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_force_complete_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_force_complete_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "pending_report"},
+        {"id": 9, "status": "completed"},
+    ]
     msg = await hub_force_complete_task(9)
-    assert "Task #9 force-completed" in msg
+    payload = json.loads(msg)
+    assert "Task #9 force-completed" in payload["message"]
+    assert payload["transition"] == {"from": "pending_report", "to": "completed"}
     mock_api_post.assert_awaited_once_with("/api/tasks/9/force-complete", None)
 
 
-async def test_hub_force_complete_task_with_comment(mock_api_post: AsyncMock) -> None:
+async def test_hub_force_complete_task_with_comment(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "pending_report"},
+        {"id": 9, "status": "completed"},
+    ]
     await hub_force_complete_task(9, comment="reviewed manually")
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/9/force-complete", {"comment": "reviewed manually"}
     )
+
+
+async def test_hub_force_complete_human_only_error(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    from hub.mcp_server import HubApiError
+
+    mock_api_get.return_value = {"id": 9, "status": "pending_report"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "human_only_gate",
+            "hint": "This operation requires a human or admin token, not an agent token.",
+            "required_status": None,
+            "message": "this operation requires human or admin role",
+        }
+    )
+    msg = await hub_force_complete_task(9)
+    payload = json.loads(msg)
+    assert payload["reason"] == "human_only_gate"
+    assert payload["actor_hint"] == "human"
+    assert "next_action" in payload
+    assert "127.0.0.1" not in msg
 
 
 async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> None:
@@ -333,23 +406,6 @@ async def test_hub_report_done(
     assert payload["actor_hint"] == "ci"
     assert payload["transition"] == {"from": "running", "to": "ci_check"}
     assert mock_api_get.await_count == 2
-
-
-async def test_hub_force_complete_human_only_error(mock_api_post: AsyncMock) -> None:
-    from hub.mcp_server import HubApiError
-
-    mock_api_post.side_effect = HubApiError(
-        {
-            "reason": "human_only_gate",
-            "hint": "This operation requires a human or admin token, not an agent token.",
-            "required_status": None,
-            "message": "this operation requires human or admin role",
-        }
-    )
-    msg = await hub_force_complete_task(9)
-    payload = json.loads(msg)
-    assert payload["reason"] == "human_only_gate"
-    assert "127.0.0.1" not in msg
 
 
 async def test_hub_report_done_open_status_returns_structured_error(

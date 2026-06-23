@@ -25,6 +25,23 @@ def test_build_mutation_envelope_completed_transition() -> None:
     assert env["transition"] == {"from": "pending_report", "to": "completed"}
 
 
+def test_enrich_error_payload_permission_without_status() -> None:
+    payload = enrich_error_payload(
+        {
+            "reason": "permission_denied",
+            "message": "missing permission: tasks.archive",
+            "hint": "Use human token.",
+            "required_role": "human",
+            "suggested_tool": "hub_withdraw_own_draft",
+        }
+    )
+    assert payload["status"] == "?"
+    assert payload["awaiting"] == "none"
+    assert payload["actor_hint"] == "human"
+    assert "next_action" in payload
+    assert payload["transition"] is None
+
+
 def test_enrich_error_payload_human_decision() -> None:
     payload = enrich_error_payload(
         {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 Awaiting = Literal["none", "human_decision", "ci", "review"]
@@ -60,6 +61,14 @@ def compute_next_action(
         return "Task is finished; no further done report is needed."
     if reason == "invalid_status_for_done":
         return "Start work via hub_pair_start or hub_start_task before reporting done."
+    if reason == "permission_denied":
+        return "Retry with a human or admin token, or use suggested_tool if provided."
+    if reason == "human_only_gate":
+        return "Retry with a human or admin Bearer token."
+    if reason == "forbidden":
+        return "This operation is forbidden for the current token; use a human or admin token."
+    if reason == "invalid_hierarchy":
+        return "Fix task_type/parent_id per hint, then retry hub_create_task or hub_propose_task."
 
     if awaiting == "human_decision" and status == "needs_decision":
         return "Call hub_decide_task (human/admin token) to accept or rework."
@@ -132,8 +141,6 @@ def merge_mutation_response(
     extra: dict[str, Any] | None = None,
 ) -> str:
     """Return JSON text with human message plus envelope fields (backward-compatible parse)."""
-    import json
-
     payload: dict[str, Any] = {"message": message, **envelope}
     if extra:
         payload.update(extra)
@@ -142,14 +149,17 @@ def merge_mutation_response(
 
 def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Add mutation envelope fields to structured API/MCP error payloads."""
-    status = payload.get("current_status") or payload.get("status")
-    if not status:
-        return payload
+    reason = payload.get("reason")
+    status = payload.get("current_status") or payload.get("status") or "?"
     envelope = build_mutation_envelope(
         {"status": status},
         status=status,
-        reason=payload.get("reason"),
+        reason=reason,
     )
+    if reason in ("permission_denied", "human_only_gate", "forbidden"):
+        envelope["actor_hint"] = "human"
+        envelope["awaiting"] = "none"
+        envelope["transition"] = None
     merged = {**payload, **envelope}
     if "message" not in merged:
         merged["message"] = payload.get("hint") or payload.get("message") or ""

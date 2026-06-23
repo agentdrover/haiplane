@@ -44,10 +44,11 @@ mcp = FastMCP(
     "openclaw-hub",
     instructions=(
         "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
-        "Mutation tools (hub_report_done, hub_start_task, hub_task_update, hub_decide_task) "
-        "return JSON with message plus envelope fields: status, awaiting "
-        "(none|human_decision|ci|review), transition {from,to}|null, next_action, actor_hint "
-        "(agent|human|ci|none). Structured errors use the same envelope plus reason and hint."
+        "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
+        "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
+        "actor_hint (agent|human|ci|none). Includes approve/reject/start/pair/claim/release, "
+        "report_done/task_update/decide, force-complete/archive/unarchive/delete. "
+        "Structured errors use the same envelope plus reason and hint."
     ),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
@@ -627,6 +628,25 @@ def _format_mutation_success(
     return merge_mutation_response(message, envelope)
 
 
+async def _read_task(task_id: int) -> dict[str, Any] | None:
+    try:
+        return await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError:
+        return None
+
+
+async def _task_mutation_response(
+    task_id: int,
+    message: str,
+    *,
+    prior_status: str | None,
+    task: dict[str, Any] | None,
+    fallback_status: str | None = None,
+) -> str:
+    body = task or {"id": task_id, "status": fallback_status or "?"}
+    return _format_mutation_success(message, body, transition_from=prior_status)
+
+
 @mcp.tool()
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
@@ -762,12 +782,25 @@ async def hub_approve_task(
         runtime: Override runtime: 'auto' or 'openrouter'. Empty to keep existing.
         force: If True, override failed DoR checks. Use only as a human decision.
     """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
     body: dict[str, Any] = {"comment": comment, "run": run, "force": force}
     if runtime:
         body["runtime"] = runtime
-    result = await _api_post(f"/api/tasks/{task_id}/approve", body)
-    status = result.get("status", "?")
-    return f"Task #{task_id} approved (status: {status})."
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/approve", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    status = (task or result).get("status", "?")
+    message = f"Task #{task_id} approved (status: {status})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=status,
+    )
 
 
 @mcp.tool()
@@ -778,8 +811,21 @@ async def hub_reject_task(task_id: int, comment: str = "") -> str:
         task_id: The draft task ID to reject
         comment: Reason for rejection
     """
-    await _api_post(f"/api/tasks/{task_id}/reject", {"comment": comment})
-    return f"Task #{task_id} rejected."
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        await _api_post(f"/api/tasks/{task_id}/reject", {"comment": comment})
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    message = f"Task #{task_id} rejected."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status="rejected",
+    )
 
 
 @mcp.tool()
@@ -834,6 +880,8 @@ async def hub_pair_start(
         assigned_agent: Agent name to record on the task. Empty uses caller identity.
         branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
     """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
     body: dict[str, Any] = {}
     if plan:
         body["plan"] = plan
@@ -841,15 +889,26 @@ async def hub_pair_start(
         body["assigned_agent"] = assigned_agent
     if branch_slug:
         body["branch_slug"] = branch_slug
-    result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
-    status = result.get("status", "?")
-    branch = result.get("branch") or "-"
-    agent = result.get("assigned_agent") or "-"
-    job_id = result.get("job_id")
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    status = (task or result).get("status", "?")
+    branch = (task or result).get("branch") or "-"
+    agent_name = (task or result).get("assigned_agent") or "-"
+    job_id = (task or result).get("job_id")
     job_note = "no dispatch job" if not job_id else f"job: {job_id}"
-    return (
+    message = (
         f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
-        f"agent: {agent}, {job_note})."
+        f"agent: {agent_name}, {job_note})."
+    )
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=status,
     )
 
 
@@ -866,13 +925,26 @@ async def hub_claim_task(
         agent: Agent name taking the claim
         session_id: Optional Cursor session id for conflict detection
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/claim",
-        {"agent": agent, "session_id": session_id},
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/claim",
+            {"agent": agent, "session_id": session_id},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    status = (task or result).get("status", "?")
+    holder = (task or result).get("claimed_by") or agent
+    message = f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=status,
     )
-    status = result.get("status", "?")
-    holder = result.get("claimed_by") or agent
-    return f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
 
 
 @mcp.tool()
@@ -888,12 +960,25 @@ async def hub_release_task(
         agent: Agent that holds the claim
         session_id: Optional session id that must match the claim
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/release",
-        {"agent": agent, "session_id": session_id},
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/release",
+            {"agent": agent, "session_id": session_id},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    status = (task or result).get("status", "?")
+    message = f"Task #{task_id} claim released (status: {status})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=status,
     )
-    status = result.get("status", "?")
-    return f"Task #{task_id} claim released (status: {status})."
 
 
 @mcp.tool()
@@ -910,13 +995,23 @@ async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
         task_id: The task ID to complete (pending_report / claimed / pair-running)
         comment: Reason for the override; recorded as the audit-trail message
     """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
     body = {"comment": comment} if comment else None
     try:
         result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
     except HubApiError as exc:
         return _format_hub_api_error(exc)
-    status = result.get("status", "?")
-    return f"Task #{task_id} force-completed (status: {status})."
+    task = await _read_task(task_id)
+    status = (task or result).get("status", "?")
+    message = f"Task #{task_id} force-completed (status: {status})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=status,
+    )
 
 
 @mcp.tool()
@@ -927,12 +1022,25 @@ async def hub_archive_task(task_id: int, cascade: bool = True) -> str:
         task_id: Task to archive
         cascade: If True, archive the whole subtree. If False, only this row.
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/archive",
-        {"cascade": cascade},
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/archive",
+            {"cascade": cascade},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    st = (task or result).get("status", "?")
+    message = f"Task #{task_id} archived (status in response: {st})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=st,
     )
-    st = result.get("status", "?")
-    return f"Task #{task_id} archived (status in response: {st})."
 
 
 @mcp.tool()
@@ -943,12 +1051,25 @@ async def hub_unarchive_task(task_id: int, cascade: bool = True) -> str:
         task_id: Task to unarchive
         cascade: If True, unarchive the whole subtree. If False, only this row.
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/unarchive",
-        {"cascade": cascade},
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/unarchive",
+            {"cascade": cascade},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    st = (task or result).get("status", "?")
+    message = f"Task #{task_id} unarchived (status in response: {st})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=st,
     )
-    st = result.get("status", "?")
-    return f"Task #{task_id} unarchived (status in response: {st})."
 
 
 @mcp.tool()
@@ -958,8 +1079,20 @@ async def hub_delete_task(task_id: int) -> str:
     Args:
         task_id: Root of the subtree to remove from the database.
     """
-    await _api_delete(f"/api/tasks/{task_id}")
-    return f"Task #{task_id} and its descendants were deleted."
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        await _api_delete(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    message = f"Task #{task_id} and its descendants were deleted."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=prior_task,
+        fallback_status=prior_status or "?",
+    )
 
 
 # ---------------------------------------------------------------------------
