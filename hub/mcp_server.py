@@ -17,6 +17,11 @@ from hub.services.tree_output import (
     truncate_text,
     TRUNCATION_NOTICE,
 )
+from hub.mcp_envelope import (
+    build_mutation_envelope,
+    enrich_error_payload,
+    merge_mutation_response,
+)
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -37,7 +42,13 @@ from hub.mcp_structured import (
 # MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
 mcp = FastMCP(
     "openclaw-hub",
-    instructions="MCP server for OpenClaw Hub — project state, tasks, proposals, decisions",
+    instructions=(
+        "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
+        "Mutation tools (hub_report_done, hub_start_task, hub_task_update, hub_decide_task) "
+        "return JSON with message plus envelope fields: status, awaiting "
+        "(none|human_decision|ci|review), transition {from,to}|null, next_action, actor_hint "
+        "(agent|human|ci|none). Structured errors use the same envelope plus reason and hint."
+    ),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
@@ -554,15 +565,28 @@ async def hub_task_update(
         agent: Name of the agent posting the update
         kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/updates",
-        {
-            "agent": agent,
-            "kind": kind,
-            "content": content,
-        },
-    )
-    return f"Update #{result['id']} added to task #{task_id}."
+    prior_status: str | None = None
+    try:
+        prior_task = await _api_get(f"/api/tasks/{task_id}")
+        prior_status = prior_task.get("status")
+    except HubApiError:
+        prior_task = None
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/updates",
+            {
+                "agent": agent,
+                "kind": kind,
+                "content": content,
+            },
+        )
+        task = await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    message = f"Update #{result['id']} added to task #{task_id}."
+    if task.get("lifecycle_hint"):
+        message += f"\nLifecycle: {task['lifecycle_hint']}"
+    return _format_mutation_success(message, task, transition_from=prior_status)
 
 
 def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
@@ -586,7 +610,21 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
 
 
 def _format_hub_api_error(err: HubApiError) -> str:
-    return err.as_json()
+    return json.dumps(enrich_error_payload(err.payload), ensure_ascii=False)
+
+
+def _format_mutation_success(
+    message: str,
+    task: dict[str, Any],
+    *,
+    transition_from: str | None = None,
+) -> str:
+    envelope = build_mutation_envelope(
+        task,
+        transition_from=transition_from,
+        transition_to=task.get("status"),
+    )
+    return merge_mutation_response(message, envelope)
 
 
 @mcp.tool()
@@ -604,6 +642,12 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
     """
+    prior_status: str | None = None
+    try:
+        prior_task = await _api_get(f"/api/tasks/{task_id}")
+        prior_status = prior_task.get("status")
+    except HubApiError:
+        prior_status = None
     try:
         result = await _api_post(
             f"/api/tasks/{task_id}/updates",
@@ -620,7 +664,7 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     msg = _format_hub_report_done_message(task_id, result["id"], status)
     if task.get("lifecycle_hint"):
         msg += f"\nLifecycle: {task['lifecycle_hint']}"
-    return msg
+    return _format_mutation_success(msg, task, transition_from=prior_status)
 
 
 # ---------------------------------------------------------------------------
@@ -750,15 +794,26 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
         plan: Work plan (what will be done and how). Required if no plan update exists.
         runtime: Override runtime: 'auto' or 'openrouter'. Empty to keep existing.
     """
+    prior_status: str | None = None
+    try:
+        prior_task = await _api_get(f"/api/tasks/{task_id}")
+        prior_status = prior_task.get("status")
+    except HubApiError:
+        prior_status = None
     body: dict[str, Any] = {}
     if plan:
         body["plan"] = plan
     if runtime:
         body["runtime"] = runtime
-    result = await _api_post(f"/api/tasks/{task_id}/start", body)
-    status = result.get("status", "?")
-    job_id = result.get("job_id", "-")
-    return f"Task #{task_id} dispatched (status: {status}, job: {job_id})."
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/start", body)
+        task = await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    status = task.get("status", result.get("status", "?"))
+    job_id = task.get("job_id", result.get("job_id", "-"))
+    message = f"Task #{task_id} dispatched (status: {status}, job: {job_id})."
+    return _format_mutation_success(message, task, transition_from=prior_status)
 
 
 @mcp.tool()
@@ -997,15 +1052,25 @@ async def hub_decide_task(
         "decision_summary": decision_summary,
         "record_decision": record_decision,
     }
+    prior_status: str | None = None
+    try:
+        prior_task = await _api_get(f"/api/tasks/{task_id}")
+        prior_status = prior_task.get("status")
+    except HubApiError:
+        prior_status = None
     try:
         result = await _api_post(f"/api/tasks/{task_id}/decide", body)
+        task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
-    status = result.get("status", "?")
+    status = task.get("status", result.get("status", "?"))
     suffix = ""
     if decision_summary:
         suffix = " (decision recorded)"
-    return f"Task #{task_id}: decision '{action}' applied (status: {status}).{suffix}"
+    message = (
+        f"Task #{task_id}: decision '{action}' applied (status: {status}).{suffix}"
+    )
+    return _format_mutation_success(message, task, transition_from=prior_status)
 
 
 # ---------------------------------------------------------------------------

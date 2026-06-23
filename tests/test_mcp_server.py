@@ -181,11 +181,19 @@ async def test_hub_propose(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_start_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_start_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "running", "job_id": "dispatch-1"}
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "open"},
+        {"id": 5, "status": "running", "job_id": "dispatch-1"},
+    ]
     msg = await hub_start_task(5, plan="Step one then two", runtime="openrouter")
-    assert "Task #5 dispatched" in msg
-    assert "dispatch-1" in msg
+    payload = json.loads(msg)
+    assert "Task #5 dispatched" in payload["message"]
+    assert "dispatch-1" in payload["message"]
+    assert payload["transition"] == {"from": "open", "to": "running"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/5/start",
         {"plan": "Step one then two", "runtime": "openrouter"},
@@ -289,10 +297,15 @@ async def test_hub_force_complete_task_with_comment(mock_api_post: AsyncMock) ->
     )
 
 
-async def test_hub_update(mock_api_post: AsyncMock) -> None:
+async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> None:
     mock_api_post.return_value = {"id": 55}
+    mock_api_get.return_value = {"id": 4, "status": "running"}
     msg = await hub_task_update(4, "Plan: ship it", agent="dev", kind="status")
-    assert "Update #55 added to task #4" in msg
+    payload = json.loads(msg)
+    assert "Update #55 added to task #4" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["awaiting"] == "none"
+    assert "next_action" in payload
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/4/updates",
         {"agent": "dev", "kind": "status", "content": "Plan: ship it"},
@@ -303,17 +316,23 @@ async def test_hub_report_done(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
     mock_api_post.return_value = {"id": 77}
-    mock_api_get.return_value = {"id": 9, "status": "ci_check"}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "running"},
+        {"id": 9, "status": "ci_check"},
+    ]
     msg = await hub_report_done(
         9,
         "Changed: tests. Validation: pytest -q",
         agent="qa",
     )
-    assert "Done report #77 submitted for task #9" in msg
-    assert "status: ci_check" in msg
-    assert "Task entered ci_check" in msg
-    assert "should now be completed" not in msg.lower()
-    mock_api_get.assert_awaited_once_with("/api/tasks/9")
+    payload = json.loads(msg)
+    assert "Done report #77 submitted for task #9" in payload["message"]
+    assert "ci_check" in payload["message"]
+    assert payload["status"] == "ci_check"
+    assert payload["awaiting"] == "ci"
+    assert payload["actor_hint"] == "ci"
+    assert payload["transition"] == {"from": "running", "to": "ci_check"}
+    assert mock_api_get.await_count == 2
 
 
 async def test_hub_force_complete_human_only_error(mock_api_post: AsyncMock) -> None:
@@ -338,6 +357,7 @@ async def test_hub_report_done_open_status_returns_structured_error(
 ) -> None:
     from hub.mcp_server import HubApiError
 
+    mock_api_get.return_value = {"id": 5, "status": "open"}
     mock_api_post.side_effect = HubApiError(
         {
             "reason": "pair_start_required",
@@ -348,19 +368,53 @@ async def test_hub_report_done_open_status_returns_structured_error(
         }
     )
     msg = await hub_report_done(5, "Changed: docs only")
-    assert "pair_start_required" in msg
+    payload = json.loads(msg)
+    assert payload["reason"] == "pair_start_required"
+    assert payload["status"] == "open"
+    assert payload["awaiting"] == "none"
+    assert payload["actor_hint"] == "agent"
     assert "127.0.0.1" not in msg
-    mock_api_get.assert_not_called()
+    mock_api_get.assert_awaited_once_with("/api/tasks/5")
 
 
 async def test_hub_report_done_completed_from_pending(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
     mock_api_post.return_value = {"id": 99}
-    mock_api_get.return_value = {"id": 3, "status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
     msg = await hub_report_done(3, "Changed: feature. Validation: pytest -q")
-    assert "status: completed" in msg
-    assert "Task completed" in msg
+    payload = json.loads(msg)
+    assert payload["status"] == "completed"
+    assert payload["awaiting"] == "none"
+    assert payload["transition"] == {"from": "pending_report", "to": "completed"}
+    assert "Task completed" in payload["message"]
+
+
+async def test_hub_report_done_needs_decision_error_envelope(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    from hub.mcp_server import HubApiError
+
+    mock_api_get.return_value = {"id": 8, "status": "needs_decision"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "human_decision_required",
+            "hint": "Task awaits hub_decide_task or human Decision Gate.",
+            "required_status": "needs_decision",
+            "current_status": "needs_decision",
+            "message": "Task awaits hub_decide_task or human Decision Gate.",
+        }
+    )
+    msg = await hub_report_done(8, "Done")
+    payload = json.loads(msg)
+    assert payload["reason"] == "human_decision_required"
+    assert payload["status"] == "needs_decision"
+    assert payload["awaiting"] == "human_decision"
+    assert payload["actor_hint"] == "human"
+    assert "hub_decide_task" in payload["next_action"]
 
 
 # ---------------------------------------------------------------------------
@@ -973,8 +1027,14 @@ async def test_hub_propose_task_passes_owner_and_reviewer(
     assert body["human_reviewer"] == "bob"
 
 
-async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> None:
+async def test_hub_decide_task_sends_all_params(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 10, "status": "needs_decision"},
+        {"id": 10, "status": "completed"},
+    ]
     msg = await hub_decide_task(
         task_id=10,
         action="accept",
@@ -982,9 +1042,11 @@ async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> Non
         decision_summary="Accepted after manual review.",
         record_decision=True,
     )
-    assert "Task #10" in msg
-    assert "accept" in msg
-    assert "decision recorded" in msg
+    payload = json.loads(msg)
+    assert "Task #10" in payload["message"]
+    assert "accept" in payload["message"]
+    assert "decision recorded" in payload["message"]
+    assert payload["transition"] == {"from": "needs_decision", "to": "completed"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/10/decide",
         {
@@ -996,12 +1058,19 @@ async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> Non
     )
 
 
-async def test_hub_decide_task_rework_without_summary(mock_api_post: AsyncMock) -> None:
+async def test_hub_decide_task_rework_without_summary(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "fix_requested"}
+    mock_api_get.side_effect = [
+        {"id": 11, "status": "needs_decision"},
+        {"id": 11, "status": "fix_requested"},
+    ]
     msg = await hub_decide_task(task_id=11, action="rework", instructions="Fix X")
-    assert "Task #11" in msg
-    assert "rework" in msg
-    assert "decision recorded" not in msg
+    payload = json.loads(msg)
+    assert "Task #11" in payload["message"]
+    assert "rework" in payload["message"]
+    assert "decision recorded" not in payload["message"]
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/11/decide",
         {
