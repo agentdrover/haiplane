@@ -358,6 +358,7 @@ async def test_hub_force_complete_human_only_error(
         {
             "reason": "human_only_gate",
             "hint": "This operation requires a human or admin token, not an agent token.",
+            "required_role": "human",
             "required_status": None,
             "message": "this operation requires human or admin role",
         }
@@ -365,9 +366,36 @@ async def test_hub_force_complete_human_only_error(
     msg = await hub_force_complete_task(9)
     payload = json.loads(msg)
     assert payload["reason"] == "human_only_gate"
+    assert payload["required_role"] == "human"
     assert payload["actor_hint"] == "human"
     assert "next_action" in payload
     assert "127.0.0.1" not in msg
+
+
+async def test_hub_archive_permission_actionable_error(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import HubApiError, hub_archive_task
+
+    mock_api_get.return_value = {"id": 12, "status": "draft"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "permission_denied",
+            "message": "missing permission: tasks.archive",
+            "hint": "Agent tokens cannot archive tasks.",
+            "required_role": "human",
+            "suggested_tool": "hub_withdraw_own_draft",
+            "required_permission": "tasks.archive",
+        }
+    )
+    msg = await hub_archive_task(12)
+    payload = json.loads(msg)
+    assert payload["reason"] == "permission_denied"
+    assert payload["suggested_tool"] == "hub_withdraw_own_draft"
+    assert payload["actor_hint"] == "human"
+    assert payload["awaiting"] == "none"
+    assert "next_action" in payload
 
 
 async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> None:
@@ -420,6 +448,7 @@ async def test_hub_report_done_open_status_returns_structured_error(
             "hint": "Call hub_pair_start before hub_report_done.",
             "required_status": "running",
             "current_status": "open",
+            "suggested_tool": "hub_pair_start",
             "message": "Call hub_pair_start before hub_report_done.",
         }
     )
@@ -429,6 +458,7 @@ async def test_hub_report_done_open_status_returns_structured_error(
     assert payload["status"] == "open"
     assert payload["awaiting"] == "none"
     assert payload["actor_hint"] == "agent"
+    assert payload["suggested_tool"] == "hub_pair_start"
     assert "127.0.0.1" not in msg
     mock_api_get.assert_awaited_once_with("/api/tasks/5")
 

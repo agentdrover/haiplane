@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
+from hub.actionable_errors import normalize_api_error_detail
 from hub.services.tree_output import (
     TreeOutputOptions,
     render_task_tree,
@@ -107,32 +108,11 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
     except Exception:
         detail = getattr(resp, "text", "") or ""
 
-    if isinstance(detail, dict) and detail.get("reason"):
-        msg = _strip_internal_urls(str(detail.get("message", detail.get("hint", ""))))
-        return {**detail, "message": msg or detail.get("hint", "")}
-
-    msg = _strip_internal_urls(str(detail))
-    if status_code == 403 and "human or admin" in msg.lower():
-        return {
-            "reason": "human_only_gate",
-            "hint": "This operation requires a human or admin token, not an agent token.",
-            "required_status": None,
-            "message": msg or "Forbidden: human or admin role required.",
-        }
-    if status_code == 403:
-        return {
-            "reason": "forbidden",
-            "hint": msg,
-            "required_status": None,
-            "message": msg or "Forbidden.",
-        }
-    return {
-        "reason": "api_error",
-        "hint": msg,
-        "required_status": None,
-        "message": msg or f"HTTP {status_code}",
-        "status_code": status_code,
-    }
+    payload = normalize_api_error_detail(detail, status_code=status_code)
+    msg = _strip_internal_urls(str(payload.get("message", payload.get("hint", ""))))
+    if msg:
+        payload["message"] = msg
+    return payload
 
 
 async def _api_get(path: str) -> Any:

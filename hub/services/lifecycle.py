@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from hub import config
 from hub import db as db_module
+from hub.actionable_errors import done_report_error_detail, hierarchy_error_detail
 from hub import repository as repo
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
@@ -159,12 +160,12 @@ def _done_report_error(
     hint: str,
     required_status: str,
 ) -> dict[str, Any]:
-    return {
-        "reason": reason,
-        "hint": hint,
-        "required_status": required_status,
-        "current_status": task["status"],
-    }
+    return done_report_error_detail(
+        task,
+        reason=reason,
+        hint=hint,
+        required_status=required_status,
+    )
 
 
 def _validate_done_report(task: dict[str, Any]) -> None:
@@ -321,7 +322,14 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
     """Create a new task, optionally dispatching it immediately."""
     err = await db_module.validate_hierarchy(db, body.task_type.value, body.parent_id)
     if err:
-        raise HTTPException(400, err)
+        raise HTTPException(
+            400,
+            detail=hierarchy_error_detail(
+                err,
+                task_type=body.task_type.value,
+                parent_id=body.parent_id,
+            ),
+        )
 
     if body.task_type in (TaskType.epic, TaskType.feature):
         initial_status = "open"
@@ -374,7 +382,14 @@ async def create_subtasks_bulk(
 
     err = await db_module.validate_hierarchy(db, body.task_type.value, parent_id)
     if err:
-        raise HTTPException(400, err)
+        raise HTTPException(
+            400,
+            detail=hierarchy_error_detail(
+                err,
+                task_type=body.task_type.value,
+                parent_id=parent_id,
+            ),
+        )
 
     if await repo.get_task(db, parent_id) is None:
         raise HTTPException(404, "parent task not found")

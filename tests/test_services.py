@@ -82,6 +82,31 @@ async def test_create_agent_task_is_draft(db: aiosqlite.Connection):
     assert tv.source.value == "agent"
 
 
+async def test_create_task_invalid_hierarchy_actionable(db: aiosqlite.Connection):
+    epic = await services.create_task(db, TaskCreate(title="E", task_type="epic"))
+    feature = await services.create_task(
+        db,
+        TaskCreate(title="F", task_type="feature", parent_id=epic.id),
+    )
+    task_parent = await services.create_task(
+        db,
+        TaskCreate(title="T", task_type="task", parent_id=feature.id),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await services.create_task(
+            db,
+            TaskCreate(
+                title="Bad",
+                task_type="task",
+                parent_id=task_parent.id,
+            ),
+        )
+    detail = exc_info.value.detail
+    assert detail["reason"] == "invalid_hierarchy"
+    assert detail["hint"]
+    assert detail["suggested_tool"] == "hub_create_task"
+
+
 async def test_approve_task(db: aiosqlite.Connection):
     body = TaskCreate(title="Draft task", source="agent", agent="bot")
     tv = await services.create_task(db, body)
@@ -287,6 +312,7 @@ async def test_done_from_open_without_pair_start_rejects_done(db: aiosqlite.Conn
     assert exc_info.value.status_code == 400
     detail = exc_info.value.detail
     assert detail["reason"] == "pair_start_required"
+    assert detail["suggested_tool"] == "hub_pair_start"
     updates = await repo.get_task_updates(db, tv.id)
     assert not any(u["kind"] == "done" for u in updates)
 
