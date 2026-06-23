@@ -118,6 +118,13 @@ async def test_approve_task(db: aiosqlite.Connection):
     # lifecycle mechanics; gate behavior is covered in test_api_approve_gate.
     approved = await services.approve_task(db, tv.id, TaskApprove(force=True))
     assert approved.status.value == "open"
+    rows = await db.execute_fetchall(
+        "SELECT detail FROM activity_log WHERE kind='task_approved' ORDER BY id DESC LIMIT 1"
+    )
+    assert rows
+    detail = json.loads(rows[0][0])
+    assert detail["instance"] in ("prod", "local")
+    assert detail["base_url"]
 
 
 async def test_approve_with_comment(db: aiosqlite.Connection):

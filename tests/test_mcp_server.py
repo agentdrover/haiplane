@@ -1177,9 +1177,12 @@ async def test_hub_get_readiness_explain_returns_full_json(
     payload = {"score": 100, "dor_passed": True, "explain": [{"k": "v"}]}
     mock_api_get.return_value = payload
     msg = await hub_get_readiness(12, explain=True)
-    import json as _json
-
-    assert _json.loads(msg) == payload
+    parsed = json.loads(msg)
+    assert parsed["score"] == 100
+    assert parsed["dor_passed"] is True
+    assert parsed["explain"] == [{"k": "v"}]
+    assert parsed["instance"] in ("prod", "local")
+    assert parsed["base_url"]
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
 
 

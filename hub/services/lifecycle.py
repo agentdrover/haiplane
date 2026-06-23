@@ -578,6 +578,7 @@ async def approve_task(
         db,
         "task_approved",
         f"Task #{task_id} approved{activity_suffix}",
+        detail=mutation_activity_detail(),
     )
 
     row = await repo.get_task(db, task_id)
@@ -609,7 +610,12 @@ async def reject_task(
 
     await repo.update_task(db, task_id, status="rejected")
     await db.commit()
-    await log_activity(db, "task_rejected", f"Task #{task_id} rejected")
+    await log_activity(
+        db,
+        "task_rejected",
+        f"Task #{task_id} rejected",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     return row_to_task(row)  # type: ignore[arg-type]
@@ -655,7 +661,12 @@ async def start_task(
         task["runtime"] = body.runtime.value
 
     await dispatch_task(db, task_id, task)
-    await log_activity(db, "task_started", f"Task #{task_id} dispatched")
+    await log_activity(
+        db,
+        "task_started",
+        f"Task #{task_id} dispatched",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -733,7 +744,12 @@ async def pair_start_task(
 
     await repo.update_task(db, task_id, **update_fields)
     await db.commit()
-    await log_activity(db, "task_pair_started", f"Task #{task_id} pair session started")
+    await log_activity(
+        db,
+        "task_pair_started",
+        f"Task #{task_id} pair session started",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -798,7 +814,12 @@ async def claim_task(
         f"Claimed by {body.agent}{session_note}",
     )
     await db.commit()
-    await log_activity(db, "task_claimed", f"Task #{task_id} claimed by {body.agent}")
+    await log_activity(
+        db,
+        "task_claimed",
+        f"Task #{task_id} claimed by {body.agent}",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -854,7 +875,12 @@ async def release_task(
         f"Claim released by {body.agent}",
     )
     await db.commit()
-    await log_activity(db, "task_released", f"Task #{task_id} claim released")
+    await log_activity(
+        db,
+        "task_released",
+        f"Task #{task_id} claim released",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -893,7 +919,12 @@ async def ask_question(
     await repo.add_task_update(db, task_id, body.agent, "question", body.question)
     await repo.update_task(db, task_id, status="needs_info")
     await db.commit()
-    await log_activity(db, "task_question", f"Task #{task_id}: agent asked a question")
+    await log_activity(
+        db,
+        "task_question",
+        f"Task #{task_id}: agent asked a question",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -940,6 +971,7 @@ async def answer_question(
                 db,
                 "task_answered",
                 f"Task #{task_id}: answered, pair resumed to {resume_status}",
+                detail=mutation_activity_detail(),
             )
         else:
             row = await repo.get_task(db, task_id)
@@ -948,6 +980,7 @@ async def answer_question(
                 db,
                 "task_answered",
                 f"Task #{task_id}: answered and re-dispatched",
+                detail=mutation_activity_detail(),
             )
     else:
         await repo.update_task(db, task_id, status="open")
@@ -956,6 +989,7 @@ async def answer_question(
             db,
             "task_answered",
             f"Task #{task_id}: answered, moved to open",
+            detail=mutation_activity_detail(),
         )
 
     row = await repo.get_task(db, task_id)
@@ -1002,6 +1036,7 @@ async def decide_task(
             db,
             "task_decided",
             f"Task #{task_id}: accepted after arbitration",
+            detail=mutation_activity_detail(),
         )
     else:
         instructions = body.instructions or "Fix remaining issues."
@@ -1034,6 +1069,7 @@ async def decide_task(
             db,
             "task_decided",
             f"Task #{task_id}: rework requested after arbitration",
+            detail=mutation_activity_detail(),
         )
 
     if body.record_decision and summary_text:
@@ -1087,6 +1123,7 @@ async def add_update(
                     db,
                     "task_completed",
                     f"Task #{task_id} completed with report from {body.agent}",
+                    detail=mutation_activity_detail(),
                 )
                 await maybe_rollup_parent(db, task_id)
             elif task["status"] in ("running", "claimed") and not task.get("job_id"):
@@ -1104,6 +1141,7 @@ async def add_update(
                         db,
                         "task_needs_decision",
                         f"Task #{task_id} → needs_decision (blocker in done flow)",
+                        detail=mutation_activity_detail(),
                     )
                 else:
                     await transition_after_agent_done(db, task, has_done=True)
@@ -1245,6 +1283,7 @@ async def archive_task(
         db,
         "task_archived",
         f"Task #{task_id} archived (cascade={cascade}, count={len(ids)})",
+        detail=mutation_activity_detail(),
     )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1269,6 +1308,7 @@ async def unarchive_task(
         db,
         "task_unarchived",
         f"Task #{task_id} unarchived (cascade={cascade}, count={len(ids)})",
+        detail=mutation_activity_detail(),
     )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1287,4 +1327,5 @@ async def delete_task_tree(db: aiosqlite.Connection, task_id: int) -> None:
         db,
         "task_deleted",
         f"Deleted task subtree rooted at #{task_id} ({n} tasks)",
+        detail=mutation_activity_detail(),
     )

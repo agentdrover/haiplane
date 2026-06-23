@@ -145,9 +145,7 @@ def merge_mutation_response(
     extra: dict[str, Any] | None = None,
 ) -> str:
     """Return JSON text with human message plus envelope fields (backward-compatible parse)."""
-    payload: dict[str, Any] = with_instance_echo(
-        {"message": message, **envelope}
-    )
+    payload: dict[str, Any] = with_instance_echo({"message": message, **envelope})
     if extra:
         payload.update(extra)
     return json.dumps(payload, ensure_ascii=False)
@@ -155,7 +153,9 @@ def merge_mutation_response(
 
 def format_echo_response(message: str, **extra: Any) -> str:
     """JSON text response for read-only MCP tools with instance echo."""
-    return json.dumps(with_instance_echo({"message": message, **extra}), ensure_ascii=False)
+    return json.dumps(
+        with_instance_echo({"message": message, **extra}), ensure_ascii=False
+    )
 
 
 def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
