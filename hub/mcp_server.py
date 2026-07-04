@@ -18,9 +18,11 @@ from hub.services.tree_output import (
     truncate_text,
     TRUNCATION_NOTICE,
 )
+from hub.hub_instance import with_instance_echo
 from hub.mcp_envelope import (
     build_mutation_envelope,
     enrich_error_payload,
+    format_echo_response,
     merge_mutation_response,
 )
 from hub.mcp_structured import (
@@ -47,9 +49,9 @@ mcp = FastMCP(
         "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
         "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
         "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
-        "actor_hint (agent|human|ci|none). Includes approve/reject/start/pair/claim/release, "
-        "report_done/task_update/decide, force-complete/archive/unarchive/delete. "
-        "Structured errors use the same envelope plus reason and hint."
+        "actor_hint (agent|human|ci|none). Every response also includes instance "
+        "(prod|local) and base_url echoing OPENCLAW_HUB_URL. Structured errors use "
+        "the same envelope plus reason and hint."
     ),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
@@ -310,7 +312,7 @@ async def hub_project_status() -> str:
             title = d.get("title", "Decision")
             parts.append(f"- {title}")
 
-    return "\n".join(parts) if parts else "No activity found."
+    return format_echo_response("\n".join(parts) if parts else "No activity found.")
 
 
 def _tree_query_string(
@@ -403,7 +405,7 @@ async def hub_create_subtasks(
         agent: Assigned agent name when source is agent.
     """
     if not items:
-        return "Nothing to create: items list is empty."
+        return format_echo_response("Nothing to create: items list is empty.")
     body: dict[str, Any] = {
         "items": items,
         "task_type": task_type,
@@ -412,12 +414,12 @@ async def hub_create_subtasks(
     }
     created = await _api_post(f"/api/tasks/{parent_id}/subtasks", body)
     if not created:
-        return f"No subtasks created under #{parent_id}."
+        return format_echo_response(f"No subtasks created under #{parent_id}.")
     lines = [
         f"Created {len(created)} {task_type}(s) under #{parent_id}:",
         *[f"  #{t['id']} [{t['status']}] {t['title']}" for t in created],
     ]
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 @mcp.tool()
@@ -466,9 +468,9 @@ async def hub_list_tasks(
         params["include_archived"] = "true"
     tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
     if not tasks:
-        return "No tasks found."
+        return format_echo_response("No tasks found.")
     lines = [_format_task(t) for t in tasks]
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 @mcp.tool()
@@ -706,7 +708,7 @@ async def hub_task_tree(
         mode=mode if mode in ("full", "summary") else "full",
     )
     rendered = render_task_tree(tree, options)
-    return rendered.text
+    return format_echo_response(rendered.text)
 
 
 @mcp.tool()
@@ -737,12 +739,7 @@ async def hub_my_context(
         text, truncated = truncate_text(text, effective_max)
         if truncated and TRUNCATION_NOTICE not in text:
             text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle: approve, reject, start
-# ---------------------------------------------------------------------------
+    return format_echo_response(text)
 
 
 @mcp.tool()
@@ -1100,7 +1097,9 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
             "question": question,
         },
     )
-    return f"Question posted on task #{task_id}. Task is now paused (needs_info). Waiting for human answer."
+    return format_echo_response(
+        f"Question posted on task #{task_id}. Task is now paused (needs_info). Waiting for human answer."
+    )
 
 
 @mcp.tool()
@@ -1124,7 +1123,7 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
         },
     )
     status = result.get("status", "?")
-    return f"Answer posted on task #{task_id} (status: {status})."
+    return format_echo_response(f"Answer posted on task #{task_id} (status: {status}).")
 
 
 # ---------------------------------------------------------------------------
@@ -1224,7 +1223,9 @@ async def hub_propose_task(
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
-    return f"Draft task #{result['id']} created. Awaiting human approval."
+    return format_echo_response(
+        f"Draft task #{result['id']} created. Awaiting human approval."
+    )
 
 
 @mcp.tool()
@@ -1237,9 +1238,9 @@ async def hub_list_proposals(status: str = "draft") -> str:
     tasks = await _api_get(f"/api/tasks?status={status}&limit=50")
     agent_tasks = [t for t in tasks if t.get("source") == "agent"]
     if not agent_tasks:
-        return f"No {status} proposals."
+        return format_echo_response(f"No {status} proposals.")
     lines = [_format_task(t) for t in agent_tasks]
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 # Deprecated aliases
@@ -1270,7 +1271,7 @@ async def hub_list_decisions(limit: int = 10) -> str:
     data = await _api_get("/api/dashboard")
     decisions = data.get("recent_decisions", [])
     if not decisions:
-        return "No decisions recorded."
+        return format_echo_response("No decisions recorded.")
     lines = []
     for d in decisions[:limit]:
         title = d.get("title", "Decision")
@@ -1278,7 +1279,7 @@ async def hub_list_decisions(limit: int = 10) -> str:
         lines.append(f"- {title}")
         if content:
             lines.append(f"  {content[:200]}")
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -1307,7 +1308,9 @@ if config.VAST_ENABLED:
             result = resp.json()
 
         if result.get("error"):
-            return f"Failed to create Vast instance: {result['error']}"
+            return format_echo_response(
+                f"Failed to create Vast instance: {result['error']}"
+            )
 
         public_ip = result.get("public_ip")
         api_port = result.get("api_port")
@@ -1333,7 +1336,7 @@ if config.VAST_ENABLED:
             "Local proxy → http://localhost:8741/v1",
             "Cursor model ready to use.",
         ]
-        return "\n".join(parts)
+        return format_echo_response("\n".join(parts))
 
     @mcp.tool()
     async def hub_vast_status() -> str:
@@ -1341,7 +1344,7 @@ if config.VAST_ENABLED:
         result = await _api_get("/api/vast/status")
 
         if not result.get("managed"):
-            return "No active Vast.ai instance."
+            return format_echo_response("No active Vast.ai instance.")
 
         parts = [
             f"Vast instance #{result.get('instance_id')} — {result.get('status', 'unknown')}",
@@ -1354,7 +1357,7 @@ if config.VAST_ENABLED:
             parts.append(
                 "  WARNING: Status degraded (API lookup failed, using cached state)"
             )
-        return "\n".join(parts)
+        return format_echo_response("\n".join(parts))
 
     @mcp.tool()
     async def hub_vast_down() -> str:
@@ -1367,8 +1370,10 @@ if config.VAST_ENABLED:
             result = resp.json()
 
         if result.get("destroyed"):
-            return f"Vast instance #{result.get('instance_id', '?')} destroyed. Billing stopped."
-        return (
+            return format_echo_response(
+                f"Vast instance #{result.get('instance_id', '?')} destroyed. Billing stopped."
+            )
+        return format_echo_response(
             f"No instance to destroy. {result.get('reason', result.get('error', ''))}"
         )
 
@@ -1387,7 +1392,7 @@ async def hub_dispatch_jobs(limit: int = 15) -> str:
     """
     jobs = await _api_get(f"/api/dispatch/jobs?limit={limit}")
     if not jobs:
-        return "No dispatch jobs found."
+        return format_echo_response("No dispatch jobs found.")
     lines = []
     for j in jobs:
         lines.append(
@@ -1395,7 +1400,7 @@ async def hub_dispatch_jobs(limit: int = 15) -> str:
             f"runtime={j.get('runtime', '?')} exit={j.get('exit_code', '-')} "
             f"session={j.get('session_id', '')}"
         )
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1533,7 @@ def _developer_handoff_text(
     if review_checklist:
         lines.append("Review checklist:")
         lines.extend(f"- {item}" for item in review_checklist)
-    return "\n".join(lines)
+    return format_echo_response("\n".join(lines))
 
 
 def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -1690,15 +1695,17 @@ async def hub_prepare_developer_task(
 
     if mode == "preview":
         return json.dumps(
-            {
-                "mode": "preview",
-                "task_id": task_id,
-                "planned_operations": planned_operations,
-                "diff": diff,
-                "quality_warnings": quality_warnings,
-                "developer_handoff_text": handoff_text,
-                "next_action": "preview_only",
-            },
+            with_instance_echo(
+                {
+                    "mode": "preview",
+                    "task_id": task_id,
+                    "planned_operations": planned_operations,
+                    "diff": diff,
+                    "quality_warnings": quality_warnings,
+                    "developer_handoff_text": handoff_text,
+                    "next_action": "preview_only",
+                }
+            ),
             ensure_ascii=False,
             indent=2,
         )
@@ -1749,22 +1756,24 @@ async def hub_prepare_developer_task(
     )
 
     return json.dumps(
-        {
-            "mode": "apply",
-            "task_id": task_id,
-            "updated_columns": updated_columns,
-            "acceptance_criteria_count": ac_count,
-            "risks_added": risks_added,
-            "duplicate_risks_count": len(duplicate_risks),
-            "readiness_score": score,
-            "dor_passed": dor_passed,
-            "missing_required": missing_required,
-            "recommendations_count": len(readiness.get("recommendations") or []),
-            "diff": diff,
-            "quality_warnings": quality_warnings,
-            "developer_handoff_text": handoff_text,
-            "next_action": next_action,
-        },
+        with_instance_echo(
+            {
+                "mode": "apply",
+                "task_id": task_id,
+                "updated_columns": updated_columns,
+                "acceptance_criteria_count": ac_count,
+                "risks_added": risks_added,
+                "duplicate_risks_count": len(duplicate_risks),
+                "readiness_score": score,
+                "dor_passed": dor_passed,
+                "missing_required": missing_required,
+                "recommendations_count": len(readiness.get("recommendations") or []),
+                "diff": diff,
+                "quality_warnings": quality_warnings,
+                "developer_handoff_text": handoff_text,
+                "next_action": next_action,
+            }
+        ),
         ensure_ascii=False,
         indent=2,
     )
@@ -1946,8 +1955,8 @@ async def hub_list_acceptance_criteria(task_id: int) -> str:
     """List all acceptance criteria (Given/When/Then scenarios) for a task."""
     items = await _api_get(f"/api/tasks/{task_id}/acceptance_criteria")
     if not items:
-        return f"Task #{task_id} has no acceptance criteria."
-    return "\n\n".join(_format_ac(ac) for ac in items)
+        return format_echo_response(f"Task #{task_id} has no acceptance criteria.")
+    return format_echo_response("\n\n".join(_format_ac(ac) for ac in items))
 
 
 @mcp.tool()
@@ -1989,8 +1998,10 @@ async def hub_add_acceptance_criterion(
         f"/api/tasks/{task_id}/acceptance_criteria", body
     )
     if status_code == 200:
-        return f"{ac_id} already exists on task #{task_id} (no change)"
-    return f"Added {ac_id} to task #{task_id}"
+        return format_echo_response(
+            f"{ac_id} already exists on task #{task_id} (no change)"
+        )
+    return format_echo_response(f"Added {ac_id} to task #{task_id}")
 
 
 @mcp.tool()
@@ -2033,7 +2044,7 @@ async def hub_upsert_acceptance_criterion(
         f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}", body
     )
     verb = "Created" if status_code == 201 else "Updated"
-    return f"{verb} {ac_id} on task #{task_id}"
+    return format_echo_response(f"{verb} {ac_id} on task #{task_id}")
 
 
 @mcp.tool()
@@ -2053,7 +2064,7 @@ async def hub_replace_acceptance_criteria(
     """
     result = await _api_put(f"/api/tasks/{task_id}/acceptance_criteria", items)
     count = len(result) if isinstance(result, list) else len(items)
-    return f"Task #{task_id} now has {count} acceptance criteria"
+    return format_echo_response(f"Task #{task_id} now has {count} acceptance criteria")
 
 
 @mcp.tool()
@@ -2063,7 +2074,7 @@ async def hub_delete_acceptance_criterion(task_id: int, ac_id: str) -> str:
 
     safe_id = urllib.parse.quote(ac_id, safe="")
     await _api_delete(f"/api/tasks/{task_id}/acceptance_criteria/{safe_id}")
-    return f"Deleted {ac_id} from task #{task_id}"
+    return format_echo_response(f"Deleted {ac_id} from task #{task_id}")
 
 
 @mcp.tool()
@@ -2096,7 +2107,9 @@ async def hub_add_risk(
     )
     total = len(result.get("risks") or []) if isinstance(result, dict) else 0
     suffix = f" (total: {total})" if total else ""
-    return f"Risk '{kind}:{severity}' added to task #{task_id}{suffix}"
+    return format_echo_response(
+        f"Risk '{kind}:{severity}' added to task #{task_id}{suffix}"
+    )
 
 
 @mcp.tool()
@@ -2116,8 +2129,8 @@ async def hub_get_readiness(task_id: int, explain: bool = False) -> str:
         path += "?explain=true"
     report = await _api_get(path)
     if explain:
-        return json.dumps(report, ensure_ascii=False, indent=2)
-    return _format_readiness(report, task_id)
+        return json.dumps(with_instance_echo(report), ensure_ascii=False, indent=2)
+    return format_echo_response(_format_readiness(report, task_id))
 
 
 @mcp.tool()
@@ -2174,12 +2187,12 @@ async def hub_admin_my_identity() -> str:
     """
     try:
         await _api_get("/api/tasks?limit=1")
-        return (
+        return format_echo_response(
             "Identity check: API access confirmed. "
             "Use the Hub Web UI or CLI for detailed identity info."
         )
     except Exception as e:
-        return f"Identity check failed: {e}"
+        return format_echo_response(f"Identity check failed: {e}")
 
 
 def main():
