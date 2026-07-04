@@ -73,6 +73,45 @@ def permission_denied_detail(permission: str) -> dict[str, Any]:
     )
 
 
+def withdraw_agent_only_detail() -> dict[str, Any]:
+    return enrich_error_payload(
+        {
+            "reason": "withdraw_agent_only",
+            "message": "withdraw is only for agent tokens",
+            "hint": (
+                "hub_withdraw_own_draft is agent-only. Humans and admins should use "
+                "hub_archive_task or POST /api/tasks/{id}/archive."
+            ),
+            "required_role": "agent",
+            "suggested_tool": "hub_archive_task",
+        }
+    )
+
+
+def withdraw_own_draft_error_detail(
+    *,
+    reason: str,
+    message: str,
+    hint: str,
+    current_status: str | None = None,
+    required_status: str | None = None,
+    suggested_tool: str | None = "hub_withdraw_own_draft",
+    required_role: str = "agent",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "message": message,
+        "hint": hint,
+        "required_role": required_role,
+        "suggested_tool": suggested_tool,
+    }
+    if current_status is not None:
+        payload["current_status"] = current_status
+    if required_status is not None:
+        payload["required_status"] = required_status
+    return enrich_error_payload(payload)
+
+
 def human_only_gate_detail(message: str | None = None) -> dict[str, Any]:
     return enrich_error_payload(
         {
