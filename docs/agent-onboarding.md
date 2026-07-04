@@ -92,6 +92,9 @@ stateDiagram-v2
 
 - Токен для Cursor лежит на сервере: `~/openclaw-hub-cursor-token.txt`
   (только наличие проверяй, **в чат токены не печатай**).
+- Каждый ответ MCP-инструмента содержит поля **`instance`** (`prod`|`local`) и
+  **`base_url`** (значение `OPENCLAW_HUB_URL` на сервере). Для JSON-ответов парси
+  `json.loads(result)`; для mutation-envelope поля рядом с `status`/`awaiting`.
 
 ---
 

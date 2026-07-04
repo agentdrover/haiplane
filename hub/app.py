@@ -18,6 +18,7 @@ from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db
 from hub.integrations.registry import plugins
+from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     BulkChildTasksCreate,
     BulkRefine,
@@ -447,6 +448,9 @@ async def api_task_context(
     )
     if missing_required:
         lines.append(f"  Missing required: {', '.join(missing_required)}")
+    if mode == "full":
+        lines.append("")
+        lines.extend(lifecycle_map_lines())
 
     effective_max_chars = max_chars
     if mode == "summary" and effective_max_chars is None:

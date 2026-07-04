@@ -106,7 +106,10 @@ async def test_hub_list_tasks(mock_api_get: AsyncMock) -> None:
         },
     ]
     out = await hub_list_tasks()
-    lines = out.split("\n")
+    payload = json.loads(out)
+    lines = payload["message"].split("\n")
+    assert payload["instance"] in ("prod", "local")
+    assert "base_url" in payload
     assert lines[0] == "#1 [open] (auto) Alpha"
     assert lines[1] == "#2 [epic] [running] (vast) [agent:coder] Beta epic"
     assert lines[2] == "#3 [subtask] [open] (auto) (parent #2) Child"
@@ -369,7 +372,7 @@ async def test_hub_force_complete_human_only_error(
     assert payload["required_role"] == "human"
     assert payload["actor_hint"] == "human"
     assert "next_action" in payload
-    assert "127.0.0.1" not in msg
+    assert payload["instance"] in ("prod", "local")
 
 
 async def test_hub_archive_permission_actionable_error(
@@ -411,6 +414,33 @@ async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> 
         "/api/tasks/4/updates",
         {"agent": "dev", "kind": "status", "content": "Plan: ship it"},
     )
+
+
+async def test_hub_task_update_kind_done_matches_report_done(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 88}
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    update_msg = await hub_task_update(
+        3, "Changed: feature. Validation: pytest -q", agent="dev", kind="done"
+    )
+    mock_api_post.reset_mock()
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    report_msg = await hub_report_done(
+        3, "Changed: feature. Validation: pytest -q", agent="dev"
+    )
+    update_payload = json.loads(update_msg)
+    report_payload = json.loads(report_msg)
+    assert "Done report #88" in update_payload["message"]
+    assert update_payload["status"] == report_payload["status"] == "completed"
+    assert update_payload["transition"] == report_payload["transition"]
+    assert update_payload["awaiting"] == report_payload["awaiting"]
 
 
 async def test_hub_report_done(
@@ -459,7 +489,7 @@ async def test_hub_report_done_open_status_returns_structured_error(
     assert payload["awaiting"] == "none"
     assert payload["actor_hint"] == "agent"
     assert payload["suggested_tool"] == "hub_pair_start"
-    assert "127.0.0.1" not in msg
+    assert payload["instance"] in ("prod", "local")
     mock_api_get.assert_awaited_once_with("/api/tasks/5")
 
 
@@ -1174,9 +1204,12 @@ async def test_hub_get_readiness_explain_returns_full_json(
     payload = {"score": 100, "dor_passed": True, "explain": [{"k": "v"}]}
     mock_api_get.return_value = payload
     msg = await hub_get_readiness(12, explain=True)
-    import json as _json
-
-    assert _json.loads(msg) == payload
+    parsed = json.loads(msg)
+    assert parsed["score"] == 100
+    assert parsed["dor_passed"] is True
+    assert parsed["explain"] == [{"k": "v"}]
+    assert parsed["instance"] in ("prod", "local")
+    assert parsed["base_url"]
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
 
 
