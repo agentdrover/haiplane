@@ -25,6 +25,7 @@ from hub.mcp_envelope import (
     format_echo_response,
     merge_mutation_response,
 )
+from hub.workflow_reference import build_mcp_instructions
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -45,19 +46,7 @@ from hub.mcp_structured import (
 # MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
 mcp = FastMCP(
     "openclaw-hub",
-    instructions=(
-        "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
-        "Agent canonical task completion: hub_report_done only (not hub_decide_task, "
-        "hub_force_complete_task, or hub_approve_task). hub_task_update kind=done is "
-        "a deprecated alias of hub_report_done with the same response contract. "
-        "Human-only tools: hub_decide_task, hub_approve_task, hub_reject_task, "
-        "hub_force_complete_task, hub_answer_question (human token). "
-        "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
-        "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
-        "actor_hint (agent|human|ci|none). Every response also includes instance "
-        "(prod|local) and base_url echoing OPENCLAW_HUB_URL. Structured errors use "
-        "the same envelope plus reason and hint."
-    ),
+    instructions=build_mcp_instructions(),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
