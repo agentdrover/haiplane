@@ -64,6 +64,7 @@ from hub.services.lifecycle import (
     row_to_task,
     start_task,
     unarchive_task,
+    withdraw_own_draft,
 )
 from hub.services.orchestration import (
     dispatch_arbiter,
@@ -144,4 +145,5 @@ __all__ = [
     "start_task",
     "transition_after_agent_done",
     "unarchive_task",
+    "withdraw_own_draft",
 ]

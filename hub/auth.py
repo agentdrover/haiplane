@@ -27,7 +27,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from hub import config
-from hub.actionable_errors import human_only_gate_detail, permission_denied_detail
+from hub.actionable_errors import (
+    human_only_gate_detail,
+    permission_denied_detail,
+    withdraw_agent_only_detail,
+)
 from hub.config import TokenIdentity
 from hub.mcp_internal_auth import bearer_context_reset, bearer_context_set
 
@@ -319,6 +323,17 @@ def require_human_or_admin(request: Request) -> TokenIdentity:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail=human_only_gate_detail(),
+        )
+    return identity
+
+
+def require_agent_caller(request: Request) -> TokenIdentity:
+    """Agent-only dependency for hub_withdraw_own_draft / POST .../withdraw."""
+    identity = current_identity(request)
+    if not identity.is_agent:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_agent_only_detail(),
         )
     return identity
 

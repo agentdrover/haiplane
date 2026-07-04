@@ -419,6 +419,12 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_withdraw(args: argparse.Namespace) -> int:
+    result = _api("POST", f"/api/tasks/{args.task_id}/withdraw")
+    _print_json(result)
+    return 0
+
+
 def cmd_unarchive(args: argparse.Namespace) -> int:
     cascade = not args.no_cascade
     result = _api(
@@ -1287,6 +1293,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archive only this task, not descendants",
     )
     p_archive.set_defaults(func=cmd_archive)
+
+    p_withdraw = sub.add_parser(
+        "withdraw",
+        help="Withdraw your own agent draft (agent token; no children)",
+    )
+    p_withdraw.add_argument("task_id", type=int)
+    p_withdraw.set_defaults(func=cmd_withdraw)
 
     p_unarchive = sub.add_parser(
         "unarchive",

@@ -401,6 +401,51 @@ async def test_hub_archive_permission_actionable_error(
     assert "next_action" in payload
 
 
+async def test_hub_withdraw_own_draft_success(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import hub_withdraw_own_draft
+
+    mock_api_get.side_effect = [
+        {"id": 21, "status": "draft", "archived": False},
+        {"id": 21, "status": "draft", "archived": True},
+    ]
+    mock_api_post.return_value = {"id": 21, "status": "draft", "archived": True}
+    msg = await hub_withdraw_own_draft(21)
+    payload = json.loads(msg)
+    assert "withdrawn" in payload["message"]
+    assert payload["status"] == "draft"
+    assert payload["instance"] in ("prod", "local")
+    assert "next_action" in payload
+    mock_api_post.assert_awaited_once_with("/api/tasks/21/withdraw")
+
+
+async def test_hub_withdraw_own_draft_actionable_error(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import HubApiError, hub_withdraw_own_draft
+
+    mock_api_get.return_value = {"id": 22, "status": "draft"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "not_task_owner",
+            "message": "caller is not the assigned agent for this draft",
+            "hint": "You can only withdraw drafts assigned to you.",
+            "required_role": "agent",
+            "suggested_tool": "hub_withdraw_own_draft",
+        }
+    )
+    msg = await hub_withdraw_own_draft(22)
+    payload = json.loads(msg)
+    assert payload["reason"] == "not_task_owner"
+    assert payload["required_role"] == "agent"
+    assert payload["suggested_tool"] == "hub_withdraw_own_draft"
+    assert payload["actor_hint"] == "agent"
+    assert "next_action" in payload
+
+
 async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> None:
     mock_api_post.return_value = {"id": 55}
     mock_api_get.return_value = {"id": 4, "status": "running"}
