@@ -47,6 +47,11 @@ mcp = FastMCP(
     "openclaw-hub",
     instructions=(
         "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
+        "Agent canonical task completion: hub_report_done only (not hub_decide_task, "
+        "hub_force_complete_task, or hub_approve_task). hub_task_update kind=done is "
+        "a deprecated alias of hub_report_done with the same response contract. "
+        "Human-only tools: hub_decide_task, hub_approve_task, hub_reject_task, "
+        "hub_force_complete_task, hub_answer_question (human token). "
         "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
         "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
         "actor_hint (agent|human|ci|none). Every response also includes instance "
@@ -546,7 +551,9 @@ async def hub_task_update(
         task_id: The task ID to update
         content: Update text — status report, blocker description, or completion report
         agent: Name of the agent posting the update
-        kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'
+        kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'.
+            Prefer hub_report_done for completion (kind='done' is a deprecated alias with
+            the same validator and response envelope).
     """
     prior_status: str | None = None
     try:
@@ -566,7 +573,11 @@ async def hub_task_update(
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
-    message = f"Update #{result['id']} added to task #{task_id}."
+    status = task.get("status", "?")
+    if kind == "done":
+        message = _format_hub_report_done_message(task_id, result["id"], status)
+    else:
+        message = f"Update #{result['id']} added to task #{task_id}."
     if task.get("lifecycle_hint"):
         message += f"\nLifecycle: {task['lifecycle_hint']}"
     return _format_mutation_success(message, task, transition_from=prior_status)

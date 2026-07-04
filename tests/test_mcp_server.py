@@ -416,6 +416,33 @@ async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> 
     )
 
 
+async def test_hub_task_update_kind_done_matches_report_done(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 88}
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    update_msg = await hub_task_update(
+        3, "Changed: feature. Validation: pytest -q", agent="dev", kind="done"
+    )
+    mock_api_post.reset_mock()
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    report_msg = await hub_report_done(
+        3, "Changed: feature. Validation: pytest -q", agent="dev"
+    )
+    update_payload = json.loads(update_msg)
+    report_payload = json.loads(report_msg)
+    assert "Done report #88" in update_payload["message"]
+    assert update_payload["status"] == report_payload["status"] == "completed"
+    assert update_payload["transition"] == report_payload["transition"]
+    assert update_payload["awaiting"] == report_payload["awaiting"]
+
+
 async def test_hub_report_done(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
