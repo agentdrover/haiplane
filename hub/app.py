@@ -54,6 +54,7 @@ from hub.models import (
 from hub.auth import (
     AuthMiddleware,
     current_identity,
+    require_agent_caller,
     require_human_or_admin,
     require_permission,
 )
@@ -251,6 +252,23 @@ async def api_archive_task(
     cascade = body.cascade if body else True
     try:
         return await services.archive_task(_db(request), task_id, cascade=cascade)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/withdraw", response_model=TaskView)
+async def api_withdraw_own_draft(
+    task_id: int,
+    request: Request,
+    identity=Depends(require_agent_caller),
+):
+    """Agent-only: archive own agent draft without children (narrow withdraw)."""
+    try:
+        return await services.withdraw_own_draft(
+            _db(request),
+            task_id,
+            caller=identity.username,
+        )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
 

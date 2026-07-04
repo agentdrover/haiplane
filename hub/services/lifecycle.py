@@ -8,11 +8,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 
 from hub import config
 from hub import db as db_module
-from hub.actionable_errors import done_report_error_detail, hierarchy_error_detail
+from hub.actionable_errors import (
+    done_report_error_detail,
+    hierarchy_error_detail,
+    withdraw_own_draft_error_detail,
+)
 from hub import repository as repo
 from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
@@ -1264,6 +1268,96 @@ async def force_complete_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def withdraw_own_draft(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    caller: str,
+) -> TaskView:
+    """Archive a single agent-owned draft (no cascade). Agent-only narrow path."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise TaskNotFoundError(f"task {task_id} not found")
+    task = dict(row)
+
+    if task.get("source") != TaskSource.agent.value:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="not_agent_draft",
+                message="only agent-created drafts can be withdrawn",
+                hint=(
+                    "hub_withdraw_own_draft applies to source=agent drafts you own. "
+                    "For other tasks ask a human to archive."
+                ),
+                suggested_tool="hub_archive_task",
+                required_role="human",
+            ),
+        )
+
+    if task.get("status") != "draft":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="invalid_status_for_withdraw",
+                message=f"can only withdraw draft tasks, current: {task.get('status')}",
+                hint="Only draft tasks can be withdrawn. Approved or active work cannot.",
+                current_status=task.get("status"),
+                required_status="draft",
+                suggested_tool="hub_task_status",
+            ),
+        )
+
+    assigned = (task.get("assigned_agent") or "").strip()
+    if assigned != caller.strip():
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="not_task_owner",
+                message="caller is not the assigned agent for this draft",
+                hint=(
+                    "You can only withdraw drafts assigned to you "
+                    "(assigned_agent must match your token identity)."
+                ),
+            ),
+        )
+
+    children = await db_module.get_children(db, task_id)
+    if children:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="withdraw_has_children",
+                message="draft has non-archived child tasks",
+                hint=(
+                    "Archive or delete child tasks first, or ask a human to "
+                    "hub_archive_task with cascade."
+                ),
+                suggested_tool="hub_archive_task",
+                required_role="human",
+            ),
+        )
+
+    await repo.set_tasks_archived(db, [task_id], 1)
+    await db.commit()
+    detail_payload = {
+        **json.loads(mutation_activity_detail()),
+        "actor": caller.strip(),
+        "action": "withdraw_own_draft",
+    }
+    await log_activity(
+        db,
+        "task_withdrawn",
+        f"Agent {caller} withdrew draft #{task_id}",
+        json.dumps(detail_payload, ensure_ascii=False),
+    )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    task_view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    return await enrich_task_view(db, task_view)
 
 
 async def archive_task(

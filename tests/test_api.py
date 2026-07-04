@@ -625,3 +625,217 @@ async def test_delete_task_returns_204(client: AsyncClient):
 
     get_resp = await client.get(f"/api/tasks/{task_id}")
     assert get_resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Withdraw own draft (#173)
+# ---------------------------------------------------------------------------
+
+
+def _withdraw_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        "agent-token": TokenIdentity("bot", "agent"),
+        "other-agent": TokenIdentity("other", "agent"),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+async def test_withdraw_own_draft_archives_and_hides_from_lists(
+    client: AsyncClient, monkeypatch
+):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _withdraw_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    headers = {"Authorization": "Bearer agent-token"}
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "mistaken draft", "source": "agent", "agent": "bot"},
+        headers=headers,
+    )
+    assert create.status_code == 200
+    task_id = create.json()["id"]
+    assert create.json()["status"] == "draft"
+
+    resp = await client.post(f"/api/tasks/{task_id}/withdraw", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["archived"] is True
+    assert body["status"] == "draft"
+
+    listed = (
+        await client.get("/api/tasks", params={"status": "draft"}, headers=headers)
+    ).json()
+    assert all(t["id"] != task_id for t in listed)
+
+    activity = (await client.get("/api/activity", headers=headers)).json()
+    withdrawn = [a for a in activity if a["kind"] == "task_withdrawn"]
+    assert withdrawn
+    assert "bot" in withdrawn[0]["summary"]
+    assert f"#{task_id}" in withdrawn[0]["summary"]
+
+
+async def test_withdraw_own_draft_rejects_foreign_or_invalid(
+    client: AsyncClient, monkeypatch, db
+):
+    from hub import config
+    from hub import repository as repo
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _withdraw_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent_headers = {"Authorization": "Bearer agent-token"}
+    other_headers = {"Authorization": "Bearer other-agent"}
+    human_headers = {"Authorization": "Bearer human-token"}
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "owned draft", "source": "agent", "agent": "bot"},
+        headers=agent_headers,
+    )
+    task_id = create.json()["id"]
+
+    wrong_owner = await client.post(
+        f"/api/tasks/{task_id}/withdraw", headers=other_headers
+    )
+    assert wrong_owner.status_code == 403
+    detail = wrong_owner.json()["detail"]
+    assert detail["reason"] == "not_task_owner"
+    assert detail["required_role"] == "agent"
+    assert detail["hint"]
+    assert detail["instance"] in ("prod", "local")
+    assert "next_action" in detail
+
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+    not_draft = await client.post(
+        f"/api/tasks/{task_id}/withdraw", headers=agent_headers
+    )
+    assert not_draft.status_code == 403
+    detail = not_draft.json()["detail"]
+    assert detail["reason"] == "invalid_status_for_withdraw"
+    assert detail["required_status"] == "draft"
+
+    human_open = await client.post(
+        "/api/tasks",
+        json={"title": "human task"},
+        headers=human_headers,
+    )
+    human_id = human_open.json()["id"]
+    not_agent_source = await client.post(
+        f"/api/tasks/{human_id}/withdraw", headers=agent_headers
+    )
+    assert not_agent_source.status_code == 403
+    assert not_agent_source.json()["detail"]["reason"] == "not_agent_draft"
+
+    await repo.update_task(db, task_id, status="draft")
+    await db.commit()
+    child = await client.post(
+        "/api/tasks",
+        json={
+            "title": "child",
+            "source": "agent",
+            "agent": "bot",
+            "parent_id": task_id,
+            "task_type": "subtask",
+        },
+        headers=agent_headers,
+    )
+    assert child.status_code == 200
+    has_children = await client.post(
+        f"/api/tasks/{task_id}/withdraw", headers=agent_headers
+    )
+    assert has_children.status_code == 403
+    assert has_children.json()["detail"]["reason"] == "withdraw_has_children"
+
+
+async def test_withdraw_rejects_human_token(client: AsyncClient, monkeypatch):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _withdraw_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "draft", "source": "agent", "agent": "bot"},
+        headers={"Authorization": "Bearer human-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/withdraw",
+        headers={"Authorization": "Bearer human-token"},
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "withdraw_agent_only"
+    assert detail["suggested_tool"] == "hub_archive_task"
+    assert detail["required_role"] == "agent"
+    assert detail["instance"] in ("prod", "local")
+    assert "next_action" in detail
+
+
+async def test_withdraw_own_draft_allows_archived_child(
+    client: AsyncClient, monkeypatch, db
+):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _withdraw_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent_headers = {"Authorization": "Bearer agent-token"}
+    human_headers = {"Authorization": "Bearer human-token"}
+
+    parent = await client.post(
+        "/api/tasks",
+        json={"title": "parent draft", "source": "agent", "agent": "bot"},
+        headers=agent_headers,
+    )
+    parent_id = parent.json()["id"]
+
+    child = await client.post(
+        "/api/tasks",
+        json={
+            "title": "child",
+            "source": "agent",
+            "agent": "bot",
+            "parent_id": parent_id,
+            "task_type": "subtask",
+        },
+        headers=agent_headers,
+    )
+    child_id = child.json()["id"]
+
+    archive_child = await client.post(
+        f"/api/tasks/{child_id}/archive",
+        json={"cascade": False},
+        headers=human_headers,
+    )
+    assert archive_child.status_code == 200
+
+    resp = await client.post(f"/api/tasks/{parent_id}/withdraw", headers=agent_headers)
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+
+async def test_withdraw_rejects_empty_assigned_agent(client: AsyncClient, monkeypatch):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _withdraw_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    headers = {"Authorization": "Bearer agent-token"}
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "no agent field", "source": "agent"},
+        headers=headers,
+    )
+    task_id = create.json()["id"]
+    assert create.json()["assigned_agent"] == ""
+
+    resp = await client.post(f"/api/tasks/{task_id}/withdraw", headers=headers)
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_task_owner"
+    assert detail["required_role"] == "agent"

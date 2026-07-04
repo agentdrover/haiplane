@@ -1021,6 +1021,34 @@ async def hub_archive_task(task_id: int, cascade: bool = True) -> str:
 
 
 @mcp.tool()
+async def hub_withdraw_own_draft(task_id: int) -> str:
+    """Withdraw (archive) your own agent draft without children.
+
+    Narrow agent-only path — does not replace hub_archive_task for humans.
+
+    Args:
+        task_id: Draft task you created (source=agent, assigned to you).
+    """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/withdraw")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    task = await _read_task(task_id)
+    st = (task or result).get("status", "?")
+    archived = (task or result).get("archived", True)
+    message = f"Draft task #{task_id} withdrawn (archived={archived}, status: {st})."
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+        fallback_status=st,
+    )
+
+
+@mcp.tool()
 async def hub_unarchive_task(task_id: int, cascade: bool = True) -> str:
     """Restore archived tasks (optional subtree cascade).
 
