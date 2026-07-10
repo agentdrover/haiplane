@@ -905,6 +905,182 @@ async def hub_pair_start(
 
 
 @mcp.tool()
+async def hub_submit_for_review(
+    task_id: int,
+    agent: str = "",
+    summary: str = "",
+) -> str:
+    """Submit the current work of a pair task for client-driven review (#307).
+
+    Moves a running pair task (no dispatch job) into status=review and bumps
+    the submission generation, which invalidates any earlier APPROVED
+    verdict. This does NOT complete the task: after review, an APPROVED
+    verdict returns it to running for the normal done path, and
+    CHANGES_REQUESTED returns it to running for fixes.
+
+    Args:
+        task_id: The running pair task ID
+        agent: Name of the submitting agent (empty uses task's assigned agent)
+        summary: Short note on what is being submitted
+    """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    body: dict[str, Any] = {}
+    if agent:
+        body["agent"] = agent
+    if summary:
+        body["summary"] = summary
+    try:
+        task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    generation = task.get("submission_generation", 0)
+    message = (
+        f"Task #{task_id} submitted for review (submission #{generation}, "
+        f"status: {task.get('status', '?')}). Awaiting reviewer verdict via "
+        "hub_submit_review."
+    )
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+    )
+
+
+@mcp.tool()
+async def hub_get_review_brief(task_id: int) -> str:
+    """Get the full review brief for a task: everything a reviewer needs (#308).
+
+    Returns acceptance criteria, scope, validation commands, review
+    checklist, branch/PR metadata with an advisory diff command, the latest
+    submission summary, and the latest recorded verdict with findings.
+
+    Args:
+        task_id: The task ID to review
+    """
+    try:
+        brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    parts = [
+        f"Review brief for task #{brief['task_id']}: {brief['title']}",
+        f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
+        f"| review cycle {brief.get('review_cycle', 0)}",
+    ]
+    if brief.get("description"):
+        parts.append(f"\nDescription:\n{brief['description']}")
+    acs = brief.get("acceptance_criteria") or []
+    if acs:
+        parts.append("\nAcceptance criteria:")
+        for ac in acs:
+            parts.append(
+                f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}] "
+                f"Given: {ac.get('given', '')} | When: {ac.get('when', '')} "
+                f"| Then: {ac.get('then', '')}"
+            )
+    if brief.get("scope_in"):
+        parts.append("\nIn scope: " + "; ".join(brief["scope_in"]))
+    if brief.get("scope_out"):
+        parts.append("Out of scope: " + "; ".join(brief["scope_out"]))
+    if brief.get("out_of_scope_for_review"):
+        parts.append(
+            "Out of scope for review: " + "; ".join(brief["out_of_scope_for_review"])
+        )
+    if brief.get("review_checklist"):
+        parts.append("\nReview checklist:")
+        for item in brief["review_checklist"]:
+            parts.append(f"  - {item}")
+    if brief.get("validation_commands"):
+        parts.append("\nValidation commands:")
+        for cmd in brief["validation_commands"]:
+            parts.append(f"  - {cmd}")
+    if brief.get("constraints"):
+        parts.append("\nConstraints: " + "; ".join(brief["constraints"]))
+    if brief.get("technical_hints"):
+        parts.append(f"\nTechnical hints:\n{brief['technical_hints']}")
+    if brief.get("branch"):
+        pr = f" | PR #{brief['pr_number']}" if brief.get("pr_number") else ""
+        parts.append(f"\nBranch: {brief['branch']}{pr}")
+        if brief.get("diff_command"):
+            parts.append(f"Diff: {brief['diff_command']}")
+    if brief.get("latest_submission_summary"):
+        parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
+    latest_review = brief.get("latest_review")
+    if latest_review:
+        freshness = (
+            "current" if latest_review.get("is_current") else "stale — work resubmitted"
+        )
+        parts.append(
+            f"\nLatest verdict: {(latest_review.get('verdict') or '?').upper()} "
+            f"for submission #{latest_review.get('submission_generation', 0)} "
+            f"({freshness})"
+        )
+        for finding in (latest_review.get("findings") or [])[:20]:
+            parts.append(
+                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
+                f"{finding.get('message', '')}"
+            )
+    parts.append(
+        "\nSubmit the verdict with hub_submit_review "
+        "(verdict=approved|changes_requested, findings for changes_requested)."
+    )
+    return format_echo_response("\n".join(parts), brief=brief)
+
+
+@mcp.tool()
+async def hub_submit_review(
+    task_id: int,
+    verdict: str,
+    comments: str = "",
+    agent: str = "",
+    findings: list[dict[str, Any]] | None = None,
+) -> str:
+    """Submit a review verdict for the current submission of a task (#307).
+
+    Records the verdict bound to the current submission generation. This
+    does NOT complete the task: for client-driven review the task returns
+    to running — with APPROVED the developer proceeds to the normal done
+    path, with CHANGES_REQUESTED the developer fixes the findings and
+    resubmits via hub_submit_for_review.
+
+    Args:
+        task_id: The task under review
+        verdict: 'approved' or 'changes_requested'
+        comments: Free-text review summary
+        agent: Reviewer agent name
+        findings: For changes_requested — list of dicts with id (int, stable
+            within this submission), severity (high|medium|low), message,
+            and optional file, line, recommendation.
+    """
+    prior_task = await _read_task(task_id)
+    prior_status = prior_task.get("status") if prior_task else None
+    body: dict[str, Any] = {"verdict": verdict}
+    if comments:
+        body["comments"] = comments
+    if agent:
+        body["agent"] = agent
+    if findings:
+        body["findings"] = findings
+    try:
+        task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    n_findings = len(findings or [])
+    findings_note = f", {n_findings} finding(s)" if n_findings else ""
+    message = (
+        f"Review verdict {verdict.upper()} recorded for task #{task_id}"
+        f"{findings_note} (status: {task.get('status', '?')})."
+    )
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=prior_status,
+        task=task,
+    )
+
+
+@mcp.tool()
 async def hub_claim_task(
     task_id: int,
     agent: str,

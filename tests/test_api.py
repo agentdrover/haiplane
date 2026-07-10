@@ -919,3 +919,98 @@ async def test_review_brief_works_without_branch_or_pr(client: AsyncClient):
 async def test_review_brief_404(client: AsyncClient):
     resp = await client.get("/api/tasks/99999/review-brief")
     assert resp.status_code == 404
+
+
+# ---- Universal Review Gate (#307): review API operations ----
+
+
+async def _running_pair_task(client: AsyncClient, title: str) -> int:
+    resp = await client.post("/api/tasks", json={"title": title})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_submit_review_api_enters_review(client: AsyncClient):
+    task_id = await _running_pair_task(client, "Submit via API")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={"agent": "dev", "summary": "ready"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "review"
+    assert body["submission_generation"] == 1
+    assert body["review_job_id"] is None
+
+
+async def test_submit_review_api_rejected_from_open(client: AsyncClient):
+    resp = await client.post("/api/tasks", json={"title": "Never started"})
+    task_id = resp.json()["id"]
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 400
+
+
+async def test_review_verdict_api_changes_requested_returns_to_running(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "Verdict loop")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [{"id": 1, "severity": "high", "message": "Fix the race"}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["review_cycle"] == 1
+    assert body["latest_review"]["verdict"] == "changes_requested"
+    assert body["latest_review"]["findings"][0]["message"] == "Fix the race"
+    assert body["review_approved_current"] is False
+
+
+async def test_review_verdict_api_approved_returns_to_running_current(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "Approve loop")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["review_cycle"] == 0
+    assert body["review_approved_current"] is True
+
+
+async def test_review_verdict_api_rejects_without_submission(client: AsyncClient):
+    task_id = await _running_pair_task(client, "No submission yet")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict", json={"verdict": "approved"}
+    )
+    assert resp.status_code == 400
+
+
+async def test_review_verdict_api_rejects_invalid_verdict(client: AsyncClient):
+    task_id = await _running_pair_task(client, "Bad verdict")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict", json={"verdict": "maybe"}
+    )
+    assert resp.status_code == 422
