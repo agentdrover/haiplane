@@ -30,6 +30,8 @@ from hub.models import (
     ReadinessTreeReport,
     ReviewBrief,
     TaskAnswer,
+    TaskReviewVerdict,
+    TaskSubmitReview,
     TaskApprove,
     TaskArchive,
     TaskClaim,
@@ -501,6 +503,36 @@ async def api_task_context(
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
     }
+
+
+@app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)
+async def api_submit_for_review(
+    task_id: int,
+    request: Request,
+    body: TaskSubmitReview | None = None,
+):
+    """Submit the current work of a pair task for client-driven review (#307).
+
+    Canonical REST operation behind hub_submit_for_review and the
+    ``oc-hub submit-review`` CLI: running pair task → status=review with a
+    bumped submission generation.
+    """
+    return await services.submit_for_review(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/review-verdict", response_model=TaskView)
+async def api_review_verdict(
+    task_id: int,
+    request: Request,
+    body: TaskReviewVerdict,
+):
+    """Record a review verdict for the current submission (#307).
+
+    Canonical REST operation behind hub_submit_review and the
+    ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
+    ``running``; this endpoint never completes a task.
+    """
+    return await services.record_review_verdict(_db(request), task_id, body)
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)

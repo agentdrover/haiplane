@@ -973,3 +973,68 @@ def test_load_payload_file_yaml_without_pyyaml(tmp_path: Path, monkeypatch) -> N
     with pytest.raises(SystemExit) as exc:
         cli._load_payload_file(str(f))
     assert exc.value.code == 2
+
+
+def test_cmd_submit_review() -> None:
+    result = {"id": 42, "status": "review", "submission_generation": 1}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(task_id=42, agent="dev", summary="first pass")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_submit_review(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/submit-review",
+        {"agent": "dev", "summary": "first pass"},
+    )
+
+
+def test_cmd_review_brief() -> None:
+    mock_api = MagicMock(return_value={"task_id": 42, "title": "T"})
+    args = argparse.Namespace(task_id=42)
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_brief(args)
+    assert rc == 0
+    mock_api.assert_called_once_with("GET", "/api/tasks/42/review-brief")
+
+
+def test_cmd_review_verdict_with_findings() -> None:
+    result = {"id": 42, "status": "running"}
+    mock_api = MagicMock(return_value=result)
+    findings = [{"id": 1, "severity": "high", "message": "Fix it"}]
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="changes_requested",
+        comments="see findings",
+        agent="reviewer",
+        findings_json=json.dumps(findings),
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "comments": "see findings",
+            "agent": "reviewer",
+            "findings": findings,
+        },
+    )
+
+
+def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="approved",
+        comments="",
+        agent="",
+        findings_json="{not json",
+    )
+    mock_api = MagicMock()
+    with patch.object(cli, "_api", mock_api):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 2
+    assert "invalid --findings-json" in capsys.readouterr().err
+    mock_api.assert_not_called()

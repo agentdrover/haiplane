@@ -294,6 +294,41 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_submit_review(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {}
+    if args.agent:
+        body["agent"] = args.agent
+    if args.summary:
+        body["summary"] = args.summary
+    result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_review_brief(args: argparse.Namespace) -> int:
+    result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
+    _print_json(result)
+    return 0
+
+
+def cmd_review_verdict(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {"verdict": args.verdict}
+    if args.comments:
+        body["comments"] = args.comments
+    if args.agent:
+        body["agent"] = args.agent
+    if args.findings_json:
+        try:
+            findings = json.loads(args.findings_json)
+        except json.JSONDecodeError as exc:
+            print(f"invalid --findings-json: {exc}", file=sys.stderr)
+            return 2
+        body["findings"] = findings
+    result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
     body = {"agent": args.agent, "session_id": args.session_id or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
@@ -1138,6 +1173,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_submit_review = sub.add_parser(
+        "submit-review",
+        help="Submit a running pair task for client-driven review (status=review)",
+    )
+    p_submit_review.add_argument("task_id", type=int)
+    p_submit_review.add_argument("--agent", default="", help="Submitting agent name")
+    p_submit_review.add_argument(
+        "--summary", default="", help="Short note on what is being submitted"
+    )
+    p_submit_review.set_defaults(func=cmd_submit_review)
+
+    p_review_brief = sub.add_parser(
+        "review-brief",
+        help="Get the full review brief (ACs, scope, validation, latest verdict)",
+    )
+    p_review_brief.add_argument("task_id", type=int)
+    p_review_brief.set_defaults(func=cmd_review_brief)
+
+    p_review_verdict = sub.add_parser(
+        "review-verdict",
+        help="Record a review verdict; never completes the task",
+    )
+    p_review_verdict.add_argument("task_id", type=int)
+    p_review_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
+    p_review_verdict.add_argument("--comments", default="", help="Review summary")
+    p_review_verdict.add_argument("--agent", default="", help="Reviewer agent name")
+    p_review_verdict.add_argument(
+        "--findings-json",
+        dest="findings_json",
+        default="",
+        help='JSON list of findings: [{"id":1,"severity":"high","message":"..."}]',
+    )
+    p_review_verdict.set_defaults(func=cmd_review_verdict)
 
     p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
     p_claim.add_argument("task_id", type=int)
