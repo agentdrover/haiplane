@@ -506,6 +506,21 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
             parts.append(f"  - {cmd}")
     if task.get("lifecycle_hint"):
         parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    latest_review = task.get("latest_review")
+    if latest_review:
+        freshness = (
+            "current" if latest_review.get("is_current") else "stale — work resubmitted"
+        )
+        parts.append(
+            f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
+            f"for submission #{latest_review.get('submission_generation', 0)} "
+            f"({freshness})"
+        )
+        for finding in (latest_review.get("findings") or [])[:10]:
+            parts.append(
+                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
+                f"{finding.get('message', '')}"
+            )
     acs = task.get("acceptance_criteria") or []
     if acs:
         parts.append("\nAcceptance criteria:")

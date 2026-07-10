@@ -367,6 +367,11 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_verdict_generation_column",
         "ALTER TABLE tasks ADD COLUMN review_verdict_generation INTEGER",
     ),
+    # ---- Universal Review Gate (#308): structured findings of the latest verdict
+    (
+        "add_review_findings_column",
+        "ALTER TABLE tasks ADD COLUMN review_findings TEXT NOT NULL DEFAULT '[]'",
+    ),
 ]
 
 

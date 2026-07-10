@@ -839,3 +839,83 @@ async def test_withdraw_rejects_empty_assigned_agent(client: AsyncClient, monkey
     detail = resp.json()["detail"]
     assert detail["reason"] == "not_task_owner"
     assert detail["required_role"] == "agent"
+
+
+# ---- Universal Review Gate (#308): review brief ----
+
+
+async def test_review_brief_api(client: AsyncClient):
+    resp = await client.post(
+        "/api/tasks", json={"title": "Brief me", "description": "the work"}
+    )
+    task_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "scope_in": ["hub/app.py"],
+            "scope_out": ["web ui"],
+            "validation_commands": ["uv run pytest -q"],
+            "review_checklist": ["check findings are structured"],
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    branch = resp.json()["branch"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "Implemented the thing"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert resp.status_code == 200
+    brief = resp.json()
+    assert brief["task_id"] == task_id
+    assert brief["title"] == "Brief me"
+    assert [ac["id"] for ac in brief["acceptance_criteria"]] == ["AC-1"]
+    assert brief["scope_in"] == ["hub/app.py"]
+    assert brief["scope_out"] == ["web ui"]
+    assert brief["validation_commands"] == ["uv run pytest -q"]
+    assert brief["review_checklist"] == ["check findings are structured"]
+    assert brief["branch"] == branch
+    assert branch in brief["diff_command"]
+    assert brief["submission_generation"] == 1
+    assert brief["latest_submission_summary"] == "Implemented the thing"
+    assert brief["latest_review"] is None
+
+
+async def test_review_brief_works_without_branch_or_pr(client: AsyncClient):
+    resp = await client.post("/api/tasks", json={"title": "Local brief"})
+    task_id = resp.json()["id"]
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert resp.status_code == 200
+    brief = resp.json()
+    assert brief["branch"] is None
+    assert brief["pr_number"] is None
+    assert brief["diff_command"] == ""
+    assert brief["latest_submission_summary"] == ""
+
+
+async def test_review_brief_404(client: AsyncClient):
+    resp = await client.get("/api/tasks/99999/review-brief")
+    assert resp.status_code == 404
