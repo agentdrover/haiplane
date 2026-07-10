@@ -1014,3 +1014,50 @@ async def test_review_verdict_api_rejects_invalid_verdict(client: AsyncClient):
         f"/api/tasks/{task_id}/review-verdict", json={"verdict": "maybe"}
     )
     assert resp.status_code == 422
+
+
+# ---- Regression coverage for Universal Review Gate (#311) ----
+
+
+async def test_full_rest_review_cycle_completes_only_after_approval(
+    client: AsyncClient,
+):
+    # AC-1 (#311): the complete REST loop — done blocked, verdict, done passes.
+    task_id = await _running_pair_task(client, "Full REST gate cycle")
+
+    # Unreviewed done report does not complete: routed by the gate.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "v1"},
+    )
+    assert resp.status_code == 200
+    resp = await client.get(f"/api/tasks/{task_id}")
+    body = resp.json()
+    assert body["status"] in ("review", "ci_check")  # branch → ci_check path
+    assert body["status"] != "completed"
+
+    # Route to client-driven review deterministically: drop branch, rerun.
+    task_id2 = await _running_pair_task(client, "Full REST gate cycle no branch")
+
+    # (db access through the app state is not available here; use the API
+    # instead: submit-review makes the review path explicit)
+    resp = await client.post(
+        f"/api/tasks/{task_id2}/submit-review", json={"agent": "dev"}
+    )
+    assert resp.json()["status"] == "review"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id2}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["review_approved_current"] is True
+
+    resp = await client.post(
+        f"/api/tasks/{task_id2}/updates",
+        json={"agent": "dev", "kind": "done", "content": "approved work"},
+    )
+    assert resp.status_code == 200
+    resp = await client.get(f"/api/tasks/{task_id2}")
+    assert resp.json()["status"] == "completed"
