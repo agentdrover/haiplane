@@ -297,7 +297,17 @@ async def dispatch_review(
             task_id,
             result.get("error"),
         )
-        await repo.update_task(db, task_id, status="completed")
+        # Universal Review Gate (#309): failure to dispatch a reviewer must
+        # never complete the task — escalate to the human Decision Gate.
+        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Reviewer dispatch failed: {result.get('error', 'no job_id')}. "
+            "Universal Review Gate: manual decision required (hub_decide_task).",
+        )
     await db.commit()
 
 
@@ -344,11 +354,21 @@ async def dispatch_fix(
             task_id,
             result.get("error"),
         )
+        # Universal Review Gate (#309): CHANGES_REQUESTED work must not
+        # silently complete when the fix dispatch fails.
         await repo.update_task(
             db,
             task_id,
-            status="completed",
+            status="needs_decision",
             review_cycle=review_cycle,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Fix dispatch failed after CHANGES_REQUESTED: "
+            f"{result.get('error', 'no job_id')}. Manual decision required.",
         )
     await db.commit()
 

@@ -1395,22 +1395,29 @@ async def refresh_task(
 
     job = plugins.dispatch.get_job(job_id)
     if job:
-        new_status = task["status"]
         if job.get("status") == "completed":
-            new_status = "completed"
-        elif job.get("status") == "failed":
-            new_status = "failed"
-        elif job.get("status") == "running":
-            new_status = "running"
-
-        await repo.update_task(
-            db,
-            task_id,
-            status=new_status,
-            exit_code=job.get("exit_code"),
-            result_text=job.get("result_text"),
-        )
-        await db.commit()
+            # Universal Review Gate (#309): a finished dispatch job must go
+            # through the same gate-checked post-done transition as the
+            # poller, not straight to completed — otherwise a manual
+            # refresh call bypasses the review requirement.
+            has_done = await repo.has_done_updates(db, task_id)
+            await transition_after_agent_done(
+                db,
+                task,
+                has_done=has_done,
+                exit_code=job.get("exit_code"),
+                result_text=job.get("result_text"),
+            )
+            await db.commit()
+        elif job.get("status") in ("failed", "running"):
+            await repo.update_task(
+                db,
+                task_id,
+                status=job["status"],
+                exit_code=job.get("exit_code"),
+                result_text=job.get("result_text"),
+            )
+            await db.commit()
 
     row = await repo.get_task(db, task_id)
     return row_to_task(row)  # type: ignore[arg-type]
