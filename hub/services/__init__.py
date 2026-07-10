@@ -72,6 +72,7 @@ from hub.services.lifecycle import (
     withdraw_own_draft,
 )
 from hub.services.orchestration import (
+    completion_requires_review,
     dispatch_arbiter,
     dispatch_ci_fix,
     dispatch_fix,
@@ -148,6 +149,7 @@ __all__ = [
     "refresh_task",
     "reject_task",
     "release_task",
+    "completion_requires_review",
     "review_approved_for_current_submission",
     "row_to_task",
     "scan_text_for_verdict",
