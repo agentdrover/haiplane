@@ -7,6 +7,10 @@ from typing import Any
 from hub.models import HIERARCHY_RULES, TaskType
 
 # Key status transitions with triggering tool and actor role.
+# Universal Review Gate (#306): hub_report_done completes a task ONLY when
+# the current submission has an APPROVED review (or auto_review=false);
+# otherwise the done report is a submission and routes to review/ci_check,
+# or to needs_decision at the review-cycle limit.
 LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
     {
         "from": "draft",
@@ -20,6 +24,42 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
     {"from": "open", "to": "running", "tool": "hub_start_task", "actor": "human"},
     {"from": "open", "to": "running", "tool": "hub_pair_start", "actor": "agent"},
     {"from": "claimed", "to": "running", "tool": "hub_pair_start", "actor": "agent"},
+    {"from": "claimed", "to": "open", "tool": "hub_release_task", "actor": "agent"},
+    {
+        "from": "running",
+        "to": "review",
+        "tool": "hub_submit_for_review",
+        "actor": "agent",
+        "gate": "review",
+    },
+    {
+        "from": "review",
+        "to": "running",
+        "tool": "hub_submit_review",
+        "actor": "agent",
+        "gate": "review",
+    },
+    {
+        "from": "running",
+        "to": "completed",
+        "tool": "hub_report_done",
+        "actor": "agent",
+        "gate": "review",
+    },
+    {
+        "from": "running",
+        "to": "review",
+        "tool": "hub_report_done",
+        "actor": "agent",
+        "gate": "review",
+    },
+    {"from": "running", "to": "ci_check", "tool": "hub_report_done", "actor": "agent"},
+    {
+        "from": "running",
+        "to": "needs_decision",
+        "tool": "hub_report_done",
+        "actor": "agent",
+    },
     {
         "from": "running",
         "to": "needs_info",
@@ -38,14 +78,13 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
         "tool": "hub_report_done",
         "actor": "agent",
     },
-    {"from": "running", "to": "ci_check", "tool": "hub_report_done", "actor": "agent"},
     {
-        "from": "running",
-        "to": "needs_decision",
+        "from": "pending_report",
+        "to": "review",
         "tool": "hub_report_done",
         "actor": "agent",
+        "gate": "review",
     },
-    {"from": "running", "to": "completed", "tool": "hub_report_done", "actor": "agent"},
     {
         "from": "ci_check",
         "to": "review",
@@ -72,6 +111,7 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
         "to": "completed",
         "tool": "hub_report_done",
         "actor": "agent",
+        "gate": "review",
     },
 ]
 
@@ -112,6 +152,13 @@ def workflow_reference_dict() -> dict[str, Any]:
                 "actor": "human",
             },
             "ci": {"status": "ci_check", "actor": "ci", "tool": "ci_poller"},
+            "review": {
+                "status": "review",
+                "tool": "hub_submit_review",
+                "actor": "agent",
+                "rule": "no completed without current APPROVED review "
+                "(auto_review=false is the explicit opt-out)",
+            },
             "decision": {
                 "status": "needs_decision",
                 "tool": "hub_decide_task",
@@ -142,7 +189,11 @@ def lifecycle_map_lines() -> list[str]:
         f"Hierarchy: {hierarchy_rules_prose()}.",
         (
             "Gates: DoR at draft (hub_approve_task, human); "
-            "CI at ci_check (poller); Decision at needs_decision (hub_decide_task, human)."
+            "CI at ci_check (poller); "
+            "Review — Universal Review Gate: no completed without a current "
+            "APPROVED review (hub_submit_for_review → hub_get_review_brief → "
+            "hub_submit_review; auto_review=false is the explicit opt-out); "
+            "Decision at needs_decision (hub_decide_task, human)."
         ),
         f"Agent completion: {AGENT_COMPLETION_TOOL} only (hub_task_update kind=done = deprecated alias).",
         f"Human-only: {', '.join(HUMAN_ONLY_TOOLS)}.",
@@ -168,6 +219,7 @@ def mcp_workflow_instruction_section() -> str:
     gate_bits = [
         f"DoR→{ref['gates']['dor']['tool']} ({ref['gates']['dor']['actor']})",
         f"CI→ci_check ({ref['gates']['ci']['actor']})",
+        "Review→hub_submit_review (agent; no completed without current APPROVED)",
         f"Decision→{ref['gates']['decision']['tool']} ({ref['gates']['decision']['actor']})",
     ]
     transition_bits = [
