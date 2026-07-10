@@ -158,3 +158,99 @@ async def test_poll_review_dispatch(mock_sleep, db):
     task = dict(row)
     assert task["status"] == "ci_check"
     assert task["pr_number"] == 42
+
+
+# ---- Universal Review Gate unification (#309) ----
+
+
+async def _make_review_task(db, *, review_job_id="rev-1", generation=1) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="Headless review task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, review_job_id=review_job_id)
+    for _ in range(generation):
+        await repo.bump_submission_generation(db, task_id)
+    await db.commit()
+    return task_id
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poll_headless_approved_converges_on_gate_transition(mock_sleep, db):
+    # AC-1: a headless APPROVED verdict completes through the same
+    # gate-checked transition as external submit_review — verdict stays
+    # bound to the completed submission (no generation bump).
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "completed"
+    assert d["review_verdict"] == "approved"
+    assert d["review_verdict_generation"] == 1
+    assert d["submission_generation"] == 1  # no bump on approved completion
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poll_ignores_client_driven_review(mock_sleep, db):
+    # AC-2: review without review_job_id belongs to an external reviewer —
+    # the poller must not treat it as its own or as a failed dispatch.
+    task_id = await _make_review_task(db, review_job_id=None)
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value={"status": "failed", "exit_code": 1})
+    plugins.dispatch = mock_dispatch
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "review"  # untouched
+    mock_dispatch.get_job.assert_not_called()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poll_failed_review_job_escalates_not_completes(mock_sleep, db):
+    # Gap #1 from the status-model audit: a crashed review job must not
+    # complete the task.
+    task_id = await _make_review_task(db)
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value={"status": "failed", "exit_code": 2})
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any(
+        u["kind"] == "alert" and "Review job failed" in u["content"] for u in updates
+    )
