@@ -28,6 +28,7 @@ from hub.models import (
     DashboardData,
     ReadinessReport,
     ReadinessTreeReport,
+    ReviewBrief,
     TaskAnswer,
     TaskApprove,
     TaskArchive,
@@ -460,6 +461,17 @@ async def api_task_context(
             f"{r.kind.value}:{r.severity.value}" for r in task_view.risks[:5]
         )
         lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
+    if task_view.latest_review:
+        lr = task_view.latest_review
+        freshness = "current" if lr.is_current else "stale — work resubmitted"
+        lines.append(
+            f"Latest review: {lr.verdict.value.upper()} "
+            f"for submission #{lr.submission_generation} ({freshness})"
+        )
+        for finding in lr.findings[:10]:
+            lines.append(
+                f"  {finding.id}. [{finding.severity.value}] {finding.message}"
+            )
     lines.append(
         f"Readiness: score={readiness_summary['score']} "
         f"dor_passed={'yes' if readiness_summary['dor_passed'] else 'no'}"
@@ -489,6 +501,61 @@ async def api_task_context(
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
     }
+
+
+@app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
+async def api_review_brief(task_id: int, request: Request):
+    """Everything a reviewer agent needs in one response (#308).
+
+    Bundles acceptance criteria, scope, validation commands, review
+    checklist, branch/PR metadata with an advisory diff command, and the
+    latest submission context — so review never depends on scraping task
+    prose. Works without a GitHub PR: ``pr_number`` is optional metadata.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task_view = services.row_to_task(row)
+    ac_rows = await repo.list_acceptance_criteria(db, task_id)
+
+    # Latest submission context: the most recent done report, falling back
+    # to the most recent status update when the task has not reported yet.
+    latest_submission_summary = ""
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    for kind in ("done", "status"):
+        for u in reversed(updates):
+            if u.get("kind") == kind:
+                latest_submission_summary = u.get("content", "")
+                break
+        if latest_submission_summary:
+            break
+
+    diff_command = ""
+    if task_view.branch:
+        diff_command = f"git diff develop...{task_view.branch}"
+
+    return ReviewBrief(
+        task_id=task_view.id,
+        title=task_view.title,
+        status=task_view.status,
+        description=task_view.description,
+        acceptance_criteria=[services.row_to_ac(r) for r in ac_rows],
+        scope_in=task_view.scope_in,
+        scope_out=task_view.scope_out,
+        out_of_scope_for_review=task_view.out_of_scope_for_review,
+        review_checklist=task_view.review_checklist,
+        validation_commands=task_view.validation_commands,
+        constraints=task_view.constraints,
+        technical_hints=task_view.technical_hints,
+        branch=task_view.branch,
+        pr_number=task_view.pr_number,
+        diff_command=diff_command,
+        review_cycle=task_view.review_cycle,
+        submission_generation=task_view.submission_generation,
+        latest_submission_summary=latest_submission_summary,
+        latest_review=task_view.latest_review,
+    )
 
 
 @app.patch("/api/tasks/{task_id}/reorder", response_model=TaskView)

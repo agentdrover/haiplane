@@ -1578,3 +1578,31 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
             "prepared_at": ANY,
         },
     )
+
+
+async def test_hub_task_status_renders_latest_review(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 77,
+        "title": "Reviewed",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix the race"},
+                {"id": 2, "severity": "low", "message": "Polish docs"},
+            ],
+        },
+    }
+    out = await hub_task_status(77)
+    text = _mcp_text(out)
+    assert "Latest review: CHANGES_REQUESTED for submission #2 (current)" in text
+    assert "1. [high] Fix the race" in text
+    assert "2. [low] Polish docs" in text
+    structured = _mcp_structured(out)
+    assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
