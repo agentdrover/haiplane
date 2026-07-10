@@ -191,6 +191,12 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     await services.maybe_destroy_vast(db, task)
                     continue
 
+                if verdict:
+                    # Canonical verdict state (#305): bind the verdict to the
+                    # current submission generation so a later resubmission
+                    # invalidates this approval.
+                    await repo.record_review_verdict(db, task["id"], verdict)
+
                 if verdict == "approved":
                     pr_num = task.get("pr_number")
                     branch = task.get("branch")

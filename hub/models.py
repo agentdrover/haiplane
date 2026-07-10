@@ -24,6 +24,18 @@ class TaskStatus(str, Enum):
     rejected = "rejected"
 
 
+class ReviewVerdict(str, Enum):
+    """Explicit review verdict bound to a specific submission generation.
+
+    An ``approved`` verdict only applies to the submission generation it was
+    recorded against; resubmitting work bumps the generation and makes any
+    earlier approval stale (Universal Review Gate, #305).
+    """
+
+    approved = "approved"
+    changes_requested = "changes_requested"
+
+
 class TaskType(str, Enum):
     epic = "epic"
     feature = "feature"
@@ -251,6 +263,21 @@ class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
     branch_slug: str = Field("", max_length=80)
+
+
+class TaskSubmitReview(BaseModel):
+    """Submit the current work of a pair task for review (#305)."""
+
+    agent: str = Field("", max_length=100)
+    summary: str = Field("", max_length=10000)
+
+
+class TaskReviewVerdict(BaseModel):
+    """Record an explicit review verdict for the current submission (#305)."""
+
+    verdict: ReviewVerdict
+    agent: str = Field("", max_length=100)
+    comments: str = Field("", max_length=50000)
 
 
 class TaskClaim(BaseModel):
@@ -555,6 +582,14 @@ class TaskView(BaseModel):
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None
+    # Universal Review Gate (#305): headless review is marked by a present
+    # review_job_id; client-driven review has status=review with no job.
+    # A verdict only counts while review_verdict_generation matches
+    # submission_generation.
+    submission_generation: int = 0
+    review_verdict: ReviewVerdict | None = None
+    review_verdict_generation: int | None = None
+    review_approved_current: bool = False
     branch: str | None = None
     pr_number: int | None = None
     claimed_by: str | None = None

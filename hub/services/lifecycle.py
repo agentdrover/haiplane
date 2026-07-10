@@ -39,8 +39,10 @@ from hub.models import (
     TaskReject,
     TaskRelease,
     TaskReorder,
+    TaskReviewVerdict,
     TaskSource,
     TaskStart,
+    TaskSubmitReview,
     TaskType,
     TaskUpdateCreate,
     TaskUpdateView,
@@ -231,6 +233,21 @@ def _validate_done_report(task: dict[str, Any]) -> None:
     )
 
 
+def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
+    """True only when an APPROVED verdict applies to the latest submission.
+
+    A verdict recorded against an earlier submission generation is stale:
+    the work changed since it was approved. A task with no submissions yet
+    (generation 0) can never count as approved.
+    """
+    generation = task.get("submission_generation") or 0
+    return (
+        generation > 0
+        and task.get("review_verdict") == "approved"
+        and task.get("review_verdict_generation") == generation
+    )
+
+
 def row_to_task(
     row: aiosqlite.Row,
     updates: list[aiosqlite.Row] | None = None,
@@ -273,6 +290,10 @@ def row_to_task(
         ci_fix_cycle=d.get("ci_fix_cycle", 0),
         auto_review=bool(d.get("auto_review", 1)),
         review_job_id=d.get("review_job_id"),
+        submission_generation=d.get("submission_generation", 0) or 0,
+        review_verdict=d.get("review_verdict"),
+        review_verdict_generation=d.get("review_verdict_generation"),
+        review_approved_current=review_approved_for_current_submission(d),
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
         claimed_by=d.get("claimed_by"),
@@ -754,6 +775,114 @@ async def pair_start_task(
         f"Task #{task_id} pair session started",
         detail=mutation_activity_detail(),
     )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def submit_for_review(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskSubmitReview | None = None,
+) -> TaskView:
+    """Submit the current work of a pair task for client-driven review (#305).
+
+    Valid only from pair ``running`` (no ``job_id``): headless tasks are
+    submitted by their done report and reviewed by the poller conveyor.
+    Bumps the submission generation — which invalidates any APPROVED verdict
+    recorded for earlier work — and moves the task into ``status=review``
+    with no ``review_job_id``, marking the review as client-driven.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    body = body or TaskSubmitReview()
+
+    if task["status"] != "running" or task.get("job_id"):
+        if task.get("job_id"):
+            raise HTTPException(
+                400,
+                "headless tasks are submitted for review by their done report; "
+                "submit-for-review is only for pair tasks without a dispatch job",
+            )
+        raise HTTPException(
+            400,
+            f"can only submit running pair tasks for review, "
+            f"current status: {task['status']}",
+        )
+
+    async with get_write_lock(db):
+        if not await repo.transition_status_if(
+            db, task_id, expected_from="running", new_status="review"
+        ):
+            raise HTTPException(
+                409,
+                f"Task #{task_id} left running state during submit; retry from "
+                "its current status",
+            )
+        generation = await repo.bump_submission_generation(db, task_id)
+        # Client-driven review: no dispatch job. A stale review_job_id from a
+        # previous headless cycle would make the poller treat this task as its
+        # own, so clear it explicitly.
+        await repo.update_task(db, task_id, review_job_id=None)
+        agent = (body.agent or "").strip() or task.get("assigned_agent", "")
+        summary = (body.summary or "").strip()
+        content = f"Submitted for review (submission #{generation})."
+        if summary:
+            content += f" {summary}"
+        await repo.add_task_update(db, task_id, agent, "status", content)
+        await db.commit()
+        await log_activity(
+            db,
+            "task_submitted_for_review",
+            f"Task #{task_id} submitted for review (generation {generation})",
+            detail=mutation_activity_detail(),
+        )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def record_review_verdict(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskReviewVerdict,
+) -> TaskView:
+    """Record an explicit review verdict for the current submission (#305).
+
+    Persists the verdict bound to the current submission generation, so a
+    later resubmission automatically invalidates an APPROVED verdict. Status
+    transitions stay with the caller (poller conveyor or the review API):
+    this is the canonical write of verdict state, not a completion path.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+
+    if (task.get("submission_generation") or 0) == 0:
+        raise HTTPException(
+            400,
+            "no submission to review yet: the task has never been submitted for review",
+        )
+
+    async with get_write_lock(db):
+        await repo.record_review_verdict(db, task_id, body.verdict.value)
+        agent = (body.agent or "").strip() or "reviewer"
+        content = f"Review verdict: {body.verdict.value.upper()}"
+        if body.comments.strip():
+            content += f"\n{body.comments.strip()}"
+        await repo.add_task_update(db, task_id, agent, "review", content)
+        await db.commit()
+        await log_activity(
+            db,
+            "task_review_verdict",
+            f"Task #{task_id} review verdict: {body.verdict.value}",
+            detail=mutation_activity_detail(),
+        )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
