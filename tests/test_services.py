@@ -1898,3 +1898,141 @@ async def test_force_complete_bypasses_gate_as_audited_override(
     assert view.status.value == "completed"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert any("override" in u["content"].lower() for u in updates)
+
+
+# ---- Universal Review Gate unification (#309) ----
+
+
+async def test_dispatch_review_failure_escalates_not_completes(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import dispatch_review
+
+    task_id = await repo.create_task(
+        db,
+        title="Dispatch fail",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    plugins.dispatch.submit_task = AsyncMock(return_value={"error": "no runtime"})
+    task = dict(await repo.get_task(db, task_id))
+    await dispatch_review(db, task)
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("Reviewer dispatch failed" in u["content"] for u in updates)
+
+
+async def test_dispatch_fix_failure_escalates_not_completes(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import dispatch_fix
+
+    task_id = await repo.create_task(
+        db,
+        title="Fix dispatch fail",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    plugins.dispatch.submit_task = AsyncMock(return_value={"error": "no runtime"})
+    task = dict(await repo.get_task(db, task_id))
+    await dispatch_fix(db, task, "fix the findings")
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "needs_decision"
+    assert d["review_cycle"] == 1
+
+
+async def test_refresh_task_completed_job_goes_through_gate(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Refresh gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-refresh-1")
+    await repo.add_task_update(db, task_id, "dev", "done", "Job finished")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0, "result_text": "ok"}
+    )
+
+    view = await services.refresh_task(db, task_id)
+    # auto_review on, no approval, no branch → the review gate routes the
+    # finished job to client-driven review instead of completed.
+    assert view.status.value == "review"
+    assert view.submission_generation == 1
+
+
+async def test_refresh_task_failed_job_still_marks_failed(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Refresh failed",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-refresh-2")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "failed", "exit_code": 3, "result_text": "boom"}
+    )
+
+    view = await services.refresh_task(db, task_id)
+    assert view.status.value == "failed"

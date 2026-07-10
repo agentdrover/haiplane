@@ -171,10 +171,22 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         )
                         await services.maybe_destroy_vast(db, task)
                     else:
-                        await repo.update_task(db, task["id"], status="completed")
+                        # Universal Review Gate (#309): a crashed review job
+                        # must never complete the task — no verdict exists.
+                        await repo.update_task(db, task["id"], status="needs_decision")
+                        await db.commit()
+                        await repo.add_task_update(
+                            db,
+                            task["id"],
+                            "hub",
+                            "alert",
+                            f"Review job failed (exit={job.get('exit_code')}) "
+                            "without a verdict. Universal Review Gate: manual "
+                            "decision required (hub_decide_task).",
+                        )
                         await db.commit()
                         log.info(
-                            "Poll: review job failed for task #%d, marking completed",
+                            "Poll: review job failed for task #%d → needs_decision",
                             task["id"],
                         )
                         await services.maybe_destroy_vast(db, task)
@@ -236,7 +248,15 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             continue
                     if not merged and not pr_num:
                         log.info("Poll: task #%d approved (no PR)", task["id"])
-                    await repo.update_task(db, task["id"], status="completed")
+                    # Converge on the same gate-checked completion used by
+                    # pair done reports (#309): the verdict recorded above
+                    # makes completion_requires_review false, so the shared
+                    # transition completes without bumping the generation.
+                    refreshed_row = await repo.get_task(db, task["id"])
+                    refreshed = dict(refreshed_row) if refreshed_row else task
+                    await services.transition_after_agent_done(
+                        db, refreshed, has_done=True
+                    )
                     await db.commit()
                     log.info("Poll: task #%d review → approved", task["id"])
                     await services.maybe_destroy_vast(db, task)
