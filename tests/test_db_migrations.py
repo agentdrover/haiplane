@@ -333,3 +333,40 @@ def test_deserialize_risks_drops_non_dict_items():
 def test_deserialize_risks_invalid_json_returns_empty():
     assert deserialize_risks("not-json") == []
     assert deserialize_risks('"some string"') == []
+
+
+async def test_review_generation_columns_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        gen = cols.get("submission_generation")
+        assert gen is not None
+        assert gen["notnull"] == 1
+        assert gen["dflt_value"] == "0"
+        verdict = cols.get("review_verdict")
+        assert verdict is not None
+        assert verdict["notnull"] == 0
+        verdict_gen = cols.get("review_verdict_generation")
+        assert verdict_gen is not None
+        assert verdict_gen["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_review_generation_defaults_for_existing_rows():
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (title, description, status) VALUES ('t', '', 'open')"
+        )
+        row = (
+            await conn.execute_fetchall(
+                "SELECT submission_generation, review_verdict, "
+                "review_verdict_generation FROM tasks"
+            )
+        )[0]
+        assert row["submission_generation"] == 0
+        assert row["review_verdict"] is None
+        assert row["review_verdict_generation"] is None
+    finally:
+        await conn.close()
