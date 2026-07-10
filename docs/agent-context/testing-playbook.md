@@ -39,3 +39,19 @@ Pick the smallest useful validation set first, then widen only if the diff cross
 - Bug fixes should normally ship with a regression test.
 - Schema changes should be validated against both fresh-state and migration scenarios.
 - Contract changes should be tested at the narrowest public surface that exposes them.
+
+## Universal Review Gate Changes
+
+Any change that touches review-gate behavior (`completion_requires_review`,
+`transition_after_agent_done`, `submit_for_review`, `record_review_verdict`,
+poller review handling, `refresh_task`) must run the focused gate suites
+before the full run:
+
+```bash
+uv run pytest tests/test_services.py tests/test_api.py tests/test_mcp_server.py tests/test_poller.py tests/test_cli.py -q
+```
+
+Key regression anchors: stale-approval invalidation, gate routing of done
+reports (review / ci_check / needs_decision at cycle limit), MCP envelope
+projection (`awaiting=review`, `actor_hint`), poller convergence on
+`transition_after_agent_done`, and the audited `force_complete` override.
