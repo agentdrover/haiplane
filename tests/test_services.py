@@ -1658,3 +1658,58 @@ async def test_pair_done_report_bumps_submission_generation(
     d = dict(await repo.get_task(db, task_id))
     assert d["status"] == "ci_check"
     assert d["submission_generation"] == 1
+
+
+async def test_record_verdict_with_findings_persists_structured_data(
+    db: aiosqlite.Connection,
+):
+    from hub.models import ReviewFinding, ReviewSeverity
+
+    task_id = await _pair_running_task(db, title="Findings task")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[
+                ReviewFinding(id=1, severity=ReviewSeverity.high, message="Bug"),
+            ],
+        ),
+    )
+    assert view.latest_review is not None
+    assert view.latest_review.findings[0].message == "Bug"
+
+    # A later verdict without findings clears the list: findings belong
+    # to the verdict that produced them.
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    await services.submit_for_review(db, task_id)
+    view = await services.record_review_verdict(
+        db, task_id, TaskReviewVerdict(verdict=ReviewVerdict.approved)
+    )
+    assert view.latest_review is not None
+    assert view.latest_review.findings == []
+    assert view.review_approved_current is True
+
+
+def test_parse_review_findings_malformed_json_is_ignored():
+    assert services.parse_review_findings("not-json") == []
+    assert services.parse_review_findings('{"id": 1}') == []
+    assert services.parse_review_findings(None) == []
+    assert services.parse_review_findings("[]") == []
+
+
+def test_review_finding_model_rejects_invalid_payloads():
+    from pydantic import ValidationError
+
+    from hub.models import ReviewFinding
+
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=0, severity="high", message="bad id")
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="catastrophic", message="bad severity")
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="low", message="")

@@ -367,18 +367,22 @@ async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
     verdict: str,
+    findings_json: str = "[]",
 ) -> None:
     """Persist a review verdict bound to the CURRENT submission generation.
 
     The binding is done in SQL (``review_verdict_generation = submission_generation``)
     so the verdict can never be attached to a generation the caller read
-    before a concurrent resubmission bumped it.
+    before a concurrent resubmission bumped it. ``findings_json`` replaces
+    the stored findings wholesale: findings belong to their verdict, so a
+    verdict without findings clears the previous list (#308).
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
+        "review_findings=?, "
         "updated_at=datetime('now') WHERE id=?",
-        (verdict, task_id),
+        (verdict, findings_json, task_id),
     )
 
 

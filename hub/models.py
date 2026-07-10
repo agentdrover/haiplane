@@ -36,6 +36,14 @@ class ReviewVerdict(str, Enum):
     changes_requested = "changes_requested"
 
 
+class ReviewSeverity(str, Enum):
+    """Finding severity, ordered so agents can prioritize fixes (#308)."""
+
+    high = "high"
+    medium = "medium"
+    low = "low"
+
+
 class TaskType(str, Enum):
     epic = "epic"
     feature = "feature"
@@ -272,12 +280,76 @@ class TaskSubmitReview(BaseModel):
     summary: str = Field("", max_length=10000)
 
 
+class ReviewFinding(BaseModel):
+    """One structured review finding (#308).
+
+    ``id`` is stable within a single review submission so a developer agent
+    can address findings by number in the CHANGES_REQUESTED loop.
+    """
+
+    id: int = Field(..., ge=1)
+    severity: ReviewSeverity
+    message: str = Field(..., min_length=1, max_length=2000)
+    file: str = Field("", max_length=500)
+    line: int | None = Field(default=None, ge=1)
+    recommendation: str = Field("", max_length=2000)
+
+
 class TaskReviewVerdict(BaseModel):
-    """Record an explicit review verdict for the current submission (#305)."""
+    """Record an explicit review verdict for the current submission (#305).
+
+    Extended in #308 with structured findings: they are persisted on the
+    task row (not in the update text), so the payload stays machine-readable
+    without stressing TaskUpdate content limits.
+    """
 
     verdict: ReviewVerdict
     agent: str = Field("", max_length=100)
     comments: str = Field("", max_length=50000)
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=50)
+
+
+class LatestReview(BaseModel):
+    """Projection of the most recent review verdict for status/context (#308).
+
+    ``is_current`` is False when work was resubmitted after the verdict was
+    recorded — the verdict is history, not a judgement of the latest work.
+    """
+
+    verdict: ReviewVerdict
+    submission_generation: int = 0
+    is_current: bool = False
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class ReviewBrief(BaseModel):
+    """Everything a reviewer agent needs in one response (#308).
+
+    Assembled from the task row, its acceptance criteria, and the latest
+    submission update — no scraping of task prose required. ``diff_command``
+    is advisory and only present when branch metadata exists; a GitHub PR is
+    never required for a local review brief.
+    """
+
+    task_id: int
+    title: str
+    status: TaskStatus
+    description: str = ""
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    scope_in: list[str] = Field(default_factory=list)
+    scope_out: list[str] = Field(default_factory=list)
+    out_of_scope_for_review: list[str] = Field(default_factory=list)
+    review_checklist: list[str] = Field(default_factory=list)
+    validation_commands: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    technical_hints: str = ""
+    branch: str | None = None
+    pr_number: int | None = None
+    diff_command: str = ""
+    review_cycle: int = 0
+    submission_generation: int = 0
+    latest_submission_summary: str = ""
+    latest_review: LatestReview | None = None
 
 
 class TaskClaim(BaseModel):
@@ -590,6 +662,7 @@ class TaskView(BaseModel):
     review_verdict: ReviewVerdict | None = None
     review_verdict_generation: int | None = None
     review_approved_current: bool = False
+    latest_review: LatestReview | None = None
     branch: str | None = None
     pr_number: int | None = None
     claimed_by: str | None = None

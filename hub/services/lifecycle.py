@@ -24,6 +24,8 @@ from hub.integrations.registry import plugins
 from hub.models import (
     BulkChildTasksCreate,
     FINAL_STATUSES,
+    LatestReview,
+    ReviewFinding,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -248,6 +250,36 @@ def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
     )
 
 
+def parse_review_findings(raw: Any) -> list[ReviewFinding]:
+    """Decode the review_findings JSON column into models, failing soft.
+
+    Malformed rows return an empty list rather than breaking every task
+    view: findings are advisory review data, not lifecycle-critical state.
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return [ReviewFinding(**f) for f in data]
+    except (ValueError, TypeError):
+        log.warning("Malformed review_findings JSON ignored: %.80r", raw)
+        return []
+
+
+def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
+    """Build the latest-review projection for status/context (#308)."""
+    verdict = task.get("review_verdict")
+    if not verdict:
+        return None
+    verdict_generation = task.get("review_verdict_generation") or 0
+    return LatestReview(
+        verdict=verdict,
+        submission_generation=verdict_generation,
+        is_current=verdict_generation == (task.get("submission_generation") or 0),
+        findings=parse_review_findings(task.get("review_findings")),
+    )
+
+
 def row_to_task(
     row: aiosqlite.Row,
     updates: list[aiosqlite.Row] | None = None,
@@ -294,6 +326,7 @@ def row_to_task(
         review_verdict=d.get("review_verdict"),
         review_verdict_generation=d.get("review_verdict_generation"),
         review_approved_current=review_approved_for_current_submission(d),
+        latest_review=latest_review_projection(d),
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
         claimed_by=d.get("claimed_by"),
@@ -870,9 +903,27 @@ async def record_review_verdict(
         )
 
     async with get_write_lock(db):
-        await repo.record_review_verdict(db, task_id, body.verdict.value)
+        findings_json = json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings],
+            ensure_ascii=False,
+        )
+        await repo.record_review_verdict(
+            db, task_id, body.verdict.value, findings_json=findings_json
+        )
         agent = (body.agent or "").strip() or "reviewer"
         content = f"Review verdict: {body.verdict.value.upper()}"
+        if body.findings:
+            # Human-readable echo only; the canonical structured findings
+            # live on the task row, so the update text can stay compact.
+            for f in body.findings[:20]:
+                place = (
+                    f" ({f.file}:{f.line})"
+                    if f.file and f.line
+                    else (f" ({f.file})" if f.file else "")
+                )
+                content += f"\n{f.id}. [{f.severity.value}]{place} {f.message}"
+            if len(body.findings) > 20:
+                content += f"\n… and {len(body.findings) - 20} more findings"
         if body.comments.strip():
             content += f"\n{body.comments.strip()}"
         await repo.add_task_update(db, task_id, agent, "review", content)
