@@ -24,8 +24,14 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
    for missing requirements.
 5. Record blockers through `hub_task_update(..., kind="blocker")`. If the
    blocker requires a human answer, use `hub_ask_question`.
-6. Finish with `hub_report_done`. Include changed files, behavior change, and
-   validation commands with results.
+6. Pass the Universal Review Gate before completion: submit work with
+   `hub_submit_for_review`, have a reviewer (another agent session or a
+   human — never yourself) run `hub_get_review_brief` and
+   `hub_submit_review`, fix `changes_requested` findings by number and
+   resubmit. Only after an APPROVED verdict finish with `hub_report_done`
+   (changed files, behavior change, validation commands with results).
+   A done report without a current APPROVED review does not complete the
+   task — the server routes it to `review`.
 7. New work discovered outside the task scope must be a draft proposal through
    `hub_propose_task`. Do not silently expand the current task.
 8. Do not close or force-complete a task when there is failed CI, an unresolved
@@ -55,6 +61,9 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
 - `hub_start_task`
 - `hub_task_update`
 - `hub_ask_question`
+- `hub_submit_for_review`
+- `hub_get_review_brief`
+- `hub_submit_review`
 - `hub_report_done`
 - `hub_force_complete_task`
 - `hub_decide_task`
