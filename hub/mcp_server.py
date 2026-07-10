@@ -597,7 +597,13 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
         return f"{base} Task completed."
     if status == "pending_report":
         return f"{base} Awaiting human review before completion."
-    if status in ("ci_check", "review", "needs_decision"):
+    if status == "review":
+        return (
+            f"{base} Universal Review Gate: the done report was routed to "
+            "review, not completion. A reviewer must run hub_get_review_brief "
+            "and hub_submit_review; after an APPROVED verdict, report done again."
+        )
+    if status in ("ci_check", "needs_decision"):
         return f"{base} Task entered {status}."
     if status in ("open", "running"):
         return (
@@ -648,11 +654,13 @@ async def _task_mutation_response(
 async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
-    From ``pending_report``, a valid done report typically moves the task to
-    ``completed``. In pair mode (``open``/``running`` without ``job_id``), the
-    same tool may leave the task unchanged or advance it to ``ci_check`` — the
-    response always states the real status and never implies ``completed`` unless
-    the task is actually completed.
+    Universal Review Gate (#306): a done report completes a task only when
+    the current submission already carries an APPROVED review (or the task
+    explicitly opted out via auto_review=false). Otherwise the report is
+    treated as a submission — the task routes to ``review`` (client-driven)
+    or ``ci_check`` (branch conveyor) and the response names the next
+    action. The response always states the real status and never implies
+    ``completed`` unless the task is actually completed.
 
     Args:
         task_id: The task ID to report on

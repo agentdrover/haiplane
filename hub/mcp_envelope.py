@@ -85,7 +85,10 @@ def compute_next_action(
     if awaiting == "ci":
         return "Wait for CI conveyor; poller advances to review when checks pass."
     if awaiting == "review":
-        return "Await review cycle or human decision if review stalls."
+        return (
+            "Obtain a review verdict: reviewer runs hub_get_review_brief and "
+            "hub_submit_review; after APPROVED, report done again."
+        )
 
     if status == "completed":
         return "No action required — task completed."

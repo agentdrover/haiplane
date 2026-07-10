@@ -98,6 +98,35 @@ async def prepare_pair_branch(
     )
 
 
+def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
+    """True only when an APPROVED verdict applies to the latest submission.
+
+    A verdict recorded against an earlier submission generation is stale:
+    the work changed since it was approved. A task with no submissions yet
+    (generation 0) can never count as approved.
+    """
+    generation = task.get("submission_generation") or 0
+    return (
+        generation > 0
+        and task.get("review_verdict") == "approved"
+        and task.get("review_verdict_generation") == generation
+    )
+
+
+def completion_requires_review(task: dict[str, Any]) -> bool:
+    """Universal Review Gate (#306): the single completion-gate predicate.
+
+    Normal completion paths (done reports across API/MCP/poller) must not
+    complete a task unless the CURRENT submission carries an APPROVED
+    verdict. ``auto_review=False`` is the explicit human-controlled opt-out
+    (subtasks default to it); human overrides (decide accept,
+    force_complete) bypass this predicate by design and stay audited.
+    """
+    return bool(task.get("auto_review")) and not review_approved_for_current_submission(
+        task
+    )
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -109,10 +138,28 @@ async def transition_after_agent_done(
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
     branch = task.get("branch")
+
+    if has_done and not completion_requires_review(task):
+        # Review gate satisfied: either an explicit auto_review opt-out or
+        # the current submission already has an APPROVED verdict. Complete
+        # WITHOUT bumping the generation — no new work is being submitted,
+        # and a bump would invalidate the very approval that authorizes
+        # this completion (#306).
+        await repo.update_task(
+            db,
+            task_id,
+            status="completed",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        log.info("Task #%d → completed after done report", task_id)
+        return "completed"
+
     if has_done:
-        # Every accepted done report is a work submission (#305): bumping the
+        # Unreviewed done report = a work submission (#305): bumping the
         # generation invalidates any APPROVED verdict from earlier work.
         await repo.bump_submission_generation(db, task_id)
+
     if (
         task.get("auto_review")
         and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
@@ -147,16 +194,65 @@ async def transition_after_agent_done(
         log.info("Task #%d → ci_check after done report", task_id)
         return "ci_check"
 
-    next_status = "completed" if has_done else "pending_report"
+    if has_done and task.get("review_cycle", 0) >= config.MAX_REVIEW_CYCLES:
+        # Review cycle limit reached without approval: escalate to the human
+        # Decision Gate instead of looping through review forever (#306).
+        await repo.update_task(
+            db,
+            task_id,
+            status="needs_decision",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Review cycle limit reached ({task.get('review_cycle', 0)}/"
+            f"{config.MAX_REVIEW_CYCLES}) without APPROVED review. "
+            "Human decision required (hub_decide_task).",
+        )
+        log.info("Task #%d → needs_decision (review cycle limit)", task_id)
+        return "needs_decision"
+
+    if has_done:
+        # Universal Review Gate (#306): a done report on an unreviewed task
+        # is a submission for review, not a completion. Route to
+        # client-driven review (no review_job_id) and tell the agent how to
+        # obtain the verdict.
+        generation = (await repo.get_task(db, task_id)) or {}
+        generation_num = dict(generation).get("submission_generation", 0)
+        await repo.update_task(
+            db,
+            task_id,
+            status="review",
+            review_job_id=None,
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Universal Review Gate: done report routed to review "
+            f"(submission #{generation_num}). Obtain an APPROVED verdict via "
+            "hub_submit_review (reviewer: hub_get_review_brief), then report "
+            "done again.",
+        )
+        log.info("Task #%d → review after done report (review gate)", task_id)
+        return "review"
+
     await repo.update_task(
         db,
         task_id,
-        status=next_status,
+        status="pending_report",
         exit_code=exit_code,
         result_text=result_text,
     )
-    log.info("Task #%d → %s after done report", task_id, next_status)
-    return next_status
+    log.info("Task #%d → pending_report after done report", task_id)
+    return "pending_report"
 
 
 async def dispatch_review(

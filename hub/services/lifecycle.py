@@ -52,8 +52,10 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError
 from hub.services.orchestration import (
+    completion_requires_review,
     dispatch_task,
     prepare_pair_branch,
+    review_approved_for_current_submission,
     transition_after_agent_done,
 )
 from hub.services.refinement import (
@@ -232,21 +234,6 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             hint="Start work via hub_pair_start or hub_start_task before reporting done.",
             required_status="running",
         ),
-    )
-
-
-def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
-    """True only when an APPROVED verdict applies to the latest submission.
-
-    A verdict recorded against an earlier submission generation is stale:
-    the work changed since it was approved. A task with no submissions yet
-    (generation 0) can never count as approved.
-    """
-    generation = task.get("submission_generation") or 0
-    return (
-        generation > 0
-        and task.get("review_verdict") == "approved"
-        and task.get("review_verdict_generation") == generation
     )
 
 
@@ -1318,14 +1305,39 @@ async def add_update(
 
         if body.kind == "done":
             if task["status"] == "pending_report":
-                await repo.update_task(db, task_id, status="completed")
-                await log_activity(
-                    db,
-                    "task_completed",
-                    f"Task #{task_id} completed with report from {body.agent}",
-                    detail=mutation_activity_detail(),
-                )
-                await maybe_rollup_parent(db, task_id)
+                if completion_requires_review(task):
+                    # Universal Review Gate (#306): even the pending_report
+                    # path may not complete unreviewed work — the done
+                    # report becomes a submission for client-driven review.
+                    generation = await repo.bump_submission_generation(db, task_id)
+                    await repo.update_task(
+                        db, task_id, status="review", review_job_id=None
+                    )
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "status",
+                        f"Universal Review Gate: done report routed to review "
+                        f"(submission #{generation}). Obtain an APPROVED "
+                        "verdict via hub_submit_review, then report done "
+                        "again.",
+                    )
+                    await log_activity(
+                        db,
+                        "task_review_required",
+                        f"Task #{task_id} → review (gate) on report from {body.agent}",
+                        detail=mutation_activity_detail(),
+                    )
+                else:
+                    await repo.update_task(db, task_id, status="completed")
+                    await log_activity(
+                        db,
+                        "task_completed",
+                        f"Task #{task_id} completed with report from {body.agent}",
+                        detail=mutation_activity_detail(),
+                    )
+                    await maybe_rollup_parent(db, task_id)
             elif task["status"] in ("running", "claimed") and not task.get("job_id"):
                 # A done report on a pair-running task OR on a reserved (claimed)
                 # task must never be silently dropped: route both through the

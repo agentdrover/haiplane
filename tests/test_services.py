@@ -604,7 +604,11 @@ async def test_add_update(db: aiosqlite.Connection):
     assert detail["base_url"]
 
 
-async def test_add_done_update_completes_pending_report(db: aiosqlite.Connection):
+async def test_add_done_update_pending_report_routes_to_review_gate(
+    db: aiosqlite.Connection,
+):
+    # Universal Review Gate (#306): pending_report + auto_review without an
+    # APPROVED review no longer completes — the report becomes a submission.
     task_id = await repo.create_task(
         db,
         title="Pending report",
@@ -624,8 +628,10 @@ async def test_add_done_update_completes_pending_report(db: aiosqlite.Connection
     body = TaskUpdateCreate(agent="dev", kind="done", content="Report: all done")
     await services.add_update(db, task_id, body)
 
-    row = await repo.get_task(db, task_id)
-    assert dict(row)["status"] == "completed"
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "review"
+    assert d["submission_generation"] == 1
+    assert d["review_job_id"] is None
 
 
 async def test_lifecycle_approve_from_running_fails(db: aiosqlite.Connection):
@@ -801,7 +807,11 @@ async def test_reorder_task(db: aiosqlite.Connection):
     assert tv.position == 5
 
 
-async def test_add_update_done_pending_report(db: aiosqlite.Connection):
+async def test_add_update_done_pending_report_completes_when_opted_out(
+    db: aiosqlite.Connection,
+):
+    # auto_review=False is the explicit review opt-out: pending_report done
+    # still completes directly (#306).
     task_id = await repo.create_task(
         db,
         title="Awaiting report",
@@ -811,7 +821,7 @@ async def test_add_update_done_pending_report(db: aiosqlite.Connection):
         assigned_agent="dev",
         rationale="",
         status="running",
-        auto_review=True,
+        auto_review=False,
         task_type="task",
         parent_id=None,
         priority="medium",
@@ -1238,9 +1248,12 @@ async def test_done_report_on_claimed_completes_when_no_auto_review(
     assert row["claim_session_id"] in (None, "")
 
 
-async def test_done_report_on_claimed_auto_review_completes_without_branch(
+async def test_done_report_on_claimed_auto_review_routes_to_review_gate(
     db: aiosqlite.Connection,
 ):
+    # Universal Review Gate (#306): a claimed task with auto_review and no
+    # branch no longer completes on done — it enters client-driven review.
+    # The claim is still cleared.
     task_id = await _make_claimed(db, auto_review=True)
     await services.add_update(
         db,
@@ -1248,8 +1261,8 @@ async def test_done_report_on_claimed_auto_review_completes_without_branch(
         TaskUpdateCreate(agent="composer", kind="done", content="Done"),
     )
     row = await repo.get_task(db, task_id)
-    # No branch on a claimed-only task: skip meaningless ci_check dead-end.
-    assert row["status"] == "completed"
+    assert row["status"] == "review"
+    assert row["submission_generation"] == 1
     assert row["claimed_by"] in (None, "")
 
 
@@ -1713,3 +1726,175 @@ def test_review_finding_model_rejects_invalid_payloads():
         ReviewFinding(id=1, severity="catastrophic", message="bad severity")
     with pytest.raises(ValidationError):
         ReviewFinding(id=1, severity="low", message="")
+
+
+# ---- Universal Review Gate (#306): completion enforcement ----
+
+
+async def test_pair_done_without_review_routes_to_review_not_completed(
+    db: aiosqlite.Connection,
+):
+    # AC-1: no branch, auto_review on, no APPROVED review → review, not done.
+    task_id = await repo.create_task(
+        db,
+        title="Gate blocks",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="First attempt"),
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "review"
+    assert d["submission_generation"] == 1
+    assert d["review_job_id"] is None
+    # No duplicate done rows and a gate hint update is present.
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert sum(1 for u in updates if u["kind"] == "done") == 1
+    assert any("Universal Review Gate" in u["content"] for u in updates)
+
+
+async def test_pair_done_with_current_approval_completes_and_rolls_up(
+    db: aiosqlite.Connection,
+):
+    # AC-2: APPROVED for the current submission → completed; parent feature
+    # rolls up only after the actual completed state.
+    epic = await services.create_task(
+        db, TaskCreate(title="Gate epic", task_type=TaskType.epic)
+    )
+    feature = await services.create_task(
+        db,
+        TaskCreate(title="Gate feature", task_type=TaskType.feature, parent_id=epic.id),
+    )
+    tv = await services.create_task(
+        db, TaskCreate(title="Gate child", parent_id=feature.id)
+    )
+    task_id = tv.id
+    await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
+    await db.commit()
+    await services.pair_start_task(db, task_id, caller="dev")
+    # Erase the branch so the no-branch gate path is exercised.
+    await repo.update_task(db, task_id, branch=None)
+    await db.commit()
+
+    await services.submit_for_review(db, task_id)
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert view.status.value == "running"
+    assert view.review_approved_current is True
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Approved work"),
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "completed"
+    # Completing approved work must NOT bump the generation (#306): the
+    # verdict stays bound to the completed submission.
+    assert d["submission_generation"] == 1
+    assert d["review_verdict_generation"] == 1
+
+    feature_row = dict(await repo.get_task(db, feature.id))
+    assert feature_row["status"] == "completed"
+    epic_row = dict(await repo.get_task(db, epic.id))
+    assert epic_row["status"] == "completed"
+
+
+async def test_gate_full_cycle_resubmission_then_approval(
+    db: aiosqlite.Connection,
+):
+    # Full loop: done → review → CHANGES_REQUESTED → fix → done → review →
+    # APPROVED → done → completed.
+    task_id = await _pair_running_task(db, title="Gate full cycle")
+    await repo.update_task(db, task_id, branch=None)
+    await db.commit()
+
+    await services.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="v1")
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[],
+            comments="fix it",
+        ),
+    )
+    assert view.status.value == "running"
+    assert view.review_cycle == 1
+
+    await services.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="v2")
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "review"
+    assert d["submission_generation"] == 2
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert view.review_approved_current is True
+
+    await services.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="ship")
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_gate_review_cycle_limit_escalates_to_decision(
+    db: aiosqlite.Connection,
+):
+    from hub import config
+
+    task_id = await _pair_running_task(db, title="Gate cycle limit")
+    await repo.update_task(
+        db, task_id, branch=None, review_cycle=config.MAX_REVIEW_CYCLES
+    )
+    await db.commit()
+
+    await services.add_update(
+        db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="vN")
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "needs_decision"
+
+
+async def test_force_complete_bypasses_gate_as_audited_override(
+    db: aiosqlite.Connection,
+):
+    from hub.models import TaskForceComplete
+
+    task_id = await _pair_running_task(db, title="Gate force override")
+    await repo.update_task(db, task_id, branch=None)
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Human override: inspected manually"),
+    )
+    assert view.status.value == "completed"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("override" in u["content"].lower() for u in updates)
