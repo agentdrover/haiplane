@@ -184,6 +184,54 @@ Force approve доступен единым контрактом через MCP 
 5. **Force gate**: любой `force=true` должен иметь комментарий и оставлять audit trail.
 6. **Completion gate for weak reports**: `pending_report` нельзя считать завершенным без понятного отчета или явного force-complete.
 
+## Universal Review Gate
+
+**Серверное правило, а не конвенция клиента:** хаб не завершает задачу ни
+одним нормальным путём, пока у **текущего** сабмишена работы нет вердикта
+APPROVED. Правило применяется в общем service-слое (`completion_requires_review`),
+поэтому действует одинаково для REST, MCP, CLI и поллера — в любом клиенте.
+
+Цикл ревью один для всех сред:
+
+1. Разработчик заканчивает итерацию и отправляет работу:
+   `hub_submit_for_review` (или done-report — хаб сам маршрутизирует его в
+   `review`, если одобрения ещё нет). Каждая отправка получает новый
+   submission generation.
+2. Ревьюер получает полный контекст одним вызовом `hub_get_review_brief`:
+   acceptance criteria, scope, validation commands, review checklist,
+   branch/PR c advisory diff-командой, последний отчёт разработчика.
+3. Ревьюер выносит вердикт `hub_submit_review`: `approved` или
+   `changes_requested` со структурированными findings (стабильные id,
+   severity high/medium/low).
+4. При `changes_requested` задача возвращается в `running`; разработчик
+   исправляет findings по номерам и отправляет работу снова. Прежний
+   вердикт при этом протухает автоматически (generation вырос).
+5. Только при APPROVED для текущего сабмишена `hub_report_done` завершает
+   задачу. Лимит review-циклов без одобрения эскалирует в `needs_decision`.
+
+Явный опт-аут — `auto_review=false` (по умолчанию у subtask): такие задачи
+завершаются без ревью, и это решение человека на этапе создания/одобрения.
+Human-переопределения (`hub_decide_task` accept, `hub_force_complete_task`)
+обходят гейт сознательно и остаются в audit trail.
+
+### Как запускается ревьюер в разных клиентах
+
+Инвариант везде один; различается только механика запуска ревьюера:
+
+- **Cursor** — второй агент/композер в отдельном чате или другой человек:
+  открывает `hub_get_review_brief`, смотрит diff по advisory-команде,
+  выносит `hub_submit_review`.
+- **Codex** — отдельный reviewer-запуск (или другая сессия) с теми же двумя
+  инструментами; вердикт — только через `hub_submit_review`, не через
+  свободный текст в updates.
+- **Claude Code** — субагент или отдельная сессия в роли
+  `agents/code-reviewer.md`; человек-ревьюер может отдать вердикт через
+  CLI (`oc-hub review-brief`, `oc-hub review-verdict`) или API.
+
+Ревьюер **не** одобряет/мержит PR и не завершает задачу — его выход только
+вердикт. Исполнитель не должен выносить вердикт собственной работе
+(серверное принуждение — задача #318).
+
 ## Branch, PR и CI
 
 Для каждой исполняемой задачи хаб создает или переиспользует branch вида `task-<id>/<slug>` через git ops plugin.
@@ -231,7 +279,11 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 4. Коммиты — с ноутбука по [repository-rules.md](repository-rules.md): `feat|fix: ...`, узкие diff.
 5. **`git push -u origin HEAD`** когда готовы к CI/review.
 6. PR в `develop` (или согласованный base), ссылка на hub task id в описании.
-7. **`hub_report_done`** с validation commands и результатами; человек принимает через UI / `hub_force_complete_task` / CI flow (см. gap #38 для полного path B без dispatch).
+7. Пройдите Universal Review Gate: `hub_submit_for_review` → вердикт
+   ревьюера (`hub_get_review_brief` + `hub_submit_review`) → при APPROVED
+   **`hub_report_done`** с validation commands и результатами завершает
+   задачу. Done-report без актуального одобрения не завершает задачу, а
+   отправляет её в `review`.
 
 ### Checklist: server workspace
 

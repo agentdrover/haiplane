@@ -1697,3 +1697,24 @@ async def test_hub_submit_review_changes_requested(
             "findings": findings,
         },
     )
+
+
+async def test_hub_report_done_review_gate_envelope(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # AC-2 (#311): MCP projects the same gate semantics and envelope as REST.
+    mock_api_get.side_effect = [
+        {"id": 88, "status": "running"},  # prior status read
+        {"id": 88, "status": "review", "submission_generation": 1},  # after
+    ]
+    mock_api_post.side_effect = [
+        {"id": 501},  # updates row
+    ]
+    out = await hub_report_done(88, "did the work", agent="dev")
+    payload = json.loads(out)
+    assert payload["status"] == "review"
+    assert payload["awaiting"] == "review"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "running", "to": "review"}
+    assert "Universal Review Gate" in payload["message"]
+    assert "hub_submit_review" in payload["message"]

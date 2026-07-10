@@ -158,7 +158,14 @@ uv run pytest -q
 - перед кодом читать контекст задачи и архитектурные документы;
 - фиксировать вопросы, блокеры и результаты через OpenClaw Hub;
 - не расширять scope молча, а создавать draft proposal для новой работы;
-- в done report указывать changed files, behavior change и validation commands.
+- в done report указывать changed files, behavior change и validation commands;
+- **Universal Review Gate**: нормальное завершение задачи возможно только при
+  APPROVED-ревью для текущего сабмишена (`hub_submit_for_review` →
+  `hub_get_review_brief` → `hub_submit_review`). Done report без актуального
+  одобрения не завершает задачу, а отправляет её в `review`. Исключения:
+  `auto_review=false` (явный опт-аут при создании) и audited human overrides
+  (`hub_decide_task` accept, `hub_force_complete_task`). Merge в `main`
+  остаётся релизом — гейт дополняет, а не заменяет PR/CI-процесс.
 
 ## Pull request / review checklist
 

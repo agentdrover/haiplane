@@ -2036,3 +2036,94 @@ async def test_refresh_task_failed_job_still_marks_failed(
 
     view = await services.refresh_task(db, task_id)
     assert view.status.value == "failed"
+
+
+# ---- Regression coverage for Universal Review Gate (#311) ----
+
+
+async def test_stale_approval_does_not_complete_after_resubmission(
+    db: aiosqlite.Connection,
+):
+    # Review checklist (#311): an APPROVED verdict for an earlier submission
+    # must not let a later, unreviewed submission complete.
+    task_id = await _pair_running_task(db, title="Stale approval gate")
+    await repo.update_task(db, task_id, branch=None)
+    await db.commit()
+
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    # Rework: resubmit changed work — the old approval goes stale.
+    resubmitted = await services.submit_for_review(db, task_id)
+    assert resubmitted.review_approved_current is False
+
+    # Verdict for gen 2 arrives as CHANGES_REQUESTED; task returns to running.
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+    )
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Still unapproved"),
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "review"  # blocked again, not completed
+    assert d["submission_generation"] == 3
+
+
+async def test_claimed_done_with_current_approval_completes_and_clears_claim(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Claimed approved done")
+    await repo.update_task(db, task_id, branch=None)
+    await db.commit()
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    # Move the approved task into claimed state (claim survives rework paths).
+    await repo.update_task(db, task_id, status="claimed", claimed_by="dev-agent")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev-agent", kind="done", content="Approved work"),
+    )
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "completed"
+    assert d["claimed_by"] in (None, "")
+
+
+async def test_force_complete_from_pending_report_bypasses_gate(
+    db: aiosqlite.Connection,
+):
+    from hub.models import TaskForceComplete
+
+    task_id = await repo.create_task(
+        db,
+        title="Pending force override",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db, task_id, TaskForceComplete(comment="Human inspected the result")
+    )
+    assert view.status.value == "completed"

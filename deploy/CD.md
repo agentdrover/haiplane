@@ -65,3 +65,26 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
   curl -sf http://127.0.0.1:8080/healthz
 '
 ```
+
+## Rollout note: Universal Review Gate (2026-07)
+
+С релиза эпика #300 (задачи #305–#311) хаб **сервером** требует ревью перед
+завершением: `hub_report_done` остаётся совместимой точкой входа, но в
+pair/client-флоу его результат изменился — без APPROVED-вердикта для текущего
+сабмишена задача уходит в `review` (client-driven) или `ci_check`, а не в
+`completed`. Клиенты, ожидавшие немедленного `completed`, должны читать
+envelope ответа:
+
+```json
+{
+  "status": "review",
+  "awaiting": "review",
+  "actor_hint": "agent",
+  "next_action": "Obtain a review verdict: reviewer runs hub_get_review_brief and hub_submit_review; after APPROVED, report done again."
+}
+```
+
+Откат этого поведения — только откатом релиза (см. выше): конфиг-флага нет,
+гейт — инвариант жизненного цикла. Явный опт-аут на уровне задачи —
+`auto_review=false`; human overrides (`hub_decide_task` accept,
+`hub_force_complete_task`) работают и аудируются.
