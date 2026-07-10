@@ -17,9 +17,18 @@ These are the rules most likely to be broken by “small” changes.
 - A `done` report from a disallowed status must not create a duplicate done row;
   the API returns HTTP 400/409 with `{reason, hint, required_status}`.
 - On pair `running` (no `job_id`) or `claimed`, a valid done report routes through
-  the shared post-done transition (blocker → `needs_decision`, else `auto_review`
-  → `ci_check` only when a `branch` exists, else `completed`); completing
-  `claimed` clears the claim.
+  the shared post-done transition (blocker → `needs_decision`, else the
+  Universal Review Gate below); completing `claimed` clears the claim.
+- Universal Review Gate (#306): normal completion paths (done reports on
+  pair/claimed/pending_report) complete a task only when
+  `completion_requires_review` is false — i.e. `auto_review` is off (explicit
+  opt-out) or the CURRENT submission generation has an APPROVED verdict.
+  Otherwise the done report is a submission: → `ci_check` when a `branch`
+  exists (conveyor), → `review` (client-driven, no `review_job_id`) without
+  one, → `needs_decision` at the review-cycle limit. Completing approved work
+  must NOT bump the submission generation (it would invalidate the approval).
+- Human overrides bypass the gate by design and stay audited: `hub_decide_task`
+  accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
   `feature` under an `epic`) auto-completes the parent when all siblings are
   `completed` (idempotent).

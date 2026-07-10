@@ -317,14 +317,16 @@ async def test_latest_review_marked_stale_after_resubmission(client: AsyncClient
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
     )
 
-    # Simulate rework + resubmission: back to running, then a new done report.
+    # Simulate rework + resubmission: back to running, then an explicit new
+    # submit-for-review. (A done report on approved work now completes the
+    # task instead of resubmitting — Universal Review Gate, #306.)
     from hub import repository as repo_module
 
     await repo_module.update_task(db, task_id, status="running")
     await db.commit()
     resp = await client.post(
-        f"/api/tasks/{task_id}/updates",
-        json={"agent": "dev", "kind": "done", "content": "Second submission"},
+        f"/api/tasks/{task_id}/submit-review",
+        json={"agent": "dev", "summary": "Second submission"},
     )
     assert resp.status_code == 200, resp.text
 
