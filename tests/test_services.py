@@ -11,6 +11,7 @@ from hub import services
 from hub.models import (
     BulkChildTaskItem,
     BulkChildTasksCreate,
+    ReviewVerdict,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -21,8 +22,10 @@ from hub.models import (
     TaskQuestion,
     TaskRelease,
     TaskReorder,
+    TaskReviewVerdict,
     TaskSource,
     TaskStart,
+    TaskSubmitReview,
     TaskType,
     TaskUpdateCreate,
 )
@@ -1487,3 +1490,171 @@ async def test_done_report_idempotent_from_completed_rejected(db: aiosqlite.Conn
     assert exc_info.value.status_code == 409
     updates = await repo.get_task_updates(db, task_id)
     assert not any(u["kind"] == "done" for u in updates)
+
+
+# ---- Universal Review Gate (#305): submission generations and verdicts ----
+
+
+async def _pair_running_task(
+    db: aiosqlite.Connection, title: str = "Review generation task"
+) -> int:
+    tv = await services.create_task(db, TaskCreate(title=title))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: do the work")
+    await db.commit()
+    started = await services.pair_start_task(db, tv.id, caller="dev-agent")
+    assert started.status.value == "running"
+    return tv.id
+
+
+async def test_submit_for_review_enters_review_with_generation(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db)
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(agent="dev-agent", summary="first pass")
+    )
+
+    assert view.status.value == "review"
+    assert view.submission_generation == 1
+    assert view.review_job_id is None  # client-driven review, no dispatch job
+    assert view.review_verdict is None
+    assert view.review_approved_current is False
+    assert any(
+        u.kind == "status" and "Submitted for review (submission #1)" in u.content
+        for u in view.updates or []
+    )
+
+
+async def test_submit_for_review_rejected_from_open(db: aiosqlite.Connection):
+    tv = await services.create_task(db, TaskCreate(title="Not started"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.submit_for_review(db, tv.id)
+    assert exc_info.value.status_code == 400
+
+
+async def test_submit_for_review_rejected_for_headless_task(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Headless",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-123")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.submit_for_review(db, task_id)
+    assert exc_info.value.status_code == 400
+    assert "headless" in str(exc_info.value.detail)
+
+
+async def test_resubmission_invalidates_prior_approval(db: aiosqlite.Connection):
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+
+    approved = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert approved.review_verdict == ReviewVerdict.approved
+    assert approved.review_verdict_generation == 1
+    assert approved.review_approved_current is True
+
+    # Developer returns to work and submits changed work again.
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    resubmitted = await services.submit_for_review(db, task_id)
+
+    assert resubmitted.submission_generation == 2
+    # The old verdict is still recorded but no longer applies.
+    assert resubmitted.review_verdict == ReviewVerdict.approved
+    assert resubmitted.review_verdict_generation == 1
+    assert resubmitted.review_approved_current is False
+
+    # A fresh APPROVED verdict re-validates the current submission.
+    reapproved = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert reapproved.review_verdict_generation == 2
+    assert reapproved.review_approved_current is True
+
+
+async def test_changes_requested_verdict_never_counts_as_approved(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="1. Fix the tests",
+        ),
+    )
+    assert view.review_verdict == ReviewVerdict.changes_requested
+    assert view.review_approved_current is False
+    assert any(
+        u.kind == "review" and "CHANGES_REQUESTED" in u.content
+        for u in view.updates or []
+    )
+
+
+async def test_record_verdict_requires_a_submission(db: aiosqlite.Connection):
+    task_id = await _pair_running_task(db)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved),
+        )
+    assert exc_info.value.status_code == 400
+
+
+async def test_pair_done_report_bumps_submission_generation(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Pair done gen",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch="task-101/test")
+    await db.commit()
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Ready for review"),
+    )
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "ci_check"
+    assert d["submission_generation"] == 1

@@ -395,3 +395,52 @@ async def test_activity_log(db: aiosqlite.Connection):
     assert len(rows) == 2
     assert dict(rows[0])["summary"] == "Another thing"
     assert dict(rows[1])["summary"] == "Something happened"
+
+
+async def _make_task(db: aiosqlite.Connection, *, status: str = "running") -> int:
+    return await repo.create_task(
+        db,
+        title="Review gen",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+
+
+async def test_bump_submission_generation_increments(db: aiosqlite.Connection):
+    task_id = await _make_task(db)
+    await db.commit()
+
+    assert await repo.bump_submission_generation(db, task_id) == 1
+    assert await repo.bump_submission_generation(db, task_id) == 2
+    await db.commit()
+
+    row = await repo.get_task(db, task_id)
+    assert dict(row)["submission_generation"] == 2
+
+
+async def test_record_review_verdict_binds_current_generation(
+    db: aiosqlite.Connection,
+):
+    task_id = await _make_task(db)
+    await repo.bump_submission_generation(db, task_id)
+    await repo.record_review_verdict(db, task_id, "approved")
+    await db.commit()
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["review_verdict"] == "approved"
+    assert d["review_verdict_generation"] == 1
+
+    # Resubmission bumps the generation; the stored verdict becomes stale.
+    await repo.bump_submission_generation(db, task_id)
+    await db.commit()
+    d = dict(await repo.get_task(db, task_id))
+    assert d["submission_generation"] == 2
+    assert d["review_verdict_generation"] == 1

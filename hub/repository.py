@@ -340,6 +340,48 @@ async def update_task(
     )
 
 
+async def bump_submission_generation(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int:
+    """Increment the review submission generation and return the new value.
+
+    The increment happens in SQL (not read-modify-write in Python) so two
+    concurrent submissions cannot both claim the same generation. Bumping
+    the generation is what invalidates earlier APPROVED verdicts: a verdict
+    only counts while ``review_verdict_generation == submission_generation``.
+    """
+    await db.execute(
+        "UPDATE tasks SET submission_generation = submission_generation + 1, "
+        "updated_at=datetime('now') WHERE id=?",
+        (task_id,),
+    )
+    cur = await db.execute(
+        "SELECT submission_generation FROM tasks WHERE id=?", (task_id,)
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def record_review_verdict(
+    db: aiosqlite.Connection,
+    task_id: int,
+    verdict: str,
+) -> None:
+    """Persist a review verdict bound to the CURRENT submission generation.
+
+    The binding is done in SQL (``review_verdict_generation = submission_generation``)
+    so the verdict can never be attached to a generation the caller read
+    before a concurrent resubmission bumped it.
+    """
+    await db.execute(
+        "UPDATE tasks SET review_verdict=?, "
+        "review_verdict_generation=submission_generation, "
+        "updated_at=datetime('now') WHERE id=?",
+        (verdict, task_id),
+    )
+
+
 async def transition_status_if(
     db: aiosqlite.Connection,
     task_id: int,

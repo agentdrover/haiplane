@@ -354,6 +354,19 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN claim_session_id TEXT",
     ),
     ("add_claimed_at_column", "ALTER TABLE tasks ADD COLUMN claimed_at TEXT"),
+    # ---- Universal Review Gate (#305): review submission generations ----
+    (
+        "add_submission_generation_column",
+        "ALTER TABLE tasks ADD COLUMN submission_generation INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "add_review_verdict_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict TEXT",
+    ),
+    (
+        "add_review_verdict_generation_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_generation INTEGER",
+    ),
 ]
 
 

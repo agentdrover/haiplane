@@ -109,6 +109,10 @@ async def transition_after_agent_done(
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
     branch = task.get("branch")
+    if has_done:
+        # Every accepted done report is a work submission (#305): bumping the
+        # generation invalidates any APPROVED verdict from earlier work.
+        await repo.bump_submission_generation(db, task_id)
     if (
         task.get("auto_review")
         and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
