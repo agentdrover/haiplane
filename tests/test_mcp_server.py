@@ -22,6 +22,7 @@ from hub.mcp_server import (
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
+    hub_get_review_brief,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
     hub_list_tasks,
@@ -35,6 +36,8 @@ from hub.mcp_server import (
     hub_replace_acceptance_criteria,
     hub_report_done,
     hub_start_task,
+    hub_submit_for_review,
+    hub_submit_review,
     hub_task_status,
     hub_task_update,
 )
@@ -1606,3 +1609,91 @@ async def test_hub_task_status_renders_latest_review(
     assert "2. [low] Polish docs" in text
     structured = _mcp_structured(out)
     assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
+
+
+async def test_hub_submit_for_review(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 2,
+    }
+    out = await hub_submit_for_review(42, agent="dev", summary="pass 2")
+    payload = json.loads(out)
+    assert "submitted for review (submission #2" in payload["message"]
+    assert payload["status"] == "review"
+    assert payload["awaiting"] == "review"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "running", "to": "review"}
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/submit-review", {"agent": "dev", "summary": "pass 2"}
+    )
+
+
+async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "submission_generation": 1,
+        "review_cycle": 0,
+        "acceptance_criteria": [
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+        "scope_in": ["hub/app.py"],
+        "review_checklist": ["check envelopes"],
+        "validation_commands": ["uv run pytest -q"],
+        "branch": "task-42/x",
+        "pr_number": None,
+        "diff_command": "git diff develop...task-42/x",
+        "latest_submission_summary": "Implemented",
+        "latest_review": None,
+    }
+    out = await hub_get_review_brief(42)
+    payload = json.loads(out)
+    text = payload["message"]
+    assert "Review brief for task #42" in text
+    assert "AC-1" in text
+    assert "In scope: hub/app.py" in text
+    assert "uv run pytest -q" in text
+    assert "git diff develop...task-42/x" in text
+    assert "hub_submit_review" in text
+    assert payload["brief"]["task_id"] == 42
+    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_submit_review_changes_requested(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [{"id": 1, "severity": "high", "message": "Fix"}]
+    out = await hub_submit_review(
+        42,
+        verdict="changes_requested",
+        comments="see findings",
+        agent="reviewer",
+        findings=findings,
+    )
+    payload = json.loads(out)
+    assert "CHANGES_REQUESTED" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "review", "to": "running"}
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "comments": "see findings",
+            "agent": "reviewer",
+            "findings": findings,
+        },
+    )

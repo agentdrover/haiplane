@@ -887,9 +887,10 @@ async def record_review_verdict(
     """Record an explicit review verdict for the current submission (#305).
 
     Persists the verdict bound to the current submission generation, so a
-    later resubmission automatically invalidates an APPROVED verdict. Status
-    transitions stay with the caller (poller conveyor or the review API):
-    this is the canonical write of verdict state, not a completion path.
+    later resubmission automatically invalidates an APPROVED verdict. For
+    client-driven review (status=review, no review_job_id) the task returns
+    to ``running`` so the developer can fix findings or report done (#307);
+    headless transitions remain with the poller. Never a completion path.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -927,6 +928,21 @@ async def record_review_verdict(
         if body.comments.strip():
             content += f"\n{body.comments.strip()}"
         await repo.add_task_update(db, task_id, agent, "review", content)
+
+        # Client-driven review only (status=review, no review_job_id): hand
+        # the task back to the developer so the loop continues — fix findings
+        # on CHANGES_REQUESTED, or report done on APPROVED. Headless review
+        # transitions stay with the poller, which owns tasks that carry a
+        # review_job_id (#307).
+        if task["status"] == "review" and not task.get("review_job_id"):
+            await repo.transition_status_if(
+                db, task_id, expected_from="review", new_status="running"
+            )
+            if body.verdict.value == "changes_requested":
+                await repo.update_task(
+                    db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
+                )
+
         await db.commit()
         await log_activity(
             db,
