@@ -28,6 +28,7 @@ from hub.mcp_server import (
     hub_task_tree,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
+    hub_list_proposals,
     hub_list_tasks,
     hub_prepare_developer_task,
     hub_propose_task,
@@ -1842,3 +1843,54 @@ async def test_hub_task_tree_structured_nested_progress(
     tree = _mcp_structured(out)["tree"]
     assert tree["progress"]["percent"] == 50
     assert tree["children"][0]["id"] == 2
+
+
+async def test_hub_list_proposals_ranked_and_flagged(
+    mock_api_get: AsyncMock,
+) -> None:
+    # (#253) proposals sorted DoR-first with ready_to_approve flags.
+    mock_api_get.return_value = [
+        {
+            "id": 1,
+            "title": "Bare",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": None,
+            "readiness_score": None,
+            "risks": [],
+            "created_at": "2026-07-01 10:00:00",
+        },
+        {
+            "id": 2,
+            "title": "Ready",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": True,
+            "readiness_score": 95,
+            "risks": [],
+            "created_at": "2026-07-02 10:00:00",
+        },
+        {
+            "id": 3,
+            "title": "Risky",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": True,
+            "readiness_score": 90,
+            "risks": [{"kind": "security", "severity": "high"}],
+            "created_at": "2026-07-03 10:00:00",
+        },
+    ]
+    out = await hub_list_proposals()
+    proposals = _mcp_structured(out)["proposals"]
+    assert [p["id"] for p in proposals] == [2, 3, 1]
+    flags = {p["id"]: p["ready_to_approve"] for p in proposals}
+    assert flags == {2: True, 3: False, 1: False}  # high risk blocks ready
+    text = json.loads(_mcp_text(out))["message"]
+    assert "READY" in text and "HIGH-RISK" in text

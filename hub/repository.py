@@ -19,10 +19,15 @@ from hub.db import (
     structured_fields_to_db,
 )
 
+# Draft queue ranking (#253): deterministic, no weights — DoR-ready first,
+# then higher readiness, then older drafts (age = FIFO fairness).
+DRAFT_QUEUE_ORDER_BY = "dor_passed DESC, readiness_score DESC, created_at ASC, id ASC"
+
 ALLOWED_TASKS_ORDER_BY = frozenset(
     {
         "id DESC",
         "updated_at ASC",
+        DRAFT_QUEUE_ORDER_BY,
     }
 )
 

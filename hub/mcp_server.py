@@ -1472,7 +1472,32 @@ async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     agent_tasks = [t for t in tasks if t.get("source") == "agent"]
     if not agent_tasks:
         return structured_echo_result(f"No {status} proposals.", proposals=[])
-    lines = [_format_task(t) for t in agent_tasks]
+    # Draft queue ranking (#253): DoR-ready first, then readiness, then age.
+    agent_tasks.sort(
+        key=lambda t: (
+            not bool(t.get("dor_passed")),
+            -(t.get("readiness_score") or 0),
+            t.get("created_at") or "",
+            t.get("id") or 0,
+        )
+    )
+    lines = []
+    for t in agent_tasks:
+        t["ready_to_approve"] = bool(t.get("dor_passed")) and not any(
+            r.get("severity") == "high" for r in (t.get("risks") or [])
+        )
+        score = t.get("readiness_score")
+        marks = [
+            f"score={score}" if score is not None else "score=?",
+            "READY" if t["ready_to_approve"] else "not-ready",
+        ]
+        if any(r.get("severity") == "high" for r in (t.get("risks") or [])):
+            marks.append("HIGH-RISK")
+        if t.get("prepared_by"):
+            marks.append(f"prep:{t['prepared_by']}")
+        if t.get("created_at"):
+            marks.append(f"created:{str(t['created_at'])[:10]}")
+        lines.append(f"{_format_task(t)}  [{', '.join(marks)}]")
     return structured_echo_result("\n".join(lines), proposals=agent_tasks)
 
 
