@@ -1270,3 +1270,92 @@ async def test_claim_records_and_release_clears_implementer_principal(
     assert resp.status_code == 200
     d = dict(await repo_module.get_task(db, task_id))
     assert d["implementer_principal_id"] is None
+
+
+# ---- Batch approve (#252) ----
+
+
+async def _make_dor_ready_draft(client: AsyncClient, title: str) -> int:
+    resp = await client.post(
+        "/api/tasks", json={"title": title, "source": "agent", "agent": "bot"}
+    )
+    task_id = resp.json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "user_story": "as a user, I want X so that Y",
+            "problem_statement": "ps",
+            "business_value": "bv",
+            "scope_in": ["m"],
+            "validation_commands": ["uv run pytest -q"],
+            "size": "S",
+            "wip_tag": "feature_work",
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_batch_approve_mixed_queue(client: AsyncClient, monkeypatch):
+    # AC-1 (#252): ready drafts approved, unready skipped with reasons.
+    from hub import config
+
+    ready_id = await _make_dor_ready_draft(client, "Ready draft")
+    resp = await client.post(
+        "/api/tasks", json={"title": "Bare draft", "source": "agent", "agent": "bot"}
+    )
+    bare_id = resp.json()["id"]
+    risky_id = await _make_dor_ready_draft(client, "Risky draft")
+    await client.post(
+        f"/api/tasks/{risky_id}/risks",
+        json={
+            "kind": "security",
+            "severity": "high",
+            "description": "d",
+            "mitigation": "m",
+        },
+    )
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+    resp = await client.post(
+        "/api/tasks/batch-approve",
+        json={"task_ids": [ready_id, bare_id, risky_id, 99999]},
+        headers=human,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["approved"] == [ready_id]
+    reasons = {s["task_id"]: s["reason"] for s in body["skipped"]}
+    assert reasons[bare_id] == "dor_failed"
+    assert reasons[risky_id] == "high_risk"
+    assert reasons[99999] == "not_found"
+
+    status_now = (await client.get(f"/api/tasks/{ready_id}", headers=human)).json()
+    assert status_now["status"] == "open"
+
+
+async def test_batch_approve_agent_token_forbidden(client: AsyncClient, monkeypatch):
+    # AC-2 (#252): human-only gate.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer impl-token"}
+
+    resp = await client.post(
+        "/api/tasks/batch-approve", json={"task_ids": [1]}, headers=agent
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "human_only_gate"

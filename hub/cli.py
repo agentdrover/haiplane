@@ -294,6 +294,21 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_approve_batch(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "task_ids": args.task_ids,
+        "require_dor_passed": not args.no_require_dor,
+        "exclude_high_risks": not args.allow_high_risks,
+    }
+    if args.min_readiness is not None:
+        body["min_readiness"] = args.min_readiness
+    if args.comment:
+        body["comment"] = args.comment
+    result = _api("POST", "/api/tasks/batch-approve", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
@@ -1173,6 +1188,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_approve_batch = sub.add_parser(
+        "approve-batch",
+        help="Approve many draft tasks with DoR/risk guards (human token)",
+    )
+    p_approve_batch.add_argument("task_ids", type=int, nargs="+")
+    p_approve_batch.add_argument(
+        "--min-readiness", dest="min_readiness", type=int, default=None
+    )
+    p_approve_batch.add_argument(
+        "--no-require-dor", dest="no_require_dor", action="store_true"
+    )
+    p_approve_batch.add_argument(
+        "--allow-high-risks", dest="allow_high_risks", action="store_true"
+    )
+    p_approve_batch.add_argument("--comment", default="")
+    p_approve_batch.set_defaults(func=cmd_approve_batch)
 
     p_submit_review = sub.add_parser(
         "submit-review",
