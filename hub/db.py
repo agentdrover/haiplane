@@ -372,6 +372,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_findings_column",
         "ALTER TABLE tasks ADD COLUMN review_findings TEXT NOT NULL DEFAULT '[]'",
     ),
+    # ---- Separation of duties (#320): implementer identity as a principal.
+    # Plain INTEGER on purpose (no FK): the value is an identity snapshot for
+    # the self-review comparison, and it must survive principal deletion and
+    # non-DB token sources without integrity errors.
+    (
+        "add_implementer_principal_id_column",
+        "ALTER TABLE tasks ADD COLUMN implementer_principal_id INTEGER",
+    ),
 ]
 
 

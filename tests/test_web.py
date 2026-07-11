@@ -672,3 +672,100 @@ async def test_htmx_done_fragment_escapes_xss_title(client: AsyncClient, db):
     assert resp.status_code == 200
     assert "<img" not in resp.text
     assert "&lt;img" in resp.text
+
+
+# ---- Web review verdict panel (#321) ----
+
+
+async def _web_task_in_review(client: AsyncClient) -> int:
+    resp = await client.post("/api/tasks", json={"title": "Web review task"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.json()["status"] == "review"
+    return task_id
+
+
+async def test_review_panel_visible_for_client_driven_review(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "Review Required" in resp.text
+    assert f"/tasks/{task_id}/web-review-verdict" in resp.text
+    assert 'name="verdict" value="approved"' in resp.text
+    assert 'name="verdict" value="changes_requested"' in resp.text
+
+
+async def test_review_panel_hidden_for_headless_review(client: AsyncClient, db):
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await repo_module.update_task(db, task_id, review_job_id="rev-42")
+    await db.commit()
+
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "Review Required" not in resp.text
+    assert "In Progress" in resp.text
+
+
+async def test_web_approve_verdict_returns_task_to_running(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "LGTM from the dashboard"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "running"
+    assert body["review_approved_current"] is True
+    assert body["latest_review"]["verdict"] == "approved"
+
+
+async def test_web_changes_requested_with_findings(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={
+            "verdict": "changes_requested",
+            "comments": "see findings",
+            "findings_text": "high: race in bump\njust a plain note\nlow: typo",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "running"
+    assert body["review_cycle"] == 1
+    findings = body["latest_review"]["findings"]
+    assert [f["id"] for f in findings] == [1, 2, 3]
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["message"] == "race in bump"
+    assert findings[1]["severity"] == "medium"  # default for plain lines
+    assert findings[2]["severity"] == "low"
+
+
+async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient):
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "maybe", "comments": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "review_error=" in resp.headers["location"]
+
+    # Task untouched.
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None

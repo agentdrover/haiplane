@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from hub import config, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.actionable_errors import self_review_forbidden_detail
 from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -541,19 +540,14 @@ async def api_review_verdict(
     ``running``; this endpoint never completes a task.
     """
     db = _db(request)
-    if identity.is_agent and config.REVIEW_SELF_APPROVE != "allow":
-        row = await repo.get_task(db, task_id)
-        if row is not None:
-            task = dict(row)
-            implementers = {
-                (task.get("assigned_agent") or "").strip(),
-                (task.get("claimed_by") or "").strip(),
-            } - {""}
-            if identity.username in implementers:
-                raise HTTPException(
-                    403,
-                    detail=self_review_forbidden_detail(identity.username),
-                )
+    row = await repo.get_task(db, task_id)
+    if row is not None:
+        services.ensure_reviewer_independence(
+            dict(row),
+            is_agent=identity.is_agent,
+            principal_id=identity.principal_id,
+            username=identity.username,
+        )
     return await services.record_review_verdict(db, task_id, body)
 
 
@@ -663,6 +657,7 @@ async def api_pair_start_task(
         task_id,
         body,
         caller=identity.username,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
     )
 
 
@@ -676,7 +671,12 @@ async def api_claim_task(
     """Claim an open task for one Cursor agent/session."""
     if not body.agent.strip():
         body = TaskClaim(agent=identity.username, session_id=body.session_id)
-    return await services.claim_task(_db(request), task_id, body)
+    return await services.claim_task(
+        _db(request),
+        task_id,
+        body,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+    )
 
 
 @app.post("/api/tasks/{task_id}/release", response_model=TaskView)

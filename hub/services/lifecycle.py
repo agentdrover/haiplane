@@ -15,6 +15,7 @@ from hub import db as db_module
 from hub.actionable_errors import (
     done_report_error_detail,
     hierarchy_error_detail,
+    self_review_forbidden_detail,
     withdraw_own_draft_error_detail,
 )
 from hub import repository as repo
@@ -235,6 +236,37 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             required_status="running",
         ),
     )
+
+
+def ensure_reviewer_independence(
+    task: dict[str, Any],
+    *,
+    is_agent: bool,
+    principal_id: int | None,
+    username: str,
+) -> None:
+    """Raise 403 when the caller implemented the task (#318/#320).
+
+    Shared by the REST endpoint and the web review panel so verdict
+    independence has exactly one definition. Principal comparison wins;
+    the name-based check is the fallback for env tokens and legacy tasks.
+    Humans and the solo opt-out (OPENCLAW_REVIEW_SELF_APPROVE=allow) pass.
+    """
+    if not is_agent or config.REVIEW_SELF_APPROVE == "allow":
+        return
+    implementer_pid = task.get("implementer_principal_id")
+    if (
+        implementer_pid is not None
+        and principal_id is not None
+        and principal_id == implementer_pid
+    ):
+        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+    implementers = {
+        (task.get("assigned_agent") or "").strip(),
+        (task.get("claimed_by") or "").strip(),
+    } - {""}
+    if username in implementers:
+        raise HTTPException(403, detail=self_review_forbidden_detail(username))
 
 
 def parse_review_findings(raw: Any) -> list[ReviewFinding]:
@@ -724,8 +756,15 @@ async def pair_start_task(
     body: TaskPairStart | None = None,
     *,
     caller: str = "",
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Start an open task in pair mode: running without headless dispatch."""
+    """Start an open task in pair mode: running without headless dispatch.
+
+    ``implementer_principal_id`` records WHO implements as an authenticated
+    principal (#320) so the self-review ban can compare identities instead
+    of free-text agent names. None (env tokens, anonymous, humans) keeps
+    the name-based fallback of #318.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -784,6 +823,8 @@ async def pair_start_task(
         "job_id": None,
         "assigned_agent": assigned_agent,
     }
+    if implementer_principal_id is not None:
+        update_fields["implementer_principal_id"] = implementer_principal_id
     if branch:
         update_fields["branch"] = branch
 
@@ -947,8 +988,14 @@ async def claim_task(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskClaim,
+    *,
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Claim an open task for a single Cursor agent/session."""
+    """Claim an open task for a single Cursor agent/session.
+
+    ``implementer_principal_id`` records the claiming agent's authenticated
+    principal (#320) for the identity-based self-review ban.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -985,14 +1032,15 @@ async def claim_task(
         raise HTTPException(409, f"Task #{task_id} claim conflict")
 
     session_note = f" session={body.session_id}" if body.session_id else ""
-    await repo.update_task(
-        db,
-        task_id,
-        claimed_by=body.agent,
-        claim_session_id=body.session_id or None,
-        claimed_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
-        assigned_agent=body.agent,
-    )
+    claim_fields: dict[str, Any] = {
+        "claimed_by": body.agent,
+        "claim_session_id": body.session_id or None,
+        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "assigned_agent": body.agent,
+    }
+    if implementer_principal_id is not None:
+        claim_fields["implementer_principal_id"] = implementer_principal_id
+    await repo.update_task(db, task_id, **claim_fields)
     await repo.add_task_update(
         db,
         task_id,
@@ -1053,6 +1101,9 @@ async def release_task(
         claimed_by=None,
         claim_session_id=None,
         claimed_at=None,
+        # The claim is the implementer's reservation: releasing it also
+        # releases the recorded implementer identity (#320).
+        implementer_principal_id=None,
     )
     await repo.add_task_update(
         db,

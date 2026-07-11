@@ -370,3 +370,14 @@ async def test_review_generation_defaults_for_existing_rows():
         assert row["review_verdict_generation"] is None
     finally:
         await conn.close()
+
+
+async def test_implementer_principal_id_column_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        col = cols.get("implementer_principal_id")
+        assert col is not None
+        assert col["notnull"] == 0  # nullable: legacy tasks use name fallback
+    finally:
+        await conn.close()
