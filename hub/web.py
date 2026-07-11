@@ -6,11 +6,13 @@ import hashlib
 import html
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiosqlite
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 
 from hub import config
 from hub import db as db_module
@@ -27,6 +29,8 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.models import (
+    ReviewFinding,
+    ReviewSeverity,
     RuntimeChoice,
     TaskAnswer,
     TaskApprove,
@@ -34,6 +38,7 @@ from hub.models import (
     TaskDecide,
     TaskForceComplete,
     TaskReject,
+    TaskReviewVerdict,
     TaskStart,
     TaskStatus,
     TaskType,
@@ -523,6 +528,7 @@ async def web_task_detail(
     task_id: int,
     request: Request,
     approve_error: str = Query(""),
+    review_error: str = Query(""),
 ):
     db = _db(request)
     row = await repo.get_task(db, task_id)
@@ -546,6 +552,7 @@ async def web_task_detail(
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),
             "approve_error": approve_error,
+            "review_error": review_error,
         },
     )
 
@@ -726,6 +733,89 @@ async def web_decide_task(
         record_decision=record_decision,
     )
     await services.decide_task(_db(request), task_id, body)
+    if _is_htmx(request):
+        return await _htmx_task_done_fragment(request, task_id)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+def _parse_findings_form(text: str) -> list[ReviewFinding]:
+    """Parse the review-panel findings textarea into structured findings.
+
+    One finding per line, optionally prefixed with a severity:
+    ``high: message`` / ``medium: message`` / ``low: message``. Lines
+    without a recognized severity prefix default to medium. Ids are
+    assigned by position — stable within this submission (#308).
+    """
+    findings: list[ReviewFinding] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        severity, _, rest = line.partition(":")
+        sev_token = severity.strip().lower()
+        if sev_token in ReviewSeverity.__members__ and rest.strip():
+            findings.append(
+                ReviewFinding(
+                    id=len(findings) + 1,
+                    severity=ReviewSeverity(sev_token),
+                    message=rest.strip(),
+                )
+            )
+        else:
+            findings.append(
+                ReviewFinding(
+                    id=len(findings) + 1,
+                    severity=ReviewSeverity.medium,
+                    message=line,
+                )
+            )
+    return findings
+
+
+@router.post("/tasks/{task_id}/web-review-verdict")
+async def web_review_verdict(
+    task_id: int,
+    request: Request,
+    verdict: str = Form(...),
+    comments: str = Form(""),
+    findings_text: str = Form(""),
+):
+    """Submit a review verdict from the task card panel (#321).
+
+    Same semantics as POST /api/tasks/{id}/review-verdict: the shared
+    independence check plus the canonical record_review_verdict service —
+    no web-only verdict logic. The verdict is recorded under the logged-in
+    identity, not a free-text name.
+    """
+    db = _db(request)
+    identity = current_identity(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    services.ensure_reviewer_independence(
+        dict(row),
+        is_agent=identity.is_agent,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
+    try:
+        body = TaskReviewVerdict(
+            verdict=verdict,  # type: ignore[arg-type]
+            agent=identity.username,
+            comments=comments,
+            findings=_parse_findings_form(findings_text),
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0] if exc.errors() else {}
+        msg = f"Invalid review form: {first.get('msg', 'validation error')}"
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div class="task-action-note">{msg}</div>', status_code=422
+            )
+        return RedirectResponse(
+            f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
+        )
+    await services.record_review_verdict(db, task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
