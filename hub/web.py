@@ -18,6 +18,7 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
+from hub.actionable_errors import human_only_gate_detail
 from hub.auth import (
     CSRF_COOKIE_NAME,
     current_user,
@@ -29,6 +30,7 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.models import (
+    BatchApprove,
     ReviewFinding,
     ReviewSeverity,
     RuntimeChoice,
@@ -736,6 +738,28 @@ async def web_decide_task(
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/web-batch-approve-ready")
+async def web_batch_approve_ready(request: Request):
+    """Inbox bulk action (#252): approve every DoR-ready draft without
+    high risks in one click. Same guards as the API — force never."""
+    db = _db(request)
+    identity = current_identity(request)
+    if identity.is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=100)
+    task_ids = [dict(r)["id"] for r in draft_rows]
+    if task_ids:
+        await services.batch_approve_tasks(
+            db,
+            BatchApprove(task_ids=task_ids, comment="Batch-approved from inbox"),
+        )
+    if _is_htmx(request):
+        inbox = await services.get_inbox_data(db)
+        inbox["dispatch_available"] = _dispatch_available()
+        return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
+    return RedirectResponse("/", status_code=303)
 
 
 def _parse_findings_form(text: str) -> list[ReviewFinding]:

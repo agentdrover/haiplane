@@ -253,6 +253,30 @@ class TaskApprove(BaseModel):
     force: bool = False
 
 
+class BatchApprove(BaseModel):
+    """Approve a list of draft tasks in one human operation (#252).
+
+    Guards default to safe: DoR must pass and high risks exclude a task.
+    ``force`` deliberately does not exist here — overrides stay per-task.
+    """
+
+    task_ids: list[int] = Field(..., min_length=1, max_length=100)
+    require_dor_passed: bool = True
+    min_readiness: int | None = Field(default=None, ge=0, le=100)
+    exclude_high_risks: bool = True
+    comment: str = Field("", max_length=2000)
+
+
+class BatchApproveSkipped(BaseModel):
+    task_id: int
+    reason: str
+
+
+class BatchApproveResult(BaseModel):
+    approved: list[int] = Field(default_factory=list)
+    skipped: list[BatchApproveSkipped] = Field(default_factory=list)
+
+
 class TaskReject(BaseModel):
     comment: str = ""
 

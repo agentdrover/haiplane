@@ -23,6 +23,9 @@ from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.models import (
+    BatchApprove,
+    BatchApproveResult,
+    BatchApproveSkipped,
     BulkChildTasksCreate,
     FINAL_STATUSES,
     LatestReview,
@@ -61,6 +64,7 @@ from hub.services.orchestration import (
 )
 from hub.services.refinement import (
     TaskNotFoundError,
+    get_readiness,
     get_write_lock,
     list_acceptance_criteria,
 )
@@ -661,6 +665,78 @@ async def approve_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def batch_approve_tasks(
+    db: aiosqlite.Connection,
+    body: BatchApprove,
+) -> BatchApproveResult:
+    """Approve many drafts with per-task guards and partial success (#252).
+
+    Каждая задача проверяется независимо: не-draft, непройденный DoR,
+    низкий readiness или high-риски дают skipped с причиной, не ломая
+    остальную пачку. force не поддерживается намеренно — override
+    остаётся одиночным, аудируемым действием.
+    """
+    result = BatchApproveResult()
+    for task_id in body.task_ids:
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason="not_found")
+            )
+            continue
+        task = dict(row)
+        if task["status"] != "draft":
+            result.skipped.append(
+                BatchApproveSkipped(
+                    task_id=task_id,
+                    reason=f"not_draft:{task['status']}",
+                )
+            )
+            continue
+
+        dor_passed = task.get("dor_passed")
+        score = task.get("readiness_score")
+        if dor_passed is None or score is None:
+            # Legacy row without persisted readiness (#250): compute lazily.
+            report = await get_readiness(db, task_id)
+            dor_passed = report.dor_passed
+            score = report.score
+        if body.require_dor_passed and not dor_passed:
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason="dor_failed")
+            )
+            continue
+        if body.min_readiness is not None and (score or 0) < body.min_readiness:
+            result.skipped.append(
+                BatchApproveSkipped(
+                    task_id=task_id,
+                    reason=f"readiness_below_{body.min_readiness}",
+                )
+            )
+            continue
+        if body.exclude_high_risks:
+            risks = db_module.deserialize_risks(task.get("risks"))
+            if any(r.get("severity") == "high" for r in risks):
+                result.skipped.append(
+                    BatchApproveSkipped(task_id=task_id, reason="high_risk")
+                )
+                continue
+
+        try:
+            await approve_task(db, task_id, TaskApprove(comment=body.comment))
+        except HTTPException as exc:
+            reason = "approve_failed"
+            detail = exc.detail
+            if isinstance(detail, dict):
+                reason = detail.get("reason") or detail.get("error") or reason
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason=f"{reason}")
+            )
+            continue
+        result.approved.append(task_id)
+    return result
 
 
 async def reject_task(
