@@ -7,6 +7,22 @@ import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+_SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def to_iso_utc(value: str | None) -> str | None:
+    """Normalize a timestamp to ISO8601 UTC at the serialization boundary (#255).
+
+    SQLite ``datetime('now')`` stores naive ``YYYY-MM-DD HH:MM:SS`` in UTC;
+    other writers (claim, verdicts) already store ISO8601 with an offset.
+    Storage stays unchanged — only API/MCP contracts are normalized.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    if _SQLITE_DT_RE.match(value):
+        return value.replace(" ", "T") + "+00:00"
+    return value
+
 
 class TaskStatus(str, Enum):
     draft = "draft"
@@ -631,6 +647,11 @@ class TaskUpdateView(BaseModel):
     content: str
     created_at: str
 
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class TaskBreadcrumb(BaseModel):
     id: int
@@ -729,6 +750,20 @@ class TaskView(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
 
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "claimed_at",
+        "ready_at",
+        "prepared_at",
+        "started_at",
+        "completed_at",
+        mode="before",
+    )
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class TaskTreeNode(BaseModel):
     id: int
@@ -794,6 +829,11 @@ class ActivityItem(BaseModel):
     summary: str
     detail: dict[str, Any] | None = None
     timestamp: str
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
 
 
 class DashboardData(BaseModel):
@@ -878,6 +918,11 @@ class PrincipalView(BaseModel):
     last_seen_at: str | None = None
     created_by: int | None = None
 
+    @field_validator("created_at", "updated_at", "last_seen_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class RoleView(BaseModel):
     id: int
@@ -904,6 +949,13 @@ class ApiKeyView(BaseModel):
     created_at: str = ""
     created_by: int | None = None
 
+    @field_validator(
+        "expires_at", "last_used_at", "revoked_at", "created_at", mode="before"
+    )
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class ApiKeyCreated(ApiKeyView):
     """Returned only once at creation time — includes the plaintext key."""
@@ -921,6 +973,11 @@ class AuditEntry(BaseModel):
     summary: str
     detail: str | None = None
     created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
 
 
 class AdminSummary(BaseModel):
