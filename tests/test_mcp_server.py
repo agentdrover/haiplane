@@ -23,6 +23,9 @@ from hub.mcp_server import (
     hub_force_complete_task,
     hub_get_readiness,
     hub_get_review_brief,
+    hub_my_context,
+    hub_project_status,
+    hub_task_tree,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
     hub_list_tasks,
@@ -109,10 +112,12 @@ async def test_hub_list_tasks(mock_api_get: AsyncMock) -> None:
         },
     ]
     out = await hub_list_tasks()
-    payload = json.loads(out)
+    payload = json.loads(_mcp_text(out))
     lines = payload["message"].split("\n")
     assert payload["instance"] in ("prod", "local")
     assert "base_url" in payload
+    structured = _mcp_structured(out)
+    assert [t["id"] for t in structured["tasks"]] == [1, 2, 3]  # object (#248)
     assert lines[0] == "#1 [open] (auto) Alpha"
     assert lines[1] == "#2 [epic] [running] (vast) [agent:coder] Beta epic"
     assert lines[2] == "#3 [subtask] [open] (auto) (parent #2) Child"
@@ -920,11 +925,14 @@ async def test_hub_get_readiness_compact_summary(mock_api_get: AsyncMock) -> Non
             }
         ],
     }
-    msg = await hub_get_readiness(12)
+    out = await hub_get_readiness(12)
+    msg = _mcp_text(out)
     assert "score=65" in msg
     assert "dor_passed=no" in msg
     assert "has_problem_statement" in msg
     assert "Add a problem" in msg
+    structured = _mcp_structured(out)
+    assert structured["report"]["score"] == 65  # object, not JSON string (#248)
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness")
 
 
@@ -1251,13 +1259,14 @@ async def test_hub_get_readiness_explain_returns_full_json(
 ) -> None:
     payload = {"score": 100, "dor_passed": True, "explain": [{"k": "v"}]}
     mock_api_get.return_value = payload
-    msg = await hub_get_readiness(12, explain=True)
-    parsed = json.loads(msg)
+    out = await hub_get_readiness(12, explain=True)
+    parsed = _mcp_structured(out)["report"]
     assert parsed["score"] == 100
     assert parsed["dor_passed"] is True
     assert parsed["explain"] == [{"k": "v"}]
-    assert parsed["instance"] in ("prod", "local")
-    assert parsed["base_url"]
+    envelope = _mcp_structured(out)
+    assert envelope["instance"] in ("prod", "local")
+    assert envelope["base_url"]
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
 
 
@@ -1658,8 +1667,9 @@ async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
         "latest_review": None,
     }
     out = await hub_get_review_brief(42)
-    payload = json.loads(out)
-    text = payload["message"]
+    payload = _mcp_structured(out)
+    text = _mcp_text(out)
+    text = json.loads(text)["message"]
     assert "Review brief for task #42" in text
     assert "AC-1" in text
     assert "In scope: hub/app.py" in text
@@ -1718,3 +1728,117 @@ async def test_hub_report_done_review_gate_envelope(
     assert payload["transition"] == {"from": "running", "to": "review"}
     assert "Universal Review Gate" in payload["message"]
     assert "hub_submit_review" in payload["message"]
+
+
+async def test_read_tools_return_object_not_json_string(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-1 (#248): structuredContent is a real object — a client never needs
+    # a nested json.loads.
+    mock_api_get.return_value = [
+        {
+            "id": 5,
+            "status": "open",
+            "runtime": "auto",
+            "title": "T",
+            "task_type": "task",
+        }
+    ]
+    out = await hub_list_tasks()
+    structured = _mcp_structured(out)
+    assert isinstance(structured, dict)
+    assert isinstance(structured["tasks"], list)
+    assert isinstance(structured["tasks"][0], dict)
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["instance"] in ("prod", "local")
+
+    mock_api_get.return_value = {"context_text": "digest", "task": {"id": 5}}
+    out = await hub_my_context(5)
+    structured = _mcp_structured(out)
+    assert structured["context"]["task"] == {"id": 5}
+
+    mock_api_get.return_value = {
+        "id": 5,
+        "title": "T",
+        "task_type": "task",
+        "status": "open",
+        "priority": "medium",
+        "children": [],
+    }
+    out = await hub_task_tree(5)
+    structured = _mcp_structured(out)
+    assert structured["tree"]["id"] == 5
+
+
+async def test_hub_project_status_structured_lists(mock_api_get: AsyncMock) -> None:
+    # AC-1 (#249): structuredContent carries the dashboard lists as objects
+    # with id/title/status/parent_id, while message keeps the markdown digest.
+    mock_api_get.return_value = {
+        "draft_tasks": [
+            {
+                "id": 9,
+                "title": "Draft A",
+                "status": "draft",
+                "task_type": "task",
+                "runtime": "auto",
+                "parent_id": 4,
+                "source": "agent",
+            }
+        ],
+        "active_tasks": [
+            {
+                "id": 4,
+                "title": "Feature F",
+                "status": "open",
+                "task_type": "feature",
+                "runtime": "auto",
+                "parent_id": 2,
+            }
+        ],
+        "needs_info_tasks": [],
+        "review_tasks": [],
+        "open_prs": [],
+        "recent_commits": [],
+        "recent_decisions": [],
+    }
+    out = await hub_project_status()
+    text = json.loads(_mcp_text(out))["message"]
+    assert "## Drafts (need approval)" in text
+
+    dashboard = _mcp_structured(out)["dashboard"]
+    draft = dashboard["draft_tasks"][0]
+    assert (draft["id"], draft["title"], draft["status"], draft["parent_id"]) == (
+        9,
+        "Draft A",
+        "draft",
+        4,
+    )
+    assert dashboard["active_tasks"][0]["id"] == 4
+
+
+async def test_hub_task_tree_structured_nested_progress(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-2 (#249): the tree is a nested object with progress, not markdown.
+    mock_api_get.return_value = {
+        "id": 1,
+        "title": "Epic",
+        "task_type": "epic",
+        "status": "open",
+        "priority": "high",
+        "progress": {"total": 2, "completed": 1, "active": 1, "percent": 50},
+        "children": [
+            {
+                "id": 2,
+                "title": "Feature",
+                "task_type": "feature",
+                "status": "open",
+                "priority": "medium",
+                "children": [],
+            }
+        ],
+    }
+    out = await hub_task_tree(1)
+    tree = _mcp_structured(out)["tree"]
+    assert tree["progress"]["percent"] == 50
+    assert tree["children"][0]["id"] == 2
