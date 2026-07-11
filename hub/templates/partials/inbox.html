@@ -58,6 +58,18 @@
         {% if t.assigned_agent %}
         <div class="inbox-item-meta">from {{ t.assigned_agent }}</div>
         {% endif %}
+        <div class="inbox-item-meta inbox-draft-rank">
+            {% if t.dor_passed %}
+            <span class="badge badge-completed">ready · score {{ t.readiness_score }}</span>
+            {% elif t.readiness_score is not none %}
+            <span class="badge badge-draft">score {{ t.readiness_score }}</span>
+            {% else %}
+            <span class="badge badge-draft">not refined</span>
+            {% endif %}
+            {% for r in t.risks %}{% if r.severity.value == 'high' %}<span class="badge badge-failed">high risk</span>{% endif %}{% endfor %}
+            {% if t.prepared_by %}<span class="inbox-item-meta">prep: {{ t.prepared_by }}</span>{% endif %}
+            <span class="inbox-item-meta">{{ t.created_at[:10] }}</span>
+        </div>
         {% if t.description %}
         <div class="inbox-item-desc">{{ t.description[:120] }}{% if t.description|length > 120 %}…{% endif %}</div>
         {% endif %}

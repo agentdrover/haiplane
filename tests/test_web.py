@@ -769,3 +769,54 @@ async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient)
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["status"] == "review"
     assert body["review_verdict"] is None
+
+
+# ---- Draft queue ranking (#253) ----
+
+
+async def _draft_with_readiness(client: AsyncClient, title: str, *, ready: bool) -> int:
+    resp = await client.post(
+        "/api/tasks", json={"title": title, "source": "agent", "agent": "bot"}
+    )
+    task_id = resp.json()["id"]
+    if ready:
+        resp = await client.post(
+            f"/api/tasks/{task_id}/refine",
+            json={
+                "work_type": "feature",
+                "user_story": "as a user, I want X so that Y",
+                "problem_statement": "ps",
+                "business_value": "bv",
+                "scope_in": ["m"],
+                "validation_commands": ["uv run pytest -q"],
+                "size": "S",
+                "wip_tag": "feature_work",
+                "acceptance_criteria": [
+                    {
+                        "id": "AC-1",
+                        "given": "g",
+                        "when": "w",
+                        "then": "t",
+                        "verifiable_by": "test",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_inbox_ranks_ready_drafts_first_with_badges(client: AsyncClient):
+    # AC-1 (#253): ready drafts sort above unready ones and carry
+    # score/risk/age markers.
+    bare_id = await _draft_with_readiness(client, "Bare zzz", ready=False)
+    ready_id = await _draft_with_readiness(client, "Ready aaa", ready=True)
+
+    resp = await client.get("/partials/inbox")
+    assert resp.status_code == 200
+    html = resp.text
+    # Ready draft is rendered before the bare one despite a higher id.
+    assert html.index(f"inbox-task-{ready_id}") < html.index(f"inbox-task-{bare_id}")
+    assert "ready · score" in html
+    assert "not refined" in html
+    assert "Approve ready (1)" in html
