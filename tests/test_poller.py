@@ -254,3 +254,95 @@ async def test_poll_failed_review_job_escalates_not_completes(mock_sleep, db):
     assert any(
         u["kind"] == "alert" and "Review job failed" in u["content"] for u in updates
     )
+
+
+# ---- Stale watchdog for silent dead-end statuses (#319) ----
+
+
+async def _make_stale_task(db, *, status, review_job_id=None, minutes=999) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=f"Stale {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    if review_job_id:
+        await repo.update_task(db, task_id, review_job_id=review_job_id)
+    await db.execute(
+        "UPDATE tasks SET updated_at = datetime('now', ?) WHERE id=?",
+        (f"-{minutes} minutes", task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _stale_alerts(db, task_id) -> list[str]:
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert" and "stale" in u["content"].lower()
+    ]
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_stale_client_review_alerted_once(mock_sleep, db):
+    # AC-1: client-driven review past the threshold gets exactly one alert;
+    # the status stays review and a second pass does not duplicate it.
+    task_id = await _make_stale_task(db, status="review")
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+    alerts = await _stale_alerts(db, task_id)
+    assert len(alerts) == 1
+    assert "review" in alerts[0]
+    assert "hub_submit_review" in alerts[0]
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+    assert len(await _stale_alerts(db, task_id)) == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_stale_claimed_and_needs_info_alerted(mock_sleep, db):
+    # AC-2: claimed and needs_info past their thresholds each get an alert
+    # naming the status and the expected action.
+    claimed_id = await _make_stale_task(db, status="claimed")
+    info_id = await _make_stale_task(db, status="needs_info")
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    claimed_alerts = await _stale_alerts(db, claimed_id)
+    assert len(claimed_alerts) == 1
+    assert "claimed" in claimed_alerts[0]
+    assert "hub_pair_start" in claimed_alerts[0]
+
+    info_alerts = await _stale_alerts(db, info_id)
+    assert len(info_alerts) == 1
+    assert "needs_info" in info_alerts[0]
+    assert "hub_answer_question" in info_alerts[0]
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_stale_headless_review_not_alerted(mock_sleep, db):
+    # AC-3: headless review (review_job_id set) belongs to the conveyor —
+    # no stale alert. Dispatch returns no job so the review loop skips it.
+    task_id = await _make_stale_task(db, status="review", review_job_id="rev-9")
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value=None)
+    plugins.dispatch = mock_dispatch
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+    assert await _stale_alerts(db, task_id) == []

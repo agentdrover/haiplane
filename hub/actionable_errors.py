@@ -124,6 +124,21 @@ def human_only_gate_detail(message: str | None = None) -> dict[str, Any]:
     )
 
 
+def self_review_forbidden_detail(agent: str) -> dict[str, Any]:
+    """Universal Review Gate (#318): implementer may not review own work."""
+    return enrich_error_payload(
+        {
+            "reason": "self_review_forbidden",
+            "message": f"agent '{agent}' implemented this task and cannot review it",
+            "hint": "The Universal Review Gate requires an independent reviewer: "
+            "another agent principal or a human token must submit the verdict. "
+            "Solo mode: set OPENCLAW_REVIEW_SELF_APPROVE=allow.",
+            "required_role": "independent_reviewer",
+            "suggested_tool": None,
+        }
+    )
+
+
 def hierarchy_error_detail(
     raw_message: str,
     *,

@@ -41,6 +41,10 @@ HUB_HOST = os.environ.get("OPENCLAW_HUB_HOST", "127.0.0.1")
 HUB_PORT = int(os.environ.get("OPENCLAW_HUB_PORT", "8080"))
 
 MAX_REVIEW_CYCLES = int(os.environ.get("OPENCLAW_MAX_REVIEW_CYCLES", "3"))
+# Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
+# from the agent principal that implemented the task (assigned_agent or
+# claimed_by); 'allow' is the explicit solo-mode opt-out.
+REVIEW_SELF_APPROVE = os.environ.get("OPENCLAW_REVIEW_SELF_APPROVE", "forbid")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
@@ -49,6 +53,13 @@ ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
 ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
+# Stale watchdog (#319): silent dead-end statuses get their own, longer
+# thresholds — review and human answers move slower than execution.
+STALE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_STALE_REVIEW_MINUTES", "120"))
+STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "240"))
+STALE_NEEDS_INFO_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
+)
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")

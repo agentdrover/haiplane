@@ -429,6 +429,64 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     config.STALE_THRESHOLD_MINUTES,
                 )
 
+            # Stale watchdog for silent dead-end statuses (#319). Only
+            # client-driven review is watched (headless review belongs to
+            # this conveyor); statuses never change here — alerts only.
+            stale_specs = (
+                (
+                    "review",
+                    config.STALE_REVIEW_MINUTES,
+                    True,
+                    "Awaiting review verdict: reviewer should run "
+                    "hub_get_review_brief and hub_submit_review.",
+                ),
+                (
+                    "claimed",
+                    config.STALE_CLAIMED_MINUTES,
+                    False,
+                    "Claim held without pair start: call hub_pair_start or "
+                    "hub_release_task.",
+                ),
+                (
+                    "needs_info",
+                    config.STALE_NEEDS_INFO_MINUTES,
+                    False,
+                    "Question awaits a human hub_answer_question.",
+                ),
+            )
+            for status_name, threshold, null_review_job, action in stale_specs:
+                rows = await repo.list_stale_tasks(
+                    db,
+                    status_name,
+                    threshold,
+                    require_null_review_job=null_review_job,
+                )
+                for row in rows:
+                    task = dict(row)
+                    if await repo.has_stale_alert(db, task["id"]):
+                        continue
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"Task stale in {status_name}: no updates for "
+                        f"{threshold}+ minutes. {action}",
+                    )
+                    await db.commit()
+                    await log_activity(
+                        db,
+                        "task_stale",
+                        f"Task #{task['id']} stale in {status_name} "
+                        f"for {threshold}+ min",
+                    )
+                    log.warning(
+                        "Poll: task #%d is stale in %s (no updates for %d+ min)",
+                        task["id"],
+                        status_name,
+                        threshold,
+                    )
+
         except Exception:
             log.exception("Poll error")
 
