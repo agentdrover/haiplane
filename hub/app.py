@@ -545,6 +545,20 @@ async def api_review_verdict(
         row = await repo.get_task(db, task_id)
         if row is not None:
             task = dict(row)
+            # Principal comparison first (#320): free-text agent names can
+            # diverge from the authenticated identity, principals cannot.
+            implementer_pid = task.get("implementer_principal_id")
+            if (
+                implementer_pid is not None
+                and identity.principal_id is not None
+                and identity.principal_id == implementer_pid
+            ):
+                raise HTTPException(
+                    403,
+                    detail=self_review_forbidden_detail(identity.username),
+                )
+            # Name-based fallback (#318) for env tokens / legacy tasks
+            # without a recorded implementer principal.
             implementers = {
                 (task.get("assigned_agent") or "").strip(),
                 (task.get("claimed_by") or "").strip(),
@@ -663,6 +677,7 @@ async def api_pair_start_task(
         task_id,
         body,
         caller=identity.username,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
     )
 
 
@@ -676,7 +691,12 @@ async def api_claim_task(
     """Claim an open task for one Cursor agent/session."""
     if not body.agent.strip():
         body = TaskClaim(agent=identity.username, session_id=body.session_id)
-    return await services.claim_task(_db(request), task_id, body)
+    return await services.claim_task(
+        _db(request),
+        task_id,
+        body,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+    )
 
 
 @app.post("/api/tasks/{task_id}/release", response_model=TaskView)

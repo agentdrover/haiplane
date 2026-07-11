@@ -724,8 +724,15 @@ async def pair_start_task(
     body: TaskPairStart | None = None,
     *,
     caller: str = "",
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Start an open task in pair mode: running without headless dispatch."""
+    """Start an open task in pair mode: running without headless dispatch.
+
+    ``implementer_principal_id`` records WHO implements as an authenticated
+    principal (#320) so the self-review ban can compare identities instead
+    of free-text agent names. None (env tokens, anonymous, humans) keeps
+    the name-based fallback of #318.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -784,6 +791,8 @@ async def pair_start_task(
         "job_id": None,
         "assigned_agent": assigned_agent,
     }
+    if implementer_principal_id is not None:
+        update_fields["implementer_principal_id"] = implementer_principal_id
     if branch:
         update_fields["branch"] = branch
 
@@ -947,8 +956,14 @@ async def claim_task(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskClaim,
+    *,
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Claim an open task for a single Cursor agent/session."""
+    """Claim an open task for a single Cursor agent/session.
+
+    ``implementer_principal_id`` records the claiming agent's authenticated
+    principal (#320) for the identity-based self-review ban.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -985,14 +1000,15 @@ async def claim_task(
         raise HTTPException(409, f"Task #{task_id} claim conflict")
 
     session_note = f" session={body.session_id}" if body.session_id else ""
-    await repo.update_task(
-        db,
-        task_id,
-        claimed_by=body.agent,
-        claim_session_id=body.session_id or None,
-        claimed_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
-        assigned_agent=body.agent,
-    )
+    claim_fields: dict[str, Any] = {
+        "claimed_by": body.agent,
+        "claim_session_id": body.session_id or None,
+        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "assigned_agent": body.agent,
+    }
+    if implementer_principal_id is not None:
+        claim_fields["implementer_principal_id"] = implementer_principal_id
+    await repo.update_task(db, task_id, **claim_fields)
     await repo.add_task_update(
         db,
         task_id,
@@ -1053,6 +1069,9 @@ async def release_task(
         claimed_by=None,
         claim_session_id=None,
         claimed_at=None,
+        # The claim is the implementer's reservation: releasing it also
+        # releases the recorded implementer identity (#320).
+        implementer_principal_id=None,
     )
     await repo.add_task_update(
         db,
