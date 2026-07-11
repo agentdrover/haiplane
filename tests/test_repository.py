@@ -444,3 +444,24 @@ async def test_record_review_verdict_binds_current_generation(
     d = dict(await repo.get_task(db, task_id))
     assert d["submission_generation"] == 2
     assert d["review_verdict_generation"] == 1
+
+
+async def test_list_stale_tasks_filters_status_and_review_job(
+    db: aiosqlite.Connection,
+):
+    stale_review = await _make_task(db, status="review")
+    fresh_review = await _make_task(db, status="review")
+    headless_review = await _make_task(db, status="review")
+    await repo.update_task(db, headless_review, review_job_id="rev-1")
+    for tid in (stale_review, headless_review):
+        await db.execute(
+            "UPDATE tasks SET updated_at = datetime('now', '-999 minutes') WHERE id=?",
+            (tid,),
+        )
+    await db.commit()
+
+    rows = await repo.list_stale_tasks(db, "review", 120, require_null_review_job=True)
+    ids = [dict(r)["id"] for r in rows]
+    assert stale_review in ids
+    assert fresh_review not in ids
+    assert headless_review not in ids

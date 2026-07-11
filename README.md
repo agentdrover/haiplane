@@ -79,7 +79,10 @@ All configuration via environment variables:
 | `OPENCLAW_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
 | `OPENCLAW_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode) |
 | `OPENCLAW_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
-| `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a task is flagged stale |
+| `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
+| `OPENCLAW_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |
+| `OPENCLAW_STALE_CLAIMED_MINUTES` | `240` | Minutes before a claim without pair start is flagged stale |
+| `OPENCLAW_STALE_NEEDS_INFO_MINUTES` | `480` | Minutes before an unanswered question is flagged stale |
 
 ## Structured task form & readiness
 

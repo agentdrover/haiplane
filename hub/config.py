@@ -53,6 +53,13 @@ ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
 ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
+# Stale watchdog (#319): silent dead-end statuses get their own, longer
+# thresholds — review and human answers move slower than execution.
+STALE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_STALE_REVIEW_MINUTES", "120"))
+STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "240"))
+STALE_NEEDS_INFO_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
+)
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
