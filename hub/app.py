@@ -207,6 +207,12 @@ async def api_create_subtasks_bulk(
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 
+@app.get("/api/integrations/notes")
+async def api_notes_availability():
+    """Diagnose the notesforllm link (#251): available | no_binary | no_space | error."""
+    return await plugins.notes.availability()
+
+
 @app.get("/api/tasks", response_model=None)
 async def api_list_tasks(
     request: Request,

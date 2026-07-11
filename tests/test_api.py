@@ -1456,3 +1456,12 @@ async def test_already_iso_timestamp_not_double_converted(client: AsyncClient):
     assert to_iso_utc("2026-07-11T10:00:00+00:00") == "2026-07-11T10:00:00+00:00"
     assert to_iso_utc(None) is None
     assert to_iso_utc("") == ""
+
+
+async def test_notes_availability_endpoint(client: AsyncClient):
+    # (#251) diagnostic endpoint; test plugins are Noop → disabled.
+    resp = await client.get("/api/integrations/notes")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] in ("available", "no_binary", "no_space", "error")
+    assert "detail" in body
