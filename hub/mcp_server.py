@@ -1454,18 +1454,28 @@ async def hub_propose_task(
     parent_id: int | None = None,
     human_owner: str = "",
     human_reviewer: str = "",
+    task_type: str = "task",
 ) -> str:
-    """Propose a new task for human approval (used by agents). Creates a draft task.
+    """Propose new work for human approval (used by agents). Creates a DRAFT.
+
+    Since #323 agents can propose the full decomposition: task, subtask,
+    feature (parent = epic), or epic. Everything an agent proposes starts
+    as a draft — the human approval gate owns the hierarchy.
 
     Args:
-        title: Short title of the proposed task
+        title: Short title of the proposed work
         description: What needs to be done and why
         agent: Name of the proposing agent
-        rationale: Why this task is needed
-        parent_id: Optional parent task ID (to propose subtask or task within a feature)
-        human_owner: Person who owns / is accountable for this task
+        rationale: Why this work is needed
+        parent_id: Parent task ID (feature → epic, task → feature, subtask → task)
+        human_owner: Person who owns / is accountable for this work
         human_reviewer: Person who will review and accept the result
+        task_type: task (default), subtask, feature, or epic
     """
+    if task_type not in ("task", "subtask", "feature", "epic"):
+        return format_echo_response(
+            f"Invalid task_type {task_type!r}: use task, subtask, feature, or epic."
+        )
     body: dict[str, Any] = {
         "title": title,
         "description": description,
@@ -1474,12 +1484,13 @@ async def hub_propose_task(
         "rationale": rationale,
         "human_owner": human_owner,
         "human_reviewer": human_reviewer,
+        "task_type": task_type,
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
     return format_echo_response(
-        f"Draft task #{result['id']} created. Awaiting human approval."
+        f"Draft {task_type} #{result['id']} created. Awaiting human approval."
     )
 
 
