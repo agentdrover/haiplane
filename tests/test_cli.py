@@ -1038,3 +1038,29 @@ def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
     assert rc == 2
     assert "invalid --findings-json" in capsys.readouterr().err
     mock_api.assert_not_called()
+
+
+def test_cmd_approve_batch() -> None:
+    result = {"approved": [1, 2], "skipped": [{"task_id": 3, "reason": "dor_failed"}]}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(
+        task_ids=[1, 2, 3],
+        min_readiness=80,
+        no_require_dor=False,
+        allow_high_risks=False,
+        comment="batch",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_approve_batch(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/batch-approve",
+        {
+            "task_ids": [1, 2, 3],
+            "require_dor_passed": True,
+            "exclude_high_risks": True,
+            "min_readiness": 80,
+            "comment": "batch",
+        },
+    )

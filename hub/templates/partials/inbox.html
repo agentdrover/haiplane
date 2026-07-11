@@ -38,6 +38,15 @@
         Proposals <span class="inbox-count">{{ drafts|length }}</span>
     </summary>
     <div class="inbox-proposals-body">
+    <div class="inbox-item-actions inbox-batch-actions">
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/web-batch-approve-ready"
+                hx-target="#inbox-proposals"
+                hx-swap="outerHTML"
+                hx-confirm="Approve all DoR-ready drafts without high risks?">
+            Approve ready ({{ drafts|selectattr('dor_passed')|list|length }})
+        </button>
+    </div>
     {% for t in drafts %}
     <article class="inbox-item" id="inbox-task-{{ t.id }}">
         <div class="inbox-item-header">

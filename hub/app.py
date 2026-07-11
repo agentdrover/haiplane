@@ -28,6 +28,8 @@ from hub.models import (
     DashboardData,
     ReadinessReport,
     ReadinessTreeReport,
+    BatchApprove,
+    BatchApproveResult,
     ReviewBrief,
     TaskAnswer,
     TaskReviewVerdict,
@@ -612,6 +614,20 @@ async def api_reorder_task(task_id: int, body: TaskReorder, request: Request):
 
 
 # --- Approve / Reject / Start ---
+
+
+@app.post("/api/tasks/batch-approve", response_model=BatchApproveResult)
+async def api_batch_approve(
+    body: BatchApprove,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Approve many drafts in one human operation with per-task guards (#252).
+
+    Human-only like single approve; ``force`` is intentionally unsupported —
+    overrides remain individual, audited actions.
+    """
+    return await services.batch_approve_tasks(_db(request), body)
 
 
 @app.post("/api/tasks/{task_id}/approve", response_model=TaskView)
