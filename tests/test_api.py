@@ -1417,3 +1417,42 @@ async def test_list_tasks_without_cursor_keeps_plain_list(client: AsyncClient):
     body = resp.json()
     assert isinstance(body, list)  # backward compatible
     assert "description" in body[0]
+
+
+# ---- ISO8601 UTC timestamps (#255) ----
+
+_ISO_UTC_RE = __import__("re").compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(\+00:00|Z)$"
+)
+
+
+async def test_all_task_timestamps_are_iso8601_utc(client: AsyncClient):
+    # AC-1 (#255): every timestamp field in REST contracts matches ISO8601
+    # with a UTC marker.
+    resp = await client.post("/api/tasks", json={"title": "Timestamps"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: t"},
+    )
+    await client.post(f"/api/tasks/{task_id}/claim", json={"agent": "dev"})
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    for field in ("created_at", "updated_at", "claimed_at"):
+        assert body[field], field
+        assert _ISO_UTC_RE.match(body[field]), (field, body[field])
+    for u in body["updates"] or []:
+        assert _ISO_UTC_RE.match(u["created_at"]), u["created_at"]
+
+    activity = (await client.get("/api/activity")).json()
+    assert activity
+    assert _ISO_UTC_RE.match(activity[0]["timestamp"]), activity[0]["timestamp"]
+
+
+async def test_already_iso_timestamp_not_double_converted(client: AsyncClient):
+    from hub.models import to_iso_utc
+
+    assert to_iso_utc("2026-07-11 10:00:00") == "2026-07-11T10:00:00+00:00"
+    assert to_iso_utc("2026-07-11T10:00:00+00:00") == "2026-07-11T10:00:00+00:00"
+    assert to_iso_utc(None) is None
+    assert to_iso_utc("") == ""
