@@ -69,6 +69,11 @@ def compute_next_action(
         return "Retry with a human or admin token, or use suggested_tool if provided."
     if reason == "human_only_gate":
         return "Retry with a human or admin Bearer token."
+    if reason == "self_review_forbidden":
+        return (
+            "Hand the verdict to an independent reviewer: another agent "
+            "principal or a human token must call hub_submit_review."
+        )
     if reason == "forbidden":
         return "This operation is forbidden for the current token; use a human or admin token."
     if reason == "invalid_hierarchy":
