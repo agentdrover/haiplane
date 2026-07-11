@@ -26,6 +26,8 @@ from hub.mcp_envelope import (
     merge_mutation_response,
 )
 from hub.workflow_reference import build_mcp_instructions
+from mcp.types import CallToolResult
+
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -37,6 +39,7 @@ from hub.mcp_structured import (
     HubRefineTasksStructured,
     HubTaskStatusResult,
     HubTaskStatusStructured,
+    structured_echo_result,
     structured_tool_result,
 )
 
@@ -246,7 +249,7 @@ def _format_task(t: dict[str, Any]) -> str:
 
 
 @mcp.tool()
-async def hub_project_status() -> str:
+async def hub_project_status() -> CallToolResult:
     """Get project overview: active tasks, drafts needing approval, tasks with questions, open PRs, recent commits, decisions."""
     data = await _api_get("/api/dashboard")
     parts: list[str] = []
@@ -306,7 +309,10 @@ async def hub_project_status() -> str:
             title = d.get("title", "Decision")
             parts.append(f"- {title}")
 
-    return format_echo_response("\n".join(parts) if parts else "No activity found.")
+    return structured_echo_result(
+        "\n".join(parts) if parts else "No activity found.",
+        dashboard=data,
+    )
 
 
 def _tree_query_string(
@@ -427,7 +433,7 @@ async def hub_list_tasks(
     mine: str = "",
     limit: int = 20,
     include_archived: bool = False,
-) -> str:
+) -> CallToolResult:
     """List tasks with optional filters.
 
     Args:
@@ -462,9 +468,9 @@ async def hub_list_tasks(
         params["include_archived"] = "true"
     tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
     if not tasks:
-        return format_echo_response("No tasks found.")
+        return structured_echo_result("No tasks found.", tasks=[])
     lines = [_format_task(t) for t in tasks]
-    return format_echo_response("\n".join(lines))
+    return structured_echo_result("\n".join(lines), tasks=tasks)
 
 
 @mcp.tool()
@@ -704,7 +710,7 @@ async def hub_task_tree(
     max_nodes: int | None = None,
     max_chars: int | None = None,
     mode: str = "full",
-) -> str:
+) -> CallToolResult:
     """Get the hierarchy tree for a task/epic/feature with all descendants and progress.
 
     Without limit parameters the full tree is returned (backward compatible).
@@ -731,7 +737,7 @@ async def hub_task_tree(
         mode=mode if mode in ("full", "summary") else "full",
     )
     rendered = render_task_tree(tree, options)
-    return format_echo_response(rendered.text)
+    return structured_echo_result(rendered.text, tree=tree)
 
 
 @mcp.tool()
@@ -739,7 +745,7 @@ async def hub_my_context(
     task_id: int,
     max_chars: int | None = None,
     mode: str = "full",
-) -> str:
+) -> CallToolResult:
     """Get full work context for an agent: hierarchy breadcrumb, siblings, progress, children.
 
     Use this before starting work on a task to understand its place in the project.
@@ -762,7 +768,7 @@ async def hub_my_context(
         text, truncated = truncate_text(text, effective_max)
         if truncated and TRUNCATION_NOTICE not in text:
             text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
-    return format_echo_response(text)
+    return structured_echo_result(text, context=ctx)
 
 
 @mcp.tool()
@@ -957,7 +963,7 @@ async def hub_submit_for_review(
 
 
 @mcp.tool()
-async def hub_get_review_brief(task_id: int) -> str:
+async def hub_get_review_brief(task_id: int) -> CallToolResult:
     """Get the full review brief for a task: everything a reviewer needs (#308).
 
     Returns acceptance criteria, scope, validation commands, review
@@ -1033,7 +1039,7 @@ async def hub_get_review_brief(task_id: int) -> str:
         "\nSubmit the verdict with hub_submit_review "
         "(verdict=approved|changes_requested, findings for changes_requested)."
     )
-    return format_echo_response("\n".join(parts), brief=brief)
+    return structured_echo_result("\n".join(parts), brief=brief)
 
 
 @mcp.tool()
@@ -1456,7 +1462,7 @@ async def hub_propose_task(
 
 
 @mcp.tool()
-async def hub_list_proposals(status: str = "draft") -> str:
+async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     """List agent proposals (draft tasks).
 
     Args:
@@ -1465,9 +1471,9 @@ async def hub_list_proposals(status: str = "draft") -> str:
     tasks = await _api_get(f"/api/tasks?status={status}&limit=50")
     agent_tasks = [t for t in tasks if t.get("source") == "agent"]
     if not agent_tasks:
-        return format_echo_response(f"No {status} proposals.")
+        return structured_echo_result(f"No {status} proposals.", proposals=[])
     lines = [_format_task(t) for t in agent_tasks]
-    return format_echo_response("\n".join(lines))
+    return structured_echo_result("\n".join(lines), proposals=agent_tasks)
 
 
 # Deprecated aliases
@@ -1489,7 +1495,7 @@ async def hub_reject_proposal(proposal_id: int, comment: str = "") -> str:
 
 
 @mcp.tool()
-async def hub_list_decisions(limit: int = 10) -> str:
+async def hub_list_decisions(limit: int = 10) -> CallToolResult:
     """List recent architectural/development decisions from notesforllm.
 
     Args:
@@ -1498,7 +1504,7 @@ async def hub_list_decisions(limit: int = 10) -> str:
     data = await _api_get("/api/dashboard")
     decisions = data.get("recent_decisions", [])
     if not decisions:
-        return format_echo_response("No decisions recorded.")
+        return structured_echo_result("No decisions recorded.", decisions=[])
     lines = []
     for d in decisions[:limit]:
         title = d.get("title", "Decision")
@@ -1506,7 +1512,7 @@ async def hub_list_decisions(limit: int = 10) -> str:
         lines.append(f"- {title}")
         if content:
             lines.append(f"  {content[:200]}")
-    return format_echo_response("\n".join(lines))
+    return structured_echo_result("\n".join(lines), decisions=decisions[:limit])
 
 
 # ---------------------------------------------------------------------------
@@ -1611,7 +1617,7 @@ if config.VAST_ENABLED:
 
 
 @mcp.tool()
-async def hub_dispatch_jobs(limit: int = 15) -> str:
+async def hub_dispatch_jobs(limit: int = 15) -> CallToolResult:
     """List recent oc-dev-dispatch jobs (raw dispatch state).
 
     Args:
@@ -1619,7 +1625,7 @@ async def hub_dispatch_jobs(limit: int = 15) -> str:
     """
     jobs = await _api_get(f"/api/dispatch/jobs?limit={limit}")
     if not jobs:
-        return format_echo_response("No dispatch jobs found.")
+        return structured_echo_result("No dispatch jobs found.", jobs=[])
     lines = []
     for j in jobs:
         lines.append(
@@ -1627,7 +1633,7 @@ async def hub_dispatch_jobs(limit: int = 15) -> str:
             f"runtime={j.get('runtime', '?')} exit={j.get('exit_code', '-')} "
             f"session={j.get('session_id', '')}"
         )
-    return format_echo_response("\n".join(lines))
+    return structured_echo_result("\n".join(lines), jobs=jobs)
 
 
 # ---------------------------------------------------------------------------
@@ -2340,7 +2346,7 @@ async def hub_add_risk(
 
 
 @mcp.tool()
-async def hub_get_readiness(task_id: int, explain: bool = False) -> str:
+async def hub_get_readiness(task_id: int, explain: bool = False) -> CallToolResult:
     """Get the Definition of Ready report and readiness score for a task.
 
     Returns a compact human-readable summary. Set explain=true to receive
@@ -2356,8 +2362,8 @@ async def hub_get_readiness(task_id: int, explain: bool = False) -> str:
         path += "?explain=true"
     report = await _api_get(path)
     if explain:
-        return json.dumps(with_instance_echo(report), ensure_ascii=False, indent=2)
-    return format_echo_response(_format_readiness(report, task_id))
+        return structured_echo_result(_format_readiness(report, task_id), report=report)
+    return structured_echo_result(_format_readiness(report, task_id), report=report)
 
 
 @mcp.tool()
