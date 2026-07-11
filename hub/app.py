@@ -207,7 +207,7 @@ async def api_create_subtasks_bulk(
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 
-@app.get("/api/tasks", response_model=list[TaskView])
+@app.get("/api/tasks", response_model=None)
 async def api_list_tasks(
     request: Request,
     status: str | None = None,
@@ -220,7 +220,15 @@ async def api_list_tasks(
     mine: str | None = Query(default=None, description="Filter owner OR claim holder"),
     limit: int = Query(default=50, le=200),
     include_archived: bool = Query(default=False, alias="include_archived"),
+    after_id: int | None = Query(
+        default=None,
+        ge=0,
+        description="Cursor (#254): 0 starts a paged walk, then pass next_cursor",
+    ),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
 ):
+    """List tasks. Plain list without after_id/mode=summary (backward
+    compatible); paged/summary calls return {tasks, next_cursor} (#254)."""
     return await services.list_tasks(
         _db(request),
         status=status,
@@ -233,6 +241,8 @@ async def api_list_tasks(
         mine=mine,
         limit=limit,
         include_archived=include_archived,
+        after_id=after_id,
+        mode=mode,
     )
 
 

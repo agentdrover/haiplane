@@ -1894,3 +1894,30 @@ async def test_hub_list_proposals_ranked_and_flagged(
     assert flags == {2: True, 3: False, 1: False}  # high risk blocks ready
     text = json.loads(_mcp_text(out))["message"]
     assert "READY" in text and "HIGH-RISK" in text
+
+
+async def test_hub_list_tasks_paged_envelope(mock_api_get: AsyncMock) -> None:
+    # (#254) MCP passes cursor params and surfaces next_cursor.
+    mock_api_get.return_value = {
+        "tasks": [
+            {
+                "id": 7,
+                "title": "T",
+                "status": "open",
+                "task_type": "task",
+                "priority": "medium",
+                "parent_id": None,
+                "readiness_score": None,
+                "dor_passed": None,
+            }
+        ],
+        "next_cursor": 7,
+    }
+    out = await hub_list_tasks(after_id=0, mode="summary", limit=1)
+    structured = _mcp_structured(out)
+    assert structured["next_cursor"] == 7
+    assert structured["tasks"][0]["id"] == 7
+    text = json.loads(_mcp_text(out))["message"]
+    assert "after_id=7" in text
+    called = mock_api_get.await_args.args[0]
+    assert "after_id=0" in called and "mode=summary" in called
