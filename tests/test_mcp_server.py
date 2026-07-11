@@ -189,9 +189,31 @@ async def test_hub_propose(mock_api_post: AsyncMock) -> None:
             "rationale": "Because",
             "human_owner": "",
             "human_reviewer": "",
+            "task_type": "task",
             "parent_id": 7,
         },
     )
+
+
+async def test_hub_propose_feature_draft(mock_api_post: AsyncMock) -> None:
+    # (#323) agents propose features as drafts under an epic.
+    mock_api_post.return_value = {"id": 101}
+    msg = await hub_propose_task(
+        "Projects feature",
+        "Split the product into projects",
+        task_type="feature",
+        parent_id=3,
+    )
+    assert "Draft feature #101 created" in msg
+    body = mock_api_post.await_args.args[1]
+    assert body["task_type"] == "feature"
+    assert body["parent_id"] == 3
+
+
+async def test_hub_propose_rejects_bad_type(mock_api_post: AsyncMock) -> None:
+    msg = await hub_propose_task("X", "Y", task_type="story")
+    assert "Invalid task_type" in msg
+    mock_api_post.assert_not_awaited()
 
 
 async def test_hub_start_task(
