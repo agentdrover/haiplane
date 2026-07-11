@@ -391,6 +391,34 @@
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 
+                {% elif task.status.value == 'review' and not task.review_job_id %}
+                <div class="task-action-state task-action-state--danger">Review Required</div>
+                {% if review_error %}
+                <div class="task-action-note">{{ review_error }}</div>
+                {% endif %}
+                {% if task.latest_review %}
+                <div class="task-action-note">
+                    Last verdict: {{ task.latest_review.verdict.value|upper }}
+                    for submission #{{ task.latest_review.submission_generation }}
+                    ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
+                    {% if task.latest_review.findings %}
+                    <ul class="task-review-findings">
+                        {% for f in task.latest_review.findings %}
+                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}</li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
+                </div>
+                {% endif %}
+                <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack">
+                    <label class="task-action-label" for="review-comments">Review comments</label>
+                    <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
+                    <button class="btn btn-success task-action-btn" type="submit" name="verdict" value="approved">Approve</button>
+                    <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...)</label>
+                    <textarea id="review-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: race condition in bump&#10;low: typo in docstring"></textarea>
+                    <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
+                </form>
+
                 {% elif task.status.value in ('running', 'review', 'fix_requested', 'ci_check') %}
                 <div class="task-action-state">In Progress</div>
                 <button class="btn btn-primary task-action-btn"

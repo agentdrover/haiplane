@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from hub import config, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.actionable_errors import self_review_forbidden_detail
 from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -541,33 +540,14 @@ async def api_review_verdict(
     ``running``; this endpoint never completes a task.
     """
     db = _db(request)
-    if identity.is_agent and config.REVIEW_SELF_APPROVE != "allow":
-        row = await repo.get_task(db, task_id)
-        if row is not None:
-            task = dict(row)
-            # Principal comparison first (#320): free-text agent names can
-            # diverge from the authenticated identity, principals cannot.
-            implementer_pid = task.get("implementer_principal_id")
-            if (
-                implementer_pid is not None
-                and identity.principal_id is not None
-                and identity.principal_id == implementer_pid
-            ):
-                raise HTTPException(
-                    403,
-                    detail=self_review_forbidden_detail(identity.username),
-                )
-            # Name-based fallback (#318) for env tokens / legacy tasks
-            # without a recorded implementer principal.
-            implementers = {
-                (task.get("assigned_agent") or "").strip(),
-                (task.get("claimed_by") or "").strip(),
-            } - {""}
-            if identity.username in implementers:
-                raise HTTPException(
-                    403,
-                    detail=self_review_forbidden_detail(identity.username),
-                )
+    row = await repo.get_task(db, task_id)
+    if row is not None:
+        services.ensure_reviewer_independence(
+            dict(row),
+            is_agent=identity.is_agent,
+            principal_id=identity.principal_id,
+            username=identity.username,
+        )
     return await services.record_review_verdict(db, task_id, body)
 
 

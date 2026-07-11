@@ -15,6 +15,7 @@ from hub import db as db_module
 from hub.actionable_errors import (
     done_report_error_detail,
     hierarchy_error_detail,
+    self_review_forbidden_detail,
     withdraw_own_draft_error_detail,
 )
 from hub import repository as repo
@@ -235,6 +236,37 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             required_status="running",
         ),
     )
+
+
+def ensure_reviewer_independence(
+    task: dict[str, Any],
+    *,
+    is_agent: bool,
+    principal_id: int | None,
+    username: str,
+) -> None:
+    """Raise 403 when the caller implemented the task (#318/#320).
+
+    Shared by the REST endpoint and the web review panel so verdict
+    independence has exactly one definition. Principal comparison wins;
+    the name-based check is the fallback for env tokens and legacy tasks.
+    Humans and the solo opt-out (OPENCLAW_REVIEW_SELF_APPROVE=allow) pass.
+    """
+    if not is_agent or config.REVIEW_SELF_APPROVE == "allow":
+        return
+    implementer_pid = task.get("implementer_principal_id")
+    if (
+        implementer_pid is not None
+        and principal_id is not None
+        and principal_id == implementer_pid
+    ):
+        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+    implementers = {
+        (task.get("assigned_agent") or "").strip(),
+        (task.get("claimed_by") or "").strip(),
+    } - {""}
+    if username in implementers:
+        raise HTTPException(403, detail=self_review_forbidden_detail(username))
 
 
 def parse_review_findings(raw: Any) -> list[ReviewFinding]:
