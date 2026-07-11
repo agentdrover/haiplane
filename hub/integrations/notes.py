@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import pathlib
 from typing import Any
 
 from hub.config import N4L_BIN, N4L_SPACE_ID
@@ -53,6 +54,38 @@ async def _n4l(
 
 class NotesIntegration:
     """Concrete notes plugin backed by the n4l CLI."""
+
+    async def availability(self) -> dict[str, str]:
+        """Diagnose the notes link (#251): available | no_binary | no_space | error.
+
+        Silent empty lists made "no decisions" indistinguishable from "the
+        integration is broken"; this gives callers an explicit reason.
+        """
+        import shutil
+
+        if not shutil.which(N4L_BIN) and not pathlib.Path(N4L_BIN).exists():
+            return {
+                "status": "no_binary",
+                "detail": f"n4l binary not found at {N4L_BIN}",
+            }
+        if N4L_SPACE_ID:
+            return {"status": "available", "detail": f"space={N4L_SPACE_ID}"}
+        result = await _n4l("spaces_list")
+        if result is None:
+            return {
+                "status": "error",
+                "detail": "n4l spaces_list failed (see hub logs)",
+            }
+        spaces = result if isinstance(result, list) else []
+        if not spaces:
+            return {
+                "status": "no_space",
+                "detail": "OPENCLAW_N4L_SPACE is not set and no spaces exist",
+            }
+        return {
+            "status": "available",
+            "detail": f"default space={spaces[0].get('id', '?')}",
+        }
 
     async def recent_decisions(
         self, space_id: str | None = None, limit: int = 10

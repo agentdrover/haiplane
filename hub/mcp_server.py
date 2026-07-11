@@ -1551,7 +1551,23 @@ async def hub_list_decisions(limit: int = 10) -> CallToolResult:
     data = await _api_get("/api/dashboard")
     decisions = data.get("recent_decisions", [])
     if not decisions:
-        return structured_echo_result("No decisions recorded.", decisions=[])
+        # Distinguish "no decisions" from "integration broken" (#251).
+        health = await _api_get("/api/integrations/notes")
+        available = health.get("status") == "available"
+        if available:
+            message = "No decisions recorded."
+        else:
+            message = (
+                "Notes integration unavailable "
+                f"({health.get('status')}): {health.get('detail', '')}"
+            )
+        return structured_echo_result(
+            message,
+            decisions=[],
+            notes_available=available,
+            notes_status=health.get("status"),
+            notes_detail=health.get("detail", ""),
+        )
     lines = []
     for d in decisions[:limit]:
         title = d.get("title", "Decision")
@@ -1559,7 +1575,12 @@ async def hub_list_decisions(limit: int = 10) -> CallToolResult:
         lines.append(f"- {title}")
         if content:
             lines.append(f"  {content[:200]}")
-    return structured_echo_result("\n".join(lines), decisions=decisions[:limit])
+    return structured_echo_result(
+        "\n".join(lines),
+        decisions=decisions[:limit],
+        notes_available=True,
+        notes_status="available",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -189,6 +189,9 @@ class NoopGitHub:
 
 
 class NoopNotes:
+    async def availability(self) -> dict[str, str]:
+        return {"status": "no_binary", "detail": "notes integration disabled"}
+
     async def recent_decisions(
         self, space_id: str | None = None, limit: int = 10
     ) -> list[dict[str, Any]]:
