@@ -1172,3 +1172,101 @@ async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkey
     )
     assert resp.status_code == 200
     assert resp.json()["review_approved_current"] is True
+
+
+# ---- Implementer principal binding (#320) ----
+
+
+def _principal_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        # Same principal id 7, different display username than assigned_agent.
+        "impl-pid-token": TokenIdentity("display-name-x", "agent", principal_id=7),
+        "other-pid-token": TokenIdentity("reviewer-y", "agent", principal_id=8),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+async def test_self_review_blocked_by_principal_despite_name_mismatch(
+    client: AsyncClient, monkeypatch
+):
+    # AC-1: the implementer principal is rejected even when assigned_agent
+    # holds a different free-text name than the token's username.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Principal gate"}, headers=impl
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "someone", "kind": "status", "content": "Plan: work"},
+        headers=impl,
+    )
+    # Pair-start with an assigned_agent name that does NOT match the token
+    # username — exactly the prod scenario that motivated #320.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "claude-code"},
+        headers=impl,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=impl
+    )
+    assert resp.json()["status"] == "review"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "claude-code"},
+        headers=impl,
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "self_review_forbidden"
+
+    # AC-3: a different principal passes.
+    other = {"Authorization": "Bearer other-pid-token"}
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer-y"},
+        headers=other,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["review_approved_current"] is True
+
+
+async def test_claim_records_and_release_clears_implementer_principal(
+    client: AsyncClient, monkeypatch, db
+):
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Claim principal"}, headers=impl
+    )
+    task_id = resp.json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim", json={"agent": "display-name-x"}, headers=impl
+    )
+    assert resp.status_code == 200
+    d = dict(await repo_module.get_task(db, task_id))
+    assert d["implementer_principal_id"] == 7
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/release",
+        json={"agent": "display-name-x"},
+        headers=impl,
+    )
+    assert resp.status_code == 200
+    d = dict(await repo_module.get_task(db, task_id))
+    assert d["implementer_principal_id"] is None
