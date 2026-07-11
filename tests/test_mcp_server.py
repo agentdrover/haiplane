@@ -24,6 +24,7 @@ from hub.mcp_server import (
     hub_get_readiness,
     hub_get_review_brief,
     hub_my_context,
+    hub_project_status,
     hub_task_tree,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
@@ -1767,3 +1768,77 @@ async def test_read_tools_return_object_not_json_string(
     out = await hub_task_tree(5)
     structured = _mcp_structured(out)
     assert structured["tree"]["id"] == 5
+
+
+async def test_hub_project_status_structured_lists(mock_api_get: AsyncMock) -> None:
+    # AC-1 (#249): structuredContent carries the dashboard lists as objects
+    # with id/title/status/parent_id, while message keeps the markdown digest.
+    mock_api_get.return_value = {
+        "draft_tasks": [
+            {
+                "id": 9,
+                "title": "Draft A",
+                "status": "draft",
+                "task_type": "task",
+                "runtime": "auto",
+                "parent_id": 4,
+                "source": "agent",
+            }
+        ],
+        "active_tasks": [
+            {
+                "id": 4,
+                "title": "Feature F",
+                "status": "open",
+                "task_type": "feature",
+                "runtime": "auto",
+                "parent_id": 2,
+            }
+        ],
+        "needs_info_tasks": [],
+        "review_tasks": [],
+        "open_prs": [],
+        "recent_commits": [],
+        "recent_decisions": [],
+    }
+    out = await hub_project_status()
+    text = json.loads(_mcp_text(out))["message"]
+    assert "## Drafts (need approval)" in text
+
+    dashboard = _mcp_structured(out)["dashboard"]
+    draft = dashboard["draft_tasks"][0]
+    assert (draft["id"], draft["title"], draft["status"], draft["parent_id"]) == (
+        9,
+        "Draft A",
+        "draft",
+        4,
+    )
+    assert dashboard["active_tasks"][0]["id"] == 4
+
+
+async def test_hub_task_tree_structured_nested_progress(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-2 (#249): the tree is a nested object with progress, not markdown.
+    mock_api_get.return_value = {
+        "id": 1,
+        "title": "Epic",
+        "task_type": "epic",
+        "status": "open",
+        "priority": "high",
+        "progress": {"total": 2, "completed": 1, "active": 1, "percent": 50},
+        "children": [
+            {
+                "id": 2,
+                "title": "Feature",
+                "task_type": "feature",
+                "status": "open",
+                "priority": "medium",
+                "children": [],
+            }
+        ],
+    }
+    out = await hub_task_tree(1)
+    tree = _mcp_structured(out)["tree"]
+    assert tree["progress"]["percent"] == 50
+    assert tree["children"][0]["id"] == 2
