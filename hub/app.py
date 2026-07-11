@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from hub import config, services
 from hub import db as db_module
 from hub import repository as repo
+from hub.actionable_errors import self_review_forbidden_detail
 from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -525,14 +526,35 @@ async def api_review_verdict(
     task_id: int,
     request: Request,
     body: TaskReviewVerdict,
+    identity=Depends(current_identity),
 ):
     """Record a review verdict for the current submission (#307).
+
+    Separation of duties (#318): the agent principal that implemented the
+    task (assigned_agent or claimed_by) may not review it. The check uses
+    the AUTHENTICATED identity — the ``agent`` field in the body is
+    display-only. Human/admin tokens always pass;
+    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` is the solo-mode opt-out.
 
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
     ``running``; this endpoint never completes a task.
     """
-    return await services.record_review_verdict(_db(request), task_id, body)
+    db = _db(request)
+    if identity.is_agent and config.REVIEW_SELF_APPROVE != "allow":
+        row = await repo.get_task(db, task_id)
+        if row is not None:
+            task = dict(row)
+            implementers = {
+                (task.get("assigned_agent") or "").strip(),
+                (task.get("claimed_by") or "").strip(),
+            } - {""}
+            if identity.username in implementers:
+                raise HTTPException(
+                    403,
+                    detail=self_review_forbidden_detail(identity.username),
+                )
+    return await services.record_review_verdict(db, task_id, body)
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)

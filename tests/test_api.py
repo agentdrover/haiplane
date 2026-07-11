@@ -1061,3 +1061,114 @@ async def test_full_rest_review_cycle_completes_only_after_approval(
     assert resp.status_code == 200
     resp = await client.get(f"/api/tasks/{task_id2}")
     assert resp.json()["status"] == "completed"
+
+
+# ---- Separation of duties: no self-approve (#318) ----
+
+
+def _review_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        "impl-token": TokenIdentity("impl-bot", "agent"),
+        "reviewer-token": TokenIdentity("reviewer-bot", "agent"),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+async def _task_in_review(client: AsyncClient, title: str, headers: dict) -> int:
+    resp = await client.post("/api/tasks", json={"title": title}, headers=headers)
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "impl-bot", "kind": "status", "content": "Plan: work"},
+        headers=headers,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "impl-bot"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=headers
+    )
+    assert resp.json()["status"] == "review"
+    return task_id
+
+
+async def test_self_review_verdict_rejected(client: AsyncClient, monkeypatch):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-token"}
+
+    task_id = await _task_in_review(client, "Self review blocked", impl)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "someone-else"},
+        headers=impl,
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "self_review_forbidden"
+    assert "independent reviewer" in detail["hint"]
+    # Verdict must not be recorded.
+    resp = await client.get(f"/api/tasks/{task_id}", headers=impl)
+    body = resp.json()
+    assert body["review_verdict"] is None
+    assert body["status"] == "review"
+
+
+async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypatch):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-token"}
+    reviewer = {"Authorization": "Bearer reviewer-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await _task_in_review(client, "Independent review ok", impl)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "changes_requested", "agent": "reviewer-bot"},
+        headers=reviewer,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+
+    # Resubmit and let the human approve.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=impl
+    )
+    assert resp.json()["status"] == "review"
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "denis"},
+        headers=human,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["review_approved_current"] is True
+
+
+async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkeypatch):
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    impl = {"Authorization": "Bearer impl-token"}
+
+    task_id = await _task_in_review(client, "Solo mode", impl)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "impl-bot"},
+        headers=impl,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["review_approved_current"] is True
