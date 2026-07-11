@@ -101,6 +101,7 @@ async def list_tasks_filtered(
     mine: str | None = None,
     limit: int = 50,
     include_archived: bool = False,
+    after_id: int | None = None,
 ) -> list[aiosqlite.Row]:
     conditions: list[str] = []
     params: list[Any] = []
@@ -134,10 +135,20 @@ async def list_tasks_filtered(
         mine=mine,
     )
 
+    # Cursor pagination (#254): a paged walk orders by id DESC only, so the
+    # cursor (last returned id) is stable across pages; after_id=0 starts
+    # the walk. Non-paged calls keep the board ordering.
+    if after_id is not None:
+        if after_id > 0:
+            conditions.append("id < ?")
+            params.append(after_id)
+        order = "id DESC"
+    else:
+        order = "position ASC, id DESC"
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE {where} ORDER BY position ASC, id DESC LIMIT ?",  # nosec B608
+        f"SELECT * FROM tasks WHERE {where} ORDER BY {order} LIMIT ?",  # nosec B608
         tuple(params),
     )
 

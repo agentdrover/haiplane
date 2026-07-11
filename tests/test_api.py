@@ -1359,3 +1359,61 @@ async def test_batch_approve_agent_token_forbidden(client: AsyncClient, monkeypa
     )
     assert resp.status_code == 403
     assert resp.json()["detail"]["reason"] == "human_only_gate"
+
+
+# ---- Cursor pagination and summary mode (#254) ----
+
+
+async def test_cursor_walk_visits_each_task_exactly_once(client: AsyncClient):
+    # AC-1 (#254): full walk via cursor — no gaps, no duplicates, last page
+    # without next_cursor.
+    created = []
+    for i in range(5):
+        resp = await client.post("/api/tasks", json={"title": f"Page task {i}"})
+        created.append(resp.json()["id"])
+
+    seen: list[int] = []
+    cursor = 0
+    pages = 0
+    while True:
+        resp = await client.get(f"/api/tasks?limit=2&after_id={cursor}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body.keys()) == {"tasks", "next_cursor"}
+        seen.extend(t["id"] for t in body["tasks"])
+        pages += 1
+        if body["next_cursor"] is None:
+            break
+        cursor = body["next_cursor"]
+        assert pages < 20
+
+    assert len(seen) == len(set(seen))  # no duplicates
+    assert set(created) <= set(seen)  # no gaps
+    assert sorted(seen, reverse=True) == seen  # stable id DESC order
+
+
+async def test_summary_mode_returns_compact_fields(client: AsyncClient):
+    # AC-2 (#254): summary mode strips to compact fields.
+    resp = await client.post("/api/tasks", json={"title": "Summary me"})
+    assert resp.status_code == 200
+    resp = await client.get("/api/tasks?mode=summary&limit=5")
+    body = resp.json()
+    task = body["tasks"][0]
+    assert set(task.keys()) == {
+        "id",
+        "title",
+        "status",
+        "task_type",
+        "parent_id",
+        "priority",
+        "readiness_score",
+        "dor_passed",
+    }
+
+
+async def test_list_tasks_without_cursor_keeps_plain_list(client: AsyncClient):
+    await client.post("/api/tasks", json={"title": "Plain list"})
+    resp = await client.get("/api/tasks?limit=5")
+    body = resp.json()
+    assert isinstance(body, list)  # backward compatible
+    assert "description" in body[0]

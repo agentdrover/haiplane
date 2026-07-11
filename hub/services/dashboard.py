@@ -186,8 +186,18 @@ async def list_tasks(
     mine: str | None = None,
     limit: int = 50,
     include_archived: bool = False,
-) -> list[TaskView]:
-    """List tasks with optional filters, returning TaskView models."""
+    after_id: int | None = None,
+    mode: str = "full",
+) -> list[TaskView] | dict[str, Any]:
+    """List tasks with optional filters.
+
+    Backward compatible: without ``after_id``/``mode=summary`` returns the
+    plain TaskView list. A paged or summary call returns an envelope
+    ``{"tasks": [...], "next_cursor": id|None}`` (#254); pass the returned
+    cursor as ``after_id`` to walk the full set without gaps or duplicates.
+    """
+    paged = after_id is not None or mode == "summary"
+    fetch_limit = limit + 1 if paged else limit
     rows = await repo.list_tasks_filtered(
         db,
         status=status,
@@ -199,10 +209,34 @@ async def list_tasks(
         human_reviewer=human_reviewer,
         claimed_by=claimed_by,
         mine=mine,
-        limit=limit,
+        limit=fetch_limit,
         include_archived=include_archived,
+        after_id=after_id if after_id is not None else (0 if paged else None),
     )
-    return [row_to_task(r) for r in rows]
+    views = [row_to_task(r) for r in rows]
+    if not paged:
+        return views
+
+    has_more = len(views) > limit
+    views = views[:limit]
+    next_cursor = views[-1].id if has_more and views else None
+    if mode == "summary":
+        tasks: list[dict[str, Any]] = [
+            {
+                "id": v.id,
+                "title": v.title,
+                "status": v.status.value,
+                "task_type": v.task_type.value,
+                "parent_id": v.parent_id,
+                "priority": v.priority.value,
+                "readiness_score": v.readiness_score,
+                "dor_passed": v.dor_passed,
+            }
+            for v in views
+        ]
+    else:
+        tasks = [v.model_dump(mode="json") for v in views]
+    return {"tasks": tasks, "next_cursor": next_cursor}
 
 
 def _parse_activity_rows(

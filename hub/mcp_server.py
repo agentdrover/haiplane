@@ -433,8 +433,14 @@ async def hub_list_tasks(
     mine: str = "",
     limit: int = 20,
     include_archived: bool = False,
+    after_id: int | None = None,
+    mode: str = "full",
 ) -> CallToolResult:
     """List tasks with optional filters.
+
+    Pagination (#254): pass after_id=0 to start a paged walk (mode=summary
+    for compact fields), then repeat with the returned next_cursor until it
+    is null.
 
     Args:
         status: Filter by status: draft, open, running, needs_info, review, fix_requested, needs_decision, completed, failed, rejected. Empty for all.
@@ -466,11 +472,27 @@ async def hub_list_tasks(
         params["mine"] = mine
     if include_archived:
         params["include_archived"] = "true"
-    tasks = await _api_get(f"/api/tasks?{urlencode(params)}")
-    if not tasks:
+    if after_id is not None:
+        params["after_id"] = after_id
+    if mode and mode != "full":
+        params["mode"] = mode
+    result = await _api_get(f"/api/tasks?{urlencode(params)}")
+    if isinstance(result, dict):
+        # Paged/summary envelope (#254).
+        tasks = result.get("tasks", [])
+        next_cursor = result.get("next_cursor")
+        if not tasks:
+            return structured_echo_result("No tasks found.", tasks=[], next_cursor=None)
+        lines = [_format_task(t) for t in tasks]
+        if next_cursor is not None:
+            lines.append(f"… more: pass after_id={next_cursor}")
+        return structured_echo_result(
+            "\n".join(lines), tasks=tasks, next_cursor=next_cursor
+        )
+    if not result:
         return structured_echo_result("No tasks found.", tasks=[])
-    lines = [_format_task(t) for t in tasks]
-    return structured_echo_result("\n".join(lines), tasks=tasks)
+    lines = [_format_task(t) for t in result]
+    return structured_echo_result("\n".join(lines), tasks=result)
 
 
 @mcp.tool()
