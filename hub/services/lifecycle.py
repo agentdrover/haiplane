@@ -414,7 +414,10 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
         )
 
     if body.task_type in (TaskType.epic, TaskType.feature):
-        initial_status = "open"
+        # Agents PROPOSE features/epics as drafts (#323) — the human
+        # approval gate owns the decomposition. Human-created ones stay
+        # open (the pre-#323 invariant, now scoped to source=human).
+        initial_status = "draft" if body.source == TaskSource.agent else "open"
         body.run_immediately = False
         body.auto_review = False
     elif body.source == TaskSource.agent:
