@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -153,6 +154,7 @@ async def refine_task(
         updated_columns, ac_count = await _apply_refine_writes(
             db, task_id, payload, old_row
         )
+        await recalc_readiness_inline(db, task_id)
 
     return {"updated_columns": updated_columns, "ac_count": ac_count}
 
@@ -236,13 +238,64 @@ async def refine_tasks_bulk(
                 )
             )
 
-    # Readiness is computed after commit so each report reflects the final row.
-    for outcome in outcomes:
-        report = await calculate_readiness_with_recommendations(db, outcome.task_id)
-        outcome.readiness_score = report.score
-        outcome.dor_passed = report.dor_passed
+    # Readiness is computed after commit so each report reflects the final row,
+    # and persisted (#250) so lists/boards can rely on the stored values.
+    async with get_write_lock(db):
+        for outcome in outcomes:
+            report = await calculate_readiness_with_recommendations(db, outcome.task_id)
+            await _persist_readiness_fields(db, outcome.task_id, report)
+            outcome.readiness_score = report.score
+            outcome.dor_passed = report.dor_passed
+        await db.commit()
 
     return BulkRefineResult(results=outcomes)
+
+
+async def _persist_readiness_fields(
+    db: aiosqlite.Connection,
+    task_id: int,
+    report: ReadinessReport,
+) -> None:
+    """Write score/dor_passed/ready_at onto the task row (#250). No locking —
+    the caller owns the transaction (an ``_atomic`` block or an explicit
+    write-lock + commit)."""
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return
+    fields: dict[str, Any] = {
+        "readiness_score": report.score,
+        "dor_passed": int(report.dor_passed),
+    }
+    if report.dor_passed:
+        if not row["ready_at"]:
+            fields["ready_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+    else:
+        # DoR regressed (e.g. a required AC was deleted): the persisted
+        # readiness must not go stale.
+        fields["ready_at"] = None
+    await repo.update_task(db, task_id, **fields)
+
+
+async def recalc_readiness_inline(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> ReadinessReport:
+    """Recompute readiness and persist it — call INSIDE an ``_atomic`` block
+    (it must not re-acquire the write lock)."""
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    await _persist_readiness_fields(db, task_id, report)
+    return report
+
+
+def _persisted_readiness_stale(row: aiosqlite.Row, report: ReadinessReport) -> bool:
+    stored_passed = row["dor_passed"]
+    return (
+        row["readiness_score"] != report.score
+        or stored_passed is None
+        or bool(stored_passed) != report.dor_passed
+        or (report.dor_passed and not row["ready_at"])
+        or (not report.dor_passed and bool(row["ready_at"]))
+    )
 
 
 async def add_risk(
@@ -256,6 +309,7 @@ async def add_risk(
         updated = await repo.append_task_risk(db, task_id, risk)
         if not updated:
             raise TaskNotFoundError(f"task {task_id} not found")
+        await recalc_readiness_inline(db, task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +356,7 @@ async def add_acceptance_criterion(
             raise DuplicateAcceptanceCriterionError(
                 f"acceptance criterion {ac.id!r} already exists for task {task_id}"
             ) from exc
+        await recalc_readiness_inline(db, task_id)
     return ac, True
 
 
@@ -318,6 +373,7 @@ async def upsert_acceptance_criterion(
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "upsert_ac"):
         created = await repo.upsert_acceptance_criterion(db, task_id, ac)
+        await recalc_readiness_inline(db, task_id)
     return ac, created
 
 
@@ -332,6 +388,7 @@ async def replace_acceptance_criteria(
             await repo.replace_acceptance_criteria(db, task_id, items)
         except ValueError as exc:
             raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+        await recalc_readiness_inline(db, task_id)
     return items
 
 
@@ -346,6 +403,7 @@ async def delete_acceptance_criterion(
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "delete_ac"):
         removed = await repo.delete_acceptance_criterion(db, task_id, ac_id)
+        await recalc_readiness_inline(db, task_id)
     return removed
 
 
@@ -361,7 +419,17 @@ async def get_readiness(
     explain: bool = False,
 ) -> ReadinessReport:
     await _ensure_task_exists(db, task_id)
-    return await calculate_readiness_with_recommendations(db, task_id, explain=explain)
+    report = await calculate_readiness_with_recommendations(
+        db, task_id, explain=explain
+    )
+    # Lazy repair (#250): reading readiness heals stale persisted values for
+    # tasks refined before persistence existed.
+    row = await repo.get_task(db, task_id)
+    if row is not None and _persisted_readiness_stale(row, report):
+        async with get_write_lock(db):
+            await _persist_readiness_fields(db, task_id, report)
+            await db.commit()
+    return report
 
 
 async def readiness_tree(

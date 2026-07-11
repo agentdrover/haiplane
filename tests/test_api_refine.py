@@ -807,3 +807,77 @@ async def test_add_ac_duplicate_ac_id_is_idempotent(client: AsyncClient):
 
     acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
     assert len(acs) == 1
+
+
+# ---- Persisted readiness (#250) ----
+
+_DOR_READY_PAYLOAD = {
+    "work_type": "feature",
+    "user_story": "as a user, I want X so that Y",
+    "problem_statement": "ps",
+    "business_value": "bv",
+    "scope_in": ["module"],
+    "validation_commands": ["uv run pytest -q"],
+    "size": "S",
+    "wip_tag": "feature_work",
+    "acceptance_criteria": [
+        {
+            "id": "AC-1",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "verifiable_by": "test",
+        }
+    ],
+}
+
+
+async def test_refine_persists_readiness_on_task_row(client: AsyncClient):
+    # AC-1 (#250): after refine, score/dor_passed are visible on the task
+    # itself — no /readiness call required.
+    task = await _create_task(client)
+    resp = await client.post(f"/api/tasks/{task['id']}/refine", json=_DOR_READY_PAYLOAD)
+    assert resp.status_code == 200, resp.text
+
+    body = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert body["dor_passed"] is True
+    assert body["readiness_score"] is not None and body["readiness_score"] > 0
+    assert body["ready_at"]
+
+
+async def test_deleting_required_ac_recomputes_persisted_readiness(
+    client: AsyncClient,
+):
+    # AC-2 (#250): persisted values must not go stale after a regression.
+    task = await _create_task(client)
+    await client.post(f"/api/tasks/{task['id']}/refine", json=_DOR_READY_PAYLOAD)
+    body = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert body["dor_passed"] is True
+
+    resp = await client.delete(f"/api/tasks/{task['id']}/acceptance_criteria/AC-1")
+    assert resp.status_code in (200, 204), resp.text
+
+    body = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert body["dor_passed"] is False
+    assert body["ready_at"] is None
+
+
+async def test_get_readiness_lazily_repairs_stale_persisted_values(
+    client: AsyncClient, db
+):
+    from hub import repository as repo_module
+
+    task = await _create_task(client)
+    await client.post(f"/api/tasks/{task['id']}/refine", json=_DOR_READY_PAYLOAD)
+    # Simulate a legacy row with stale persisted values.
+    await repo_module.update_task(
+        db, task["id"], readiness_score=None, dor_passed=None, ready_at=None
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task['id']}/readiness")
+    assert resp.status_code == 200
+
+    body = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert body["dor_passed"] is True
+    assert body["readiness_score"] == resp.json()["score"]
