@@ -5,8 +5,8 @@ These are the rules most likely to be broken by “small” changes.
 ## Domain Invariants
 
 - Task hierarchy is strict: `epic -> feature -> task -> subtask`.
-- Agent-created tasks start as `draft`; human-created work usually starts as `open` unless run immediately.
-- `epic` and `feature` items are created as `open` and do not auto-run.
+- Agent-created work starts as `draft` — including `epic`/`feature` proposals (#323); human-created work usually starts as `open` unless run immediately.
+- Human-created `epic` and `feature` items are created as `open`; epics and features never auto-run and never auto-review.
 - `subtask` items must not auto-enable review by default.
 
 ## Lifecycle Invariants

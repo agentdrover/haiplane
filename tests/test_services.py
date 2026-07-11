@@ -2127,3 +2127,54 @@ async def test_force_complete_from_pending_report_bypasses_gate(
         db, task_id, TaskForceComplete(comment="Human inspected the result")
     )
     assert view.status.value == "completed"
+
+
+# ---- Agent-proposed features and epics (#323) ----
+
+
+async def test_agent_proposed_feature_is_draft_then_approvable(
+    db: aiosqlite.Connection,
+):
+    epic = await services.create_task(
+        db, TaskCreate(title="Decomp epic", task_type="epic")
+    )
+    feature = await services.create_task(
+        db,
+        TaskCreate(
+            title="Proposed feature",
+            task_type="feature",
+            parent_id=epic.id,
+            source=TaskSource.agent,
+            agent="analyst-bot",
+        ),
+    )
+    assert feature.status.value == "draft"  # AC-1: draft, not open
+
+    approved = await services.approve_task(
+        db, feature.id, TaskApprove(comment="ok", force=True)
+    )
+    assert approved.status.value == "open"
+
+
+async def test_human_created_feature_stays_open(db: aiosqlite.Connection):
+    epic = await services.create_task(
+        db, TaskCreate(title="Human epic", task_type="epic")
+    )
+    feature = await services.create_task(
+        db,
+        TaskCreate(
+            title="Human feature",
+            task_type="feature",
+            parent_id=epic.id,
+            source=TaskSource.human,
+        ),
+    )
+    assert feature.status.value == "open"  # AC-2: unchanged
+
+
+async def test_agent_proposed_epic_is_draft(db: aiosqlite.Connection):
+    epic = await services.create_task(
+        db,
+        TaskCreate(title="Proposed epic", task_type="epic", source=TaskSource.agent),
+    )
+    assert epic.status.value == "draft"
