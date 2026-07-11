@@ -28,6 +28,7 @@ from hub.mcp_server import (
     hub_task_tree,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
+    hub_list_decisions,
     hub_list_proposals,
     hub_list_tasks,
     hub_prepare_developer_task,
@@ -1921,3 +1922,33 @@ async def test_hub_list_tasks_paged_envelope(mock_api_get: AsyncMock) -> None:
     assert "after_id=7" in text
     called = mock_api_get.await_args.args[0]
     assert "after_id=0" in called and "mode=summary" in called
+
+
+async def test_hub_list_decisions_reports_unavailable_integration(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-1 (#251): empty because broken != empty because none exist.
+    mock_api_get.side_effect = [
+        {"recent_decisions": []},
+        {"status": "no_binary", "detail": "n4l binary not found at /x/n4l"},
+    ]
+    out = await hub_list_decisions()
+    structured = _mcp_structured(out)
+    assert structured["notes_available"] is False
+    assert structured["notes_status"] == "no_binary"
+    text = json.loads(_mcp_text(out))["message"]
+    assert "Notes integration unavailable" in text
+    assert "n4l binary not found" in text
+
+
+async def test_hub_list_decisions_empty_but_available(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.side_effect = [
+        {"recent_decisions": []},
+        {"status": "available", "detail": "space=abc"},
+    ]
+    out = await hub_list_decisions()
+    structured = _mcp_structured(out)
+    assert structured["notes_available"] is True
+    assert json.loads(_mcp_text(out))["message"] == "No decisions recorded."
