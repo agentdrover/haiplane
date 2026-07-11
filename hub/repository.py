@@ -238,6 +238,35 @@ async def list_stale_running(
     )
 
 
+async def list_stale_tasks(
+    db: aiosqlite.Connection,
+    status: str,
+    threshold_minutes: int,
+    *,
+    require_null_review_job: bool = False,
+) -> list[aiosqlite.Row]:
+    """Tasks stuck in ``status`` with no updates for ``threshold_minutes``.
+
+    Generalizes stale detection beyond running (#319): review, claimed, and
+    needs_info can silently dead-end otherwise. ``require_null_review_job``
+    restricts review staleness to client-driven reviews — headless reviews
+    (review_job_id set) are owned by the poller conveyor.
+    """
+    conditions = [
+        "archived=0",
+        "status=?",
+        "updated_at < datetime('now', ?)",
+    ]
+    params: list[Any] = [status, f"-{threshold_minutes} minutes"]
+    if require_null_review_job:
+        conditions.append("review_job_id IS NULL")
+    where = " AND ".join(conditions)
+    return await db.execute_fetchall(
+        f"SELECT * FROM tasks WHERE {where}",  # nosec B608
+        tuple(params),
+    )
+
+
 async def list_active_epics(
     db: aiosqlite.Connection,
     *,
