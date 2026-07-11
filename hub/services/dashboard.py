@@ -97,7 +97,13 @@ async def get_inbox_data(
         "claimed_by": claimed_by,
         "mine": mine,
     }
-    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=20, **person)
+    draft_rows = await repo.list_tasks_by_status(
+        db,
+        "draft",
+        order_by=repo.DRAFT_QUEUE_ORDER_BY,
+        limit=20,
+        **person,
+    )
     needs_info_rows = await repo.list_tasks_by_status(
         db, "needs_info", limit=20, **person
     )
