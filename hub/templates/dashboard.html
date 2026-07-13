@@ -10,6 +10,7 @@
     <div class="topbar-brand">
         <span class="topbar-title">Dashboard</span>
         <span class="topbar-sub">overview</span>
+        {% with selector_action='/' %}{% include "partials/project_selector.html" %}{% endwith %}
     </div>
     <div class="topbar-stats">
         <a href="#inbox-content" class="topbar-stat topbar-stat--inbox{% if inbox_total == 0 %} is-zero{% endif %}">
@@ -52,7 +53,7 @@
         </h2>
     </div>
     <div id="inbox-content"
-         hx-get="/partials/inbox"
+         hx-get="/partials/inbox{% if current_project %}?project={{ current_project }}{% endif %}"
          hx-trigger="every 30s"
          hx-swap="innerHTML">
         {% include "partials/inbox.html" with context %}
@@ -66,7 +67,7 @@
     </div>
     <div class="kanban"
          id="kanban-board"
-         hx-get="/partials/kanban"
+         hx-get="/partials/kanban{% if current_project %}?project={{ current_project }}{% endif %}"
          hx-trigger="every 30s"
          hx-swap="innerHTML">
         {% include "partials/kanban.html" %}

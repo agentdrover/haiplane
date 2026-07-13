@@ -337,13 +337,25 @@ async def web_partial_inbox(
     human_owner: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    project: str | None = Query(None),
 ):
+    db = _db(request)
     inbox = await services.get_inbox_data(
-        _db(request),
+        db,
         human_owner=human_owner,
         claimed_by=claimed_by,
         mine=mine,
     )
+    allowed, _, _ = await _project_filter_ctx(db, project)
+    if allowed is not None:
+        for key in (
+            "drafts",
+            "questions",
+            "decisions",
+            "pending_reports",
+            "stale_tasks",
+        ):
+            inbox[key] = _filter_by_ids(inbox[key], allowed)
     inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
@@ -357,8 +369,20 @@ async def web_partial_epics(request: Request):
 
 
 @router.get("/partials/kanban", response_class=HTMLResponse)
-async def web_partial_kanban(request: Request):
-    data = await services.get_dashboard_data(_db(request))
+async def web_partial_kanban(request: Request, project: str | None = Query(None)):
+    db = _db(request)
+    data = await services.get_dashboard_data(db)
+    allowed, _, _ = await _project_filter_ctx(db, project)
+    if allowed is not None:
+        for field in (
+            "active_tasks",
+            "draft_tasks",
+            "review_tasks",
+            "needs_decision_tasks",
+            "needs_info_tasks",
+        ):
+            if hasattr(data, field):
+                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
     tasks_for_badges = [
         *data.active_tasks,
         *data.draft_tasks,
@@ -428,12 +452,62 @@ async def web_tasks_list_partial(
 # ---------------------------------------------------------------------------
 
 
+async def _project_filter_ctx(
+    db: aiosqlite.Connection, project: str | None
+) -> tuple[set[int] | None, list[dict[str, Any]], str]:
+    """(allowed task ids | None, projects for the selector, current slug) (#339)."""
+    rows = await repo.list_projects(db)
+    projects = [dict(r) for r in rows]
+    allowed: set[int] | None = None
+    current = (project or "").strip()
+    if current:
+        prow = await repo.get_project_by_slug(db, current)
+        allowed = (
+            await repo.list_task_ids_for_project(db, prow["id"])
+            if prow is not None
+            else set()
+        )
+    return allowed, projects, current
+
+
+def _filter_by_ids(items: list[Any], allowed: set[int] | None) -> list[Any]:
+    if allowed is None:
+        return items
+    return [t for t in items if (t.id if hasattr(t, "id") else t.get("id")) in allowed]
+
+
 @router.get("/", response_class=HTMLResponse)
-async def web_dashboard(request: Request):
+async def web_dashboard(request: Request, project: str | None = Query(None)):
     db = _db(request)
+    allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     data = await services.get_dashboard_data(db)
     inbox = await services.get_inbox_data(db)
+    if allowed is not None:
+        for field in (
+            "active_tasks",
+            "draft_tasks",
+            "review_tasks",
+            "needs_decision_tasks",
+            "needs_info_tasks",
+        ):
+            if hasattr(data, field):
+                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
+        for key in (
+            "drafts",
+            "questions",
+            "decisions",
+            "pending_reports",
+            "stale_tasks",
+        ):
+            inbox[key] = _filter_by_ids(inbox[key], allowed)
     epics = await services.get_epics_enriched(db)
+    if allowed is not None:
+        epics = [
+            e
+            for e in epics
+            if (e.get("id") if isinstance(e, dict) else getattr(e, "id", None))
+            in allowed
+        ]
     inbox_total = (
         len(inbox["drafts"])
         + len(inbox["questions"])
@@ -447,6 +521,8 @@ async def web_dashboard(request: Request):
         "epics": epics,
         "inbox_total": inbox_total,
         "dispatch_available": _dispatch_available(),
+        "projects_list": projects_list,
+        "current_project": current_project,
     }
     ctx.update(inbox)
     tasks_for_badges = [
@@ -464,6 +540,17 @@ async def web_dashboard(request: Request):
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
+@router.get("/projects", response_class=HTMLResponse)
+async def web_projects(request: Request):
+    """Read-only project list (#339)."""
+    rows = await repo.list_projects(_db(request), include_archived=True)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "projects.html",
+        {"projects": [dict(r) for r in rows]},
+    )
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 async def web_tasks(
     request: Request,
@@ -475,8 +562,10 @@ async def web_tasks(
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     analyst_ready: bool = Query(default=False),
+    project: str | None = Query(default=None),
 ):
     db = _db(request)
+    allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
     tasks = await services.list_tasks(
         db,
@@ -489,6 +578,8 @@ async def web_tasks(
         human_reviewer=human_reviewer,
         limit=100,
     )
+    if allowed is not None:
+        tasks = _filter_by_ids(tasks, allowed)
     tasks, ready_by_id = await _apply_analyst_ready_filter(
         db, tasks, analyst_ready=analyst_ready
     )
@@ -515,6 +606,8 @@ async def web_tasks(
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
             "filter_analyst_ready": analyst_ready,
+            "projects_list": projects_list,
+            "current_project": current_project,
             "parent_breadcrumb": parent_breadcrumb,
             "all_statuses": all_statuses,
             "all_types": all_types,

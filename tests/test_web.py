@@ -820,3 +820,73 @@ async def test_inbox_ranks_ready_drafts_first_with_badges(client: AsyncClient):
     assert "ready · score" in html
     assert "not refined" in html
     assert "Approve ready (1)" in html
+
+
+# ---- Project selector and filtering in Web UI (#339) ----
+
+
+async def _web_two_projects(client: AsyncClient, db) -> tuple[int, int]:
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid_a = await repo_module.create_project(db, slug="ui-a", name="UI A")
+    resp = await client.post(
+        "/api/tasks", json={"title": "Epic UI-A", "task_type": "epic"}
+    )
+    epic_a = resp.json()["id"]
+    await repo_module.update_task(db, epic_a, project_id=pid_a)
+    resp = await client.post(
+        "/api/tasks", json={"title": "Epic UI-B", "task_type": "epic"}
+    )
+    epic_b = resp.json()["id"]
+    await db.commit()
+    return epic_a, epic_b
+
+
+async def test_tasks_page_filters_by_project(client: AsyncClient, db):
+    # AC-1 (#339)
+    epic_a, epic_b = await _web_two_projects(client, db)
+
+    resp = await client.get("/tasks?project=ui-a&type=epic")
+    assert resp.status_code == 200
+    assert "Epic UI-A" in resp.text
+    assert "Epic UI-B" not in resp.text
+    assert 'id="project-select"' in resp.text
+    assert "selected" in resp.text
+
+    resp = await client.get("/tasks?type=epic")
+    assert "Epic UI-A" in resp.text and "Epic UI-B" in resp.text
+
+
+async def test_dashboard_and_inbox_filter_by_project(client: AsyncClient, db):
+    epic_a, epic_b = await _web_two_projects(client, db)
+
+    resp = await client.get("/?project=ui-a")
+    assert resp.status_code == 200
+    assert "Epic UI-A" in resp.text
+    # Task cards/lists link to /tasks/{id}; the global activity feed keeps
+    # plain-text mentions and is intentionally not project-scoped in V1.
+    assert f'href="/tasks/{epic_a}"' in resp.text.replace("'", '"')
+    assert f'href="/tasks/{epic_b}"' not in resp.text.replace("'", '"')
+
+    resp = await client.get("/partials/kanban?project=ui-a")
+    assert "Epic UI-A" in resp.text and "Epic UI-B" not in resp.text
+
+
+async def test_projects_page_lists_and_links(client: AsyncClient, db):
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.get("/projects")
+    assert resp.status_code == 200
+    assert "default" in resp.text
+    assert "/tasks?project=default" in resp.text
+
+
+async def test_task_detail_shows_project_badge(client: AsyncClient, db):
+    epic_a, _ = await _web_two_projects(client, db)
+    resp = await client.get(f"/tasks/{epic_a}")
+    assert resp.status_code == 200
+    assert "Project" in resp.text
+    assert "ui-a" in resp.text
