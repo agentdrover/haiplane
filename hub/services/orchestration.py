@@ -15,20 +15,55 @@ from hub.integrations.registry import plugins
 log = logging.getLogger("hub")
 
 
+async def project_git_context(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> dict[str, Any]:
+    """Git kwargs from the task's project (#337).
+
+    Empty project fields are omitted so git_ops falls back to env — the
+    seeded default project behaves exactly like the pre-project hub.
+    """
+    row = await repo.resolve_project_for_task(db, task_id)
+    if row is None:
+        return {}
+    d = dict(row)
+    ctx: dict[str, Any] = {}
+    if (d.get("workspace_path") or "").strip():
+        ctx["repo"] = d["workspace_path"].strip()
+    if (d.get("repo") or "").strip():
+        ctx["gh_repo"] = d["repo"].strip()
+    if (d.get("default_branch") or "").strip():
+        ctx["base_branch"] = d["default_branch"].strip()
+    # The default project mirrors env values; dropping them keeps call
+    # sites byte-identical to legacy behavior for it.
+    if d.get("slug") == "default":
+        return {}
+    return ctx
+
+
+def _split_git_kwargs(ctx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(local_git_kwargs, pr_kwargs) — local ops need repo/base, PR needs all."""
+    local = {k: v for k, v in ctx.items() if k in ("repo", "base_branch")}
+    return local, dict(ctx)
+
+
 async def dispatch_task(
     db: aiosqlite.Connection,
     task_id: int,
     task: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
     branch = task.get("branch") or ""
     if not branch:
-        branch = await plugins.git_ops.create_branch(task_id, task["title"])
+        branch = await plugins.git_ops.create_branch(task_id, task["title"], **local_kw)
         if branch:
             await repo.update_task(db, task_id, branch=branch)
             await db.commit()
     else:
-        await plugins.git_ops.checkout(branch)
+        await plugins.git_ops.checkout(branch, repo=local_kw.get("repo"))
 
     updates_rows = await repo.get_task_updates(db, task_id)
     updates = [dict(r) for r in updates_rows] if updates_rows else None
@@ -87,14 +122,17 @@ async def prepare_pair_branch(
     branch_slug: str = "",
 ) -> str:
     """Create or checkout a task branch without dispatching a headless agent."""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
     branch = (task.get("branch") or "").strip()
     if branch:
-        await plugins.git_ops.checkout(branch)
+        await plugins.git_ops.checkout(branch, repo=local_kw.get("repo"))
         return branch
     return await plugins.git_ops.pair_prepare_branch(
         task_id,
         task["title"],
         branch_slug=branch_slug,
+        **local_kw,
     )
 
 
@@ -166,20 +204,28 @@ async def transition_after_agent_done(
         and has_done
         and branch
     ):
-        await plugins.git_ops.checkout(branch)
-        await plugins.git_ops.auto_commit(task_id, title=task.get("title", ""))
+        ctx = await project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        await plugins.git_ops.checkout(branch, repo=workspace)
+        await plugins.git_ops.auto_commit(
+            task_id, title=task.get("title", ""), repo=workspace
+        )
         squashed = await plugins.git_ops.squash_branch(
             task_id,
             task.get("title", ""),
             branch,
+            repo=workspace,
         )
-        await plugins.git_ops.push_branch(branch, force=squashed)
+        await plugins.git_ops.push_branch(branch, repo=workspace, force=squashed)
         if not task.get("pr_number"):
             pr_num = await plugins.git_ops.create_pr(
                 task_id,
                 task["title"],
                 task.get("description", ""),
                 branch,
+                repo=workspace,
+                gh_repo=ctx.get("gh_repo"),
+                base_branch=ctx.get("base_branch"),
             )
             if pr_num:
                 await repo.update_task(db, task_id, pr_number=pr_num)
