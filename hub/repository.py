@@ -254,6 +254,90 @@ async def list_stale_running(
     )
 
 
+# ---------------------------------------------------------------------------
+# Projects (#335)
+# ---------------------------------------------------------------------------
+
+
+async def create_project(
+    db: aiosqlite.Connection,
+    *,
+    slug: str,
+    name: str,
+    repo_name: str = "",
+    workspace_path: str = "",
+    default_branch: str = "develop",
+    default_branch_policy: str = "{}",
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO projects (slug, name, repo, workspace_path, "
+        "default_branch, default_branch_policy) VALUES (?, ?, ?, ?, ?, ?)",
+        (slug, name, repo_name, workspace_path, default_branch, default_branch_policy),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def get_project(
+    db: aiosqlite.Connection, project_id: int
+) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall("SELECT * FROM projects WHERE id=?", (project_id,))
+    return rows[0] if rows else None
+
+
+async def get_project_by_slug(
+    db: aiosqlite.Connection, slug: str
+) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall("SELECT * FROM projects WHERE slug=?", (slug,))
+    return rows[0] if rows else None
+
+
+async def list_projects(
+    db: aiosqlite.Connection, *, include_archived: bool = False
+) -> list[aiosqlite.Row]:
+    where = "" if include_archived else "WHERE archived=0"
+    return await db.execute_fetchall(
+        f"SELECT * FROM projects {where} ORDER BY slug ASC"  # nosec B608
+    )
+
+
+async def update_project(
+    db: aiosqlite.Connection, project_id: int, **fields: Any
+) -> None:
+    sets = [f"{k}=?" for k in fields]
+    sets.append("updated_at=datetime('now')")
+    values = [*fields.values(), project_id]
+    await db.execute(
+        f"UPDATE projects SET {', '.join(sets)} WHERE id=?",  # nosec B608
+        tuple(values),
+    )
+
+
+async def resolve_project_for_task(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """Resolve a task's project by walking up to its root epic (#335).
+
+    Projects live on epics only; descendants inherit. Tasks outside any
+    epic (or epics without an assignment) fall back to the seeded
+    'default' project so legacy behavior never breaks.
+    """
+    current_id: int | None = task_id
+    for _ in range(20):  # hierarchy depth guard
+        if current_id is None:
+            break
+        rows = await db.execute_fetchall(
+            "SELECT id, parent_id, project_id FROM tasks WHERE id=?",
+            (current_id,),
+        )
+        if not rows:
+            break
+        row = rows[0]
+        if row["project_id"] is not None:
+            return await get_project(db, row["project_id"])
+        current_id = row["parent_id"]
+    return await get_project_by_slug(db, "default")
+
+
 async def list_stale_tasks(
     db: aiosqlite.Connection,
     status: str,

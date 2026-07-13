@@ -372,6 +372,30 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_findings_column",
         "ALTER TABLE tasks ADD COLUMN review_findings TEXT NOT NULL DEFAULT '[]'",
     ),
+    # ---- Projects V1.1 (#335): multi-project foundation ----
+    (
+        "create_projects_table",
+        """CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            repo TEXT NOT NULL DEFAULT '',
+            workspace_path TEXT NOT NULL DEFAULT '',
+            default_branch TEXT NOT NULL DEFAULT 'develop',
+            default_branch_policy TEXT NOT NULL DEFAULT '{}',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "add_tasks_project_id_column",
+        "ALTER TABLE tasks ADD COLUMN project_id INTEGER",
+    ),
+    (
+        "idx_tasks_project_id",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)",
+    ),
     # ---- Separation of duties (#320): implementer identity as a principal.
     # Plain INTEGER on purpose (no FK): the value is an identity snapshot for
     # the self-review comparison, and it must survive principal deletion and
@@ -662,6 +686,8 @@ async def get_db() -> aiosqlite.Connection:
     await repair_stale_parent_completions(db)
     if await _table_exists(db, "roles"):
         await seed_system_roles(db)
+    if await _table_exists(db, "projects"):
+        await seed_default_project(db)
     return db
 
 
@@ -961,6 +987,36 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         ("admin.read", "admin.audit.read"),
     ),
 )
+
+
+async def seed_default_project(db: aiosqlite.Connection) -> None:
+    """Seed the 'default' project from env and backfill epics (#335).
+
+    Idempotent: an existing default row is reused, and only epics without a
+    project are assigned. Until consumers land (V1.2+), this changes no
+    behavior — it only gives every existing task a resolvable project.
+    """
+    from hub import config as cfg
+
+    rows = await db.execute_fetchall("SELECT id FROM projects WHERE slug='default'")
+    if rows:
+        default_id = rows[0][0]
+    else:
+        cur = await db.execute(
+            "INSERT INTO projects (slug, name, repo, workspace_path, "
+            "default_branch) VALUES ('default', 'Default', ?, ?, ?)",
+            (
+                cfg.REPO_NAME,
+                str(cfg.WORKSPACE_REPO_LINK),
+                cfg.PAIR_BASE_BRANCH,
+            ),
+        )
+        default_id = cur.lastrowid
+    await db.execute(
+        "UPDATE tasks SET project_id=? WHERE task_type='epic' AND project_id IS NULL",
+        (default_id,),
+    )
+    await db.commit()
 
 
 async def seed_system_roles(db: aiosqlite.Connection) -> None:
