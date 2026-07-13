@@ -107,7 +107,11 @@ class NoopGitOps:
         return ""
 
     async def create_branch(
-        self, task_id: int, title: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         return ""
 
@@ -118,6 +122,7 @@ class NoopGitOps:
         *,
         branch_slug: str = "",
         repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         from hub.integrations.git_ops import _slugify
 
@@ -156,6 +161,8 @@ class NoopGitOps:
         description: str,
         branch: str,
         repo: str | None = None,
+        gh_repo: str | None = None,
+        base_branch: str | None = None,
     ) -> int | None:
         return None
 
