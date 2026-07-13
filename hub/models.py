@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any, Literal
 
@@ -822,6 +823,45 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+
+
+class ProjectCreate(BaseModel):
+    """Create a project (#335). ``create`` is a human gate at the API layer."""
+
+    slug: str = Field(..., min_length=1, max_length=60, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(..., min_length=1, max_length=200)
+    repo: str = Field("", max_length=200)
+    workspace_path: str = Field("", max_length=500)
+    default_branch: str = Field("develop", max_length=100)
+    default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectView(BaseModel):
+    id: int
+    slug: str
+    name: str
+    repo: str = ""
+    workspace_path: str = ""
+    default_branch: str = "develop"
+    default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+    archived: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("default_branch_policy", mode="before")
+    @classmethod
+    def _policy_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                return json.loads(v) if v else {}
+            except ValueError:
+                return {}
+        return v or {}
 
 
 class ActivityItem(BaseModel):

@@ -381,3 +381,49 @@ async def test_implementer_principal_id_column_present():
         assert col["notnull"] == 0  # nullable: legacy tasks use name fallback
     finally:
         await conn.close()
+
+
+async def test_projects_table_and_project_id_column():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "projects")
+        for col in (
+            "slug",
+            "name",
+            "repo",
+            "workspace_path",
+            "default_branch",
+            "default_branch_policy",
+            "archived",
+        ):
+            assert col in cols, col
+        task_cols = await _table_columns(conn, "tasks")
+        assert "project_id" in task_cols
+        assert task_cols["project_id"]["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_seed_default_project_idempotent_and_backfills_epics():
+    from hub.db import seed_default_project
+
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (title, description, status, task_type) "
+            "VALUES ('E', '', 'open', 'epic')"
+        )
+        await conn.commit()
+        await seed_default_project(conn)
+        await seed_default_project(conn)  # idempotent
+
+        projects = await conn.execute_fetchall(
+            "SELECT id, slug FROM projects WHERE slug='default'"
+        )
+        assert len(projects) == 1
+        epics = await conn.execute_fetchall(
+            "SELECT project_id FROM tasks WHERE task_type='epic'"
+        )
+        assert all(e["project_id"] == projects[0]["id"] for e in epics)
+    finally:
+        await conn.close()
