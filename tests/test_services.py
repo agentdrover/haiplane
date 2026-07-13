@@ -2178,3 +2178,64 @@ async def test_agent_proposed_epic_is_draft(db: aiosqlite.Connection):
         TaskCreate(title="Proposed epic", task_type="epic", source=TaskSource.agent),
     )
     assert epic.status.value == "draft"
+
+
+# ---- Project git context (#337) ----
+
+
+async def test_pair_start_uses_project_workspace_and_base(
+    db: aiosqlite.Connection,
+):
+    # AC-1 (#337): pair branch is prepared in the project's workspace from
+    # its base branch.
+    from unittest.mock import AsyncMock
+
+    from hub.db import seed_default_project
+    from hub.integrations.registry import plugins
+
+    await seed_default_project(db)
+    pid = await repo.create_project(
+        db,
+        slug="prod-x",
+        name="Prod X",
+        repo_name="mrPDA/prod-x",
+        workspace_path="/srv/prod-x",
+        default_branch="trunk",
+    )
+    epic = await services.create_task(db, TaskCreate(title="X epic", task_type="epic"))
+    await repo.update_task(db, epic.id, project_id=pid)
+    feat = await services.create_task(
+        db, TaskCreate(title="X feat", task_type="feature", parent_id=epic.id)
+    )
+    tv = await services.create_task(
+        db, TaskCreate(title="X task", task_type="task", parent_id=feat.id)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+
+    prep = AsyncMock(return_value=f"task-{tv.id}/x-task")
+    plugins.git_ops.pair_prepare_branch = prep
+    started = await services.pair_start_task(db, tv.id, caller="dev")
+    assert started.status.value == "running"
+    kwargs = prep.await_args.kwargs
+    assert kwargs["repo"] == "/srv/prod-x"
+    assert kwargs["base_branch"] == "trunk"
+
+
+async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
+    # AC-2 (#337): the default project passes no overrides — env behavior.
+    from unittest.mock import AsyncMock
+
+    from hub.db import seed_default_project
+    from hub.integrations.registry import plugins
+
+    await seed_default_project(db)
+    tv = await services.create_task(db, TaskCreate(title="Legacy task"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: y")
+    await db.commit()
+
+    prep = AsyncMock(return_value=f"task-{tv.id}/legacy-task")
+    plugins.git_ops.pair_prepare_branch = prep
+    await services.pair_start_task(db, tv.id, caller="dev")
+    kwargs = prep.await_args.kwargs
+    assert "repo" not in kwargs and "base_branch" not in kwargs

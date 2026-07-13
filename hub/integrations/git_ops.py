@@ -197,13 +197,20 @@ class GitOpsIntegration:
         return out if rc == 0 else "unknown"
 
     async def create_branch(
-        self, task_id: int, title: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         repo = repo or _repo_root()
+        # Project git context (#337): headless branches historically cut
+        # from main; a project may define its own integration branch.
+        base = base_branch or "main"
         slug = _slugify(title)
         branch = f"task-{task_id}/{slug}"
 
-        await _git("checkout", "main", repo=repo, check=False)
+        await _git("checkout", base, repo=repo, check=False)
 
         rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
         if dirty.strip():
@@ -211,7 +218,7 @@ class GitOpsIntegration:
             await _git("checkout", ".", repo=repo, check=False)
             await _git("clean", "-fd", repo=repo, check=False)
 
-        await _git("pull", "origin", "main", "--ff-only", repo=repo, check=False)
+        await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
 
         rc, _, err = await _git("checkout", "-b", branch, repo=repo, check=False)
         if rc != 0:
@@ -232,12 +239,13 @@ class GitOpsIntegration:
         *,
         branch_slug: str = "",
         repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         """Safe branch setup for pair mode: never git-clean a dirty worktree."""
         from hub import config
 
         repo = repo or _repo_root()
-        base = config.PAIR_BASE_BRANCH
+        base = base_branch or config.PAIR_BASE_BRANCH
 
         rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
         if dirty.strip():
@@ -431,6 +439,8 @@ class GitOpsIntegration:
         description: str,
         branch: str,
         repo: str | None = None,
+        gh_repo: str | None = None,
+        base_branch: str | None = None,
     ) -> int | None:
         ctype = _conv_commit_type(title)
         pr_title = f"{ctype}(task): {title} (#{task_id})"
@@ -444,9 +454,9 @@ class GitOpsIntegration:
             "pr",
             "create",
             "--repo",
-            REPO_NAME,
+            gh_repo or REPO_NAME,
             "--base",
-            PAIR_BASE_BRANCH,
+            base_branch or PAIR_BASE_BRANCH,
             "--head",
             branch,
             "--title",

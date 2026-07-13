@@ -309,15 +309,22 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             ci_rows = await repo.list_ci_check_tasks(db)
             for row in ci_rows:
                 task = dict(row)
+                ctx = await services.project_git_context(db, task["id"])
+                workspace = ctx.get("repo")
                 if not task.get("pr_number"):
                     branch = task.get("branch")
                     if branch:
-                        await plugins.git_ops.push_branch(branch, force=True)
+                        await plugins.git_ops.push_branch(
+                            branch, repo=workspace, force=True
+                        )
                         pr_num = await plugins.git_ops.create_pr(
                             task["id"],
                             task["title"],
                             task.get("description", ""),
                             branch,
+                            repo=workspace,
+                            gh_repo=ctx.get("gh_repo"),
+                            base_branch=ctx.get("base_branch"),
                         )
                         if pr_num:
                             await repo.update_task(db, task["id"], pr_number=pr_num)

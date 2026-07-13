@@ -84,6 +84,7 @@ from hub.services.orchestration import (
     get_breadcrumb_str,
     maybe_destroy_vast,
     prepare_pair_branch,
+    project_git_context,
     scan_text_for_verdict,
     transition_after_agent_done,
 )
@@ -149,6 +150,7 @@ __all__ = [
     "pair_start_task",
     "parse_review_findings",
     "prepare_pair_branch",
+    "project_git_context",
     "record_review_verdict",
     "refresh_task",
     "reject_task",
