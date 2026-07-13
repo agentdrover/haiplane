@@ -268,11 +268,21 @@ async def create_project(
     workspace_path: str = "",
     default_branch: str = "develop",
     default_branch_policy: str = "{}",
+    status: str = "active",
 ) -> int:
     cur = await db.execute(
         "INSERT INTO projects (slug, name, repo, workspace_path, "
-        "default_branch, default_branch_policy) VALUES (?, ?, ?, ?, ?, ?)",
-        (slug, name, repo_name, workspace_path, default_branch, default_branch_policy),
+        "default_branch, default_branch_policy, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            slug,
+            name,
+            repo_name,
+            workspace_path,
+            default_branch,
+            default_branch_policy,
+            status,
+        ),
     )
     return cur.lastrowid  # type: ignore[return-value]
 
@@ -292,9 +302,18 @@ async def get_project_by_slug(
 
 
 async def list_projects(
-    db: aiosqlite.Connection, *, include_archived: bool = False
+    db: aiosqlite.Connection,
+    *,
+    include_archived: bool = False,
+    only_active: bool = False,
 ) -> list[aiosqlite.Row]:
-    where = "" if include_archived else "WHERE archived=0"
+    conditions = []
+    if not include_archived:
+        conditions.append("archived=0")
+    if only_active:
+        # Pending proposals (#345) stay out of routing and selectors.
+        conditions.append("status='active'")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     return await db.execute_fetchall(
         f"SELECT * FROM projects {where} ORDER BY slug ASC"  # nosec B608
     )
@@ -351,7 +370,11 @@ async def resolve_project_for_task(
             break
         row = rows[0]
         if row["project_id"] is not None:
-            return await get_project(db, row["project_id"])
+            project = await get_project(db, row["project_id"])
+            # A pending proposal (#345) must not affect routing yet.
+            if project is not None and project["status"] != "active":
+                return await get_project_by_slug(db, "default")
+            return project
         current_id = row["parent_id"]
     return await get_project_by_slug(db, "default")
 
