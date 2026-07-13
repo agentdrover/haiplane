@@ -277,6 +277,20 @@ async def api_patch_project(
     return ProjectView(**dict(row))
 
 
+@app.post("/api/telemetry/deprecated-tool")
+async def api_deprecated_tool_call(request: Request, body: dict[str, Any]):
+    """Stage-1 deprecation telemetry (#325, ADR-0002): count alias calls."""
+    tool = str(body.get("tool", ""))[:100]
+    replacement = str(body.get("replacement", ""))[:100]
+    agent = str(body.get("agent", ""))[:100]
+    await db_module.log_activity(
+        _db(request),
+        "deprecated_tool_call",
+        f"{tool} called{f' by {agent}' if agent else ''}; use {replacement}",
+    )
+    return {"ok": True}
+
+
 @app.get("/api/integrations/notes")
 async def api_notes_availability():
     """Diagnose the notesforllm link (#251): available | no_binary | no_space | error."""
@@ -365,6 +379,7 @@ async def api_withdraw_own_draft(
             _db(request),
             task_id,
             caller=identity.username,
+            caller_principal_id=identity.principal_id,
         )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc

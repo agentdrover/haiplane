@@ -1593,3 +1593,41 @@ async def test_epic_binds_to_project_via_refine(client: AsyncClient, db):
     resp = await client.post(f"/api/tasks/{task_id}/refine", json={"project": "prod-z"})
     assert resp.status_code == 422
     assert "epic" in resp.json()["detail"]
+
+
+async def test_deprecated_tool_telemetry_endpoint(client: AsyncClient):
+    # (#325) counted in activity_log.
+    resp = await client.post(
+        "/api/telemetry/deprecated-tool",
+        json={"tool": "hub_approve_proposal", "replacement": "hub_approve_task"},
+    )
+    assert resp.status_code == 200
+    activity = (await client.get("/api/activity")).json()
+    assert any(
+        a["kind"] == "deprecated_tool_call" and "hub_approve_proposal" in a["summary"]
+        for a in activity
+    )
+
+
+async def test_withdraw_matches_by_principal_id(client: AsyncClient, monkeypatch, db):
+    # (#325 bonus, gap from #322): withdraw works when the principal matches
+    # even if the display name differs from assigned_agent.
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    impl = {"Authorization": "Bearer impl-pid-token"}  # principal 7
+
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Withdraw me", "source": "agent", "agent": "other-name"},
+        headers=impl,
+    )
+    task_id = resp.json()["id"]
+    await repo_module.update_task(db, task_id, implementer_principal_id=7)
+    await db.commit()
+
+    resp = await client.post(f"/api/tasks/{task_id}/withdraw", headers=impl)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["archived"] is True

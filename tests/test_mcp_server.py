@@ -15,6 +15,7 @@ from hub.mcp_server import (
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
+    hub_approve_proposal,
     hub_claim_task,
     hub_create_task,
     hub_create_subtasks,
@@ -1992,3 +1993,42 @@ async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:
     structured = _mcp_structured(out)
     assert structured["projects"][0]["slug"] == "default"
     mock_api_get.assert_awaited_once_with("/api/projects")
+
+
+async def test_deprecated_alias_marks_and_counts(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # AC-1 (#325): alias response carries deprecated + replacement, and the
+    # call is counted through the telemetry endpoint.
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "draft"},  # prior read inside hub_approve_task
+        {"id": 5, "status": "open"},  # refreshed task
+    ]
+    mock_api_post.side_effect = [
+        {"id": 5, "status": "open"},  # approve call
+        {"ok": True},  # telemetry
+    ]
+    out = await hub_approve_proposal(5)
+    payload = json.loads(out)
+    assert payload["deprecated"] is True
+    assert "hub_approve_task" in payload["next_action"]
+    telemetry_call = mock_api_post.await_args_list[-1]
+    assert telemetry_call.args[0] == "/api/telemetry/deprecated-tool"
+    assert telemetry_call.args[1]["tool"] == "hub_approve_proposal"
+
+
+async def test_task_update_done_alias_marked_deprecated(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.side_effect = [
+        {"id": 6, "status": "running"},
+        {"id": 6, "status": "review", "submission_generation": 1},
+    ]
+    mock_api_post.side_effect = [
+        {"id": 601},  # update row
+        {"ok": True},  # telemetry
+    ]
+    out = await hub_task_update(6, "done text", agent="dev", kind="done")
+    payload = json.loads(out)
+    assert payload["deprecated"] is True
+    assert "hub_report_done" in payload["next_action"]
