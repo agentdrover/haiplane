@@ -1627,6 +1627,7 @@ async def withdraw_own_draft(
     task_id: int,
     *,
     caller: str,
+    caller_principal_id: int | None = None,
 ) -> TaskView:
     """Archive a single agent-owned draft (no cascade). Agent-only narrow path."""
     row = await repo.get_task(db, task_id)
@@ -1663,7 +1664,12 @@ async def withdraw_own_draft(
         )
 
     assigned = (task.get("assigned_agent") or "").strip()
-    if assigned != caller.strip():
+    principal_match = (
+        caller_principal_id is not None
+        and task.get("implementer_principal_id") is not None
+        and task.get("implementer_principal_id") == caller_principal_id
+    )
+    if assigned != caller.strip() and not principal_match:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail=withdraw_own_draft_error_detail(

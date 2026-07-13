@@ -615,7 +615,14 @@ async def hub_task_update(
         message = f"Update #{result['id']} added to task #{task_id}."
     if task.get("lifecycle_hint"):
         message += f"\nLifecycle: {task['lifecycle_hint']}"
-    return _format_mutation_success(message, task, transition_from=prior_status)
+    response = _format_mutation_success(message, task, transition_from=prior_status)
+    if kind == "done":
+        # ADR-0002 Stage 1 (#325): kind=done is the deprecated alias of
+        # hub_report_done.
+        response = await _mark_deprecated(
+            "hub_task_update kind=done", "hub_report_done", response
+        )
+    return response
 
 
 def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
@@ -1589,17 +1596,37 @@ async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     return structured_echo_result("\n".join(lines), proposals=agent_tasks)
 
 
-# Deprecated aliases
+# Deprecated aliases (ADR-0002 Stage 1: warning + telemetry, #325)
+async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
+    """Count the alias call and stamp the response with a migration hint."""
+    try:
+        await _api_post(
+            "/api/telemetry/deprecated-tool",
+            {"tool": tool, "replacement": replacement},
+        )
+    except HubApiError:
+        pass  # telemetry must never break the aliased operation
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        return result
+    payload["deprecated"] = True
+    payload["next_action"] = f"Deprecated alias: use {replacement} instead."
+    return json.dumps(payload, ensure_ascii=False)
+
+
 @mcp.tool()
 async def hub_approve_proposal(proposal_id: int, comment: str = "") -> str:
     """Deprecated: use hub_approve_task instead. Approves and dispatches."""
-    return await hub_approve_task(proposal_id, comment=comment, run=True)
+    result = await hub_approve_task(proposal_id, comment=comment, run=True)
+    return await _mark_deprecated("hub_approve_proposal", "hub_approve_task", result)
 
 
 @mcp.tool()
 async def hub_reject_proposal(proposal_id: int, comment: str = "") -> str:
     """Deprecated: use hub_reject_task instead."""
-    return await hub_reject_task(proposal_id, comment=comment)
+    result = await hub_reject_task(proposal_id, comment=comment)
+    return await _mark_deprecated("hub_reject_proposal", "hub_reject_task", result)
 
 
 # ---------------------------------------------------------------------------
