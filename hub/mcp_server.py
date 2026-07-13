@@ -1557,6 +1557,42 @@ async def hub_create_project(
 
 
 @mcp.tool()
+async def hub_propose_project(
+    slug: str,
+    name: str,
+    repo: str = "",
+    workspace_path: str = "",
+    default_branch: str = "develop",
+) -> str:
+    """Propose a project (#345): created as PENDING until a human
+    activates it — pending projects stay out of git routing.
+
+    Args:
+        slug: URL-safe unique slug
+        name: Display name
+        repo: GitHub owner/repo
+        workspace_path: Server workspace clone path
+        default_branch: Integration branch
+    """
+    body = {
+        "slug": slug,
+        "name": name,
+        "repo": repo,
+        "workspace_path": workspace_path,
+        "default_branch": default_branch,
+    }
+    try:
+        result = await _api_post("/api/projects", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return format_echo_response(
+        f"Project {result['slug']} (#{result['id']}) proposed "
+        f"(status: {result.get('status', 'pending')}). "
+        "A human activates it via PATCH /api/projects or the UI."
+    )
+
+
+@mcp.tool()
 async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     """List agent proposals (draft tasks).
 

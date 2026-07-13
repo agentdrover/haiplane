@@ -164,6 +164,8 @@ async def refine_task(
         project_row = await repo.get_project_by_slug(db, payload.project)
         if project_row is None:
             raise ProjectBindError(f"unknown project slug: {payload.project!r}")
+        if project_row["status"] != "active":
+            raise ProjectBindError(f"project {payload.project!r} is pending activation")
         project_id = project_row["id"]
 
     async with _atomic(db, "refine_task"):
