@@ -376,6 +376,7 @@ class ReviewBrief(BaseModel):
     title: str
     status: TaskStatus
     description: str = ""
+    project: TaskProjectRef | None = None
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
@@ -676,6 +677,13 @@ class TaskProgress(BaseModel):
     percent: int = 0
 
 
+class TaskProjectRef(BaseModel):
+    """Compact project reference on task contracts (#336)."""
+
+    id: int
+    slug: str
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -714,6 +722,7 @@ class TaskView(BaseModel):
     claimed_by: str | None = None
     claim_session_id: str | None = None
     claimed_at: str | None = None
+    project: TaskProjectRef | None = None
     breadcrumb: list[TaskBreadcrumb] | None = None
     children: list[TaskChildSummary] | None = None
     progress: TaskProgress | None = None

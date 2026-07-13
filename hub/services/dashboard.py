@@ -188,6 +188,7 @@ async def list_tasks(
     include_archived: bool = False,
     after_id: int | None = None,
     mode: str = "full",
+    project: str | None = None,
 ) -> list[TaskView] | dict[str, Any]:
     """List tasks with optional filters.
 
@@ -196,6 +197,17 @@ async def list_tasks(
     ``{"tasks": [...], "next_cursor": id|None}`` (#254); pass the returned
     cursor as ``after_id`` to walk the full set without gaps or duplicates.
     """
+    project_ids: set[int] | None = None
+    if project:
+        project_row = await repo.get_project_by_slug(db, project)
+        if project_row is None:
+            return (
+                {"tasks": [], "next_cursor": None}
+                if (after_id is not None or mode == "summary")
+                else []
+            )
+        project_ids = await repo.list_task_ids_for_project(db, project_row["id"])
+
     paged = after_id is not None or mode == "summary"
     fetch_limit = limit + 1 if paged else limit
     rows = await repo.list_tasks_filtered(
@@ -214,6 +226,8 @@ async def list_tasks(
         after_id=after_id if after_id is not None else (0 if paged else None),
     )
     views = [row_to_task(r) for r in rows]
+    if project_ids is not None:
+        views = [v for v in views if v.id in project_ids]
     if not paged:
         return views
 
