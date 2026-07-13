@@ -192,9 +192,23 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         await services.maybe_destroy_vast(db, task)
                     continue
 
-                verdict = services.extract_review_verdict(
-                    task["id"], task["review_job_id"], updates_list
-                )
+                # Structured channel first (#326): a persisted verdict for
+                # the CURRENT submission wins; text scanning stays as the
+                # fallback for legacy reviewers and dispatch logs.
+                persisted = task.get("review_verdict")
+                if persisted and task.get("review_verdict_generation") == task.get(
+                    "submission_generation"
+                ):
+                    verdict = persisted
+                    log.info(
+                        "Poll: task #%d verdict '%s' from persisted review state",
+                        task["id"],
+                        verdict,
+                    )
+                else:
+                    verdict = services.extract_review_verdict(
+                        task["id"], task["review_job_id"], updates_list
+                    )
 
                 if has_arbitration:
                     await repo.update_task(db, task["id"], status="needs_decision")
