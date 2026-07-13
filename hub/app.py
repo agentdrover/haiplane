@@ -39,6 +39,7 @@ from hub.models import (
     TaskClaim,
     TaskContextView,
     TaskCreate,
+    TaskProjectRef,
     TaskDecide,
     TaskForceComplete,
     TaskQuestion,
@@ -232,9 +233,14 @@ async def api_list_tasks(
         description="Cursor (#254): 0 starts a paged walk, then pass next_cursor",
     ),
     mode: str = Query(default="full", pattern="^(full|summary)$"),
+    project: str | None = Query(
+        default=None,
+        description="Project slug filter (#336): subtree of the project's epics",
+    ),
 ):
     """List tasks. Plain list without after_id/mode=summary (backward
-    compatible); paged/summary calls return {tasks, next_cursor} (#254)."""
+    compatible); paged/summary calls return {tasks, next_cursor} (#254).
+    ``project`` narrows to tasks whose root epic belongs to the project (#336)."""
     return await services.list_tasks(
         _db(request),
         status=status,
@@ -249,6 +255,7 @@ async def api_list_tasks(
         include_archived=include_archived,
         after_id=after_id,
         mode=mode,
+        project=project,
     )
 
 
@@ -391,6 +398,11 @@ async def api_task_context(
     task_view = services.row_to_task(row)
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
     task_view.acceptance_criteria = [services.row_to_ac(r) for r in ac_rows]
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
 
     # --- Readiness summary. Reuse the same calculator as /readiness so
     # /context and /readiness can never drift.
@@ -583,6 +595,11 @@ async def api_review_brief(task_id: int, request: Request):
     if not row:
         raise HTTPException(404, "task not found")
     task_view = services.row_to_task(row)
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
 
     # Latest submission context: the most recent done report, falling back
@@ -606,6 +623,7 @@ async def api_review_brief(task_id: int, request: Request):
         title=task_view.title,
         status=task_view.status,
         description=task_view.description,
+        project=task_view.project,
         acceptance_criteria=[services.row_to_ac(r) for r in ac_rows],
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,

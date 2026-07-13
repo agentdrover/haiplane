@@ -1465,3 +1465,65 @@ async def test_notes_availability_endpoint(client: AsyncClient):
     body = resp.json()
     assert body["status"] in ("available", "no_binary", "no_space", "error")
     assert "detail" in body
+
+
+# ---- Project read layer (#336) ----
+
+
+async def _project_with_epic_task(client: AsyncClient, db, slug: str) -> tuple:
+    from hub import repository as repo_module
+
+    pid = await repo_module.create_project(db, slug=slug, name=slug.title())
+    resp = await client.post(
+        "/api/tasks", json={"title": f"Epic {slug}", "task_type": "epic"}
+    )
+    epic_id = resp.json()["id"]
+    await repo_module.update_task(db, epic_id, project_id=pid)
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": f"Feat {slug}", "task_type": "feature", "parent_id": epic_id},
+    )
+    feat_id = resp.json()["id"]
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": f"Task {slug}", "task_type": "task", "parent_id": feat_id},
+    )
+    await db.commit()
+    return pid, epic_id, feat_id, resp.json()["id"]
+
+
+async def test_project_filter_returns_only_subtree(client: AsyncClient, db):
+    # AC-1 (#336)
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    _, epic_a, feat_a, task_a = await _project_with_epic_task(client, db, "prod-a")
+    _, epic_b, _, _ = await _project_with_epic_task(client, db, "prod-b")
+
+    resp = await client.get("/api/tasks?project=prod-a&limit=100")
+    ids = {t["id"] for t in resp.json()}
+    assert {epic_a, feat_a, task_a} <= ids
+    assert epic_b not in ids
+
+    # Unknown slug → empty; no filter → old behavior (everything visible).
+    resp = await client.get("/api/tasks?project=nope&limit=100")
+    assert resp.json() == []
+    resp = await client.get("/api/tasks?limit=100")
+    assert epic_b in {t["id"] for t in resp.json()}
+
+
+async def test_task_contracts_carry_project_ref(client: AsyncClient, db):
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    _, _, _, task_id = await _project_with_epic_task(client, db, "prod-c")
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["project"] == {
+        "id": body["project"]["id"],
+        "slug": "prod-c",
+    }
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    assert ctx["task"]["project"]["slug"] == "prod-c"
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["project"]["slug"] == "prod-c"

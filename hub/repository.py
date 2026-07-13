@@ -312,6 +312,24 @@ async def update_project(
     )
 
 
+async def list_task_ids_for_project(
+    db: aiosqlite.Connection, project_id: int
+) -> set[int]:
+    """All task ids whose root epic belongs to the project (#336)."""
+    rows = await db.execute_fetchall(
+        """
+        WITH RECURSIVE subtree(id) AS (
+            SELECT id FROM tasks WHERE project_id = ?
+            UNION ALL
+            SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
+        )
+        SELECT id FROM subtree
+        """,
+        (project_id,),
+    )
+    return {r["id"] for r in rows}
+
+
 async def resolve_project_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> aiosqlite.Row | None:

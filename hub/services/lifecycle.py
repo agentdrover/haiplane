@@ -40,6 +40,7 @@ from hub.models import (
     TaskForceComplete,
     TaskPairStart,
     TaskProgress,
+    TaskProjectRef,
     TaskQuestion,
     TaskRefine,
     TaskReject,
@@ -396,6 +397,12 @@ async def enrich_task_view(
     row = await repo.get_task(db, task_view.id)
     if row:
         task_view.lifecycle_hint = compute_lifecycle_hint(dict(row))
+
+    project_row = await repo.resolve_project_for_task(db, task_view.id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
 
     return task_view
 
