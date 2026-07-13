@@ -420,6 +420,25 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
             ),
         )
 
+    # Bind an epic to a project at creation (#346). Only epics carry
+    # project_id — children resolve it by walking up to the root epic.
+    project_id: int | None = None
+    if body.project:
+        if body.task_type != TaskType.epic:
+            raise HTTPException(
+                422, "project can only be set on epics; children inherit it"
+            )
+        project_row = await repo.get_project_by_slug(db, body.project)
+        if project_row is None:
+            raise HTTPException(422, f"unknown project slug: {body.project!r}")
+        if project_row["archived"] or project_row["status"] != "active":
+            raise HTTPException(
+                422,
+                f"project {body.project!r} is not active "
+                "(pending proposals and archived projects cannot take epics)",
+            )
+        project_id = project_row["id"]
+
     if body.task_type in (TaskType.epic, TaskType.feature):
         # Agents PROPOSE features/epics as drafts (#323) — the human
         # approval gate owns the decomposition. Human-created ones stay
@@ -442,6 +461,8 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
     # The legacy repo.create_task only knew about the original columns
     # and silently dropped the rest of the payload (#46 / review C1).
     task_id = await repo.create_task_full(db, body, status=initial_status)
+    if project_id is not None:
+        await repo.update_task(db, task_id, project_id=project_id)
     await db.commit()
 
     result: dict[str, Any] = {}
