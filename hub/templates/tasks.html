@@ -6,6 +6,7 @@
 {% block content %}
 <header class="page-header">
     <h1 class="page-title">Tasks</h1>
+    {% with selector_action='/tasks' %}{% include "partials/project_selector.html" %}{% endwith %}
 </header>
 
 {% if parent_breadcrumb %}

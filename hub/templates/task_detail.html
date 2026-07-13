@@ -439,6 +439,10 @@
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Task Metadata</div>
                 <dl class="task-meta-list">
+                    {% if task.project %}
+                    <dt>Project</dt>
+                    <dd><span class="badge badge-type-epic">{{ task.project.slug }}</span></dd>
+                    {% endif %}
                     <dt>Status</dt>
                     <dd><span class="badge badge-{{ task.status.value }}">{{ task.status.value }}</span></dd>
                     <dt>Type</dt>
