@@ -465,3 +465,64 @@ async def test_list_stale_tasks_filters_status_and_review_job(
     assert stale_review in ids
     assert fresh_review not in ids
     assert headless_review not in ids
+
+
+async def test_resolve_project_for_task_walks_to_epic(db: aiosqlite.Connection):
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(
+        db, slug="calc-kids", name="Calc Kids", repo_name="mrPDA/calc-kids"
+    )
+    epic_id = await repo.create_task(
+        db,
+        title="E",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, epic_id, project_id=pid)
+    feat_id = await repo.create_task(
+        db,
+        title="F",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    task_id = await repo.create_task(
+        db,
+        title="T",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=feat_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    project = await repo.resolve_project_for_task(db, task_id)
+    assert project is not None and project["slug"] == "calc-kids"
+
+    # Task outside any project-assigned epic falls back to default.
+    loose_id = await _make_task(db, status="open")
+    project = await repo.resolve_project_for_task(db, loose_id)
+    assert project is not None and project["slug"] == "default"
