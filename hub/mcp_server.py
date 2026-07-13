@@ -435,6 +435,7 @@ async def hub_list_tasks(
     include_archived: bool = False,
     after_id: int | None = None,
     mode: str = "full",
+    project: str = "",
 ) -> CallToolResult:
     """List tasks with optional filters.
 
@@ -476,6 +477,8 @@ async def hub_list_tasks(
         params["after_id"] = after_id
     if mode and mode != "full":
         params["mode"] = mode
+    if project:
+        params["project"] = project
     result = await _api_get(f"/api/tasks?{urlencode(params)}")
     if isinstance(result, dict):
         # Paged/summary envelope (#254).
