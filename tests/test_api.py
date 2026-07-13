@@ -1542,14 +1542,18 @@ async def test_project_create_human_gate(client: AsyncClient, monkeypatch):
     human = {"Authorization": "Bearer human-token"}
 
     body = {"slug": "calc-kids", "name": "Calc Kids", "repo": "mrPDA/calc-kids"}
-    resp = await client.post("/api/projects", json=body, headers=agent)
-    assert resp.status_code == 403
-    assert resp.json()["detail"]["reason"] == "human_only_gate"
+    # Since #345 an agent CAN create — but only as a pending proposal.
+    resp = await client.post(
+        "/api/projects", json={**body, "slug": "agent-ck"}, headers=agent
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pending"
 
     resp = await client.post("/api/projects", json=body, headers=human)
     assert resp.status_code == 200, resp.text
     created = resp.json()
     assert created["slug"] == "calc-kids"
+    assert created["status"] == "active"
 
     # Duplicate slug → 409; list returns it.
     resp = await client.post("/api/projects", json=body, headers=human)
@@ -1631,3 +1635,83 @@ async def test_withdraw_matches_by_principal_id(client: AsyncClient, monkeypatch
     resp = await client.post(f"/api/tasks/{task_id}/withdraw", headers=impl)
     assert resp.status_code == 200, resp.text
     assert resp.json()["archived"] is True
+
+
+# ---- Project proposals (#345) ----
+
+
+async def test_agent_project_proposal_pending_then_activated(
+    client: AsyncClient, monkeypatch, db
+):
+    # AC-1 (#345)
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "ALLOW_AGENT_PROJECTS", "propose")
+    agent = {"Authorization": "Bearer impl-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    resp = await client.post(
+        "/api/projects",
+        json={"slug": "agent-idea", "name": "Agent Idea"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["status"] == "pending"
+
+    # Pending is invisible to routing: epic binding rejected, resolver falls
+    # back to default, selector list skips it.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "E for pending", "task_type": "epic"},
+        headers=human,
+    )
+    epic_id = resp.json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{epic_id}/refine",
+        json={"project": "agent-idea"},
+        headers=human,
+    )
+    assert resp.status_code == 422
+    assert "pending" in resp.json()["detail"]
+    active_rows = await repo_module.list_projects(db, only_active=True)
+    assert "agent-idea" not in {dict(r)["slug"] for r in active_rows}
+
+    # Human activation flips it to active and binding works.
+    resp = await client.patch(
+        f"/api/projects/{created['id']}",
+        json={"status": "active"},
+        headers=human,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "active"
+    resp = await client.post(
+        f"/api/tasks/{epic_id}/refine",
+        json={"project": "agent-idea"},
+        headers=human,
+    )
+    assert resp.status_code == 200
+
+
+async def test_agent_project_direct_mode(client: AsyncClient, monkeypatch):
+    # AC-2 (#345)
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "ALLOW_AGENT_PROJECTS", "direct")
+    agent = {"Authorization": "Bearer impl-token"}
+
+    resp = await client.post(
+        "/api/projects",
+        json={"slug": "solo-direct", "name": "Solo"},
+        headers=agent,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "active"

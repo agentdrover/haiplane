@@ -396,6 +396,10 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_tasks_project_id",
         "CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)",
     ),
+    (
+        "add_projects_status_column",
+        "ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    ),
     # ---- Separation of duties (#320): implementer identity as a principal.
     # Plain INTEGER on purpose (no FK): the value is an identity snapshot for
     # the self-review comparison, and it must survive principal deletion and

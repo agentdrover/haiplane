@@ -216,14 +216,24 @@ async def api_create_subtasks_bulk(
 async def api_create_project(
     body: ProjectCreate,
     request: Request,
-    _identity=Depends(require_human_or_admin),
+    identity=Depends(current_identity),
 ):
-    """Create a project (#338). Human gate: projects define git routing."""
+    """Create a project (#338/#345).
+
+    Humans create active projects. Agents PROPOSE: their projects start
+    as ``pending`` and stay out of git routing until a human activates
+    them (PATCH status=active). OPENCLAW_ALLOW_AGENT_PROJECTS=direct is
+    the solo-mode opt-out.
+    """
     db = _db(request)
     if await repo.get_project_by_slug(db, body.slug) is not None:
         raise HTTPException(409, f"project slug {body.slug!r} already exists")
     import json as _json
 
+    if identity.is_agent and config.ALLOW_AGENT_PROJECTS != "direct":
+        status_value = "pending"
+    else:
+        status_value = "active"
     pid = await repo.create_project(
         db,
         slug=body.slug,
@@ -232,10 +242,14 @@ async def api_create_project(
         workspace_path=body.workspace_path,
         default_branch=body.default_branch,
         default_branch_policy=_json.dumps(body.default_branch_policy),
+        status=status_value,
     )
     await db.commit()
     await db_module.log_activity(
-        db, "project_created", f"Project {body.slug} (#{pid}) created"
+        db,
+        "project_created",
+        f"Project {body.slug} (#{pid}) created as {status_value} "
+        f"by {identity.username}",
     )
     row = await repo.get_project(db, pid)
     return ProjectView(**dict(row))

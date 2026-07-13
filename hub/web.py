@@ -456,7 +456,7 @@ async def _project_filter_ctx(
     db: aiosqlite.Connection, project: str | None
 ) -> tuple[set[int] | None, list[dict[str, Any]], str]:
     """(allowed task ids | None, projects for the selector, current slug) (#339)."""
-    rows = await repo.list_projects(db)
+    rows = await repo.list_projects(db, only_active=True)
     projects = [dict(r) for r in rows]
     allowed: set[int] | None = None
     current = (project or "").strip()

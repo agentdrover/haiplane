@@ -857,12 +857,14 @@ class ProjectPatch(BaseModel):
     default_branch: str | None = Field(default=None, max_length=100)
     default_branch_policy: dict[str, Any] | None = None
     archived: bool | None = None
+    status: str | None = Field(default=None, pattern="^(pending|active)$")
 
 
 class ProjectView(BaseModel):
     id: int
     slug: str
     name: str
+    status: str = "active"
     repo: str = ""
     workspace_path: str = ""
     default_branch: str = "develop"
