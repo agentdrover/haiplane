@@ -294,6 +294,26 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_projects_list(args: argparse.Namespace) -> int:
+    query = "?include_archived=true" if args.include_archived else ""
+    result = _api("GET", f"/api/projects{query}")
+    _print_json(result)
+    return 0
+
+
+def cmd_projects_create(args: argparse.Namespace) -> int:
+    body = {
+        "slug": args.slug,
+        "name": args.name,
+        "repo": args.repo,
+        "workspace_path": args.workspace_path,
+        "default_branch": args.default_branch,
+    }
+    result = _api("POST", "/api/projects", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_approve_batch(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "task_ids": args.task_ids,
@@ -1188,6 +1208,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
+    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
+    pp_list = projects_sub.add_parser("list", help="List projects")
+    pp_list.add_argument(
+        "--include-archived", dest="include_archived", action="store_true"
+    )
+    pp_list.set_defaults(func=cmd_projects_list)
+    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
+    pp_create.add_argument("slug")
+    pp_create.add_argument("--name", required=True)
+    pp_create.add_argument("--repo", default="")
+    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
+    pp_create.add_argument("--default-branch", dest="default_branch", default="develop")
+    pp_create.set_defaults(func=cmd_projects_create)
 
     p_approve_batch = sub.add_parser(
         "approve-batch",

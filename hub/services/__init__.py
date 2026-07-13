@@ -30,6 +30,7 @@ from hub.services.recommendations import (
 )
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
+    ProjectBindError,
     TaskNotFoundError,
     add_acceptance_criterion,
     add_risk,
@@ -96,6 +97,7 @@ __all__ = [
     "DOR_REQUIRED_BY_WORK_TYPE",
     "DoREvaluation",
     "DuplicateAcceptanceCriterionError",
+    "ProjectBindError",
     "ReadinessConfig",
     "SEVERITY_ORDER",
     "ScoreComponent",

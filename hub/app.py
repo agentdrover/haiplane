@@ -40,6 +40,9 @@ from hub.models import (
     TaskContextView,
     TaskCreate,
     TaskProjectRef,
+    ProjectCreate,
+    ProjectPatch,
+    ProjectView,
     TaskDecide,
     TaskForceComplete,
     TaskQuestion,
@@ -69,6 +72,7 @@ from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
+    ProjectBindError,
     TaskNotFoundError,
 )
 from hub.services.tree_output import (
@@ -206,6 +210,71 @@ async def api_create_subtasks_bulk(
 ):
     """Atomically create multiple child tasks under ``parent_id``."""
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
+
+
+@app.post("/api/projects", response_model=ProjectView)
+async def api_create_project(
+    body: ProjectCreate,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Create a project (#338). Human gate: projects define git routing."""
+    db = _db(request)
+    if await repo.get_project_by_slug(db, body.slug) is not None:
+        raise HTTPException(409, f"project slug {body.slug!r} already exists")
+    import json as _json
+
+    pid = await repo.create_project(
+        db,
+        slug=body.slug,
+        name=body.name,
+        repo_name=body.repo,
+        workspace_path=body.workspace_path,
+        default_branch=body.default_branch,
+        default_branch_policy=_json.dumps(body.default_branch_policy),
+    )
+    await db.commit()
+    await db_module.log_activity(
+        db, "project_created", f"Project {body.slug} (#{pid}) created"
+    )
+    row = await repo.get_project(db, pid)
+    return ProjectView(**dict(row))
+
+
+@app.get("/api/projects", response_model=list[ProjectView])
+async def api_list_projects(
+    request: Request,
+    include_archived: bool = Query(default=False),
+):
+    rows = await repo.list_projects(_db(request), include_archived=include_archived)
+    return [ProjectView(**dict(r)) for r in rows]
+
+
+@app.patch("/api/projects/{project_id}", response_model=ProjectView)
+async def api_patch_project(
+    project_id: int,
+    body: ProjectPatch,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    db = _db(request)
+    if await repo.get_project(db, project_id) is None:
+        raise HTTPException(404, "project not found")
+    fields = body.model_dump(exclude_unset=True)
+    if (
+        "default_branch_policy" in fields
+        and fields["default_branch_policy"] is not None
+    ):
+        import json as _json
+
+        fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
+    if "archived" in fields and fields["archived"] is not None:
+        fields["archived"] = int(fields["archived"])
+    if fields:
+        await repo.update_project(db, project_id, **fields)
+        await db.commit()
+    row = await repo.get_project(db, project_id)
+    return ProjectView(**dict(row))
 
 
 @app.get("/api/integrations/notes")
@@ -837,6 +906,8 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, 422) from exc
+    except ProjectBindError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)

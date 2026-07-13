@@ -29,6 +29,7 @@ from hub.mcp_server import (
     hub_readiness_tree,
     hub_list_acceptance_criteria,
     hub_list_decisions,
+    hub_list_projects,
     hub_list_proposals,
     hub_list_tasks,
     hub_prepare_developer_task,
@@ -1974,3 +1975,20 @@ async def test_hub_list_decisions_empty_but_available(
     structured = _mcp_structured(out)
     assert structured["notes_available"] is True
     assert json.loads(_mcp_text(out))["message"] == "No decisions recorded."
+
+
+async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = [
+        {
+            "id": 1,
+            "slug": "default",
+            "name": "Default",
+            "repo": "",
+            "default_branch": "develop",
+            "archived": False,
+        }
+    ]
+    out = await hub_list_projects()
+    structured = _mcp_structured(out)
+    assert structured["projects"][0]["slug"] == "default"
+    mock_api_get.assert_awaited_once_with("/api/projects")

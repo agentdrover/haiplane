@@ -1064,3 +1064,28 @@ def test_cmd_approve_batch() -> None:
             "comment": "batch",
         },
     )
+
+
+def test_cmd_projects_create() -> None:
+    mock_api = MagicMock(return_value={"id": 2, "slug": "calc-kids"})
+    args = argparse.Namespace(
+        slug="calc-kids",
+        name="Calc Kids",
+        repo="mrPDA/calc-kids",
+        workspace_path="/srv/calc",
+        default_branch="develop",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_projects_create(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/projects",
+        {
+            "slug": "calc-kids",
+            "name": "Calc Kids",
+            "repo": "mrPDA/calc-kids",
+            "workspace_path": "/srv/calc",
+            "default_branch": "develop",
+        },
+    )
