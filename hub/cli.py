@@ -187,6 +187,8 @@ def _cmd_create_typed(task_type: str) -> Any:
             body["human_owner"] = args.owner
         if getattr(args, "reviewer", None):
             body["human_reviewer"] = args.reviewer
+        if getattr(args, "project", None):
+            body["project"] = args.project
         result = _api("POST", "/api/tasks", body)
         _print_json(result)
         return 0
@@ -1072,6 +1074,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_epic.add_argument("--owner", default="", help="Human owner")
     p_epic.add_argument("--reviewer", default="", help="Human reviewer")
+    p_epic.add_argument(
+        "--project", default=None, help="Project slug to attach the epic to"
+    )
     p_epic.set_defaults(func=_cmd_create_typed("epic"))
 
     # feature — create a feature under an epic

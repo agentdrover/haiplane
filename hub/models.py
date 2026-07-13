@@ -200,6 +200,8 @@ FINAL_STATUSES = frozenset(
 
 class TaskCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
+    # Bind an EPIC to a project at creation (#346); virtual field, epic-only.
+    project: str | None = Field(default=None, max_length=60)
     description: str = Field("", max_length=10000)
     task_type: TaskType = TaskType.task
     parent_id: int | None = None
