@@ -2239,3 +2239,91 @@ async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
     await services.pair_start_task(db, tv.id, caller="dev")
     kwargs = prep.await_args.kwargs
     assert "repo" not in kwargs and "base_branch" not in kwargs
+
+
+# --- project binding at epic creation (#346) ---
+
+
+async def _make_project(
+    db: aiosqlite.Connection, slug: str = "calc", status: str = "active"
+) -> int:
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    return await repo.create_project(
+        db, slug=slug, name=slug.title(), repo_name=f"mrPDA/{slug}", status=status
+    )
+
+
+async def test_create_epic_with_project_slug(db: aiosqlite.Connection):
+    pid = await _make_project(db)
+    tv = await services.create_task(
+        db, TaskCreate(title="Calc epic", task_type="epic", project="calc")
+    )
+    row = await repo.get_task(db, tv.id)
+    assert row["project_id"] == pid
+    resolved = await repo.resolve_project_for_task(db, tv.id)
+    assert resolved["slug"] == "calc"
+
+
+async def test_create_epic_agent_draft_keeps_project(db: aiosqlite.Connection):
+    # Agent proposes an epic (#323 draft gate) — project binds immediately,
+    # so approval does not lose the routing.
+    pid = await _make_project(db)
+    tv = await services.create_task(
+        db,
+        TaskCreate(
+            title="Agent epic",
+            task_type="epic",
+            project="calc",
+            source="agent",
+            agent="bot",
+        ),
+    )
+    assert tv.status.value == "draft"
+    row = await repo.get_task(db, tv.id)
+    assert row["project_id"] == pid
+
+
+async def test_create_non_epic_with_project_rejected(db: aiosqlite.Connection):
+    await _make_project(db)
+    epic = await services.create_task(db, TaskCreate(title="E", task_type="epic"))
+    with pytest.raises(HTTPException) as exc:
+        await services.create_task(
+            db,
+            TaskCreate(
+                title="F", task_type="feature", parent_id=epic.id, project="calc"
+            ),
+        )
+    assert exc.value.status_code == 422
+
+
+async def test_create_epic_unknown_project_rejected(db: aiosqlite.Connection):
+    await _make_project(db)
+    with pytest.raises(HTTPException) as exc:
+        await services.create_task(
+            db, TaskCreate(title="E", task_type="epic", project="nope")
+        )
+    assert exc.value.status_code == 422
+    assert "unknown project" in str(exc.value.detail)
+
+
+async def test_create_epic_pending_project_rejected(db: aiosqlite.Connection):
+    # Pending proposals (#345) cannot take epics until a human activates them.
+    await _make_project(db, slug="pend", status="pending")
+    with pytest.raises(HTTPException) as exc:
+        await services.create_task(
+            db, TaskCreate(title="E", task_type="epic", project="pend")
+        )
+    assert exc.value.status_code == 422
+    assert "not active" in str(exc.value.detail)
+
+
+async def test_create_epic_archived_project_rejected(db: aiosqlite.Connection):
+    pid = await _make_project(db, slug="old")
+    await repo.update_project(db, pid, archived=1)
+    with pytest.raises(HTTPException) as exc:
+        await services.create_task(
+            db, TaskCreate(title="E", task_type="epic", project="old")
+        )
+    assert exc.value.status_code == 422

@@ -1225,6 +1225,22 @@ async def test_hub_propose_task_passes_owner_and_reviewer(
     assert body["human_reviewer"] == "bob"
 
 
+async def test_hub_propose_task_passes_project_for_epic(
+    mock_api_post: AsyncMock,
+) -> None:
+    # #346: epic proposals carry the project slug; omitted otherwise.
+    mock_api_post.return_value = {"id": 201}
+    await hub_propose_task("Calc epic", "Epic body", task_type="epic", project="calc")
+    body = mock_api_post.await_args.args[1]
+    assert body["project"] == "calc"
+
+    mock_api_post.reset_mock()
+    mock_api_post.return_value = {"id": 202}
+    await hub_propose_task("Plain task", "No project")
+    body = mock_api_post.await_args.args[1]
+    assert "project" not in body
+
+
 async def test_hub_decide_task_sends_all_params(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:

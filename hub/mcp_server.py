@@ -1465,6 +1465,7 @@ async def hub_propose_task(
     human_owner: str = "",
     human_reviewer: str = "",
     task_type: str = "task",
+    project: str = "",
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -1481,6 +1482,7 @@ async def hub_propose_task(
         human_owner: Person who owns / is accountable for this work
         human_reviewer: Person who will review and accept the result
         task_type: task (default), subtask, feature, or epic
+        project: Project slug — only when proposing an epic (#346)
     """
     if task_type not in ("task", "subtask", "feature", "epic"):
         return format_echo_response(
@@ -1496,6 +1498,8 @@ async def hub_propose_task(
         "human_reviewer": human_reviewer,
         "task_type": task_type,
     }
+    if project:
+        body["project"] = project
     if parent_id is not None:
         body["parent_id"] = parent_id
     result = await _api_post("/api/tasks", body)
