@@ -346,3 +346,55 @@ async def test_stale_headless_review_not_alerted(mock_sleep, db):
     with pytest.raises(_BreakLoop):
         await _poll_running_tasks(_make_app(db))
     assert await _stale_alerts(db, task_id) == []
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poll_uses_persisted_verdict_without_text_scan(mock_sleep, db):
+    # AC-1 (#326): structured verdict for the current generation wins;
+    # extract_review_verdict is never called.
+    from unittest.mock import patch as _patch
+
+    task_id = await _make_review_task(db)
+    await repo.record_review_verdict(db, task_id, "approved")
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        _patch("hub.poller.services.extract_review_verdict") as extract_mock,
+        _patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    extract_mock.assert_not_called()
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "completed"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
+    # AC-2 (#326): no persisted verdict → the old text channel still works.
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(db, task_id, "reviewer", "review", "ok\nAPPROVED")
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["status"] == "completed"
+    assert d["review_verdict"] == "approved"
