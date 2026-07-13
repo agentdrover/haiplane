@@ -46,6 +46,10 @@ class DuplicateAcceptanceCriterionError(ValueError):
     """Raised when ac_id collides with an existing one for the same task."""
 
 
+class ProjectBindError(ValueError):
+    """Raised when a project binding is invalid (#338)."""
+
+
 def get_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
     """Return a per-connection write lock, created lazily on the running loop.
 
@@ -150,10 +154,25 @@ async def refine_task(
     await _ensure_task_exists(db, task_id)
     old_row = await repo.get_task(db, task_id)
 
+    project_id: int | None = None
+    if payload.project is not None:
+        # Epic-to-project binding (#338): projects live on epics only.
+        if old_row is None or old_row["task_type"] != "epic":
+            raise ProjectBindError(
+                "project can only be set on an epic; descendants inherit it"
+            )
+        project_row = await repo.get_project_by_slug(db, payload.project)
+        if project_row is None:
+            raise ProjectBindError(f"unknown project slug: {payload.project!r}")
+        project_id = project_row["id"]
+
     async with _atomic(db, "refine_task"):
         updated_columns, ac_count = await _apply_refine_writes(
             db, task_id, payload, old_row
         )
+        if project_id is not None:
+            await repo.update_task(db, task_id, project_id=project_id)
+            updated_columns["project_id"] = project_id
         await recalc_readiness_inline(db, task_id)
 
     return {"updated_columns": updated_columns, "ac_count": ac_count}

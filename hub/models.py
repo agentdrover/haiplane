@@ -473,6 +473,9 @@ class TaskRefine(BaseModel):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
 
+    # Bind an EPIC to a project by slug (#338); rejected for other types.
+    project: str | None = Field(default=None, max_length=60)
+
     title: str | None = Field(default=None, min_length=1, max_length=500)
     work_type: WorkType | None = None
     class_of_service: ClassOfService | None = None
@@ -843,6 +846,17 @@ class ProjectCreate(BaseModel):
     workspace_path: str = Field("", max_length=500)
     default_branch: str = Field("develop", max_length=100)
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectPatch(BaseModel):
+    """PATCH semantics: omitted fields stay unchanged (#338)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    repo: str | None = Field(default=None, max_length=200)
+    workspace_path: str | None = Field(default=None, max_length=500)
+    default_branch: str | None = Field(default=None, max_length=100)
+    default_branch_policy: dict[str, Any] | None = None
+    archived: bool | None = None
 
 
 class ProjectView(BaseModel):

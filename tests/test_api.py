@@ -1527,3 +1527,69 @@ async def test_task_contracts_carry_project_ref(client: AsyncClient, db):
     assert ctx["task"]["project"]["slug"] == "prod-c"
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert brief["project"]["slug"] == "prod-c"
+
+
+# ---- Projects CRUD (#338) ----
+
+
+async def test_project_create_human_gate(client: AsyncClient, monkeypatch):
+    # AC-1 (#338)
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer impl-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    body = {"slug": "calc-kids", "name": "Calc Kids", "repo": "mrPDA/calc-kids"}
+    resp = await client.post("/api/projects", json=body, headers=agent)
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "human_only_gate"
+
+    resp = await client.post("/api/projects", json=body, headers=human)
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["slug"] == "calc-kids"
+
+    # Duplicate slug → 409; list returns it.
+    resp = await client.post("/api/projects", json=body, headers=human)
+    assert resp.status_code == 409
+    resp = await client.get("/api/projects", headers=human)
+    assert "calc-kids" in {p["slug"] for p in resp.json()}
+
+    # PATCH updates and archives.
+    resp = await client.patch(
+        f"/api/projects/{created['id']}",
+        json={"default_branch": "trunk", "archived": True},
+        headers=human,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["default_branch"] == "trunk"
+    resp = await client.get("/api/projects", headers=human)
+    assert "calc-kids" not in {p["slug"] for p in resp.json()}
+
+
+async def test_epic_binds_to_project_via_refine(client: AsyncClient, db):
+    # AC-2 (#338)
+    from hub import repository as repo_module
+
+    await repo_module.create_project(db, slug="prod-z", name="Z")
+    await db.commit()
+    resp = await client.post(
+        "/api/tasks", json={"title": "Z epic", "task_type": "epic"}
+    )
+    epic_id = resp.json()["id"]
+
+    resp = await client.post(f"/api/tasks/{epic_id}/refine", json={"project": "prod-z"})
+    assert resp.status_code == 200, resp.text
+    body = (await client.get(f"/api/tasks/{epic_id}")).json()
+    assert body["project"]["slug"] == "prod-z"
+
+    # Unknown slug and non-epic target → 422.
+    resp = await client.post(f"/api/tasks/{epic_id}/refine", json={"project": "ghost"})
+    assert resp.status_code == 422
+    resp = await client.post("/api/tasks", json={"title": "Plain task"})
+    task_id = resp.json()["id"]
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json={"project": "prod-z"})
+    assert resp.status_code == 422
+    assert "epic" in resp.json()["detail"]

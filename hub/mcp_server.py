@@ -1498,6 +1498,58 @@ async def hub_propose_task(
 
 
 @mcp.tool()
+async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
+    """List projects (#338): slug, repo, workspace, base branch.
+
+    Args:
+        include_archived: Include archived projects.
+    """
+    query = "?include_archived=true" if include_archived else ""
+    projects = await _api_get(f"/api/projects{query}")
+    if not projects:
+        return structured_echo_result("No projects.", projects=[])
+    lines = [
+        f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'} "
+        f"| base={p.get('default_branch', 'develop')}"
+        + (" [archived]" if p.get("archived") else "")
+        for p in projects
+    ]
+    return structured_echo_result("\n".join(lines), projects=projects)
+
+
+@mcp.tool()
+async def hub_create_project(
+    slug: str,
+    name: str,
+    repo: str = "",
+    workspace_path: str = "",
+    default_branch: str = "develop",
+) -> str:
+    """Create a project (#338). HUMAN-ONLY: projects define git routing;
+    agent tokens receive human_only_gate.
+
+    Args:
+        slug: URL-safe unique slug (lowercase, digits, dashes)
+        name: Display name
+        repo: GitHub owner/repo for PRs
+        workspace_path: Server workspace clone path
+        default_branch: Integration branch (default develop)
+    """
+    body = {
+        "slug": slug,
+        "name": name,
+        "repo": repo,
+        "workspace_path": workspace_path,
+        "default_branch": default_branch,
+    }
+    try:
+        result = await _api_post("/api/projects", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return format_echo_response(f"Project {result['slug']} (#{result['id']}) created.")
+
+
+@mcp.tool()
 async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     """List agent proposals (draft tasks).
 
