@@ -516,6 +516,10 @@ def structured_fields_to_db(
     for key, value in data.items():
         if key == "acceptance_criteria":
             continue
+        if key == "project":
+            # Virtual refine field (#338): binds an epic to a project via
+            # slug in the service layer; there is no 'project' column.
+            continue
         if key == "risks":
             if value is None:
                 continue
