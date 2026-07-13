@@ -1,0 +1,12 @@
+{# Project selector (#339): GET form keeps other query params out of scope for V1. #}
+{% if projects_list is defined and projects_list %}
+<form method="get" action="{{ selector_action | default('/') }}" class="project-selector">
+    <label class="filter-label" for="project-select">Project</label>
+    <select id="project-select" name="project" class="filter-control" onchange="this.form.submit()">
+        <option value="">All projects</option>
+        {% for p in projects_list %}
+        <option value="{{ p.slug }}" {% if current_project == p.slug %}selected{% endif %}>{{ p.name }}</option>
+        {% endfor %}
+    </select>
+</form>
+{% endif %}

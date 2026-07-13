@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% set active = "projects" %}
+{% block title %}Projects — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Projects</h1>
+</header>
+<table class="task-table">
+    <thead>
+        <tr><th>Slug</th><th>Name</th><th>Repo</th><th>Base branch</th><th>Workspace</th><th></th></tr>
+    </thead>
+    <tbody>
+        {% for p in projects %}
+        <tr>
+            <td><a href="/tasks?project={{ p.slug }}">{{ p.slug }}</a></td>
+            <td>{{ p.name }}</td>
+            <td>{{ p.repo or '—' }}</td>
+            <td>{{ p.default_branch }}</td>
+            <td>{{ p.workspace_path or '—' }}</td>
+            <td>{% if p.archived %}<span class="badge badge-failed">archived</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
