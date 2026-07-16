@@ -3337,3 +3337,12 @@ body.htmx-request .htmx-progress {
     white-space: nowrap;
     border: 0;
 }
+
+/* Projects page forms (#344) */
+.project-error-note { margin-bottom: 12px; }
+.project-create { margin-bottom: 16px; }
+.project-create > summary { display: inline-block; cursor: pointer; }
+.project-form { max-width: 480px; margin-top: 12px; }
+.project-inline-form { display: inline; }
+.project-edit-cell { padding: 0 8px 8px; }
+.project-edit-summary { cursor: pointer; font-size: 0.85em; opacity: 0.7; }
