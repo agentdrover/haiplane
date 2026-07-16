@@ -408,6 +408,24 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_implementer_principal_id_column",
         "ALTER TABLE tasks ADD COLUMN implementer_principal_id INTEGER",
     ),
+    # ---- Events feed (#349): typed, cursor-addressable transition events.
+    # task_id/project_id are plain INTEGERs (no FK) for the same snapshot
+    # semantics as implementer_principal_id: an event must outlive its task.
+    (
+        "create_events_table",
+        "CREATE TABLE IF NOT EXISTS events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "kind TEXT NOT NULL, "
+        "task_id INTEGER, "
+        "project_id INTEGER, "
+        "actor TEXT NOT NULL DEFAULT '', "
+        "payload TEXT NOT NULL DEFAULT '{}', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    ),
+    (
+        "idx_events_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
+    ),
 ]
 
 

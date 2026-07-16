@@ -2327,3 +2327,83 @@ async def test_create_epic_archived_project_rejected(db: aiosqlite.Connection):
             db, TaskCreate(title="E", task_type="epic", project="old")
         )
     assert exc.value.status_code == 422
+
+
+# --- events feed (#349) ---
+
+
+async def _all_events(db: aiosqlite.Connection) -> list[dict]:
+    return [dict(r) for r in await repo.list_events(db, since=0)]
+
+
+async def test_event_emitted_on_verdict(db: aiosqlite.Connection):
+    # AC-1: verdict emits review_verdict_recorded in the same transaction.
+    task_id = await _pair_running_task(db, title="Verdict event task")
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    evs = [e for e in await _all_events(db) if e["kind"] == "review_verdict_recorded"]
+    assert len(evs) == 1
+    assert evs[0]["task_id"] == task_id
+    assert evs[0]["actor"] == "reviewer"
+    payload = json.loads(evs[0]["payload"])
+    assert payload["verdict"] == "approved"
+    assert payload["submission_generation"] == 1
+
+
+async def test_event_rolls_back_with_transaction(db: aiosqlite.Connection):
+    # AC-1: insert_event does not commit — a rollback removes the event.
+    await repo.insert_event(db, kind="task_approved", task_id=123)
+    await db.rollback()
+    assert await _all_events(db) == []
+
+
+async def test_event_kinds_on_human_gates(db: aiosqlite.Connection):
+    # AC-2: approve / reject / answer / decide-accept emit typed events.
+    d1 = await services.create_task(
+        db, TaskCreate(title="Draft A", source="agent", agent="bot")
+    )
+    await services.approve_task(db, d1.id, TaskApprove(force=True))
+
+    d2 = await services.create_task(
+        db, TaskCreate(title="Draft B", source="agent", agent="bot")
+    )
+    await services.reject_task(db, d2.id)
+
+    t3 = await services.create_task(db, TaskCreate(title="Q task"))
+    await repo.update_task(db, t3.id, status="needs_info")
+    await db.commit()
+    await services.answer_question(db, t3.id, TaskAnswer(answer="42", resume=False))
+
+    t4 = await services.create_task(db, TaskCreate(title="Decide task"))
+    await repo.update_task(db, t4.id, status="needs_decision")
+    await db.commit()
+    await services.decide_task(db, t4.id, TaskDecide(action="accept"))
+
+    events = await _all_events(db)
+    by_kind = {e["kind"]: e for e in events}
+    assert by_kind["task_approved"]["task_id"] == d1.id
+    assert by_kind["task_rejected"]["task_id"] == d2.id
+    assert by_kind["question_answered"]["task_id"] == t3.id
+    completed = by_kind["task_completed"]
+    assert completed["task_id"] == t4.id
+    assert json.loads(completed["payload"])["via"] == "decide_accept"
+
+
+async def test_event_completed_on_report_done(db: aiosqlite.Connection):
+    # AC-2: the report_done completion path emits task_completed.
+    tv = await services.create_task(
+        db, TaskCreate(title="Done path", auto_review=False)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: quick")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await services.add_update(
+        db, tv.id, TaskUpdateCreate(agent="dev", kind="done", content="Done")
+    )
+    evs = [e for e in await _all_events(db) if e["kind"] == "task_completed"]
+    assert len(evs) == 1
+    assert json.loads(evs[0]["payload"])["via"] == "report_done"

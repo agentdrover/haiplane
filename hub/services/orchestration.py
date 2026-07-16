@@ -190,6 +190,13 @@ async def transition_after_agent_done(
             exit_code=exit_code,
             result_text=result_text,
         )
+        await repo.insert_event(
+            db,
+            kind="task_completed",
+            task_id=task_id,
+            actor=task.get("assigned_agent") or "agent",
+            payload={"via": "report_done"},
+        )
         log.info("Task #%d → completed after done report", task_id)
         return "completed"
 
@@ -258,6 +265,13 @@ async def transition_after_agent_done(
             f"Review cycle limit reached ({task.get('review_cycle', 0)}/"
             f"{config.MAX_REVIEW_CYCLES}) without APPROVED review. "
             "Human decision required (hub_decide_task).",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "review_cycle_limit"},
         )
         log.info("Task #%d → needs_decision (review cycle limit)", task_id)
         return "needs_decision"
@@ -346,6 +360,13 @@ async def dispatch_review(
         # Universal Review Gate (#309): failure to dispatch a reviewer must
         # never complete the task — escalate to the human Decision Gate.
         await repo.update_task(db, task_id, status="needs_decision")
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "review_dispatch_failed"},
+        )
         await repo.add_task_update(
             db,
             task_id,
@@ -407,6 +428,13 @@ async def dispatch_fix(
             task_id,
             status="needs_decision",
             review_cycle=review_cycle,
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "fix_dispatch_failed"},
         )
         await repo.add_task_update(
             db,
@@ -477,6 +505,13 @@ async def dispatch_arbiter(
             result.get("error"),
         )
         await repo.update_task(db, task_id, status="needs_decision")
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "arbiter_dispatch_failed"},
+        )
     await db.commit()
 
 
@@ -526,6 +561,13 @@ async def dispatch_ci_fix(
             result.get("error"),
         )
         await repo.update_task(db, task_id, status="needs_decision")
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "ci_fix_dispatch_failed"},
+        )
     await db.commit()
 
 
