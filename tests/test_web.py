@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -966,6 +968,61 @@ async def test_web_create_project_bad_slug(client: AsyncClient, db):
     )
     assert resp.status_code == 303
     assert "project_error=" in resp.headers["location"]
+
+
+async def test_web_create_project_deeply_nested_policy_json(client: AsyncClient, db):
+    # #350 AC-1: '['*20000 makes json.loads raise RecursionError on py<3.13 —
+    # must land as a form error redirect, never a 500.
+    from hub import repository as repo_module
+
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "deep", "name": "Deep", "default_branch_policy": "[" * 20000},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    assert await repo_module.get_project_by_slug(db, "deep") is None
+
+
+async def test_web_edit_project_deeply_nested_policy_json(client: AsyncClient, db):
+    from hub import repository as repo_module
+
+    pid = await repo_module.create_project(db, slug="deep-ed", name="DeepEd")
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Changed", "default_branch_policy": "[" * 20000},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "DeepEd"  # nothing applied
+
+
+async def test_web_create_project_concurrent_duplicate_slug(client: AsyncClient, db):
+    # #350 AC-2: double-submit race — both requests pass the slug check before
+    # the first INSERT unless check+insert is serialized; the loser must get a
+    # 409-driven form error, not an IntegrityError 500.
+    from hub import repository as repo_module
+
+    def post():
+        return client.post(
+            "/projects/web-create",
+            data={"slug": "race", "name": "Race"},
+            follow_redirects=False,
+        )
+
+    r1, r2 = await asyncio.gather(post(), post())
+    assert {r1.status_code, r2.status_code} == {303}
+    locations = sorted([r1.headers["location"], r2.headers["location"]])
+    assert locations[0] == "/projects"
+    assert "project_error=" in locations[1]
+
+    rows = await repo_module.list_projects(db, include_archived=True)
+    assert sum(1 for r in rows if r["slug"] == "race") == 1
 
 
 async def test_web_edit_project(client: AsyncClient, db):
