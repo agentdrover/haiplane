@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -949,6 +951,9 @@ async def test_web_create_project_duplicate_slug(client: AsyncClient, db):
 
 async def test_web_create_project_bad_policy_json(client: AsyncClient, db):
     # AC-2: malformed policy JSON is a form error, not a 500.
+    # #351 AC-3: the project must NOT be created and the error must name policy.
+    from hub import repository as repo_module
+
     resp = await client.post(
         "/projects/web-create",
         data={"slug": "poly", "name": "Poly", "default_branch_policy": "{oops"},
@@ -956,9 +961,16 @@ async def test_web_create_project_bad_policy_json(client: AsyncClient, db):
     )
     assert resp.status_code == 303
     assert "project_error=" in resp.headers["location"]
+    assert await repo_module.get_project_by_slug(db, "poly") is None
+
+    page = await client.get(resp.headers["location"])
+    assert "policy" in page.text
 
 
 async def test_web_create_project_bad_slug(client: AsyncClient, db):
+    # #351 AC-3: no project row appears and the error names the slug field.
+    from hub import repository as repo_module
+
     resp = await client.post(
         "/projects/web-create",
         data={"slug": "Bad Slug!", "name": "X"},
@@ -966,6 +978,66 @@ async def test_web_create_project_bad_slug(client: AsyncClient, db):
     )
     assert resp.status_code == 303
     assert "project_error=" in resp.headers["location"]
+    rows = await repo_module.list_projects(db, include_archived=True)
+    assert all(r["name"] != "X" for r in rows)
+
+    page = await client.get(resp.headers["location"])
+    assert "slug" in page.text
+
+
+async def test_web_create_project_deeply_nested_policy_json(client: AsyncClient, db):
+    # #350 AC-1: '['*20000 makes json.loads raise RecursionError on py<3.13 —
+    # must land as a form error redirect, never a 500.
+    from hub import repository as repo_module
+
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "deep", "name": "Deep", "default_branch_policy": "[" * 20000},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    assert await repo_module.get_project_by_slug(db, "deep") is None
+
+
+async def test_web_edit_project_deeply_nested_policy_json(client: AsyncClient, db):
+    from hub import repository as repo_module
+
+    pid = await repo_module.create_project(db, slug="deep-ed", name="DeepEd")
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Changed", "default_branch_policy": "[" * 20000},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "DeepEd"  # nothing applied
+
+
+async def test_web_create_project_concurrent_duplicate_slug(client: AsyncClient, db):
+    # #350 AC-2: double-submit race — both requests pass the slug check before
+    # the first INSERT unless check+insert is serialized; the loser must get a
+    # 409-driven form error, not an IntegrityError 500.
+    from hub import repository as repo_module
+
+    def post():
+        return client.post(
+            "/projects/web-create",
+            data={"slug": "race", "name": "Race"},
+            follow_redirects=False,
+        )
+
+    r1, r2 = await asyncio.gather(post(), post())
+    assert {r1.status_code, r2.status_code} == {303}
+    locations = sorted([r1.headers["location"], r2.headers["location"]])
+    assert locations[0] == "/projects"
+    assert "project_error=" in locations[1]
+
+    rows = await repo_module.list_projects(db, include_archived=True)
+    assert sum(1 for r in rows if r["slug"] == "race") == 1
 
 
 async def test_web_edit_project(client: AsyncClient, db):
@@ -1041,6 +1113,90 @@ async def test_web_activate_pending_project(client: AsyncClient, db):
     assert resp.status_code == 303
     row = await repo_module.get_project(db, pid)
     assert row["status"] == "active"
+
+
+def _web_project_tokens():
+    from hub.config import TokenIdentity
+
+    return {
+        "agent-token": TokenIdentity("bot", "agent"),
+        "human-token": TokenIdentity("op", "human"),
+    }
+
+
+async def test_web_patch_routes_reject_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    # #351 AC-1: the human gate on web-activate/edit/archive must hold for an
+    # agent Bearer — the web path is guarded only by require_human_or_admin.
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    pid = await repo_module.create_project(
+        db, slug="gate", name="Gate", status="pending"
+    )
+    await db.commit()
+
+    for url, data in (
+        (f"/projects/{pid}/web-activate", {}),
+        (f"/projects/{pid}/web-edit", {"name": "Hacked"}),
+        (f"/projects/{pid}/web-archive", {"archived": "true"}),
+    ):
+        resp = await client.post(url, data=data, headers=agent, follow_redirects=False)
+        assert resp.status_code == 403, url
+
+    row = await repo_module.get_project(db, pid)
+    assert row["status"] == "pending"
+    assert row["name"] == "Gate"
+    assert row["archived"] == 0
+
+
+async def test_web_create_project_agent_token_creates_pending(
+    client: AsyncClient, monkeypatch, db
+):
+    # #351 AC-2: agent→pending must survive through the web-create wrapper,
+    # not only through POST /api/projects.
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "ALLOW_AGENT_PROJECTS", "propose")
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "agent-made", "name": "Agent Made"},
+        headers=agent,
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project_by_slug(db, "agent-made")
+    assert row is not None
+    assert row["status"] == "pending"
+
+
+async def test_web_edit_project_name_too_long_is_form_error(client: AsyncClient, db):
+    # #351 AC-4: ProjectPatch max_length=200 — the ValidationError branch of
+    # web-edit must redirect with project_error, never 500.
+    from hub import repository as repo_module
+
+    pid = await repo_module.create_project(db, slug="longname", name="Long")
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "x" * 201},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "Long"
 
 
 async def test_web_edit_project_bad_policy_json(client: AsyncClient, db):

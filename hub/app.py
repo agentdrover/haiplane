@@ -75,6 +75,7 @@ from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
     ProjectBindError,
     TaskNotFoundError,
+    get_write_lock,
 )
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -227,25 +228,29 @@ async def api_create_project(
     the solo-mode opt-out.
     """
     db = _db(request)
-    if await repo.get_project_by_slug(db, body.slug) is not None:
-        raise HTTPException(409, f"project slug {body.slug!r} already exists")
     import json as _json
 
     if identity.is_agent and config.ALLOW_AGENT_PROJECTS != "direct":
         status_value = "pending"
     else:
         status_value = "active"
-    pid = await repo.create_project(
-        db,
-        slug=body.slug,
-        name=body.name,
-        repo_name=body.repo,
-        workspace_path=body.workspace_path,
-        default_branch=body.default_branch,
-        default_branch_policy=_json.dumps(body.default_branch_policy),
-        status=status_value,
-    )
-    await db.commit()
+    # Write lock serializes check-then-insert: two concurrent creates with the
+    # same slug would otherwise both pass the SELECT and the second INSERT
+    # would surface as IntegrityError → 500 instead of the promised 409.
+    async with get_write_lock(db):
+        if await repo.get_project_by_slug(db, body.slug) is not None:
+            raise HTTPException(409, f"project slug {body.slug!r} already exists")
+        pid = await repo.create_project(
+            db,
+            slug=body.slug,
+            name=body.name,
+            repo_name=body.repo,
+            workspace_path=body.workspace_path,
+            default_branch=body.default_branch,
+            default_branch_policy=_json.dumps(body.default_branch_policy),
+            status=status_value,
+        )
+        await db.commit()
     await db_module.log_activity(
         db,
         "project_created",

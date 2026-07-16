@@ -562,7 +562,9 @@ def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
         return None, None
     try:
         parsed = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: на Python <3.13 json.loads падает рекурсией на глубоко
+        # вложенном вводе ('['*20000) — это не ValueError и без перехвата даёт 500.
         return None, "policy: не парсится как JSON"
     if not isinstance(parsed, dict):
         return None, "policy: ожидается JSON-объект"
