@@ -114,10 +114,10 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
     return payload
 
 
-async def _api_get(path: str) -> Any:
+async def _api_get(path: str, *, timeout: float = 15) -> Any:
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
         try:
             resp.raise_for_status()
@@ -1526,6 +1526,52 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
         for p in projects
     ]
     return structured_echo_result("\n".join(lines), projects=projects)
+
+
+@mcp.tool()
+async def hub_wait_events(
+    since: int = 0,
+    wait: int = 30,
+    kinds: str = "",
+) -> CallToolResult:
+    """Wait for typed hub events past a cursor (#349) — the agent half of
+    the «human pressed a button → agent continues» loop.
+
+    Long-polls GET /api/events: returns immediately when events with
+    id > ``since`` exist, otherwise blocks up to ``wait`` seconds (server
+    caps at 60). An empty result is normal — repeat with the same cursor.
+
+    Args:
+        since: Last seen event id (0 starts from the whole feed).
+        wait: Long-poll seconds, 0 returns immediately.
+        kinds: Comma-separated filter, e.g. "review_verdict_recorded,task_approved".
+    """
+    from urllib.parse import urlencode
+
+    params = {"since": since, "wait": wait}
+    if kinds:
+        params["kinds"] = kinds
+    result = await _api_get(
+        f"/api/events?{urlencode(params)}", timeout=min(wait, 60) + 20
+    )
+    events = result.get("events", [])
+    next_cursor = result.get("next_cursor", since)
+    if not events:
+        return structured_echo_result(
+            f"No events (cursor {next_cursor}). Repeat hub_wait_events with "
+            f"since={next_cursor}.",
+            events=[],
+            next_cursor=next_cursor,
+        )
+    lines = []
+    for e in events:
+        target = f"task #{e['task_id']}" if e.get("task_id") else ""
+        if e.get("project_id"):
+            target = (target + f" project #{e['project_id']}").strip()
+        lines.append(f"[{e['id']}] {e['kind']} {target} {e.get('payload') or ''}")
+    return structured_echo_result(
+        "\n".join(lines), events=events, next_cursor=next_cursor
+    )
 
 
 @mcp.tool()

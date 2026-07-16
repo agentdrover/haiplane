@@ -2048,3 +2048,43 @@ async def test_task_update_done_alias_marked_deprecated(
     payload = json.loads(out)
     assert payload["deprecated"] is True
     assert "hub_report_done" in payload["next_action"]
+
+
+async def test_hub_wait_events(mock_api_get: AsyncMock) -> None:
+    # AC-6: structured envelope with events[] and next_cursor.
+    from hub.mcp_server import hub_wait_events
+
+    mock_api_get.return_value = {
+        "events": [
+            {
+                "id": 5,
+                "kind": "task_approved",
+                "task_id": 7,
+                "project_id": None,
+                "actor": "human",
+                "payload": {"run": False},
+                "created_at": "2026-07-14 00:00:00",
+            }
+        ],
+        "next_cursor": 5,
+    }
+    out = await hub_wait_events(since=0, wait=0)
+    structured = _mcp_structured(out)
+    assert structured["next_cursor"] == 5
+    assert structured["events"][0]["kind"] == "task_approved"
+    path = mock_api_get.await_args.args[0]
+    assert path.startswith("/api/events?")
+    assert "since=0" in path and "wait=0" in path
+
+
+async def test_hub_wait_events_empty(mock_api_get: AsyncMock) -> None:
+    # AC-6: empty feed is a normal answer, not an error.
+    from hub.mcp_server import hub_wait_events
+
+    mock_api_get.return_value = {"events": [], "next_cursor": 42}
+    out = await hub_wait_events(since=42, wait=1, kinds="task_approved")
+    structured = _mcp_structured(out)
+    assert structured["events"] == []
+    assert structured["next_cursor"] == 42
+    path = mock_api_get.await_args.args[0]
+    assert "kinds=task_approved" in path

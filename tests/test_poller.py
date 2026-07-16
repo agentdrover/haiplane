@@ -398,3 +398,23 @@ async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
     d = dict(await repo.get_task(db, task_id))
     assert d["status"] == "completed"
     assert d["review_verdict"] == "approved"
+
+
+async def test_events_pruning(db):
+    # AC-7 (#349): maintenance removes events older than 14 days only.
+    from hub import repository as repo_module
+
+    await repo_module.insert_event(db, kind="ancient", task_id=1)
+    await repo_module.insert_event(db, kind="fresh", task_id=2)
+    await db.execute(
+        "UPDATE events SET created_at = datetime('now', '-20 days') "
+        "WHERE kind = 'ancient'"
+    )
+    await db.commit()
+
+    removed = await repo_module.prune_events(db, keep_days=14)
+    await db.commit()
+
+    assert removed == 1
+    kinds = {r["kind"] for r in await repo_module.list_events(db, since=0)}
+    assert kinds == {"fresh"}
