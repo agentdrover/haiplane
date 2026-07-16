@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +24,7 @@ from hub.auth import (
     CSRF_COOKIE_NAME,
     current_user,
     current_identity,
+    require_human_or_admin,
     generate_csrf_token,
     login_limiter,
     require_permission,
@@ -31,6 +33,8 @@ from hub.auth import (
 from hub.integrations.registry import plugins
 from hub.models import (
     BatchApprove,
+    ProjectCreate,
+    ProjectPatch,
     ReviewFinding,
     ReviewSeverity,
     RuntimeChoice,
@@ -541,14 +545,121 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
 
 
 @router.get("/projects", response_class=HTMLResponse)
-async def web_projects(request: Request):
-    """Read-only project list (#339)."""
+async def web_projects(request: Request, project_error: str = Query("")):
+    """Project list with create/edit/archive forms (#339, #344)."""
     rows = await repo.list_projects(_db(request), include_archived=True)
     return TEMPLATES.TemplateResponse(
         request,
         "projects.html",
-        {"projects": [dict(r) for r in rows]},
+        {"projects": [dict(r) for r in rows], "project_error": project_error},
     )
+
+
+def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
+    """(policy dict | None if absent, error message | None)."""
+    raw = raw.strip()
+    if not raw:
+        return None, None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None, "policy: не парсится как JSON"
+    if not isinstance(parsed, dict):
+        return None, "policy: ожидается JSON-объект"
+    return parsed, None
+
+
+def _projects_error_redirect(message: str) -> RedirectResponse:
+    return RedirectResponse(
+        f"/projects?project_error={quote(message)}", status_code=303
+    )
+
+
+@router.post("/projects/web-create")
+async def web_create_project(request: Request):
+    """Create-project form (#344): thin wrapper over the API handler —
+    the same slug validation, 409 duplication and agent→pending rules."""
+    form = await request.form()
+    policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))
+    if err:
+        return _projects_error_redirect(err)
+    try:
+        body = ProjectCreate(
+            slug=str(form.get("slug") or "").strip(),
+            name=str(form.get("name") or "").strip(),
+            repo=str(form.get("repo") or "").strip(),
+            workspace_path=str(form.get("workspace_path") or "").strip(),
+            default_branch=str(form.get("default_branch") or "").strip() or "develop",
+            default_branch_policy=policy or {},
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
+
+    from hub.app import api_create_project
+
+    try:
+        await api_create_project(body, request, identity=current_identity(request))
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return _projects_error_redirect(str(exc.detail))
+        raise
+    return RedirectResponse("/projects", status_code=303)
+
+
+async def _web_patch_project(
+    request: Request, project_id: int, body: ProjectPatch
+) -> None:
+    """Shared web→API bridge: the same human gate as PATCH /api/projects."""
+    from hub.app import api_patch_project
+
+    await api_patch_project(
+        project_id, body, request, _identity=require_human_or_admin(request)
+    )
+
+
+@router.post("/projects/{project_id}/web-edit")
+async def web_edit_project(project_id: int, request: Request):
+    """Inline-edit form (#344): exactly the ProjectPatch fields."""
+    form = await request.form()
+    fields: dict[str, Any] = {}
+    for key in ("name", "repo", "workspace_path", "default_branch"):
+        if key in form:
+            value = str(form.get(key) or "").strip()
+            if not value and key in ("name", "default_branch"):
+                continue  # обязательные в модели — пустое значит «не менять»
+            fields[key] = value
+    policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))
+    if err:
+        return _projects_error_redirect(err)
+    if policy is not None:
+        fields["default_branch_policy"] = policy
+    if not fields:
+        return RedirectResponse("/projects", status_code=303)
+    try:
+        body = ProjectPatch(**fields)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
+    await _web_patch_project(request, project_id, body)
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/projects/{project_id}/web-archive")
+async def web_archive_project(
+    project_id: int, request: Request, archived: bool = Form(...)
+):
+    await _web_patch_project(request, project_id, ProjectPatch(archived=archived))
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/projects/{project_id}/web-activate")
+async def web_activate_project(project_id: int, request: Request):
+    """Activate a pending agent proposal (#345) from the UI."""
+    await _web_patch_project(request, project_id, ProjectPatch(status="active"))
+    return RedirectResponse("/projects", status_code=303)
 
 
 @router.get("/tasks", response_class=HTMLResponse)

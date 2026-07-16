@@ -890,3 +890,258 @@ async def test_task_detail_shows_project_badge(client: AsyncClient, db):
     assert resp.status_code == 200
     assert "Project" in resp.text
     assert "ui-a" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Project forms: create / edit / archive / activate (#344)
+# ---------------------------------------------------------------------------
+
+
+async def test_web_create_project_form(client: AsyncClient, db):
+    # AC-1: form submit creates the project; it shows up in the table.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/projects/web-create",
+        data={
+            "slug": "calc-kids",
+            "name": "Calc Kids",
+            "repo": "mrPDA/calc-kids",
+            "workspace_path": "/srv/calc",
+            "default_branch": "master",
+            "default_branch_policy": '{"release_base": "main"}',
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/projects"
+
+    page = await client.get("/projects")
+    assert "calc-kids" in page.text
+    assert "master" in page.text
+
+    from hub import repository as repo_module
+
+    row = await repo_module.get_project_by_slug(db, "calc-kids")
+    assert row is not None
+    assert row["status"] == "active"  # web session = human path
+    assert '"release_base"' in row["default_branch_policy"]
+
+
+async def test_web_create_project_duplicate_slug(client: AsyncClient, db):
+    # AC-2: duplicate slug lands as a form error, not a 500.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "default", "name": "Dup"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+
+    page = await client.get(resp.headers["location"])
+    assert page.status_code == 200
+    assert "already exists" in page.text
+
+
+async def test_web_create_project_bad_policy_json(client: AsyncClient, db):
+    # AC-2: malformed policy JSON is a form error, not a 500.
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "poly", "name": "Poly", "default_branch_policy": "{oops"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+
+
+async def test_web_create_project_bad_slug(client: AsyncClient, db):
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "Bad Slug!", "name": "X"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+
+
+async def test_web_edit_project(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(
+        db, slug="edit-me", name="Before", repo_name=""
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "name": "After",
+            "repo": "mrPDA/after",
+            "workspace_path": "",
+            "default_branch": "trunk",
+            "default_branch_policy": "",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "After"
+    assert row["repo"] == "mrPDA/after"
+    assert row["default_branch"] == "trunk"
+
+
+async def test_web_archive_and_unarchive_project(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(db, slug="arch", name="Arch")
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-archive",
+        data={"archived": "true"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["archived"] == 1
+
+    resp = await client.post(
+        f"/projects/{pid}/web-archive",
+        data={"archived": "false"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["archived"] == 0
+
+
+async def test_web_activate_pending_project(client: AsyncClient, db):
+    # #345 loop closed in UI: pending proposal → Activate button → active.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(
+        db, slug="pend", name="Pending", status="pending"
+    )
+    await db.commit()
+
+    page = await client.get("/projects")
+    assert "pending" in page.text and "web-activate" in page.text
+
+    resp = await client.post(f"/projects/{pid}/web-activate", follow_redirects=False)
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["status"] == "active"
+
+
+async def test_web_edit_project_bad_policy_json(client: AsyncClient, db):
+    # Review finding (#344): the edit route has its own _parse_policy_form
+    # call — malformed JSON must be a form error there too, row untouched.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(db, slug="polyed", name="PolyEd")
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Hacked", "default_branch_policy": "{oops"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "PolyEd"  # ничего не применилось
+
+
+async def test_web_edit_project_policy_roundtrip(client: AsyncClient, db):
+    # Review finding (#344): pin 'empty textarea = keep policy' and the
+    # stored-JSON → textarea → resubmit round-trip.
+    import json as json_module
+
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await client.post(
+        "/projects/web-create",
+        data={
+            "slug": "rt",
+            "name": "RT",
+            "default_branch_policy": '{"release_base": "main"}',
+        },
+        follow_redirects=False,
+    )
+    row = await repo_module.get_project_by_slug(db, "rt")
+    pid = row["id"]
+
+    page = await client.get("/projects")
+    assert "release_base" in page.text  # policy prefilled in the edit textarea
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"default_branch_policy": '{"release_base": "trunk"}'},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert json_module.loads(row["default_branch_policy"]) == {"release_base": "trunk"}
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "RT2", "default_branch_policy": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "RT2"
+    assert json_module.loads(row["default_branch_policy"]) == {
+        "release_base": "trunk"
+    }  # пусто = не менять
+
+
+async def test_web_edit_project_empty_required_fields_keep_values(
+    client: AsyncClient, db
+):
+    # Review finding (#344): blank name/default_branch mean 'keep', while
+    # blank repo/workspace_path intentionally clear.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(
+        db,
+        slug="keep",
+        name="Keeper",
+        repo_name="mrPDA/keep",
+        workspace_path="/srv/keep",
+        default_branch="trunk",
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "name": "",
+            "default_branch": "",
+            "repo": "",
+            "workspace_path": "",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_project(db, pid)
+    assert row["name"] == "Keeper"  # пустое обязательное — не меняем
+    assert row["default_branch"] == "trunk"
+    assert row["repo"] == ""  # пустое необязательное — очищаем
+    assert row["workspace_path"] == ""
