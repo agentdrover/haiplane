@@ -1715,3 +1715,80 @@ async def test_agent_project_direct_mode(client: AsyncClient, monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# Events feed (#349)
+# ---------------------------------------------------------------------------
+
+
+async def test_events_cursor(client: AsyncClient, db):
+    # AC-3: ASC order, next_cursor, idempotent repeat, kinds filter.
+    from hub import repository as repo_module
+
+    for i in range(3):
+        await repo_module.insert_event(db, kind=f"k{i}", task_id=i + 1)
+    await db.commit()
+
+    resp = await client.get("/api/events?since=0")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert [e["kind"] for e in data["events"]] == ["k0", "k1", "k2"]
+    assert data["events"][0]["payload"] == {}
+    cursor = data["next_cursor"]
+    assert cursor == data["events"][-1]["id"]
+
+    resp2 = await client.get(f"/api/events?since={cursor}")
+    assert resp2.json() == {"events": [], "next_cursor": cursor}
+
+    resp3 = await client.get("/api/events?since=0&kinds=k1")
+    assert [e["kind"] for e in resp3.json()["events"]] == ["k1"]
+
+
+async def test_events_long_poll(client: AsyncClient, db):
+    # AC-4: long-poll returns early when an event lands during the wait.
+    import asyncio
+    import time as time_module
+
+    from hub import repository as repo_module
+
+    async def emit_later():
+        await asyncio.sleep(0.3)
+        await repo_module.insert_event(db, kind="late_event", task_id=9)
+        await db.commit()
+
+    emitter = asyncio.create_task(emit_later())
+    started = time_module.monotonic()
+    resp = await client.get("/api/events?since=0&wait=5")
+    elapsed = time_module.monotonic() - started
+    await emitter
+
+    assert [e["kind"] for e in resp.json()["events"]] == ["late_event"]
+    assert elapsed < 4.5  # returned well before the 5s deadline
+
+    # No events: empty answer after the wait expires.
+    cursor = resp.json()["next_cursor"]
+    started = time_module.monotonic()
+    resp2 = await client.get(f"/api/events?since={cursor}&wait=1")
+    elapsed2 = time_module.monotonic() - started
+    assert resp2.json()["events"] == []
+    assert elapsed2 >= 0.9
+
+
+async def test_events_auth(client: AsyncClient, monkeypatch):
+    # AC-5: 401 without a token once tokens are configured; 200 with one.
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"events-token": TokenIdentity("bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.get("/api/events")
+    assert resp.status_code == 401
+
+    resp2 = await client.get(
+        "/api/events", headers={"Authorization": "Bearer events-token"}
+    )
+    assert resp2.status_code == 200

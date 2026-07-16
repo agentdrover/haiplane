@@ -671,6 +671,14 @@ async def approve_task(
     transitioned = await repo.transition_status_if(
         db, task_id, expected_from="draft", new_status="open"
     )
+    if transitioned:
+        await repo.insert_event(
+            db,
+            kind="task_approved",
+            task_id=task_id,
+            actor="human",
+            payload={"run": bool(body.run), "force": bool(body.force)},
+        )
     await db.commit()
     if not transitioned:
         raise HTTPException(409, "task is no longer draft (concurrent approve?)")
@@ -793,6 +801,7 @@ async def reject_task(
         )
 
     await repo.update_task(db, task_id, status="rejected")
+    await repo.insert_event(db, kind="task_rejected", task_id=task_id, actor="human")
     await db.commit()
     await log_activity(
         db,
@@ -1078,6 +1087,16 @@ async def record_review_verdict(
                     db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
                 )
 
+        await repo.insert_event(
+            db,
+            kind="review_verdict_recorded",
+            task_id=task_id,
+            actor=agent,
+            payload={
+                "verdict": body.verdict.value,
+                "submission_generation": task.get("submission_generation") or 0,
+            },
+        )
         await db.commit()
         await log_activity(
             db,
@@ -1305,6 +1324,13 @@ async def answer_question(
         )
 
     await repo.add_task_update(db, task_id, "", "answer", body.answer)
+    await repo.insert_event(
+        db,
+        kind="question_answered",
+        task_id=task_id,
+        actor="human",
+        payload={"resume": bool(body.resume)},
+    )
     await db.commit()
 
     if body.resume:
@@ -1375,6 +1401,13 @@ async def decide_task(
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
         await repo.update_task(db, task_id, status="completed")
+        await repo.insert_event(
+            db,
+            kind="task_completed",
+            task_id=task_id,
+            actor="human",
+            payload={"via": "decide_accept"},
+        )
         await db.commit()
         await maybe_rollup_parent(db, task_id)
         await log_activity(

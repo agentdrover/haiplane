@@ -379,6 +379,66 @@ async def resolve_project_for_task(
     return await get_project_by_slug(db, "default")
 
 
+# --- events feed (#349) ----------------------------------------------------
+
+
+async def insert_event(
+    db: aiosqlite.Connection,
+    *,
+    kind: str,
+    task_id: int | None = None,
+    project_id: int | None = None,
+    actor: str = "",
+    payload: dict[str, Any] | None = None,
+) -> int:
+    """Append a typed event. Deliberately NO commit: the caller emits it
+    inside the same transaction as the transition it describes, so a
+    rollback removes both (#349 AC-1)."""
+    cur = await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            kind,
+            task_id,
+            project_id,
+            actor,
+            json.dumps(payload or {}, ensure_ascii=False),
+        ),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def list_events(
+    db: aiosqlite.Connection,
+    *,
+    since: int = 0,
+    kinds: list[str] | None = None,
+    limit: int = 200,
+) -> list[aiosqlite.Row]:
+    """Events with id > since, oldest first. ``kinds`` narrows the feed."""
+    conditions = ["id > ?"]
+    params: list[Any] = [since]
+    if kinds:
+        placeholders = ",".join("?" for _ in kinds)
+        conditions.append(f"kind IN ({placeholders})")
+        params.extend(kinds)
+    params.append(min(limit, 200))
+    return await db.execute_fetchall(
+        f"SELECT * FROM events WHERE {' AND '.join(conditions)} "  # nosec B608
+        "ORDER BY id ASC LIMIT ?",
+        tuple(params),
+    )
+
+
+async def prune_events(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
+    """Delete events older than ``keep_days``. Returns rows removed."""
+    cur = await db.execute(
+        "DELETE FROM events WHERE created_at < datetime('now', ?)",
+        (f"-{keep_days} days",),
+    )
+    return cur.rowcount or 0
+
+
 async def list_stale_tasks(
     db: aiosqlite.Connection,
     status: str,

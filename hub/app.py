@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -272,7 +273,8 @@ async def api_patch_project(
     _identity=Depends(require_human_or_admin),
 ):
     db = _db(request)
-    if await repo.get_project(db, project_id) is None:
+    before = await repo.get_project(db, project_id)
+    if before is None:
         raise HTTPException(404, "project not found")
     fields = body.model_dump(exclude_unset=True)
     if (
@@ -286,9 +288,64 @@ async def api_patch_project(
         fields["archived"] = int(fields["archived"])
     if fields:
         await repo.update_project(db, project_id, **fields)
+        if fields.get("status") == "active" and before["status"] != "active":
+            # Events feed (#349): a pending proposal became a real project.
+            await repo.insert_event(
+                db,
+                kind="project_activated",
+                project_id=project_id,
+                actor="human",
+                payload={"slug": before["slug"]},
+            )
         await db.commit()
     row = await repo.get_project(db, project_id)
     return ProjectView(**dict(row))
+
+
+@app.get("/api/events")
+async def api_list_events(
+    request: Request,
+    since: int = Query(default=0, ge=0, description="Cursor: last seen event id"),
+    wait: int = Query(
+        default=0,
+        ge=0,
+        description="Long-poll seconds (capped at 60): block until events or timeout",
+    ),
+    kinds: str = Query(default="", description="Comma-separated kind filter"),
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    """Cursor-addressable events feed (#349).
+
+    Returns transition events with id > ``since`` oldest-first plus
+    ``next_cursor`` (last returned id; unchanged ``since`` when empty, so
+    repeat calls are idempotent). With ``wait`` > 0 the request long-polls:
+    periodic re-reads on asyncio.sleep — the shared write lock is never
+    held between reads, so writers are not starved.
+    """
+    import json as _json
+    import time as _time
+
+    db = _db(request)
+    kind_list = [k.strip() for k in kinds.split(",") if k.strip()] or None
+    deadline = _time.monotonic() + min(wait, 60)
+    while True:
+        rows = await repo.list_events(db, since=since, kinds=kind_list, limit=limit)
+        if rows or _time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(1.0)
+
+    events = []
+    for r in rows:
+        item = dict(r)
+        try:
+            item["payload"] = _json.loads(item.get("payload") or "{}")
+        except (TypeError, ValueError):
+            item["payload"] = {}
+        events.append(item)
+    return {
+        "events": events,
+        "next_cursor": events[-1]["id"] if events else since,
+    }
 
 
 @app.post("/api/telemetry/deprecated-tool")

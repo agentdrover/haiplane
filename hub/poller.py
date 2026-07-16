@@ -72,6 +72,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         exit_code=job.get("exit_code"),
                         result_text=job.get("result_text"),
                     )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "blocker_reported"},
+                    )
                     await db.commit()
                     log.info(
                         "Poll: task #%d → needs_decision (blocker reported)",
@@ -156,6 +163,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 if job_status == "failed":
                     if has_alert or has_arbitration:
                         await repo.update_task(db, task["id"], status="needs_decision")
+                        await repo.insert_event(
+                            db,
+                            kind="needs_decision",
+                            task_id=task["id"],
+                            actor="hub",
+                            payload={"reason": "review_job_failed_after_limit"},
+                        )
                         await db.commit()
                         await repo.add_task_update(
                             db,
@@ -174,6 +188,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         # Universal Review Gate (#309): a crashed review job
                         # must never complete the task — no verdict exists.
                         await repo.update_task(db, task["id"], status="needs_decision")
+                        await repo.insert_event(
+                            db,
+                            kind="needs_decision",
+                            task_id=task["id"],
+                            actor="hub",
+                            payload={"reason": "review_job_failed"},
+                        )
                         await db.commit()
                         await repo.add_task_update(
                             db,
@@ -212,6 +233,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
 
                 if has_arbitration:
                     await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "arbitration_finished"},
+                    )
                     await db.commit()
                     log.info("Poll: task #%d arbiter done → needs_decision", task["id"])
                     await services.maybe_destroy_vast(db, task)
@@ -317,6 +345,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         "Manual decision required.",
                     )
                     await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "no_clear_verdict"},
+                    )
                     await db.commit()
                     await services.maybe_destroy_vast(db, task)
 
@@ -416,6 +451,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             "Manual intervention required.",
                         )
                         await repo.update_task(db, task["id"], status="needs_decision")
+                        await repo.insert_event(
+                            db,
+                            kind="needs_decision",
+                            task_id=task["id"],
+                            actor="hub",
+                            payload={"reason": "ci_fix_cycle_limit"},
+                        )
                         await db.commit()
                         _ci_pushed_at.pop(task["id"], None)
                         log.info(
@@ -507,6 +549,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         status_name,
                         threshold,
                     )
+
+            # Events feed retention (#349): the feed is a notification
+            # channel, not an archive — activity_log keeps the history.
+            pruned = await repo.prune_events(db, keep_days=14)
+            if pruned:
+                await db.commit()
+                log.info("Poll: pruned %d events older than 14 days", pruned)
 
         except Exception:
             log.exception("Poll error")
