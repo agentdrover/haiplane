@@ -634,7 +634,8 @@ async def test_web_force_complete_records_hx_prompt(client: AsyncClient, db):
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["content"].startswith("reviewed manually, accepting risk")
+    assert "from_status=pending_report" in done_updates[0]["content"]
     assert done_updates[0]["agent"] == "human"
 
 
@@ -656,7 +657,8 @@ async def test_web_force_complete_falls_back_to_form_comment(client: AsyncClient
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "form-based override"
+    assert done_updates[0]["content"].startswith("form-based override")
+    assert "from_status=pending_report" in done_updates[0]["content"]
 
 
 async def test_htmx_done_fragment_escapes_xss_title(client: AsyncClient, db):

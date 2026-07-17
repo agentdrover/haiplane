@@ -255,14 +255,17 @@ async def test_force_complete_api(client: AsyncClient, db):
     )
 
 
-async def test_force_complete_api_rejects_wrong_status(client: AsyncClient):
-    create_resp = await client.post("/api/tasks", json={"title": "Open task"})
+async def test_force_complete_api_rejects_terminal_status(client: AsyncClient, db):
+    create_resp = await client.post("/api/tasks", json={"title": "Completed task"})
     task_id = create_resp.json()["id"]
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
 
     resp = await client.post(f"/api/tasks/{task_id}/force-complete")
 
     assert resp.status_code == 400
-    assert "pending_report" in resp.text
+    assert "terminal" in resp.text
+    assert "completed" in resp.text
 
 
 async def test_force_complete_api_records_human_comment(client: AsyncClient, db):
@@ -281,7 +284,8 @@ async def test_force_complete_api_records_human_comment(client: AsyncClient, db)
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["content"].startswith("reviewed manually, accepting risk")
+    assert "from_status=pending_report" in done_updates[0]["content"]
     assert done_updates[0]["agent"] == "human"
 
 

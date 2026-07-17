@@ -17,6 +17,7 @@ from hub.models import (
     TaskClaim,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskPairStart,
     TaskPriority,
     TaskQuestion,
@@ -774,15 +775,28 @@ async def test_force_complete_task(db: aiosqlite.Connection):
     )
 
 
-async def test_force_complete_wrong_status(db: aiosqlite.Connection):
-    body = TaskCreate(title="Still open")
-    tv = await services.create_task(db, body)
-    assert tv.status.value == "open"
+async def test_force_complete_rejects_terminal_status(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Already done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        await services.force_complete_task(db, tv.id)
+        await services.force_complete_task(db, task_id)
     assert exc_info.value.status_code == 400
-    assert "pending_report" in str(exc_info.value.detail)
+    assert "terminal" in str(exc_info.value.detail)
+    assert "completed" in str(exc_info.value.detail)
 
 
 async def test_reorder_task(db: aiosqlite.Connection):
@@ -1312,12 +1326,22 @@ async def test_force_complete_from_pair_running(db: aiosqlite.Connection):
         priority="medium",
     )
     await db.commit()  # job_id stays NULL → pair task
-    tv = await services.force_complete_task(db, task_id)
+    tv = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Pair running human override"),
+    )
     assert tv.status.value == "completed"
 
 
-async def test_force_complete_rejected_for_headless_running(db: aiosqlite.Connection):
-    """Headless running (job_id set) is poller-owned and must NOT force-complete."""
+async def test_force_complete_rejects_active_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Active dispatch job blocks force-complete with 409 (AC-2)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
     task_id = await repo.create_task(
         db,
         title="Headless running",
@@ -1332,13 +1356,577 @@ async def test_force_complete_rejected_for_headless_running(db: aiosqlite.Connec
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(db, task_id, job_id="job-xyz")
+    await repo.update_task(
+        db,
+        task_id,
+        job_id="job-xyz",
+        claimed_by="dev",
+        claim_session_id="sess-1",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
     await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "running", "exit_code": None}
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, task_id)
+    assert exc_info.value.status_code == 409
+    assert "job-xyz" in str(exc_info.value.detail)
+    assert "running" in str(exc_info.value.detail)
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "running"
+    assert row["claimed_by"] == "dev"
+
+
+async def test_force_complete_rejects_active_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Review dispatch running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        review_job_id="review-job-active",
+        claimed_by="dev",
+        claim_session_id="sess-r",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "running", "exit_code": None}
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(
+            db,
+            task_id,
+            TaskForceComplete(comment="Should not apply"),
+        )
+    assert exc_info.value.status_code == 409
+    assert "review-job-active" in str(exc_info.value.detail)
+    assert "running" in str(exc_info.value.detail)
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "review"
+    assert row["claimed_by"] == "dev"
+
+
+async def test_force_complete_allows_missing_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Missing review job",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, review_job_id="review-job-missing")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(return_value=None)
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover stale review dispatch"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "review_job_id=review-job-missing" in done.content
+    assert "missing from registry" in done.content
+
+
+async def test_force_complete_allows_terminal_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Terminal review job",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="fix_requested",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, review_job_id="review-job-done")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Close over finished review job"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "review_job_id=review-job-done" in done.content
+    assert "terminal status='completed'" in done.content
+
+
+async def test_force_complete_allows_missing_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Missing dispatch registry entry does not block recovery (AC-3)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Headless running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-missing")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(return_value=None)
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover stale headless task"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "from_status=running" in done.content
+    assert "job_id=job-missing" in done.content
+    assert "missing from registry" in done.content
+
+
+async def test_force_complete_allows_terminal_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Terminal dispatch job reference is allowed and audited (AC-3)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Stale ci_check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-failed")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "failed", "exit_code": 1}
+    )
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover after terminal dispatch job"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "from_status=ci_check" in done.content
+    assert "terminal status='failed'" in done.content
+
+
+async def test_force_complete_from_open(db: aiosqlite.Connection):
+    body = TaskCreate(title="Still open")
+    tv = await services.create_task(db, body)
+    assert tv.status.value == "open"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, tv.id)
+    assert exc_info.value.status_code == 400
+    assert "comment" in str(exc_info.value.detail)
+    assert "open" in str(exc_info.value.detail)
+
+    completed = await services.force_complete_task(
+        db, tv.id, TaskForceComplete(comment="Human shutdown from open")
+    )
+    assert completed.status.value == "completed"
+
+
+async def test_force_complete_requires_comment_from_active_ci_check(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Stuck ci",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
     with pytest.raises(HTTPException) as exc_info:
         await services.force_complete_task(db, task_id)
     assert exc_info.value.status_code == 400
+    assert "ci_check" in str(exc_info.value.detail)
+
+
+async def test_force_complete_default_comment_from_pending_report(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Awaiting report",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
+
+
+async def test_force_complete_default_comment_from_draft(
+    db: aiosqlite.Connection,
+):
+    """draft is not an ACTIVE_STATUS, so the default comment path applies."""
+    task_id = await repo.create_task(
+        db,
+        title="Abandoned draft",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
+    assert "from_status=draft" in done.content
+
+
+async def test_force_complete_clears_stale_claim_metadata(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Stuck ci_check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by="dev",
+        claim_session_id="sess-stale",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Clear stale claim after ci_check stuck"),
+    )
+    assert view.status.value == "completed"
+    assert view.claimed_by in (None, "")
+    assert view.claim_session_id in (None, "")
+    assert view.claimed_at in (None, "")
     row = await repo.get_task(db, task_id)
-    assert row["status"] == "running"
+    assert row["claimed_at"] in (None, "")
+
+
+async def test_force_complete_rejects_epic_with_incomplete_descendants(
+    db: aiosqlite.Connection,
+):
+    epic_id = await repo.create_task(
+        db,
+        title="Epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Child feature",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, epic_id)
+    assert exc_info.value.status_code == 400
+    assert "incomplete descendants" in str(exc_info.value.detail)
+
+
+async def test_force_complete_feature_all_terminal_children_succeeds(
+    db: aiosqlite.Connection,
+):
+    feature_id = await repo.create_task(
+        db,
+        title="Feature rollup",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="feature",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Done child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Failed child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="failed",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        feature_id,
+        TaskForceComplete(comment="Human closes feature after terminal children"),
+    )
+    assert view.status.value == "completed"
+
+
+async def test_force_complete_epic_nested_descendants_cte(
+    db: aiosqlite.Connection,
+):
+    epic_id = await repo.create_task(
+        db,
+        title="Epic nested",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    feature_id = await repo.create_task(
+        db,
+        title="Feature under epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Open task under feature",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(
+            db,
+            epic_id,
+            TaskForceComplete(comment="Should block on open grandchild"),
+        )
+    assert exc_info.value.status_code == 400
+    assert "incomplete descendants" in str(exc_info.value.detail)
+
+    await repo.update_task(db, feature_id, status="completed")
+    grandchild = await db.execute_fetchall(
+        "SELECT id FROM tasks WHERE parent_id=? LIMIT 1", (feature_id,)
+    )
+    await repo.update_task(db, grandchild[0]["id"], status="completed")
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        epic_id,
+        TaskForceComplete(comment="All nested descendants terminal"),
+    )
+    assert view.status.value == "completed"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "draft",
+        "open",
+        "claimed",
+        "running",
+        "needs_info",
+        "review",
+        "fix_requested",
+        "ci_check",
+        "needs_decision",
+        "pending_report",
+    ],
+)
+async def test_force_complete_from_all_non_terminal_statuses(
+    db: aiosqlite.Connection,
+    status: str,
+):
+
+    task_id = await repo.create_task(
+        db,
+        title=f"Force from {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="subtask" if status == "draft" else "task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment=f"override from {status}"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert f"from_status={status}" in done.content
+    assert f"override from {status}" in done.content
 
 
 async def test_claim_task_conflict(db: aiosqlite.Connection):
@@ -1884,7 +2472,6 @@ async def test_gate_review_cycle_limit_escalates_to_decision(
 async def test_force_complete_bypasses_gate_as_audited_override(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await _pair_running_task(db, title="Gate force override")
     await repo.update_task(db, task_id, branch=None)
@@ -2105,7 +2692,6 @@ async def test_claimed_done_with_current_approval_completes_and_clears_claim(
 async def test_force_complete_from_pending_report_bypasses_gate(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await repo.create_task(
         db,

@@ -32,9 +32,13 @@ These are the rules most likely to be broken by “small” changes.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
   `feature` under an `epic`) auto-completes the parent when all siblings are
   `completed` (idempotent).
-- `force_complete` is the audited human override and is allowed from
-  `pending_report`, `claimed`, or pair `running` (no `job_id`); headless
-  `running` (with `job_id`) is owned by the poller and is excluded.
+- `force_complete` is the audited human override for `task`/`subtask` rows:
+  allowed from any non-terminal status when no *active* dispatch job backs
+  `job_id` or `review_job_id` (409 if active; missing/terminal jobs are
+  audited and allowed). A non-empty comment is required for active lifecycle
+  states other than `pending_report`/`claimed` (those two may fall back to
+  the default audit message). Clears stale claim metadata. Rejects terminal
+  tasks and `epic`/`feature` rows with incomplete descendants.
 - Write serialization (`get_write_lock`) covers refinement/AC paths,
   `create_subtasks_bulk`, and the lifecycle completion paths (`add_update`
   done-flow, `force_complete_task`). It is NOT yet a full per-connection

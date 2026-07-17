@@ -1219,7 +1219,12 @@ async def web_force_complete_task(
     request: Request,
     comment: str = Form(""),
 ):
-    """Force-complete a pending_report task from the Web UI.
+    """Force-complete a non-terminal task/subtask from the Web UI (human-only).
+
+    Same semantics as REST/MCP force-complete: any non-terminal task/subtask when
+    no active dispatch job backs job_id or review_job_id; 409 if active.
+    Missing/terminal jobs are audited. Comment required for most active
+    lifecycle states (pending_report/claimed may use the default).
 
     The audit-trail comment can be supplied either via the ``HX-Prompt``
     header (populated by htmx ``hx-prompt``) or via a ``comment`` form field

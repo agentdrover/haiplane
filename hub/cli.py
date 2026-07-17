@@ -1413,7 +1413,11 @@ def build_parser() -> argparse.ArgumentParser:
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
         "force-complete",
-        help="Force-complete a stuck task (pending_report/claimed/pair-running) without a done report (audited human override)",
+        help=(
+            "Human-only override: complete non-terminal task/subtask without "
+            "active dispatch jobs (409 if job_id/review_job_id active); comment "
+            "required for most active lifecycle states"
+        ),
     )
     p_force_complete.add_argument("task_id", type=int)
     p_force_complete.add_argument(

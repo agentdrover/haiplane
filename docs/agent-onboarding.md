@@ -290,8 +290,12 @@ curl -sS \
 - `hub_task_update` — статус/блокер/отчёт
 - `hub_ask_question` / `hub_answer_question`
 - `hub_report_done`
-- `hub_force_complete_task` — человеческий override; работает из
-  `pending_report`, `claimed` и pair-`running` (без job)
+- `hub_force_complete_task` — human-only audited override; completes any
+  non-terminal ``task``/``subtask`` when no active dispatch job backs
+  ``job_id`` or ``review_job_id`` (409 if active). Missing/terminal jobs are
+  audited. Non-empty comment required for active lifecycle states except
+  ``pending_report``/``claimed``. Rejects terminal tasks and epic/feature
+  rows with incomplete descendants. See ``docs/agent-context/invariants.md``.
 - `hub_decide_task` (решение после арбитража)
 - `hub_archive_task` / `hub_unarchive_task` / `hub_delete_task`
 
