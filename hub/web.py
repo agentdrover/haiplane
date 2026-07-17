@@ -803,11 +803,24 @@ async def web_task_detail(
     readiness = await services.get_readiness(db, task_id, explain=False)
     analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
+
+    # Machine review (#381): summary next to the verdict buttons.
+    machine_review = None
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    if mr_row is not None:
+        from hub.models import MachineReviewView
+
+        machine_review = MachineReviewView(**dict(mr_row))
+        machine_review.is_current = machine_review.submission_generation == (
+            task.submission_generation or 0
+        )
+
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
+            "machine_review": machine_review,
             "readiness": readiness,
             "analyst_ready": analyst_ready,
             "can_archive": identity.has_permission("tasks.archive"),
