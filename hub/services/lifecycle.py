@@ -31,6 +31,7 @@ from hub.models import (
     FINAL_STATUSES,
     LatestReview,
     ReviewFinding,
+    SelfReviewWarning,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -260,19 +261,81 @@ def ensure_reviewer_independence(
     """
     if not is_agent or config.REVIEW_SELF_APPROVE == "allow":
         return
+    if caller_implemented_task(task, principal_id=principal_id, username=username):
+        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+
+
+def caller_implemented_task(
+    task: dict[str, Any],
+    *,
+    principal_id: int | None,
+    username: str,
+) -> bool:
+    """True when the caller is the implementer of the task (#318/#320).
+
+    Single definition of implementer identity, shared by the verdict gate
+    and the review-brief warning (#433). Principal comparison wins; the
+    name-based check (assigned_agent/claimed_by) is the fallback for env
+    tokens and legacy tasks.
+    """
     implementer_pid = task.get("implementer_principal_id")
     if (
         implementer_pid is not None
         and principal_id is not None
         and principal_id == implementer_pid
     ):
-        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+        return True
     implementers = {
         (task.get("assigned_agent") or "").strip(),
         (task.get("claimed_by") or "").strip(),
     } - {""}
-    if username in implementers:
-        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+    return username in implementers
+
+
+def self_review_brief_warning(
+    task: dict[str, Any],
+    *,
+    is_agent: bool,
+    principal_id: int | None,
+    username: str,
+) -> SelfReviewWarning | None:
+    """Fail-fast self-review notice for the review brief (#433).
+
+    Mirrors ensure_reviewer_independence but warns instead of raising: the
+    implementer may still read the brief for self-checking, yet must know
+    BEFORE spending review effort that hub_submit_review will reject the
+    verdict. With OPENCLAW_REVIEW_SELF_APPROVE=allow the warning becomes an
+    informational solo-mode note. Humans and non-implementers get None.
+    """
+    if not is_agent:
+        return None
+    if not caller_implemented_task(task, principal_id=principal_id, username=username):
+        return None
+    if config.REVIEW_SELF_APPROVE == "allow":
+        return SelfReviewWarning(
+            reason="solo_mode_self_review",
+            message=(
+                f"agent '{username}' implemented this task; solo mode permits "
+                "self-review"
+            ),
+            hint=(
+                "OPENCLAW_REVIEW_SELF_APPROVE=allow is active: hub_submit_review "
+                "will accept your verdict. This note is informational."
+            ),
+            required_role=None,
+        )
+    return SelfReviewWarning(
+        reason="self_review_forbidden",
+        message=(f"agent '{username}' implemented this task and cannot review it"),
+        hint=(
+            "Stop before running the review: hub_submit_review will reject "
+            "your verdict. The Universal Review Gate requires an independent "
+            "reviewer — another agent principal or a human token. You may "
+            "still use this brief for self-checking. "
+            "Solo mode: set OPENCLAW_REVIEW_SELF_APPROVE=allow."
+        ),
+        required_role="independent_reviewer",
+    )
 
 
 def parse_review_findings(raw: Any) -> list[ReviewFinding]:

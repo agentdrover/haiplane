@@ -1718,8 +1718,60 @@ async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
     assert "uv run pytest -q" in text
     assert "git diff develop...task-42/x" in text
     assert "hub_submit_review" in text
+    assert "WARNING" not in text
     assert payload["brief"]["task_id"] == 42
     mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_self_review_warning(
+    mock_api_get: AsyncMock,
+) -> None:
+    # #433: the REST brief carries self_review_warning for the implementer;
+    # MCP must surface it FIRST in the text and pass it through structured.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "submission_generation": 1,
+        "review_cycle": 0,
+        "self_review_warning": {
+            "reason": "self_review_forbidden",
+            "message": "agent 'impl-bot' implemented this task and cannot review it",
+            "hint": "Stop before running the review: hand off to an "
+            "independent reviewer.",
+            "required_role": "independent_reviewer",
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [self_review_forbidden]:")
+    assert "impl-bot" in text
+    assert "independent reviewer" in text
+    structured = _mcp_structured(out)
+    assert (
+        structured["brief"]["self_review_warning"]["reason"] == "self_review_forbidden"
+    )
+    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> None:
+    # #433: OPENCLAW_REVIEW_SELF_APPROVE=allow — solo-mode note, not a stop.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Solo task",
+        "status": "review",
+        "self_review_warning": {
+            "reason": "solo_mode_self_review",
+            "message": "agent 'impl-bot' implemented this task; solo mode "
+            "permits self-review",
+            "hint": "OPENCLAW_REVIEW_SELF_APPROVE=allow is active.",
+            "required_role": None,
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [solo_mode_self_review]:")
+    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in text
 
 
 async def test_hub_submit_review_changes_requested(

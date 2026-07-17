@@ -960,18 +960,34 @@ async def api_review_verdict(
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
-async def api_review_brief(task_id: int, request: Request):
+async def api_review_brief(
+    task_id: int,
+    request: Request,
+    identity=Depends(current_identity),
+):
     """Everything a reviewer agent needs in one response (#308).
 
     Bundles acceptance criteria, scope, validation commands, review
     checklist, branch/PR metadata with an advisory diff command, and the
     latest submission context — so review never depends on scraping task
     prose. Works without a GitHub PR: ``pr_number`` is optional metadata.
+
+    Fail-fast self-review check (#433): when the caller is the agent that
+    implemented the task, the brief carries a ``self_review_warning`` so
+    the reviewer stops BEFORE spending review effort — hub_submit_review
+    (the source of truth) would reject the verdict anyway. Not a hard-fail:
+    the implementer may still read the brief for self-checking.
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    self_review_warning = services.self_review_brief_warning(
+        dict(row),
+        is_agent=identity.is_agent,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
     task_view = services.row_to_task(row)
     project_row = await repo.resolve_project_for_task(db, task_id)
     if project_row is not None:
@@ -1026,6 +1042,7 @@ async def api_review_brief(task_id: int, request: Request):
         latest_submission_summary=latest_submission_summary,
         latest_review=task_view.latest_review,
         machine_review=machine_review,
+        self_review_warning=self_review_warning,
     )
 
 
