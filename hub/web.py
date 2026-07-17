@@ -215,6 +215,12 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request") == "true"
 
 
+def _require_human_web(request: Request) -> None:
+    """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
+    if current_identity(request).is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+
+
 def _dispatch_available() -> bool:
     return plugins.dispatch.is_available()
 
@@ -1017,6 +1023,7 @@ async def web_approve_task(
     affordance in the sidebar) set ``force=true`` as a hidden form value;
     plain 'Approve' keeps the gate active.
     """
+    _require_human_web(request)
     body = TaskApprove(
         comment=comment,
         run=run,
@@ -1050,6 +1057,7 @@ async def web_reject_task(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), task_id, body)
     if _is_htmx(request):
@@ -1063,6 +1071,7 @@ async def web_start_task(
     request: Request,
     runtime: str = Form("auto"),
 ):
+    _require_human_web(request)
     body = TaskStart(
         plan="Developer-agent dispatch requested from Hub UI.",
         runtime=RuntimeChoice(runtime) if runtime else None,
@@ -1080,6 +1089,7 @@ async def web_answer_task(
     answer: str = Form(...),
     resume: bool = Form(True),
 ):
+    _require_human_web(request)
     body = TaskAnswer(answer=answer, resume=resume)
     await services.answer_question(_db(request), task_id, body)
     if _is_htmx(request):
@@ -1096,6 +1106,7 @@ async def web_decide_task(
     decision_summary: str = Form(""),
     record_decision: bool = Form(False),
 ):
+    _require_human_web(request)
     body = TaskDecide(
         action=action,
         instructions=instructions,
@@ -1230,6 +1241,7 @@ async def web_force_complete_task(
     header (populated by htmx ``hx-prompt``) or via a ``comment`` form field
     for non-htmx clients. The header takes precedence.
     """
+    _require_human_web(request)
     reason = request.headers.get("HX-Prompt", "") or comment
     body = TaskForceComplete(comment=reason) if reason else None
     await services.force_complete_task(_db(request), task_id, body)
@@ -1290,6 +1302,7 @@ async def web_approve_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskApprove(comment=comment, run=True)
     await services.approve_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)
@@ -1301,6 +1314,7 @@ async def web_reject_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)
