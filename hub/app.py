@@ -487,6 +487,16 @@ async def api_provision_project(
     return {**result, "project": ProjectView(**dict(row))}
 
 
+@app.get("/api/metrics/practices")
+async def api_practice_metrics(
+    request: Request,
+    since_days: int = Query(default=90, ge=1, le=3650),
+):
+    """Practice metrics (#384): review economics, harness versions,
+    recurring finding categories, cycle times."""
+    return await services.practice_metrics(_db(request), since_days=since_days)
+
+
 @app.post("/api/telemetry/deprecated-tool")
 async def api_deprecated_tool_call(request: Request, body: dict[str, Any]):
     """Stage-1 deprecation telemetry (#325, ADR-0002): count alias calls."""

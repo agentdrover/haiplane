@@ -1596,6 +1596,35 @@ async def hub_submit_machine_review(
 
 
 @mcp.tool()
+async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
+    """Practice metrics (#384): machine-review economics, harness-version
+    comparison, recurring finding categories, task cycle times.
+
+    Args:
+        since_days: Aggregation window in days (default 90).
+    """
+    try:
+        data = await _api_get(f"/api/metrics/practices?since_days={since_days}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    mr = data.get("machine_reviews", {})
+    lines = [
+        f"Machine reviews ({data.get('since_days')}d): {mr.get('reviews', 0)} "
+        f"runs, {mr.get('raw_total', 0)} raw → {mr.get('confirmed_total', 0)} "
+        f"confirmed / {mr.get('rejected_total', 0)} rejected",
+        f"Tokens: {mr.get('tokens_total', 0)} total, "
+        f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding",
+    ]
+    recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
+    if recurring:
+        lines.append(
+            "Recurring categories (checklist candidates): "
+            + ", ".join(f"{c['category']} ({c['tasks']} tasks)" for c in recurring[:5])
+        )
+    return structured_echo_result("\n".join(lines), metrics=data)
+
+
+@mcp.tool()
 async def hub_list_skills() -> CallToolResult:
     """List the skills library (#380): latest version per name.
 

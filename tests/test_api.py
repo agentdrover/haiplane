@@ -2106,3 +2106,98 @@ async def test_seed_machine_review_cycle_skill(client: AsyncClient, db):
     names = [s["name"] for s in listing.json()]
     assert names.count("machine-review-cycle") == 1
     assert "multi-agent-review" in names
+
+
+# ---------------------------------------------------------------------------
+# Practice metrics (#384)
+# ---------------------------------------------------------------------------
+
+
+async def test_practice_metrics_aggregates(client: AsyncClient, db):
+    # AC-1/AC-2: cost per confirmed, filtration, harness split, recurrence.
+    from hub import repository as repo_module
+
+    t1 = await _reviewable_task(client, db)
+    await client.post(
+        f"/api/tasks/{t1}/machine-review",
+        json={
+            "raw_count": 10,
+            "tokens_spent": 1_000_000,
+            "duration_ms": 60_000,
+            "harness_skill": "multi-agent-review",
+            "harness_version": 1,
+            "findings_confirmed": [
+                {"title": "a", "severity": "low", "category": "tests"},
+                {"title": "b", "severity": "medium", "category": "consistency"},
+            ],
+            "findings_rejected": [
+                {"title": "c", "reason": "noise"},
+                {"title": "d", "reason": "noise"},
+            ],
+        },
+    )
+    t2 = await _reviewable_task(client, db)
+    await client.post(
+        f"/api/tasks/{t2}/machine-review",
+        json={
+            "raw_count": 6,
+            "harness_skill": "multi-agent-review",
+            "harness_version": 2,
+            "findings_confirmed": [
+                {"title": "e", "severity": "low", "category": "tests"},
+            ],
+            "findings_rejected": [],
+        },
+    )
+    assert t1 != t2
+    assert await repo_module.get_latest_machine_review(db, t2) is not None
+
+    resp = await client.get("/api/metrics/practices?since_days=30")
+    assert resp.status_code == 200
+    data = resp.json()
+    mr = data["machine_reviews"]
+    assert mr["reviews"] == 2
+    assert mr["raw_total"] == 16
+    assert mr["confirmed_total"] == 3
+    assert mr["tokens_total"] == 1_000_000
+    assert mr["tokens_per_confirmed"] == round(1_000_000 / 3)
+    assert mr["reports_without_tokens"] == 1  # второй отчёт без токенов
+    assert abs(mr["filtration_rate"] - (1 - 3 / 16)) < 0.001
+
+    versions = {(h["harness_skill"], h["harness_version"]) for h in data["by_harness"]}
+    assert ("multi-agent-review", 1) in versions
+    assert ("multi-agent-review", 2) in versions
+
+    cats = {c["category"]: c for c in data["recurring_categories"]}
+    assert cats["tests"]["tasks"] == 2 and cats["tests"]["recurring"] is True
+    assert cats["consistency"]["recurring"] is False
+
+
+async def test_practice_metrics_cycle_times(client: AsyncClient, db):
+    # AC-3: median ready→completed hours by work_type from existing stamps.
+    from hub import repository as repo_module
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    for hours in (2, 4, 100):
+        tv = await services_module.create_task(
+            db, TaskCreate(title=f"Cycle {hours}", work_type="bug")
+        )
+        await db.execute(
+            "UPDATE tasks SET status='completed', "
+            "ready_at=datetime('now', ?), updated_at=datetime('now') WHERE id=?",
+            (f"-{hours} hours", tv.id),
+        )
+    await db.commit()
+    assert await repo_module.get_task(db, tv.id) is not None
+
+    resp = await client.get("/api/metrics/practices")
+    cycles = {c["work_type"]: c for c in resp.json()["cycle_times"]}
+    assert cycles["bug"]["tasks"] == 3
+    assert 3.5 <= cycles["bug"]["median_hours"] <= 4.5  # медиана, не среднее
+
+
+async def test_metrics_page_renders(client: AsyncClient, db):
+    resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    assert "Practice Metrics" in resp.text
