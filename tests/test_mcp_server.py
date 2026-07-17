@@ -2137,3 +2137,31 @@ async def test_hub_get_skill_and_propose(
     assert structured["skill"]["status"] == "draft"
     body = mock_api_post.await_args.args[1]
     assert body["tags"] == ["review", "quality"]
+
+
+async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
+    # #381: wrapper posts the report and echoes the summary.
+    from hub.mcp_server import hub_submit_machine_review
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 42,
+        "submission_generation": 2,
+        "is_current": True,
+        "raw_count": 4,
+        "findings_confirmed": [{"title": "x", "severity": "low"}],
+        "findings_rejected": [],
+    }
+    out = await hub_submit_machine_review(
+        42,
+        raw_count=4,
+        findings_confirmed=[{"title": "x", "severity": "low"}],
+        tokens_spent=1000,
+        agent="claude-code",
+    )
+    structured = _mcp_structured(out)
+    assert structured["machine_review"]["submission_generation"] == 2
+    path, body = mock_api_post.await_args.args
+    assert path == "/api/tasks/42/machine-review"
+    assert body["tokens_spent"] == 1000
+    assert "duration_ms" not in body  # omitted optionals stay omitted

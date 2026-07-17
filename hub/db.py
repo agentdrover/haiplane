@@ -448,6 +448,33 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_skills_name_status",
         "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
     ),
+    # ---- Machine review reports (#381): structured multi-agent review
+    # outcomes bound to a submission generation; metrics fields (#384)
+    # are nullable — clients that can't count tokens still report.
+    (
+        "create_machine_reviews_table",
+        "CREATE TABLE IF NOT EXISTS machine_reviews ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "task_id INTEGER NOT NULL, "
+        "submission_generation INTEGER NOT NULL, "
+        "harness_skill TEXT NOT NULL DEFAULT '', "
+        "harness_version INTEGER, "
+        "agent_count INTEGER, "
+        "tokens_spent INTEGER, "
+        "duration_ms INTEGER, "
+        "orchestrator TEXT NOT NULL DEFAULT '', "
+        "model TEXT NOT NULL DEFAULT '', "
+        "raw_count INTEGER NOT NULL DEFAULT 0, "
+        "findings_confirmed TEXT NOT NULL DEFAULT '[]', "
+        "findings_rejected TEXT NOT NULL DEFAULT '[]', "
+        "submitted_by TEXT NOT NULL DEFAULT '', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    ),
+    (
+        "idx_machine_reviews_task",
+        "CREATE INDEX IF NOT EXISTS idx_machine_reviews_task "
+        "ON machine_reviews(task_id, submission_generation)",
+    ),
     # ---- Workspace provisioning (#347): clone state lives on the project.
     (
         "add_projects_provision_status_column",

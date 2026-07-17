@@ -394,6 +394,9 @@ class ReviewBrief(BaseModel):
     submission_generation: int = 0
     latest_submission_summary: str = ""
     latest_review: LatestReview | None = None
+    # #381: latest machine-review report; forward ref — MachineReviewView is
+    # declared later in this module, rebuilt below.
+    machine_review: "MachineReviewView | None" = None
 
 
 class TaskClaim(BaseModel):
@@ -862,6 +865,83 @@ class ProjectPatch(BaseModel):
     status: str | None = Field(default=None, pattern="^(pending|active)$")
 
 
+class MachineFinding(BaseModel):
+    """One machine-review finding (#381). Mirrors ReviewFinding plus a
+    free-slug category feeding the recurrence metrics (#384)."""
+
+    title: str = Field(..., min_length=1, max_length=300)
+    severity: ReviewSeverity
+    category: str = Field("", max_length=60)
+    file: str = Field("", max_length=500)
+    line: int | None = Field(default=None, ge=1)
+    detail: str = Field("", max_length=4000)
+
+
+class MachineRejectedFinding(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    category: str = Field("", max_length=60)
+    reason: str = Field("", max_length=2000)
+
+
+class MachineReviewSubmit(BaseModel):
+    """Structured multi-agent review report (#381).
+
+    Metrics fields (#384) are optional — a client that cannot count
+    tokens still reports the review itself.
+    """
+
+    harness_skill: str = Field("", max_length=80)
+    harness_version: int | None = Field(default=None, ge=1)
+    agent_count: int | None = Field(default=None, ge=1)
+    tokens_spent: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0)
+    orchestrator: str = Field("", max_length=100)
+    model: str = Field("", max_length=100)
+    raw_count: int = Field(0, ge=0)
+    findings_confirmed: list[MachineFinding] = Field(
+        default_factory=list, max_length=100
+    )
+    findings_rejected: list[MachineRejectedFinding] = Field(
+        default_factory=list, max_length=200
+    )
+    agent: str = Field("", max_length=100)
+
+
+class MachineReviewView(BaseModel):
+    id: int
+    task_id: int
+    submission_generation: int
+    is_current: bool = True
+    harness_skill: str = ""
+    harness_version: int | None = None
+    agent_count: int | None = None
+    tokens_spent: int | None = None
+    duration_ms: int | None = None
+    orchestrator: str = ""
+    model: str = ""
+    raw_count: int = 0
+    findings_confirmed: list[MachineFinding] = Field(default_factory=list)
+    findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
+    submitted_by: str = ""
+    created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _mr_iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("findings_confirmed", "findings_rejected", mode="before")
+    @classmethod
+    def _mr_findings_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v or "[]")
+                return parsed if isinstance(parsed, list) else []
+            except ValueError:
+                return []
+        return v
+
+
 class SkillCreate(BaseModel):
     """New skill version (#380). Agents create drafts; humans activate."""
 
@@ -1133,3 +1213,7 @@ class AdminBootstrap(BaseModel):
 ProposalStatus = TaskStatus
 ProposalCreate = TaskCreate
 ProposalView = TaskView
+
+# Forward-ref rebuild: ReviewBrief.machine_review points at MachineReviewView,
+# which is declared after ReviewBrief (#381).
+ReviewBrief.model_rebuild()
