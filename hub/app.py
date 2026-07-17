@@ -1167,7 +1167,12 @@ async def api_force_complete_task(
     body: TaskForceComplete | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    """Force-complete a stuck task (pending_report/claimed/pair-running)."""
+    """Force-complete a non-terminal task/subtask (human-only audited override).
+
+    Allowed when no active dispatch job backs job_id or review_job_id; 409 if
+    active. Missing/terminal jobs are audited. Comment required for active
+    lifecycle states except pending_report/claimed.
+    """
     return await services.force_complete_task(_db(request), task_id, body)
 
 

@@ -1199,15 +1199,17 @@ async def hub_release_task(
 async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     """Human force-completes a stuck task without an agent done report.
 
-    Works from pending_report, claimed (reserved but never pair-started), and
-    pair-running (no headless job) tasks. Use this only when a human has
-    inspected the result and intentionally accepts responsibility for completing
-    a task that lacks a normal done report. The comment is recorded as the
-    audit-trail message on the task update.
+    Audited override for any non-terminal ``task`` or ``subtask`` when no *active*
+    dispatch job backs ``job_id`` or ``review_job_id`` (409 if active). Missing
+    or terminal dispatch jobs are allowed and noted in the audit trail. A
+    non-empty ``comment`` is required for active lifecycle states other than
+    ``pending_report`` and ``claimed``; those two may use the default message.
+    Rejects terminal tasks and ``epic``/``feature`` rows with incomplete
+    descendants.
 
     Args:
-        task_id: The task ID to complete (pending_report / claimed / pair-running)
-        comment: Reason for the override; recorded as the audit-trail message
+        task_id: Task or subtask to complete
+        comment: Audit-trail reason; required for most active lifecycle states
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
