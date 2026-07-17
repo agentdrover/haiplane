@@ -1529,6 +1529,33 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_provision_project(project_id: int) -> CallToolResult:
+    """Clone/verify a project's workspace on the hub server (#348).
+
+    Human-only gate (like project activation): provisioning touches the
+    server filesystem and git credentials, so agent tokens get 403.
+    The outcome is always readable — provision_status ok|error plus a
+    detail explaining WHY (missing deploy key, wrong origin, no repo).
+
+    Args:
+        project_id: Numeric project id (see hub_list_projects).
+    """
+    try:
+        result = await _api_post(f"/api/projects/{project_id}/provision")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    status_value = result.get("provision_status", "?")
+    detail = result.get("provision_detail", "")
+    project = result.get("project") or {}
+    return structured_echo_result(
+        f"Provision {project.get('slug', project_id)}: {status_value} — {detail}",
+        provision_status=status_value,
+        provision_detail=detail,
+        project=project,
+    )
+
+
+@mcp.tool()
 async def hub_wait_events(
     since: int = 0,
     wait: int = 30,
