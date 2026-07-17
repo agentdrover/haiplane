@@ -680,6 +680,33 @@ async def web_provision_project(project_id: int, request: Request):
     return RedirectResponse("/projects", status_code=303)
 
 
+@router.post("/tasks/{task_id}/web-request-machine-review")
+async def web_request_machine_review(task_id: int, request: Request):
+    """Reviewer explicitly demands a machine review (#382): sets the task
+    override, leaves an alert for the agent and wakes it via the feed."""
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    if await repo.get_task(db, task_id) is None:
+        raise HTTPException(404, "task not found")
+    await repo.update_task(db, task_id, machine_review_override="require")
+    await repo.add_task_update(
+        db,
+        task_id,
+        identity.username,
+        "alert",
+        "Reviewer запросил machine-review: hub_get_skill('multi-agent-review') "
+        "→ прогон харнесса → hub_submit_machine_review, затем ждите вердикт.",
+    )
+    await repo.insert_event(
+        db,
+        kind="machine_review_requested",
+        task_id=task_id,
+        actor=identity.username,
+    )
+    await db.commit()
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
 @router.get("/skills", response_class=HTMLResponse)
 async def web_skills(request: Request):
     """Skills library (#380): latest version per name."""
@@ -815,12 +842,20 @@ async def web_task_detail(
             task.submission_generation or 0
         )
 
+    # Machine-review policy gap (#382): warning in the verdict panel.
+    machine_review_gap_text = None
+    if task.status.value == "review" and not task.review_job_id:
+        from hub.services.orchestration import machine_review_gap
+
+        machine_review_gap_text = await machine_review_gap(db, dict(row))
+
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
             "machine_review": machine_review,
+            "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
             "analyst_ready": analyst_ready,
             "can_archive": identity.has_permission("tasks.archive"),

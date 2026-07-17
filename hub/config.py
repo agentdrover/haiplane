@@ -48,6 +48,10 @@ REVIEW_SELF_APPROVE = os.environ.get("OPENCLAW_REVIEW_SELF_APPROVE", "forbid")
 # Projects V2 (#345): 'propose' (default) — agent-created projects start as
 # pending and need human activation; 'direct' is the solo-mode opt-out.
 ALLOW_AGENT_PROJECTS = os.environ.get("OPENCLAW_ALLOW_AGENT_PROJECTS", "propose")
+# Agent Practices (#382): 'warn' (default) — a missing machine-review report
+# only warns in the review panel; 'require' blocks the human verdict until a
+# current report exists. Applies only where policy says a review is needed.
+MACHINE_REVIEW_MODE = os.environ.get("OPENCLAW_MACHINE_REVIEW", "warn")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
