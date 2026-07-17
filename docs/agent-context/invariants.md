@@ -34,6 +34,11 @@ These are the rules most likely to be broken by “small” changes.
   A review of task A never sees task B's branch; do not base new task branches
   on unmerged branches under review (see `docs/repository-rules.md`,
   «Жизненный цикл ветки задачи»).
+- Finding routing (#435, #437): `in_scope` findings are closed ONLY via a
+  resubmit of the same task on the same branch (`changes_requested` →
+  `running` → fix → `hub_submit_for_review`). Never spawn parallel tasks for
+  in-scope findings (incident #392). `out_of_scope` findings go to separate
+  tasks referenced by `linked_task_id` and never block the verdict.
 - Human overrides bypass the gate by design and stay audited: `hub_decide_task`
   accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
