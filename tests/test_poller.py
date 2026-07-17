@@ -900,3 +900,100 @@ async def test_arbiter_dispatching_ambiguity_escalates(db):
     events = await _events_for(db, task_id, "needs_decision")
     assert any("arbiter_dispatch_ambiguous" in (e["payload"] or "") for e in events)
     mock_dispatch.submit_task.assert_not_called()
+
+
+# ---- Server-owned arbiter termination (#422) ----
+
+
+async def _make_arbiter_running(db, *, job_id="arb-1"):
+    task_id = await _make_review_gen1(db)  # review, generation 1
+    await repo.claim_arbiter_dispatch(db, task_id, 1)
+    await repo.mark_arbiter_running(db, task_id, job_id)
+    await repo.update_task(db, task_id, review_job_id=job_id)
+    await db.commit()
+    return task_id
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_arbiter_job_completed_routes_to_needs_decision(mock_sleep, db):
+    # AC-1 (#422): a completed arbiter job — with no agent arbitration update —
+    # ends the phase server-side: needs_decision once, marker finished, audit
+    # summary from the job result.
+    task_id = await _make_arbiter_running(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={
+            "status": "completed",
+            "exit_code": 0,
+            "result_text": "Arbiter: the change is incomplete, fix X.",
+        }
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"
+    assert row["arbiter_state"] == "finished"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert any("arbitration_finished" in (e["payload"] or "") for e in events)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("Arbiter summary" in u["content"] for u in updates)
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_arbiter_job_failed_routes_to_needs_decision(mock_sleep, db):
+    # AC-2 (#422): a failed arbiter job goes to needs_decision with a failure
+    # reason and never re-dispatches.
+    task_id = await _make_arbiter_running(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value={"status": "failed", "exit_code": 1})
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "arb-2"})
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"
+    assert row["arbiter_state"] == "finished"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert any("arbiter_job_failed" in (e["payload"] or "") for e in events)
+    mock_dispatch.submit_task.assert_not_called()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_new_submission_completes_despite_old_arbitration(mock_sleep, db):
+    # AC-4 (#422): a stale finished arbiter marker from an earlier generation
+    # does not block a new submission whose current verdict is APPROVED.
+    task_id = await _make_review_task(db, review_job_id="rev-2", generation=2)
+    await repo.update_task(
+        db,
+        task_id,
+        arbiter_state="finished",
+        arbiter_job_id="arb-old",
+        arbiter_generation=1,
+    )
+    await repo.record_review_verdict(db, task_id, "approved")  # binds to gen 2
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"

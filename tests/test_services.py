@@ -3708,3 +3708,51 @@ async def test_noop_gitops_accepts_project_context_keywords():
     assert probe.outcome.value == "pending"
     assert await g.merge_pr(1, 2, "t", repo="/ws", gh_repo="owner/repo") is False
     assert await g.get_ci_failure_logs(1, "b", repo="/ws", gh_repo="owner/repo") == {}
+
+
+# ---- Rework closes the arbiter/verdict window (#422) ----
+
+
+async def test_decide_rework_closes_arbiter_marker(db: aiosqlite.Connection):
+    # AC-3 (#422): a human rework decision resets the cycle and clears the
+    # arbiter marker, so the reworked submission starts clean.
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+    from hub.models import TaskDecide
+
+    task_id = await repo.create_task(
+        db,
+        title="Reworked task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)  # generation 1
+    await repo.record_review_verdict(db, task_id, "changes_requested")
+    await repo.claim_arbiter_dispatch(db, task_id, 1)
+    await repo.mark_arbiter_finished(db, task_id)
+    await repo.update_task(db, task_id, review_cycle=3)
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "fix-1"})
+    plugins.dispatch = mock_dispatch
+
+    await services.decide_task(
+        db, task_id, TaskDecide(action="rework", instructions="fix it")
+    )
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["arbiter_state"] is None
+    assert row["arbiter_generation"] is None
+    assert row["arbiter_job_id"] is None
+    assert row["review_cycle"] == 0
