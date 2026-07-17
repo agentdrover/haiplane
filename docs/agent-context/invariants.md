@@ -27,6 +27,13 @@ These are the rules most likely to be broken by “small” changes.
   exists (conveyor), → `review` (client-driven, no `review_job_id`) without
   one, → `needs_decision` at the review-cycle limit. Completing approved work
   must NOT bump the submission generation (it would invalidate the approval).
+- Review is submission-bound: `hub_submit_for_review` (or a routed done report)
+  bumps the submission generation, which makes prior verdicts and reports stale.
+  Fixes after `changes_requested` reach review only via a resubmit of the SAME
+  task on the SAME branch — pushing commits alone does not re-trigger review.
+  A review of task A never sees task B's branch; do not base new task branches
+  on unmerged branches under review (see `docs/repository-rules.md`,
+  «Жизненный цикл ветки задачи»).
 - Human overrides bypass the gate by design and stay audited: `hub_decide_task`
   accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
