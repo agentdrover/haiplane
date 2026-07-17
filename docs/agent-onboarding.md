@@ -202,6 +202,45 @@ curl -sS \
 
 Агент не имитирует человеческий гейт и не «дожимает» статус сам.
 
+### Reviewer-идентичность: не ревьюй под токеном исполнителя (#432)
+
+Universal Review Gate сравнивает **принципалов**, а не тип токена: вердикт
+(`hub_submit_review` / `POST /api/tasks/{id}/review-verdict`) от той же
+идентичности, что делала `hub_pair_start`/`hub_claim_task`, отклоняется с
+403 `self_review_forbidden`. Сравнение идёт по `principal_id` (DB-токены),
+для env-токенов — по имени против `assigned_agent`/`claimed_by`. Поэтому
+один токен `cursor` на «имплементацию + ревью» стопорит цикл ревью.
+
+Решение — вторая агентская идентичность в `OPENCLAW_HUB_TOKENS` (код менять
+не нужно, поддерживается любое число токенов):
+
+```bash
+# .env.local / /etc/openclaw-hub/openclaw-hub.env — только плейсхолдеры!
+OPENCLAW_HUB_TOKENS=you:your-human-token:human,cursor:your-agent-token:agent,cursor-reviewer:your-reviewer-token:agent
+```
+
+Требования к reviewer-токену:
+
+- роль `agent` (третье поле), **имя отличается** от исполнителя;
+- значение токена уникально (токен — ключ словаря идентичностей);
+- секрет генерируй локально (`openssl rand -hex 32`), в git и чат не печатай.
+
+Передача ревью другой идентичности (оркестратор): у MCP/CLI-клиента hub
+токен берётся из `OPENCLAW_HUB_TOKEN`. Reviewer-сессия (отдельный агент,
+subagent или профиль MCP-сервера) запускается с reviewer-токеном:
+
+```bash
+# сессия исполнителя
+OPENCLAW_HUB_TOKEN=your-agent-token      # identity: cursor
+# сессия ревьюера — другой env-профиль / MCP-конфиг
+OPENCLAW_HUB_TOKEN=your-reviewer-token   # identity: cursor-reviewer
+```
+
+Проверить, кто ты сейчас: `hub_admin_my_identity`. Solo-режим без второго
+токена — явный opt-out `OPENCLAW_REVIEW_SELF_APPROVE=allow` (не для прода).
+Роли: `agents/python-senior-developer.md` (исполнитель) и
+`agents/code-reviewer.md` (ревьюер).
+
 ---
 
 ## 8. `hub_report_done`: реальный статус, не желаемый
