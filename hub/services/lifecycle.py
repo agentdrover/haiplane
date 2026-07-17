@@ -250,29 +250,37 @@ def ensure_reviewer_independence(
     is_agent: bool,
     principal_id: int | None,
     username: str,
-) -> None:
+) -> bool:
     """Raise 403 when the caller implemented the task (#318/#320).
 
     Shared by the REST endpoint and the web review panel so verdict
     independence has exactly one definition. Principal comparison wins;
     the name-based check is the fallback for env tokens and legacy tasks.
     Humans and the solo opt-out (OPENCLAW_REVIEW_SELF_APPROVE=allow) pass.
+
+    Returns True only when the caller IS the implementer and passed solely
+    because of the solo opt-out — so the verdict can be audited as
+    self-approved (#434). Independent reviewers and humans return False.
     """
-    if not is_agent or config.REVIEW_SELF_APPROVE == "allow":
-        return
+    if not is_agent:
+        return False
     implementer_pid = task.get("implementer_principal_id")
-    if (
+    is_implementer = (
         implementer_pid is not None
         and principal_id is not None
         and principal_id == implementer_pid
-    ):
-        raise HTTPException(403, detail=self_review_forbidden_detail(username))
-    implementers = {
-        (task.get("assigned_agent") or "").strip(),
-        (task.get("claimed_by") or "").strip(),
-    } - {""}
-    if username in implementers:
-        raise HTTPException(403, detail=self_review_forbidden_detail(username))
+    )
+    if not is_implementer:
+        implementers = {
+            (task.get("assigned_agent") or "").strip(),
+            (task.get("claimed_by") or "").strip(),
+        } - {""}
+        is_implementer = username in implementers
+    if not is_implementer:
+        return False
+    if config.REVIEW_SELF_APPROVE == "allow":
+        return True
+    raise HTTPException(403, detail=self_review_forbidden_detail(username))
 
 
 def parse_review_findings(raw: Any) -> list[ReviewFinding]:
@@ -301,6 +309,7 @@ def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
         verdict=verdict,
         submission_generation=verdict_generation,
         is_current=verdict_generation == (task.get("submission_generation") or 0),
+        self_approved=bool(task.get("review_self_approved") or 0),
         findings=parse_review_findings(task.get("review_findings")),
     )
 
@@ -1040,6 +1049,8 @@ async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskReviewVerdict,
+    *,
+    self_approved: bool = False,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -1048,6 +1059,11 @@ async def record_review_verdict(
     client-driven review (status=review, no review_job_id) the task returns
     to ``running`` so the developer can fix findings or report done (#307);
     headless transitions remain with the poller. Never a completion path.
+
+    ``self_approved=True`` (the ensure_reviewer_independence solo opt-out
+    result) marks the verdict as non-independent: the flag is persisted on
+    the task row, echoed in the task update, and logged as a warning so a
+    weakened Review Gate stays visible in hindsight (#434).
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1080,10 +1096,24 @@ async def record_review_verdict(
             ensure_ascii=False,
         )
         await repo.record_review_verdict(
-            db, task_id, body.verdict.value, findings_json=findings_json
+            db,
+            task_id,
+            body.verdict.value,
+            findings_json=findings_json,
+            self_approved=self_approved,
         )
         agent = (body.agent or "").strip() or "reviewer"
         content = f"Review verdict: {body.verdict.value.upper()}"
+        if self_approved:
+            content += " [self-approved: solo mode, OPENCLAW_REVIEW_SELF_APPROVE=allow]"
+            log.warning(
+                "Task #%s: review verdict %s accepted via "
+                "OPENCLAW_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
+                "implemented this task (no independent review)",
+                task_id,
+                body.verdict.value,
+                agent,
+            )
         if body.findings:
             # Human-readable echo only; the canonical structured findings
             # live on the task row, so the update text can stay compact.
@@ -1122,6 +1152,7 @@ async def record_review_verdict(
             payload={
                 "verdict": body.verdict.value,
                 "submission_generation": task.get("submission_generation") or 0,
+                "self_approved": self_approved,
             },
         )
         await db.commit()

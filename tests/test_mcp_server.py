@@ -1660,6 +1660,70 @@ async def test_hub_task_status_renders_latest_review(
     assert "2. [low] Polish docs" in text
     structured = _mcp_structured(out)
     assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
+    # Independent verdict — no solo-mode marker (#434).
+    assert "SELF-APPROVED" not in text
+
+
+async def test_hub_task_status_marks_self_approved_verdict(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#434: a solo-mode verdict is called out in the status text."""
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Solo reviewed",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": True,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert (
+        "Latest review: APPROVED for submission #1 (current) "
+        "[SELF-APPROVED: solo mode, not independent]" in text
+    )
+    structured = _mcp_structured(out)
+    assert structured["task"]["latest_review"]["self_approved"] is True
+
+
+async def test_hub_review_brief_marks_self_approved_verdict(
+    mock_api_get: AsyncMock,
+) -> None:
+    """#434: the review brief flags a prior solo-mode verdict."""
+    mock_api_get.return_value = {
+        "task_id": 43,
+        "title": "Solo brief",
+        "status": "review",
+        "submission_generation": 2,
+        "review_cycle": 1,
+        "acceptance_criteria": [],
+        "scope_in": [],
+        "review_checklist": [],
+        "validation_commands": [],
+        "branch": None,
+        "pr_number": None,
+        "diff_command": None,
+        "latest_submission_summary": "",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": False,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_get_review_brief(43)
+    text = json.loads(_mcp_text(out))["message"]
+    assert (
+        "Latest verdict: APPROVED for submission #1 "
+        "(stale — work resubmitted) [SELF-APPROVED: solo mode, not independent]" in text
+    )
 
 
 async def test_hub_submit_for_review(

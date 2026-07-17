@@ -542,10 +542,15 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         freshness = (
             "current" if latest_review.get("is_current") else "stale — work resubmitted"
         )
+        solo = (
+            " [SELF-APPROVED: solo mode, not independent]"
+            if latest_review.get("self_approved")
+            else ""
+        )
         parts.append(
             f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
             f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness})"
+            f"({freshness}){solo}"
         )
         for finding in (latest_review.get("findings") or [])[:10]:
             parts.append(
@@ -1057,10 +1062,15 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         freshness = (
             "current" if latest_review.get("is_current") else "stale — work resubmitted"
         )
+        solo = (
+            " [SELF-APPROVED: solo mode, not independent]"
+            if latest_review.get("self_approved")
+            else ""
+        )
         parts.append(
             f"\nLatest verdict: {(latest_review.get('verdict') or '?').upper()} "
             f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness})"
+            f"({freshness}){solo}"
         )
         for finding in (latest_review.get("findings") or [])[:20]:
             parts.append(

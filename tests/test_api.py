@@ -1158,6 +1158,8 @@ async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypa
     )
     assert resp.status_code == 200
     assert resp.json()["review_approved_current"] is True
+    # Independent verdicts are never marked as self-approved (#434).
+    assert resp.json()["latest_review"]["self_approved"] is False
 
 
 async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkeypatch):
@@ -1175,7 +1177,14 @@ async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkey
         headers=impl,
     )
     assert resp.status_code == 200
-    assert resp.json()["review_approved_current"] is True
+    body = resp.json()
+    assert body["review_approved_current"] is True
+    # #434: the weakened gate is audited — the verdict is marked.
+    assert body["latest_review"]["self_approved"] is True
+    assert any(
+        u["kind"] == "review" and "[self-approved: solo mode" in u["content"]
+        for u in body["updates"] or []
+    )
 
 
 # ---- Implementer principal binding (#320) ----

@@ -2296,6 +2296,124 @@ async def test_record_verdict_with_findings_persists_structured_data(
     assert view.review_approved_current is True
 
 
+# ---- Audited solo mode (#434) ----
+
+
+async def test_solo_self_approved_verdict_is_marked(db: aiosqlite.Connection, caplog):
+    task_id = await _pair_running_task(db, title="Solo verdict")
+    await services.submit_for_review(db, task_id)
+
+    with caplog.at_level("WARNING"):
+        view = await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="dev-agent"),
+            self_approved=True,
+        )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is True
+    assert view.review_approved_current is True
+    assert any(
+        u.kind == "review" and "[self-approved: solo mode" in u.content
+        for u in view.updates or []
+    )
+    assert any(
+        "OPENCLAW_REVIEW_SELF_APPROVE=allow" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_independent_verdict_is_not_marked_self_approved(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Independent verdict")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is False
+    assert all("self-approved" not in u.content for u in view.updates or [])
+
+
+async def test_new_independent_verdict_clears_self_approved_mark(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Solo then independent")
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="dev-agent"),
+        self_approved=True,
+    )
+
+    # Client-driven verdict returned the task to running; resubmit and let
+    # an independent reviewer approve — the mark belongs to the verdict.
+    await services.submit_for_review(db, task_id)
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is False
+
+
+def test_ensure_reviewer_independence_flags_solo_opt_out(monkeypatch):
+    from hub import config
+
+    task = {"assigned_agent": "impl-bot", "claimed_by": ""}
+
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    # The implementer passes only because of the opt-out — flagged.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="impl-bot"
+        )
+        is True
+    )
+    # An independent agent reviewer is never flagged, even in solo mode.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="reviewer-bot"
+        )
+        is False
+    )
+    # Humans always pass unflagged.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=False, principal_id=None, username="impl-bot"
+        )
+        is False
+    )
+    # Principal-based implementer match is flagged too (#320 identity wins).
+    ptask = {
+        "implementer_principal_id": 7,
+        "assigned_agent": "other-name",
+        "claimed_by": "",
+    }
+    assert (
+        services.ensure_reviewer_independence(
+            ptask, is_agent=True, principal_id=7, username="display-x"
+        )
+        is True
+    )
+
+    # With the flag off the implementer is still rejected — unchanged (#318).
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    with pytest.raises(HTTPException) as exc_info:
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="impl-bot"
+        )
+    assert exc_info.value.status_code == 403
+
+
 def test_parse_review_findings_malformed_json_is_ignored():
     assert services.parse_review_findings("not-json") == []
     assert services.parse_review_findings('{"id": 1}') == []
