@@ -2165,3 +2165,29 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
     assert path == "/api/tasks/42/machine-review"
     assert body["tokens_spent"] == 1000
     assert "duration_ms" not in body  # omitted optionals stay omitted
+
+
+async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
+    # #384: MCP wrapper summarises economics and recurring categories.
+    from hub.mcp_server import hub_practice_metrics
+
+    mock_api_get.return_value = {
+        "since_days": 90,
+        "machine_reviews": {
+            "reviews": 2,
+            "raw_total": 16,
+            "confirmed_total": 4,
+            "rejected_total": 12,
+            "tokens_total": 1428876,
+            "tokens_per_confirmed": 357219,
+        },
+        "by_harness": [],
+        "recurring_categories": [
+            {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
+        ],
+        "cycle_times": [],
+    }
+    out = await hub_practice_metrics(since_days=90)
+    structured = _mcp_structured(out)
+    assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
+    mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")

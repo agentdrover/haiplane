@@ -707,6 +707,13 @@ async def web_request_machine_review(task_id: int, request: Request):
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 
+@router.get("/metrics", response_class=HTMLResponse)
+async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1)):
+    """Practice metrics page (#384)."""
+    data = await services.practice_metrics(_db(request), since_days=since_days)
+    return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
+
+
 @router.get("/skills", response_class=HTMLResponse)
 async def web_skills(request: Request):
     """Skills library (#380): latest version per name."""
