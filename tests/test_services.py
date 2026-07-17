@@ -1512,7 +1512,6 @@ async def test_force_complete_allows_missing_dispatch_job(
     from unittest.mock import MagicMock
 
     from hub.integrations.registry import plugins
-    from hub.models import TaskForceComplete
 
     task_id = await repo.create_task(
         db,
@@ -1586,8 +1585,6 @@ async def test_force_complete_allows_terminal_dispatch_job(
 
 
 async def test_force_complete_from_open(db: aiosqlite.Connection):
-    from hub.models import TaskForceComplete
-
     body = TaskCreate(title="Still open")
     tv = await services.create_task(db, body)
     assert tv.status.value == "open"
@@ -1652,6 +1649,33 @@ async def test_force_complete_default_comment_from_pending_report(
     assert view.status.value == "completed"
     done = next(u for u in view.updates if u.kind == "done")
     assert "Force-completed by human without agent report." in done.content
+
+
+async def test_force_complete_default_comment_from_draft(
+    db: aiosqlite.Connection,
+):
+    """draft is not an ACTIVE_STATUS, so the default comment path applies."""
+    task_id = await repo.create_task(
+        db,
+        title="Abandoned draft",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
+    assert "from_status=draft" in done.content
 
 
 async def test_force_complete_clears_stale_claim_metadata(
@@ -1877,7 +1901,6 @@ async def test_force_complete_from_all_non_terminal_statuses(
     db: aiosqlite.Connection,
     status: str,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await repo.create_task(
         db,
@@ -2449,7 +2472,6 @@ async def test_gate_review_cycle_limit_escalates_to_decision(
 async def test_force_complete_bypasses_gate_as_audited_override(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await _pair_running_task(db, title="Gate force override")
     await repo.update_task(db, task_id, branch=None)
@@ -2670,7 +2692,6 @@ async def test_claimed_done_with_current_approval_completes_and_clears_claim(
 async def test_force_complete_from_pending_report_bypasses_gate(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await repo.create_task(
         db,

@@ -1781,7 +1781,7 @@ async def force_complete_task(
             _force_complete_job_overlay_note(label, job_ref, dispatch_status)
         )
 
-    comment_raw = (body.comment.strip() if body else "")
+    comment_raw = body.comment.strip() if body else ""
     active_statuses = {s.value for s in ACTIVE_STATUSES}
     if (
         status in active_statuses
@@ -1793,9 +1793,7 @@ async def force_complete_task(
             f"force-complete from active status {status!r} requires a non-empty comment",
         )
 
-    base_comment = comment_raw or (
-        "Force-completed by human without agent report."
-    )
+    base_comment = comment_raw or ("Force-completed by human without agent report.")
     comment = _build_force_complete_comment(
         base_comment,
         from_status=status,
