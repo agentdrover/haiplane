@@ -68,6 +68,15 @@ STALE_NEEDS_INFO_MINUTES = int(
     os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
 )
 
+# Bounded recovery (#417): a headless dispatch/review job that stays missing
+# past the grace escalates to needs_decision; a claim held past the lease is
+# auto-released back to open. Both decisions read persisted timestamps so a
+# restart never resets them.
+MISSING_JOB_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_MISSING_JOB_GRACE_MINUTES", "5")
+)
+CLAIM_LEASE_MINUTES = int(os.environ.get("OPENCLAW_CLAIM_LEASE_MINUTES", "240"))
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 

@@ -38,6 +38,47 @@ def _seconds_since(iso_ts: str | None) -> float | None:
     return (datetime.now(UTC) - started).total_seconds()
 
 
+async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
+    """Grace-then-escalate for a headless task whose dispatch job is gone (#417).
+
+    A missing job used to be a silent ``continue`` — the task then sat in a
+    machine status forever. Now the first miss stamps a durable clock; once the
+    grace passes the task escalates once to needs_decision with a machine
+    reason. The clock lives in the row, so the decision survives a restart and
+    matches a continuous run. Pair-running and client-driven review are never
+    routed here — they carry no job id and are excluded by the selection.
+    """
+    elapsed = _seconds_since(task.get("job_missing_since"))
+    if elapsed is None:
+        await repo.mark_job_missing(db, task["id"])
+        await db.commit()
+        return
+    if elapsed < config.MISSING_JOB_GRACE_MINUTES * 60:
+        return
+    await repo.add_task_update(
+        db,
+        task["id"],
+        "hub",
+        "alert",
+        "Dispatch job missing beyond grace period. Manual decision required.",
+    )
+    await repo.update_task(db, task["id"], status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task["id"],
+        actor="hub",
+        payload={"reason": reason},
+    )
+    await repo.clear_job_missing(db, task["id"])
+    await db.commit()
+    log.warning(
+        "Poll: task #%d dispatch job missing beyond grace → needs_decision",
+        task["id"],
+    )
+    await services.maybe_destroy_vast(db, task)
+
+
 async def _poll_running_tasks(app: FastAPI) -> None:
     """Background task: sync running/review/fix_requested tasks with dispatch job status."""
     while True:
@@ -50,7 +91,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["job_id"])
                 if not job:
+                    await _handle_missing_job(
+                        db, task, reason="dispatch_job_missing"
+                    )
                     continue
+                if task.get("job_missing_since"):
+                    await repo.clear_job_missing(db, task["id"])
+                    await db.commit()
                 job_status = job.get("status")
                 if job_status not in ("completed", "failed"):
                     continue
@@ -138,7 +185,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["review_job_id"])
                 if not job:
+                    await _handle_missing_job(
+                        db, task, reason="review_job_missing"
+                    )
                     continue
+                if task.get("job_missing_since"):
+                    await repo.clear_job_missing(db, task["id"])
+                    await db.commit()
                 job_status = job.get("status")
                 if job_status not in ("completed", "failed"):
                     continue
@@ -566,6 +619,36 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         status_name,
                         threshold,
                     )
+
+            # Claim lease expiry (#417): a claim held past the lease without a
+            # pair start is auto-released back to open so the task returns to
+            # the queue instead of sitting owned by a dead session forever.
+            # Status change makes this idempotent — an expired claim is only
+            # seen once. Release does not dispatch; the task waits in open.
+            expired_claims = await repo.list_expired_claims(
+                db, config.CLAIM_LEASE_MINUTES
+            )
+            for row in expired_claims:
+                task = dict(row)
+                await repo.update_task(
+                    db,
+                    task["id"],
+                    status="open",
+                    claimed_by=None,
+                    claim_session_id=None,
+                    claimed_at=None,
+                )
+                await repo.insert_event(
+                    db,
+                    kind="claim_expired",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "claim_lease_expired"},
+                )
+                await db.commit()
+                log.info(
+                    "Poll: task #%d claim lease expired → open", task["id"]
+                )
 
             # Events feed retention (#349): the feed is a notification
             # channel, not an archive — activity_log keeps the history.

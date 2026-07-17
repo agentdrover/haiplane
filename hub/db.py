@@ -524,6 +524,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "UPDATE tasks SET status_entered_at = datetime('now') "
         "WHERE status_entered_at IS NULL",
     ),
+    # ---- Bounded recovery for missing jobs (#417): the durable clock that
+    # marks when a headless dispatch/review job was first seen missing, so the
+    # grace-then-escalate decision survives a restart. NULL means the job is
+    # present (or the task is not headless).
+    (
+        "add_job_missing_since_column",
+        "ALTER TABLE tasks ADD COLUMN job_missing_since TEXT",
+    ),
 ]
 
 
