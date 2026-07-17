@@ -259,3 +259,42 @@ async def test_pair_prepare_branch_explicit_repo_skips_default_guard(tmp_path):
             3, "Proj task", branch_slug="proj-task", repo=str(tmp_path)
         )
     assert branch == "task-3/proj-task"
+
+
+# ---- Typed CI probe outcomes (#419) ----
+
+
+@pytest.mark.parametrize(
+    "rc, out, expected_outcome, expected_reason",
+    [
+        (0, '[{"name": "build", "state": "SUCCESS"}]', "pass", "checks_passed"),
+        (0, '[{"name": "build", "state": "NEUTRAL"}]', "pass", "checks_passed"),
+        (0, '[{"name": "build", "state": "FAILURE"}]', "fail", "checks_failed"),
+        (0, '[{"name": "build", "state": "IN_PROGRESS"}]', "pending", "checks_running"),
+        (
+            0,
+            '[{"name": "a", "state": "SUCCESS"}, {"name": "b", "state": "QUEUED"}]',
+            "pending",
+            "checks_running",
+        ),
+        (0, "[]", "absent", "no_checks"),
+        (1, "", "unavailable", "gh_error"),
+        (0, "not json at all", "unavailable", "invalid_json"),
+        (0, '[{"name": "x", "state": "WEIRD"}]', "unavailable", "unknown_state"),
+    ],
+)
+async def test_check_pr_ci_typed_outcomes(
+    git_ops: GitOpsIntegration, rc, out, expected_outcome, expected_reason
+):
+    # AC-1 (#419): every observable gh response maps to a distinct outcome with
+    # a stable, non-empty reason — running checks, an empty set, a gh error and
+    # unparseable output are no longer all "pending".
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(rc, out, "boom" if rc else ""),
+    ):
+        result = await git_ops.check_pr_ci(42)
+    assert result.outcome.value == expected_outcome
+    assert result.reason == expected_reason
+    assert result.reason  # never empty

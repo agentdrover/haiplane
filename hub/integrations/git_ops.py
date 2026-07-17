@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 
 log = logging.getLogger(__name__)
 
@@ -646,8 +647,10 @@ class GitOpsIntegration:
 
         return result
 
-    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str:
-        rc, out, _ = await _gh(
+    async def check_pr_ci(
+        self, pr_number: int, repo: str | None = None
+    ) -> CIProbeResult:
+        rc, out, err = await _gh(
             "pr",
             "checks",
             str(pr_number),
@@ -658,28 +661,36 @@ class GitOpsIntegration:
             repo=repo,
             check=False,
         )
-        if rc != 0 or not out:
-            return "pending"
+        # rc error / empty output — the probe itself could not run. Not pending:
+        # nothing is known to be in flight (#419).
+        if rc != 0 or not out or not out.strip():
+            return CIProbeResult(
+                CIProbeOutcome.unavailable, "gh_error", details=(err or "").strip()
+            )
         try:
             checks = json.loads(out)
         except json.JSONDecodeError:
-            return "pending"
+            return CIProbeResult(CIProbeOutcome.unavailable, "invalid_json")
 
+        # An empty check set is a definite answer, not a wait: the PR has no CI.
         if not checks:
-            return "pending"
+            return CIProbeResult(CIProbeOutcome.absent, "no_checks")
 
         states = [c.get("state", "").upper() for c in checks]
-        still_running = any(
+        if any(
             s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "")
             for s in states
-        )
-        if still_running:
-            return "pending"
-        if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
-            return "pass"
+        ):
+            return CIProbeResult(CIProbeOutcome.pending, "checks_running")
         if any(s in ("FAILURE", "ERROR", "ACTION_REQUIRED") for s in states):
-            return "fail"
-        return "pending"
+            return CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+        if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
+            return CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+        # Reached only for states gh reports that we do not recognise — treat as
+        # unavailable (a stable reason) rather than silently waiting.
+        return CIProbeResult(
+            CIProbeOutcome.unavailable, "unknown_state", details=",".join(states)
+        )
 
     async def merge_pr(
         self, pr_number: int, task_id: int, title: str, repo: str | None = None

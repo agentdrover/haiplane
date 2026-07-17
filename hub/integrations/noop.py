@@ -10,6 +10,8 @@ from typing import Any
 
 import aiosqlite
 
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
 
 class NoopDispatch:
     def is_available(self) -> bool:
@@ -185,8 +187,10 @@ class NoopGitOps:
     ) -> dict[str, Any]:
         return {}
 
-    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str:
-        return "pending"
+    async def check_pr_ci(
+        self, pr_number: int, repo: str | None = None
+    ) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.pending, "noop")
 
     async def merge_pr(
         self, pr_number: int, task_id: int, title: str, repo: str | None = None
