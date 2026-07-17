@@ -1155,6 +1155,162 @@ async def test_web_patch_routes_reject_agent_token(
     assert row["archived"] == 0
 
 
+async def test_web_human_only_routes_reject_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    """#427: agent bearer must not bypass human-only web lifecycle gates."""
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    draft_id = await repo_module.create_task(
+        db,
+        title="Draft gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    open_id = await repo_module.create_task(
+        db,
+        title="Open gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    needs_info_id = await repo_module.create_task(
+        db,
+        title="Needs info gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    needs_decision_id = await repo_module.create_task(
+        db,
+        title="Needs decision gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    pending_id = await repo_module.create_task(
+        db,
+        title="Pending report gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    proposal_id = await repo_module.create_task(
+        db,
+        title="Agent proposal",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    routes = [
+        (f"/tasks/{draft_id}/web-approve", {}),
+        (f"/tasks/{draft_id}/web-reject", {}),
+        (f"/tasks/{open_id}/web-start", {}),
+        (f"/tasks/{needs_info_id}/web-answer", {"answer": "ok"}),
+        (
+            f"/tasks/{needs_decision_id}/web-decide",
+            {"action": "accept", "decision_summary": "yes"},
+        ),
+        (f"/tasks/{pending_id}/web-force-complete", {"comment": "override"}),
+        (f"/proposals/{proposal_id}/approve", {}),
+        (f"/proposals/{proposal_id}/reject", {}),
+    ]
+    for url, data in routes:
+        resp = await client.post(url, data=data, headers=agent, follow_redirects=False)
+        assert resp.status_code == 403, url
+
+    assert (await repo_module.get_task(db, draft_id))["status"] == "draft"
+    assert (await repo_module.get_task(db, open_id))["status"] == "open"
+    assert (await repo_module.get_task(db, pending_id))["status"] == "pending_report"
+
+
+async def test_web_force_complete_human_token_still_works(
+    client: AsyncClient, monkeypatch, db
+):
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await repo_module.create_task(
+        db,
+        title="Human override",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-force-complete",
+        data={"comment": "human approved override"},
+        headers=human,
+        follow_redirects=False,
+    )
+    assert resp.status_code in (200, 303)
+    row = await repo_module.get_task(db, task_id)
+    assert row["status"] == "completed"
+
+
 async def test_web_create_project_agent_token_creates_pending(
     client: AsyncClient, monkeypatch, db
 ):
