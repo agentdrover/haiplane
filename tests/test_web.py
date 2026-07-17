@@ -759,6 +759,43 @@ async def test_web_changes_requested_with_findings(client: AsyncClient):
     assert findings[2]["severity"] == "low"
 
 
+async def test_task_detail_shows_finding_scope_and_linked_task(client: AsyncClient):
+    # #435: out-of-scope findings render a scope badge and a link to the
+    # follow-up task in the review panel.
+    linked = await client.post("/api/tasks", json={"title": "Follow-up work"})
+    linked_id = linked.json()["id"]
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix in this task"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Handled separately",
+                    "scope": "out_of_scope",
+                    "linked_task_id": linked_id,
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    # Resubmit so the task is back in client-driven review and the panel
+    # (including the stale latest verdict with findings) is rendered.
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "Fix in this task" in page.text
+    assert "Handled separately" in page.text
+    assert "out of scope" in page.text
+    assert f'href="/tasks/{linked_id}"' in page.text
+    assert f"#{linked_id}" in page.text
+
+
 async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient):
     task_id = await _web_task_in_review(client)
     resp = await client.post(

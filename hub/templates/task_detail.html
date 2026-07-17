@@ -434,7 +434,11 @@
                     {% if task.latest_review.findings %}
                     <ul class="task-review-findings">
                         {% for f in task.latest_review.findings %}
-                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}</li>
+                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}
+                            {% if f.scope.value == 'out_of_scope' %}
+                            <span class="badge badge--xs badge-type-subtask">out of scope{% if f.linked_task_id %} &rarr; <a href="/tasks/{{ f.linked_task_id }}">#{{ f.linked_task_id }}</a>{% endif %}</span>
+                            {% endif %}
+                        </li>
                         {% endfor %}
                     </ul>
                     {% endif %}

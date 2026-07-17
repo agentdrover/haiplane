@@ -227,6 +227,18 @@ async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
         return resp.json(), resp.status_code
 
 
+def _finding_line(finding: dict[str, Any]) -> str:
+    """One-line rendering of a review finding with its scope marker (#435)."""
+    scope_mark = ""
+    if finding.get("scope") == "out_of_scope":
+        linked = finding.get("linked_task_id")
+        scope_mark = f" [out-of-scope → #{linked}]" if linked else " [out-of-scope]"
+    return (
+        f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}]"
+        f"{scope_mark} {finding.get('message', '')}"
+    )
+
+
 def _format_task(t: dict[str, Any]) -> str:
     src = (
         f" [agent:{t.get('assigned_agent', '')}]" if t.get("source") == "agent" else ""
@@ -548,10 +560,7 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
             f"({freshness})"
         )
         for finding in (latest_review.get("findings") or [])[:10]:
-            parts.append(
-                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
-                f"{finding.get('message', '')}"
-            )
+            parts.append(_finding_line(finding))
     acs = task.get("acceptance_criteria") or []
     if acs:
         parts.append("\nAcceptance criteria:")
@@ -1063,13 +1072,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"({freshness})"
         )
         for finding in (latest_review.get("findings") or [])[:20]:
-            parts.append(
-                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
-                f"{finding.get('message', '')}"
-            )
+            parts.append(_finding_line(finding))
     parts.append(
         "\nSubmit the verdict with hub_submit_review "
-        "(verdict=approved|changes_requested, findings for changes_requested)."
+        "(verdict=approved|changes_requested, findings for changes_requested; "
+        "changes_requested needs at least one scope=in_scope finding)."
     )
     return structured_echo_result("\n".join(parts), brief=brief)
 
@@ -1090,6 +1097,13 @@ async def hub_submit_review(
     path, with CHANGES_REQUESTED the developer fixes the findings and
     resubmits via hub_submit_for_review.
 
+    Finding scope (#435): every finding carries scope
+    (in_scope|out_of_scope, default in_scope). changes_requested with
+    findings requires at least one in_scope finding — if everything is out
+    of scope, submit approved and keep out-of-scope findings as
+    recommendations linked to follow-up tasks. Out-of-scope findings
+    without linked_task_id get a non-blocking warning.
+
     Args:
         task_id: The task under review
         verdict: 'approved' or 'changes_requested'
@@ -1097,7 +1111,9 @@ async def hub_submit_review(
         agent: Reviewer agent name
         findings: For changes_requested — list of dicts with id (int, stable
             within this submission), severity (high|medium|low), message,
-            and optional file, line, recommendation.
+            and optional file, line, recommendation,
+            scope (in_scope|out_of_scope, default in_scope),
+            linked_task_id (int — follow-up task for out_of_scope findings).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None

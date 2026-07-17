@@ -1276,7 +1276,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--findings-json",
         dest="findings_json",
         default="",
-        help='JSON list of findings: [{"id":1,"severity":"high","message":"..."}]',
+        help=(
+            "JSON list of findings: "
+            '[{"id":1,"severity":"high","message":"...",'
+            '"scope":"in_scope|out_of_scope","linked_task_id":123}]. '
+            "scope defaults to in_scope; changes_requested requires at "
+            "least one in_scope finding; linked_task_id references the "
+            "follow-up task for out_of_scope findings."
+        ),
     )
     p_review_verdict.set_defaults(func=cmd_review_verdict)
 

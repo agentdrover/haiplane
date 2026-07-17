@@ -1662,6 +1662,45 @@ async def test_hub_task_status_renders_latest_review(
     assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
 
 
+async def test_hub_task_status_renders_finding_scope(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: out-of-scope findings show their scope and linked follow-up task.
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Scoped findings",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 1,
+            "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Linked elsewhere",
+                    "scope": "out_of_scope",
+                    "linked_task_id": 436,
+                },
+                {
+                    "id": 3,
+                    "severity": "low",
+                    "message": "Unlinked elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert "1. [high] Fix here" in text
+    assert "2. [low] [out-of-scope → #436] Linked elsewhere" in text
+    assert "3. [low] [out-of-scope] Unlinked elsewhere" in text
+
+
 async def test_hub_submit_for_review(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:
@@ -1748,6 +1787,29 @@ async def test_hub_submit_review_changes_requested(
             "agent": "reviewer",
             "findings": findings,
         },
+    )
+
+
+async def test_hub_submit_review_forwards_scope_fields(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: scope/linked_task_id pass through to the canonical REST body.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {"id": 1, "severity": "high", "message": "Fix here"},
+        {
+            "id": 2,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+            "linked_task_id": 436,
+        },
+    ]
+    await hub_submit_review(42, verdict="changes_requested", findings=findings)
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {"verdict": "changes_requested", "findings": findings},
     )
 
 

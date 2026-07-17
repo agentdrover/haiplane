@@ -986,6 +986,69 @@ async def test_review_verdict_api_changes_requested_returns_to_running(
     assert body["review_approved_current"] is False
 
 
+async def test_review_verdict_api_finding_scope_roundtrip(client: AsyncClient):
+    # #435: scope defaults to in_scope; out_of_scope findings carry the
+    # linked follow-up task through the review brief.
+    task_id = await _running_pair_task(client, "Scope roundtrip API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                    "linked_task_id": 436,
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    findings = resp.json()["latest_review"]["findings"]
+    assert findings[0]["scope"] == "in_scope"
+    assert findings[0]["linked_task_id"] is None
+    assert findings[1]["scope"] == "out_of_scope"
+    assert findings[1]["linked_task_id"] == 436
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    brief_findings = brief["latest_review"]["findings"]
+    assert brief_findings[1]["scope"] == "out_of_scope"
+    assert brief_findings[1]["linked_task_id"] == 436
+
+
+async def test_review_verdict_api_rejects_all_out_of_scope_findings(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "All out of scope API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {
+                    "id": 1,
+                    "severity": "high",
+                    "message": "Different subsystem",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "changes_requested_requires_in_scope_finding"
+    assert "approved" in detail["hint"]
+
+
 async def test_review_verdict_api_approved_returns_to_running_current(
     client: AsyncClient,
 ):
