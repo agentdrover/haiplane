@@ -206,10 +206,25 @@ ssh user1@194.113.34.33 '
 
 ```bash
 OPENCLAW_HUB_DB=/absolute/path/.local/state/hub.db
-OPENCLAW_HUB_TOKENS=name:token:human,agent-name:token:agent
+OPENCLAW_HUB_TOKENS=name:token:human,cursor:token:agent,cursor-reviewer:token2:agent
 OPENCLAW_WORKSPACE_REPO=/absolute/path/to/workspace-clone
 OPENCLAW_HUB_REPO=org/repo-name
 ```
+
+### Reviewer-токен (Universal Review Gate, #432)
+
+Кроме токена агента-исполнителя, провижинь **отдельную reviewer-идентичность**
+(`cursor-reviewer` в примере выше): роль `agent`, имя отличается от
+исполнителя, значение токена уникально. Без неё вердикт ревью от исполнителя
+блокируется gate'ом (`self_review_forbidden`) и цикл ревью стопорится.
+
+- Генерация секрета: `openssl rand -hex 32` (в чат/git не выводить).
+- На production токен добавляется в `OPENCLAW_HUB_TOKENS` в
+  `/etc/openclaw-hub/openclaw-hub.env` (проверять наличие через `grep -q`,
+  как в разделе 2, без вывода значений) + restart `openclaw-hub`.
+- Reviewer-сессия (агент/subagent, который вызывает `hub_submit_review`)
+  запускается с `OPENCLAW_HUB_TOKEN=<reviewer-token>`; исполнитель — со своим
+  токеном. Детали: `docs/agent-onboarding.md`, раздел про reviewer-идентичность.
 
 ### `OPENCLAW_WORKSPACE_REPO` и pair mode
 

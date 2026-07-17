@@ -1143,17 +1143,19 @@ def _review_tokens() -> dict:
     }
 
 
-async def _task_in_review(client: AsyncClient, title: str, headers: dict) -> int:
+async def _task_in_review(
+    client: AsyncClient, title: str, headers: dict, agent: str = "impl-bot"
+) -> int:
     resp = await client.post("/api/tasks", json={"title": title}, headers=headers)
     task_id = resp.json()["id"]
     await client.post(
         f"/api/tasks/{task_id}/updates",
-        json={"agent": "impl-bot", "kind": "status", "content": "Plan: work"},
+        json={"agent": agent, "kind": "status", "content": "Plan: work"},
         headers=headers,
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "impl-bot"},
+        json={"assigned_agent": agent},
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -1442,6 +1444,83 @@ async def test_claim_records_and_release_clears_implementer_principal(
     assert resp.status_code == 200
     d = dict(await repo_module.get_task(db, task_id))
     assert d["implementer_principal_id"] is None
+
+
+# ---- Reviewer identity provisioning (#432) ----
+#
+# The documented deploy setup (deploy/local-hub.env.example,
+# docs/agent-onboarding.md): TWO env tokens with role `agent` — the
+# implementer (`cursor`) and a dedicated reviewer (`cursor-reviewer`).
+# Parsed straight from the OPENCLAW_HUB_TOKENS format so the tests pin the
+# exact configuration operators are told to provision.
+
+
+def _provisioned_reviewer_tokens() -> dict:
+    from hub import config
+
+    return config.parse_tokens(
+        "denis:human-tok:human,"
+        "cursor:cursor-tok:agent,"
+        "cursor-reviewer:reviewer-tok:agent"
+    )
+
+
+async def test_provisioned_reviewer_identity_verdict_passes_gate(
+    client: AsyncClient, monkeypatch
+):
+    # AC (#432): a verdict from a DIFFERENT agent principal passes the gate.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _provisioned_reviewer_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer cursor-tok"}
+    reviewer = {"Authorization": "Bearer reviewer-tok"}
+
+    task_id = await _task_in_review(
+        client, "Reviewer identity passes", impl, agent="cursor"
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "cursor-reviewer"},
+        headers=reviewer,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["review_approved_current"] is True
+    assert body["status"] == "running"
+
+
+async def test_provisioned_implementer_identity_verdict_rejected(
+    client: AsyncClient, monkeypatch
+):
+    # AC (#432): the implementing principal is rejected with a structured
+    # reason; the gate compares principals, not the token role — both tokens
+    # here share role `agent`.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _provisioned_reviewer_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer cursor-tok"}
+
+    task_id = await _task_in_review(
+        client, "Implementer verdict blocked", impl, agent="cursor"
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "cursor"},
+        headers=impl,
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "self_review_forbidden"
+    assert detail["required_role"] == "independent_reviewer"
+    assert "independent reviewer" in detail["hint"]
+    # No verdict recorded; the task stays in review for a real reviewer.
+    body = (await client.get(f"/api/tasks/{task_id}", headers=impl)).json()
+    assert body["review_verdict"] is None
+    assert body["status"] == "review"
 
 
 # ---- Batch approve (#252) ----

@@ -272,6 +272,17 @@ def test_parse_tokens_empty_returns_empty_dict():
     assert config.parse_tokens("   ") == {}
 
 
+def test_parse_tokens_multiple_agent_identities():
+    """Reviewer identity provisioning (#432): several tokens may share the
+    ``agent`` role while remaining distinct principals by name."""
+    out = config.parse_tokens("cursor:tok-a:agent,cursor-reviewer:tok-b:agent")
+    assert out["tok-a"].username == "cursor"
+    assert out["tok-a"].role == "agent"
+    assert out["tok-b"].username == "cursor-reviewer"
+    assert out["tok-b"].role == "agent"
+    assert out["tok-a"].username != out["tok-b"].username
+
+
 # ---------------------------------------------------------------------------
 # Role boundaries — agent tokens blocked from human-only operations
 # ---------------------------------------------------------------------------
