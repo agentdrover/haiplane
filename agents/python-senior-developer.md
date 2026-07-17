@@ -30,6 +30,11 @@
   `hub_task_update(..., kind="status", content="Plan: ...")`.
 - Use `hub_ask_question` for missing requirements and
   `hub_task_update(..., kind="blocker")` for blocked execution.
+- Review cycle: `review` → `changes_requested` → `running` → fix findings on
+  the SAME task branch → `hub_submit_for_review` (new submission generation) →
+  re-review. Pushing commits alone does not re-trigger review.
+- Base task branches on current `develop`, never on an unmerged branch under
+  review (see `docs/repository-rules.md`, «Жизненный цикл ветки задачи»).
 - Finish with `hub_report_done`; include changed files, behavior change, and
   validation commands with results.
 - Propose out-of-scope follow-up work with `hub_propose_task`; do not absorb it

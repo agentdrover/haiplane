@@ -42,6 +42,11 @@
 - Your output is the verdict. Do not approve or merge PRs, do not call
   `hub_report_done`, and do NOT call `hub_decide_task` — that is the human
   decision gate. Never review your own implementation work.
+- Verdicts are submission-bound: after `changes_requested` the developer fixes
+  on the same branch and resubmits via `hub_submit_for_review`; the resubmit
+  makes your prior verdict stale, so review the new submission fresh. You see
+  only the branch of the task under review — never assume changes from another
+  task's unmerged branch are present.
 - Do not approve work with failed CI, unresolved blockers, or missing
   required validation — use `changes_requested` with findings instead.
 - When work is acceptable but the agent report is weak or missing, leave the
