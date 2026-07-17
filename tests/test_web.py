@@ -1448,3 +1448,76 @@ async def test_review_panel_gap_warning_and_request_button(client: AsyncClient, 
         )
     ]
     assert events and events[0]["task_id"] == tv.id
+
+
+async def test_web_create_skill_from_form(client: AsyncClient, db):
+    # AC-1 (#385): create form → active skill (human path) in the list.
+    from hub import repository as repo_module
+
+    resp = await client.post(
+        "/skills/web-create",
+        data={
+            "name": "dor-checklist",
+            "kind": "checklist",
+            "tags": "dor, quality",
+            "content": "- AC present?\n- risks listed?",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/skills/dor-checklist"
+
+    row = await repo_module.get_active_skill(db, "dor-checklist")
+    assert row is not None and row["version"] == 1 and row["status"] == "active"
+
+    page = await client.get("/skills")
+    assert "dor-checklist" in page.text
+
+
+async def test_web_edit_as_new_version(client: AsyncClient, db):
+    # AC-2 (#385): active content prefilled; save creates N+1, history kept.
+    from hub import repository as repo_module
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+
+    detail = await client.get("/skills/multi-agent-review")
+    assert "refuted" in detail.text  # textarea prefilled with active v1
+    assert 'name="content"' in detail.text  # Edit-as-new-version form present
+
+    resp = await client.post(
+        "/skills/multi-agent-review/web-new-version",
+        data={"content": "v2 harness body", "tags": "review"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    versions = await repo_module.list_skill_versions(db, "multi-agent-review")
+    assert len(versions) == 2
+    assert versions[0]["version"] == 2  # newest first
+    # v1 стала неактивной? нет — новая версия у человека сразу active,
+    # активной считается старшая active-версия
+    active = await repo_module.get_active_skill(db, "multi-agent-review")
+    assert active["version"] == 2
+    assert active["content"] == "v2 harness body"
+    # история цела: v1 всё ещё существует
+    assert any(v["version"] == 1 for v in versions)
+
+
+async def test_web_create_skill_bad_slug(client: AsyncClient, db):
+    # AC-3 (#385): invalid slug → form error, not a 500.
+    resp = await client.post(
+        "/skills/web-create",
+        data={"name": "Bad Slug!", "kind": "prompt", "content": "x"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "skill_error=" in resp.headers["location"]
+
+
+async def test_web_new_version_unknown_skill_404(client: AsyncClient, db):
+    resp = await client.post(
+        "/skills/nope/web-new-version",
+        data={"content": "x"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 404
