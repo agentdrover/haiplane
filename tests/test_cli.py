@@ -1024,6 +1024,37 @@ def test_cmd_review_verdict_with_findings() -> None:
     )
 
 
+def test_cmd_review_verdict_forwards_auto_draft_flag() -> None:
+    # #436: --create-tasks-for-out-of-scope passes through to the REST body.
+    result = {"id": 42, "status": "running"}
+    mock_api = MagicMock(return_value=result)
+    findings = [
+        {"id": 1, "severity": "low", "message": "Elsewhere", "scope": "out_of_scope"},
+        {"id": 2, "severity": "high", "message": "Fix it"},
+    ]
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="changes_requested",
+        comments="",
+        agent="reviewer",
+        findings_json=json.dumps(findings),
+        create_tasks_for_out_of_scope=True,
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": findings,
+            "create_tasks_for_out_of_scope": True,
+        },
+    )
+
+
 def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
     args = argparse.Namespace(
         task_id=42,

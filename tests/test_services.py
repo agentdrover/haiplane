@@ -2458,6 +2458,166 @@ async def test_finding_scope_and_linked_task_persist_roundtrip(
     assert "Warning:" not in review_update.content
 
 
+# ---- Auto-draft follow-ups for out-of-scope findings (#436) ----
+
+
+async def _count_tasks(db: aiosqlite.Connection) -> int:
+    cur = await db.execute("SELECT COUNT(*) FROM tasks")
+    row = await cur.fetchone()
+    return int(row[0])
+
+
+def _mixed_scope_verdict(
+    *,
+    create_tasks: bool,
+    linked_task_id: int | None = None,
+) -> TaskReviewVerdict:
+    return TaskReviewVerdict(
+        verdict=ReviewVerdict.changes_requested,
+        agent="reviewer",
+        create_tasks_for_out_of_scope=create_tasks,
+        findings=[
+            ReviewFinding(id=1, severity=ReviewSeverity.high, message="In-task bug"),
+            ReviewFinding(
+                id=2,
+                severity=ReviewSeverity.medium,
+                message="Race in the poller retry loop",
+                file="hub/poller.py",
+                line=42,
+                recommendation="Serialize the retry path",
+                scope=FindingScope.out_of_scope,
+                linked_task_id=linked_task_id,
+            ),
+        ],
+    )
+
+
+async def test_out_of_scope_auto_draft_flag_off_creates_nothing(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Flag off")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=False)
+    )
+
+    assert await _count_tasks(db) == before
+    assert view.latest_review.findings[1].linked_task_id is None
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "Auto-created" not in review_update.content
+    assert "Warning: out-of-scope finding(s) 2" in review_update.content
+
+
+async def test_out_of_scope_auto_draft_creates_draft_and_links(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Auto draft")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    assert await _count_tasks(db) == before + 1
+    linked_id = view.latest_review.findings[1].linked_task_id
+    assert linked_id is not None
+    assert view.latest_review.findings[0].linked_task_id is None
+
+    draft = dict(await repo.get_task(db, linked_id))
+    assert draft["status"] == "draft"
+    assert draft["task_type"] == "task"
+    assert draft["source"] == "agent"
+    assert draft["parent_id"] is None  # reviewed task has no feature parent
+    assert draft["title"] == "Review follow-up: Race in the poller retry loop"
+    marker = services.out_of_scope_draft_marker(task_id, 2)
+    assert marker in draft["description"]
+    assert f"from review of task #{task_id} (submission #1)" in draft["description"]
+    assert "Severity: medium" in draft["description"]
+    assert "Location: hub/poller.py:42" in draft["description"]
+    assert "Recommendation: Serialize the retry path" in draft["description"]
+
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert f"Auto-created draft task(s) for out-of-scope findings: #{linked_id}" in (
+        review_update.content
+    )
+    assert "Warning:" not in review_update.content
+
+
+async def test_out_of_scope_auto_draft_inherits_feature_parent(
+    db: aiosqlite.Connection,
+):
+    epic = await services.create_task(
+        db, TaskCreate(title="Parent epic", task_type=TaskType.epic)
+    )
+    feature = await services.create_task(
+        db,
+        TaskCreate(
+            title="Parent feature",
+            task_type=TaskType.feature,
+            parent_id=epic.id,
+        ),
+    )
+    tv = await services.create_task(
+        db, TaskCreate(title="Child under feature", parent_id=feature.id)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: do the work")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev-agent")
+    await services.submit_for_review(db, tv.id)
+
+    view = await services.record_review_verdict(
+        db, tv.id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    linked_id = view.latest_review.findings[1].linked_task_id
+    draft = dict(await repo.get_task(db, linked_id))
+    assert draft["parent_id"] == feature.id
+    assert draft["status"] == "draft"
+
+
+async def test_out_of_scope_auto_draft_skips_already_linked_findings(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Already linked")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True, linked_task_id=424)
+    )
+
+    assert await _count_tasks(db) == before
+    assert view.latest_review.findings[1].linked_task_id == 424
+
+
+async def test_out_of_scope_auto_draft_resubmit_does_not_duplicate(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Idempotent resubmit")
+    await services.submit_for_review(db, task_id)
+
+    first = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+    linked_id = first.latest_review.findings[1].linked_task_id
+    assert linked_id is not None
+    after_first = await _count_tasks(db)
+
+    # Developer fixes finding 1 and resubmits; the reviewer sends the same
+    # out-of-scope finding again WITHOUT a link — the existing draft must
+    # be reused, not duplicated.
+    await services.submit_for_review(db, task_id)
+    second = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    assert await _count_tasks(db) == after_first
+    assert second.latest_review.findings[1].linked_task_id == linked_id
+
+
 # ---- Universal Review Gate (#306): completion enforcement ----
 
 

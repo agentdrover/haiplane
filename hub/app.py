@@ -962,6 +962,10 @@ async def api_review_verdict(
     findings. ``changes_requested`` with findings requires at least one
     in_scope finding (422 otherwise); out-of-scope findings without a
     linked task produce a non-blocking warning in the review update.
+
+    Auto-drafts (#436): ``create_tasks_for_out_of_scope=true`` creates a
+    DRAFT follow-up task for each unlinked out-of-scope finding and stamps
+    its id into the stored finding; idempotent on resubmit.
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
