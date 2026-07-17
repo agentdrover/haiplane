@@ -33,6 +33,28 @@ def _repo_root() -> str:
     return str(p)
 
 
+async def _default_workspace_error() -> str | None:
+    """Readable reason when the default-project workspace is unusable (#378).
+
+    Returns None when WORKSPACE_REPO_LINK is a git repository. Callers that
+    operate with repo=None consult this instead of failing later with a
+    bare 'not a git repository' from the git binary. Probed through _git so
+    the check sees exactly what subsequent commands will see.
+    """
+    root = _repo_root()
+    try:
+        rc, _, _ = await _git("rev-parse", "--git-dir", repo=root, check=False)
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        rc = 1
+    if rc == 0:
+        return None
+    return (
+        f"default workspace is not a git repository ({root}); "
+        "set OPENCLAW_WORKSPACE_REPO to a git clone or use a project "
+        "with workspace_path"
+    )
+
+
 def _slugify(title: str, max_len: int = 40) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
     return slug[:max_len].rstrip("-")
@@ -206,6 +228,11 @@ class GitOpsIntegration:
         repo: str | None = None,
         base_branch: str | None = None,
     ) -> str:
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                log.error("create_branch: %s", reason)
+                return ""
         repo = repo or _repo_root()
         # Project git context (#337): headless branches historically cut
         # from main; a project may define its own integration branch.
@@ -247,6 +274,10 @@ class GitOpsIntegration:
         """Safe branch setup for pair mode: never git-clean a dirty worktree."""
         from hub import config
 
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                raise PairBranchConflictError(reason)  # readable 422 (#378)
         repo = repo or _repo_root()
         base = base_branch or config.PAIR_BASE_BRANCH
 
