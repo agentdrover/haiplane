@@ -2088,3 +2088,19 @@ async def test_hub_wait_events_empty(mock_api_get: AsyncMock) -> None:
     assert structured["next_cursor"] == 42
     path = mock_api_get.await_args.args[0]
     assert "kinds=task_approved" in path
+
+
+async def test_hub_provision_project(mock_api_post: AsyncMock) -> None:
+    # #348: MCP wrapper over the human-gated provision endpoint.
+    from hub.mcp_server import hub_provision_project
+
+    mock_api_post.return_value = {
+        "provision_status": "ok",
+        "provision_detail": "cloned mrPDA/x (develop)",
+        "project": {"id": 7, "slug": "x", "provision_status": "ok"},
+    }
+    out = await hub_provision_project(7)
+    structured = _mcp_structured(out)
+    assert structured["provision_status"] == "ok"
+    assert structured["project"]["slug"] == "x"
+    mock_api_post.assert_awaited_once_with("/api/projects/7/provision")

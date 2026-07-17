@@ -1301,3 +1301,55 @@ async def test_web_edit_project_empty_required_fields_keep_values(
     assert row["default_branch"] == "trunk"
     assert row["repo"] == ""  # пустое необязательное — очищаем
     assert row["workspace_path"] == ""
+
+
+async def test_web_provision_button_and_status(client: AsyncClient, db):
+    # AC-1 (#348): Provision button for repo projects; status lands on page.
+    from unittest.mock import AsyncMock
+
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+    from hub.integrations.registry import plugins
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(
+        db,
+        slug="provui",
+        name="ProvUI",
+        repo_name="mrPDA/provui",
+        workspace_path="/srv/provui",
+    )
+    await db.commit()
+
+    page = await client.get("/projects")
+    assert f"/projects/{pid}/web-provision" in page.text  # кнопка есть
+    assert "ws" not in page.text or "ws ok" not in page.text
+
+    plugins.git_ops.clone_repo = AsyncMock(return_value=(True, "cloned"))
+    resp = await client.post(f"/projects/{pid}/web-provision", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/projects"
+    page = await client.get("/projects")
+    assert "ws&nbsp;ok" in page.text
+
+    plugins.git_ops.clone_repo = AsyncMock(
+        return_value=(False, "remote not accessible: no key")
+    )
+    resp = await client.post(f"/projects/{pid}/web-provision", follow_redirects=False)
+    assert resp.status_code == 303
+    assert "project_error=" in resp.headers["location"]
+    page = await client.get(resp.headers["location"])
+    assert "remote not accessible" in page.text
+    page = await client.get("/projects")
+    assert "ws&nbsp;error" in page.text
+
+
+async def test_web_provision_hidden_without_repo(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(db, slug="norepo-ui", name="NoRepo")
+    await db.commit()
+    page = await client.get("/projects")
+    assert f"/projects/{pid}/web-provision" not in page.text
