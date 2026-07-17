@@ -801,9 +801,10 @@ async def api_task_context(
     if task_view.latest_review:
         lr = task_view.latest_review
         freshness = "current" if lr.is_current else "stale — work resubmitted"
+        solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
         lines.append(
             f"Latest review: {lr.verdict.value.upper()} "
-            f"for submission #{lr.submission_generation} ({freshness})"
+            f"for submission #{lr.submission_generation} ({freshness}){solo}"
         )
         for finding in lr.findings[:10]:
             scope_mark = ""
@@ -965,14 +966,17 @@ async def api_review_verdict(
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
+    self_approved = False
     if row is not None:
-        services.ensure_reviewer_independence(
+        self_approved = services.ensure_reviewer_independence(
             dict(row),
             is_agent=identity.is_agent,
             principal_id=identity.principal_id,
             username=identity.username,
         )
-    return await services.record_review_verdict(db, task_id, body)
+    return await services.record_review_verdict(
+        db, task_id, body, self_approved=self_approved
+    )
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)

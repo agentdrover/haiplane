@@ -77,7 +77,7 @@ All configuration via environment variables:
 | `OPENCLAW_VAST_JOB_BIN` | `~/.local/bin/vast-openclaw` | Vast.ai CLI path |
 | `GH_BIN` | `gh` | GitHub CLI binary |
 | `OPENCLAW_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
-| `OPENCLAW_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode) |
+| `OPENCLAW_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
 | `OPENCLAW_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
 | `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
 | `OPENCLAW_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |

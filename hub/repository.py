@@ -733,6 +733,7 @@ async def record_review_verdict(
     task_id: int,
     verdict: str,
     findings_json: str = "[]",
+    self_approved: bool = False,
 ) -> None:
     """Persist a review verdict bound to the CURRENT submission generation.
 
@@ -741,13 +742,17 @@ async def record_review_verdict(
     before a concurrent resubmission bumped it. ``findings_json`` replaces
     the stored findings wholesale: findings belong to their verdict, so a
     verdict without findings clears the previous list (#308).
+    ``self_approved`` marks verdicts accepted only via the
+    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
+    to the verdict, so every new verdict overwrites the flag.
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
+        "review_self_approved=?, "
         "updated_at=datetime('now') WHERE id=?",
-        (verdict, findings_json, task_id),
+        (verdict, findings_json, 1 if self_approved else 0, task_id),
     )
 
 

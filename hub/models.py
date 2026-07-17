@@ -375,11 +375,15 @@ class LatestReview(BaseModel):
 
     ``is_current`` is False when work was resubmitted after the verdict was
     recorded — the verdict is history, not a judgement of the latest work.
+    ``self_approved`` is True when the verdict was accepted only because of
+    the ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
+    reviewed their own work, so the verdict is not independent (#434).
     """
 
     verdict: ReviewVerdict
     submission_generation: int = 0
     is_current: bool = False
+    self_approved: bool = False
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 

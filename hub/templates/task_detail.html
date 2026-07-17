@@ -431,6 +431,9 @@
                     Last verdict: {{ task.latest_review.verdict.value|upper }}
                     for submission #{{ task.latest_review.submission_generation }}
                     ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
+                    {% if task.latest_review.self_approved %}
+                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via OPENCLAW_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
+                    {% endif %}
                     {% if task.latest_review.findings %}
                     <ul class="task-review-findings">
                         {% for f in task.latest_review.findings %}

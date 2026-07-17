@@ -1195,7 +1195,7 @@ async def web_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
-    services.ensure_reviewer_independence(
+    self_approved = services.ensure_reviewer_independence(
         dict(row),
         is_agent=identity.is_agent,
         principal_id=identity.principal_id,
@@ -1218,7 +1218,7 @@ async def web_review_verdict(
         return RedirectResponse(
             f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
         )
-    await services.record_review_verdict(db, task_id, body)
+    await services.record_review_verdict(db, task_id, body, self_approved=self_approved)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

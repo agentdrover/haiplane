@@ -249,6 +249,31 @@ OPENCLAW_HUB_TOKEN=your-reviewer-token   # identity: cursor-reviewer
 Роли: `agents/python-senior-developer.md` (исполнитель) и
 `agents/code-reviewer.md` (ревьюер).
 
+### Соло-режим: `OPENCLAW_REVIEW_SELF_APPROVE`
+
+Universal Review Gate требует независимого ревьюера: агент, который
+реализовал задачу (`assigned_agent`/`claimed_by`/principal), не может сам
+принять вердикт. `OPENCLAW_REVIEW_SELF_APPROVE=allow` — осознанное
+ослабление гейта для соло-работы. Допустимо: локальная разработка в
+одиночку (один человек + один агент, второго агента-ревьюера нет),
+прототипы, личные стенды. Недопустимо: общий/продакшн-инстанс с
+несколькими агентами и задачи с высоким риском — там держи дефолт
+`forbid`.
+
+Риск: вердикт перестаёт быть независимым — слепые зоны исполнителя
+проходят ревью без второй пары глаз. Поэтому ослабленный гейт всегда
+аудируется (#434):
+
+- вердикт помечается `latest_review.self_approved=true` (REST/MCP);
+- в task update дописывается `[self-approved: solo mode, ...]`;
+- сервер пишет WARNING в лог;
+- Web показывает бейдж `self-approved` рядом с вердиктом;
+- `hub_task_status` и review brief выводят
+  `[SELF-APPROVED: solo mode, not independent]`.
+
+Семантика флага не меняется: `allow` по-прежнему пропускает вердикт —
+он просто больше не выглядит как независимый.
+
 ---
 
 ## 8. `hub_report_done`: реальный статус, не желаемый

@@ -812,6 +812,77 @@ async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient)
     assert body["review_verdict"] is None
 
 
+async def test_web_solo_verdict_marked_and_badge_rendered(
+    client: AsyncClient, monkeypatch
+):
+    """#434: a verdict accepted via OPENCLAW_REVIEW_SELF_APPROVE=allow is
+    persisted as self-approved and badged next to the verdict in the panel."""
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post("/api/tasks", json={"title": "Solo web"}, headers=agent)
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "bot", "kind": "status", "content": "Plan: work"},
+        headers=agent,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+
+    # The implementer reviews their own work through the web panel.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "changes_requested", "comments": "self check"},
+        headers=agent,
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}", headers=agent)).json()
+    assert body["latest_review"]["self_approved"] is True
+
+    # Back in review, the panel badges the solo verdict.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+    page = await client.get(f"/tasks/{task_id}", headers=agent)
+    assert page.status_code == 200
+    assert "badge-self-approved" in page.text
+
+
+async def test_web_independent_verdict_has_no_solo_badge(client: AsyncClient):
+    """#434: without the opt-out nothing changes — no badge, no mark."""
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "changes_requested", "comments": "rework"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["latest_review"]["self_approved"] is False
+
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.json()["status"] == "review"
+    page = await client.get(f"/tasks/{task_id}")
+    assert "badge-self-approved" not in page.text
+
+
 # ---- Draft queue ranking (#253) ----
 
 
