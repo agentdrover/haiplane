@@ -1655,6 +1655,75 @@ async def reorder_task(
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+_TERMINAL_DISPATCH_JOB_STATUSES = frozenset({"completed", "failed"})
+
+
+def _dispatch_job_blocks_force_complete(
+    job_id: str,
+    job: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Return (blocks, dispatch_status_or_missing)."""
+    if job is None:
+        return False, "missing"
+    job_status = (job.get("status") or "").strip() or "unknown"
+    if job_status in _TERMINAL_DISPATCH_JOB_STATUSES:
+        return False, job_status
+    return True, job_status
+
+
+def _force_complete_job_overlay_note(
+    field: str,
+    job_id: str,
+    dispatch_status: str | None,
+) -> str:
+    if dispatch_status == "missing":
+        return f"Closed over {field}={job_id!r} (dispatch job missing from registry)."
+    return (
+        f"Closed over {field}={job_id!r} "
+        f"(dispatch job terminal status={dispatch_status!r})."
+    )
+
+
+def _build_force_complete_comment(
+    base_comment: str,
+    *,
+    from_status: str,
+    job_id: str | None,
+    review_job_id: str | None,
+    overlay_notes: list[str],
+) -> str:
+    audit_bits = [f"from_status={from_status}"]
+    if job_id:
+        audit_bits.append(f"job_id={job_id}")
+    if review_job_id:
+        audit_bits.append(f"review_job_id={review_job_id}")
+    parts = [base_comment, "[force-complete audit] " + ", ".join(audit_bits)]
+    parts.extend(overlay_notes)
+    return "\n".join(parts)
+
+
+async def _has_incomplete_descendants(
+    db: aiosqlite.Connection,
+    root_id: int,
+) -> bool:
+    rows = await db.execute_fetchall(
+        """
+        WITH RECURSIVE sub(id) AS (
+            SELECT id FROM tasks WHERE parent_id = ?
+            UNION ALL
+            SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+        )
+        SELECT 1 FROM tasks t
+        JOIN sub ON t.id = sub.id
+        WHERE t.archived = 0
+          AND t.status NOT IN ('completed', 'failed', 'rejected')
+        LIMIT 1
+        """,
+        (root_id,),
+    )
+    return bool(rows)
+
+
 async def force_complete_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1662,11 +1731,11 @@ async def force_complete_task(
 ) -> TaskView:
     """Force-complete a stuck task without going through review.
 
-    Human override escape hatch for non-headless tasks that cannot otherwise
-    reach a terminal state: ``pending_report`` (agent never reported),
-    ``claimed`` (reserved but no pair-start), and pair ``running`` (no
-    headless ``job_id``). Headless ``running`` tasks (with a ``job_id``) are
-    excluded — the poller owns those.
+    Human-only audited override: allowed from any non-terminal ``task`` or
+    ``subtask`` when no *active* dispatch job backs ``job_id`` or
+    ``review_job_id``. Missing or terminal dispatch jobs are permitted and
+    noted in the audit trail. ``epic``/``feature`` rows are rejected when
+    they still have incomplete descendants.
 
     The optional ``body.comment`` is recorded as the audit-trail message; if
     omitted, a default human-override message is used.
@@ -1676,25 +1745,59 @@ async def force_complete_task(
         raise HTTPException(404, "task not found")
     task = dict(row)
     status = task["status"]
-    is_pair_running = status == "running" and not task.get("job_id")
-    if status not in ("pending_report", "claimed") and not is_pair_running:
+    final_values = {s.value for s in FINAL_STATUSES}
+    if status in final_values:
         raise HTTPException(
             400,
-            "can only force-complete pending_report, claimed, or pair-running "
-            f"tasks, current: {status}",
+            f"cannot force-complete terminal task, current status: {status}",
         )
-    comment = (body.comment.strip() if body else "") or (
+
+    task_type = task.get("task_type") or "task"
+    if task_type in ("epic", "feature"):
+        if await _has_incomplete_descendants(db, task_id):
+            raise HTTPException(
+                400,
+                f"cannot force-complete {task_type} with incomplete descendants",
+            )
+
+    overlay_notes: list[str] = []
+    for field, label in (("job_id", "job_id"), ("review_job_id", "review_job_id")):
+        job_ref = (task.get(field) or "").strip()
+        if not job_ref:
+            continue
+        job = plugins.dispatch.get_job(job_ref)
+        blocks, dispatch_status = _dispatch_job_blocks_force_complete(job_ref, job)
+        if blocks:
+            raise HTTPException(
+                409,
+                f"active dispatch {label} {job_ref!r} status={dispatch_status!r} "
+                "blocks force-complete",
+            )
+        overlay_notes.append(
+            _force_complete_job_overlay_note(label, job_ref, dispatch_status)
+        )
+
+    base_comment = (body.comment.strip() if body else "") or (
         "Force-completed by human without agent report."
     )
+    comment = _build_force_complete_comment(
+        base_comment,
+        from_status=status,
+        job_id=(task.get("job_id") or None),
+        review_job_id=(task.get("review_job_id") or None),
+        overlay_notes=overlay_notes,
+    )
+
+    update_fields: dict[str, Any] = {"status": "completed"}
+    if task.get("claimed_by") or task.get("claim_session_id") or task.get("claimed_at"):
+        update_fields["claimed_by"] = None
+        update_fields["claim_session_id"] = None
+        update_fields["claimed_at"] = None
+
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with get_write_lock(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
-        if status == "claimed":
-            await repo.update_task(
-                db, task_id, status="completed", claimed_by=None, claim_session_id=None
-            )
-        else:
-            await repo.update_task(db, task_id, status="completed")
+        await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
     row = await repo.get_task(db, task_id)
