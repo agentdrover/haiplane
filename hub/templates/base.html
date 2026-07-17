@@ -34,6 +34,9 @@
             <a href="/skills" class="{% if active == 'skills' %}active{% endif %}">
                 <span class="nav-icon">&#9998;</span> Skills
             </a>
+            <a href="/metrics" class="{% if active == 'metrics' %}active{% endif %}">
+                <span class="nav-icon">&#9632;</span> Metrics
+            </a>
             {% if request.state.identity and request.state.identity.is_admin %}
             <hr class="nav-divider">
             <a href="/admin" class="{% if active == 'admin' %}active{% endif %}">

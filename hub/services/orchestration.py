@@ -100,6 +100,92 @@ async def machine_review_gap(
     return None
 
 
+async def practice_metrics(
+    db: aiosqlite.Connection, *, since_days: int = 90
+) -> dict[str, Any]:
+    """Practice economics (#384): machine-review costs, filtration rate,
+    harness-version comparison, recurring finding categories, cycle times.
+
+    Aggregated on the fly from machine_reviews and task timestamps —
+    ``updated_at`` of a completed task is the completion proxy (the
+    dedicated completed_at column was never populated). Token/duration
+    fields are optional in reports, so aggregates carry ``reports_without_tokens``
+    instead of pretending coverage is full.
+    """
+    import statistics
+
+    since = f"-{since_days} days"
+
+    totals_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS reviews, "
+        "COALESCE(SUM(raw_count), 0) AS raw_total, "
+        "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
+        "COALESCE(SUM(json_array_length(findings_rejected)), 0) AS rejected_total, "
+        "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
+        "COALESCE(SUM(duration_ms), 0) AS duration_ms_total, "
+        "SUM(CASE WHEN tokens_spent IS NULL THEN 1 ELSE 0 END) AS reports_without_tokens "
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
+        (since,),
+    )
+    totals = dict(totals_rows[0])
+    confirmed = totals["confirmed_total"] or 0
+    raw = totals["raw_total"] or 0
+    totals["tokens_per_confirmed"] = (
+        round(totals["tokens_total"] / confirmed) if confirmed else None
+    )
+    totals["filtration_rate"] = round(1 - confirmed / raw, 3) if raw else None
+
+    harness_rows = await db.execute_fetchall(
+        "SELECT harness_skill, harness_version, COUNT(*) AS reviews, "
+        "COALESCE(SUM(raw_count), 0) AS raw_total, "
+        "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
+        "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        "GROUP BY harness_skill, harness_version "
+        "ORDER BY harness_skill, harness_version",
+        (since,),
+    )
+
+    category_rows = await db.execute_fetchall(
+        "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
+        "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
+        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
+        "WHERE mr.created_at >= datetime('now', ?) "
+        "GROUP BY category HAVING category != '' "
+        "ORDER BY findings DESC LIMIT 50",
+        (since,),
+    )
+    recurring = [dict(r) | {"recurring": r["tasks"] > 1} for r in category_rows]
+
+    cycle_rows = await db.execute_fetchall(
+        "SELECT work_type, "
+        "(julianday(updated_at) - julianday(ready_at)) * 24.0 AS hours "
+        "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
+        "AND updated_at >= datetime('now', ?)",
+        (since,),
+    )
+    by_type: dict[str, list[float]] = {}
+    for r in cycle_rows:
+        if r["hours"] is not None and r["hours"] >= 0:
+            by_type.setdefault(r["work_type"] or "feature", []).append(r["hours"])
+    cycle_times = [
+        {
+            "work_type": wt,
+            "tasks": len(hours),
+            "median_hours": round(statistics.median(hours), 2),
+        }
+        for wt, hours in sorted(by_type.items())
+    ]
+
+    return {
+        "since_days": since_days,
+        "machine_reviews": totals,
+        "by_harness": [dict(r) for r in harness_rows],
+        "recurring_categories": recurring,
+        "cycle_times": cycle_times,
+    }
+
+
 async def provision_project(
     db: aiosqlite.Connection, project_id: int, *, actor: str = ""
 ) -> dict[str, str]:
