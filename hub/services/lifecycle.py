@@ -22,6 +22,7 @@ from hub import repository as repo
 from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
+from hub.mcp_envelope import enrich_error_payload
 from hub.models import (
     ACTIVE_STATUSES,
     BatchApprove,
@@ -29,6 +30,7 @@ from hub.models import (
     BatchApproveSkipped,
     BulkChildTasksCreate,
     FINAL_STATUSES,
+    FindingScope,
     LatestReview,
     ReviewFinding,
     TaskAnswer,
@@ -1048,6 +1050,14 @@ async def record_review_verdict(
     client-driven review (status=review, no review_job_id) the task returns
     to ``running`` so the developer can fix findings or report done (#307);
     headless transitions remain with the poller. Never a completion path.
+
+    Finding scope (#435): a ``changes_requested`` verdict with findings must
+    include at least one ``in_scope`` finding — if everything is out of
+    scope there is nothing to fix in this task, so the verdict should be
+    ``approved`` with the out-of-scope findings kept as recommendations
+    (incident #392: the source task hung in review while every finding went
+    to parallel tasks). Out-of-scope findings without ``linked_task_id``
+    produce a non-blocking warning in the review update.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1059,6 +1069,28 @@ async def record_review_verdict(
             400,
             "no submission to review yet: the task has never been submitted for review",
         )
+
+    if body.verdict.value == "changes_requested" and body.findings:
+        if all(f.scope == FindingScope.out_of_scope for f in body.findings):
+            raise HTTPException(
+                422,
+                detail=enrich_error_payload(
+                    {
+                        "reason": "changes_requested_requires_in_scope_finding",
+                        "message": (
+                            "changes_requested requires at least one in_scope "
+                            "finding; all findings are out_of_scope"
+                        ),
+                        "hint": (
+                            "If nothing needs fixing in this task, submit "
+                            "verdict=approved and keep out-of-scope findings "
+                            "as recommendations (linked to follow-up tasks "
+                            "via linked_task_id)."
+                        ),
+                        "suggested_tool": "hub_submit_review",
+                    }
+                ),
+            )
 
     # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require,
     # and only for APPROVED — the reviewer must always be able to reject work
@@ -1093,9 +1125,29 @@ async def record_review_verdict(
                     if f.file and f.line
                     else (f" ({f.file})" if f.file else "")
                 )
-                content += f"\n{f.id}. [{f.severity.value}]{place} {f.message}"
+                scope_mark = ""
+                if f.scope == FindingScope.out_of_scope:
+                    scope_mark = (
+                        f" [out-of-scope → #{f.linked_task_id}]"
+                        if f.linked_task_id
+                        else " [out-of-scope]"
+                    )
+                content += (
+                    f"\n{f.id}. [{f.severity.value}]{place}{scope_mark} {f.message}"
+                )
             if len(body.findings) > 20:
                 content += f"\n… and {len(body.findings) - 20} more findings"
+            unlinked = [
+                f.id
+                for f in body.findings
+                if f.scope == FindingScope.out_of_scope and not f.linked_task_id
+            ]
+            if unlinked:
+                ids = ", ".join(str(i) for i in unlinked)
+                content += (
+                    f"\nWarning: out-of-scope finding(s) {ids} have no "
+                    "linked_task_id — create follow-up task(s) and link them."
+                )
         if body.comments.strip():
             content += f"\n{body.comments.strip()}"
         await repo.add_task_update(db, task_id, agent, "review", content)

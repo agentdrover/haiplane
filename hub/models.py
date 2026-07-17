@@ -61,6 +61,18 @@ class ReviewSeverity(str, Enum):
     low = "low"
 
 
+class FindingScope(str, Enum):
+    """Whether a review finding belongs to the reviewed task (#435).
+
+    ``in_scope`` findings must be fixed in the same task via the
+    CHANGES_REQUESTED loop; ``out_of_scope`` findings are moved to separate
+    tasks (referenced by ``linked_task_id``) and never block the verdict.
+    """
+
+    in_scope = "in_scope"
+    out_of_scope = "out_of_scope"
+
+
 class TaskType(str, Enum):
     epic = "epic"
     feature = "feature"
@@ -328,6 +340,10 @@ class ReviewFinding(BaseModel):
 
     ``id`` is stable within a single review submission so a developer agent
     can address findings by number in the CHANGES_REQUESTED loop.
+
+    ``scope``/``linked_task_id`` (#435): ``in_scope`` findings are fixed in
+    the same task via resubmit; ``out_of_scope`` findings are moved to
+    separate tasks and reference the created task via ``linked_task_id``.
     """
 
     id: int = Field(..., ge=1)
@@ -336,6 +352,8 @@ class ReviewFinding(BaseModel):
     file: str = Field("", max_length=500)
     line: int | None = Field(default=None, ge=1)
     recommendation: str = Field("", max_length=2000)
+    scope: FindingScope = FindingScope.in_scope
+    linked_task_id: int | None = Field(default=None, ge=1)
 
 
 class TaskReviewVerdict(BaseModel):

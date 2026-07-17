@@ -11,6 +11,9 @@ from hub import services
 from hub.models import (
     BulkChildTaskItem,
     BulkChildTasksCreate,
+    FindingScope,
+    ReviewFinding,
+    ReviewSeverity,
     ReviewVerdict,
     TaskAnswer,
     TaskApprove,
@@ -2314,6 +2317,145 @@ def test_review_finding_model_rejects_invalid_payloads():
         ReviewFinding(id=1, severity="catastrophic", message="bad severity")
     with pytest.raises(ValidationError):
         ReviewFinding(id=1, severity="low", message="")
+
+
+def test_review_finding_scope_defaults_and_validation():
+    from pydantic import ValidationError
+
+    finding = ReviewFinding(id=1, severity="low", message="legacy payload")
+    assert finding.scope == FindingScope.in_scope
+    assert finding.linked_task_id is None
+
+    linked = ReviewFinding(
+        id=2,
+        severity="medium",
+        message="belongs elsewhere",
+        scope="out_of_scope",
+        linked_task_id=436,
+    )
+    assert linked.scope == FindingScope.out_of_scope
+    assert linked.linked_task_id == 436
+
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="low", message="bad scope", scope="elsewhere")
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="low", message="bad link", linked_task_id=0)
+
+
+def test_parse_review_findings_legacy_json_defaults_to_in_scope():
+    # Rows persisted before #435 have no scope key: they must parse as
+    # in_scope so old verdicts keep their meaning.
+    legacy = '[{"id": 1, "severity": "high", "message": "old finding"}]'
+    findings = services.parse_review_findings(legacy)
+    assert findings[0].scope == FindingScope.in_scope
+    assert findings[0].linked_task_id is None
+
+
+async def test_changes_requested_all_out_of_scope_findings_rejected(
+    db: aiosqlite.Connection,
+):
+    # #435 (incident #392): if every finding is out of scope there is
+    # nothing to fix in this task — the verdict must be approved instead.
+    task_id = await _pair_running_task(db, title="All out of scope")
+    await services.submit_for_review(db, task_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(
+                verdict=ReviewVerdict.changes_requested,
+                agent="reviewer",
+                findings=[
+                    ReviewFinding(
+                        id=1,
+                        severity=ReviewSeverity.high,
+                        message="Refactor another module",
+                        scope=FindingScope.out_of_scope,
+                        linked_task_id=436,
+                    ),
+                ],
+            ),
+        )
+    assert exc_info.value.status_code == 422
+    detail = exc_info.value.detail
+    assert detail["reason"] == "changes_requested_requires_in_scope_finding"
+    assert "approved" in detail["hint"]
+
+    # The rejected verdict must not have been recorded.
+    task = dict(await repo.get_task(db, task_id))
+    assert task["review_verdict"] is None
+    assert task["status"] == "review"
+
+
+async def test_out_of_scope_finding_without_link_warns_not_blocks(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Unlinked out of scope")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[
+                ReviewFinding(
+                    id=1, severity=ReviewSeverity.high, message="Fix the race"
+                ),
+                ReviewFinding(
+                    id=2,
+                    severity=ReviewSeverity.low,
+                    message="Cleanup elsewhere",
+                    scope=FindingScope.out_of_scope,
+                ),
+            ],
+        ),
+    )
+    # Non-blocking: the verdict is recorded, task returns to running.
+    assert view.status.value == "running"
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "Warning: out-of-scope finding(s) 2 have no linked_task_id" in (
+        review_update.content
+    )
+    assert "[out-of-scope]" in review_update.content
+
+
+async def test_finding_scope_and_linked_task_persist_roundtrip(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Scope roundtrip")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[
+                ReviewFinding(
+                    id=1, severity=ReviewSeverity.high, message="In-task bug"
+                ),
+                ReviewFinding(
+                    id=2,
+                    severity=ReviewSeverity.medium,
+                    message="Follow-up work",
+                    scope=FindingScope.out_of_scope,
+                    linked_task_id=436,
+                ),
+            ],
+        ),
+    )
+    findings = view.latest_review.findings
+    assert findings[0].scope == FindingScope.in_scope
+    assert findings[0].linked_task_id is None
+    assert findings[1].scope == FindingScope.out_of_scope
+    assert findings[1].linked_task_id == 436
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "[out-of-scope → #436]" in review_update.content
+    assert "Warning:" not in review_update.content
 
 
 # ---- Universal Review Gate (#306): completion enforcement ----

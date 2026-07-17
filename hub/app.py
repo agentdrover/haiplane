@@ -40,6 +40,7 @@ from hub.models import (
     ReadinessTreeReport,
     BatchApprove,
     BatchApproveResult,
+    FindingScope,
     ReviewBrief,
     TaskAnswer,
     TaskReviewVerdict,
@@ -805,8 +806,16 @@ async def api_task_context(
             f"for submission #{lr.submission_generation} ({freshness})"
         )
         for finding in lr.findings[:10]:
+            scope_mark = ""
+            if finding.scope == FindingScope.out_of_scope:
+                scope_mark = (
+                    f" [out-of-scope → #{finding.linked_task_id}]"
+                    if finding.linked_task_id
+                    else " [out-of-scope]"
+                )
             lines.append(
-                f"  {finding.id}. [{finding.severity.value}] {finding.message}"
+                f"  {finding.id}. [{finding.severity.value}]{scope_mark} "
+                f"{finding.message}"
             )
     lines.append(
         f"Readiness: score={readiness_summary['score']} "
@@ -946,6 +955,13 @@ async def api_review_verdict(
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
     ``running``; this endpoint never completes a task.
+
+    Finding scope (#435): each finding carries ``scope``
+    (in_scope|out_of_scope, default in_scope) and an optional
+    ``linked_task_id`` referencing the follow-up task for out-of-scope
+    findings. ``changes_requested`` with findings requires at least one
+    in_scope finding (422 otherwise); out-of-scope findings without a
+    linked task produce a non-blocking warning in the review update.
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
