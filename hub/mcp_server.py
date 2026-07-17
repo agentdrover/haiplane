@@ -1011,6 +1011,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     checklist, branch/PR metadata with an advisory diff command, the latest
     submission summary, and the latest recorded verdict with findings.
 
+    Fail-fast self-review check (#433): if YOU implemented this task, the
+    response starts with a self_review_warning — stop and hand the review
+    to an independent reviewer instead of running it (hub_submit_review
+    would reject your verdict).
+
     Args:
         task_id: The task ID to review
     """
@@ -1018,11 +1023,22 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
-    parts = [
-        f"Review brief for task #{brief['task_id']}: {brief['title']}",
-        f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
-        f"| review cycle {brief.get('review_cycle', 0)}",
-    ]
+    parts = []
+    # #433: fail-fast self-review notice goes FIRST so the reviewer stops
+    # before spending review effort — hub_submit_review would reject anyway.
+    warning = brief.get("self_review_warning")
+    if warning:
+        parts.append(
+            f"WARNING [{warning.get('reason', 'self_review_forbidden')}]: "
+            f"{warning.get('message', '')}\n{warning.get('hint', '')}\n"
+        )
+    parts.extend(
+        [
+            f"Review brief for task #{brief['task_id']}: {brief['title']}",
+            f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
+            f"| review cycle {brief.get('review_cycle', 0)}",
+        ]
+    )
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []

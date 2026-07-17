@@ -383,6 +383,21 @@ class LatestReview(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 
+class SelfReviewWarning(BaseModel):
+    """Fail-fast self-review notice on the review brief (#433).
+
+    Emitted when the caller requesting the brief is the agent that
+    implemented the task, BEFORE any review effort is spent. Advisory, not
+    a hard-fail: the implementer may still read the brief for self-checking,
+    but hub_submit_review will reject the verdict (unless solo mode).
+    """
+
+    reason: str
+    message: str
+    hint: str
+    required_role: str | None = None
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -415,6 +430,8 @@ class ReviewBrief(BaseModel):
     # #381: latest machine-review report; forward ref — MachineReviewView is
     # declared later in this module, rebuilt below.
     machine_review: "MachineReviewView | None" = None
+    # #433: fail-fast notice when the caller implemented this task.
+    self_review_warning: SelfReviewWarning | None = None
 
 
 class TaskClaim(BaseModel):

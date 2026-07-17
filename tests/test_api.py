@@ -1241,6 +1241,111 @@ async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkey
     assert resp.json()["review_approved_current"] is True
 
 
+# ---- Fail-fast self-review warning in the review brief (#433) ----
+
+
+async def test_review_brief_warns_implementer_of_self_review(
+    client: AsyncClient, monkeypatch
+):
+    # AC-1: the implementer gets a structured warning BEFORE running the
+    # review; independent reviewers and humans get a clean brief.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-token"}
+    reviewer = {"Authorization": "Bearer reviewer-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await _task_in_review(client, "Brief self-review warning", impl)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "self_review_forbidden"
+    assert "impl-bot" in warning["message"]
+    assert "independent" in warning["hint"]
+    assert warning["required_role"] == "independent_reviewer"
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=reviewer)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=human)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
+
+
+async def test_review_brief_solo_mode_note_for_implementer(
+    client: AsyncClient, monkeypatch
+):
+    # AC-2: with OPENCLAW_REVIEW_SELF_APPROVE=allow the warning turns into
+    # an informational solo-mode note instead.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    impl = {"Authorization": "Bearer impl-token"}
+
+    task_id = await _task_in_review(client, "Brief solo-mode note", impl)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "solo_mode_self_review"
+    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in warning["hint"]
+    assert warning["required_role"] is None
+
+
+async def test_review_brief_warns_implementer_by_principal_id(
+    client: AsyncClient, monkeypatch
+):
+    # AC-3: principal binding (#320) — the warning fires even when
+    # assigned_agent holds a different free-text name than the token
+    # username, matching ensure_reviewer_independence semantics.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Brief principal warning"}, headers=impl
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "someone", "kind": "status", "content": "Plan: work"},
+        headers=impl,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "claude-code"},
+        headers=impl,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=impl
+    )
+    assert resp.json()["status"] == "review"
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "self_review_forbidden"
+
+    other = {"Authorization": "Bearer other-pid-token"}
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=other)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
+
+
 # ---- Implementer principal binding (#320) ----
 
 
