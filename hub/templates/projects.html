@@ -47,8 +47,19 @@
                 {% if p.archived %}<span class="badge badge-failed">archived</span>
                 {% elif p.status == 'pending' %}<span class="badge badge-review">pending</span>
                 {% else %}<span class="badge badge-completed">active</span>{% endif %}
+                {% if p.provision_status == 'ok' %}
+                <span class="badge badge-completed" title="{{ p.provision_detail }}">ws&nbsp;ok</span>
+                {% elif p.provision_status == 'error' %}
+                <span class="badge badge-failed" title="{{ p.provision_detail }}">ws&nbsp;error</span>
+                {% endif %}
             </td>
             <td>
+                {% if p.repo and not p.archived %}
+                <form method="post" action="/projects/{{ p.id }}/web-provision" class="project-inline-form">
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Клонировать/проверить workspace проекта {{ p.slug }}?')">Provision</button>
+                </form>
+                {% endif %}
                 {% if p.status == 'pending' and not p.archived %}
                 <form method="post" action="/projects/{{ p.id }}/web-activate" class="project-inline-form">
                     <button class="btn btn-success" type="submit"

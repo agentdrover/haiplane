@@ -664,6 +664,22 @@ async def web_activate_project(project_id: int, request: Request):
     return RedirectResponse("/projects", status_code=303)
 
 
+@router.post("/projects/{project_id}/web-provision")
+async def web_provision_project(project_id: int, request: Request):
+    """Provision button (#348): same human gate and service as the API.
+
+    An error outcome is shown next to the form; the status badge on the
+    page reflects provision_status either way."""
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    if await repo.get_project(db, project_id) is None:
+        return _projects_error_redirect("project not found")
+    result = await services.provision_project(db, project_id, actor=identity.username)
+    if result["provision_status"] != "ok":
+        return _projects_error_redirect(f"Provision: {result['provision_detail']}")
+    return RedirectResponse("/projects", status_code=303)
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 async def web_tasks(
     request: Request,
