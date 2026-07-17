@@ -62,6 +62,7 @@ from hub.models import (
 from hub.integrations.git_ops import PairBranchConflictError
 from hub.services.orchestration import (
     completion_requires_review,
+    detect_branch_stacking,
     dispatch_task,
     prepare_pair_branch,
     review_approved_for_current_submission,
@@ -1092,6 +1093,15 @@ async def submit_for_review(
             detail=mutation_activity_detail(),
         )
 
+    # Advisory branch-stacking detection (#438): warn — never block — when
+    # this branch carries commits of another unmerged task branch. A stack
+    # can be a deliberate decision, so the finding is an alert update plus
+    # a response hint, not a failed submission.
+    stacking = await detect_branch_stacking(db, task_id, task.get("branch") or "")
+    if stacking:
+        await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
+        await db.commit()
+
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
@@ -1105,6 +1115,12 @@ async def submit_for_review(
         view.lifecycle_hint = (
             f"Machine-review требуется ({gap}): hub_get_skill('multi-agent-review') "
             "→ прогон → hub_submit_machine_review — до человеческого вердикта."
+        )
+    if stacking:
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{stacking['message']}"
+            if view.lifecycle_hint
+            else stacking["message"]
         )
     return view
 

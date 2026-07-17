@@ -436,6 +436,9 @@ class ReviewBrief(BaseModel):
     machine_review: "MachineReviewView | None" = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
+    # #438: advisory — non-empty when the branch carries commits of another
+    # unmerged task branch (stacked branches). Never blocks the review.
+    stacking_warning: str = ""
 
 
 class TaskClaim(BaseModel):
