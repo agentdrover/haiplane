@@ -53,6 +53,8 @@ from hub.models import (
     ProjectCreate,
     ProjectPatch,
     ProjectView,
+    SkillCreate,
+    SkillView,
     TaskDecide,
     TaskForceComplete,
     TaskQuestion,
@@ -373,6 +375,92 @@ async def api_list_events(
         "events": events,
         "next_cursor": events[-1]["id"] if events else since,
     }
+
+
+@app.get("/api/skills", response_model=list[SkillView])
+async def api_list_skills(request: Request):
+    """Skills library (#380): latest version per name."""
+    rows = await repo.list_skills(_db(request))
+    return [SkillView(**dict(r)) for r in rows]
+
+
+@app.get("/api/skills/{name}", response_model=SkillView)
+async def api_get_skill(name: str, request: Request):
+    """Active version of a skill — what agents should execute."""
+    row = await repo.get_active_skill(_db(request), name)
+    if row is None:
+        raise HTTPException(404, f"no active skill named {name!r}")
+    return SkillView(**dict(row))
+
+
+@app.post("/api/skills", response_model=SkillView)
+async def api_create_skill(
+    body: SkillCreate,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """New skill version (#380). Draft-gate mirrors projects (#345):
+    humans publish active versions, agents PROPOSE drafts."""
+    import json as _json
+
+    db = _db(request)
+    status_value = "draft" if identity.is_agent else "active"
+    skill_id, version = await repo.create_skill_version(
+        db,
+        name=body.name,
+        kind=body.kind,
+        content=body.content,
+        tags=_json.dumps(body.tags, ensure_ascii=False),
+        project_id=body.project_id,
+        status=status_value,
+        created_by=identity.username,
+    )
+    if status_value == "active":
+        await repo.insert_event(
+            db,
+            kind="skill_activated",
+            actor=identity.username,
+            payload={"name": body.name, "version": version},
+        )
+    await db.commit()
+    await db_module.log_activity(
+        db,
+        "skill_version_created",
+        f"Skill {body.name} v{version} created as {status_value} "
+        f"by {identity.username}",
+    )
+    row = await repo.get_skill_version(db, body.name, version)
+    return SkillView(**dict(row))
+
+
+@app.patch("/api/skills/{name}/versions/{version}/activate", response_model=SkillView)
+async def api_activate_skill(
+    name: str,
+    version: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Activate a proposed skill version (human gate, #380)."""
+    db = _db(request)
+    row = await repo.get_skill_version(db, name, version)
+    if row is None:
+        raise HTTPException(404, "skill version not found")
+    if row["status"] != "active":
+        await repo.activate_skill_version(db, name, version)
+        await repo.insert_event(
+            db,
+            kind="skill_activated",
+            actor=_identity.username,
+            payload={"name": name, "version": version},
+        )
+        await db.commit()
+        await db_module.log_activity(
+            db,
+            "skill_activated",
+            f"Skill {name} v{version} activated by {_identity.username}",
+        )
+    row = await repo.get_skill_version(db, name, version)
+    return SkillView(**dict(row))
 
 
 @app.post("/api/projects/{project_id}/provision")

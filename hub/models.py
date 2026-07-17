@@ -862,6 +862,45 @@ class ProjectPatch(BaseModel):
     status: str | None = Field(default=None, pattern="^(pending|active)$")
 
 
+class SkillCreate(BaseModel):
+    """New skill version (#380). Agents create drafts; humans activate."""
+
+    name: str = Field(..., min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    kind: str = Field("prompt", pattern="^(prompt|skill|checklist|workflow)$")
+    content: str = Field(..., min_length=1, max_length=100_000)
+    tags: list[str] = Field(default_factory=list)
+    project_id: int | None = None
+
+
+class SkillView(BaseModel):
+    id: int
+    name: str
+    kind: str
+    version: int
+    content: str = ""
+    tags: list[str] = Field(default_factory=list)
+    project_id: int | None = None
+    status: str
+    created_by: str = ""
+    created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _skill_iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _skill_tags_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v or "[]")
+                return parsed if isinstance(parsed, list) else []
+            except ValueError:
+                return []
+        return v
+
+
 class ProjectView(BaseModel):
     id: int
     slug: str

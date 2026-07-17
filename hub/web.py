@@ -680,6 +680,44 @@ async def web_provision_project(project_id: int, request: Request):
     return RedirectResponse("/projects", status_code=303)
 
 
+@router.get("/skills", response_class=HTMLResponse)
+async def web_skills(request: Request):
+    """Skills library (#380): latest version per name."""
+    from hub.models import SkillView
+
+    rows = await repo.list_skills(_db(request))
+    return TEMPLATES.TemplateResponse(
+        request,
+        "skills.html",
+        {"skills": [SkillView(**dict(r)) for r in rows]},
+    )
+
+
+@router.get("/skills/{name}", response_class=HTMLResponse)
+async def web_skill_detail(name: str, request: Request):
+    from hub.models import SkillView
+
+    rows = await repo.list_skill_versions(_db(request), name)
+    if not rows:
+        raise HTTPException(404, "skill not found")
+    return TEMPLATES.TemplateResponse(
+        request,
+        "skill_detail.html",
+        {"name": name, "versions": [SkillView(**dict(r)) for r in rows]},
+    )
+
+
+@router.post("/skills/{name}/versions/{version}/web-activate")
+async def web_activate_skill(name: str, version: int, request: Request):
+    """Activate a proposed skill version — same human gate as the API."""
+    from hub.app import api_activate_skill
+
+    await api_activate_skill(
+        name, version, request, _identity=require_human_or_admin(request)
+    )
+    return RedirectResponse(f"/skills/{name}", status_code=303)
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 async def web_tasks(
     request: Request,

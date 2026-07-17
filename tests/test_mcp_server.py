@@ -2104,3 +2104,36 @@ async def test_hub_provision_project(mock_api_post: AsyncMock) -> None:
     assert structured["provision_status"] == "ok"
     assert structured["project"]["slug"] == "x"
     mock_api_post.assert_awaited_once_with("/api/projects/7/provision")
+
+
+async def test_hub_get_skill_and_propose(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #380: fetch active skill; propose creates a draft version.
+    from hub.mcp_server import hub_get_skill, hub_propose_skill
+
+    mock_api_get.return_value = {
+        "name": "multi-agent-review",
+        "version": 1,
+        "kind": "prompt",
+        "status": "active",
+        "content": "harness text",
+        "tags": ["review"],
+    }
+    out = await hub_get_skill("multi-agent-review")
+    structured = _mcp_structured(out)
+    assert structured["skill"]["version"] == 1
+    mock_api_get.assert_awaited_once_with("/api/skills/multi-agent-review")
+
+    mock_api_post.return_value = {
+        "name": "multi-agent-review",
+        "version": 2,
+        "status": "draft",
+    }
+    out = await hub_propose_skill(
+        "multi-agent-review", "v2 text", tags="review,quality"
+    )
+    structured = _mcp_structured(out)
+    assert structured["skill"]["status"] == "draft"
+    body = mock_api_post.await_args.args[1]
+    assert body["tags"] == ["review", "quality"]

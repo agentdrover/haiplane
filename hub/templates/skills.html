@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% set active = "skills" %}
+{% block title %}Skills — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Skills Library</h1>
+</header>
+
+<table class="task-table">
+    <thead>
+        <tr><th>Name</th><th>Kind</th><th>Version</th><th>Status</th><th>Tags</th><th>Author</th></tr>
+    </thead>
+    <tbody>
+        {% for s in skills %}
+        <tr>
+            <td><a href="/skills/{{ s.name }}">{{ s.name }}</a></td>
+            <td>{{ s.kind }}</td>
+            <td>v{{ s.version }}</td>
+            <td>
+                {% if s.status == 'active' %}<span class="badge badge-completed">active</span>
+                {% else %}<span class="badge badge-review">draft</span>{% endif %}
+            </td>
+            <td>{{ s.tags | join(', ') }}</td>
+            <td>{{ s.created_by }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

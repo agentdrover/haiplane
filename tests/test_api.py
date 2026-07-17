@@ -1897,3 +1897,93 @@ async def test_create_project_without_workspace_skips_auto_provision(
     assert resp.status_code == 200
     row = await repo_module.get_project_by_slug(db, "no-auto")
     assert row["provision_status"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# Skills library (#380)
+# ---------------------------------------------------------------------------
+
+
+async def test_skills_seed_and_get(client: AsyncClient, db):
+    # AC-3: seed puts multi-agent-review v1 active.
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+    resp = await client.get("/api/skills/multi-agent-review")
+    assert resp.status_code == 200
+    skill = resp.json()
+    assert skill["version"] == 1
+    assert skill["status"] == "active"
+    assert "опровергатель" in skill["content"].lower() or "refuted" in skill["content"]
+
+    listing = await client.get("/api/skills")
+    assert any(s["name"] == "multi-agent-review" for s in listing.json())
+
+
+async def test_skill_agent_proposes_draft_human_activates(
+    client: AsyncClient, db, monkeypatch
+):
+    # AC-1/AC-2: agent POST → draft, active untouched; human activates.
+    from hub import config
+    from hub.config import TokenIdentity
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-tok": TokenIdentity("bot", "agent"),
+            "human-tok": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-tok"}
+    human = {"Authorization": "Bearer human-tok"}
+
+    resp = await client.post(
+        "/api/skills",
+        json={"name": "multi-agent-review", "content": "v2 harness", "kind": "prompt"},
+        headers=agent,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "draft"
+    assert resp.json()["version"] == 2
+
+    # active stays v1 until a human activates v2
+    resp = await client.get("/api/skills/multi-agent-review", headers=agent)
+    assert resp.json()["version"] == 1
+
+    resp = await client.patch(
+        "/api/skills/multi-agent-review/versions/2/activate", headers=agent
+    )
+    assert resp.status_code == 403  # human gate
+
+    resp = await client.patch(
+        "/api/skills/multi-agent-review/versions/2/activate", headers=human
+    )
+    assert resp.status_code == 200
+    resp = await client.get("/api/skills/multi-agent-review", headers=agent)
+    assert resp.json()["version"] == 2
+
+    # activation emitted a feed event (#349)
+    events = await client.get(
+        "/api/events?since=0&kinds=skill_activated", headers=human
+    )
+    assert any(e["payload"].get("version") == 2 for e in events.json()["events"])
+
+
+async def test_skill_human_creates_active(client: AsyncClient, db):
+    resp = await client.post(
+        "/api/skills",
+        json={
+            "name": "dor-checklist",
+            "content": "- AC?\n- risks?",
+            "kind": "checklist",
+            "tags": ["dor"],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "active"  # open mode = human path
+    got = await client.get("/api/skills/dor-checklist")
+    assert got.json()["tags"] == ["dor"]
