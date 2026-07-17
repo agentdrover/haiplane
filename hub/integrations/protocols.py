@@ -128,6 +128,9 @@ class GitOpsPlugin(Protocol):
         self, pr_number: int, task_id: int, title: str, repo: str | None = None
     ) -> bool: ...
     async def delete_branch(self, branch: str, repo: str | None = None) -> None: ...
+    async def clone_repo(
+        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+    ) -> tuple[bool, str]: ...
 
 
 @runtime_checkable
