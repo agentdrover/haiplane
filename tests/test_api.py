@@ -1792,3 +1792,108 @@ async def test_events_auth(client: AsyncClient, monkeypatch):
         "/api/events", headers={"Authorization": "Bearer events-token"}
     )
     assert resp2.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Workspace provisioning (#347)
+# ---------------------------------------------------------------------------
+
+
+async def _provision_project_row(db) -> int:
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo_module.create_project(
+        db,
+        slug="prov-api",
+        name="Prov API",
+        repo_name="mrPDA/prov-api",
+        workspace_path="/srv/prov-api",
+    )
+    await db.commit()
+    return pid
+
+
+async def test_provision_endpoint_human_gate(client: AsyncClient, db, monkeypatch):
+    # Human gate: agent tokens get 403, human tokens get an answer.
+    from hub import config
+    from hub.config import TokenIdentity
+
+    pid = await _provision_project_row(db)
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-tok": TokenIdentity("bot", "agent"),
+            "human-tok": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.post(
+        f"/api/projects/{pid}/provision",
+        headers={"Authorization": "Bearer agent-tok"},
+    )
+    assert resp.status_code == 403
+
+    resp = await client.post(
+        f"/api/projects/{pid}/provision",
+        headers={"Authorization": "Bearer human-tok"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Mock/noop git ops → readable error, never a 500.
+    assert data["provision_status"] == "error"
+    assert "git ops disabled" in data["provision_detail"]
+    assert data["project"]["provision_status"] == "error"
+
+
+async def test_provision_endpoint_success_with_mock(client: AsyncClient, db):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    pid = await _provision_project_row(db)
+    plugins.git_ops.clone_repo = AsyncMock(return_value=(True, "cloned"))
+    resp = await client.post(f"/api/projects/{pid}/provision")
+    assert resp.status_code == 200
+    assert resp.json()["provision_status"] == "ok"
+
+
+async def test_create_active_project_auto_provisions(client: AsyncClient, db):
+    # #347: creating an active project with repo+workspace kicks provisioning
+    # in the background; with noop git ops the outcome is a readable error.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/api/projects",
+        json={
+            "slug": "auto-prov",
+            "name": "Auto Prov",
+            "repo": "mrPDA/auto-prov",
+            "workspace_path": "/srv/auto-prov",
+        },
+    )
+    assert resp.status_code == 200
+    row = await repo_module.get_project_by_slug(db, "auto-prov")
+    assert row["provision_status"] == "error"  # background task ran (noop)
+    assert "git ops disabled" in row["provision_detail"]
+
+
+async def test_create_project_without_workspace_skips_auto_provision(
+    client: AsyncClient, db
+):
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/api/projects",
+        json={"slug": "no-auto", "name": "No Auto", "repo": "mrPDA/no-auto"},
+    )
+    assert resp.status_code == 200
+    row = await repo_module.get_project_by_slug(db, "no-auto")
+    assert row["provision_status"] == "none"

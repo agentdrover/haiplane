@@ -426,6 +426,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_events_created_at",
         "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
     ),
+    # ---- Workspace provisioning (#347): clone state lives on the project.
+    (
+        "add_projects_provision_status_column",
+        "ALTER TABLE projects ADD COLUMN provision_status TEXT NOT NULL DEFAULT 'none'",
+    ),
+    (
+        "add_projects_provision_detail_column",
+        "ALTER TABLE projects ADD COLUMN provision_detail TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

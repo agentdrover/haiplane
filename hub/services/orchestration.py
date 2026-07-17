@@ -42,6 +42,50 @@ async def project_git_context(
     return ctx
 
 
+async def provision_project(
+    db: aiosqlite.Connection, project_id: int, *, actor: str = ""
+) -> dict[str, str]:
+    """Clone/verify a project workspace and record the outcome (#347).
+
+    Never raises for git failures — the outcome lands in
+    ``provision_status``/``provision_detail`` so the operator can read
+    WHY instead of getting a 500. Missing repo/workspace are provision
+    errors too, not validation errors: the button must always answer.
+    """
+    row = await repo.get_project(db, project_id)
+    if row is None:
+        return {"provision_status": "error", "provision_detail": "project not found"}
+    project = dict(row)
+    if not (project.get("repo") or "").strip():
+        ok, detail = False, "project has no repo configured"
+    elif not (project.get("workspace_path") or "").strip():
+        ok, detail = False, "project has no workspace_path configured"
+    else:
+        ok, detail = await plugins.git_ops.clone_repo(
+            project["repo"].strip(),
+            project["workspace_path"].strip(),
+            (project.get("default_branch") or "develop").strip() or "develop",
+        )
+    status = "ok" if ok else "error"
+    await repo.update_project(
+        db, project_id, provision_status=status, provision_detail=detail[:1000]
+    )
+    await repo.insert_event(
+        db,
+        kind="project_provisioned",
+        project_id=project_id,
+        actor=actor or "hub",
+        payload={"status": status, "slug": project.get("slug", "")},
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "project_provisioned",
+        f"Project {project.get('slug', project_id)} provision: {status} — {detail[:200]}",
+    )
+    return {"provision_status": status, "provision_detail": detail}
+
+
 def _split_git_kwargs(ctx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """(local_git_kwargs, pr_kwargs) — local ops need repo/base, PR needs all."""
     local = {k: v for k, v in ctx.items() if k in ("repo", "base_branch")}
