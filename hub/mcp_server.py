@@ -1529,6 +1529,71 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_list_skills() -> CallToolResult:
+    """List the skills library (#380): latest version per name.
+
+    Skills are versioned prompts/checklists/workflows agents pull from
+    the hub instead of carrying them in session memory.
+    """
+    skills = await _api_get("/api/skills")
+    if not skills:
+        return structured_echo_result("No skills in the library.", skills=[])
+    lines = [
+        f"{s['name']} v{s['version']} [{s['kind']}, {s['status']}]"
+        + (f" tags={','.join(s.get('tags') or [])}" if s.get("tags") else "")
+        for s in skills
+    ]
+    return structured_echo_result("\n".join(lines), skills=skills)
+
+
+@mcp.tool()
+async def hub_get_skill(name: str) -> CallToolResult:
+    """Fetch the ACTIVE version of a skill — the content to execute.
+
+    Args:
+        name: Skill slug, e.g. "multi-agent-review".
+    """
+    try:
+        skill = await _api_get(f"/api/skills/{name}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return structured_echo_result(
+        f"{skill['name']} v{skill['version']} [{skill['kind']}]\n\n{skill['content']}",
+        skill=skill,
+    )
+
+
+@mcp.tool()
+async def hub_propose_skill(
+    name: str,
+    content: str,
+    kind: str = "prompt",
+    tags: str = "",
+) -> CallToolResult:
+    """Propose a new skill version (#380). Created as DRAFT — a human
+    activates it via the UI or PATCH; the active version stays untouched.
+
+    Args:
+        name: Skill slug (a-z, 0-9, dashes). Existing name = next version.
+        content: Full markdown content of the skill/prompt.
+        kind: prompt (default) | skill | checklist | workflow.
+        tags: Comma-separated tags.
+    """
+    body: dict[str, Any] = {"name": name, "content": content, "kind": kind}
+    if tags:
+        body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    try:
+        skill = await _api_post("/api/skills", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return structured_echo_result(
+        f"Skill {skill['name']} v{skill['version']} proposed "
+        f"(status: {skill['status']}). A human activates it.",
+        skill=skill,
+    )
+
+
+@mcp.tool()
 async def hub_provision_project(project_id: int) -> CallToolResult:
     """Clone/verify a project's workspace on the hub server (#348).
 

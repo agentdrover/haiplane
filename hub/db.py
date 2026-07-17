@@ -426,6 +426,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_events_created_at",
         "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
     ),
+    # ---- Skills library (#380): versioned prompts/checklists for agents.
+    # Every INSERT is a new (name, version) row; the live one is the highest
+    # version with status='active' — history is immutable by construction.
+    (
+        "create_skills_table",
+        "CREATE TABLE IF NOT EXISTS skills ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "kind TEXT NOT NULL DEFAULT 'prompt', "
+        "version INTEGER NOT NULL, "
+        "content TEXT NOT NULL, "
+        "tags TEXT NOT NULL DEFAULT '[]', "
+        "project_id INTEGER, "
+        "status TEXT NOT NULL DEFAULT 'draft', "
+        "created_by TEXT NOT NULL DEFAULT '', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+        "UNIQUE(name, version))",
+    ),
+    (
+        "idx_skills_name_status",
+        "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
+    ),
     # ---- Workspace provisioning (#347): clone state lives on the project.
     (
         "add_projects_provision_status_column",
@@ -723,6 +745,8 @@ async def get_db() -> aiosqlite.Connection:
         await seed_system_roles(db)
     if await _table_exists(db, "projects"):
         await seed_default_project(db)
+    if await _table_exists(db, "skills"):
+        await seed_default_skills(db)
     return db
 
 
@@ -1050,6 +1074,76 @@ async def seed_default_project(db: aiosqlite.Connection) -> None:
     await db.execute(
         "UPDATE tasks SET project_id=? WHERE task_type='epic' AND project_id IS NULL",
         (default_id,),
+    )
+    await db.commit()
+
+
+MULTI_AGENT_REVIEW_SKILL = """\
+# Multi-agent review harness (v1)
+
+Прогони ревью диффа через несколько независимых агентов по схеме
+«измерения → адверсариальная верификация → единогласие».
+
+## Фаза 1 — ревьюверы по измерениям (параллельно, по одному агенту на роль)
+Каждому: узкий мандат, контекст задачи (постановка + ограничения из хаба),
+схема ответа findings[] = {title, file, line, severity: high|medium|low,
+detail, category}.
+
+1. security — только реально эксплуатируемое: инъекции, XSS, обход
+   авторизации/гейтов, утечки. Запрещено флагать паттерн, который кодовая
+   база уже принимает, если дифф не делает хуже.
+2. correctness — реальные баги с конкретным сценарием отказа: краевые
+   значения, семантика пустых/отсутствующих полей, гонки, потеря состояния.
+   Требование: «опиши вход и наблюдаемый неправильный результат».
+3. consistency — сравнение с конвенциями ЭТОГО репозитория, не с
+   абстрактными best practices; нарушение ограничений из постановки —
+   всегда находка.
+4. tests — только пробелы, при которых регрессия проходит зелёной; не
+   требовать тестов на поведение фреймворка.
+
+Всем: «Верни только находки, которые готов защищать перед автором.
+Каждая привязана к file:line. Лучше 2 настоящих, чем 10 предположительных».
+
+## Фаза 2 — адверсариальная верификация (на КАЖДУЮ находку, 2 агента)
+Без барьера: находки измерения уходят на проверку сразу.
+- Опровергатель: «Попробуй ОПРОВЕРГНУТЬ: прочитай реальный код, проверь
+  достижимость и вред, не принят ли паттерн в репо. По умолчанию
+  refuted=true, если вред спекулятивен, недостижим или конвенционален».
+- Валидатор: «Независимо воспроизведи рассуждение по коду. refuted=true,
+  если не можешь указать точные строки, делающие проблему реальной».
+Схема ответа: {refuted: bool, reasoning}.
+Находка подтверждена ТОЛЬКО единогласно (оба refuted=false).
+
+## Фаза 3 — итог
+confirmed[] (severity, file:line, detail, цитаты голосов), rejected[]
+(title + причина), строка «N сырых → K подтверждено, M опровергнуто».
+Отклонённые не выбрасывать: иногда это долг вне скоупа диффа.
+
+## Правила
+- Агенты работают с реальными файлами и командами, не с пересказом диффа.
+- Конвенция репо сильнее общего best practice.
+- Находок > ~20 — дедупликация по file+суть между фазами.
+- После прогона: исправить confirmed, прогнать тесты, сдать отчёт в хаб
+  (machine-review), затем submit_for_review.
+"""
+
+
+async def seed_default_skills(db: aiosqlite.Connection) -> None:
+    """Seed the multi-agent-review harness prompt (#380).
+
+    Idempotent: only inserts when the skill has no versions at all, so
+    operator edits and newer versions are never overwritten.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT id FROM skills WHERE name='multi-agent-review' LIMIT 1"
+    )
+    if rows:
+        return
+    await db.execute(
+        "INSERT INTO skills (name, kind, version, content, tags, status, "
+        "created_by) VALUES ('multi-agent-review', 'prompt', 1, ?, ?, "
+        "'active', 'seed')",
+        (MULTI_AGENT_REVIEW_SKILL, '["review", "quality", "workflow"]'),
     )
     await db.commit()
 
