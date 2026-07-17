@@ -2081,3 +2081,28 @@ async def test_machine_review_requires_submission(client: AsyncClient, db):
     )
     assert resp.status_code == 400
     assert "submit_for_review" in resp.text
+
+
+async def test_seed_machine_review_cycle_skill(client: AsyncClient, db):
+    # #383: the portable cycle contract ships as an active seed skill.
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+    resp = await client.get("/api/skills/machine-review-cycle")
+    assert resp.status_code == 200
+    skill = resp.json()
+    assert skill["kind"] == "skill"
+    assert skill["status"] == "active"
+    for marker in (
+        "hub_get_skill",
+        "hub_submit_machine_review",
+        "submission_generation",
+    ):
+        assert marker in skill["content"]
+
+    # both seeds coexist and re-seeding is idempotent
+    await seed_default_skills(db)
+    listing = await client.get("/api/skills")
+    names = [s["name"] for s in listing.json()]
+    assert names.count("machine-review-cycle") == 1
+    assert "multi-agent-review" in names

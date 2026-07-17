@@ -2592,6 +2592,17 @@ async def test_verdict_blocked_in_require_mode(db: aiosqlite.Connection, monkeyp
     assert exc.value.status_code == 422
     assert "machine-review" in str(exc.value.detail)
 
+    # Гейт касается только аппрува: отклонить работу ревьюер может всегда,
+    # даже в require-режиме без отчёта (#383 review finding).
+    rejected = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+    )
+    assert rejected.review_verdict == ReviewVerdict.changes_requested
+    # возвращаем задачу в review для продолжения сценария
+    await services.submit_for_review(db, task_id)
+
     # отчёт для текущего сабмишена снимает блок
     row = await repo.get_task(db, task_id)
     await repo.insert_machine_review(

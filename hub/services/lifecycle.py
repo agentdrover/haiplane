@@ -1059,16 +1059,18 @@ async def record_review_verdict(
             "no submission to review yet: the task has never been submitted for review",
         )
 
-    # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require.
-    # Default 'warn' keeps the verdict available — the panel shows the gap.
-    if config.MACHINE_REVIEW_MODE == "require":
+    # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require,
+    # and only for APPROVED — the reviewer must always be able to reject work
+    # (changes_requested), harness or no harness. Default 'warn' keeps every
+    # verdict available; the panel shows the gap.
+    if config.MACHINE_REVIEW_MODE == "require" and body.verdict.value == "approved":
         from hub.services.orchestration import machine_review_gap
 
         gap = await machine_review_gap(db, task)
         if gap:
             raise HTTPException(
                 422,
-                f"machine-review обязателен для этой задачи: {gap}",
+                f"machine-review обязателен для аппрува этой задачи: {gap}",
             )
 
     async with get_write_lock(db):
