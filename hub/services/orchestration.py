@@ -42,6 +42,64 @@ async def project_git_context(
     return ctx
 
 
+def machine_review_required(task: dict[str, Any], project_policy: str = "auto") -> bool:
+    """Machine-review applicability cascade (#382).
+
+    task override > project policy > auto rules from task metadata.
+    Computed at submit/verdict time, not at creation — size and risks are
+    refined along the way and the decision must see current values.
+    """
+    import json as _json
+
+    override = (task.get("machine_review_override") or "").strip()
+    if override == "require":
+        return True
+    if override == "skip":
+        return False
+    policy = (project_policy or "auto").strip()
+    if policy == "off":
+        return False
+    if policy == "always":
+        return True
+    # auto rules: high/security risk always wins
+    try:
+        risks = _json.loads(task.get("risks") or "[]")
+    except ValueError:
+        risks = []
+    for risk in risks:
+        if isinstance(risk, dict) and (
+            risk.get("severity") == "high" or risk.get("kind") == "security"
+        ):
+            return True
+    work_type = (task.get("work_type") or "feature").strip()
+    if work_type in ("docs", "chore", "spike"):
+        return False
+    if work_type == "refactor":
+        return True
+    if (task.get("size") or "").strip() in ("XS", "S"):
+        return False
+    # feature/bug/incident sized M+ (or unsized — err toward review)
+    return True
+
+
+async def machine_review_gap(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str | None:
+    """None when policy is satisfied; otherwise a human-readable gap reason."""
+    project = await repo.resolve_project_for_task(db, task["id"])
+    keys = project.keys() if project is not None else []
+    policy = project["machine_review"] if "machine_review" in keys else "auto"
+    if not machine_review_required(task, policy):
+        return None
+    generation = task.get("submission_generation") or 0
+    mr = await repo.get_latest_machine_review(db, task["id"])
+    if mr is None:
+        return "machine-review отсутствует для текущего сабмишена"
+    if mr["submission_generation"] != generation:
+        return "machine-review устарел (работа пересдана) — прогоните харнесс заново"
+    return None
+
+
 async def provision_project(
     db: aiosqlite.Connection, project_id: int, *, actor: str = ""
 ) -> dict[str, str]:

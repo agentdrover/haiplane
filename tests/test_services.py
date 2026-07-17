@@ -2503,3 +2503,128 @@ async def test_provision_project_noop_gitops_is_readable_error(
     result = await services.provision_project(db, pid)
     assert result["provision_status"] == "error"
     assert "git ops disabled" in result["provision_detail"]
+
+
+# --- machine-review policy (#382) ---
+
+
+def _mr_task(**overrides) -> dict:
+    base = {
+        "id": 1,
+        "machine_review_override": None,
+        "work_type": "feature",
+        "size": "M",
+        "risks": "[]",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_machine_review_required_matrix():
+    # AC-1: параметризованная матрица автоправил.
+    from hub.services.orchestration import machine_review_required as req
+
+    cases = [
+        (_mr_task(work_type="docs"), "auto", False),
+        (_mr_task(work_type="chore"), "auto", False),
+        (_mr_task(work_type="spike"), "auto", False),
+        (_mr_task(work_type="feature", size="S"), "auto", False),
+        (_mr_task(work_type="feature", size="M"), "auto", True),
+        (_mr_task(work_type="bug", size="L"), "auto", True),
+        (_mr_task(work_type="bug", size=None), "auto", True),  # unsized → review
+        (_mr_task(work_type="refactor", size="XS"), "auto", True),
+        (
+            _mr_task(
+                work_type="docs",
+                risks='[{"kind": "security", "severity": "low"}]',
+            ),
+            "auto",
+            True,
+        ),  # security risk beats work_type
+        (
+            _mr_task(
+                work_type="chore",
+                risks='[{"kind": "performance", "severity": "high"}]',
+            ),
+            "auto",
+            True,
+        ),  # high severity beats work_type
+    ]
+    for task, policy, expected in cases:
+        assert req(task, policy) is expected, (task["work_type"], task.get("size"))
+
+
+def test_machine_review_cascade():
+    # AC-2: override задачи > политика проекта > автоправила.
+    from hub.services.orchestration import machine_review_required as req
+
+    assert req(_mr_task(work_type="docs"), "always") is True
+    assert req(_mr_task(work_type="feature", size="L"), "off") is False
+    assert (
+        req(_mr_task(work_type="docs", machine_review_override="require"), "off")
+        is True
+    )
+    assert (
+        req(
+            _mr_task(work_type="feature", size="L", machine_review_override="skip"),
+            "always",
+        )
+        is False
+    )
+
+
+async def test_verdict_blocked_in_require_mode(db: aiosqlite.Connection, monkeypatch):
+    # AC-3: require блокирует вердикт без актуального отчёта; warn — нет.
+    from hub import config as config_module
+
+    task_id = await _pair_running_task(db, title="MR policy task")
+    await repo.update_task(db, task_id, size="M", work_type="feature")
+    await db.commit()
+    await services.submit_for_review(db, task_id)
+
+    monkeypatch.setattr(config_module, "MACHINE_REVIEW_MODE", "require")
+    with pytest.raises(HTTPException) as exc:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+        )
+    assert exc.value.status_code == 422
+    assert "machine-review" in str(exc.value.detail)
+
+    # отчёт для текущего сабмишена снимает блок
+    row = await repo.get_task(db, task_id)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=dict(row)["submission_generation"],
+        raw_count=1,
+    )
+    await db.commit()
+    approved = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert approved.review_verdict == ReviewVerdict.approved
+
+    # в warn-режиме блока нет даже без отчёта
+    monkeypatch.setattr(config_module, "MACHINE_REVIEW_MODE", "warn")
+    task_id2 = await _pair_running_task(db, title="MR warn task")
+    await repo.update_task(db, task_id2, size="M", work_type="feature")
+    await db.commit()
+    await services.submit_for_review(db, task_id2)
+    ok = await services.record_review_verdict(
+        db,
+        task_id2,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert ok.review_verdict == ReviewVerdict.approved
+
+
+async def test_submit_for_review_hints_machine_review(db: aiosqlite.Connection):
+    task_id = await _pair_running_task(db, title="Hint task")
+    await repo.update_task(db, task_id, size="L", work_type="feature")
+    await db.commit()
+    view = await services.submit_for_review(db, task_id)
+    assert view.lifecycle_hint and "Machine-review" in view.lifecycle_hint

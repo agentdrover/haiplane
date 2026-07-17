@@ -1416,3 +1416,35 @@ async def test_review_panel_shows_machine_review(client: AsyncClient, db):
     assert "5 raw" in page.text
     assert "1 confirmed" in page.text
     assert "missing test" in page.text
+
+
+async def test_review_panel_gap_warning_and_request_button(client: AsyncClient, db):
+    # #382: warning + Request machine review button; button sets override.
+    from hub import repository as repo_module
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    tv = await services_module.create_task(db, TaskCreate(title="Gap task"))
+    await repo_module.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await repo_module.update_task(db, tv.id, size="M", work_type="feature")
+    await db.commit()
+    await services_module.pair_start_task(db, tv.id, caller="dev")
+    await services_module.submit_for_review(db, tv.id)
+
+    page = await client.get(f"/tasks/{tv.id}")
+    assert "machine-review отсутствует" in page.text
+    assert "web-request-machine-review" in page.text
+
+    resp = await client.post(
+        f"/tasks/{tv.id}/web-request-machine-review", follow_redirects=False
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_task(db, tv.id)
+    assert row["machine_review_override"] == "require"
+    events = [
+        dict(e)
+        for e in await repo_module.list_events(
+            db, since=0, kinds=["machine_review_requested"]
+        )
+    ]
+    assert events and events[0]["task_id"] == tv.id

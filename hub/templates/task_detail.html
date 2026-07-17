@@ -396,6 +396,14 @@
                 {% if review_error %}
                 <div class="task-action-note">{{ review_error }}</div>
                 {% endif %}
+                {% if machine_review_gap %}
+                <div class="task-action-note task-action-note--warning">
+                    {{ machine_review_gap }}
+                    <form method="post" action="/tasks/{{ task.id }}/web-request-machine-review" class="project-inline-form">
+                        <button class="btn btn-ghost" type="submit">Request machine review</button>
+                    </form>
+                </div>
+                {% endif %}
                 {% if machine_review %}
                 <div class="task-action-note">
                     Machine review: {{ machine_review.raw_count }} raw &rarr;
