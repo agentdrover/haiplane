@@ -396,6 +396,28 @@
                 {% if review_error %}
                 <div class="task-action-note">{{ review_error }}</div>
                 {% endif %}
+                {% if machine_review %}
+                <div class="task-action-note">
+                    Machine review: {{ machine_review.raw_count }} raw &rarr;
+                    {{ machine_review.findings_confirmed|length }} confirmed /
+                    {{ machine_review.findings_rejected|length }} rejected
+                    {% if not machine_review.is_current %}
+                    <span class="badge badge-failed">stale — работа пересдана</span>
+                    {% endif %}
+                    {% if machine_review.findings_confirmed %}
+                    <details>
+                        <summary class="project-edit-summary">confirmed findings</summary>
+                        <ul class="task-review-findings">
+                            {% for f in machine_review.findings_confirmed %}
+                            <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
+                                {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
+                                {{ f.title }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                </div>
+                {% endif %}
                 {% if task.latest_review %}
                 <div class="task-action-note">
                     Last verdict: {{ task.latest_review.verdict.value|upper }}

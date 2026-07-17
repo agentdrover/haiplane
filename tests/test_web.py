@@ -1385,3 +1385,34 @@ async def test_web_skills_pages(client: AsyncClient, db):
     assert resp.status_code == 303
     row = await repo_module.get_active_skill(db, "multi-agent-review")
     assert row["version"] == 2
+
+
+async def test_review_panel_shows_machine_review(client: AsyncClient, db):
+    # #381: summary and confirmed findings render above the verdict buttons.
+    from hub import repository as repo_module
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    tv = await services_module.create_task(db, TaskCreate(title="MR panel task"))
+    await repo_module.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+    await services_module.pair_start_task(db, tv.id, caller="dev")
+    await services_module.submit_for_review(db, tv.id)
+
+    resp = await client.post(
+        f"/api/tasks/{tv.id}/machine-review",
+        json={
+            "raw_count": 5,
+            "findings_confirmed": [
+                {"title": "missing test", "severity": "low", "category": "tests"}
+            ],
+            "findings_rejected": [{"title": "noise", "reason": "unreachable"}],
+        },
+    )
+    assert resp.status_code == 200
+
+    page = await client.get(f"/tasks/{tv.id}")
+    assert "Machine review" in page.text
+    assert "5 raw" in page.text
+    assert "1 confirmed" in page.text
+    assert "missing test" in page.text

@@ -50,6 +50,8 @@ from hub.models import (
     TaskContextView,
     TaskCreate,
     TaskProjectRef,
+    MachineReviewSubmit,
+    MachineReviewView,
     ProjectCreate,
     ProjectPatch,
     ProjectView,
@@ -836,6 +838,80 @@ async def api_submit_for_review(
     return await services.submit_for_review(_db(request), task_id, body)
 
 
+@app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)
+async def api_submit_machine_review(
+    task_id: int,
+    body: MachineReviewSubmit,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Accept a structured multi-agent review report (#381).
+
+    Bound to the task's CURRENT submission generation — resubmitting work
+    makes the report stale, exactly like human verdicts (#305). Informs
+    the human verdict; never replaces it.
+    """
+    import json as _json
+
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    generation = task.get("submission_generation") or 0
+    if generation == 0:
+        raise HTTPException(
+            400,
+            "no submission to review: submit_for_review must run at least once",
+        )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill=body.harness_skill,
+        harness_version=body.harness_version,
+        agent_count=body.agent_count,
+        tokens_spent=body.tokens_spent,
+        duration_ms=body.duration_ms,
+        orchestrator=body.orchestrator,
+        model=body.model,
+        raw_count=body.raw_count,
+        findings_confirmed=_json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings_confirmed],
+            ensure_ascii=False,
+        ),
+        findings_rejected=_json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings_rejected],
+            ensure_ascii=False,
+        ),
+        submitted_by=(body.agent or identity.username)[:100],
+    )
+    await repo.insert_event(
+        db,
+        kind="machine_review_completed",
+        task_id=task_id,
+        actor=(body.agent or identity.username)[:100],
+        payload={
+            "confirmed": len(body.findings_confirmed),
+            "rejected": len(body.findings_rejected),
+            "raw": body.raw_count,
+            "generation": generation,
+        },
+    )
+    await db.commit()
+    await db_module.log_activity(
+        db,
+        "machine_review_completed",
+        f"Task #{task_id}: machine review — {body.raw_count} raw → "
+        f"{len(body.findings_confirmed)} confirmed, "
+        f"{len(body.findings_rejected)} rejected",
+    )
+    saved = await repo.get_latest_machine_review(db, task_id)
+    view = MachineReviewView(**dict(saved))
+    view.is_current = view.submission_generation == generation
+    return view
+
+
 @app.post("/api/tasks/{task_id}/review-verdict", response_model=TaskView)
 async def api_review_verdict(
     task_id: int,
@@ -904,6 +980,14 @@ async def api_review_brief(task_id: int, request: Request):
     if task_view.branch:
         diff_command = f"git diff develop...{task_view.branch}"
 
+    machine_review = None
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    if mr_row is not None:
+        machine_review = MachineReviewView(**dict(mr_row))
+        machine_review.is_current = machine_review.submission_generation == (
+            task_view.submission_generation or 0
+        )
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -925,6 +1009,7 @@ async def api_review_brief(task_id: int, request: Request):
         submission_generation=task_view.submission_generation,
         latest_submission_summary=latest_submission_summary,
         latest_review=task_view.latest_review,
+        machine_review=machine_review,
     )
 
 

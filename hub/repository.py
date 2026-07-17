@@ -459,6 +459,61 @@ async def activate_skill_version(
     )
 
 
+# --- machine reviews (#381) -------------------------------------------------
+
+
+async def insert_machine_review(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    submission_generation: int,
+    harness_skill: str = "",
+    harness_version: int | None = None,
+    agent_count: int | None = None,
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+    orchestrator: str = "",
+    model: str = "",
+    raw_count: int = 0,
+    findings_confirmed: str = "[]",
+    findings_rejected: str = "[]",
+    submitted_by: str = "",
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO machine_reviews (task_id, submission_generation, "
+        "harness_skill, harness_version, agent_count, tokens_spent, "
+        "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
+        "findings_rejected, submitted_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            harness_skill,
+            harness_version,
+            agent_count,
+            tokens_spent,
+            duration_ms,
+            orchestrator,
+            model,
+            raw_count,
+            findings_confirmed,
+            findings_rejected,
+            submitted_by,
+        ),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def get_latest_machine_review(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM machine_reviews WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return rows[0] if rows else None
+
+
 # --- events feed (#349) ----------------------------------------------------
 
 

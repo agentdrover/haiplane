@@ -1987,3 +1987,97 @@ async def test_skill_human_creates_active(client: AsyncClient, db):
     assert resp.json()["status"] == "active"  # open mode = human path
     got = await client.get("/api/skills/dor-checklist")
     assert got.json()["tags"] == ["dor"]
+
+
+# ---------------------------------------------------------------------------
+# Machine review reports (#381)
+# ---------------------------------------------------------------------------
+
+
+async def _reviewable_task(client: AsyncClient, db) -> int:
+    from hub import repository as repo_module
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    tv = await services_module.create_task(db, TaskCreate(title="MR task"))
+    await repo_module.add_task_update(db, tv.id, "dev", "status", "Plan: mr")
+    await db.commit()
+    await services_module.pair_start_task(db, tv.id, caller="dev")
+    await services_module.submit_for_review(db, tv.id)
+    return tv.id
+
+
+async def test_machine_review_submit_and_brief(client: AsyncClient, db):
+    task_id = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "raw_count": 16,
+            "agent_count": 36,
+            "tokens_spent": 1428876,
+            "duration_ms": 716827,
+            "harness_skill": "multi-agent-review",
+            "harness_version": 1,
+            "orchestrator": "claude-code-workflow",
+            "findings_confirmed": [
+                {
+                    "title": "policy JSON error path untested",
+                    "severity": "medium",
+                    "category": "tests",
+                    "file": "hub/web.py",
+                    "line": 633,
+                }
+            ],
+            "findings_rejected": [
+                {"title": "slug XSS", "category": "security", "reason": "unreachable"}
+            ],
+            "agent": "claude-code",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_current"] is True
+    assert data["submission_generation"] == 1
+    assert data["tokens_spent"] == 1428876
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+    mr = brief.json()["machine_review"]
+    assert mr["raw_count"] == 16
+    assert mr["is_current"] is True
+
+    events = await client.get("/api/events?since=0&kinds=machine_review_completed")
+    assert any(
+        e["task_id"] == task_id and e["payload"]["confirmed"] == 1
+        for e in events.json()["events"]
+    )
+
+
+async def test_machine_review_stale_after_resubmit(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub import services as services_module
+
+    task_id = await _reviewable_task(client, db)
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={"raw_count": 3, "findings_confirmed": [], "findings_rejected": []},
+    )
+    # resubmit bumps generation → report goes stale
+    await repo_module.update_task(db, task_id, status="running")
+    await db.commit()
+    await services_module.submit_for_review(db, task_id)
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert brief.json()["machine_review"]["is_current"] is False
+
+
+async def test_machine_review_requires_submission(client: AsyncClient, db):
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    tv = await services_module.create_task(db, TaskCreate(title="No submission"))
+    resp = await client.post(
+        f"/api/tasks/{tv.id}/machine-review",
+        json={"raw_count": 1},
+    )
+    assert resp.status_code == 400
+    assert "submit_for_review" in resp.text

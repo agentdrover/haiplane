@@ -1529,6 +1529,73 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
 
 
 @mcp.tool()
+async def hub_submit_machine_review(
+    task_id: int,
+    raw_count: int,
+    findings_confirmed: list[dict[str, Any]] | None = None,
+    findings_rejected: list[dict[str, Any]] | None = None,
+    harness_skill: str = "multi-agent-review",
+    harness_version: int | None = None,
+    agent_count: int | None = None,
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+    orchestrator: str = "",
+    model: str = "",
+    agent: str = "",
+) -> CallToolResult:
+    """Submit a structured multi-agent review report (#381).
+
+    Bound to the task's current submission generation — resubmitting work
+    makes the report stale (like human verdicts). Metrics fields (#384)
+    are optional but strongly encouraged: tokens_spent/duration_ms feed
+    the practice economics.
+
+    Args:
+        task_id: Reviewed task.
+        raw_count: Findings before adversarial verification.
+        findings_confirmed: [{title, severity, category?, file?, line?, detail?}]
+        findings_rejected: [{title, category?, reason?}]
+        harness_skill: Skill name used (hub_get_skill source).
+        harness_version: Skill version executed.
+        agent_count: Total subagents in the run.
+        tokens_spent: Tokens consumed by the run.
+        duration_ms: Wall-clock duration.
+        orchestrator: Client/orchestrator name (e.g. claude-code-workflow).
+        model: Model id used by review agents.
+        agent: Submitting agent name.
+    """
+    body: dict[str, Any] = {
+        "raw_count": raw_count,
+        "findings_confirmed": findings_confirmed or [],
+        "findings_rejected": findings_rejected or [],
+        "harness_skill": harness_skill,
+        "orchestrator": orchestrator,
+        "model": model,
+        "agent": agent,
+    }
+    for key, value in (
+        ("harness_version", harness_version),
+        ("agent_count", agent_count),
+        ("tokens_spent", tokens_spent),
+        ("duration_ms", duration_ms),
+    ):
+        if value is not None:
+            body[key] = value
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/machine-review", body)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    confirmed = len(result.get("findings_confirmed") or [])
+    rejected = len(result.get("findings_rejected") or [])
+    return structured_echo_result(
+        f"Machine review for task #{task_id} recorded (submission "
+        f"#{result.get('submission_generation')}): {raw_count} raw → "
+        f"{confirmed} confirmed / {rejected} rejected.",
+        machine_review=result,
+    )
+
+
+@mcp.tool()
 async def hub_list_skills() -> CallToolResult:
     """List the skills library (#380): latest version per name.
 
