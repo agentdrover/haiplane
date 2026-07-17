@@ -499,6 +499,31 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_self_approved_column",
         "ALTER TABLE tasks ADD COLUMN review_self_approved INTEGER NOT NULL DEFAULT 0",
     ),
+    # ---- Durable poller state (#416): orchestration clocks and CI retry
+    # budget move out of process memory into the row, so a hub restart no
+    # longer resets grace periods or retry counts. status_entered_at is the
+    # clock a status transition sets (F2 deadlines read it); ci_check_started_at
+    # replaces the in-memory push time; ci_no_pr_attempts replaces the
+    # in-memory retry counter. Existing rows get status_entered_at backfilled to
+    # migration time so they receive a full grace window, never an instant
+    # escalation.
+    (
+        "add_status_entered_at_column",
+        "ALTER TABLE tasks ADD COLUMN status_entered_at TEXT",
+    ),
+    (
+        "add_ci_check_started_at_column",
+        "ALTER TABLE tasks ADD COLUMN ci_check_started_at TEXT",
+    ),
+    (
+        "add_ci_no_pr_attempts_column",
+        "ALTER TABLE tasks ADD COLUMN ci_no_pr_attempts INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "backfill_status_entered_at",
+        "UPDATE tasks SET status_entered_at = datetime('now') "
+        "WHERE status_entered_at IS NULL",
+    ),
 ]
 
 

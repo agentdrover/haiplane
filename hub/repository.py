@@ -705,8 +705,9 @@ async def create_task(
 ) -> int:
     cur = await db.execute(
         "INSERT INTO tasks (title, description, runtime, source, assigned_agent, "
-        "rationale, status, auto_review, task_type, parent_id, priority, position) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "rationale, status, auto_review, task_type, parent_id, priority, position, "
+        "status_entered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         (
             title,
             description,
@@ -730,10 +731,23 @@ async def update_task(
     task_id: int,
     **fields: Any,
 ) -> None:
-    """Update arbitrary task columns and always bump ``updated_at``."""
+    """Update arbitrary task columns and always bump ``updated_at``.
+
+    When ``status`` is among the updated fields, ``status_entered_at`` advances
+    only if the status actually changes (#416). SQLite evaluates SET
+    right-hand sides against the pre-update row, so ``CASE WHEN status != ?``
+    compares the stored status to the new one — re-writing the same status
+    leaves the clock untouched, and a plain field PATCH never advances it.
+    """
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
     values = list(fields.values())
+    if "status" in fields:
+        sets.append(
+            "status_entered_at = CASE WHEN status != ? "
+            "THEN datetime('now') ELSE status_entered_at END"
+        )
+        values.append(fields["status"])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -807,10 +821,59 @@ async def transition_status_if(
     409 Conflict instead of double-processing the task. Review I5.
     """
     cur = await db.execute(
-        "UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=? AND status=?",
+        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "
+        "updated_at=datetime('now') WHERE id=? AND status=?",
         (new_status, task_id, expected_from),
     )
     return (cur.rowcount or 0) > 0
+
+
+async def mark_ci_check_started(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Stamp the CI push time durably (#416).
+
+    Replaces the in-memory ``_ci_pushed_at`` clock so the grace period is
+    measured from the real push time and survives a hub restart. Deliberately
+    does not touch ``updated_at`` — CI conveyor bookkeeping must not reset the
+    stale watchdog.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at=datetime('now') WHERE id=?",
+        (task_id,),
+    )
+
+
+async def increment_ci_no_pr_attempts(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int:
+    """Atomically bump the no-PR retry counter and return the new value (#416).
+
+    The increment is a single ``x = x + 1`` UPDATE so concurrent polls cannot
+    lose a count, replacing the in-memory ``_ci_no_pr_retries`` dict.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_no_pr_attempts = ci_no_pr_attempts + 1 WHERE id=?",
+        (task_id,),
+    )
+    cur = await db.execute(
+        "SELECT ci_no_pr_attempts FROM tasks WHERE id=?", (task_id,)
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def reset_ci_check_state(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear durable CI state when a task leaves the ci_check conveyor (#416)."""
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at=NULL, ci_no_pr_attempts=0 WHERE id=?",
+        (task_id,),
+    )
 
 
 async def create_task_full(
@@ -857,7 +920,10 @@ async def create_task_full(
     ]
     placeholders = ", ".join("?" for _ in columns)
     cur = await db.execute(
-        f"INSERT INTO tasks ({', '.join(columns)}) VALUES ({placeholders})",  # nosec B608
+        # status_entered_at is stamped in SQL so it shares datetime('now')
+        # format with created_at/updated_at (#416).
+        f"INSERT INTO tasks ({', '.join(columns)}, status_entered_at) "  # nosec B608
+        f"VALUES ({placeholders}, datetime('now'))",
         tuple(values),
     )
     return cur.lastrowid  # type: ignore[return-value]
