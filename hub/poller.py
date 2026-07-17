@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
-from hub import config, services
+from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.registry import plugins
@@ -649,6 +649,51 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 log.info(
                     "Poll: task #%d claim lease expired → open", task["id"]
                 )
+
+            # Machine-owned deadline backstop (#418): the ownership/deadline
+            # matrix is the source of truth. Any machine-owned instance that
+            # sits past its (generous) deadline is transitioned to
+            # needs_decision once, so no status+discriminator combination can
+            # stay stuck without an owner. claimed → open is handled above.
+            for policy in lifecycle_matrix.machine_deadline_policies():
+                if policy.escalation != "needs_decision":
+                    continue
+                threshold = getattr(config, policy.deadline_config)
+                overdue = await repo.list_past_status_deadline(
+                    db,
+                    policy.status,
+                    threshold,
+                    require_job_id=policy.require_job_id,
+                    require_review_job_id=policy.require_review_job_id,
+                )
+                for row in overdue:
+                    task = dict(row)
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"{policy.instance} exceeded its {threshold}m deadline. "
+                        "Manual decision required.",
+                    )
+                    await repo.update_task(
+                        db, task["id"], status="needs_decision"
+                    )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": policy.reason},
+                    )
+                    await db.commit()
+                    log.warning(
+                        "Poll: task #%d past %s deadline (%dm) → needs_decision",
+                        task["id"],
+                        policy.instance,
+                        threshold,
+                    )
+                    await services.maybe_destroy_vast(db, task)
 
             # Events feed retention (#349): the feed is a notification
             # channel, not an archive — activity_log keeps the history.

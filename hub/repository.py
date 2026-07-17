@@ -915,6 +915,38 @@ async def list_expired_claims(
     )
 
 
+async def list_past_status_deadline(
+    db: aiosqlite.Connection,
+    status: str,
+    threshold_minutes: int,
+    *,
+    require_job_id: bool = False,
+    require_review_job_id: bool = False,
+) -> list[aiosqlite.Row]:
+    """Tasks that entered ``status`` longer than ``threshold_minutes`` ago (#418).
+
+    Uses the durable ``status_entered_at`` clock (#416), so the deadline
+    measures time-in-status and survives a restart. The discriminator flags
+    keep headless running/review distinct from their pair/client variants.
+    """
+    conditions = [
+        "archived=0",
+        "status=?",
+        "status_entered_at IS NOT NULL",
+        "status_entered_at < datetime('now', ?)",
+    ]
+    params: list[Any] = [status, f"-{threshold_minutes} minutes"]
+    if require_job_id:
+        conditions.append("job_id IS NOT NULL")
+    if require_review_job_id:
+        conditions.append("review_job_id IS NOT NULL")
+    where = " AND ".join(conditions)
+    return await db.execute_fetchall(
+        f"SELECT * FROM tasks WHERE {where}",  # nosec B608
+        tuple(params),
+    )
+
+
 async def create_task_full(
     db: aiosqlite.Connection,
     payload: Any,

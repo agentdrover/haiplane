@@ -3645,3 +3645,51 @@ async def test_submit_for_review_hints_machine_review(db: aiosqlite.Connection):
     await db.commit()
     view = await services.submit_for_review(db, task_id)
     assert view.lifecycle_hint and "Machine-review" in view.lifecycle_hint
+
+
+# ---- Ownership/deadline matrix coverage (#418) ----
+
+
+def test_matrix_policies_are_well_formed():
+    # AC-3 (#418): human/agent_queue instances name a surface and next actor
+    # and never auto-transition; machine instances carry a finite deadline
+    # config, an escalation and a reason. A malformed/missing policy fails here.
+    from hub import config
+    from hub.lifecycle_matrix import (
+        LIFECYCLE_MATRIX,
+        OWNER_MACHINE,
+        VALID_OWNERS,
+    )
+
+    assert LIFECYCLE_MATRIX  # non-empty
+    for key, p in LIFECYCLE_MATRIX.items():
+        assert p.owner in VALID_OWNERS, key
+        assert p.next_actor, key
+        assert p.surface, key
+        if p.owner == OWNER_MACHINE:
+            assert p.deadline_config is not None, key
+            assert hasattr(config, p.deadline_config), key
+            assert p.escalation is not None, key
+            assert p.reason is not None, key
+        else:
+            assert p.deadline_config is None, key
+            assert p.escalation is None, key
+
+
+def test_matrix_covers_every_non_terminal_status_and_discriminator():
+    # AC-4 (#418): a new TaskStatus enum member or a new running/review
+    # discriminator that lacks a policy breaks this test until one is added.
+    from hub.lifecycle_matrix import (
+        LIFECYCLE_MATRIX,
+        non_terminal_statuses,
+        resolve_instance,
+    )
+
+    covered = {p.status for p in LIFECYCLE_MATRIX.values()}
+    for s in non_terminal_statuses():
+        assert s.value in covered, f"no lifecycle policy covers status {s.value}"
+
+    for job_id, review_job_id in ((("j"), None), (None, None)):
+        assert resolve_instance("running", job_id=job_id, review_job_id=None) in LIFECYCLE_MATRIX
+    for review_job_id in ("r", None):
+        assert resolve_instance("review", job_id=None, review_job_id=review_job_id) in LIFECYCLE_MATRIX
