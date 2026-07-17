@@ -397,6 +397,9 @@ class ReviewBrief(BaseModel):
     # #381: latest machine-review report; forward ref — MachineReviewView is
     # declared later in this module, rebuilt below.
     machine_review: "MachineReviewView | None" = None
+    # #438: advisory — non-empty when the branch carries commits of another
+    # unmerged task branch (stacked branches). Never blocks the review.
+    stacking_warning: str = ""
 
 
 class TaskClaim(BaseModel):

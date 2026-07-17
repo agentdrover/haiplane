@@ -1050,6 +1050,8 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         parts.append(f"\nBranch: {brief['branch']}{pr}")
         if brief.get("diff_command"):
             parts.append(f"Diff: {brief['diff_command']}")
+    if brief.get("stacking_warning"):
+        parts.append(f"\n{brief['stacking_warning']}")
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")

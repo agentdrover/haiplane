@@ -324,6 +324,81 @@ async def prepare_pair_branch(
     )
 
 
+# Statuses whose branch is active-but-unmerged: work in progress or waiting
+# for a review verdict. Stacking on top of such a branch is what incident
+# #392 produced (#424→#425→#426 on top of unmerged task-392).
+STACK_ADVISORY_STATUSES = ["running", "review"]
+
+
+async def detect_branch_stacking(
+    db: aiosqlite.Connection,
+    task_id: int,
+    branch: str,
+) -> dict[str, Any] | None:
+    """Advisory branch-stacking detection at submission time (#438).
+
+    Checks — via the project's git repo — whether ``branch`` contains
+    commits of ANOTHER unmerged task branch in running/review status.
+    Returns ``{"base_task_id", "base_task_branch", "base_task_status",
+    "message"}`` for the first stacked base found, or None.
+
+    Advisory by design: a stack can be a deliberate decision, so this never
+    blocks and never raises. Graceful degradation: no branch, no plugin
+    support, or any git failure silently skips the check.
+    """
+    branch = (branch or "").strip()
+    if not branch:
+        return None
+    checker = getattr(plugins.git_ops, "branch_contains_unmerged_commits_of", None)
+    if checker is None:
+        return None
+
+    ctx = await project_git_context(db, task_id)
+    base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+    repo_path = ctx.get("repo")
+    rows = await repo.list_unmerged_branch_tasks(
+        db, exclude_task_id=task_id, statuses=STACK_ADVISORY_STATUSES
+    )
+    for row in rows:
+        other = dict(row)
+        other_branch = (other.get("branch") or "").strip()
+        if not other_branch or other_branch == branch:
+            continue
+        try:
+            stacked = await checker(
+                branch, other_branch, base_branch=base, repo=repo_path
+            )
+        except Exception:  # noqa: BLE001 — advisory only; never break the caller
+            log.debug(
+                "branch stacking check skipped for #%d (%s vs %s)",
+                task_id,
+                branch,
+                other_branch,
+                exc_info=True,
+            )
+            return None
+        if stacked:
+            other_id = other["id"]
+            other_status = other.get("status") or ""
+            message = (
+                f"ADVISORY branch stacking: '{branch}' contains unmerged "
+                f"commits of task #{other_id} branch '{other_branch}' "
+                f"(status: {other_status}). This branch cannot be verified "
+                f"against '{base}' on its own and the merge order is "
+                f"implicit. Alternatives: wait for task #{other_id} to merge "
+                f"into '{base}', rebase, and resubmit — or, if the stack is "
+                f"deliberate, merge task #{other_id}'s branch first and "
+                f"state the merge order explicitly."
+            )
+            return {
+                "base_task_id": other_id,
+                "base_task_branch": other_branch,
+                "base_task_status": other_status,
+                "message": message,
+            }
+    return None
+
+
 def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
     """True only when an APPROVED verdict applies to the latest submission.
 

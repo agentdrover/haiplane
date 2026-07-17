@@ -106,6 +106,16 @@ class NoopGitOps:
     async def current_branch(self, repo: str | None = None) -> str:
         return ""
 
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool:
+        # No repo access — the advisory stacking check is silently skipped.
+        return False
+
     async def create_branch(
         self,
         task_id: int,

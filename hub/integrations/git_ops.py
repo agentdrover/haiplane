@@ -179,6 +179,22 @@ async def _reject_broken_files(repo: str) -> list[str]:
     return reverted
 
 
+async def _resolve_ref(name: str, repo: str) -> str | None:
+    """Resolve a branch name to a commit sha, falling back to origin/<name>."""
+    for ref in (name, f"origin/{name}"):
+        rc, out, _ = await _git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0 and out:
+            return out.strip()
+    return None
+
+
 def _parse_pr_number(gh_output: str) -> int | None:
     m = re.search(r"/pull/(\d+)", gh_output)
     return int(m.group(1)) if m else None
@@ -220,6 +236,48 @@ class GitOpsIntegration:
     async def current_branch(self, repo: str | None = None) -> str:
         rc, out, _ = await _git("branch", "--show-current", repo=repo, check=False)
         return out if rc == 0 else "unknown"
+
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool:
+        """True when ``branch`` carries commits unique to ``other_branch`` (#438).
+
+        Merge-base analysis against ``base_branch``: ``other_branch`` owns the
+        commits reachable from it but not from base; if ``branch`` contains
+        any of them, the branches are stacked and ``branch`` cannot be
+        verified against base independently. Best-effort: unresolvable refs
+        or any git failure return False (advisory check, never an error).
+        """
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                return False
+        repo = repo or _repo_root()
+        head = await _resolve_ref(branch, repo)
+        other = await _resolve_ref(other_branch, repo)
+        base = await _resolve_ref(base_branch, repo)
+        if not (head and other and base):
+            return False
+
+        rc, total, _ = await _git(
+            "rev-list", "--count", other, f"^{base}", repo=repo, check=False
+        )
+        rc2, excluded, _ = await _git(
+            "rev-list", "--count", other, f"^{base}", f"^{head}", repo=repo, check=False
+        )
+        if rc != 0 or rc2 != 0:
+            return False
+        try:
+            total_n = int(total.strip() or "0")
+            excluded_n = int(excluded.strip() or "0")
+        except ValueError:
+            return False
+        # other_branch has unmerged commits, and at least one is inside branch.
+        return total_n > 0 and excluded_n < total_n
 
     async def create_branch(
         self,

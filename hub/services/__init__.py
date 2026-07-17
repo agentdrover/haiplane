@@ -76,6 +76,7 @@ from hub.services.lifecycle import (
 )
 from hub.services.orchestration import (
     completion_requires_review,
+    detect_branch_stacking,
     dispatch_arbiter,
     dispatch_ci_fix,
     dispatch_fix,
@@ -132,6 +133,7 @@ __all__ = [
     "create_subtasks_bulk",
     "decide_task",
     "delete_task_tree",
+    "detect_branch_stacking",
     "dispatch_arbiter",
     "dispatch_ci_fix",
     "dispatch_fix",

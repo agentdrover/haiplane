@@ -1004,6 +1004,15 @@ async def api_review_brief(task_id: int, request: Request):
             task_view.submission_generation or 0
         )
 
+    # Advisory branch-stacking check (#438): the reviewer should know when
+    # the diff includes another task's unmerged work. Best-effort — no repo
+    # access means no warning, never an error.
+    stacking_warning = ""
+    if task_view.branch:
+        stacking = await services.detect_branch_stacking(db, task_id, task_view.branch)
+        if stacking:
+            stacking_warning = stacking["message"]
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1026,6 +1035,7 @@ async def api_review_brief(task_id: int, request: Request):
         latest_submission_summary=latest_submission_summary,
         latest_review=task_view.latest_review,
         machine_review=machine_review,
+        stacking_warning=stacking_warning,
     )
 
 

@@ -90,6 +90,13 @@ class DispatchPlugin(Protocol):
 @runtime_checkable
 class GitOpsPlugin(Protocol):
     async def current_branch(self, repo: str | None = None) -> str: ...
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool: ...
     async def create_branch(
         self, task_id: int, title: str, repo: str | None = None
     ) -> str: ...

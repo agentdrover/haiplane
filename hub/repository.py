@@ -200,6 +200,22 @@ async def list_tasks_by_status(
     )
 
 
+async def list_unmerged_branch_tasks(
+    db: aiosqlite.Connection,
+    *,
+    exclude_task_id: int,
+    statuses: list[str],
+) -> list[aiosqlite.Row]:
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    placeholders = ",".join("?" for _ in statuses)
+    return await db.execute_fetchall(
+        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
+        "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
+        (exclude_task_id, *statuses),
+    )
+
+
 async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
