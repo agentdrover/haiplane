@@ -1353,3 +1353,35 @@ async def test_web_provision_hidden_without_repo(client: AsyncClient, db):
     await db.commit()
     page = await client.get("/projects")
     assert f"/projects/{pid}/web-provision" not in page.text
+
+
+async def test_web_skills_pages(client: AsyncClient, db):
+    # #380: list page, detail page, Activate button for drafts.
+    from hub import repository as repo_module
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+    await repo_module.create_skill_version(
+        db,
+        name="multi-agent-review",
+        content="v2 draft",
+        status="draft",
+        created_by="bot",
+    )
+    await db.commit()
+
+    page = await client.get("/skills")
+    assert page.status_code == 200
+    assert "multi-agent-review" in page.text
+
+    detail = await client.get("/skills/multi-agent-review")
+    assert detail.status_code == 200
+    assert "web-activate" in detail.text  # кнопка для драфта v2
+
+    resp = await client.post(
+        "/skills/multi-agent-review/versions/2/web-activate",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    row = await repo_module.get_active_skill(db, "multi-agent-review")
+    assert row["version"] == 2

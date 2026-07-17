@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% set active = "skills" %}
+{% block title %}{{ name }} — Skills — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Skill: {{ name }}</h1>
+</header>
+
+{% for v in versions %}
+<details {% if loop.first %}open{% endif %} class="task-action-stack project-create">
+    <summary class="project-edit-summary">
+        v{{ v.version }} — {{ v.kind }},
+        {% if v.status == 'active' %}<span class="badge badge-completed">active</span>
+        {% else %}<span class="badge badge-review">draft</span>{% endif %}
+        by {{ v.created_by }} at {{ v.created_at }}
+    </summary>
+    {% if v.status != 'active' %}
+    <form method="post" action="/skills/{{ name }}/versions/{{ v.version }}/web-activate" class="project-inline-form">
+        <button class="btn btn-success" type="submit"
+                onclick="return confirm('Активировать {{ name }} v{{ v.version }}? Агенты начнут получать эту версию.')">Activate v{{ v.version }}</button>
+    </form>
+    {% endif %}
+    <pre class="u-pre-wrap">{{ v.content }}</pre>
+</details>
+{% endfor %}
+{% endblock %}

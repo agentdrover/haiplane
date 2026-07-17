@@ -379,6 +379,86 @@ async def resolve_project_for_task(
     return await get_project_by_slug(db, "default")
 
 
+# --- skills library (#380) --------------------------------------------------
+
+
+async def create_skill_version(
+    db: aiosqlite.Connection,
+    *,
+    name: str,
+    kind: str = "prompt",
+    content: str,
+    tags: str = "[]",
+    project_id: int | None = None,
+    status: str = "draft",
+    created_by: str = "",
+) -> tuple[int, int]:
+    """Insert the next version for ``name``. Returns (id, version)."""
+    rows = await db.execute_fetchall(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM skills WHERE name=?", (name,)
+    )
+    version = (rows[0]["v"] or 0) + 1
+    cur = await db.execute(
+        "INSERT INTO skills (name, kind, version, content, tags, project_id, "
+        "status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, kind, version, content, tags, project_id, status, created_by),
+    )
+    return cur.lastrowid, version  # type: ignore[return-value]
+
+
+async def get_active_skill(db: aiosqlite.Connection, name: str) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM skills WHERE name=? AND status='active' "
+        "ORDER BY version DESC LIMIT 1",
+        (name,),
+    )
+    return rows[0] if rows else None
+
+
+async def list_skills(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Latest version per name (active preferred, else newest draft)."""
+    return await db.execute_fetchall(
+        """
+        SELECT s.* FROM skills s
+        JOIN (
+            SELECT name,
+                   COALESCE(
+                       MAX(CASE WHEN status='active' THEN version END),
+                       MAX(version)
+                   ) AS v
+            FROM skills GROUP BY name
+        ) latest ON latest.name = s.name AND latest.v = s.version
+        ORDER BY s.name ASC
+        """
+    )
+
+
+async def list_skill_versions(
+    db: aiosqlite.Connection, name: str
+) -> list[aiosqlite.Row]:
+    return await db.execute_fetchall(
+        "SELECT * FROM skills WHERE name=? ORDER BY version DESC", (name,)
+    )
+
+
+async def get_skill_version(
+    db: aiosqlite.Connection, name: str, version: int
+) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM skills WHERE name=? AND version=?", (name, version)
+    )
+    return rows[0] if rows else None
+
+
+async def activate_skill_version(
+    db: aiosqlite.Connection, name: str, version: int
+) -> None:
+    await db.execute(
+        "UPDATE skills SET status='active' WHERE name=? AND version=?",
+        (name, version),
+    )
+
+
 # --- events feed (#349) ----------------------------------------------------
 
 
