@@ -188,3 +188,74 @@ async def test_clone_repo_explicit_url_untouched(tmp_path):
         )
     assert ok is True
     assert all("github.com" not in c for c in calls)
+
+
+# --- git_ops registration and default-workspace degradation (#378) ---
+
+
+async def test_register_plugins_gitops_without_workspace(monkeypatch, tmp_path):
+    # AC-1: git binary present, WORKSPACE_REPO_LINK absent → real GitOpsIntegration.
+    from pathlib import Path
+
+    from hub import config
+    from hub.app import _register_plugins
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        config, "WORKSPACE_REPO_LINK", Path(tmp_path / "does-not-exist")
+    )
+    orig = plugins.git_ops
+    try:
+        _register_plugins()
+        assert isinstance(plugins.git_ops, GitOpsIntegration)
+    finally:
+        plugins.git_ops = orig
+
+
+async def test_pair_prepare_branch_readable_error_without_workspace(
+    monkeypatch, tmp_path
+):
+    # AC-2: default workspace is not a git repo → readable conflict error,
+    # not a raw 'not a git repository' traceback.
+    from pathlib import Path
+
+    import hub.integrations.git_ops as git_ops_module
+    from hub.integrations.git_ops import GitOpsIntegration, PairBranchConflictError
+
+    monkeypatch.setattr(
+        git_ops_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "empty-dir")
+    )
+    (tmp_path / "empty-dir").mkdir()
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await GitOpsIntegration().pair_prepare_branch(1, "Test task")
+    assert "OPENCLAW_WORKSPACE_REPO" in str(exc.value)
+
+
+async def test_create_branch_readable_error_without_workspace(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    import hub.integrations.git_ops as git_ops_module
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    monkeypatch.setattr(git_ops_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "nope"))
+    branch = await GitOpsIntegration().create_branch(2, "Another task")
+    assert branch == ""  # degraded, no exception
+
+
+async def test_pair_prepare_branch_explicit_repo_skips_default_guard(tmp_path):
+    # AC-3: project workspaces (repo=...) are untouched by the guard.
+    from unittest.mock import AsyncMock, patch
+
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    with patch(
+        "hub.integrations.git_ops._git",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ):
+        branch = await GitOpsIntegration().pair_prepare_branch(
+            3, "Proj task", branch_slug="proj-task", repo=str(tmp_path)
+        )
+    assert branch == "task-3/proj-task"

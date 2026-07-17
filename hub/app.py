@@ -113,7 +113,13 @@ def _register_plugins() -> None:
 
         plugins.dispatch = DispatchIntegration()
 
-    if config.WORKSPACE_REPO_LINK and config.WORKSPACE_REPO_LINK.exists():
+    # #378: git ops depend on the git binary, not on the default-project
+    # workspace. clone_repo (provisioning) must work on a fresh server;
+    # operations that DO need the default workspace degrade readably
+    # inside git_ops instead of silently disabling the whole plugin.
+    import shutil
+
+    if shutil.which("git"):
         from hub.integrations.git_ops import GitOpsIntegration
 
         plugins.git_ops = GitOpsIntegration()
