@@ -448,6 +448,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_skills_name_status",
         "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
     ),
+    # ---- Machine review policy (#382): project default + task override.
+    (
+        "add_projects_machine_review_column",
+        "ALTER TABLE projects ADD COLUMN machine_review TEXT NOT NULL DEFAULT 'auto'",
+    ),
+    (
+        "add_tasks_machine_review_override_column",
+        "ALTER TABLE tasks ADD COLUMN machine_review_override TEXT",
+    ),
     # ---- Machine review reports (#381): structured multi-agent review
     # outcomes bound to a submission generation; metrics fields (#384)
     # are nullable — clients that can't count tokens still report.

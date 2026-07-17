@@ -1020,7 +1020,19 @@ async def submit_for_review(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+    # Machine-review policy (#382): tell the submitting agent right away
+    # when the harness run is expected before the human verdict.
+    from hub.services.orchestration import machine_review_gap
+
+    gap = await machine_review_gap(db, dict(row))
+    if gap:
+        view.lifecycle_hint = (
+            f"Machine-review требуется ({gap}): hub_get_skill('multi-agent-review') "
+            "→ прогон → hub_submit_machine_review — до человеческого вердикта."
+        )
+    return view
 
 
 async def record_review_verdict(
@@ -1046,6 +1058,18 @@ async def record_review_verdict(
             400,
             "no submission to review yet: the task has never been submitted for review",
         )
+
+    # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require.
+    # Default 'warn' keeps the verdict available — the panel shows the gap.
+    if config.MACHINE_REVIEW_MODE == "require":
+        from hub.services.orchestration import machine_review_gap
+
+        gap = await machine_review_gap(db, task)
+        if gap:
+            raise HTTPException(
+                422,
+                f"machine-review обязателен для этой задачи: {gap}",
+            )
 
     async with get_write_lock(db):
         findings_json = json.dumps(
