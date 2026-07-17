@@ -94,3 +94,97 @@ async def test_pair_prepare_branch_raises_when_not_on_base_after_checkout(
         )
 
     assert branch == "task-5/good"
+
+
+# --- clone_repo transport selection (#377) ---
+
+
+def _clone_runner(responses):
+    """Fake _run keyed by (command marker) → (rc, out, err)."""
+
+    async def fake_run(*cmd, **kw):
+        joined = " ".join(cmd)
+        for marker, resp in responses:
+            if marker in joined:
+                return resp
+        return (0, "", "")
+
+    return fake_run
+
+
+async def test_clone_repo_public_https_no_key(tmp_path):
+    # AC-1: https ls-remote ok → clone over https, ssh never needed.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    calls = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(" ".join(cmd))
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+        ok, detail = await GitOpsIntegration().clone_repo(
+            "mrPDA/pub-repo", str(tmp_path / "ws"), "main"
+        )
+    assert ok is True
+    assert "https" in detail
+    ls_calls = [c for c in calls if "ls-remote" in c]
+    assert len(ls_calls) == 1
+    assert "https://github.com/mrPDA/pub-repo.git" in ls_calls[0]
+    clone_call = next(c for c in calls if " clone " in f" {c} ")
+    assert "https://github.com/mrPDA/pub-repo.git" in clone_call
+
+
+async def test_clone_repo_private_falls_back_to_ssh(tmp_path):
+    # AC-2: https refused → ssh candidate succeeds.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    async def fake_run(*cmd, **kw):
+        joined = " ".join(cmd)
+        if "ls-remote" in joined and "https://" in joined:
+            return (128, "", "fatal: could not read Username")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+        ok, detail = await GitOpsIntegration().clone_repo(
+            "mrPDA/priv-repo", str(tmp_path / "ws"), "master"
+        )
+    assert ok is True
+    assert "ssh" in detail
+
+
+async def test_clone_repo_both_transports_fail_lists_reasons(tmp_path):
+    # AC-3: detail carries BOTH failed attempts.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    async def fake_run(*cmd, **kw):
+        joined = " ".join(cmd)
+        if "https://" in joined:
+            return (128, "", "could not read Username")
+        return (128, "", "Permission denied (publickey)")
+
+    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+        ok, detail = await GitOpsIntegration().clone_repo(
+            "mrPDA/locked", str(tmp_path / "ws")
+        )
+    assert ok is False
+    assert "could not read Username" in detail
+    assert "Permission denied" in detail
+
+
+async def test_clone_repo_explicit_url_untouched(tmp_path):
+    # Explicit URLs bypass candidate substitution.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    calls = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(" ".join(cmd))
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+        ok, _ = await GitOpsIntegration().clone_repo(
+            "git@gitlab.local:team/x.git", str(tmp_path / "ws")
+        )
+    assert ok is True
+    assert all("github.com" not in c for c in calls)

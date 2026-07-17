@@ -62,6 +62,9 @@ def _git_env() -> dict[str, str]:
     ssh_key = Path.home() / ".ssh" / "id_ed25519"
     if ssh_key.exists():
         env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o StrictHostKeyChecking=accept-new"
+    # #377: anonymous https against a private repo must fail fast, not hang
+    # waiting for credentials on a headless server.
+    env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
 
@@ -625,30 +628,17 @@ class GitOpsIntegration:
     async def clone_repo(
         self, repo_url: str, workspace_path: str, base_branch: str = "develop"
     ) -> tuple[bool, str]:
-        """Provision a project workspace (#347). Returns (ok, detail).
+        """Provision a project workspace (#347, #377). Returns (ok, detail).
 
-        Access is pre-checked with ``ls-remote`` so a missing deploy key or
-        gh auth fails with a readable message instead of a clone stacktrace.
+        Short ``owner/repo`` form tries https first — public repos clone
+        anonymously with zero server setup — then falls back to ssh with
+        the deploy key; the detail keeps every failed attempt so a private
+        repo without a key reads as a diagnosis, not a stacktrace.
         Idempotent: an existing clone is verified against the expected
-        origin (owner/repo) and fetched instead of re-cloned.
+        origin (owner/repo) and fetched instead of re-cloned — the fetch
+        itself validates access, no ls-remote needed.
         """
         import os
-
-        url = repo_url
-        if "://" not in url and not url.startswith("git@"):
-            url = f"git@github.com:{repo_url}.git"
-
-        rc, _, err = await _run(
-            "git",
-            "ls-remote",
-            "--heads",
-            url,
-            base_branch,
-            timeout=60,
-            check=False,
-        )
-        if rc != 0:
-            return False, f"remote not accessible: {err[:300] or 'ls-remote failed'}"
 
         git_dir = os.path.join(workspace_path, ".git")
         if os.path.isdir(git_dir):
@@ -681,6 +671,35 @@ class GitOpsIntegration:
             log.info("clone_repo: verified existing clone at %s", workspace_path)
             return True, "existing clone verified, origin fetched"
 
+        if "://" in repo_url or repo_url.startswith("git@"):
+            candidates = [repo_url]
+        else:
+            # #377: public repos need no credentials over https; ssh with
+            # the deploy key is the private-repo fallback.
+            candidates = [
+                f"https://github.com/{repo_url}.git",
+                f"git@github.com:{repo_url}.git",
+            ]
+
+        url = None
+        failures: list[str] = []
+        for candidate in candidates:
+            rc, _, err = await _run(
+                "git",
+                "ls-remote",
+                "--heads",
+                candidate,
+                base_branch,
+                timeout=60,
+                check=False,
+            )
+            if rc == 0:
+                url = candidate
+                break
+            failures.append(f"{candidate}: {err[:150] or 'ls-remote failed'}")
+        if url is None:
+            return False, "remote not accessible: " + "; ".join(failures)
+
         os.makedirs(os.path.dirname(workspace_path) or "/", exist_ok=True)
         rc, _, err = await _run(
             "git",
@@ -693,8 +712,13 @@ class GitOpsIntegration:
             check=False,
         )
         if rc != 0:
-            return False, f"clone failed: {err[:300]}"
+            return False, f"clone failed ({url}): {err[:300]}"
+        transport = "https" if url.startswith("https") else "ssh"
         log.info(
-            "clone_repo: cloned %s → %s (%s)", repo_url, workspace_path, base_branch
+            "clone_repo: cloned %s → %s (%s, %s)",
+            repo_url,
+            workspace_path,
+            base_branch,
+            transport,
         )
-        return True, f"cloned {repo_url} ({base_branch})"
+        return True, f"cloned {repo_url} ({base_branch}, {transport})"
