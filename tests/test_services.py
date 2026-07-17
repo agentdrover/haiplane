@@ -3756,3 +3756,47 @@ async def test_decide_rework_closes_arbiter_marker(db: aiosqlite.Connection):
     assert row["arbiter_generation"] is None
     assert row["arbiter_job_id"] is None
     assert row["review_cycle"] == 0
+
+
+# ---- Unified review budget semantics (#423) ----
+
+
+@pytest.mark.parametrize(
+    "review_cycle, max_cycles, expected",
+    [
+        (0, 3, False),
+        (1, 3, False),
+        (2, 3, False),
+        (3, 3, True),   # AC-2: budget spent at MAX
+        (4, 3, True),
+        (5, 3, True),   # review_cycle > MAX
+        (0, 0, True),   # AC-3: MAX<=0 exhausted immediately
+        (0, 1, False),
+        (1, 1, True),
+    ],
+)
+def test_review_budget_exhausted_boundaries(review_cycle, max_cycles, expected):
+    # AC-2/AC-3 (#423): one helper, one documented boundary — exhausted once
+    # review_cycle reaches max_cycles. Same result for any caller (pair or
+    # headless) since it is a single pure function.
+    from hub.services import review_budget_exhausted
+
+    assert review_budget_exhausted(review_cycle, max_cycles) is expected
+
+
+def test_review_budget_is_single_source_of_truth():
+    # AC-4 (#423): no flow compares review_cycle to MAX_REVIEW_CYCLES on its
+    # own — only review_budget_exhausted may.
+    import pathlib
+    import re
+
+    pat = re.compile(r"review_cycle.{0,40}(<|>=|\+ 1).{0,20}MAX_REVIEW_CYCLES")
+    for rel in ("hub/poller.py", "hub/services/lifecycle.py"):
+        src = pathlib.Path(rel).read_text()
+        assert not pat.search(src), f"{rel} compares review_cycle to MAX directly"
+
+    orch = pathlib.Path("hub/services/orchestration.py").read_text()
+    helper_start = orch.index("def review_budget_exhausted")
+    helper_end = orch.index("async def dispatch_review")
+    outside = orch[:helper_start] + orch[helper_end:]
+    assert not pat.search(outside), "orchestration compares outside the helper"

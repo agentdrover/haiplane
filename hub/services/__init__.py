@@ -93,6 +93,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     project_git_context,
     provision_project,
+    review_budget_exhausted,
     scan_text_for_verdict,
     transition_after_agent_done,
 )
@@ -177,6 +178,7 @@ __all__ = [
     "self_review_brief_warning",
     "start_task",
     "submit_for_review",
+    "review_budget_exhausted",
     "transition_after_agent_done",
     "unarchive_task",
     "withdraw_own_draft",

@@ -470,7 +470,7 @@ async def transition_after_agent_done(
 
     if (
         task.get("auto_review")
-        and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
+        and not review_budget_exhausted(task.get("review_cycle", 0))
         and has_done
         and branch
     ):
@@ -510,7 +510,7 @@ async def transition_after_agent_done(
         log.info("Task #%d → ci_check after done report", task_id)
         return "ci_check"
 
-    if has_done and task.get("review_cycle", 0) >= config.MAX_REVIEW_CYCLES:
+    if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human
         # Decision Gate instead of looping through review forever (#306).
         await repo.update_task(
@@ -576,6 +576,21 @@ async def transition_after_agent_done(
     )
     log.info("Task #%d → pending_report after done report", task_id)
     return "pending_report"
+
+
+def review_budget_exhausted(review_cycle: int, max_cycles: int | None = None) -> bool:
+    """Whether the review fix budget is spent (#423) — one source of truth.
+
+    ``review_cycle`` is the number of developer fix iterations already
+    dispatched. The budget is exhausted — the next CHANGES_REQUESTED escalates
+    (to arbiter / needs_decision) instead of dispatching another fix — once that
+    count reaches ``max_cycles``. Pair and headless share this, so at MAX=3 both
+    run fixes 1, 2 and 3 and escalate the 4th. ``MAX <= 0`` is exhausted
+    immediately. No flow may compare review_cycle to MAX_REVIEW_CYCLES itself.
+    """
+    if max_cycles is None:
+        max_cycles = config.MAX_REVIEW_CYCLES
+    return review_cycle >= max_cycles
 
 
 async def dispatch_review(
