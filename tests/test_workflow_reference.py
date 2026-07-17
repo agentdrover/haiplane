@@ -97,3 +97,14 @@ async def test_propose_task_under_task_parent_returns_hierarchy_hint(
     assert detail["reason"] == "invalid_hierarchy"
     assert detail.get("required_parent_type") == TaskType.feature.value
     assert "feature" in detail.get("hint", "").lower()
+
+
+def test_machine_review_gate_in_reference():
+    # #383: the machine-review step is discoverable in the workflow schema.
+    from hub.workflow_reference import build_mcp_instructions, workflow_reference_dict
+
+    gates = workflow_reference_dict()["gates"]
+    assert gates["machine_review"]["tool"] == "hub_submit_machine_review"
+    assert "machine-review-cycle" in gates["machine_review"]["rule"]
+    # base MCP instructions stay within the documented size budget
+    assert len(build_mcp_instructions()) < 4096

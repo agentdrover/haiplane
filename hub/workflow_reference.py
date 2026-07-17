@@ -159,6 +159,16 @@ def workflow_reference_dict() -> dict[str, Any]:
                 "rule": "no completed without current APPROVED review "
                 "(auto_review=false is the explicit opt-out)",
             },
+            "machine_review": {
+                "status": "review",
+                "tool": "hub_submit_machine_review",
+                "actor": "agent",
+                "rule": "when policy requires it (#382): run the "
+                "multi-agent harness (hub_get_skill 'machine-review-cycle') "
+                "and submit the report BEFORE the human verdict; "
+                "OPENCLAW_MACHINE_REVIEW=require blocks the verdict without "
+                "a current report, default 'warn' only surfaces the gap",
+            },
             "decision": {
                 "status": "needs_decision",
                 "tool": "hub_decide_task",
