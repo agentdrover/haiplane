@@ -715,30 +715,83 @@ async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1
 
 
 @router.get("/skills", response_class=HTMLResponse)
-async def web_skills(request: Request):
-    """Skills library (#380): latest version per name."""
+async def web_skills(request: Request, skill_error: str = Query("")):
+    """Skills library (#380): latest version per name; create form (#385)."""
     from hub.models import SkillView
 
     rows = await repo.list_skills(_db(request))
     return TEMPLATES.TemplateResponse(
         request,
         "skills.html",
-        {"skills": [SkillView(**dict(r)) for r in rows]},
+        {
+            "skills": [SkillView(**dict(r)) for r in rows],
+            "skill_error": skill_error,
+        },
     )
 
 
 @router.get("/skills/{name}", response_class=HTMLResponse)
-async def web_skill_detail(name: str, request: Request):
+async def web_skill_detail(name: str, request: Request, skill_error: str = Query("")):
     from hub.models import SkillView
 
     rows = await repo.list_skill_versions(_db(request), name)
     if not rows:
         raise HTTPException(404, "skill not found")
+    versions = [SkillView(**dict(r)) for r in rows]
+    active = next((v for v in versions if v.status == "active"), versions[0])
     return TEMPLATES.TemplateResponse(
         request,
         "skill_detail.html",
-        {"name": name, "versions": [SkillView(**dict(r)) for r in rows]},
+        {
+            "name": name,
+            "versions": versions,
+            "active_content": active.content,
+            "skill_error": skill_error,
+        },
     )
+
+
+def _skills_error_redirect(message: str, name: str = "") -> RedirectResponse:
+    target = f"/skills/{name}" if name else "/skills"
+    return RedirectResponse(f"{target}?skill_error={quote(message)}", status_code=303)
+
+
+async def _web_create_skill_version(request: Request, form: Any, name_hint: str = ""):
+    """Shared web→API bridge for create and new-version (#385)."""
+    from hub.app import api_create_skill
+    from hub.models import SkillCreate
+
+    tags = [t.strip() for t in str(form.get("tags") or "").split(",") if t.strip()]
+    try:
+        body = SkillCreate(
+            name=(name_hint or str(form.get("name") or "")).strip(),
+            kind=str(form.get("kind") or "prompt").strip(),
+            content=str(form.get("content") or ""),
+            tags=tags,
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _skills_error_redirect(
+            f"{loc}: {first.get('msg', 'invalid')}", name_hint
+        )
+    await api_create_skill(body, request, identity=current_identity(request))
+    return RedirectResponse(f"/skills/{body.name}", status_code=303)
+
+
+@router.post("/skills/web-create")
+async def web_create_skill(request: Request):
+    """Create-skill form (#385): thin wrapper over api_create_skill; the
+    human path publishes an active version, agents still land as drafts."""
+    return await _web_create_skill_version(request, await request.form())
+
+
+@router.post("/skills/{name}/web-new-version")
+async def web_new_skill_version(name: str, request: Request):
+    """Edit as new version (#385): immutable history — always a new INSERT."""
+    if not await repo.list_skill_versions(_db(request), name):
+        raise HTTPException(404, "skill not found")
+    return await _web_create_skill_version(request, await request.form(), name)
 
 
 @router.post("/skills/{name}/versions/{version}/web-activate")

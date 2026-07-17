@@ -6,6 +6,32 @@
     <h1 class="page-title">Skills Library</h1>
 </header>
 
+{% if skill_error %}
+<div class="task-action-note task-action-note--warning project-error-note">
+    {{ skill_error }}
+</div>
+{% endif %}
+
+<details class="task-action-stack project-create">
+    <summary class="btn btn-primary">+ New Skill</summary>
+    <form method="post" action="/skills/web-create" class="task-action-stack project-form">
+        <label class="task-action-label" for="ns-name">Name (a-z, 0-9, dashes)</label>
+        <input id="ns-name" name="name" class="task-action-control" required pattern="[a-z0-9][a-z0-9-]*" placeholder="dor-checklist">
+        <label class="task-action-label" for="ns-kind">Kind</label>
+        <select id="ns-kind" name="kind" class="task-action-control">
+            <option value="prompt">prompt</option>
+            <option value="skill">skill</option>
+            <option value="checklist">checklist</option>
+            <option value="workflow">workflow</option>
+        </select>
+        <label class="task-action-label" for="ns-tags">Tags (comma-separated)</label>
+        <input id="ns-tags" name="tags" class="task-action-control" placeholder="review, quality">
+        <label class="task-action-label" for="ns-content">Content (markdown)</label>
+        <textarea id="ns-content" name="content" class="task-action-control task-action-textarea" required rows="10"></textarea>
+        <button class="btn btn-success task-action-btn" type="submit">Create Skill</button>
+    </form>
+</details>
+
 <table class="task-table">
     <thead>
         <tr><th>Name</th><th>Kind</th><th>Version</th><th>Status</th><th>Tags</th><th>Author</th></tr>

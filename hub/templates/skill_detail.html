@@ -6,6 +6,23 @@
     <h1 class="page-title">Skill: {{ name }}</h1>
 </header>
 
+{% if skill_error %}
+<div class="task-action-note task-action-note--warning project-error-note">
+    {{ skill_error }}
+</div>
+{% endif %}
+
+<details class="task-action-stack project-create">
+    <summary class="btn btn-primary">Edit as new version</summary>
+    <form method="post" action="/skills/{{ name }}/web-new-version" class="task-action-stack project-form">
+        <label class="task-action-label" for="ev-tags">Tags (comma-separated)</label>
+        <input id="ev-tags" name="tags" class="task-action-control" placeholder="review, quality">
+        <label class="task-action-label" for="ev-content">Content (предзаполнено активной версией — правка создаёт новую версию)</label>
+        <textarea id="ev-content" name="content" class="task-action-control task-action-textarea" required rows="16">{{ active_content }}</textarea>
+        <button class="btn btn-success task-action-btn" type="submit">Save as new version</button>
+    </form>
+</details>
+
 {% for v in versions %}
 <details {% if loop.first %}open{% endif %} class="task-action-stack project-create">
     <summary class="project-edit-summary">
