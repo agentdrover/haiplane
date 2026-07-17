@@ -1116,6 +1116,7 @@ async def hub_submit_review(
     comments: str = "",
     agent: str = "",
     findings: list[dict[str, Any]] | None = None,
+    create_tasks_for_out_of_scope: bool = False,
 ) -> str:
     """Submit a review verdict for the current submission of a task (#307).
 
@@ -1132,6 +1133,12 @@ async def hub_submit_review(
     recommendations linked to follow-up tasks. Out-of-scope findings
     without linked_task_id get a non-blocking warning.
 
+    Auto-drafts (#436): create_tasks_for_out_of_scope=true auto-creates a
+    DRAFT follow-up task for every out_of_scope finding without
+    linked_task_id (same feature parent as the reviewed task when
+    applicable) and stamps the created id into the stored finding. Drafts
+    still need human DoR approval. Idempotent on resubmit.
+
     Args:
         task_id: The task under review
         verdict: 'approved' or 'changes_requested'
@@ -1142,6 +1149,8 @@ async def hub_submit_review(
             and optional file, line, recommendation,
             scope (in_scope|out_of_scope, default in_scope),
             linked_task_id (int — follow-up task for out_of_scope findings).
+        create_tasks_for_out_of_scope: Auto-create draft follow-up tasks
+            for unlinked out_of_scope findings (default false).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1152,6 +1161,8 @@ async def hub_submit_review(
         body["agent"] = agent
     if findings:
         body["findings"] = findings
+    if create_tasks_for_out_of_scope:
+        body["create_tasks_for_out_of_scope"] = True
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:

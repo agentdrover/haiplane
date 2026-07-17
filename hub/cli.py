@@ -361,6 +361,8 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
             print(f"invalid --findings-json: {exc}", file=sys.stderr)
             return 2
         body["findings"] = findings
+    if getattr(args, "create_tasks_for_out_of_scope", False):
+        body["create_tasks_for_out_of_scope"] = True
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0
@@ -1283,6 +1285,15 @@ def build_parser() -> argparse.ArgumentParser:
             "scope defaults to in_scope; changes_requested requires at "
             "least one in_scope finding; linked_task_id references the "
             "follow-up task for out_of_scope findings."
+        ),
+    )
+    p_review_verdict.add_argument(
+        "--create-tasks-for-out-of-scope",
+        dest="create_tasks_for_out_of_scope",
+        action="store_true",
+        help=(
+            "Auto-create DRAFT follow-up tasks for out_of_scope findings "
+            "without linked_task_id (#436); drafts still need human approval"
         ),
     )
     p_review_verdict.set_defaults(func=cmd_review_verdict)

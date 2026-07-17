@@ -1125,6 +1125,97 @@ async def submit_for_review(
     return view
 
 
+def out_of_scope_draft_marker(task_id: int, finding_id: int) -> str:
+    """Back-reference marker stamped into auto-created draft descriptions (#436).
+
+    Encodes source task + finding id (NOT submission generation), so a
+    resubmitted verdict maps the same finding to the same draft instead of
+    creating a duplicate.
+    """
+    return f"[auto-draft: task #{task_id} finding #{finding_id}]"
+
+
+async def create_drafts_for_out_of_scope_findings(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    body: TaskReviewVerdict,
+) -> list[int]:
+    """Auto-create DRAFT follow-up tasks for unlinked out-of-scope findings (#436).
+
+    For each ``out_of_scope`` finding without ``linked_task_id``, creates a
+    draft task (source=agent → DoR gate stays: a human decides whether to
+    take it into work) and stamps the created id into the finding, so the
+    stored verdict references the follow-up. Returns ids created in THIS
+    call. Idempotency: findings already linked are skipped, and an existing
+    draft carrying the same back-reference marker is reused (incident #392:
+    out-of-scope findings got lost until #424–#427 were created manually).
+    """
+    pending = [
+        f
+        for f in body.findings
+        if f.scope == FindingScope.out_of_scope and not f.linked_task_id
+    ]
+    if not pending:
+        return []
+
+    # Drafts land under the reviewed task's feature parent so triage sees
+    # them in context. Any other parent kind (or none) → top-level draft;
+    # the strict hierarchy only allows feature as a task's parent.
+    parent_id: int | None = None
+    if task.get("parent_id"):
+        parent_row = await repo.get_task(db, task["parent_id"])
+        if parent_row is not None and parent_row["task_type"] == "feature":
+            parent_id = int(parent_row["id"])
+
+    source_task_id = int(task["id"])
+    generation = task.get("submission_generation") or 0
+    created: list[int] = []
+    for f in pending:
+        marker = out_of_scope_draft_marker(source_task_id, f.id)
+        existing = await repo.find_task_id_by_description_marker(db, marker)
+        if existing is not None:
+            f.linked_task_id = existing
+            continue
+
+        place = f"{f.file}:{f.line}" if f.file and f.line else f.file
+        lines = [
+            f"Out-of-scope review finding #{f.id} from review of task "
+            f"#{source_task_id} (submission #{generation}).",
+            "",
+            f"Severity: {f.severity.value}",
+        ]
+        if place:
+            lines.append(f"Location: {place}")
+        lines.append(f"Finding: {f.message}")
+        if f.recommendation:
+            lines.append(f"Recommendation: {f.recommendation}")
+        lines.extend(["", marker])
+
+        title = f"Review follow-up: {f.message}"
+        if len(title) > 500:
+            title = title[:499] + "…"
+
+        view = await create_task(
+            db,
+            TaskCreate(
+                title=title,
+                description="\n".join(lines),
+                task_type=TaskType.task,
+                parent_id=parent_id,
+                source=TaskSource.agent,
+                agent=(body.agent or "").strip() or "reviewer",
+                rationale=(
+                    f"Auto-created from out-of-scope review finding #{f.id} "
+                    f"on task #{source_task_id} (#436)"
+                ),
+                run_immediately=False,
+            ),
+        )
+        f.linked_task_id = view.id
+        created.append(view.id)
+    return created
+
+
 async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1152,6 +1243,11 @@ async def record_review_verdict(
     result) marks the verdict as non-independent: the flag is persisted on
     the task row, echoed in the task update, and logged as a warning so a
     weakened Review Gate stays visible in hindsight (#434).
+
+    ``create_tasks_for_out_of_scope`` (#436): opt-in auto-creation of DRAFT
+    follow-up tasks for unlinked out-of-scope findings, so they cannot get
+    lost when the reviewer forgets to create tasks manually. See
+    :func:`create_drafts_for_out_of_scope_findings`.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1199,6 +1295,13 @@ async def record_review_verdict(
                 422,
                 f"machine-review обязателен для аппрува этой задачи: {gap}",
             )
+
+    # Auto-draft follow-ups BEFORE persisting the verdict so the created
+    # ids land in the stored findings (create_task commits on its own, so
+    # it must run outside the verdict's write-lock critical section).
+    auto_created: list[int] = []
+    if body.create_tasks_for_out_of_scope and body.findings:
+        auto_created = await create_drafts_for_out_of_scope_findings(db, task, body)
 
     async with get_write_lock(db):
         findings_json = json.dumps(
@@ -1255,6 +1358,12 @@ async def record_review_verdict(
                 content += (
                     f"\nWarning: out-of-scope finding(s) {ids} have no "
                     "linked_task_id — create follow-up task(s) and link them."
+                )
+            if auto_created:
+                ids = ", ".join(f"#{i}" for i in auto_created)
+                content += (
+                    f"\nAuto-created draft task(s) for out-of-scope "
+                    f"findings: {ids} (awaiting human DoR approval)."
                 )
         if body.comments.strip():
             content += f"\n{body.comments.strip()}"

@@ -1929,6 +1929,38 @@ async def test_hub_submit_review_forwards_scope_fields(
     )
 
 
+async def test_hub_submit_review_forwards_auto_draft_flag(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #436: create_tasks_for_out_of_scope passes through to the REST body
+    # only when set — the default keeps the canonical payload unchanged.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {
+            "id": 1,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+        },
+        {"id": 2, "severity": "high", "message": "Fix here"},
+    ]
+    await hub_submit_review(
+        42,
+        verdict="changes_requested",
+        findings=findings,
+        create_tasks_for_out_of_scope=True,
+    )
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "findings": findings,
+            "create_tasks_for_out_of_scope": True,
+        },
+    )
+
+
 async def test_hub_report_done_review_gate_envelope(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:

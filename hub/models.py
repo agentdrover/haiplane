@@ -362,12 +362,20 @@ class TaskReviewVerdict(BaseModel):
     Extended in #308 with structured findings: they are persisted on the
     task row (not in the update text), so the payload stays machine-readable
     without stressing TaskUpdate content limits.
+
+    ``create_tasks_for_out_of_scope`` (#436): when true, every
+    ``out_of_scope`` finding without a ``linked_task_id`` gets a DRAFT
+    follow-up task auto-created (DoR gate stays — a human decides whether to
+    take it into work) and the created id is stamped into the stored
+    finding. Idempotent: already-linked findings are skipped and resubmits
+    reuse the existing draft via a back-reference marker in its description.
     """
 
     verdict: ReviewVerdict
     agent: str = Field("", max_length=100)
     comments: str = Field("", max_length=50000)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=50)
+    create_tasks_for_out_of_scope: bool = False
 
 
 class LatestReview(BaseModel):

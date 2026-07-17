@@ -1022,6 +1022,70 @@ async def test_review_verdict_api_finding_scope_roundtrip(client: AsyncClient):
     assert brief_findings[1]["linked_task_id"] == 436
 
 
+async def test_review_verdict_api_auto_creates_drafts_for_out_of_scope(
+    client: AsyncClient,
+):
+    # #436: create_tasks_for_out_of_scope=true auto-creates a DRAFT
+    # follow-up task and stamps its id into the stored finding.
+    task_id = await _running_pair_task(client, "Auto draft API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "create_tasks_for_out_of_scope": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    findings = resp.json()["latest_review"]["findings"]
+    linked_id = findings[1]["linked_task_id"]
+    assert linked_id is not None
+    assert findings[0]["linked_task_id"] is None
+
+    draft = (await client.get(f"/api/tasks/{linked_id}")).json()
+    assert draft["status"] == "draft"
+    assert draft["task_type"] == "task"
+    assert draft["parent_id"] is None
+    assert f"from review of task #{task_id}" in draft["description"]
+
+
+async def test_review_verdict_api_flag_off_keeps_findings_unlinked(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "Flag off API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["latest_review"]["findings"][1]["linked_task_id"] is None
+
+
 async def test_review_verdict_api_rejects_all_out_of_scope_findings(
     client: AsyncClient,
 ):

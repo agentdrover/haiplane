@@ -662,6 +662,26 @@ async def get_siblings(
     )
 
 
+async def find_task_id_by_description_marker(
+    db: aiosqlite.Connection,
+    marker: str,
+) -> int | None:
+    """Return the oldest non-archived task whose description contains ``marker``.
+
+    Used by the out-of-scope auto-draft flow (#436) to keep draft creation
+    idempotent across verdict resubmissions: the marker encodes the source
+    task + finding id, so an existing draft is reused instead of duplicated.
+    ``instr`` is a literal substring match — no LIKE wildcard escaping needed.
+    """
+    cur = await db.execute(
+        "SELECT id FROM tasks WHERE instr(description, ?) > 0 AND archived=0 "
+        "ORDER BY id ASC LIMIT 1",
+        (marker,),
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Tasks — Write
 # ---------------------------------------------------------------------------
