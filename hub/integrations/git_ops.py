@@ -621,3 +621,80 @@ class GitOpsIntegration:
         await _git("checkout", "main", repo=repo, check=False)
         await _git("branch", "-D", branch, repo=repo, check=False)
         log.info("Deleted local branch %s", branch)
+
+    async def clone_repo(
+        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+    ) -> tuple[bool, str]:
+        """Provision a project workspace (#347). Returns (ok, detail).
+
+        Access is pre-checked with ``ls-remote`` so a missing deploy key or
+        gh auth fails with a readable message instead of a clone stacktrace.
+        Idempotent: an existing clone is verified against the expected
+        origin (owner/repo) and fetched instead of re-cloned.
+        """
+        import os
+
+        url = repo_url
+        if "://" not in url and not url.startswith("git@"):
+            url = f"git@github.com:{repo_url}.git"
+
+        rc, _, err = await _run(
+            "git",
+            "ls-remote",
+            "--heads",
+            url,
+            base_branch,
+            timeout=60,
+            check=False,
+        )
+        if rc != 0:
+            return False, f"remote not accessible: {err[:300] or 'ls-remote failed'}"
+
+        git_dir = os.path.join(workspace_path, ".git")
+        if os.path.isdir(git_dir):
+            rc, origin, err = await _run(
+                "git",
+                "-C",
+                workspace_path,
+                "remote",
+                "get-url",
+                "origin",
+                check=False,
+            )
+            slug = repo_url.removesuffix(".git").lower()
+            if rc != 0 or slug.split(":")[-1] not in origin.lower():
+                return False, (
+                    f"existing workspace origin mismatch: {origin or err} "
+                    f"(expected {repo_url})"
+                )
+            rc, _, err = await _run(
+                "git",
+                "-C",
+                workspace_path,
+                "fetch",
+                "origin",
+                timeout=300,
+                check=False,
+            )
+            if rc != 0:
+                return False, f"fetch failed: {err[:300]}"
+            log.info("clone_repo: verified existing clone at %s", workspace_path)
+            return True, "existing clone verified, origin fetched"
+
+        os.makedirs(os.path.dirname(workspace_path) or "/", exist_ok=True)
+        rc, _, err = await _run(
+            "git",
+            "clone",
+            "--branch",
+            base_branch,
+            url,
+            workspace_path,
+            timeout=600,
+            check=False,
+        )
+        if rc != 0:
+            return False, f"clone failed: {err[:300]}"
+        log.info(
+            "clone_repo: cloned %s → %s (%s)", repo_url, workspace_path, base_branch
+        )
+        return True, f"cloned {repo_url} ({base_branch})"

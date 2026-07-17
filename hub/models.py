@@ -872,6 +872,8 @@ class ProjectView(BaseModel):
     default_branch: str = "develop"
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
     archived: bool = False
+    provision_status: str = "none"
+    provision_detail: str = ""
     created_at: str = ""
     updated_at: str = ""
 

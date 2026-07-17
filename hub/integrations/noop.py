@@ -186,6 +186,12 @@ class NoopGitOps:
     async def delete_branch(self, branch: str, repo: str | None = None) -> None:
         pass
 
+    async def clone_repo(
+        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+    ) -> tuple[bool, str]:
+        # Valid provision outcome (#347): the operator sees WHY it failed.
+        return False, "git ops disabled (noop integration)"
+
 
 class NoopGitHub:
     async def recent_commits(self, limit: int = 10) -> list[dict[str, Any]]:

@@ -2407,3 +2407,99 @@ async def test_event_completed_on_report_done(db: aiosqlite.Connection):
     evs = [e for e in await _all_events(db) if e["kind"] == "task_completed"]
     assert len(evs) == 1
     assert json.loads(evs[0]["payload"])["via"] == "report_done"
+
+
+# --- workspace provisioning (#347) ---
+
+
+async def _provision_target(db: aiosqlite.Connection, **overrides) -> int:
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    fields = {
+        "slug": "prov",
+        "name": "Prov",
+        "repo_name": "mrPDA/prov",
+        "workspace_path": "/srv/prov",
+        "default_branch": "trunk",
+    }
+    fields.update(overrides)
+    pid = await repo.create_project(db, **fields)
+    await db.commit()
+    return pid
+
+
+async def test_provision_project_success_and_repeat(db: aiosqlite.Connection):
+    # AC-1: clone called with repo/workspace/base; repeat is the fetch path.
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    pid = await _provision_target(db)
+    clone = AsyncMock(side_effect=[(True, "cloned"), (True, "existing clone verified")])
+    plugins.git_ops.clone_repo = clone
+
+    result = await services.provision_project(db, pid, actor="denis")
+    assert result["provision_status"] == "ok"
+    clone.assert_awaited_with("mrPDA/prov", "/srv/prov", "trunk")
+    row = await repo.get_project(db, pid)
+    assert row["provision_status"] == "ok"
+    assert row["provision_detail"] == "cloned"
+
+    again = await services.provision_project(db, pid)
+    assert again["provision_status"] == "ok"
+    assert "existing clone" in again["provision_detail"]
+
+    events = [
+        dict(e)
+        for e in await repo.list_events(db, since=0, kinds=["project_provisioned"])
+    ]
+    assert len(events) == 2
+    assert events[0]["project_id"] == pid
+
+
+async def test_provision_project_remote_inaccessible(db: aiosqlite.Connection):
+    # AC-2: readable error detail, project row otherwise intact.
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    pid = await _provision_target(db, slug="broken", workspace_path="/srv/broken")
+    plugins.git_ops.clone_repo = AsyncMock(
+        return_value=(False, "remote not accessible: no deploy key")
+    )
+    result = await services.provision_project(db, pid)
+    assert result["provision_status"] == "error"
+    assert "remote not accessible" in result["provision_detail"]
+    row = await repo.get_project(db, pid)
+    assert row["provision_status"] == "error"
+    assert row["slug"] == "broken" and row["archived"] == 0
+
+
+async def test_provision_project_missing_repo_or_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    clone = AsyncMock()
+    plugins.git_ops.clone_repo = clone
+    pid = await _provision_target(db, slug="norepo", repo_name="")
+    result = await services.provision_project(db, pid)
+    assert result["provision_status"] == "error"
+    assert "no repo" in result["provision_detail"]
+
+    pid2 = await _provision_target(db, slug="nows", workspace_path="")
+    result2 = await services.provision_project(db, pid2)
+    assert result2["provision_status"] == "error"
+    assert "workspace_path" in result2["provision_detail"]
+    clone.assert_not_awaited()
+
+
+async def test_provision_project_noop_gitops_is_readable_error(
+    db: aiosqlite.Connection,
+):
+    # Noop integration is a valid outcome: error + WHY, never a crash.
+    pid = await _provision_target(db, slug="noop")
+    result = await services.provision_project(db, pid)
+    assert result["provision_status"] == "error"
+    assert "git ops disabled" in result["provision_detail"]

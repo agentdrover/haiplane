@@ -10,7 +10,16 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -219,6 +228,7 @@ async def api_create_project(
     body: ProjectCreate,
     request: Request,
     identity=Depends(current_identity),
+    background_tasks: BackgroundTasks = None,
 ):
     """Create a project (#338/#345).
 
@@ -257,6 +267,18 @@ async def api_create_project(
         f"Project {body.slug} (#{pid}) created as {status_value} "
         f"by {identity.username}",
     )
+    # Auto-provision (#347): an active project with repo+workspace starts
+    # cloning right away — after the response, so a slow clone never blocks
+    # creation and a git failure lands in provision_status, not in a 500.
+    if (
+        background_tasks is not None
+        and status_value == "active"
+        and body.repo.strip()
+        and body.workspace_path.strip()
+    ):
+        background_tasks.add_task(
+            services.provision_project, db, pid, actor=identity.username
+        )
     row = await repo.get_project(db, pid)
     return ProjectView(**dict(row))
 
@@ -351,6 +373,22 @@ async def api_list_events(
         "events": events,
         "next_cursor": events[-1]["id"] if events else since,
     }
+
+
+@app.post("/api/projects/{project_id}/provision")
+async def api_provision_project(
+    project_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Clone/verify the project workspace on demand (#347). Human gate:
+    provisioning touches the server filesystem and git credentials."""
+    db = _db(request)
+    if await repo.get_project(db, project_id) is None:
+        raise HTTPException(404, "project not found")
+    result = await services.provision_project(db, project_id, actor=_identity.username)
+    row = await repo.get_project(db, project_id)
+    return {**result, "project": ProjectView(**dict(row))}
 
 
 @app.post("/api/telemetry/deprecated-tool")
