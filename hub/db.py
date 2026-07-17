@@ -532,6 +532,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_job_missing_since_column",
         "ALTER TABLE tasks ADD COLUMN job_missing_since TEXT",
     ),
+    # ---- At-most-once arbiter dispatch (#421): the arbiter fact used to be
+    # inferred from an agent-written update, so a repeat poll or restart could
+    # re-dispatch a paid arbiter job. These columns make the dispatch a durable
+    # conditional claim per submission generation: state dispatching→running→
+    # finished, with the job id and the dispatch clock. Existing rows start with
+    # NULL state (no arbiter in flight).
+    (
+        "add_arbiter_generation_column",
+        "ALTER TABLE tasks ADD COLUMN arbiter_generation INTEGER",
+    ),
+    ("add_arbiter_state_column", "ALTER TABLE tasks ADD COLUMN arbiter_state TEXT"),
+    ("add_arbiter_job_id_column", "ALTER TABLE tasks ADD COLUMN arbiter_job_id TEXT"),
+    (
+        "add_arbiter_dispatch_at_column",
+        "ALTER TABLE tasks ADD COLUMN arbiter_dispatch_at TEXT",
+    ),
 ]
 
 

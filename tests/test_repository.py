@@ -592,3 +592,31 @@ async def test_ci_no_pr_attempts_increment_and_reset(db: aiosqlite.Connection):
     row = dict(await repo.get_task(db, task_id))
     assert row["ci_no_pr_attempts"] == 0
     assert row["ci_check_started_at"] is None
+
+
+async def test_claim_arbiter_dispatch_at_most_once(db: aiosqlite.Connection):
+    # AC-1 (#421): the first claim for a generation sets a durable dispatching
+    # marker; a second claim for the same generation is refused; a new
+    # generation opens a fresh window.
+    task_id = await _make_task(db, status="review")
+    await repo.bump_submission_generation(db, task_id)  # generation 1
+    await db.commit()
+
+    assert await repo.claim_arbiter_dispatch(db, task_id, 1) is True
+    row = dict(await repo.get_task(db, task_id))
+    assert row["arbiter_state"] == "dispatching"
+    assert row["arbiter_generation"] == 1
+    assert row["arbiter_dispatch_at"] is not None
+    assert row["arbiter_job_id"] is None
+
+    assert await repo.claim_arbiter_dispatch(db, task_id, 1) is False
+
+    await repo.mark_arbiter_running(db, task_id, "arb-1")
+    row = dict(await repo.get_task(db, task_id))
+    assert row["arbiter_state"] == "running"
+    assert row["arbiter_job_id"] == "arb-1"
+    # Still refused while running.
+    assert await repo.claim_arbiter_dispatch(db, task_id, 1) is False
+
+    # A newer submission generation is a fresh window.
+    assert await repo.claim_arbiter_dispatch(db, task_id, 2) is True

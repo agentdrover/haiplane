@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hub import repository as repo
+from hub import services
 from hub.integrations.noop import NoopDispatch, NoopGitOps
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
@@ -814,3 +815,88 @@ async def test_ci_check_passes_project_context(mock_sleep, db):
     kwargs = mock_git.check_pr_ci.await_args.kwargs
     assert "gh_repo" in kwargs
     assert "repo" in kwargs
+
+
+# ---- At-most-once arbiter dispatch (#421) ----
+
+
+async def _make_review_gen1(db):
+    task_id = await repo.create_task(
+        db,
+        title="Arbiter task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)  # generation 1
+    await db.commit()
+    return task_id
+
+
+async def test_arbiter_dispatch_skipped_when_marker_exists(db):
+    # AC-2 (#421): an existing dispatching/running marker for the generation
+    # means a repeat call never submits a second paid job.
+    task_id = await _make_review_gen1(db)
+    await repo.claim_arbiter_dispatch(db, task_id, 1)
+    await repo.mark_arbiter_running(db, task_id, "arb-1")
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "arb-2"})
+    plugins.dispatch = mock_dispatch
+
+    task = dict(await repo.get_task(db, task_id))
+    await services.dispatch_arbiter(db, task, [])
+
+    mock_dispatch.submit_task.assert_not_called()
+
+
+async def test_arbiter_dispatch_marks_running_on_success(db):
+    # AC-3 (#421): a successful submit atomically moves the same marker to
+    # running and records the arbiter job id.
+    task_id = await _make_review_gen1(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "arb-9"})
+    plugins.dispatch = mock_dispatch
+
+    task = dict(await repo.get_task(db, task_id))
+    await services.dispatch_arbiter(db, task, [])
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["arbiter_state"] == "running"
+    assert row["arbiter_job_id"] == "arb-9"
+    assert row["review_job_id"] == "arb-9"
+    assert row["status"] == "review"
+    mock_dispatch.submit_task.assert_called_once()
+
+
+async def test_arbiter_dispatching_ambiguity_escalates(db):
+    # AC-4 (#421): a marker stuck dispatching (submit started, no job id) past
+    # the grace fails safe to needs_decision, never re-submitting.
+    task_id = await _make_review_gen1(db)
+    await repo.claim_arbiter_dispatch(db, task_id, 1)  # dispatching, no job id
+    await db.execute(
+        "UPDATE tasks SET arbiter_dispatch_at = datetime('now', '-60 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock()
+    plugins.dispatch = mock_dispatch
+
+    await _run_poll_once(db)
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"
+    assert row["arbiter_state"] == "finished"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert any("arbiter_dispatch_ambiguous" in (e["payload"] or "") for e in events)
+    mock_dispatch.submit_task.assert_not_called()
