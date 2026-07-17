@@ -17,6 +17,7 @@ from hub.models import (
     TaskClaim,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskPairStart,
     TaskPriority,
     TaskQuestion,
@@ -1325,7 +1326,11 @@ async def test_force_complete_from_pair_running(db: aiosqlite.Connection):
         priority="medium",
     )
     await db.commit()  # job_id stays NULL → pair task
-    tv = await services.force_complete_task(db, task_id)
+    tv = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Pair running human override"),
+    )
     assert tv.status.value == "completed"
 
 
@@ -1444,7 +1449,11 @@ async def test_force_complete_allows_terminal_dispatch_job(
         return_value={"status": "failed", "exit_code": 1}
     )
 
-    view = await services.force_complete_task(db, task_id)
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover after terminal dispatch job"),
+    )
     assert view.status.value == "completed"
     done = next(u for u in view.updates if u.kind == "done")
     assert "from_status=ci_check" in done.content
@@ -1452,12 +1461,72 @@ async def test_force_complete_allows_terminal_dispatch_job(
 
 
 async def test_force_complete_from_open(db: aiosqlite.Connection):
+    from hub.models import TaskForceComplete
+
     body = TaskCreate(title="Still open")
     tv = await services.create_task(db, body)
     assert tv.status.value == "open"
 
-    completed = await services.force_complete_task(db, tv.id)
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, tv.id)
+    assert exc_info.value.status_code == 400
+    assert "comment" in str(exc_info.value.detail)
+    assert "open" in str(exc_info.value.detail)
+
+    completed = await services.force_complete_task(
+        db, tv.id, TaskForceComplete(comment="Human shutdown from open")
+    )
     assert completed.status.value == "completed"
+
+
+async def test_force_complete_requires_comment_from_active_ci_check(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Stuck ci",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, task_id)
+    assert exc_info.value.status_code == 400
+    assert "ci_check" in str(exc_info.value.detail)
+
+
+async def test_force_complete_default_comment_from_pending_report(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Awaiting report",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
 
 
 async def test_force_complete_clears_stale_claim_metadata(
@@ -1486,7 +1555,11 @@ async def test_force_complete_clears_stale_claim_metadata(
     )
     await db.commit()
 
-    view = await services.force_complete_task(db, task_id)
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Clear stale claim after ci_check stuck"),
+    )
     assert view.status.value == "completed"
     assert view.claimed_by in (None, "")
     assert view.claim_session_id in (None, "")

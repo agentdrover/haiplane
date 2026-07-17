@@ -23,6 +23,7 @@ from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.models import (
+    ACTIVE_STATUSES,
     BatchApprove,
     BatchApproveResult,
     BatchApproveSkipped,
@@ -1724,6 +1725,9 @@ async def _has_incomplete_descendants(
     return bool(rows)
 
 
+_FORCE_COMPLETE_DEFAULT_COMMENT_STATUSES = frozenset({"pending_report", "claimed"})
+
+
 async def force_complete_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1777,7 +1781,19 @@ async def force_complete_task(
             _force_complete_job_overlay_note(label, job_ref, dispatch_status)
         )
 
-    base_comment = (body.comment.strip() if body else "") or (
+    comment_raw = (body.comment.strip() if body else "")
+    active_statuses = {s.value for s in ACTIVE_STATUSES}
+    if (
+        status in active_statuses
+        and status not in _FORCE_COMPLETE_DEFAULT_COMMENT_STATUSES
+        and not comment_raw
+    ):
+        raise HTTPException(
+            400,
+            f"force-complete from active status {status!r} requires a non-empty comment",
+        )
+
+    base_comment = comment_raw or (
         "Force-completed by human without agent report."
     )
     comment = _build_force_complete_comment(
