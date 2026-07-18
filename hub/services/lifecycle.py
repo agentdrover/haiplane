@@ -16,6 +16,7 @@ from hub import db as db_module
 from hub.actionable_errors import (
     done_report_error_detail,
     hierarchy_error_detail,
+    pair_start_claim_mismatch_detail,
     self_review_forbidden_detail,
     withdraw_own_draft_error_detail,
 )
@@ -75,6 +76,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     restore_pair_workspace_base,
     review_approved_for_current_submission,
+    switch_pair_workspace_to_task,
     transition_after_agent_done,
 )
 from hub.services.refinement import (
@@ -99,6 +101,21 @@ async def _try_restore_pair_workspace(
     except Exception:
         log.warning(
             "Failed to restore pair workspace base for task #%s",
+            task_id,
+            exc_info=True,
+        )
+
+
+async def _try_switch_pair_workspace_to_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort workspace switch to the task branch for rework (#457)."""
+    try:
+        await switch_pair_workspace_to_task(db, task_id)
+    except Exception:
+        log.warning(
+            "Failed to switch pair workspace to task branch for task #%s",
             task_id,
             exc_info=True,
         )
@@ -1054,10 +1071,24 @@ async def pair_start_task(
     if task["status"] == "claimed":
         holder = (task.get("claimed_by") or "").strip()
         if holder and assigned_agent and holder != assigned_agent:
-            raise HTTPException(
-                409,
-                f"Task #{task_id} is claimed by {holder}; pair-start denied",
+            # Principal is truth, name is presentational (#453): if the caller
+            # authenticated as the same principal that holds the claim, allow
+            # the pair-start even when the agent names differ.
+            claim_principal = task.get("implementer_principal_id")
+            same_principal = (
+                implementer_principal_id is not None
+                and claim_principal is not None
+                and implementer_principal_id == claim_principal
             )
+            if not same_principal:
+                raise HTTPException(
+                    409,
+                    detail=pair_start_claim_mismatch_detail(
+                        task_id=task_id,
+                        holder=holder,
+                        caller=assigned_agent,
+                    ),
+                )
     elif task["status"] != "open":
         raise HTTPException(
             400,
@@ -1472,6 +1503,9 @@ async def record_review_verdict(
                 await repo.update_task(
                     db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
                 )
+                # #451 restored the workspace to base on submit; on rework put it
+                # back on the task branch so fixes don't land on local base (#457).
+                await _try_switch_pair_workspace_to_task(db, task_id)
 
         await repo.insert_event(
             db,

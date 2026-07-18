@@ -136,6 +136,30 @@ async def _branch_is_fully_pushed(branch: str, repo: str) -> bool:
         return False
 
 
+async def _base_ahead_of_origin(base: str, repo: str) -> bool:
+    """True when local ``base`` has commits not present on ``origin/base`` (#457).
+
+    A pair branch cut from such a base would inherit those commits — the
+    contamination of incident #392, where a broken fetch left the local base
+    ahead of a stale origin ref. Returns False when ``origin/base`` is unknown
+    so a missing remote ref never blocks branch creation on its own.
+    """
+    rc, _, _ = await _git(
+        "rev-parse", "--verify", f"origin/{base}^{{commit}}", repo=repo, check=False
+    )
+    if rc != 0:
+        return False
+    rc, count, _ = await _git(
+        "rev-list", "--count", f"origin/{base}..{base}", repo=repo, check=False
+    )
+    if rc != 0:
+        return False
+    try:
+        return int(count.strip() or "0") > 0
+    except ValueError:
+        return False
+
+
 async def _default_workspace_error() -> str | None:
     """Readable reason when the default-project workspace is unusable (#378).
 
@@ -524,6 +548,25 @@ class GitOpsIntegration:
 
         await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
 
+        # Guard against branching on top of a local base that diverged from
+        # origin (broken fetch → stale origin ref → foreign commits, #457/#392).
+        if await _base_ahead_of_origin(base, repo):
+            raise _pair_branch_conflict(
+                f"Local {base!r} is ahead of origin/{base!r} in {repo}; "
+                f"refusing to create {branch!r} on top of unpushed base commits",
+                repo=repo,
+                reason="pair_base_ahead_of_origin",
+                hint=(
+                    f"The workspace {base!r} carries commits not on origin/{base!r} "
+                    f"(likely fixes committed to the local base, or a stale origin "
+                    f"ref from a broken fetch). On {_hostname()}: cd {repo} && "
+                    f"git log origin/{base}..{base} to inspect, then reconcile "
+                    f"(e.g. git reset --hard origin/{base} if they belong elsewhere) "
+                    f"before pair-start for #{task_id}."
+                ),
+                task_id=task_id,
+            )
+
         rc, _, err = await _git("checkout", "-b", branch, repo=repo, check=False)
         if rc != 0:
             if "already exists" in err:
@@ -585,6 +628,85 @@ class GitOpsIntegration:
             current,
         )
         return True
+
+    async def pair_switch_to_task_branch(
+        self,
+        task_id: int,
+        branch: str,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        """Best-effort: checkout the task branch when the workspace sits on base (#457).
+
+        Symmetric to pair_restore_workspace_base: used after a CHANGES_REQUESTED
+        verdict so rework commits land on the task branch, not the local base.
+        Only switches a clean tree that is currently on the base branch — never
+        yanks another task's branch or clobbers uncommitted changes.
+        """
+        branch = (branch or "").strip()
+        if not branch:
+            return False
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                log.warning("pair_switch_to_task_branch: %s", reason)
+                return False
+        repo = repo or _repo_root()
+        base = base_branch or PAIR_BASE_BRANCH
+
+        rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        current = (current or "").strip()
+        if current == branch:
+            return True
+        if current != base:
+            # Only leave the base branch; never yank a different task's branch.
+            return False
+
+        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        if dirty.strip():
+            log.warning(
+                "pair_switch_to_task_branch: dirty worktree at %s, skipping switch",
+                repo,
+            )
+            return False
+
+        rc, _, err = await _git("checkout", branch, repo=repo, check=False)
+        if rc != 0:
+            log.warning(
+                "pair_switch_to_task_branch: checkout %s failed at %s: %s",
+                branch,
+                repo,
+                err,
+            )
+            return False
+        log.info(
+            "pair_switch_to_task_branch: switched %s to %s (was %s)",
+            repo,
+            branch,
+            current,
+        )
+        return True
+
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool:
+        """True when ``git ls-remote origin`` succeeds (#455).
+
+        A live check that the workspace can actually reach GitHub (deploy key,
+        ssh/network). Used to surface a silently stale base — pair branches cut
+        from a workspace whose fetch fails check=False land on old refs.
+        """
+        repo = repo or _repo_root()
+        rc, _, _ = await _git(
+            "ls-remote",
+            "--heads",
+            "origin",
+            repo=repo,
+            check=False,
+            timeout=timeout,
+        )
+        return rc == 0
 
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         rc, _, _ = await _git("checkout", branch, repo=repo, check=False)

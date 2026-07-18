@@ -1680,24 +1680,31 @@ async def test_hub_health_formats_config(mock_api_get: AsyncMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_hub_admin_my_identity_delegates_to_whoami(
+async def test_hub_admin_my_identity_uses_diagnostics_endpoint(
     mock_api_get: AsyncMock,
 ) -> None:
+    # #452: identity now delegates to the enriched diagnostics endpoint.
     mock_api_get.return_value = {
         "username": "alice",
         "role": "human",
-        "permissions_summary": ["tasks.read"],
-        "permissions_count": 1,
         "auth_source": "env",
-        "api_key_id": None,
         "principal_id": None,
+        "permissions_count": 1,
+        "instance": "local",
+        "base_url": "http://127.0.0.1:8080",
+        "server_id": "laptop",
+        "connected_via": "http://127.0.0.1:8080",
+        "config_mismatch": False,
+        "workspace_path": "/repo",
+        "workspace_branch": "develop",
         "app_version": "0.1.0",
     }
 
     text = _mcp_text(await hub_admin_my_identity())
 
-    mock_api_get.assert_awaited_once_with("/api/whoami")
+    mock_api_get.assert_awaited_once_with("/api/diagnostics/identity")
     assert "User: alice (role: human)" in text
+    assert "Instance: local" in text
 
 
 async def test_hub_task_status_renders_latest_review(
@@ -2467,3 +2474,109 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     structured = _mcp_structured(out)
     assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
     mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")
+
+
+# --- hub_my_context: general context + mode normalization (#454) ---
+
+
+async def test_hub_my_context_without_task_id(mock_api_get: AsyncMock) -> None:
+    # AC-1 (#454): no task_id → general Hub context, no validation error.
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        [{"id": 451, "title": "Pair workspace", "status": "completed"}],
+    ]
+    out = await hub_my_context()
+    text = _mcp_text(out)
+    assert "Hub Context (no task)" in text
+    assert "Identity: cursor" in text
+    assert "#451" in text
+    assert "Workflow reference" in text
+    # Identity is resolved via whoami first.
+    assert mock_api_get.await_args_list[0].args[0] == "/api/whoami"
+    structured = _mcp_structured(out)
+    assert structured["identity"]["username"] == "cursor"
+    assert structured["instance"] in ("prod", "local")
+
+
+async def test_hub_my_context_without_task_id_anonymous(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-1 (#454): even without an identity the general digest still renders.
+    mock_api_get.return_value = {}
+    out = await hub_my_context()
+    text = _mcp_text(out)
+    assert "Hub Context (no task)" in text
+    assert "Workflow reference" in text
+    # No username → no task lookup, only the whoami probe.
+    mock_api_get.assert_awaited_once_with("/api/whoami")
+
+
+async def test_hub_my_context_brief_alias(mock_api_get: AsyncMock) -> None:
+    # AC-2 (#454): 'brief' is accepted as an alias of 'summary'.
+    mock_api_get.return_value = {"context_text": "digest", "task": {"id": 5}}
+    out = await hub_my_context(5, mode="brief")
+    assert mock_api_get.await_args.args[0] == "/api/tasks/5/context?mode=summary"
+    assert "digest" in _mcp_text(out)
+
+
+async def test_hub_my_context_invalid_mode(mock_api_get: AsyncMock) -> None:
+    # AC-2 (#454): unknown mode → clear error listing allowed values, no API call.
+    out = await hub_my_context(5, mode="wat")
+    text = _mcp_text(out)
+    assert "full" in text and "summary" in text
+    mock_api_get.assert_not_awaited()
+
+
+# --- hub_admin_my_identity: enriched instance + workspace diagnostics (#452) ---
+
+
+def _diag_payload(**over: Any) -> dict[str, Any]:
+    data = {
+        "username": "cursor",
+        "role": "agent",
+        "auth_source": "db",
+        "principal_id": 7,
+        "permissions_count": 5,
+        "instance": "prod",
+        "base_url": "https://agenthai.ru",
+        "server_id": "agenthai",
+        "connected_via": "https://agenthai.ru",
+        "config_mismatch": False,
+        "workspace_path": "/srv/ws",
+        "workspace_branch": "develop",
+        "app_version": "1.2.3",
+    }
+    data.update(over)
+    return data
+
+
+async def test_hub_admin_my_identity_formats_diagnostics(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-3 (#452): one call surfaces identity, instance, server_id, workspace, branch.
+    mock_api_get.return_value = _diag_payload()
+    out = await hub_admin_my_identity()
+    text = _mcp_text(out)
+    assert "cursor" in text
+    assert "Instance: prod" in text
+    assert "server_id: agenthai" in text
+    assert "Workspace: /srv/ws" in text
+    assert "branch: develop" in text
+    assert "CONFIG MISMATCH" not in text
+    mock_api_get.assert_awaited_once_with("/api/diagnostics/identity")
+
+
+async def test_hub_admin_my_identity_warns_on_mismatch(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-2 (#452): a config/reality mismatch is flagged loudly.
+    mock_api_get.return_value = _diag_payload(
+        instance="local",
+        base_url="http://127.0.0.1:8080",
+        connected_via="https://agenthai.ru",
+        config_mismatch=True,
+    )
+    out = await hub_admin_my_identity()
+    text = _mcp_text(out)
+    assert "CONFIG MISMATCH" in text
+    assert "Connected via: https://agenthai.ru" in text

@@ -3833,9 +3833,15 @@ def test_matrix_covers_every_non_terminal_status_and_discriminator():
         assert s.value in covered, f"no lifecycle policy covers status {s.value}"
 
     for job_id, review_job_id in ((("j"), None), (None, None)):
-        assert resolve_instance("running", job_id=job_id, review_job_id=None) in LIFECYCLE_MATRIX
+        assert (
+            resolve_instance("running", job_id=job_id, review_job_id=None)
+            in LIFECYCLE_MATRIX
+        )
     for review_job_id in ("r", None):
-        assert resolve_instance("review", job_id=None, review_job_id=review_job_id) in LIFECYCLE_MATRIX
+        assert (
+            resolve_instance("review", job_id=None, review_job_id=review_job_id)
+            in LIFECYCLE_MATRIX
+        )
 
 
 # ---- Noop GitOps accepts project context keywords (#420) ----
@@ -3910,10 +3916,10 @@ async def test_decide_rework_closes_arbiter_marker(db: aiosqlite.Connection):
         (0, 3, False),
         (1, 3, False),
         (2, 3, False),
-        (3, 3, True),   # AC-2: budget spent at MAX
+        (3, 3, True),  # AC-2: budget spent at MAX
         (4, 3, True),
-        (5, 3, True),   # review_cycle > MAX
-        (0, 0, True),   # AC-3: MAX<=0 exhausted immediately
+        (5, 3, True),  # review_cycle > MAX
+        (0, 0, True),  # AC-3: MAX<=0 exhausted immediately
         (0, 1, False),
         (1, 1, True),
     ],
@@ -3943,3 +3949,131 @@ def test_review_budget_is_single_source_of_truth():
     helper_end = orch.index("async def dispatch_review")
     outside = orch[:helper_start] + orch[helper_end:]
     assert not pat.search(outside), "orchestration compares outside the helper"
+
+
+# --- pair-start claim mismatch: actionable hint + same-principal (#453) ---
+
+
+async def _make_claimed_for_pair(
+    db: aiosqlite.Connection, *, holder: str, principal_id: int | None
+) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="Claimed pair",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent=holder,
+        rationale="",
+        status="claimed",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db, task_id, claimed_by=holder, implementer_principal_id=principal_id
+    )
+    await repo.add_task_update(db, task_id, holder, "status", "Plan: fix it")
+    await db.commit()
+    return task_id
+
+
+async def test_pair_start_claim_mismatch_structured_error(db: aiosqlite.Connection):
+    # AC-1 (#453): different holder/caller and different principal → structured 409.
+    task_id = await _make_claimed_for_pair(db, holder="alice", principal_id=1)
+    with pytest.raises(HTTPException) as ei:
+        await services.pair_start_task(
+            db,
+            task_id,
+            TaskPairStart(assigned_agent="bob"),
+            caller="bob",
+            implementer_principal_id=2,
+        )
+    exc = ei.value
+    assert exc.status_code == 409
+    detail = exc.detail
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "pair_start_claim_mismatch"
+    assert detail["claimed_by"] == "alice"
+    assert detail["caller_identity"] == "bob"
+    assert "alice" in detail["hint"]
+    assert detail["suggested_tool"] == "hub_pair_start"
+
+
+async def test_pair_start_same_principal_different_name_allowed(
+    db: aiosqlite.Connection,
+):
+    # AC-2 (#453): same authenticated principal, different presentational name → allowed.
+    task_id = await _make_claimed_for_pair(
+        db, holder="cursor-orchestrator", principal_id=7
+    )
+    started = await services.pair_start_task(
+        db,
+        task_id,
+        TaskPairStart(assigned_agent="cursor"),
+        caller="cursor",
+        implementer_principal_id=7,
+    )
+    assert started.status.value == "running"
+
+
+async def test_pair_start_matching_name_still_allowed(db: aiosqlite.Connection):
+    # Guard: the happy path (name matches holder) is unaffected by the new check.
+    task_id = await _make_claimed_for_pair(db, holder="alice", principal_id=None)
+    started = await services.pair_start_task(
+        db, task_id, TaskPairStart(assigned_agent="alice"), caller="alice"
+    )
+    assert started.status.value == "running"
+
+
+# --- pair workspace switch back to task branch on rework (#457) ---
+
+
+async def test_changes_requested_switches_pair_workspace_to_task(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    # AC-1 (#457): CHANGES_REQUESTED (review→running) switches workspace to branch.
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    switch = AsyncMock(return_value=True)
+    plugins.git_ops.pair_switch_to_task_branch = switch
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="1. fix the tests",
+        ),
+    )
+
+    switch.assert_awaited_once()
+    assert switch.await_args.args[0] == task_id
+
+
+async def test_approved_verdict_does_not_switch_pair_workspace(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    # Symmetry check: APPROVED needs no switch (task moves on to report_done).
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    switch = AsyncMock(return_value=True)
+    plugins.git_ops.pair_switch_to_task_branch = switch
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    switch.assert_not_awaited()

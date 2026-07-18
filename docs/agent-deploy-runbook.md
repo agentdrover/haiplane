@@ -251,6 +251,53 @@ OPENCLAW_HUB_REPO=org/repo-name
 
 Подробнее: [software-development-workflow.md](../software-development-workflow.md#pair-mode-git-policy), [task-workflow.html](task-workflow.html#pair-git-policy).
 
+### Git-доступ сервисного пользователя (deploy key, #455)
+
+Сервисный пользователь `openclaw` на agenthai должен уметь `git fetch origin` в
+workspace хаба (`/var/lib/openclaw-hub/workspaces/_default`). Если доступа нет,
+`pair_prepare_branch` тихо делает `pull --ff-only` с `check=False` и создаёт
+pair-ветки от **устаревшего** develop.
+
+**Настройка (человек/админ, один раз):**
+
+1. Сгенерировать read-only deploy key (без passphrase) от имени `openclaw`:
+
+   ```sh
+   sudo -u openclaw ssh-keygen -t ed25519 -N '' \
+     -f /home/openclaw/.ssh/id_ed25519 -C 'openclaw@agenthai deploy'
+   sudo -u openclaw cat /home/openclaw/.ssh/id_ed25519.pub
+   ```
+
+2. Добавить публичный ключ в GitHub: репозиторий `mrPDA/openclaw-hub-standalone`
+   → Settings → Deploy keys → Add deploy key → **Allow write access ВЫКЛ**
+   (read-only достаточно; push идёт с машины разработчика).
+
+3. Прописать хост в `~openclaw/.ssh/config` (или задать `GIT_SSH_COMMAND` в
+   unit-файле сервиса):
+
+   ```
+   Host github.com
+     IdentityFile /home/openclaw/.ssh/id_ed25519
+     IdentitiesOnly yes
+   ```
+
+4. Убедиться, что `origin` использует ssh, а не https:
+   `sudo -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default remote set-url origin git@github.com:mrPDA/openclaw-hub-standalone.git`
+
+**Проверка (AC-1):**
+
+```sh
+ssh agenthai "sudo -n -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default fetch origin --prune \
+  && sudo -n -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default remote -v"
+```
+
+**Health-check в хабе (#455):** при `OPENCLAW_WORKSPACE_HEALTHCHECK=1` хаб на
+старте пробует `git ls-remote origin` в default workspace и пишет `WARNING` в
+лог, если origin недоступен (вместо тихого устаревания базы). Диагностика также
+доступна в `hub_admin_my_identity` (ветка workspace) и `GET
+/api/diagnostics/identity`. Метод `git_ops.origin_reachable(repo)` — переиспользуемая
+проверка. Секрет ключа в лог/чат не выводить.
+
 ## 10. Чеклист для следующего агента
 
 1. Прочитать задачу пользователя.

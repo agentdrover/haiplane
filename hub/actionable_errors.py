@@ -139,6 +139,41 @@ def self_review_forbidden_detail(agent: str) -> dict[str, Any]:
     )
 
 
+def pair_start_claim_mismatch_detail(
+    *, task_id: int, holder: str, caller: str
+) -> dict[str, Any]:
+    """409 for hub_pair_start when the claim holder ≠ resolved caller name (#453).
+
+    The name in hub_claim_task(agent=...) must match assigned_agent in
+    hub_pair_start; a mismatch here is almost always a wrong/missing
+    assigned_agent argument, so spell out both the holder and the caller
+    identity the server actually resolved, plus the two ways to recover.
+    """
+    caller_repr = caller or "(unresolved: token identity matched no agent name)"
+    return enrich_error_payload(
+        {
+            "reason": "pair_start_claim_mismatch",
+            "message": (
+                f"Task #{task_id} is claimed by '{holder}'; "
+                f"pair-start denied for '{caller_repr}'"
+            ),
+            "hint": (
+                f"The claim is held by '{holder}', but pair-start resolved your "
+                f"identity as '{caller_repr}'. Either call "
+                f"hub_pair_start(assigned_agent='{holder}') to continue as the "
+                "holder, or hub_release_task first and re-claim under your name. "
+                "The name in hub_claim_task(agent=...) must equal assigned_agent "
+                "in hub_pair_start (the same authenticated principal is accepted "
+                "even when the presentational name differs)."
+            ),
+            "claimed_by": holder,
+            "caller_identity": caller,
+            "task_id": task_id,
+            "suggested_tool": "hub_pair_start",
+        }
+    )
+
+
 def hierarchy_error_detail(
     raw_message: str,
     *,

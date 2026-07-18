@@ -18,14 +18,14 @@ from hub.services.tree_output import (
     truncate_text,
     TRUNCATION_NOTICE,
 )
-from hub.hub_instance import with_instance_echo
+from hub.hub_instance import instance_echo_fields, with_instance_echo
 from hub.mcp_envelope import (
     build_mutation_envelope,
     enrich_error_payload,
     format_echo_response,
     merge_mutation_response,
 )
-from hub.workflow_reference import build_mcp_instructions
+from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
 from hub.mcp_structured import (
@@ -805,24 +805,113 @@ async def hub_task_tree(
     return structured_echo_result(rendered.text, tree=tree)
 
 
+_CONTEXT_MODES = ("full", "summary")
+# Agents routinely guess ``brief`` for a shorter digest; accept it as an alias
+# of ``summary`` instead of failing with a raw pattern-mismatch error (#454).
+_CONTEXT_MODE_ALIASES = {"brief": "summary"}
+
+
+def _normalize_context_mode(mode: str) -> str:
+    """Coerce a context ``mode`` to a supported value or raise a clear error."""
+    normalized = (mode or "full").strip().lower()
+    normalized = _CONTEXT_MODE_ALIASES.get(normalized, normalized)
+    if normalized not in _CONTEXT_MODES:
+        allowed = ", ".join(_CONTEXT_MODES)
+        raise ValueError(
+            f"Invalid mode {mode!r}. Allowed values: {allowed} "
+            f"('brief' is accepted as an alias of 'summary')."
+        )
+    return normalized
+
+
+async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
+    """General Hub context for an agent with no active task (#454).
+
+    Combines the connected instance, the caller's identity, their active
+    (claimed) tasks, and the Workflow reference into one digest — the thing to
+    read when onboarding a session before any task is claimed.
+    """
+    instance = instance_echo_fields()
+    identity: dict[str, Any] = {}
+    my_tasks: list[dict[str, Any]] = []
+    try:
+        identity = await _api_get("/api/whoami")
+    except HubApiError:
+        identity = {}
+    username = (identity.get("username") or "").strip()
+    if username:
+        try:
+            my_tasks = await _api_get(
+                f"/api/tasks?claimed_by={urllib.parse.quote(username)}&limit=50"
+            )
+        except HubApiError:
+            my_tasks = []
+        if isinstance(my_tasks, dict):  # paginated envelope shape
+            my_tasks = my_tasks.get("tasks", [])
+
+    lines = ["## Hub Context (no task)"]
+    lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
+    if identity:
+        lines.append(
+            f"Identity: {username or 'anonymous'} "
+            f"(role={identity.get('role', '?')}, "
+            f"principal_id={identity.get('principal_id')})"
+        )
+    else:
+        lines.append("Identity: unavailable")
+    if my_tasks:
+        task_strs = [
+            f"#{t.get('id')} {t.get('title', '')} ({t.get('status', '?')})"
+            for t in my_tasks[:20]
+        ]
+        lines.append("Your claimed tasks: " + "; ".join(task_strs))
+    else:
+        lines.append("Your claimed tasks: none")
+    lines.append("")
+    lines.extend(lifecycle_map_lines())
+
+    text = "\n".join(lines)
+    effective_max = max_chars
+    if mode == "summary" and effective_max is None:
+        effective_max = 4000
+    if effective_max is not None:
+        text, truncated = truncate_text(text, effective_max)
+        if truncated and TRUNCATION_NOTICE not in text:
+            text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
+    return structured_echo_result(text, identity=identity, my_tasks=my_tasks)
+
+
 @mcp.tool()
 async def hub_my_context(
-    task_id: int,
+    task_id: int | None = None,
     max_chars: int | None = None,
     mode: str = "full",
 ) -> CallToolResult:
-    """Get full work context for an agent: hierarchy breadcrumb, siblings, progress, children.
+    """Get work context for an agent: hierarchy breadcrumb, siblings, progress, children.
 
-    Use this before starting work on a task to understand its place in the project.
+    Call it before starting work on a task to understand its place in the project.
+    Omit ``task_id`` (or pass null) to get the general Hub context instead — the
+    Workflow reference plus your own active tasks and the connected instance — which
+    is what to read when you have no active task yet.
+
     Without ``max_chars`` the full digest is returned (backward compatible).
     ``mode=summary`` caps the digest to 4000 chars unless ``max_chars`` is set
     explicitly. Truncated output ends with ``[truncated]``.
 
     Args:
-        task_id: The task ID to get context for
+        task_id: The task ID to get context for. Omit for general Hub context.
         max_chars: Maximum UTF-8 character length of the digest
-        mode: ``full`` (default) or ``summary``
+        mode: ``full`` (default) or ``summary``. ``brief`` is accepted as an
+            alias of ``summary``; any other value is rejected with the allowed set.
     """
+    try:
+        mode = _normalize_context_mode(mode)
+    except ValueError as exc:
+        return structured_echo_result(str(exc), error="invalid_mode")
+
+    if task_id is None:
+        return await _general_hub_context(max_chars=max_chars, mode=mode)
+
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
@@ -945,10 +1034,18 @@ async def hub_pair_start(
     Use this when a human works with a Cursor agent locally instead of
     ``hub_start_task``, which always calls oc-dev-dispatch.
 
+    If the task is already claimed, ``assigned_agent`` must match the claim
+    holder's name — i.e. the ``agent`` you passed to hub_claim_task. A mismatch
+    returns a structured ``pair_start_claim_mismatch`` error naming the holder
+    and the identity the server resolved. Pair-start by the same authenticated
+    principal is accepted even when the presentational name differs.
+
     Args:
         task_id: The open task ID to pair-start
         plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
-        assigned_agent: Agent name to record on the task. Empty uses caller identity.
+        assigned_agent: Agent name to record on the task; for a claimed task it
+            must equal the claim holder (hub_claim_task agent). Empty uses caller
+            identity, which may not match the holder — pass it explicitly.
         branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
     """
     prior_task = await _read_task(task_id)
@@ -1208,9 +1305,13 @@ async def hub_claim_task(
 ) -> str:
     """Claim an open task for one Cursor agent/session (409 if already claimed).
 
+    Remember the ``agent`` name you pass here: a later hub_pair_start must use
+    the same value as its ``assigned_agent`` (the name is how the holder is
+    matched), unless you pair-start under the same authenticated principal.
+
     Args:
         task_id: The open task ID
-        agent: Agent name taking the claim
+        agent: Agent name taking the claim; reuse it as assigned_agent in hub_pair_start
         session_id: Optional Cursor session id for conflict detection
     """
     prior_task = await _read_task(task_id)
@@ -2969,10 +3070,50 @@ async def hub_health() -> str:
     return _format_health(data)
 
 
+def _format_identity_diagnostics(data: dict[str, Any]) -> str:
+    lines = [
+        f"User: {data['username']} (role: {data['role']})",
+        f"Auth source: {data['auth_source']}",
+    ]
+    if data.get("principal_id") is not None:
+        lines.append(f"Principal id: {data['principal_id']}")
+    lines.append(f"Permissions: {data.get('permissions_count', 0)}")
+    lines.append(
+        f"Instance: {data['instance']} "
+        f"(base_url: {data['base_url']}, server_id: {data.get('server_id') or '?'})"
+    )
+    connected = data.get("connected_via")
+    if connected:
+        lines.append(f"Connected via: {connected}")
+    if data.get("config_mismatch"):
+        lines.append(
+            "⚠ CONFIG MISMATCH: the server's configured base_url host differs "
+            "from the address you actually reached — verify you are acting on "
+            "the intended instance before any destructive operation."
+        )
+    lines.append(
+        f"Workspace: {data.get('workspace_path') or '?'} "
+        f"(branch: {data.get('workspace_branch') or '?'})"
+    )
+    lines.append(f"App version: {data['app_version']}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def hub_admin_my_identity() -> str:
-    """Deprecated alias for :func:`hub_whoami`."""
-    return await hub_whoami()
+    """Show who you are and which instance/workspace you are really on (#452).
+
+    One call returns caller identity, the server instance (base_url + server_id),
+    the address you actually connected through, a mismatch warning when the
+    server's configured URL disagrees with reality, and the workspace path and
+    current branch. Read this before any destructive operation to avoid acting
+    on the wrong instance.
+    """
+    try:
+        data = await _api_get("/api/diagnostics/identity")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return _format_identity_diagnostics(data)
 
 
 def main():

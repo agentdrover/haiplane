@@ -106,3 +106,122 @@ def test_build_health_open_mode(monkeypatch):
     assert view.auth_required is False
     assert view.env_tokens_configured is False
     assert view.vast_enabled is False
+
+
+# --- identity diagnostics: honest instance + workspace (#452) ---
+
+
+async def test_identity_diagnostics_flags_config_mismatch(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.diagnostics import build_identity_diagnostics
+
+    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    plugins.git_ops.current_branch = AsyncMock(return_value="develop")
+
+    view = await build_identity_diagnostics(
+        TokenIdentity("alice", "agent"), connected_via="https://agenthai.ru"
+    )
+    assert view.instance == "local"
+    assert view.base_url == "http://127.0.0.1:8080"
+    assert view.connected_via == "https://agenthai.ru"
+    assert view.config_mismatch is True
+    assert view.workspace_branch == "develop"
+    assert view.workspace_path
+    assert view.server_id
+
+
+async def test_identity_diagnostics_no_mismatch_when_hosts_match(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.diagnostics import build_identity_diagnostics
+
+    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://agenthai.ru/mcp")
+    plugins.git_ops.current_branch = AsyncMock(return_value="")
+
+    view = await build_identity_diagnostics(
+        TokenIdentity("bot", "agent"), connected_via="https://agenthai.ru/x"
+    )
+    assert view.instance == "prod"
+    assert view.config_mismatch is False
+
+
+async def test_identity_diagnostics_no_connection_never_mismatches(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.diagnostics import build_identity_diagnostics
+
+    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    plugins.git_ops.current_branch = AsyncMock(return_value="")
+
+    view = await build_identity_diagnostics(
+        TokenIdentity("bot", "agent"), connected_via=""
+    )
+    assert view.config_mismatch is False
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_identity_endpoint(client, monkeypatch):
+    # AC-1/AC-2/AC-3 (#452): one call returns identity + honest instance + workspace.
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+
+    resp = await client.get(
+        "/api/diagnostics/identity",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["username"] == "alice"
+    assert data["role"] == "agent"
+    assert data["instance"] == "local"
+    assert data["base_url"] == "http://127.0.0.1:8080"
+    assert data["server_id"]
+    assert "workspace_path" in data
+    assert data["connected_via"]
+    # The test client reaches the app as 'testserver', not 127.0.0.1 → mismatch.
+    assert data["config_mismatch"] is True
+
+
+# --- default workspace origin health-check (#455) ---
+
+
+async def test_check_default_workspace_origin_warns(monkeypatch, tmp_path, caplog):
+    from unittest.mock import AsyncMock
+
+    import hub.services.diagnostics as diag
+    from hub.integrations.registry import plugins
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    plugins.git_ops.origin_reachable = AsyncMock(return_value=False)
+
+    with caplog.at_level("WARNING", logger="hub"):
+        ok = await diag.check_default_workspace_origin()
+
+    assert ok is False
+    assert any("cannot reach origin" in r.getMessage() for r in caplog.records)
+
+
+async def test_check_default_workspace_origin_ok(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    import hub.services.diagnostics as diag
+    from hub.integrations.registry import plugins
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    plugins.git_ops.origin_reachable = AsyncMock(return_value=True)
+
+    assert await diag.check_default_workspace_origin() is True
+
+
+async def test_check_default_workspace_origin_none_when_not_git(monkeypatch, tmp_path):
+    import hub.services.diagnostics as diag
+
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    assert await diag.check_default_workspace_origin() is None

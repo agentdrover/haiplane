@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from hub.models import (
     ActivityItem,
     DashboardData,
     HealthView,
+    IdentityDiagnosticsView,
     ReadinessReport,
     ReadinessTreeReport,
     BatchApprove,
@@ -93,7 +95,11 @@ from hub.services.refinement import (
     TaskNotFoundError,
     get_write_lock,
 )
-from hub.services.diagnostics import build_health, build_whoami
+from hub.services.diagnostics import (
+    build_health,
+    build_identity_diagnostics,
+    build_whoami,
+)
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -181,6 +187,17 @@ async def lifespan(app: FastAPI):
                     "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
                 )
 
+            # Workspace git health-check (#455): opt-in network probe so a
+            # broken deploy key on the default workspace is loud, not silent.
+            # Off by default to keep startup (and tests) free of network I/O.
+            if os.environ.get("OPENCLAW_WORKSPACE_HEALTHCHECK") == "1":
+                from hub.services.diagnostics import check_default_workspace_origin
+
+                try:
+                    await check_default_workspace_origin()
+                except Exception:
+                    log.warning("workspace origin health-check failed", exc_info=True)
+
             # Bootstrap token guard
             if config.HUB_BOOTSTRAP_TOKEN:
                 from hub.db import has_active_admin
@@ -228,6 +245,21 @@ async def health() -> HealthView:
 async def api_whoami(request: Request) -> WhoamiView:
     """Return the authenticated caller identity and permission summary."""
     return build_whoami(current_identity(request))
+
+
+@app.get("/api/diagnostics/identity", response_model=IdentityDiagnosticsView)
+async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
+    """Caller identity plus honest instance and workspace state (#452).
+
+    ``connected_via`` reflects the address the client actually reached (the
+    request Host), so ``config_mismatch`` catches a server whose
+    OPENCLAW_HUB_URL disagrees with reality — the trap that had an operator
+    editing prod while believing it was local.
+    """
+    connected_via = str(request.base_url).rstrip("/")
+    return await build_identity_diagnostics(
+        current_identity(request), connected_via=connected_via
+    )
 
 
 # ---------------------------------------------------------------------------

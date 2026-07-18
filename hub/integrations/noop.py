@@ -150,6 +150,21 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    async def pair_switch_to_task_branch(
+        self,
+        task_id: int,
+        branch: str,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        return False
+
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool:
+        return False
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 
