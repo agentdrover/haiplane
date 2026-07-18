@@ -3247,6 +3247,102 @@ async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
     assert "repo" not in kwargs and "base_branch" not in kwargs
 
 
+# --- pair workspace restore (#451) ---
+
+
+async def test_submit_for_review_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await _pair_running_task(db)
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.submit_for_review(db, task_id)
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == task_id
+
+
+async def test_report_done_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(
+        db,
+        TaskCreate(title="Done restore", auto_review=False),
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: finish")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.add_update(
+        db,
+        tv.id,
+        TaskUpdateCreate(agent="dev", kind="done", content="All done"),
+    )
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == tv.id
+
+
+async def test_release_task_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(db, TaskCreate(title="Release restore"))
+    claimed = await services.claim_task(
+        db, tv.id, TaskClaim(agent="dev-agent", session_id="sess-1")
+    )
+    assert claimed.status.value == "claimed"
+
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.release_task(
+        db, tv.id, TaskRelease(agent="dev-agent", session_id="sess-1")
+    )
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == tv.id
+
+
+async def test_pair_start_conflict_returns_structured_detail(db: aiosqlite.Connection):
+    from hub.integrations.git_ops import PairBranchConflictError
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(db, TaskCreate(title="Conflict task"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: go")
+    await db.commit()
+
+    async def boom(*args, **kwargs):
+        raise PairBranchConflictError(
+            "Uncommitted changes in workspace; commit or stash before pair-start",
+            reason="pair_branch_dirty",
+            hint="Commit or stash, then hub_pair_start.",
+            workspace_path="/var/lib/openclaw-hub/workspaces/_default",
+            hostname="agenthai",
+        )
+
+    plugins.git_ops.pair_prepare_branch = boom
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.pair_start_task(db, tv.id, caller="dev")
+
+    assert exc_info.value.status_code == 422
+    detail = exc_info.value.detail
+    assert detail["reason"] == "pair_branch_dirty"
+    assert detail["workspace_path"] == "/var/lib/openclaw-hub/workspaces/_default"
+    assert detail["hostname"] == "agenthai"
+    assert "hub_pair_start" in detail["hint"]
+
+
 # --- project binding at epic creation (#346) ---
 
 

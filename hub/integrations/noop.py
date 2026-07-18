@@ -139,6 +139,15 @@ class NoopGitOps:
         slug = (branch_slug or "").strip() or _slugify(title)
         return f"task-{task_id}/{slug}"
 
+    async def pair_restore_workspace_base(
+        self,
+        task_id: int,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        return False
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 
