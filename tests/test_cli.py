@@ -85,6 +85,7 @@ def test_cmd_create() -> None:
         priority="high",
         owner="",
         reviewer="",
+        request_id="",
     )
     with (
         patch.object(cli, "_api", mock_api),
@@ -106,6 +107,7 @@ def test_cmd_create() -> None:
             "priority": "high",
             "parent_id": 5,
         },
+        extra_headers=None,
     )
     assert json.loads(out.getvalue()) == created
 
@@ -124,6 +126,7 @@ def test_cmd_create_with_owner_and_reviewer() -> None:
         priority="medium",
         owner="alice",
         reviewer="bob",
+        request_id="",
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_task(args)
@@ -973,3 +976,150 @@ def test_load_payload_file_yaml_without_pyyaml(tmp_path: Path, monkeypatch) -> N
     with pytest.raises(SystemExit) as exc:
         cli._load_payload_file(str(f))
     assert exc.value.code == 2
+
+
+def test_cmd_submit_review() -> None:
+    result = {"id": 42, "status": "review", "submission_generation": 1}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(task_id=42, agent="dev", summary="first pass")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_submit_review(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/submit-review",
+        {"agent": "dev", "summary": "first pass"},
+    )
+
+
+def test_cmd_review_brief() -> None:
+    mock_api = MagicMock(return_value={"task_id": 42, "title": "T"})
+    args = argparse.Namespace(task_id=42)
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_brief(args)
+    assert rc == 0
+    mock_api.assert_called_once_with("GET", "/api/tasks/42/review-brief")
+
+
+def test_cmd_review_verdict_with_findings() -> None:
+    result = {"id": 42, "status": "running"}
+    mock_api = MagicMock(return_value=result)
+    findings = [{"id": 1, "severity": "high", "message": "Fix it"}]
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="changes_requested",
+        comments="see findings",
+        agent="reviewer",
+        findings_json=json.dumps(findings),
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "comments": "see findings",
+            "agent": "reviewer",
+            "findings": findings,
+        },
+    )
+
+
+def test_cmd_review_verdict_forwards_auto_draft_flag() -> None:
+    # #436: --create-tasks-for-out-of-scope passes through to the REST body.
+    result = {"id": 42, "status": "running"}
+    mock_api = MagicMock(return_value=result)
+    findings = [
+        {"id": 1, "severity": "low", "message": "Elsewhere", "scope": "out_of_scope"},
+        {"id": 2, "severity": "high", "message": "Fix it"},
+    ]
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="changes_requested",
+        comments="",
+        agent="reviewer",
+        findings_json=json.dumps(findings),
+        create_tasks_for_out_of_scope=True,
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": findings,
+            "create_tasks_for_out_of_scope": True,
+        },
+    )
+
+
+def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
+    args = argparse.Namespace(
+        task_id=42,
+        verdict="approved",
+        comments="",
+        agent="",
+        findings_json="{not json",
+    )
+    mock_api = MagicMock()
+    with patch.object(cli, "_api", mock_api):
+        rc = cli.cmd_review_verdict(args)
+    assert rc == 2
+    assert "invalid --findings-json" in capsys.readouterr().err
+    mock_api.assert_not_called()
+
+
+def test_cmd_approve_batch() -> None:
+    result = {"approved": [1, 2], "skipped": [{"task_id": 3, "reason": "dor_failed"}]}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(
+        task_ids=[1, 2, 3],
+        min_readiness=80,
+        no_require_dor=False,
+        allow_high_risks=False,
+        comment="batch",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_approve_batch(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/batch-approve",
+        {
+            "task_ids": [1, 2, 3],
+            "require_dor_passed": True,
+            "exclude_high_risks": True,
+            "min_readiness": 80,
+            "comment": "batch",
+        },
+    )
+
+
+def test_cmd_projects_create() -> None:
+    mock_api = MagicMock(return_value={"id": 2, "slug": "calc-kids"})
+    args = argparse.Namespace(
+        slug="calc-kids",
+        name="Calc Kids",
+        repo="mrPDA/calc-kids",
+        workspace_path="/srv/calc",
+        default_branch="develop",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_projects_create(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/projects",
+        {
+            "slug": "calc-kids",
+            "name": "Calc Kids",
+            "repo": "mrPDA/calc-kids",
+            "workspace_path": "/srv/calc",
+            "default_branch": "develop",
+        },
+    )

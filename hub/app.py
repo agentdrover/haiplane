@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,16 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,6 +28,7 @@ from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db
 from hub.integrations.registry import plugins
+from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     BulkChildTasksCreate,
     BulkRefine,
@@ -28,12 +39,26 @@ from hub.models import (
     HealthView,
     ReadinessReport,
     ReadinessTreeReport,
+    BatchApprove,
+    BatchApproveResult,
+    FindingScope,
+    ReviewBrief,
     TaskAnswer,
+    TaskReviewVerdict,
+    TaskSubmitReview,
     TaskApprove,
     TaskArchive,
     TaskClaim,
     TaskContextView,
     TaskCreate,
+    TaskProjectRef,
+    MachineReviewSubmit,
+    MachineReviewView,
+    ProjectCreate,
+    ProjectPatch,
+    ProjectView,
+    SkillCreate,
+    SkillView,
     TaskDecide,
     TaskForceComplete,
     TaskQuestion,
@@ -55,6 +80,7 @@ from hub.models import (
 from hub.auth import (
     AuthMiddleware,
     current_identity,
+    require_agent_caller,
     require_human_or_admin,
     require_permission,
 )
@@ -63,9 +89,17 @@ from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
+    ProjectBindError,
     TaskNotFoundError,
+    get_write_lock,
 )
 from hub.services.diagnostics import build_health, build_whoami
+from hub.services.task_idempotency import resolve_client_request_id
+from hub.services.tree_output import (
+    TreeOutputOptions,
+    apply_tree_limits,
+    truncate_text,
+)
 from hub.poller import start_poller
 from hub.web import router as web_router
 
@@ -86,7 +120,13 @@ def _register_plugins() -> None:
 
         plugins.dispatch = DispatchIntegration()
 
-    if config.WORKSPACE_REPO_LINK and config.WORKSPACE_REPO_LINK.exists():
+    # #378: git ops depend on the git binary, not on the default-project
+    # workspace. clone_repo (provisioning) must work on a fresh server;
+    # operations that DO need the default workspace degrade readably
+    # inside git_ops instead of silently disabling the whole plugin.
+    import shutil
+
+    if shutil.which("git"):
         from hub.integrations.git_ops import GitOpsIntegration
 
         plugins.git_ops = GitOpsIntegration()
@@ -196,8 +236,21 @@ async def api_whoami(request: Request) -> WhoamiView:
 
 
 @app.post("/api/tasks", response_model=TaskView)
-async def api_create_task(body: TaskCreate, request: Request):
-    return await services.create_task(_db(request), body)
+async def api_create_task(body: TaskCreate, request: Request, response: Response):
+    idem_key = resolve_client_request_id(
+        request.headers.get("X-Client-Request-Id"),
+        body.client_request_id,
+    )
+    outcome = await services.create_task(
+        _db(request),
+        body,
+        client_request_id=idem_key,
+    )
+    if idem_key:
+        response.status_code = (
+            status.HTTP_201_CREATED if outcome.is_new else status.HTTP_200_OK
+        )
+    return outcome.task
 
 
 @app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
@@ -210,7 +263,291 @@ async def api_create_subtasks_bulk(
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 
-@app.get("/api/tasks", response_model=list[TaskView])
+@app.post("/api/projects", response_model=ProjectView)
+async def api_create_project(
+    body: ProjectCreate,
+    request: Request,
+    identity=Depends(current_identity),
+    background_tasks: BackgroundTasks = None,
+):
+    """Create a project (#338/#345).
+
+    Humans create active projects. Agents PROPOSE: their projects start
+    as ``pending`` and stay out of git routing until a human activates
+    them (PATCH status=active). OPENCLAW_ALLOW_AGENT_PROJECTS=direct is
+    the solo-mode opt-out.
+    """
+    db = _db(request)
+    import json as _json
+
+    if identity.is_agent and config.ALLOW_AGENT_PROJECTS != "direct":
+        status_value = "pending"
+    else:
+        status_value = "active"
+    # Write lock serializes check-then-insert: two concurrent creates with the
+    # same slug would otherwise both pass the SELECT and the second INSERT
+    # would surface as IntegrityError → 500 instead of the promised 409.
+    async with get_write_lock(db):
+        if await repo.get_project_by_slug(db, body.slug) is not None:
+            raise HTTPException(409, f"project slug {body.slug!r} already exists")
+        pid = await repo.create_project(
+            db,
+            slug=body.slug,
+            name=body.name,
+            repo_name=body.repo,
+            workspace_path=body.workspace_path,
+            default_branch=body.default_branch,
+            default_branch_policy=_json.dumps(body.default_branch_policy),
+            status=status_value,
+        )
+        await db.commit()
+    await db_module.log_activity(
+        db,
+        "project_created",
+        f"Project {body.slug} (#{pid}) created as {status_value} "
+        f"by {identity.username}",
+    )
+    # Auto-provision (#347): an active project with repo+workspace starts
+    # cloning right away — after the response, so a slow clone never blocks
+    # creation and a git failure lands in provision_status, not in a 500.
+    if (
+        background_tasks is not None
+        and status_value == "active"
+        and body.repo.strip()
+        and body.workspace_path.strip()
+    ):
+        background_tasks.add_task(
+            services.provision_project, db, pid, actor=identity.username
+        )
+    row = await repo.get_project(db, pid)
+    return ProjectView(**dict(row))
+
+
+@app.get("/api/projects", response_model=list[ProjectView])
+async def api_list_projects(
+    request: Request,
+    include_archived: bool = Query(default=False),
+):
+    rows = await repo.list_projects(_db(request), include_archived=include_archived)
+    return [ProjectView(**dict(r)) for r in rows]
+
+
+@app.patch("/api/projects/{project_id}", response_model=ProjectView)
+async def api_patch_project(
+    project_id: int,
+    body: ProjectPatch,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    db = _db(request)
+    before = await repo.get_project(db, project_id)
+    if before is None:
+        raise HTTPException(404, "project not found")
+    fields = body.model_dump(exclude_unset=True)
+    if (
+        "default_branch_policy" in fields
+        and fields["default_branch_policy"] is not None
+    ):
+        import json as _json
+
+        fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
+    if "archived" in fields and fields["archived"] is not None:
+        fields["archived"] = int(fields["archived"])
+    if fields:
+        await repo.update_project(db, project_id, **fields)
+        if fields.get("status") == "active" and before["status"] != "active":
+            # Events feed (#349): a pending proposal became a real project.
+            await repo.insert_event(
+                db,
+                kind="project_activated",
+                project_id=project_id,
+                actor="human",
+                payload={"slug": before["slug"]},
+            )
+        await db.commit()
+    row = await repo.get_project(db, project_id)
+    return ProjectView(**dict(row))
+
+
+@app.get("/api/events")
+async def api_list_events(
+    request: Request,
+    since: int = Query(default=0, ge=0, description="Cursor: last seen event id"),
+    wait: int = Query(
+        default=0,
+        ge=0,
+        description="Long-poll seconds (capped at 60): block until events or timeout",
+    ),
+    kinds: str = Query(default="", description="Comma-separated kind filter"),
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    """Cursor-addressable events feed (#349).
+
+    Returns transition events with id > ``since`` oldest-first plus
+    ``next_cursor`` (last returned id; unchanged ``since`` when empty, so
+    repeat calls are idempotent). With ``wait`` > 0 the request long-polls:
+    periodic re-reads on asyncio.sleep — the shared write lock is never
+    held between reads, so writers are not starved.
+    """
+    import json as _json
+    import time as _time
+
+    db = _db(request)
+    kind_list = [k.strip() for k in kinds.split(",") if k.strip()] or None
+    deadline = _time.monotonic() + min(wait, 60)
+    while True:
+        rows = await repo.list_events(db, since=since, kinds=kind_list, limit=limit)
+        if rows or _time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(1.0)
+
+    events = []
+    for r in rows:
+        item = dict(r)
+        try:
+            item["payload"] = _json.loads(item.get("payload") or "{}")
+        except (TypeError, ValueError):
+            item["payload"] = {}
+        events.append(item)
+    return {
+        "events": events,
+        "next_cursor": events[-1]["id"] if events else since,
+    }
+
+
+@app.get("/api/skills", response_model=list[SkillView])
+async def api_list_skills(request: Request):
+    """Skills library (#380): latest version per name."""
+    rows = await repo.list_skills(_db(request))
+    return [SkillView(**dict(r)) for r in rows]
+
+
+@app.get("/api/skills/{name}", response_model=SkillView)
+async def api_get_skill(name: str, request: Request):
+    """Active version of a skill — what agents should execute."""
+    row = await repo.get_active_skill(_db(request), name)
+    if row is None:
+        raise HTTPException(404, f"no active skill named {name!r}")
+    return SkillView(**dict(row))
+
+
+@app.post("/api/skills", response_model=SkillView)
+async def api_create_skill(
+    body: SkillCreate,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """New skill version (#380). Draft-gate mirrors projects (#345):
+    humans publish active versions, agents PROPOSE drafts."""
+    import json as _json
+
+    db = _db(request)
+    status_value = "draft" if identity.is_agent else "active"
+    skill_id, version = await repo.create_skill_version(
+        db,
+        name=body.name,
+        kind=body.kind,
+        content=body.content,
+        tags=_json.dumps(body.tags, ensure_ascii=False),
+        project_id=body.project_id,
+        status=status_value,
+        created_by=identity.username,
+    )
+    if status_value == "active":
+        await repo.insert_event(
+            db,
+            kind="skill_activated",
+            actor=identity.username,
+            payload={"name": body.name, "version": version},
+        )
+    await db.commit()
+    await db_module.log_activity(
+        db,
+        "skill_version_created",
+        f"Skill {body.name} v{version} created as {status_value} "
+        f"by {identity.username}",
+    )
+    row = await repo.get_skill_version(db, body.name, version)
+    return SkillView(**dict(row))
+
+
+@app.patch("/api/skills/{name}/versions/{version}/activate", response_model=SkillView)
+async def api_activate_skill(
+    name: str,
+    version: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Activate a proposed skill version (human gate, #380)."""
+    db = _db(request)
+    row = await repo.get_skill_version(db, name, version)
+    if row is None:
+        raise HTTPException(404, "skill version not found")
+    if row["status"] != "active":
+        await repo.activate_skill_version(db, name, version)
+        await repo.insert_event(
+            db,
+            kind="skill_activated",
+            actor=_identity.username,
+            payload={"name": name, "version": version},
+        )
+        await db.commit()
+        await db_module.log_activity(
+            db,
+            "skill_activated",
+            f"Skill {name} v{version} activated by {_identity.username}",
+        )
+    row = await repo.get_skill_version(db, name, version)
+    return SkillView(**dict(row))
+
+
+@app.post("/api/projects/{project_id}/provision")
+async def api_provision_project(
+    project_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Clone/verify the project workspace on demand (#347). Human gate:
+    provisioning touches the server filesystem and git credentials."""
+    db = _db(request)
+    if await repo.get_project(db, project_id) is None:
+        raise HTTPException(404, "project not found")
+    result = await services.provision_project(db, project_id, actor=_identity.username)
+    row = await repo.get_project(db, project_id)
+    return {**result, "project": ProjectView(**dict(row))}
+
+
+@app.get("/api/metrics/practices")
+async def api_practice_metrics(
+    request: Request,
+    since_days: int = Query(default=90, ge=1, le=3650),
+):
+    """Practice metrics (#384): review economics, harness versions,
+    recurring finding categories, cycle times."""
+    return await services.practice_metrics(_db(request), since_days=since_days)
+
+
+@app.post("/api/telemetry/deprecated-tool")
+async def api_deprecated_tool_call(request: Request, body: dict[str, Any]):
+    """Stage-1 deprecation telemetry (#325, ADR-0002): count alias calls."""
+    tool = str(body.get("tool", ""))[:100]
+    replacement = str(body.get("replacement", ""))[:100]
+    agent = str(body.get("agent", ""))[:100]
+    await db_module.log_activity(
+        _db(request),
+        "deprecated_tool_call",
+        f"{tool} called{f' by {agent}' if agent else ''}; use {replacement}",
+    )
+    return {"ok": True}
+
+
+@app.get("/api/integrations/notes")
+async def api_notes_availability():
+    """Diagnose the notesforllm link (#251): available | no_binary | no_space | error."""
+    return await plugins.notes.availability()
+
+
+@app.get("/api/tasks", response_model=None)
 async def api_list_tasks(
     request: Request,
     status: str | None = None,
@@ -223,7 +560,20 @@ async def api_list_tasks(
     mine: str | None = Query(default=None, description="Filter owner OR claim holder"),
     limit: int = Query(default=50, le=200),
     include_archived: bool = Query(default=False, alias="include_archived"),
+    after_id: int | None = Query(
+        default=None,
+        ge=0,
+        description="Cursor (#254): 0 starts a paged walk, then pass next_cursor",
+    ),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
+    project: str | None = Query(
+        default=None,
+        description="Project slug filter (#336): subtree of the project's epics",
+    ),
 ):
+    """List tasks. Plain list without after_id/mode=summary (backward
+    compatible); paged/summary calls return {tasks, next_cursor} (#254).
+    ``project`` narrows to tasks whose root epic belongs to the project (#336)."""
     return await services.list_tasks(
         _db(request),
         status=status,
@@ -236,6 +586,9 @@ async def api_list_tasks(
         mine=mine,
         limit=limit,
         include_archived=include_archived,
+        after_id=after_id,
+        mode=mode,
+        project=project,
     )
 
 
@@ -260,6 +613,24 @@ async def api_archive_task(
     cascade = body.cascade if body else True
     try:
         return await services.archive_task(_db(request), task_id, cascade=cascade)
+    except TaskNotFoundError as exc:
+        raise _not_found_to_http(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/withdraw", response_model=TaskView)
+async def api_withdraw_own_draft(
+    task_id: int,
+    request: Request,
+    identity=Depends(require_agent_caller),
+):
+    """Agent-only: archive own agent draft without children (narrow withdraw)."""
+    try:
+        return await services.withdraw_own_draft(
+            _db(request),
+            task_id,
+            caller=identity.username,
+            caller_principal_id=identity.principal_id,
+        )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
 
@@ -299,17 +670,38 @@ async def api_delete_task(
 
 
 @app.get("/api/tasks/{task_id}/tree", response_model=TaskTreeNode)
-async def api_task_tree(task_id: int, request: Request):
-    """Get recursive tree of a task and all descendants."""
+async def api_task_tree(
+    task_id: int,
+    request: Request,
+    response: Response,
+    depth: int | None = Query(default=None, ge=0),
+    max_nodes: int | None = Query(default=None, ge=1),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
+):
+    """Get recursive tree of a task and all descendants.
+
+    Without limit parameters the full tree is returned (backward compatible).
+    Use ``mode=summary`` or explicit ``depth`` / ``max_nodes`` to cap output size.
+    """
     db = _db(request)
     tree = await db_module.build_tree(db, task_id)
     if not tree:
         raise HTTPException(404, "task not found")
-    return tree
+    options = TreeOutputOptions(depth=depth, max_nodes=max_nodes, mode=mode)  # type: ignore[arg-type]
+    limited, truncated = apply_tree_limits(tree, options)
+    if truncated:
+        response.headers["X-Hub-Truncated"] = "true"
+    return limited
 
 
 @app.get("/api/tasks/{task_id}/context", response_model=TaskContextView)
-async def api_task_context(task_id: int, request: Request):
+async def api_task_context(
+    task_id: int,
+    request: Request,
+    response: Response,
+    max_chars: int | None = Query(default=None, ge=1),
+    mode: str = Query(default="full", pattern="^(full|summary)$"),
+):
     """Full developer contract for a task (#41).
 
     Returns a single envelope covering:
@@ -340,6 +732,11 @@ async def api_task_context(task_id: int, request: Request):
     task_view = services.row_to_task(row)
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
     task_view.acceptance_criteria = [services.row_to_ac(r) for r in ac_rows]
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
 
     # --- Readiness summary. Reuse the same calculator as /readiness so
     # /context and /readiness can never drift.
@@ -430,12 +827,43 @@ async def api_task_context(task_id: int, request: Request):
             f"{r.kind.value}:{r.severity.value}" for r in task_view.risks[:5]
         )
         lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
+    if task_view.latest_review:
+        lr = task_view.latest_review
+        freshness = "current" if lr.is_current else "stale — work resubmitted"
+        solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
+        lines.append(
+            f"Latest review: {lr.verdict.value.upper()} "
+            f"for submission #{lr.submission_generation} ({freshness}){solo}"
+        )
+        for finding in lr.findings[:10]:
+            scope_mark = ""
+            if finding.scope == FindingScope.out_of_scope:
+                scope_mark = (
+                    f" [out-of-scope → #{finding.linked_task_id}]"
+                    if finding.linked_task_id
+                    else " [out-of-scope]"
+                )
+            lines.append(
+                f"  {finding.id}. [{finding.severity.value}]{scope_mark} "
+                f"{finding.message}"
+            )
     lines.append(
         f"Readiness: score={readiness_summary['score']} "
         f"dor_passed={'yes' if readiness_summary['dor_passed'] else 'no'}"
     )
     if missing_required:
         lines.append(f"  Missing required: {', '.join(missing_required)}")
+    if mode == "full":
+        lines.append("")
+        lines.extend(lifecycle_map_lines())
+
+    effective_max_chars = max_chars
+    if mode == "summary" and effective_max_chars is None:
+        effective_max_chars = 4000
+
+    context_text, char_truncated = truncate_text("\n".join(lines), effective_max_chars)
+    if char_truncated:
+        response.headers["X-Hub-Truncated"] = "true"
 
     return {
         "task_id": task_id,
@@ -443,11 +871,242 @@ async def api_task_context(task_id: int, request: Request):
         "siblings": siblings,
         "children": children,
         "progress": progress,
-        "context_text": "\n".join(lines),
+        "context_text": context_text,
         "task": task_view,
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
     }
+
+
+@app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)
+async def api_submit_for_review(
+    task_id: int,
+    request: Request,
+    body: TaskSubmitReview | None = None,
+):
+    """Submit the current work of a pair task for client-driven review (#307).
+
+    Canonical REST operation behind hub_submit_for_review and the
+    ``oc-hub submit-review`` CLI: running pair task → status=review with a
+    bumped submission generation.
+    """
+    return await services.submit_for_review(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)
+async def api_submit_machine_review(
+    task_id: int,
+    body: MachineReviewSubmit,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Accept a structured multi-agent review report (#381).
+
+    Bound to the task's CURRENT submission generation — resubmitting work
+    makes the report stale, exactly like human verdicts (#305). Informs
+    the human verdict; never replaces it.
+    """
+    import json as _json
+
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    generation = task.get("submission_generation") or 0
+    if generation == 0:
+        raise HTTPException(
+            400,
+            "no submission to review: submit_for_review must run at least once",
+        )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill=body.harness_skill,
+        harness_version=body.harness_version,
+        agent_count=body.agent_count,
+        tokens_spent=body.tokens_spent,
+        duration_ms=body.duration_ms,
+        orchestrator=body.orchestrator,
+        model=body.model,
+        raw_count=body.raw_count,
+        findings_confirmed=_json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings_confirmed],
+            ensure_ascii=False,
+        ),
+        findings_rejected=_json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings_rejected],
+            ensure_ascii=False,
+        ),
+        submitted_by=(body.agent or identity.username)[:100],
+    )
+    await repo.insert_event(
+        db,
+        kind="machine_review_completed",
+        task_id=task_id,
+        actor=(body.agent or identity.username)[:100],
+        payload={
+            "confirmed": len(body.findings_confirmed),
+            "rejected": len(body.findings_rejected),
+            "raw": body.raw_count,
+            "generation": generation,
+        },
+    )
+    await db.commit()
+    await db_module.log_activity(
+        db,
+        "machine_review_completed",
+        f"Task #{task_id}: machine review — {body.raw_count} raw → "
+        f"{len(body.findings_confirmed)} confirmed, "
+        f"{len(body.findings_rejected)} rejected",
+    )
+    saved = await repo.get_latest_machine_review(db, task_id)
+    view = MachineReviewView(**dict(saved))
+    view.is_current = view.submission_generation == generation
+    return view
+
+
+@app.post("/api/tasks/{task_id}/review-verdict", response_model=TaskView)
+async def api_review_verdict(
+    task_id: int,
+    request: Request,
+    body: TaskReviewVerdict,
+    identity=Depends(current_identity),
+):
+    """Record a review verdict for the current submission (#307).
+
+    Separation of duties (#318): the agent principal that implemented the
+    task (assigned_agent or claimed_by) may not review it. The check uses
+    the AUTHENTICATED identity — the ``agent`` field in the body is
+    display-only. Human/admin tokens always pass;
+    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` is the solo-mode opt-out.
+
+    Canonical REST operation behind hub_submit_review and the
+    ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
+    ``running``; this endpoint never completes a task.
+
+    Finding scope (#435): each finding carries ``scope``
+    (in_scope|out_of_scope, default in_scope) and an optional
+    ``linked_task_id`` referencing the follow-up task for out-of-scope
+    findings. ``changes_requested`` with findings requires at least one
+    in_scope finding (422 otherwise); out-of-scope findings without a
+    linked task produce a non-blocking warning in the review update.
+
+    Auto-drafts (#436): ``create_tasks_for_out_of_scope=true`` creates a
+    DRAFT follow-up task for each unlinked out-of-scope finding and stamps
+    its id into the stored finding; idempotent on resubmit.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    self_approved = False
+    if row is not None:
+        self_approved = services.ensure_reviewer_independence(
+            dict(row),
+            is_agent=identity.is_agent,
+            principal_id=identity.principal_id,
+            username=identity.username,
+        )
+    return await services.record_review_verdict(
+        db, task_id, body, self_approved=self_approved
+    )
+
+
+@app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
+async def api_review_brief(
+    task_id: int,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Everything a reviewer agent needs in one response (#308).
+
+    Bundles acceptance criteria, scope, validation commands, review
+    checklist, branch/PR metadata with an advisory diff command, and the
+    latest submission context — so review never depends on scraping task
+    prose. Works without a GitHub PR: ``pr_number`` is optional metadata.
+
+    Fail-fast self-review check (#433): when the caller is the agent that
+    implemented the task, the brief carries a ``self_review_warning`` so
+    the reviewer stops BEFORE spending review effort — hub_submit_review
+    (the source of truth) would reject the verdict anyway. Not a hard-fail:
+    the implementer may still read the brief for self-checking.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    self_review_warning = services.self_review_brief_warning(
+        dict(row),
+        is_agent=identity.is_agent,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
+    task_view = services.row_to_task(row)
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
+    ac_rows = await repo.list_acceptance_criteria(db, task_id)
+
+    # Latest submission context: the most recent done report, falling back
+    # to the most recent status update when the task has not reported yet.
+    latest_submission_summary = ""
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    for kind in ("done", "status"):
+        for u in reversed(updates):
+            if u.get("kind") == kind:
+                latest_submission_summary = u.get("content", "")
+                break
+        if latest_submission_summary:
+            break
+
+    diff_command = ""
+    if task_view.branch:
+        diff_command = f"git diff develop...{task_view.branch}"
+
+    machine_review = None
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    if mr_row is not None:
+        machine_review = MachineReviewView(**dict(mr_row))
+        machine_review.is_current = machine_review.submission_generation == (
+            task_view.submission_generation or 0
+        )
+
+    # Advisory branch-stacking check (#438): the reviewer should know when
+    # the diff includes another task's unmerged work. Best-effort — no repo
+    # access means no warning, never an error.
+    stacking_warning = ""
+    if task_view.branch:
+        stacking = await services.detect_branch_stacking(db, task_id, task_view.branch)
+        if stacking:
+            stacking_warning = stacking["message"]
+
+    return ReviewBrief(
+        task_id=task_view.id,
+        title=task_view.title,
+        status=task_view.status,
+        description=task_view.description,
+        project=task_view.project,
+        acceptance_criteria=[services.row_to_ac(r) for r in ac_rows],
+        scope_in=task_view.scope_in,
+        scope_out=task_view.scope_out,
+        out_of_scope_for_review=task_view.out_of_scope_for_review,
+        review_checklist=task_view.review_checklist,
+        validation_commands=task_view.validation_commands,
+        constraints=task_view.constraints,
+        technical_hints=task_view.technical_hints,
+        branch=task_view.branch,
+        pr_number=task_view.pr_number,
+        diff_command=diff_command,
+        review_cycle=task_view.review_cycle,
+        submission_generation=task_view.submission_generation,
+        latest_submission_summary=latest_submission_summary,
+        latest_review=task_view.latest_review,
+        machine_review=machine_review,
+        self_review_warning=self_review_warning,
+        stacking_warning=stacking_warning,
+    )
 
 
 @app.patch("/api/tasks/{task_id}/reorder", response_model=TaskView)
@@ -456,6 +1115,20 @@ async def api_reorder_task(task_id: int, body: TaskReorder, request: Request):
 
 
 # --- Approve / Reject / Start ---
+
+
+@app.post("/api/tasks/batch-approve", response_model=BatchApproveResult)
+async def api_batch_approve(
+    body: BatchApprove,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Approve many drafts in one human operation with per-task guards (#252).
+
+    Human-only like single approve; ``force`` is intentionally unsupported —
+    overrides remain individual, audited actions.
+    """
+    return await services.batch_approve_tasks(_db(request), body)
 
 
 @app.post("/api/tasks/{task_id}/approve", response_model=TaskView)
@@ -501,6 +1174,7 @@ async def api_pair_start_task(
         task_id,
         body,
         caller=identity.username,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
     )
 
 
@@ -514,7 +1188,12 @@ async def api_claim_task(
     """Claim an open task for one Cursor agent/session."""
     if not body.agent.strip():
         body = TaskClaim(agent=identity.username, session_id=body.session_id)
-    return await services.claim_task(_db(request), task_id, body)
+    return await services.claim_task(
+        _db(request),
+        task_id,
+        body,
+        implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+    )
 
 
 @app.post("/api/tasks/{task_id}/release", response_model=TaskView)
@@ -568,7 +1247,12 @@ async def api_force_complete_task(
     body: TaskForceComplete | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    """Force-complete a stuck task (pending_report/claimed/pair-running)."""
+    """Force-complete a non-terminal task/subtask (human-only audited override).
+
+    Allowed when no active dispatch job backs job_id or review_job_id; 409 if
+    active. Missing/terminal jobs are audited. Comment required for active
+    lifecycle states except pending_report/claimed.
+    """
     return await services.force_complete_task(_db(request), task_id, body)
 
 
@@ -625,6 +1309,8 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, 422) from exc
+    except ProjectBindError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -843,7 +1529,7 @@ async def api_create_proposal_compat(request: Request):
         agent=raw.get("agent", ""),
         rationale=raw.get("rationale", ""),
     )
-    return await services.create_task(_db(request), body)
+    return (await services.create_task(_db(request), body)).task
 
 
 @app.get("/api/proposals", response_model=list[TaskView])

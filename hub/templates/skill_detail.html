@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% set active = "skills" %}
+{% block title %}{{ name }} — Skills — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Skill: {{ name }}</h1>
+</header>
+
+{% if skill_error %}
+<div class="task-action-note task-action-note--warning project-error-note">
+    {{ skill_error }}
+</div>
+{% endif %}
+
+<details class="task-action-stack project-create">
+    <summary class="btn btn-primary">Edit as new version</summary>
+    <form method="post" action="/skills/{{ name }}/web-new-version" class="task-action-stack project-form">
+        <label class="task-action-label" for="ev-tags">Tags (comma-separated)</label>
+        <input id="ev-tags" name="tags" class="task-action-control" placeholder="review, quality">
+        <label class="task-action-label" for="ev-content">Content (предзаполнено активной версией — правка создаёт новую версию)</label>
+        <textarea id="ev-content" name="content" class="task-action-control task-action-textarea" required rows="16">{{ active_content }}</textarea>
+        <button class="btn btn-success task-action-btn" type="submit">Save as new version</button>
+    </form>
+</details>
+
+{% for v in versions %}
+<details {% if loop.first %}open{% endif %} class="task-action-stack project-create">
+    <summary class="project-edit-summary">
+        v{{ v.version }} — {{ v.kind }},
+        {% if v.status == 'active' %}<span class="badge badge-completed">active</span>
+        {% else %}<span class="badge badge-review">draft</span>{% endif %}
+        by {{ v.created_by }} at {{ v.created_at }}
+    </summary>
+    {% if v.status != 'active' %}
+    <form method="post" action="/skills/{{ name }}/versions/{{ v.version }}/web-activate" class="project-inline-form">
+        <button class="btn btn-success" type="submit"
+                onclick="return confirm('Активировать {{ name }} v{{ v.version }}? Агенты начнут получать эту версию.')">Activate v{{ v.version }}</button>
+    </form>
+    {% endif %}
+    <pre class="u-pre-wrap">{{ v.content }}</pre>
+</details>
+{% endfor %}
+{% endblock %}

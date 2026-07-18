@@ -41,14 +41,78 @@ HUB_HOST = os.environ.get("OPENCLAW_HUB_HOST", "127.0.0.1")
 HUB_PORT = int(os.environ.get("OPENCLAW_HUB_PORT", "8080"))
 
 MAX_REVIEW_CYCLES = int(os.environ.get("OPENCLAW_MAX_REVIEW_CYCLES", "3"))
+# Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
+# from the agent principal that implemented the task (assigned_agent or
+# claimed_by); 'allow' is the explicit solo-mode opt-out.
+REVIEW_SELF_APPROVE = os.environ.get("OPENCLAW_REVIEW_SELF_APPROVE", "forbid")
+# Projects V2 (#345): 'propose' (default) — agent-created projects start as
+# pending and need human activation; 'direct' is the solo-mode opt-out.
+ALLOW_AGENT_PROJECTS = os.environ.get("OPENCLAW_ALLOW_AGENT_PROJECTS", "propose")
+# Agent Practices (#382): 'warn' (default) — a missing machine-review report
+# only warns in the review panel; 'require' blocks the human verdict until a
+# current report exists. Applies only where policy says a review is needed.
+MACHINE_REVIEW_MODE = os.environ.get("OPENCLAW_MACHINE_REVIEW", "warn")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
 
 ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
 ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
+# At-most-once arbiter dispatch (#421): if the marker sits in 'dispatching'
+# (submit started, job id never recorded — a crash window) past this grace, the
+# task fails safe to needs_decision rather than risk a duplicate paid dispatch.
+ARBITER_DISPATCH_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_ARBITER_DISPATCH_GRACE_MINUTES", "15")
+)
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
+# Stale watchdog (#319): silent dead-end statuses get their own, longer
+# thresholds — review and human answers move slower than execution.
+STALE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_STALE_REVIEW_MINUTES", "120"))
+STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "240"))
+STALE_NEEDS_INFO_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
+)
+# Machine-owned dead-end statuses (#393): visible via stale alerts until the
+# durable deadline transitions from F2 land. F1 only alerts — status unchanged.
+STALE_CI_CHECK_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60")
+)
+STALE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_FIX_REQUESTED_MINUTES", "60")
+)
+STALE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_PENDING_REPORT_MINUTES", "30")
+)
+
+# Bounded recovery (#417): a headless dispatch/review job that stays missing
+# past the grace escalates to needs_decision; a claim held past the lease is
+# auto-released back to open. Both decisions read persisted timestamps so a
+# restart never resets them.
+MISSING_JOB_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_MISSING_JOB_GRACE_MINUTES", "5")
+)
+CLAIM_LEASE_MINUTES = int(os.environ.get("OPENCLAW_CLAIM_LEASE_MINUTES", "240"))
+
+# Machine-owned deadlines (#418): a backstop, deliberately generous so normal
+# work never trips them — the stale watchdog (#393) alerts long before. When a
+# machine-owned instance sits past its deadline the watchdog transitions it to
+# needs_decision, so no combination stays stuck without an owner.
+DEADLINE_CI_CHECK_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_CI_CHECK_MINUTES", "180")
+)
+DEADLINE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_FIX_REQUESTED_MINUTES", "180")
+)
+DEADLINE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_PENDING_REPORT_MINUTES", "120")
+)
+DEADLINE_RUNNING_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_RUNNING_MINUTES", "360")
+)
+DEADLINE_REVIEW_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180")
+)
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% set active = "metrics" %}
+{% block title %}Metrics — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Practice Metrics <span class="badge badge-review">last {{ m.since_days }}d</span></h1>
+</header>
+
+<h2>Machine reviews</h2>
+<table class="task-table">
+    <tbody>
+        <tr><td>Reviews</td><td>{{ m.machine_reviews.reviews }}</td></tr>
+        <tr><td>Findings: raw → confirmed / rejected</td>
+            <td>{{ m.machine_reviews.raw_total }} → {{ m.machine_reviews.confirmed_total }} / {{ m.machine_reviews.rejected_total }}</td></tr>
+        <tr><td>Filtration rate (отсев шума)</td>
+            <td>{{ (m.machine_reviews.filtration_rate * 100) | round(1) if m.machine_reviews.filtration_rate is not none else '—' }}%</td></tr>
+        <tr><td>Tokens total / per confirmed finding</td>
+            <td>{{ m.machine_reviews.tokens_total }} / {{ m.machine_reviews.tokens_per_confirmed or '—' }}</td></tr>
+        <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
+        <tr><td>Reports without token data</td><td>{{ m.machine_reviews.reports_without_tokens or 0 }}</td></tr>
+    </tbody>
+</table>
+
+<h2>By harness version</h2>
+<table class="task-table">
+    <thead><tr><th>Harness</th><th>Reviews</th><th>Raw</th><th>Confirmed</th><th>Tokens</th></tr></thead>
+    <tbody>
+        {% for h in m.by_harness %}
+        <tr>
+            <td>{{ h.harness_skill or '—' }}{% if h.harness_version %} v{{ h.harness_version }}{% endif %}</td>
+            <td>{{ h.reviews }}</td><td>{{ h.raw_total }}</td><td>{{ h.confirmed_total }}</td><td>{{ h.tokens_total }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Recurring finding categories</h2>
+<table class="task-table">
+    <thead><tr><th>Category</th><th>Findings</th><th>Tasks</th><th></th></tr></thead>
+    <tbody>
+        {% for c in m.recurring_categories %}
+        <tr>
+            <td>{{ c.category }}</td><td>{{ c.findings }}</td><td>{{ c.tasks }}</td>
+            <td>{% if c.recurring %}<span class="badge badge-failed">recurring — кандидат в чеклист</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Cycle time (ready → completed), median</h2>
+<table class="task-table">
+    <thead><tr><th>Work type</th><th>Tasks</th><th>Median, hours</th></tr></thead>
+    <tbody>
+        {% for c in m.cycle_times %}
+        <tr><td>{{ c.work_type }}</td><td>{{ c.tasks }}</td><td>{{ c.median_hours }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

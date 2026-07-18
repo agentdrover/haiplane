@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any, Literal
 
 import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def to_iso_utc(value: str | None) -> str | None:
+    """Normalize a timestamp to ISO8601 UTC at the serialization boundary (#255).
+
+    SQLite ``datetime('now')`` stores naive ``YYYY-MM-DD HH:MM:SS`` in UTC;
+    other writers (claim, verdicts) already store ISO8601 with an offset.
+    Storage stays unchanged — only API/MCP contracts are normalized.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    if _SQLITE_DT_RE.match(value):
+        return value.replace(" ", "T") + "+00:00"
+    return value
 
 
 class TaskStatus(str, Enum):
@@ -22,6 +39,38 @@ class TaskStatus(str, Enum):
     completed = "completed"
     failed = "failed"
     rejected = "rejected"
+
+
+class ReviewVerdict(str, Enum):
+    """Explicit review verdict bound to a specific submission generation.
+
+    An ``approved`` verdict only applies to the submission generation it was
+    recorded against; resubmitting work bumps the generation and makes any
+    earlier approval stale (Universal Review Gate, #305).
+    """
+
+    approved = "approved"
+    changes_requested = "changes_requested"
+
+
+class ReviewSeverity(str, Enum):
+    """Finding severity, ordered so agents can prioritize fixes (#308)."""
+
+    high = "high"
+    medium = "medium"
+    low = "low"
+
+
+class FindingScope(str, Enum):
+    """Whether a review finding belongs to the reviewed task (#435).
+
+    ``in_scope`` findings must be fixed in the same task via the
+    CHANGES_REQUESTED loop; ``out_of_scope`` findings are moved to separate
+    tasks (referenced by ``linked_task_id``) and never block the verdict.
+    """
+
+    in_scope = "in_scope"
+    out_of_scope = "out_of_scope"
 
 
 class TaskType(str, Enum):
@@ -163,6 +212,8 @@ FINAL_STATUSES = frozenset(
 
 class TaskCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
+    # Bind an EPIC to a project at creation (#346); virtual field, epic-only.
+    project: str | None = Field(default=None, max_length=60)
     description: str = Field("", max_length=10000)
     task_type: TaskType = TaskType.task
     parent_id: int | None = None
@@ -195,6 +246,11 @@ class TaskCreate(BaseModel):
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
+    client_request_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional idempotency key; duplicates return the original task",
+    )
 
 
 MAX_BULK_CHILD_TASKS = 20
@@ -233,6 +289,30 @@ class TaskApprove(BaseModel):
     force: bool = False
 
 
+class BatchApprove(BaseModel):
+    """Approve a list of draft tasks in one human operation (#252).
+
+    Guards default to safe: DoR must pass and high risks exclude a task.
+    ``force`` deliberately does not exist here — overrides stay per-task.
+    """
+
+    task_ids: list[int] = Field(..., min_length=1, max_length=100)
+    require_dor_passed: bool = True
+    min_readiness: int | None = Field(default=None, ge=0, le=100)
+    exclude_high_risks: bool = True
+    comment: str = Field("", max_length=2000)
+
+
+class BatchApproveSkipped(BaseModel):
+    task_id: int
+    reason: str
+
+
+class BatchApproveResult(BaseModel):
+    approved: list[int] = Field(default_factory=list)
+    skipped: list[BatchApproveSkipped] = Field(default_factory=list)
+
+
 class TaskReject(BaseModel):
     comment: str = ""
 
@@ -251,6 +331,127 @@ class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
     branch_slug: str = Field("", max_length=80)
+
+
+class TaskSubmitReview(BaseModel):
+    """Submit the current work of a pair task for review (#305)."""
+
+    agent: str = Field("", max_length=100)
+    summary: str = Field("", max_length=10000)
+
+
+class ReviewFinding(BaseModel):
+    """One structured review finding (#308).
+
+    ``id`` is stable within a single review submission so a developer agent
+    can address findings by number in the CHANGES_REQUESTED loop.
+
+    ``scope``/``linked_task_id`` (#435): ``in_scope`` findings are fixed in
+    the same task via resubmit; ``out_of_scope`` findings are moved to
+    separate tasks and reference the created task via ``linked_task_id``.
+    """
+
+    id: int = Field(..., ge=1)
+    severity: ReviewSeverity
+    message: str = Field(..., min_length=1, max_length=2000)
+    file: str = Field("", max_length=500)
+    line: int | None = Field(default=None, ge=1)
+    recommendation: str = Field("", max_length=2000)
+    scope: FindingScope = FindingScope.in_scope
+    linked_task_id: int | None = Field(default=None, ge=1)
+
+
+class TaskReviewVerdict(BaseModel):
+    """Record an explicit review verdict for the current submission (#305).
+
+    Extended in #308 with structured findings: they are persisted on the
+    task row (not in the update text), so the payload stays machine-readable
+    without stressing TaskUpdate content limits.
+
+    ``create_tasks_for_out_of_scope`` (#436): when true, every
+    ``out_of_scope`` finding without a ``linked_task_id`` gets a DRAFT
+    follow-up task auto-created (DoR gate stays — a human decides whether to
+    take it into work) and the created id is stamped into the stored
+    finding. Idempotent: already-linked findings are skipped and resubmits
+    reuse the existing draft via a back-reference marker in its description.
+    """
+
+    verdict: ReviewVerdict
+    agent: str = Field("", max_length=100)
+    comments: str = Field("", max_length=50000)
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=50)
+    create_tasks_for_out_of_scope: bool = False
+
+
+class LatestReview(BaseModel):
+    """Projection of the most recent review verdict for status/context (#308).
+
+    ``is_current`` is False when work was resubmitted after the verdict was
+    recorded — the verdict is history, not a judgement of the latest work.
+    ``self_approved`` is True when the verdict was accepted only because of
+    the ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
+    reviewed their own work, so the verdict is not independent (#434).
+    """
+
+    verdict: ReviewVerdict
+    submission_generation: int = 0
+    is_current: bool = False
+    self_approved: bool = False
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class SelfReviewWarning(BaseModel):
+    """Fail-fast self-review notice on the review brief (#433).
+
+    Emitted when the caller requesting the brief is the agent that
+    implemented the task, BEFORE any review effort is spent. Advisory, not
+    a hard-fail: the implementer may still read the brief for self-checking,
+    but hub_submit_review will reject the verdict (unless solo mode).
+    """
+
+    reason: str
+    message: str
+    hint: str
+    required_role: str | None = None
+
+
+class ReviewBrief(BaseModel):
+    """Everything a reviewer agent needs in one response (#308).
+
+    Assembled from the task row, its acceptance criteria, and the latest
+    submission update — no scraping of task prose required. ``diff_command``
+    is advisory and only present when branch metadata exists; a GitHub PR is
+    never required for a local review brief.
+    """
+
+    task_id: int
+    title: str
+    status: TaskStatus
+    description: str = ""
+    project: TaskProjectRef | None = None
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    scope_in: list[str] = Field(default_factory=list)
+    scope_out: list[str] = Field(default_factory=list)
+    out_of_scope_for_review: list[str] = Field(default_factory=list)
+    review_checklist: list[str] = Field(default_factory=list)
+    validation_commands: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    technical_hints: str = ""
+    branch: str | None = None
+    pr_number: int | None = None
+    diff_command: str = ""
+    review_cycle: int = 0
+    submission_generation: int = 0
+    latest_submission_summary: str = ""
+    latest_review: LatestReview | None = None
+    # #381: latest machine-review report; forward ref — MachineReviewView is
+    # declared later in this module, rebuilt below.
+    machine_review: "MachineReviewView | None" = None
+    # #433: fail-fast notice when the caller implemented this task.
+    self_review_warning: SelfReviewWarning | None = None
+    # #438: advisory — non-empty when the branch carries commits of another
+    # unmerged task branch (stacked branches). Never blocks the review.
+    stacking_warning: str = ""
 
 
 class TaskClaim(BaseModel):
@@ -331,6 +532,9 @@ class TaskRisk(BaseModel):
 class TaskRefine(BaseModel):
     """PATCH payload for structured fields. Every field is optional —
     omitted keys leave the existing value untouched."""
+
+    # Bind an EPIC to a project by slug (#338); rejected for other types.
+    project: str | None = Field(default=None, max_length=60)
 
     title: str | None = Field(default=None, min_length=1, max_length=500)
     work_type: WorkType | None = None
@@ -508,6 +712,11 @@ class TaskUpdateView(BaseModel):
     content: str
     created_at: str
 
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class TaskBreadcrumb(BaseModel):
     id: int
@@ -529,6 +738,13 @@ class TaskProgress(BaseModel):
     failed: int = 0
     active: int = 0
     percent: int = 0
+
+
+class TaskProjectRef(BaseModel):
+    """Compact project reference on task contracts (#336)."""
+
+    id: int
+    slug: str
 
 
 class TaskView(BaseModel):
@@ -555,11 +771,21 @@ class TaskView(BaseModel):
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None
+    # Universal Review Gate (#305): headless review is marked by a present
+    # review_job_id; client-driven review has status=review with no job.
+    # A verdict only counts while review_verdict_generation matches
+    # submission_generation.
+    submission_generation: int = 0
+    review_verdict: ReviewVerdict | None = None
+    review_verdict_generation: int | None = None
+    review_approved_current: bool = False
+    latest_review: LatestReview | None = None
     branch: str | None = None
     pr_number: int | None = None
     claimed_by: str | None = None
     claim_session_id: str | None = None
     claimed_at: str | None = None
+    project: TaskProjectRef | None = None
     breadcrumb: list[TaskBreadcrumb] | None = None
     children: list[TaskChildSummary] | None = None
     progress: TaskProgress | None = None
@@ -596,6 +822,20 @@ class TaskView(BaseModel):
     prepared_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "claimed_at",
+        "ready_at",
+        "prepared_at",
+        "started_at",
+        "completed_at",
+        mode="before",
+    )
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
 
 
 class TaskTreeNode(BaseModel):
@@ -657,11 +897,186 @@ class TaskContextView(BaseModel):
     parent_goal: ContextParentGoal | None = None
 
 
+class ProjectCreate(BaseModel):
+    """Create a project (#335). ``create`` is a human gate at the API layer."""
+
+    slug: str = Field(..., min_length=1, max_length=60, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(..., min_length=1, max_length=200)
+    repo: str = Field("", max_length=200)
+    workspace_path: str = Field("", max_length=500)
+    default_branch: str = Field("develop", max_length=100)
+    default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectPatch(BaseModel):
+    """PATCH semantics: omitted fields stay unchanged (#338)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    repo: str | None = Field(default=None, max_length=200)
+    workspace_path: str | None = Field(default=None, max_length=500)
+    default_branch: str | None = Field(default=None, max_length=100)
+    default_branch_policy: dict[str, Any] | None = None
+    archived: bool | None = None
+    status: str | None = Field(default=None, pattern="^(pending|active)$")
+
+
+class MachineFinding(BaseModel):
+    """One machine-review finding (#381). Mirrors ReviewFinding plus a
+    free-slug category feeding the recurrence metrics (#384)."""
+
+    title: str = Field(..., min_length=1, max_length=300)
+    severity: ReviewSeverity
+    category: str = Field("", max_length=60)
+    file: str = Field("", max_length=500)
+    line: int | None = Field(default=None, ge=1)
+    detail: str = Field("", max_length=4000)
+
+
+class MachineRejectedFinding(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    category: str = Field("", max_length=60)
+    reason: str = Field("", max_length=2000)
+
+
+class MachineReviewSubmit(BaseModel):
+    """Structured multi-agent review report (#381).
+
+    Metrics fields (#384) are optional — a client that cannot count
+    tokens still reports the review itself.
+    """
+
+    harness_skill: str = Field("", max_length=80)
+    harness_version: int | None = Field(default=None, ge=1)
+    agent_count: int | None = Field(default=None, ge=1)
+    tokens_spent: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0)
+    orchestrator: str = Field("", max_length=100)
+    model: str = Field("", max_length=100)
+    raw_count: int = Field(0, ge=0)
+    findings_confirmed: list[MachineFinding] = Field(
+        default_factory=list, max_length=100
+    )
+    findings_rejected: list[MachineRejectedFinding] = Field(
+        default_factory=list, max_length=200
+    )
+    agent: str = Field("", max_length=100)
+
+
+class MachineReviewView(BaseModel):
+    id: int
+    task_id: int
+    submission_generation: int
+    is_current: bool = True
+    harness_skill: str = ""
+    harness_version: int | None = None
+    agent_count: int | None = None
+    tokens_spent: int | None = None
+    duration_ms: int | None = None
+    orchestrator: str = ""
+    model: str = ""
+    raw_count: int = 0
+    findings_confirmed: list[MachineFinding] = Field(default_factory=list)
+    findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
+    submitted_by: str = ""
+    created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _mr_iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("findings_confirmed", "findings_rejected", mode="before")
+    @classmethod
+    def _mr_findings_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v or "[]")
+                return parsed if isinstance(parsed, list) else []
+            except ValueError:
+                return []
+        return v
+
+
+class SkillCreate(BaseModel):
+    """New skill version (#380). Agents create drafts; humans activate."""
+
+    name: str = Field(..., min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    kind: str = Field("prompt", pattern="^(prompt|skill|checklist|workflow)$")
+    content: str = Field(..., min_length=1, max_length=100_000)
+    tags: list[str] = Field(default_factory=list)
+    project_id: int | None = None
+
+
+class SkillView(BaseModel):
+    id: int
+    name: str
+    kind: str
+    version: int
+    content: str = ""
+    tags: list[str] = Field(default_factory=list)
+    project_id: int | None = None
+    status: str
+    created_by: str = ""
+    created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _skill_iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _skill_tags_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v or "[]")
+                return parsed if isinstance(parsed, list) else []
+            except ValueError:
+                return []
+        return v
+
+
+class ProjectView(BaseModel):
+    id: int
+    slug: str
+    name: str
+    status: str = "active"
+    repo: str = ""
+    workspace_path: str = ""
+    default_branch: str = "develop"
+    default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+    archived: bool = False
+    provision_status: str = "none"
+    provision_detail: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("default_branch_policy", mode="before")
+    @classmethod
+    def _policy_json(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                return json.loads(v) if v else {}
+            except ValueError:
+                return {}
+        return v or {}
+
+
 class ActivityItem(BaseModel):
     kind: str
     summary: str
     detail: dict[str, Any] | None = None
     timestamp: str
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
 
 
 class DashboardData(BaseModel):
@@ -746,6 +1161,11 @@ class PrincipalView(BaseModel):
     last_seen_at: str | None = None
     created_by: int | None = None
 
+    @field_validator("created_at", "updated_at", "last_seen_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class RoleView(BaseModel):
     id: int
@@ -772,6 +1192,13 @@ class ApiKeyView(BaseModel):
     created_at: str = ""
     created_by: int | None = None
 
+    @field_validator(
+        "expires_at", "last_used_at", "revoked_at", "created_at", mode="before"
+    )
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
 
 class ApiKeyCreated(ApiKeyView):
     """Returned only once at creation time — includes the plaintext key."""
@@ -789,6 +1216,11 @@ class AuditEntry(BaseModel):
     summary: str
     detail: str | None = None
     created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
 
 
 class AdminSummary(BaseModel):
@@ -858,3 +1290,7 @@ class HealthView(BaseModel):
 ProposalStatus = TaskStatus
 ProposalCreate = TaskCreate
 ProposalView = TaskView
+
+# Forward-ref rebuild: ReviewBrief.machine_review points at MachineReviewView,
+# which is declared after ReviewBrief (#381).
+ReviewBrief.model_rebuild()

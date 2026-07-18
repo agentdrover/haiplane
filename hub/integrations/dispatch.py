@@ -157,20 +157,20 @@ class DispatchIntegration:
             "3. Критерии: корректность логики, наличие тестов для новых изменений, "
             "стиль кода, обратная совместимость\n"
             "4. Для каждого замечания укажи severity (high/medium/low) и обоснование\n"
-            "5. ОБЯЗАТЕЛЬНО запиши результат ревью командой:\n"
-            f'   oc-hub update {task_id} --kind review --agent code-reviewer --message "<твой отчёт>"\n\n'
-            "ВАЖНО: Если основная задача выполнена корректно — ставь APPROVED, "
+            "5. ОБЯЗАТЕЛЬНО запиши вердикт СТРУКТУРИРОВАННОЙ командой (#326):\n"
+            f"   oc-hub review-verdict {task_id} approved --agent code-reviewer "
+            '--comments "<краткий отчёт>"\n'
+            "   ИЛИ\n"
+            f"   oc-hub review-verdict {task_id} changes_requested --agent code-reviewer "
+            '--comments "<краткий отчёт>" '
+            '--findings-json \'[{"id":1,"severity":"high","message":"..."}]\'\n\n'
+            "ВАЖНО: Если основная задача выполнена корректно — approved, "
             "даже если есть мелкие недочёты (low severity). "
-            "CHANGES_REQUESTED — только для высокоприоритетных проблем (high), "
+            "changes_requested — только для высокоприоритетных проблем (high), "
             "которые ломают логику, безопасность или обратную совместимость.\n\n"
-            "ФОРМАТ ВЕРДИКТА — последняя строка отчёта ОБЯЗАНА содержать ровно одно из:\n"
-            "  APPROVED\n"
-            "  CHANGES_REQUESTED\n\n"
-            "Пример отчёта:\n"
-            f"  Проверил {diff_cmd}. Обнаружено:\n"
-            "  1. [high] Не обновлён __init__.py — сломаны импорты в тестах\n"
-            "  2. [low] Отсутствует docstring в новом модуле\n"
-            "  CHANGES_REQUESTED\n"
+            "Если review-verdict недоступен в твоей версии oc-hub — fallback:\n"
+            f'   oc-hub update {task_id} --kind review --agent code-reviewer --message "<отчёт>"\n'
+            "   с последней строкой ровно APPROVED или CHANGES_REQUESTED.\n"
         )
 
     def build_fix_message(

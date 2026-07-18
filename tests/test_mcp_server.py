@@ -16,6 +16,7 @@ from hub.mcp_server import (
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
+    hub_approve_proposal,
     hub_claim_task,
     hub_create_task,
     hub_create_subtasks,
@@ -23,9 +24,16 @@ from hub.mcp_server import (
     hub_delete_acceptance_criterion,
     hub_force_complete_task,
     hub_get_readiness,
+    hub_get_review_brief,
     hub_health,
+    hub_my_context,
+    hub_project_status,
+    hub_task_tree,
     hub_readiness_tree,
     hub_list_acceptance_criteria,
+    hub_list_decisions,
+    hub_list_projects,
+    hub_list_proposals,
     hub_list_tasks,
     hub_prepare_developer_task,
     hub_propose_task,
@@ -37,6 +45,8 @@ from hub.mcp_server import (
     hub_replace_acceptance_criteria,
     hub_report_done,
     hub_start_task,
+    hub_submit_for_review,
+    hub_submit_review,
     hub_task_status,
     hub_task_update,
     hub_whoami,
@@ -109,7 +119,12 @@ async def test_hub_list_tasks(mock_api_get: AsyncMock) -> None:
         },
     ]
     out = await hub_list_tasks()
-    lines = out.split("\n")
+    payload = json.loads(_mcp_text(out))
+    lines = payload["message"].split("\n")
+    assert payload["instance"] in ("prod", "local")
+    assert "base_url" in payload
+    structured = _mcp_structured(out)
+    assert [t["id"] for t in structured["tasks"]] == [1, 2, 3]  # object (#248)
     assert lines[0] == "#1 [open] (auto) Alpha"
     assert lines[1] == "#2 [epic] [running] (vast) [agent:coder] Beta epic"
     assert lines[2] == "#3 [subtask] [open] (auto) (parent #2) Child"
@@ -179,34 +194,77 @@ async def test_hub_propose(mock_api_post: AsyncMock) -> None:
             "rationale": "Because",
             "human_owner": "",
             "human_reviewer": "",
+            "task_type": "task",
             "parent_id": 7,
         },
     )
 
 
-async def test_hub_start_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_propose_feature_draft(mock_api_post: AsyncMock) -> None:
+    # (#323) agents propose features as drafts under an epic.
+    mock_api_post.return_value = {"id": 101}
+    msg = await hub_propose_task(
+        "Projects feature",
+        "Split the product into projects",
+        task_type="feature",
+        parent_id=3,
+    )
+    assert "Draft feature #101 created" in msg
+    body = mock_api_post.await_args.args[1]
+    assert body["task_type"] == "feature"
+    assert body["parent_id"] == 3
+
+
+async def test_hub_propose_rejects_bad_type(mock_api_post: AsyncMock) -> None:
+    msg = await hub_propose_task("X", "Y", task_type="story")
+    assert "Invalid task_type" in msg
+    mock_api_post.assert_not_awaited()
+
+
+async def test_hub_start_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "running", "job_id": "dispatch-1"}
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "open"},
+        {"id": 5, "status": "running", "job_id": "dispatch-1"},
+    ]
     msg = await hub_start_task(5, plan="Step one then two", runtime="openrouter")
-    assert "Task #5 dispatched" in msg
-    assert "dispatch-1" in msg
+    payload = json.loads(msg)
+    assert "Task #5 dispatched" in payload["message"]
+    assert "dispatch-1" in payload["message"]
+    assert payload["transition"] == {"from": "open", "to": "running"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/5/start",
         {"plan": "Step one then two", "runtime": "openrouter"},
     )
 
 
-async def test_hub_pair_start(mock_api_post: AsyncMock) -> None:
+async def test_hub_pair_start(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {
         "status": "running",
         "branch": "task-37/pair-start",
         "assigned_agent": "composer-analyst",
         "job_id": None,
     }
+    mock_api_get.side_effect = [
+        {"id": 37, "status": "open"},
+        {
+            "id": 37,
+            "status": "running",
+            "branch": "task-37/pair-start",
+            "assigned_agent": "composer-analyst",
+        },
+    ]
     msg = await hub_pair_start(
         37, plan="Plan: pair work", assigned_agent="composer-analyst"
     )
-    assert "Task #37 pair-started" in msg
-    assert "no dispatch job" in msg
+    payload = json.loads(msg)
+    assert "Task #37 pair-started" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["transition"] == {"from": "open", "to": "running"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/37/pair-start",
         {"plan": "Plan: pair work", "assigned_agent": "composer-analyst"},
@@ -233,31 +291,53 @@ async def test_hub_answer_question(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_claim_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_claim_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {
         "status": "claimed",
         "claimed_by": "composer",
     }
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {"id": 41, "status": "claimed", "claimed_by": "composer"},
+    ]
     msg = await hub_claim_task(41, "composer", session_id="sess-1")
-    assert "claimed" in msg
+    payload = json.loads(msg)
+    assert "claimed" in payload["message"]
+    assert payload["status"] == "claimed"
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/41/claim",
         {"agent": "composer", "session_id": "sess-1"},
     )
 
 
-async def test_hub_release_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_release_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "open"}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "claimed"},
+        {"id": 41, "status": "open"},
+    ]
     msg = await hub_release_task(41, "composer", session_id="sess-1")
-    assert "released" in msg
+    payload = json.loads(msg)
+    assert "released" in payload["message"]
+    assert payload["transition"] == {"from": "claimed", "to": "open"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/41/release",
         {"agent": "composer", "session_id": "sess-1"},
     )
 
 
-async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
+async def test_hub_approve_task_passes_force(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "open"}
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "draft"},
+        {"id": 5, "status": "open"},
+    ]
     msg = await hub_approve_task(
         5,
         comment="human override",
@@ -265,7 +345,9 @@ async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
         runtime="vast",
         force=True,
     )
-    assert "Task #5 approved" in msg
+    payload = json.loads(msg)
+    assert "Task #5 approved" in payload["message"]
+    assert payload["transition"] == {"from": "draft", "to": "open"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/5/approve",
         {
@@ -277,55 +359,46 @@ async def test_hub_approve_task_passes_force(mock_api_post: AsyncMock) -> None:
     )
 
 
-async def test_hub_force_complete_task(mock_api_post: AsyncMock) -> None:
+async def test_hub_force_complete_task(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "pending_report"},
+        {"id": 9, "status": "completed"},
+    ]
     msg = await hub_force_complete_task(9)
-    assert "Task #9 force-completed" in msg
+    payload = json.loads(msg)
+    assert "Task #9 force-completed" in payload["message"]
+    assert payload["transition"] == {"from": "pending_report", "to": "completed"}
     mock_api_post.assert_awaited_once_with("/api/tasks/9/force-complete", None)
 
 
-async def test_hub_force_complete_task_with_comment(mock_api_post: AsyncMock) -> None:
+async def test_hub_force_complete_task_with_comment(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "pending_report"},
+        {"id": 9, "status": "completed"},
+    ]
     await hub_force_complete_task(9, comment="reviewed manually")
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/9/force-complete", {"comment": "reviewed manually"}
     )
 
 
-async def test_hub_update(mock_api_post: AsyncMock) -> None:
-    mock_api_post.return_value = {"id": 55}
-    msg = await hub_task_update(4, "Plan: ship it", agent="dev", kind="status")
-    assert "Update #55 added to task #4" in msg
-    mock_api_post.assert_awaited_once_with(
-        "/api/tasks/4/updates",
-        {"agent": "dev", "kind": "status", "content": "Plan: ship it"},
-    )
-
-
-async def test_hub_report_done(
+async def test_hub_force_complete_human_only_error(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
-    mock_api_post.return_value = {"id": 77}
-    mock_api_get.return_value = {"id": 9, "status": "ci_check"}
-    msg = await hub_report_done(
-        9,
-        "Changed: tests. Validation: pytest -q",
-        agent="qa",
-    )
-    assert "Done report #77 submitted for task #9" in msg
-    assert "status: ci_check" in msg
-    assert "Task entered ci_check" in msg
-    assert "should now be completed" not in msg.lower()
-    mock_api_get.assert_awaited_once_with("/api/tasks/9")
-
-
-async def test_hub_force_complete_human_only_error(mock_api_post: AsyncMock) -> None:
     from hub.mcp_server import HubApiError
 
+    mock_api_get.return_value = {"id": 9, "status": "pending_report"}
     mock_api_post.side_effect = HubApiError(
         {
             "reason": "human_only_gate",
             "hint": "This operation requires a human or admin token, not an agent token.",
+            "required_role": "human",
             "required_status": None,
             "message": "this operation requires human or admin role",
         }
@@ -333,7 +406,146 @@ async def test_hub_force_complete_human_only_error(mock_api_post: AsyncMock) -> 
     msg = await hub_force_complete_task(9)
     payload = json.loads(msg)
     assert payload["reason"] == "human_only_gate"
-    assert "127.0.0.1" not in msg
+    assert payload["required_role"] == "human"
+    assert payload["actor_hint"] == "human"
+    assert "next_action" in payload
+    assert payload["instance"] in ("prod", "local")
+
+
+async def test_hub_archive_permission_actionable_error(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import HubApiError, hub_archive_task
+
+    mock_api_get.return_value = {"id": 12, "status": "draft"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "permission_denied",
+            "message": "missing permission: tasks.archive",
+            "hint": "Agent tokens cannot archive tasks.",
+            "required_role": "human",
+            "suggested_tool": "hub_withdraw_own_draft",
+            "required_permission": "tasks.archive",
+        }
+    )
+    msg = await hub_archive_task(12)
+    payload = json.loads(msg)
+    assert payload["reason"] == "permission_denied"
+    assert payload["suggested_tool"] == "hub_withdraw_own_draft"
+    assert payload["actor_hint"] == "human"
+    assert payload["awaiting"] == "none"
+    assert "next_action" in payload
+
+
+async def test_hub_withdraw_own_draft_success(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import hub_withdraw_own_draft
+
+    mock_api_get.side_effect = [
+        {"id": 21, "status": "draft", "archived": False},
+        {"id": 21, "status": "draft", "archived": True},
+    ]
+    mock_api_post.return_value = {"id": 21, "status": "draft", "archived": True}
+    msg = await hub_withdraw_own_draft(21)
+    payload = json.loads(msg)
+    assert "withdrawn" in payload["message"]
+    assert payload["status"] == "draft"
+    assert payload["instance"] in ("prod", "local")
+    assert "next_action" in payload
+    mock_api_post.assert_awaited_once_with("/api/tasks/21/withdraw")
+
+
+async def test_hub_withdraw_own_draft_actionable_error(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    from hub.mcp_server import HubApiError, hub_withdraw_own_draft
+
+    mock_api_get.return_value = {"id": 22, "status": "draft"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "not_task_owner",
+            "message": "caller is not the assigned agent for this draft",
+            "hint": "You can only withdraw drafts assigned to you.",
+            "required_role": "agent",
+            "suggested_tool": "hub_withdraw_own_draft",
+        }
+    )
+    msg = await hub_withdraw_own_draft(22)
+    payload = json.loads(msg)
+    assert payload["reason"] == "not_task_owner"
+    assert payload["required_role"] == "agent"
+    assert payload["suggested_tool"] == "hub_withdraw_own_draft"
+    assert payload["actor_hint"] == "agent"
+    assert "next_action" in payload
+
+
+async def test_hub_update(mock_api_post: AsyncMock, mock_api_get: AsyncMock) -> None:
+    mock_api_post.return_value = {"id": 55}
+    mock_api_get.return_value = {"id": 4, "status": "running"}
+    msg = await hub_task_update(4, "Plan: ship it", agent="dev", kind="status")
+    payload = json.loads(msg)
+    assert "Update #55 added to task #4" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["awaiting"] == "none"
+    assert "next_action" in payload
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/4/updates",
+        {"agent": "dev", "kind": "status", "content": "Plan: ship it"},
+    )
+
+
+async def test_hub_task_update_kind_done_matches_report_done(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 88}
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    update_msg = await hub_task_update(
+        3, "Changed: feature. Validation: pytest -q", agent="dev", kind="done"
+    )
+    mock_api_post.reset_mock()
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
+    report_msg = await hub_report_done(
+        3, "Changed: feature. Validation: pytest -q", agent="dev"
+    )
+    update_payload = json.loads(update_msg)
+    report_payload = json.loads(report_msg)
+    assert "Done report #88" in update_payload["message"]
+    assert update_payload["status"] == report_payload["status"] == "completed"
+    assert update_payload["transition"] == report_payload["transition"]
+    assert update_payload["awaiting"] == report_payload["awaiting"]
+
+
+async def test_hub_report_done(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    mock_api_post.return_value = {"id": 77}
+    mock_api_get.side_effect = [
+        {"id": 9, "status": "running"},
+        {"id": 9, "status": "ci_check"},
+    ]
+    msg = await hub_report_done(
+        9,
+        "Changed: tests. Validation: pytest -q",
+        agent="qa",
+    )
+    payload = json.loads(msg)
+    assert "Done report #77 submitted for task #9" in payload["message"]
+    assert "ci_check" in payload["message"]
+    assert payload["status"] == "ci_check"
+    assert payload["awaiting"] == "ci"
+    assert payload["actor_hint"] == "ci"
+    assert payload["transition"] == {"from": "running", "to": "ci_check"}
+    assert mock_api_get.await_count == 2
 
 
 async def test_hub_report_done_open_status_returns_structured_error(
@@ -341,29 +553,66 @@ async def test_hub_report_done_open_status_returns_structured_error(
 ) -> None:
     from hub.mcp_server import HubApiError
 
+    mock_api_get.return_value = {"id": 5, "status": "open"}
     mock_api_post.side_effect = HubApiError(
         {
             "reason": "pair_start_required",
             "hint": "Call hub_pair_start before hub_report_done.",
             "required_status": "running",
             "current_status": "open",
+            "suggested_tool": "hub_pair_start",
             "message": "Call hub_pair_start before hub_report_done.",
         }
     )
     msg = await hub_report_done(5, "Changed: docs only")
-    assert "pair_start_required" in msg
-    assert "127.0.0.1" not in msg
-    mock_api_get.assert_not_called()
+    payload = json.loads(msg)
+    assert payload["reason"] == "pair_start_required"
+    assert payload["status"] == "open"
+    assert payload["awaiting"] == "none"
+    assert payload["actor_hint"] == "agent"
+    assert payload["suggested_tool"] == "hub_pair_start"
+    assert payload["instance"] in ("prod", "local")
+    mock_api_get.assert_awaited_once_with("/api/tasks/5")
 
 
 async def test_hub_report_done_completed_from_pending(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
     mock_api_post.return_value = {"id": 99}
-    mock_api_get.return_value = {"id": 3, "status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 3, "status": "pending_report"},
+        {"id": 3, "status": "completed"},
+    ]
     msg = await hub_report_done(3, "Changed: feature. Validation: pytest -q")
-    assert "status: completed" in msg
-    assert "Task completed" in msg
+    payload = json.loads(msg)
+    assert payload["status"] == "completed"
+    assert payload["awaiting"] == "none"
+    assert payload["transition"] == {"from": "pending_report", "to": "completed"}
+    assert "Task completed" in payload["message"]
+
+
+async def test_hub_report_done_needs_decision_error_envelope(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    from hub.mcp_server import HubApiError
+
+    mock_api_get.return_value = {"id": 8, "status": "needs_decision"}
+    mock_api_post.side_effect = HubApiError(
+        {
+            "reason": "human_decision_required",
+            "hint": "Task awaits hub_decide_task or human Decision Gate.",
+            "required_status": "needs_decision",
+            "current_status": "needs_decision",
+            "message": "Task awaits hub_decide_task or human Decision Gate.",
+        }
+    )
+    msg = await hub_report_done(8, "Done")
+    payload = json.loads(msg)
+    assert payload["reason"] == "human_decision_required"
+    assert payload["status"] == "needs_decision"
+    assert payload["awaiting"] == "human_decision"
+    assert payload["actor_hint"] == "human"
+    assert "hub_decide_task" in payload["next_action"]
 
 
 # ---------------------------------------------------------------------------
@@ -705,11 +954,14 @@ async def test_hub_get_readiness_compact_summary(mock_api_get: AsyncMock) -> Non
             }
         ],
     }
-    msg = await hub_get_readiness(12)
+    out = await hub_get_readiness(12)
+    msg = _mcp_text(out)
     assert "score=65" in msg
     assert "dor_passed=no" in msg
     assert "has_problem_statement" in msg
     assert "Add a problem" in msg
+    structured = _mcp_structured(out)
+    assert structured["report"]["score"] == 65  # object, not JSON string (#248)
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness")
 
 
@@ -976,8 +1228,30 @@ async def test_hub_propose_task_passes_owner_and_reviewer(
     assert body["human_reviewer"] == "bob"
 
 
-async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> None:
+async def test_hub_propose_task_passes_project_for_epic(
+    mock_api_post: AsyncMock,
+) -> None:
+    # #346: epic proposals carry the project slug; omitted otherwise.
+    mock_api_post.return_value = {"id": 201}
+    await hub_propose_task("Calc epic", "Epic body", task_type="epic", project="calc")
+    body = mock_api_post.await_args.args[1]
+    assert body["project"] == "calc"
+
+    mock_api_post.reset_mock()
+    mock_api_post.return_value = {"id": 202}
+    await hub_propose_task("Plain task", "No project")
+    body = mock_api_post.await_args.args[1]
+    assert "project" not in body
+
+
+async def test_hub_decide_task_sends_all_params(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "completed"}
+    mock_api_get.side_effect = [
+        {"id": 10, "status": "needs_decision"},
+        {"id": 10, "status": "completed"},
+    ]
     msg = await hub_decide_task(
         task_id=10,
         action="accept",
@@ -985,9 +1259,11 @@ async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> Non
         decision_summary="Accepted after manual review.",
         record_decision=True,
     )
-    assert "Task #10" in msg
-    assert "accept" in msg
-    assert "decision recorded" in msg
+    payload = json.loads(msg)
+    assert "Task #10" in payload["message"]
+    assert "accept" in payload["message"]
+    assert "decision recorded" in payload["message"]
+    assert payload["transition"] == {"from": "needs_decision", "to": "completed"}
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/10/decide",
         {
@@ -999,12 +1275,19 @@ async def test_hub_decide_task_sends_all_params(mock_api_post: AsyncMock) -> Non
     )
 
 
-async def test_hub_decide_task_rework_without_summary(mock_api_post: AsyncMock) -> None:
+async def test_hub_decide_task_rework_without_summary(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
     mock_api_post.return_value = {"status": "fix_requested"}
+    mock_api_get.side_effect = [
+        {"id": 11, "status": "needs_decision"},
+        {"id": 11, "status": "fix_requested"},
+    ]
     msg = await hub_decide_task(task_id=11, action="rework", instructions="Fix X")
-    assert "Task #11" in msg
-    assert "rework" in msg
-    assert "decision recorded" not in msg
+    payload = json.loads(msg)
+    assert "Task #11" in payload["message"]
+    assert "rework" in payload["message"]
+    assert "decision recorded" not in payload["message"]
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/11/decide",
         {
@@ -1021,10 +1304,14 @@ async def test_hub_get_readiness_explain_returns_full_json(
 ) -> None:
     payload = {"score": 100, "dor_passed": True, "explain": [{"k": "v"}]}
     mock_api_get.return_value = payload
-    msg = await hub_get_readiness(12, explain=True)
-    import json as _json
-
-    assert _json.loads(msg) == payload
+    out = await hub_get_readiness(12, explain=True)
+    parsed = _mcp_structured(out)["report"]
+    assert parsed["score"] == 100
+    assert parsed["dor_passed"] is True
+    assert parsed["explain"] == [{"k": "v"}]
+    envelope = _mcp_structured(out)
+    assert envelope["instance"] in ("prod", "local")
+    assert envelope["base_url"]
     mock_api_get.assert_awaited_once_with("/api/tasks/12/readiness?explain=true")
 
 
@@ -1411,3 +1698,772 @@ async def test_hub_admin_my_identity_delegates_to_whoami(
 
     mock_api_get.assert_awaited_once_with("/api/whoami")
     assert "User: alice (role: human)" in text
+
+
+async def test_hub_task_status_renders_latest_review(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 77,
+        "title": "Reviewed",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix the race"},
+                {"id": 2, "severity": "low", "message": "Polish docs"},
+            ],
+        },
+    }
+    out = await hub_task_status(77)
+    text = _mcp_text(out)
+    assert "Latest review: CHANGES_REQUESTED for submission #2 (current)" in text
+    assert "1. [high] Fix the race" in text
+    assert "2. [low] Polish docs" in text
+    structured = _mcp_structured(out)
+    assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
+    # Independent verdict — no solo-mode marker (#434).
+    assert "SELF-APPROVED" not in text
+
+
+async def test_hub_task_status_marks_self_approved_verdict(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#434: a solo-mode verdict is called out in the status text."""
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Solo reviewed",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": True,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert (
+        "Latest review: APPROVED for submission #1 (current) "
+        "[SELF-APPROVED: solo mode, not independent]" in text
+    )
+    structured = _mcp_structured(out)
+    assert structured["task"]["latest_review"]["self_approved"] is True
+
+
+async def test_hub_review_brief_marks_self_approved_verdict(
+    mock_api_get: AsyncMock,
+) -> None:
+    """#434: the review brief flags a prior solo-mode verdict."""
+    mock_api_get.return_value = {
+        "task_id": 43,
+        "title": "Solo brief",
+        "status": "review",
+        "submission_generation": 2,
+        "review_cycle": 1,
+        "acceptance_criteria": [],
+        "scope_in": [],
+        "review_checklist": [],
+        "validation_commands": [],
+        "branch": None,
+        "pr_number": None,
+        "diff_command": None,
+        "latest_submission_summary": "",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": False,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_get_review_brief(43)
+    text = json.loads(_mcp_text(out))["message"]
+    assert (
+        "Latest verdict: APPROVED for submission #1 "
+        "(stale — work resubmitted) [SELF-APPROVED: solo mode, not independent]" in text
+    )
+
+
+async def test_hub_task_status_renders_finding_scope(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: out-of-scope findings show their scope and linked follow-up task.
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Scoped findings",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 1,
+            "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Linked elsewhere",
+                    "scope": "out_of_scope",
+                    "linked_task_id": 436,
+                },
+                {
+                    "id": 3,
+                    "severity": "low",
+                    "message": "Unlinked elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert "1. [high] Fix here" in text
+    assert "2. [low] [out-of-scope → #436] Linked elsewhere" in text
+    assert "3. [low] [out-of-scope] Unlinked elsewhere" in text
+
+
+async def test_hub_submit_for_review(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 2,
+    }
+    out = await hub_submit_for_review(42, agent="dev", summary="pass 2")
+    payload = json.loads(out)
+    assert "submitted for review (submission #2" in payload["message"]
+    assert payload["status"] == "review"
+    assert payload["awaiting"] == "review"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "running", "to": "review"}
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/submit-review", {"agent": "dev", "summary": "pass 2"}
+    )
+
+
+async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "submission_generation": 1,
+        "review_cycle": 0,
+        "acceptance_criteria": [
+            {
+                "id": "AC-1",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "test",
+            }
+        ],
+        "scope_in": ["hub/app.py"],
+        "review_checklist": ["check envelopes"],
+        "validation_commands": ["uv run pytest -q"],
+        "branch": "task-42/x",
+        "pr_number": None,
+        "diff_command": "git diff develop...task-42/x",
+        "latest_submission_summary": "Implemented",
+        "latest_review": None,
+    }
+    out = await hub_get_review_brief(42)
+    payload = _mcp_structured(out)
+    text = _mcp_text(out)
+    text = json.loads(text)["message"]
+    assert "Review brief for task #42" in text
+    assert "AC-1" in text
+    assert "In scope: hub/app.py" in text
+    assert "uv run pytest -q" in text
+    assert "git diff develop...task-42/x" in text
+    assert "hub_submit_review" in text
+    assert "WARNING" not in text
+    assert payload["brief"]["task_id"] == 42
+    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_self_review_warning(
+    mock_api_get: AsyncMock,
+) -> None:
+    # #433: the REST brief carries self_review_warning for the implementer;
+    # MCP must surface it FIRST in the text and pass it through structured.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "submission_generation": 1,
+        "review_cycle": 0,
+        "self_review_warning": {
+            "reason": "self_review_forbidden",
+            "message": "agent 'impl-bot' implemented this task and cannot review it",
+            "hint": "Stop before running the review: hand off to an "
+            "independent reviewer.",
+            "required_role": "independent_reviewer",
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [self_review_forbidden]:")
+    assert "impl-bot" in text
+    assert "independent reviewer" in text
+    structured = _mcp_structured(out)
+    assert (
+        structured["brief"]["self_review_warning"]["reason"] == "self_review_forbidden"
+    )
+    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> None:
+    # #433: OPENCLAW_REVIEW_SELF_APPROVE=allow — solo-mode note, not a stop.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Solo task",
+        "status": "review",
+        "self_review_warning": {
+            "reason": "solo_mode_self_review",
+            "message": "agent 'impl-bot' implemented this task; solo mode "
+            "permits self-review",
+            "hint": "OPENCLAW_REVIEW_SELF_APPROVE=allow is active.",
+            "required_role": None,
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [solo_mode_self_review]:")
+    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in text
+
+
+async def test_hub_submit_review_changes_requested(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [{"id": 1, "severity": "high", "message": "Fix"}]
+    out = await hub_submit_review(
+        42,
+        verdict="changes_requested",
+        comments="see findings",
+        agent="reviewer",
+        findings=findings,
+    )
+    payload = json.loads(out)
+    assert "CHANGES_REQUESTED" in payload["message"]
+    assert payload["status"] == "running"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "review", "to": "running"}
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "comments": "see findings",
+            "agent": "reviewer",
+            "findings": findings,
+        },
+    )
+
+
+async def test_hub_submit_review_forwards_scope_fields(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: scope/linked_task_id pass through to the canonical REST body.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {"id": 1, "severity": "high", "message": "Fix here"},
+        {
+            "id": 2,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+            "linked_task_id": 436,
+        },
+    ]
+    await hub_submit_review(42, verdict="changes_requested", findings=findings)
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {"verdict": "changes_requested", "findings": findings},
+    )
+
+
+async def test_hub_submit_review_forwards_auto_draft_flag(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #436: create_tasks_for_out_of_scope passes through to the REST body
+    # only when set — the default keeps the canonical payload unchanged.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {
+            "id": 1,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+        },
+        {"id": 2, "severity": "high", "message": "Fix here"},
+    ]
+    await hub_submit_review(
+        42,
+        verdict="changes_requested",
+        findings=findings,
+        create_tasks_for_out_of_scope=True,
+    )
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "findings": findings,
+            "create_tasks_for_out_of_scope": True,
+        },
+    )
+
+
+async def test_hub_report_done_review_gate_envelope(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # AC-2 (#311): MCP projects the same gate semantics and envelope as REST.
+    mock_api_get.side_effect = [
+        {"id": 88, "status": "running"},  # prior status read
+        {"id": 88, "status": "review", "submission_generation": 1},  # after
+    ]
+    mock_api_post.side_effect = [
+        {"id": 501},  # updates row
+    ]
+    out = await hub_report_done(88, "did the work", agent="dev")
+    payload = json.loads(out)
+    assert payload["status"] == "review"
+    assert payload["awaiting"] == "review"
+    assert payload["actor_hint"] == "agent"
+    assert payload["transition"] == {"from": "running", "to": "review"}
+    assert "Universal Review Gate" in payload["message"]
+    assert "hub_submit_review" in payload["message"]
+
+
+async def test_read_tools_return_object_not_json_string(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-1 (#248): structuredContent is a real object — a client never needs
+    # a nested json.loads.
+    mock_api_get.return_value = [
+        {
+            "id": 5,
+            "status": "open",
+            "runtime": "auto",
+            "title": "T",
+            "task_type": "task",
+        }
+    ]
+    out = await hub_list_tasks()
+    structured = _mcp_structured(out)
+    assert isinstance(structured, dict)
+    assert isinstance(structured["tasks"], list)
+    assert isinstance(structured["tasks"][0], dict)
+    assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
+    assert structured["instance"] in ("prod", "local")
+
+    mock_api_get.return_value = {"context_text": "digest", "task": {"id": 5}}
+    out = await hub_my_context(5)
+    structured = _mcp_structured(out)
+    assert structured["context"]["task"] == {"id": 5}
+
+    mock_api_get.return_value = {
+        "id": 5,
+        "title": "T",
+        "task_type": "task",
+        "status": "open",
+        "priority": "medium",
+        "children": [],
+    }
+    out = await hub_task_tree(5)
+    structured = _mcp_structured(out)
+    assert structured["tree"]["id"] == 5
+
+
+async def test_hub_project_status_structured_lists(mock_api_get: AsyncMock) -> None:
+    # AC-1 (#249): structuredContent carries the dashboard lists as objects
+    # with id/title/status/parent_id, while message keeps the markdown digest.
+    mock_api_get.return_value = {
+        "draft_tasks": [
+            {
+                "id": 9,
+                "title": "Draft A",
+                "status": "draft",
+                "task_type": "task",
+                "runtime": "auto",
+                "parent_id": 4,
+                "source": "agent",
+            }
+        ],
+        "active_tasks": [
+            {
+                "id": 4,
+                "title": "Feature F",
+                "status": "open",
+                "task_type": "feature",
+                "runtime": "auto",
+                "parent_id": 2,
+            }
+        ],
+        "needs_info_tasks": [],
+        "review_tasks": [],
+        "open_prs": [],
+        "recent_commits": [],
+        "recent_decisions": [],
+    }
+    out = await hub_project_status()
+    text = json.loads(_mcp_text(out))["message"]
+    assert "## Drafts (need approval)" in text
+
+    dashboard = _mcp_structured(out)["dashboard"]
+    draft = dashboard["draft_tasks"][0]
+    assert (draft["id"], draft["title"], draft["status"], draft["parent_id"]) == (
+        9,
+        "Draft A",
+        "draft",
+        4,
+    )
+    assert dashboard["active_tasks"][0]["id"] == 4
+
+
+async def test_hub_task_tree_structured_nested_progress(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-2 (#249): the tree is a nested object with progress, not markdown.
+    mock_api_get.return_value = {
+        "id": 1,
+        "title": "Epic",
+        "task_type": "epic",
+        "status": "open",
+        "priority": "high",
+        "progress": {"total": 2, "completed": 1, "active": 1, "percent": 50},
+        "children": [
+            {
+                "id": 2,
+                "title": "Feature",
+                "task_type": "feature",
+                "status": "open",
+                "priority": "medium",
+                "children": [],
+            }
+        ],
+    }
+    out = await hub_task_tree(1)
+    tree = _mcp_structured(out)["tree"]
+    assert tree["progress"]["percent"] == 50
+    assert tree["children"][0]["id"] == 2
+
+
+async def test_hub_list_proposals_ranked_and_flagged(
+    mock_api_get: AsyncMock,
+) -> None:
+    # (#253) proposals sorted DoR-first with ready_to_approve flags.
+    mock_api_get.return_value = [
+        {
+            "id": 1,
+            "title": "Bare",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": None,
+            "readiness_score": None,
+            "risks": [],
+            "created_at": "2026-07-01 10:00:00",
+        },
+        {
+            "id": 2,
+            "title": "Ready",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": True,
+            "readiness_score": 95,
+            "risks": [],
+            "created_at": "2026-07-02 10:00:00",
+        },
+        {
+            "id": 3,
+            "title": "Risky",
+            "status": "draft",
+            "task_type": "task",
+            "runtime": "auto",
+            "source": "agent",
+            "dor_passed": True,
+            "readiness_score": 90,
+            "risks": [{"kind": "security", "severity": "high"}],
+            "created_at": "2026-07-03 10:00:00",
+        },
+    ]
+    out = await hub_list_proposals()
+    proposals = _mcp_structured(out)["proposals"]
+    assert [p["id"] for p in proposals] == [2, 3, 1]
+    flags = {p["id"]: p["ready_to_approve"] for p in proposals}
+    assert flags == {2: True, 3: False, 1: False}  # high risk blocks ready
+    text = json.loads(_mcp_text(out))["message"]
+    assert "READY" in text and "HIGH-RISK" in text
+
+
+async def test_hub_list_tasks_paged_envelope(mock_api_get: AsyncMock) -> None:
+    # (#254) MCP passes cursor params and surfaces next_cursor.
+    mock_api_get.return_value = {
+        "tasks": [
+            {
+                "id": 7,
+                "title": "T",
+                "status": "open",
+                "task_type": "task",
+                "priority": "medium",
+                "parent_id": None,
+                "readiness_score": None,
+                "dor_passed": None,
+            }
+        ],
+        "next_cursor": 7,
+    }
+    out = await hub_list_tasks(after_id=0, mode="summary", limit=1)
+    structured = _mcp_structured(out)
+    assert structured["next_cursor"] == 7
+    assert structured["tasks"][0]["id"] == 7
+    text = json.loads(_mcp_text(out))["message"]
+    assert "after_id=7" in text
+    called = mock_api_get.await_args.args[0]
+    assert "after_id=0" in called and "mode=summary" in called
+
+
+async def test_hub_list_decisions_reports_unavailable_integration(
+    mock_api_get: AsyncMock,
+) -> None:
+    # AC-1 (#251): empty because broken != empty because none exist.
+    mock_api_get.side_effect = [
+        {"recent_decisions": []},
+        {"status": "no_binary", "detail": "n4l binary not found at /x/n4l"},
+    ]
+    out = await hub_list_decisions()
+    structured = _mcp_structured(out)
+    assert structured["notes_available"] is False
+    assert structured["notes_status"] == "no_binary"
+    text = json.loads(_mcp_text(out))["message"]
+    assert "Notes integration unavailable" in text
+    assert "n4l binary not found" in text
+
+
+async def test_hub_list_decisions_empty_but_available(
+    mock_api_get: AsyncMock,
+) -> None:
+    mock_api_get.side_effect = [
+        {"recent_decisions": []},
+        {"status": "available", "detail": "space=abc"},
+    ]
+    out = await hub_list_decisions()
+    structured = _mcp_structured(out)
+    assert structured["notes_available"] is True
+    assert json.loads(_mcp_text(out))["message"] == "No decisions recorded."
+
+
+async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:
+    mock_api_get.return_value = [
+        {
+            "id": 1,
+            "slug": "default",
+            "name": "Default",
+            "repo": "",
+            "default_branch": "develop",
+            "archived": False,
+        }
+    ]
+    out = await hub_list_projects()
+    structured = _mcp_structured(out)
+    assert structured["projects"][0]["slug"] == "default"
+    mock_api_get.assert_awaited_once_with("/api/projects")
+
+
+async def test_deprecated_alias_marks_and_counts(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # AC-1 (#325): alias response carries deprecated + replacement, and the
+    # call is counted through the telemetry endpoint.
+    mock_api_get.side_effect = [
+        {"id": 5, "status": "draft"},  # prior read inside hub_approve_task
+        {"id": 5, "status": "open"},  # refreshed task
+    ]
+    mock_api_post.side_effect = [
+        {"id": 5, "status": "open"},  # approve call
+        {"ok": True},  # telemetry
+    ]
+    out = await hub_approve_proposal(5)
+    payload = json.loads(out)
+    assert payload["deprecated"] is True
+    assert "hub_approve_task" in payload["next_action"]
+    telemetry_call = mock_api_post.await_args_list[-1]
+    assert telemetry_call.args[0] == "/api/telemetry/deprecated-tool"
+    assert telemetry_call.args[1]["tool"] == "hub_approve_proposal"
+
+
+async def test_task_update_done_alias_marked_deprecated(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    mock_api_get.side_effect = [
+        {"id": 6, "status": "running"},
+        {"id": 6, "status": "review", "submission_generation": 1},
+    ]
+    mock_api_post.side_effect = [
+        {"id": 601},  # update row
+        {"ok": True},  # telemetry
+    ]
+    out = await hub_task_update(6, "done text", agent="dev", kind="done")
+    payload = json.loads(out)
+    assert payload["deprecated"] is True
+    assert "hub_report_done" in payload["next_action"]
+
+
+async def test_hub_wait_events(mock_api_get: AsyncMock) -> None:
+    # AC-6: structured envelope with events[] and next_cursor.
+    from hub.mcp_server import hub_wait_events
+
+    mock_api_get.return_value = {
+        "events": [
+            {
+                "id": 5,
+                "kind": "task_approved",
+                "task_id": 7,
+                "project_id": None,
+                "actor": "human",
+                "payload": {"run": False},
+                "created_at": "2026-07-14 00:00:00",
+            }
+        ],
+        "next_cursor": 5,
+    }
+    out = await hub_wait_events(since=0, wait=0)
+    structured = _mcp_structured(out)
+    assert structured["next_cursor"] == 5
+    assert structured["events"][0]["kind"] == "task_approved"
+    path = mock_api_get.await_args.args[0]
+    assert path.startswith("/api/events?")
+    assert "since=0" in path and "wait=0" in path
+
+
+async def test_hub_wait_events_empty(mock_api_get: AsyncMock) -> None:
+    # AC-6: empty feed is a normal answer, not an error.
+    from hub.mcp_server import hub_wait_events
+
+    mock_api_get.return_value = {"events": [], "next_cursor": 42}
+    out = await hub_wait_events(since=42, wait=1, kinds="task_approved")
+    structured = _mcp_structured(out)
+    assert structured["events"] == []
+    assert structured["next_cursor"] == 42
+    path = mock_api_get.await_args.args[0]
+    assert "kinds=task_approved" in path
+
+
+async def test_hub_provision_project(mock_api_post: AsyncMock) -> None:
+    # #348: MCP wrapper over the human-gated provision endpoint.
+    from hub.mcp_server import hub_provision_project
+
+    mock_api_post.return_value = {
+        "provision_status": "ok",
+        "provision_detail": "cloned mrPDA/x (develop)",
+        "project": {"id": 7, "slug": "x", "provision_status": "ok"},
+    }
+    out = await hub_provision_project(7)
+    structured = _mcp_structured(out)
+    assert structured["provision_status"] == "ok"
+    assert structured["project"]["slug"] == "x"
+    mock_api_post.assert_awaited_once_with("/api/projects/7/provision")
+
+
+async def test_hub_get_skill_and_propose(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #380: fetch active skill; propose creates a draft version.
+    from hub.mcp_server import hub_get_skill, hub_propose_skill
+
+    mock_api_get.return_value = {
+        "name": "multi-agent-review",
+        "version": 1,
+        "kind": "prompt",
+        "status": "active",
+        "content": "harness text",
+        "tags": ["review"],
+    }
+    out = await hub_get_skill("multi-agent-review")
+    structured = _mcp_structured(out)
+    assert structured["skill"]["version"] == 1
+    mock_api_get.assert_awaited_once_with("/api/skills/multi-agent-review")
+
+    mock_api_post.return_value = {
+        "name": "multi-agent-review",
+        "version": 2,
+        "status": "draft",
+    }
+    out = await hub_propose_skill(
+        "multi-agent-review", "v2 text", tags="review,quality"
+    )
+    structured = _mcp_structured(out)
+    assert structured["skill"]["status"] == "draft"
+    body = mock_api_post.await_args.args[1]
+    assert body["tags"] == ["review", "quality"]
+
+
+async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
+    # #381: wrapper posts the report and echoes the summary.
+    from hub.mcp_server import hub_submit_machine_review
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 42,
+        "submission_generation": 2,
+        "is_current": True,
+        "raw_count": 4,
+        "findings_confirmed": [{"title": "x", "severity": "low"}],
+        "findings_rejected": [],
+    }
+    out = await hub_submit_machine_review(
+        42,
+        raw_count=4,
+        findings_confirmed=[{"title": "x", "severity": "low"}],
+        tokens_spent=1000,
+        agent="claude-code",
+    )
+    structured = _mcp_structured(out)
+    assert structured["machine_review"]["submission_generation"] == 2
+    path, body = mock_api_post.await_args.args
+    assert path == "/api/tasks/42/machine-review"
+    assert body["tokens_spent"] == 1000
+    assert "duration_ms" not in body  # omitted optionals stay omitted
+
+
+async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
+    # #384: MCP wrapper summarises economics and recurring categories.
+    from hub.mcp_server import hub_practice_metrics
+
+    mock_api_get.return_value = {
+        "since_days": 90,
+        "machine_reviews": {
+            "reviews": 2,
+            "raw_total": 16,
+            "confirmed_total": 4,
+            "rejected_total": 12,
+            "tokens_total": 1428876,
+            "tokens_per_confirmed": 357219,
+        },
+        "by_harness": [],
+        "recurring_categories": [
+            {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
+        ],
+        "cycle_times": [],
+    }
+    out = await hub_practice_metrics(since_days=90)
+    structured = _mcp_structured(out)
+    assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
+    mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")

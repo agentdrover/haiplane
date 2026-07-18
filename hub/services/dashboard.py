@@ -97,7 +97,13 @@ async def get_inbox_data(
         "claimed_by": claimed_by,
         "mine": mine,
     }
-    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=20, **person)
+    draft_rows = await repo.list_tasks_by_status(
+        db,
+        "draft",
+        order_by=repo.DRAFT_QUEUE_ORDER_BY,
+        limit=20,
+        **person,
+    )
     needs_info_rows = await repo.list_tasks_by_status(
         db, "needs_info", limit=20, **person
     )
@@ -107,6 +113,20 @@ async def get_inbox_data(
     pending_report_rows = await repo.list_tasks_by_status(
         db,
         "pending_report",
+        order_by="updated_at ASC",
+        limit=20,
+        **person,
+    )
+    ci_check_rows = await repo.list_tasks_by_status(
+        db,
+        "ci_check",
+        order_by="updated_at ASC",
+        limit=20,
+        **person,
+    )
+    fix_requested_rows = await repo.list_tasks_by_status(
+        db,
+        "fix_requested",
         order_by="updated_at ASC",
         limit=20,
         **person,
@@ -130,6 +150,8 @@ async def get_inbox_data(
         "questions": questions,
         "decisions": [row_to_task(r) for r in needs_decision_rows],
         "pending_reports": [row_to_task(r) for r in pending_report_rows],
+        "ci_check_tasks": [row_to_task(r) for r in ci_check_rows],
+        "fix_requested_tasks": [row_to_task(r) for r in fix_requested_rows],
         "stale_tasks": [row_to_task(r) for r in stale_rows],
         "filter_human_owner": human_owner or "",
         "filter_claimed_by": claimed_by or "",
@@ -180,8 +202,30 @@ async def list_tasks(
     mine: str | None = None,
     limit: int = 50,
     include_archived: bool = False,
-) -> list[TaskView]:
-    """List tasks with optional filters, returning TaskView models."""
+    after_id: int | None = None,
+    mode: str = "full",
+    project: str | None = None,
+) -> list[TaskView] | dict[str, Any]:
+    """List tasks with optional filters.
+
+    Backward compatible: without ``after_id``/``mode=summary`` returns the
+    plain TaskView list. A paged or summary call returns an envelope
+    ``{"tasks": [...], "next_cursor": id|None}`` (#254); pass the returned
+    cursor as ``after_id`` to walk the full set without gaps or duplicates.
+    """
+    project_ids: set[int] | None = None
+    if project:
+        project_row = await repo.get_project_by_slug(db, project)
+        if project_row is None:
+            return (
+                {"tasks": [], "next_cursor": None}
+                if (after_id is not None or mode == "summary")
+                else []
+            )
+        project_ids = await repo.list_task_ids_for_project(db, project_row["id"])
+
+    paged = after_id is not None or mode == "summary"
+    fetch_limit = limit + 1 if paged else limit
     rows = await repo.list_tasks_filtered(
         db,
         status=status,
@@ -193,10 +237,36 @@ async def list_tasks(
         human_reviewer=human_reviewer,
         claimed_by=claimed_by,
         mine=mine,
-        limit=limit,
+        limit=fetch_limit,
         include_archived=include_archived,
+        after_id=after_id if after_id is not None else (0 if paged else None),
     )
-    return [row_to_task(r) for r in rows]
+    views = [row_to_task(r) for r in rows]
+    if project_ids is not None:
+        views = [v for v in views if v.id in project_ids]
+    if not paged:
+        return views
+
+    has_more = len(views) > limit
+    views = views[:limit]
+    next_cursor = views[-1].id if has_more and views else None
+    if mode == "summary":
+        tasks: list[dict[str, Any]] = [
+            {
+                "id": v.id,
+                "title": v.title,
+                "status": v.status.value,
+                "task_type": v.task_type.value,
+                "parent_id": v.parent_id,
+                "priority": v.priority.value,
+                "readiness_score": v.readiness_score,
+                "dor_passed": v.dor_passed,
+            }
+            for v in views
+        ]
+    else:
+        tasks = [v.model_dump(mode="json") for v in views]
+    return {"tasks": tasks, "next_cursor": next_cursor}
 
 
 def _parse_activity_rows(

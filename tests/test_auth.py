@@ -272,6 +272,17 @@ def test_parse_tokens_empty_returns_empty_dict():
     assert config.parse_tokens("   ") == {}
 
 
+def test_parse_tokens_multiple_agent_identities():
+    """Reviewer identity provisioning (#432): several tokens may share the
+    ``agent`` role while remaining distinct principals by name."""
+    out = config.parse_tokens("cursor:tok-a:agent,cursor-reviewer:tok-b:agent")
+    assert out["tok-a"].username == "cursor"
+    assert out["tok-a"].role == "agent"
+    assert out["tok-b"].username == "cursor-reviewer"
+    assert out["tok-b"].role == "agent"
+    assert out["tok-a"].username != out["tok-b"].username
+
+
 # ---------------------------------------------------------------------------
 # Role boundaries — agent tokens blocked from human-only operations
 # ---------------------------------------------------------------------------
@@ -335,6 +346,109 @@ async def test_agent_token_cannot_force_complete(client, monkeypatch):
         headers={"Authorization": "Bearer secret-token"},
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_agent_token_archive_actionable_error(client, monkeypatch):
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "drafty", "source": "agent"},
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/archive",
+        json={"cascade": False},
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "permission_denied"
+    assert detail["required_role"] == "human"
+    assert detail["suggested_tool"] == "hub_withdraw_own_draft"
+    assert detail["hint"]
+
+
+@pytest.mark.asyncio
+async def test_agent_token_can_withdraw_own_draft(client, monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "other-agent": TokenIdentity("other", "agent"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "my draft", "source": "agent", "agent": "bot"},
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/withdraw",
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_token_cannot_withdraw_foreign_draft(client, monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "other-agent": TokenIdentity("other", "agent"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "bot draft", "source": "agent", "agent": "bot"},
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/withdraw",
+        headers={"Authorization": "Bearer other-agent"},
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_task_owner"
+    assert detail["required_role"] == "agent"
+    assert detail["hint"]
+    assert detail["suggested_tool"] == "hub_withdraw_own_draft"
+
+
+@pytest.mark.asyncio
+async def test_agent_token_withdraw_empty_assigned_agent(client, monkeypatch):
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    create = await client.post(
+        "/api/tasks",
+        json={"title": "orphan draft", "source": "agent"},
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/withdraw",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "not_task_owner"
 
 
 @pytest.mark.asyncio

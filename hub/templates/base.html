@@ -28,6 +28,15 @@
             <a href="/tasks?type=epic" class="{% if active == 'epics' %}active{% endif %}">
                 <span class="nav-icon">&#9733;</span> Epics
             </a>
+            <a href="/projects" class="{% if active == 'projects' %}active{% endif %}">
+                <span class="nav-icon">&#9670;</span> Projects
+            </a>
+            <a href="/skills" class="{% if active == 'skills' %}active{% endif %}">
+                <span class="nav-icon">&#9998;</span> Skills
+            </a>
+            <a href="/metrics" class="{% if active == 'metrics' %}active{% endif %}">
+                <span class="nav-icon">&#9632;</span> Metrics
+            </a>
             {% if request.state.identity and request.state.identity.is_admin %}
             <hr class="nav-divider">
             <a href="/admin" class="{% if active == 'admin' %}active{% endif %}">

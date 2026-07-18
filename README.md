@@ -38,7 +38,10 @@ openclaw-hub
 ## Cursor + Hub Workflow
 
 Run the hub, connect Cursor to its MCP endpoint, and treat OpenClaw Hub as the
-task state source. The delivery process is documented in
+task state source. Step-by-step MCP setup (streamable URL, headers, stdio vs
+HTTP, troubleshooting) is in
+[docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).
+The delivery process is documented in
 [docs/software-development-workflow.md](docs/software-development-workflow.md);
 the staged rollout lives in
 [docs/software-development-workflow-implementation-plan.md](docs/software-development-workflow-implementation-plan.md).
@@ -77,8 +80,12 @@ All configuration via environment variables:
 | `OPENCLAW_VAST_JOB_BIN` | `~/.local/bin/vast-openclaw` | Vast.ai CLI path |
 | `GH_BIN` | `gh` | GitHub CLI binary |
 | `OPENCLAW_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
+| `OPENCLAW_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
 | `OPENCLAW_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
-| `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a task is flagged stale |
+| `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
+| `OPENCLAW_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |
+| `OPENCLAW_STALE_CLAIMED_MINUTES` | `240` | Minutes before a claim without pair start is flagged stale |
+| `OPENCLAW_STALE_NEEDS_INFO_MINUTES` | `480` | Minutes before an unanswered question is flagged stale |
 
 ## Structured task form & readiness
 

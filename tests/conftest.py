@@ -36,16 +36,23 @@ class MockDispatch(NoopDispatch):
 
 
 class MockGitOps(NoopGitOps):
-    async def create_branch(self, task_id, title, repo=None):
+    async def create_branch(self, task_id, title, repo=None, base_branch=None):
         from hub.integrations.git_ops import _slugify
 
         return f"task-{task_id}/{_slugify(title)}"
 
-    async def pair_prepare_branch(self, task_id, title, *, branch_slug="", repo=None):
+    async def pair_prepare_branch(
+        self, task_id, title, *, branch_slug="", repo=None, base_branch=None
+    ):
         from hub.integrations.git_ops import _slugify
 
         slug = branch_slug or _slugify(title)
         return f"task-{task_id}/{slug}"
+
+    async def pair_restore_workspace_base(
+        self, task_id, *, repo=None, base_branch=None
+    ):
+        return False
 
     async def checkout(self, branch, repo=None):
         return True

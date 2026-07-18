@@ -10,6 +10,8 @@ from typing import Any
 
 import aiosqlite
 
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
 
 class NoopDispatch:
     def is_available(self) -> bool:
@@ -106,8 +108,22 @@ class NoopGitOps:
     async def current_branch(self, repo: str | None = None) -> str:
         return ""
 
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool:
+        # No repo access — the advisory stacking check is silently skipped.
+        return False
+
     async def create_branch(
-        self, task_id: int, title: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         return ""
 
@@ -118,11 +134,21 @@ class NoopGitOps:
         *,
         branch_slug: str = "",
         repo: str | None = None,
+        base_branch: str | None = None,
     ) -> str:
         from hub.integrations.git_ops import _slugify
 
         slug = (branch_slug or "").strip() or _slugify(title)
         return f"task-{task_id}/{slug}"
+
+    async def pair_restore_workspace_base(
+        self,
+        task_id: int,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        return False
 
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
@@ -156,6 +182,8 @@ class NoopGitOps:
         description: str,
         branch: str,
         repo: str | None = None,
+        gh_repo: str | None = None,
+        base_branch: str | None = None,
     ) -> int | None:
         return None
 
@@ -165,19 +193,33 @@ class NoopGitOps:
         branch: str,
         max_log_chars: int = 4000,
         repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> dict[str, Any]:
         return {}
 
-    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str:
-        return "pending"
+    async def check_pr_ci(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.pending, "noop")
 
     async def merge_pr(
-        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool:
         return False
 
     async def delete_branch(self, branch: str, repo: str | None = None) -> None:
         pass
+
+    async def clone_repo(
+        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+    ) -> tuple[bool, str]:
+        # Valid provision outcome (#347): the operator sees WHY it failed.
+        return False, "git ops disabled (noop integration)"
 
 
 class NoopGitHub:
@@ -189,6 +231,9 @@ class NoopGitHub:
 
 
 class NoopNotes:
+    async def availability(self) -> dict[str, str]:
+        return {"status": "no_binary", "detail": "notes integration disabled"}
+
     async def recent_decisions(
         self, space_id: str | None = None, limit: int = 10
     ) -> list[dict[str, Any]]:

@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiosqlite
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 
 from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
+from hub.actionable_errors import human_only_gate_detail
 from hub.auth import (
     CSRF_COOKIE_NAME,
     current_user,
     current_identity,
+    require_human_or_admin,
     generate_csrf_token,
     login_limiter,
     require_permission,
@@ -26,6 +32,11 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.models import (
+    BatchApprove,
+    ProjectCreate,
+    ProjectPatch,
+    ReviewFinding,
+    ReviewSeverity,
     RuntimeChoice,
     TaskAnswer,
     TaskApprove,
@@ -33,6 +44,7 @@ from hub.models import (
     TaskDecide,
     TaskForceComplete,
     TaskReject,
+    TaskReviewVerdict,
     TaskStart,
     TaskStatus,
     TaskType,
@@ -203,6 +215,12 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request") == "true"
 
 
+def _require_human_web(request: Request) -> None:
+    """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
+    if current_identity(request).is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+
+
 def _dispatch_available() -> bool:
     return plugins.dispatch.is_available()
 
@@ -268,21 +286,54 @@ async def _apply_analyst_ready_filter(
 
 async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
     """Return a small 'done' indicator for HTMX-swapped items."""
-    import html as html_mod
-
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         return HTMLResponse("")
     t = services.row_to_task(row)
-    safe_title = html_mod.escape(t.title[:40])
-    safe_status = html_mod.escape(t.status.value)
+    safe_title = html.escape(t.title[:40])
+    safe_status = html.escape(t.status.value)
     fragment = (
         f'<div class="inbox-item-done" id="inbox-task-{t.id}">'
         f'<span class="badge badge-{safe_status}">{safe_status}</span> '
         f"#{t.id} {safe_title}</div>"
     )
     return HTMLResponse(fragment)
+
+
+def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLResponse:
+    """Self-contained HTMX block shown when plain Approve hits the DoR gate.
+
+    Explains exactly what the task is missing to move further along the
+    route (the unmet Definition of Ready fields and their recommendations)
+    so the human knows what to fill in next. Returned with HTTP 200 so HTMX
+    swaps it in place instead of erroring.
+    """
+    missing = detail.get("missing_required") or []
+    recommendations = detail.get("recommendations") or []
+    score = detail.get("score")
+    score_text = f" (score {html.escape(str(score))})" if score is not None else ""
+    if recommendations:
+        items = "".join(
+            f"<li><b>{html.escape(str(rec.get('field', '')))}:</b> "
+            f"{html.escape(str(rec.get('message', '')))}</li>"
+            for rec in recommendations
+        )
+        what_missing = f"<ul class='dor-gate-list'>{items}</ul>"
+    elif missing:
+        what_missing = f"<p>Не хватает: <b>{html.escape(', '.join(missing))}</b>.</p>"
+    else:
+        what_missing = "<p>Не заполнены обязательные поля Definition of Ready.</p>"
+    fragment = (
+        f'<div class="dor-gate-warning" id="dor-warn-{task_id}">'
+        f'<span class="badge badge-draft">DoR не пройден</span>'
+        f"<p>Задача #{task_id}{score_text} ещё не готова к одобрению. "
+        f"Заполните недостающее, чтобы двигаться дальше по маршруту:</p>"
+        f"{what_missing}"
+        f'<a class="btn btn-secondary btn-xs" href="/tasks/{task_id}">Открыть задачу</a>'
+        f"</div>"
+    )
+    return HTMLResponse(fragment, status_code=200)
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +347,27 @@ async def web_partial_inbox(
     human_owner: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    project: str | None = Query(None),
 ):
+    db = _db(request)
     inbox = await services.get_inbox_data(
-        _db(request),
+        db,
         human_owner=human_owner,
         claimed_by=claimed_by,
         mine=mine,
     )
+    allowed, _, _ = await _project_filter_ctx(db, project)
+    if allowed is not None:
+        for key in (
+            "drafts",
+            "questions",
+            "decisions",
+            "pending_reports",
+            "ci_check_tasks",
+            "fix_requested_tasks",
+            "stale_tasks",
+        ):
+            inbox[key] = _filter_by_ids(inbox[key], allowed)
     inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
@@ -316,8 +381,20 @@ async def web_partial_epics(request: Request):
 
 
 @router.get("/partials/kanban", response_class=HTMLResponse)
-async def web_partial_kanban(request: Request):
-    data = await services.get_dashboard_data(_db(request))
+async def web_partial_kanban(request: Request, project: str | None = Query(None)):
+    db = _db(request)
+    data = await services.get_dashboard_data(db)
+    allowed, _, _ = await _project_filter_ctx(db, project)
+    if allowed is not None:
+        for field in (
+            "active_tasks",
+            "draft_tasks",
+            "review_tasks",
+            "needs_decision_tasks",
+            "needs_info_tasks",
+        ):
+            if hasattr(data, field):
+                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
     tasks_for_badges = [
         *data.active_tasks,
         *data.draft_tasks,
@@ -387,17 +464,71 @@ async def web_tasks_list_partial(
 # ---------------------------------------------------------------------------
 
 
+async def _project_filter_ctx(
+    db: aiosqlite.Connection, project: str | None
+) -> tuple[set[int] | None, list[dict[str, Any]], str]:
+    """(allowed task ids | None, projects for the selector, current slug) (#339)."""
+    rows = await repo.list_projects(db, only_active=True)
+    projects = [dict(r) for r in rows]
+    allowed: set[int] | None = None
+    current = (project or "").strip()
+    if current:
+        prow = await repo.get_project_by_slug(db, current)
+        allowed = (
+            await repo.list_task_ids_for_project(db, prow["id"])
+            if prow is not None
+            else set()
+        )
+    return allowed, projects, current
+
+
+def _filter_by_ids(items: list[Any], allowed: set[int] | None) -> list[Any]:
+    if allowed is None:
+        return items
+    return [t for t in items if (t.id if hasattr(t, "id") else t.get("id")) in allowed]
+
+
 @router.get("/", response_class=HTMLResponse)
-async def web_dashboard(request: Request):
+async def web_dashboard(request: Request, project: str | None = Query(None)):
     db = _db(request)
+    allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     data = await services.get_dashboard_data(db)
     inbox = await services.get_inbox_data(db)
+    if allowed is not None:
+        for field in (
+            "active_tasks",
+            "draft_tasks",
+            "review_tasks",
+            "needs_decision_tasks",
+            "needs_info_tasks",
+        ):
+            if hasattr(data, field):
+                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
+        for key in (
+            "drafts",
+            "questions",
+            "decisions",
+            "pending_reports",
+            "ci_check_tasks",
+            "fix_requested_tasks",
+            "stale_tasks",
+        ):
+            inbox[key] = _filter_by_ids(inbox[key], allowed)
     epics = await services.get_epics_enriched(db)
+    if allowed is not None:
+        epics = [
+            e
+            for e in epics
+            if (e.get("id") if isinstance(e, dict) else getattr(e, "id", None))
+            in allowed
+        ]
     inbox_total = (
         len(inbox["drafts"])
         + len(inbox["questions"])
         + len(inbox["decisions"])
         + len(inbox["pending_reports"])
+        + len(inbox["ci_check_tasks"])
+        + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
     )
     ctx: dict[str, Any] = {
@@ -406,6 +537,8 @@ async def web_dashboard(request: Request):
         "epics": epics,
         "inbox_total": inbox_total,
         "dispatch_available": _dispatch_available(),
+        "projects_list": projects_list,
+        "current_project": current_project,
     }
     ctx.update(inbox)
     tasks_for_badges = [
@@ -423,6 +556,267 @@ async def web_dashboard(request: Request):
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
+@router.get("/projects", response_class=HTMLResponse)
+async def web_projects(request: Request, project_error: str = Query("")):
+    """Project list with create/edit/archive forms (#339, #344)."""
+    rows = await repo.list_projects(_db(request), include_archived=True)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "projects.html",
+        {"projects": [dict(r) for r in rows], "project_error": project_error},
+    )
+
+
+def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
+    """(policy dict | None if absent, error message | None)."""
+    raw = raw.strip()
+    if not raw:
+        return None, None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):
+        # RecursionError: на Python <3.13 json.loads падает рекурсией на глубоко
+        # вложенном вводе ('['*20000) — это не ValueError и без перехвата даёт 500.
+        return None, "policy: не парсится как JSON"
+    if not isinstance(parsed, dict):
+        return None, "policy: ожидается JSON-объект"
+    return parsed, None
+
+
+def _projects_error_redirect(message: str) -> RedirectResponse:
+    return RedirectResponse(
+        f"/projects?project_error={quote(message)}", status_code=303
+    )
+
+
+@router.post("/projects/web-create")
+async def web_create_project(request: Request):
+    """Create-project form (#344): thin wrapper over the API handler —
+    the same slug validation, 409 duplication and agent→pending rules."""
+    form = await request.form()
+    policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))
+    if err:
+        return _projects_error_redirect(err)
+    try:
+        body = ProjectCreate(
+            slug=str(form.get("slug") or "").strip(),
+            name=str(form.get("name") or "").strip(),
+            repo=str(form.get("repo") or "").strip(),
+            workspace_path=str(form.get("workspace_path") or "").strip(),
+            default_branch=str(form.get("default_branch") or "").strip() or "develop",
+            default_branch_policy=policy or {},
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
+
+    from hub.app import api_create_project
+
+    try:
+        await api_create_project(body, request, identity=current_identity(request))
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return _projects_error_redirect(str(exc.detail))
+        raise
+    return RedirectResponse("/projects", status_code=303)
+
+
+async def _web_patch_project(
+    request: Request, project_id: int, body: ProjectPatch
+) -> None:
+    """Shared web→API bridge: the same human gate as PATCH /api/projects."""
+    from hub.app import api_patch_project
+
+    await api_patch_project(
+        project_id, body, request, _identity=require_human_or_admin(request)
+    )
+
+
+@router.post("/projects/{project_id}/web-edit")
+async def web_edit_project(project_id: int, request: Request):
+    """Inline-edit form (#344): exactly the ProjectPatch fields."""
+    form = await request.form()
+    fields: dict[str, Any] = {}
+    for key in ("name", "repo", "workspace_path", "default_branch"):
+        if key in form:
+            value = str(form.get(key) or "").strip()
+            if not value and key in ("name", "default_branch"):
+                continue  # обязательные в модели — пустое значит «не менять»
+            fields[key] = value
+    policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))
+    if err:
+        return _projects_error_redirect(err)
+    if policy is not None:
+        fields["default_branch_policy"] = policy
+    if not fields:
+        return RedirectResponse("/projects", status_code=303)
+    try:
+        body = ProjectPatch(**fields)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
+    await _web_patch_project(request, project_id, body)
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/projects/{project_id}/web-archive")
+async def web_archive_project(
+    project_id: int, request: Request, archived: bool = Form(...)
+):
+    await _web_patch_project(request, project_id, ProjectPatch(archived=archived))
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/projects/{project_id}/web-activate")
+async def web_activate_project(project_id: int, request: Request):
+    """Activate a pending agent proposal (#345) from the UI."""
+    await _web_patch_project(request, project_id, ProjectPatch(status="active"))
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/projects/{project_id}/web-provision")
+async def web_provision_project(project_id: int, request: Request):
+    """Provision button (#348): same human gate and service as the API.
+
+    An error outcome is shown next to the form; the status badge on the
+    page reflects provision_status either way."""
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    if await repo.get_project(db, project_id) is None:
+        return _projects_error_redirect("project not found")
+    result = await services.provision_project(db, project_id, actor=identity.username)
+    if result["provision_status"] != "ok":
+        return _projects_error_redirect(f"Provision: {result['provision_detail']}")
+    return RedirectResponse("/projects", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-request-machine-review")
+async def web_request_machine_review(task_id: int, request: Request):
+    """Reviewer explicitly demands a machine review (#382): sets the task
+    override, leaves an alert for the agent and wakes it via the feed."""
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    if await repo.get_task(db, task_id) is None:
+        raise HTTPException(404, "task not found")
+    await repo.update_task(db, task_id, machine_review_override="require")
+    await repo.add_task_update(
+        db,
+        task_id,
+        identity.username,
+        "alert",
+        "Reviewer запросил machine-review: hub_get_skill('multi-agent-review') "
+        "→ прогон харнесса → hub_submit_machine_review, затем ждите вердикт.",
+    )
+    await repo.insert_event(
+        db,
+        kind="machine_review_requested",
+        task_id=task_id,
+        actor=identity.username,
+    )
+    await db.commit()
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.get("/metrics", response_class=HTMLResponse)
+async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1)):
+    """Practice metrics page (#384)."""
+    data = await services.practice_metrics(_db(request), since_days=since_days)
+    return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
+
+
+@router.get("/skills", response_class=HTMLResponse)
+async def web_skills(request: Request, skill_error: str = Query("")):
+    """Skills library (#380): latest version per name; create form (#385)."""
+    from hub.models import SkillView
+
+    rows = await repo.list_skills(_db(request))
+    return TEMPLATES.TemplateResponse(
+        request,
+        "skills.html",
+        {
+            "skills": [SkillView(**dict(r)) for r in rows],
+            "skill_error": skill_error,
+        },
+    )
+
+
+@router.get("/skills/{name}", response_class=HTMLResponse)
+async def web_skill_detail(name: str, request: Request, skill_error: str = Query("")):
+    from hub.models import SkillView
+
+    rows = await repo.list_skill_versions(_db(request), name)
+    if not rows:
+        raise HTTPException(404, "skill not found")
+    versions = [SkillView(**dict(r)) for r in rows]
+    active = next((v for v in versions if v.status == "active"), versions[0])
+    return TEMPLATES.TemplateResponse(
+        request,
+        "skill_detail.html",
+        {
+            "name": name,
+            "versions": versions,
+            "active_content": active.content,
+            "skill_error": skill_error,
+        },
+    )
+
+
+def _skills_error_redirect(message: str, name: str = "") -> RedirectResponse:
+    target = f"/skills/{name}" if name else "/skills"
+    return RedirectResponse(f"{target}?skill_error={quote(message)}", status_code=303)
+
+
+async def _web_create_skill_version(request: Request, form: Any, name_hint: str = ""):
+    """Shared web→API bridge for create and new-version (#385)."""
+    from hub.app import api_create_skill
+    from hub.models import SkillCreate
+
+    tags = [t.strip() for t in str(form.get("tags") or "").split(",") if t.strip()]
+    try:
+        body = SkillCreate(
+            name=(name_hint or str(form.get("name") or "")).strip(),
+            kind=str(form.get("kind") or "prompt").strip(),
+            content=str(form.get("content") or ""),
+            tags=tags,
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        return _skills_error_redirect(
+            f"{loc}: {first.get('msg', 'invalid')}", name_hint
+        )
+    await api_create_skill(body, request, identity=current_identity(request))
+    return RedirectResponse(f"/skills/{body.name}", status_code=303)
+
+
+@router.post("/skills/web-create")
+async def web_create_skill(request: Request):
+    """Create-skill form (#385): thin wrapper over api_create_skill; the
+    human path publishes an active version, agents still land as drafts."""
+    return await _web_create_skill_version(request, await request.form())
+
+
+@router.post("/skills/{name}/web-new-version")
+async def web_new_skill_version(name: str, request: Request):
+    """Edit as new version (#385): immutable history — always a new INSERT."""
+    if not await repo.list_skill_versions(_db(request), name):
+        raise HTTPException(404, "skill not found")
+    return await _web_create_skill_version(request, await request.form(), name)
+
+
+@router.post("/skills/{name}/versions/{version}/web-activate")
+async def web_activate_skill(name: str, version: int, request: Request):
+    """Activate a proposed skill version — same human gate as the API."""
+    from hub.app import api_activate_skill
+
+    await api_activate_skill(
+        name, version, request, _identity=require_human_or_admin(request)
+    )
+    return RedirectResponse(f"/skills/{name}", status_code=303)
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 async def web_tasks(
     request: Request,
@@ -434,8 +828,10 @@ async def web_tasks(
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     analyst_ready: bool = Query(default=False),
+    project: str | None = Query(default=None),
 ):
     db = _db(request)
+    allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
     tasks = await services.list_tasks(
         db,
@@ -448,6 +844,8 @@ async def web_tasks(
         human_reviewer=human_reviewer,
         limit=100,
     )
+    if allowed is not None:
+        tasks = _filter_by_ids(tasks, allowed)
     tasks, ready_by_id = await _apply_analyst_ready_filter(
         db, tasks, analyst_ready=analyst_ready
     )
@@ -474,6 +872,8 @@ async def web_tasks(
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
             "filter_analyst_ready": analyst_ready,
+            "projects_list": projects_list,
+            "current_project": current_project,
             "parent_breadcrumb": parent_breadcrumb,
             "all_statuses": all_statuses,
             "all_types": all_types,
@@ -485,7 +885,12 @@ async def web_tasks(
 
 
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)
-async def web_task_detail(task_id: int, request: Request):
+async def web_task_detail(
+    task_id: int,
+    request: Request,
+    approve_error: str = Query(""),
+    review_error: str = Query(""),
+):
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
@@ -497,16 +902,39 @@ async def web_task_detail(task_id: int, request: Request):
     readiness = await services.get_readiness(db, task_id, explain=False)
     analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
+
+    # Machine review (#381): summary next to the verdict buttons.
+    machine_review = None
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    if mr_row is not None:
+        from hub.models import MachineReviewView
+
+        machine_review = MachineReviewView(**dict(mr_row))
+        machine_review.is_current = machine_review.submission_generation == (
+            task.submission_generation or 0
+        )
+
+    # Machine-review policy gap (#382): warning in the verdict panel.
+    machine_review_gap_text = None
+    if task.status.value == "review" and not task.review_job_id:
+        from hub.services.orchestration import machine_review_gap
+
+        machine_review_gap_text = await machine_review_gap(db, dict(row))
+
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
+            "machine_review": machine_review,
+            "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
             "analyst_ready": analyst_ready,
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),
+            "approve_error": approve_error,
+            "review_error": review_error,
         },
     )
 
@@ -580,7 +1008,7 @@ async def web_create_task(
         human_reviewer=human_reviewer,
         agent=user,
     )
-    created = await services.create_task(_db(request), body)
+    created = (await services.create_task(_db(request), body)).task
     if after_create == "refine":
         return RedirectResponse(f"/tasks/{created.id}", status_code=303)
     return RedirectResponse("/tasks", status_code=303)
@@ -601,13 +1029,29 @@ async def web_approve_task(
     affordance in the sidebar) set ``force=true`` as a hidden form value;
     plain 'Approve' keeps the gate active.
     """
+    _require_human_web(request)
     body = TaskApprove(
         comment=comment,
         run=run,
         runtime=RuntimeChoice(runtime) if runtime else None,
         force=force,
     )
-    await services.approve_task(_db(request), task_id, body)
+    try:
+        await services.approve_task(_db(request), task_id, body)
+    except HTTPException as exc:
+        detail = exc.detail
+        is_dor = (
+            exc.status_code == 422
+            and isinstance(detail, dict)
+            and detail.get("error") == "dor_failed"
+        )
+        if not is_dor:
+            raise
+        if _is_htmx(request):
+            return _htmx_dor_failed_fragment(task_id, detail)
+        return RedirectResponse(
+            f"/tasks/{task_id}?approve_error=dor_failed", status_code=303
+        )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
@@ -619,6 +1063,7 @@ async def web_reject_task(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), task_id, body)
     if _is_htmx(request):
@@ -632,6 +1077,7 @@ async def web_start_task(
     request: Request,
     runtime: str = Form("auto"),
 ):
+    _require_human_web(request)
     body = TaskStart(
         plan="Developer-agent dispatch requested from Hub UI.",
         runtime=RuntimeChoice(runtime) if runtime else None,
@@ -649,6 +1095,7 @@ async def web_answer_task(
     answer: str = Form(...),
     resume: bool = Form(True),
 ):
+    _require_human_web(request)
     body = TaskAnswer(answer=answer, resume=resume)
     await services.answer_question(_db(request), task_id, body)
     if _is_htmx(request):
@@ -665,6 +1112,7 @@ async def web_decide_task(
     decision_summary: str = Form(""),
     record_decision: bool = Form(False),
 ):
+    _require_human_web(request)
     body = TaskDecide(
         action=action,
         instructions=instructions,
@@ -677,18 +1125,129 @@ async def web_decide_task(
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 
+@router.post("/tasks/web-batch-approve-ready")
+async def web_batch_approve_ready(request: Request):
+    """Inbox bulk action (#252): approve every DoR-ready draft without
+    high risks in one click. Same guards as the API — force never."""
+    db = _db(request)
+    identity = current_identity(request)
+    if identity.is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=100)
+    task_ids = [dict(r)["id"] for r in draft_rows]
+    if task_ids:
+        await services.batch_approve_tasks(
+            db,
+            BatchApprove(task_ids=task_ids, comment="Batch-approved from inbox"),
+        )
+    if _is_htmx(request):
+        inbox = await services.get_inbox_data(db)
+        inbox["dispatch_available"] = _dispatch_available()
+        return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
+    return RedirectResponse("/", status_code=303)
+
+
+def _parse_findings_form(text: str) -> list[ReviewFinding]:
+    """Parse the review-panel findings textarea into structured findings.
+
+    One finding per line, optionally prefixed with a severity:
+    ``high: message`` / ``medium: message`` / ``low: message``. Lines
+    without a recognized severity prefix default to medium. Ids are
+    assigned by position — stable within this submission (#308).
+    """
+    findings: list[ReviewFinding] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        severity, _, rest = line.partition(":")
+        sev_token = severity.strip().lower()
+        if sev_token in ReviewSeverity.__members__ and rest.strip():
+            findings.append(
+                ReviewFinding(
+                    id=len(findings) + 1,
+                    severity=ReviewSeverity(sev_token),
+                    message=rest.strip(),
+                )
+            )
+        else:
+            findings.append(
+                ReviewFinding(
+                    id=len(findings) + 1,
+                    severity=ReviewSeverity.medium,
+                    message=line,
+                )
+            )
+    return findings
+
+
+@router.post("/tasks/{task_id}/web-review-verdict")
+async def web_review_verdict(
+    task_id: int,
+    request: Request,
+    verdict: str = Form(...),
+    comments: str = Form(""),
+    findings_text: str = Form(""),
+):
+    """Submit a review verdict from the task card panel (#321).
+
+    Same semantics as POST /api/tasks/{id}/review-verdict: the shared
+    independence check plus the canonical record_review_verdict service —
+    no web-only verdict logic. The verdict is recorded under the logged-in
+    identity, not a free-text name.
+    """
+    db = _db(request)
+    identity = current_identity(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    self_approved = services.ensure_reviewer_independence(
+        dict(row),
+        is_agent=identity.is_agent,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
+    try:
+        body = TaskReviewVerdict(
+            verdict=verdict,  # type: ignore[arg-type]
+            agent=identity.username,
+            comments=comments,
+            findings=_parse_findings_form(findings_text),
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0] if exc.errors() else {}
+        msg = f"Invalid review form: {first.get('msg', 'validation error')}"
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div class="task-action-note">{msg}</div>', status_code=422
+            )
+        return RedirectResponse(
+            f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
+        )
+    await services.record_review_verdict(db, task_id, body, self_approved=self_approved)
+    if _is_htmx(request):
+        return await _htmx_task_done_fragment(request, task_id)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
 @router.post("/tasks/{task_id}/web-force-complete")
 async def web_force_complete_task(
     task_id: int,
     request: Request,
     comment: str = Form(""),
 ):
-    """Force-complete a pending_report task from the Web UI.
+    """Force-complete a non-terminal task/subtask from the Web UI (human-only).
+
+    Same semantics as REST/MCP force-complete: any non-terminal task/subtask when
+    no active dispatch job backs job_id or review_job_id; 409 if active.
+    Missing/terminal jobs are audited. Comment required for most active
+    lifecycle states (pending_report/claimed may use the default).
 
     The audit-trail comment can be supplied either via the ``HX-Prompt``
     header (populated by htmx ``hx-prompt``) or via a ``comment`` form field
     for non-htmx clients. The header takes precedence.
     """
+    _require_human_web(request)
     reason = request.headers.get("HX-Prompt", "") or comment
     body = TaskForceComplete(comment=reason) if reason else None
     await services.force_complete_task(_db(request), task_id, body)
@@ -749,6 +1308,7 @@ async def web_approve_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskApprove(comment=comment, run=True)
     await services.approve_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)
@@ -760,6 +1320,7 @@ async def web_reject_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
-from hub import config, services
+from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.db import log_activity
+from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
@@ -19,8 +20,64 @@ POLL_INTERVAL = 30  # seconds
 
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
 
-_ci_no_pr_retries: dict[int, int] = {}
-_ci_pushed_at: dict[int, float] = {}  # task_id → time.monotonic() of last push
+MAX_CI_NO_PR_ATTEMPTS = 3  # give up creating a PR after this many polls
+
+
+def _seconds_since(iso_ts: str | None) -> float | None:
+    """Seconds elapsed since a stored ``datetime('now')`` timestamp (#416).
+
+    CI push time now lives in the row (``ci_check_started_at``) as a naive-UTC
+    ``YYYY-MM-DD HH:MM:SS`` string, so the grace period is measured from the
+    real push and survives a restart. Returns ``None`` when unset/unparseable.
+    """
+    if not iso_ts:
+        return None
+    try:
+        started = datetime.strptime(iso_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return (datetime.now(UTC) - started).total_seconds()
+
+
+async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
+    """Grace-then-escalate for a headless task whose dispatch job is gone (#417).
+
+    A missing job used to be a silent ``continue`` — the task then sat in a
+    machine status forever. Now the first miss stamps a durable clock; once the
+    grace passes the task escalates once to needs_decision with a machine
+    reason. The clock lives in the row, so the decision survives a restart and
+    matches a continuous run. Pair-running and client-driven review are never
+    routed here — they carry no job id and are excluded by the selection.
+    """
+    elapsed = _seconds_since(task.get("job_missing_since"))
+    if elapsed is None:
+        await repo.mark_job_missing(db, task["id"])
+        await db.commit()
+        return
+    if elapsed < config.MISSING_JOB_GRACE_MINUTES * 60:
+        return
+    await repo.add_task_update(
+        db,
+        task["id"],
+        "hub",
+        "alert",
+        "Dispatch job missing beyond grace period. Manual decision required.",
+    )
+    await repo.update_task(db, task["id"], status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task["id"],
+        actor="hub",
+        payload={"reason": reason},
+    )
+    await repo.clear_job_missing(db, task["id"])
+    await db.commit()
+    log.warning(
+        "Poll: task #%d dispatch job missing beyond grace → needs_decision",
+        task["id"],
+    )
+    await services.maybe_destroy_vast(db, task)
 
 
 async def _poll_running_tasks(app: FastAPI) -> None:
@@ -35,7 +92,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["job_id"])
                 if not job:
+                    await _handle_missing_job(
+                        db, task, reason="dispatch_job_missing"
+                    )
                     continue
+                if task.get("job_missing_since"):
+                    await repo.clear_job_missing(db, task["id"])
+                    await db.commit()
                 job_status = job.get("status")
                 if job_status not in ("completed", "failed"):
                     continue
@@ -72,6 +135,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         exit_code=job.get("exit_code"),
                         result_text=job.get("result_text"),
                     )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "blocker_reported"},
+                    )
                     await db.commit()
                     log.info(
                         "Poll: task #%d → needs_decision (blocker reported)",
@@ -101,7 +171,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     result_text=job.get("result_text"),
                 )
                 if next_status == "ci_check":
-                    _ci_pushed_at[task["id"]] = time.monotonic()
+                    await repo.mark_ci_check_started(db, task["id"])
                 log.info(
                     "Poll: task #%d → %s (exit=%s)",
                     task["id"],
@@ -116,7 +186,13 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["review_job_id"])
                 if not job:
+                    await _handle_missing_job(
+                        db, task, reason="review_job_missing"
+                    )
                     continue
+                if task.get("job_missing_since"):
+                    await repo.clear_job_missing(db, task["id"])
+                    await db.commit()
                 job_status = job.get("status")
                 if job_status not in ("completed", "failed"):
                     continue
@@ -124,93 +200,141 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 updates_rows = await repo.get_task_updates(db, task["id"])
                 updates_list = [dict(r) for r in updates_rows]
 
-                last_rework_at = ""
-                for u in reversed(updates_list):
-                    if (
-                        u.get("agent") == "human"
-                        and u.get("kind") == "status"
-                        and "rework" in u.get("content", "").lower()
-                    ):
-                        last_rework_at = u.get("created_at", "")
-                        break
-
-                recent_updates = (
-                    [
-                        u
-                        for u in updates_list
-                        if u.get("created_at", "") > last_rework_at
-                    ]
-                    if last_rework_at
-                    else updates_list
+                # Server-owned arbiter termination (#422): when the current
+                # review job IS the arbiter job, the Hub — not a voluntary
+                # agent update — ends the arbiter phase. Any terminal state
+                # routes to the human Decision Gate with an audit summary taken
+                # from the job result/log; a free-text APPROVED never
+                # auto-completes. This replaces the old kind="arbitration"
+                # inference (and the never-matching last_rework_at filter).
+                is_arbiter_job = bool(
+                    task.get("arbiter_state") == "running"
+                    and task.get("arbiter_job_id")
+                    and task.get("arbiter_job_id") == task.get("review_job_id")
                 )
-
-                has_alert = any(
-                    u.get("kind") == "alert"
-                    and "cycle limit" in u.get("content", "").lower()
-                    for u in recent_updates
-                )
-                has_arbitration = any(
-                    u.get("kind") == "arbitration" for u in recent_updates
-                )
-
-                if job_status == "failed":
-                    if has_alert or has_arbitration:
-                        await repo.update_task(db, task["id"], status="needs_decision")
-                        await db.commit()
-                        await repo.add_task_update(
-                            db,
-                            task["id"],
-                            "hub",
-                            "alert",
-                            f"Review/arbiter job failed (exit={job.get('exit_code')}). Manual decision required.",
+                if is_arbiter_job:
+                    summary = (job.get("result_text") or "").strip()
+                    if not summary:
+                        summary = _extract_agent_summary(
+                            plugins.dispatch.job_log_full(task["review_job_id"])
                         )
-                        await db.commit()
-                        log.info(
-                            "Poll: review/arbiter job failed for task #%d after cycle limit → needs_decision",
-                            task["id"],
-                        )
-                        await services.maybe_destroy_vast(db, task)
-                    else:
-                        await repo.update_task(db, task["id"], status="completed")
-                        await db.commit()
-                        log.info(
-                            "Poll: review job failed for task #%d, marking completed",
-                            task["id"],
-                        )
-                        await services.maybe_destroy_vast(db, task)
-                    continue
-
-                verdict = services.extract_review_verdict(
-                    task["id"], task["review_job_id"], updates_list
-                )
-
-                if has_arbitration:
+                    reason = (
+                        "arbiter_job_failed"
+                        if job_status == "failed"
+                        else "arbitration_finished"
+                    )
+                    await repo.mark_arbiter_finished(db, task["id"])
                     await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": reason},
+                    )
                     await db.commit()
-                    log.info("Poll: task #%d arbiter done → needs_decision", task["id"])
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        "Arbiter phase finished — human decision required "
+                        "(hub_decide_task)."
+                        + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
+                    )
+                    await db.commit()
+                    log.info(
+                        "Poll: task #%d arbiter %s → needs_decision",
+                        task["id"],
+                        job_status,
+                    )
                     await services.maybe_destroy_vast(db, task)
                     continue
+
+                if job_status == "failed":
+                    # Universal Review Gate (#309): a crashed review job must
+                    # never complete the task — no verdict exists.
+                    await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "review_job_failed"},
+                    )
+                    await db.commit()
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"Review job failed (exit={job.get('exit_code')}) "
+                        "without a verdict. Universal Review Gate: manual "
+                        "decision required (hub_decide_task).",
+                    )
+                    await db.commit()
+                    log.info(
+                        "Poll: review job failed for task #%d → needs_decision",
+                        task["id"],
+                    )
+                    await services.maybe_destroy_vast(db, task)
+                    continue
+
+                # Structured channel first (#326): a persisted verdict for
+                # the CURRENT submission wins; text scanning stays as the
+                # fallback for legacy reviewers and dispatch logs.
+                persisted = task.get("review_verdict")
+                if persisted and task.get("review_verdict_generation") == task.get(
+                    "submission_generation"
+                ):
+                    verdict = persisted
+                    log.info(
+                        "Poll: task #%d verdict '%s' from persisted review state",
+                        task["id"],
+                        verdict,
+                    )
+                else:
+                    verdict = services.extract_review_verdict(
+                        task["id"], task["review_job_id"], updates_list
+                    )
+
+                if verdict:
+                    # Canonical verdict state (#305): bind the verdict to the
+                    # current submission generation so a later resubmission
+                    # invalidates this approval.
+                    await repo.record_review_verdict(db, task["id"], verdict)
 
                 if verdict == "approved":
                     pr_num = task.get("pr_number")
                     branch = task.get("branch")
                     merged = False
                     if pr_num:
-                        ci = await plugins.git_ops.check_pr_ci(pr_num)
-                        if ci == "pass":
+                        mctx = await services.project_git_context(db, task["id"])
+                        mworkspace = mctx.get("repo")
+                        mgh_repo = mctx.get("gh_repo")
+                        ci = await plugins.git_ops.check_pr_ci(
+                            pr_num, repo=mworkspace, gh_repo=mgh_repo
+                        )
+                        if ci.outcome == CIProbeOutcome.passed:
                             merged = await plugins.git_ops.merge_pr(
-                                pr_num, task["id"], task["title"]
+                                pr_num,
+                                task["id"],
+                                task["title"],
+                                repo=mworkspace,
+                                gh_repo=mgh_repo,
                             )
                             if merged:
-                                await plugins.git_ops.pull_main()
+                                await plugins.git_ops.pull_main(repo=mworkspace)
                                 if branch:
-                                    await plugins.git_ops.delete_branch(branch)
+                                    await plugins.git_ops.delete_branch(
+                                        branch, repo=mworkspace
+                                    )
                                 log.info(
                                     "Poll: task #%d PR #%d merged on GitHub",
                                     task["id"],
                                     pr_num,
                                 )
-                        elif ci == "fail":
+                        elif ci.outcome == CIProbeOutcome.failed:
                             log.warning(
                                 "Poll: task #%d CI failed on PR #%d", task["id"], pr_num
                             )
@@ -223,14 +347,23 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             )
                         else:
                             log.info(
-                                "Poll: task #%d CI pending on PR #%d, will retry",
+                                "Poll: task #%d CI %s on PR #%d, will retry",
                                 task["id"],
+                                ci.outcome.value,
                                 pr_num,
                             )
                             continue
                     if not merged and not pr_num:
                         log.info("Poll: task #%d approved (no PR)", task["id"])
-                    await repo.update_task(db, task["id"], status="completed")
+                    # Converge on the same gate-checked completion used by
+                    # pair done reports (#309): the verdict recorded above
+                    # makes completion_requires_review false, so the shared
+                    # transition completes without bumping the generation.
+                    refreshed_row = await repo.get_task(db, task["id"])
+                    refreshed = dict(refreshed_row) if refreshed_row else task
+                    await services.transition_after_agent_done(
+                        db, refreshed, has_done=True
+                    )
                     await db.commit()
                     log.info("Poll: task #%d review → approved", task["id"])
                     await services.maybe_destroy_vast(db, task)
@@ -250,7 +383,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             "не удалось извлечь. Проверь git diff и исправь проблемы."
                         )
 
-                    if task.get("review_cycle", 0) + 1 >= config.MAX_REVIEW_CYCLES:
+                    if services.review_budget_exhausted(task.get("review_cycle", 0)):
                         await repo.update_task(
                             db,
                             task["id"],
@@ -277,40 +410,55 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         "Manual decision required.",
                     )
                     await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "no_clear_verdict"},
+                    )
                     await db.commit()
                     await services.maybe_destroy_vast(db, task)
 
             ci_rows = await repo.list_ci_check_tasks(db)
             for row in ci_rows:
                 task = dict(row)
+                ctx = await services.project_git_context(db, task["id"])
+                workspace = ctx.get("repo")
                 if not task.get("pr_number"):
                     branch = task.get("branch")
                     if branch:
-                        await plugins.git_ops.push_branch(branch, force=True)
+                        await plugins.git_ops.push_branch(
+                            branch, repo=workspace, force=True
+                        )
                         pr_num = await plugins.git_ops.create_pr(
                             task["id"],
                             task["title"],
                             task.get("description", ""),
                             branch,
+                            repo=workspace,
+                            gh_repo=ctx.get("gh_repo"),
+                            base_branch=ctx.get("base_branch"),
                         )
                         if pr_num:
                             await repo.update_task(db, task["id"], pr_number=pr_num)
                             task["pr_number"] = pr_num
+                            await repo.mark_ci_check_started(db, task["id"])
                             await db.commit()
-                            _ci_pushed_at[task["id"]] = time.monotonic()
                             log.info(
                                 "Poll: task #%d created PR #%d (was missing)",
                                 task["id"],
                                 pr_num,
                             )
                     if not task.get("pr_number"):
-                        _ci_no_pr_retries[task["id"]] = (
-                            _ci_no_pr_retries.get(task["id"], 0) + 1
+                        attempts = await repo.increment_ci_no_pr_attempts(
+                            db, task["id"]
                         )
-                        if _ci_no_pr_retries[task["id"]] >= 3:
+                        if attempts >= MAX_CI_NO_PR_ATTEMPTS:
                             log.warning(
-                                "Poll: task #%d ci_check without PR after 3 retries → needs_decision",
+                                "Poll: task #%d ci_check without PR after %d retries → needs_decision",
                                 task["id"],
+                                MAX_CI_NO_PR_ATTEMPTS,
                             )
                             await repo.add_task_update(
                                 db,
@@ -322,35 +470,68 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             await repo.update_task(
                                 db, task["id"], status="needs_decision"
                             )
+                            await repo.reset_ci_check_state(db, task["id"])
                             await db.commit()
-                            _ci_no_pr_retries.pop(task["id"], None)
                             await services.maybe_destroy_vast(db, task)
+                        else:
+                            await db.commit()
                         continue
-                pushed_at = _ci_pushed_at.get(task["id"], 0.0)
-                if pushed_at and (time.monotonic() - pushed_at) < CI_GRACE_PERIOD:
+                elapsed = _seconds_since(task.get("ci_check_started_at"))
+                if elapsed is not None and elapsed < CI_GRACE_PERIOD:
                     log.debug(
                         "Poll: task #%d CI grace period (%ds remaining)",
                         task["id"],
-                        int(CI_GRACE_PERIOD - (time.monotonic() - pushed_at)),
+                        int(CI_GRACE_PERIOD - elapsed),
                     )
                     continue
-                ci = await plugins.git_ops.check_pr_ci(task["pr_number"])
-                if ci == "pending":
+                ci = await plugins.git_ops.check_pr_ci(
+                    task["pr_number"],
+                    repo=workspace,
+                    gh_repo=ctx.get("gh_repo"),
+                )
+                if ci.outcome == CIProbeOutcome.pending:
                     continue
-                _ci_pushed_at.pop(task["id"], None)
-                if ci == "pass":
+                if ci.outcome == CIProbeOutcome.unavailable:
+                    # The probe could not be read. Keep the diagnostic and retry;
+                    # the #418 deadline backstop escalates if it persists (#419).
+                    log.warning(
+                        "Poll: task #%d CI probe unavailable (%s), will retry",
+                        task["id"],
+                        ci.reason,
+                    )
+                    continue
+                await repo.reset_ci_check_state(db, task["id"])
+                if ci.outcome == CIProbeOutcome.absent:
+                    # A PR with no checks is a definite answer, not a wait: skip
+                    # the CI conveyor and go straight to review (#419).
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "status",
+                        "CI checks absent on PR — skipping CI, dispatching review.",
+                    )
+                    log.info(
+                        "Poll: task #%d CI absent on PR #%s, dispatching review",
+                        task["id"],
+                        task.get("pr_number"),
+                    )
+                    await services.dispatch_review(db, task)
+                elif ci.outcome == CIProbeOutcome.passed:
                     log.info(
                         "Poll: task #%d CI passed on PR #%s, dispatching review",
                         task["id"],
                         task.get("pr_number"),
                     )
                     await services.dispatch_review(db, task)
-                elif ci == "fail":
+                elif ci.outcome == CIProbeOutcome.failed:
                     ci_fix_cycle = task.get("ci_fix_cycle", 0)
                     if ci_fix_cycle < config.MAX_CI_FIX_CYCLES:
                         ci_details = await plugins.git_ops.get_ci_failure_logs(
                             task["pr_number"],
                             task.get("branch", ""),
+                            repo=workspace,
+                            gh_repo=ctx.get("gh_repo"),
                         )
                         log.info(
                             "Poll: task #%d CI failed (cycle %d/%d), dispatching CI fix",
@@ -369,8 +550,14 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             "Manual intervention required.",
                         )
                         await repo.update_task(db, task["id"], status="needs_decision")
+                        await repo.insert_event(
+                            db,
+                            kind="needs_decision",
+                            task_id=task["id"],
+                            actor="hub",
+                            payload={"reason": "ci_fix_cycle_limit"},
+                        )
                         await db.commit()
-                        _ci_pushed_at.pop(task["id"], None)
                         log.info(
                             "Poll: task #%d CI fix cycle limit → needs_decision",
                             task["id"],
@@ -382,14 +569,15 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             )
             for row in stale_rows:
                 task = dict(row)
-                if await repo.has_stale_alert(db, task["id"]):
+                if await repo.has_stale_alert(db, task["id"], "running"):
                     continue
                 await repo.add_task_update(
                     db,
                     task["id"],
                     "hub",
                     "alert",
-                    f"Task stale: no updates for {config.STALE_THRESHOLD_MINUTES}+ minutes.",
+                    "Task stale in running: no updates for "
+                    f"{config.STALE_THRESHOLD_MINUTES}+ minutes.",
                 )
                 await db.commit()
                 await log_activity(
@@ -402,6 +590,202 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     task["id"],
                     config.STALE_THRESHOLD_MINUTES,
                 )
+
+            # Stale watchdog for silent dead-end statuses (#319, #393). Only
+            # client-driven review is watched (headless review belongs to
+            # this conveyor); statuses never change here — alerts only. The
+            # machine-owned dead-ends (ci_check, fix_requested, pending_report)
+            # get visibility here until F2 lands durable deadline transitions.
+            stale_specs = (
+                (
+                    "review",
+                    config.STALE_REVIEW_MINUTES,
+                    True,
+                    "Awaiting review verdict: reviewer should run "
+                    "hub_get_review_brief and hub_submit_review.",
+                ),
+                (
+                    "claimed",
+                    config.STALE_CLAIMED_MINUTES,
+                    False,
+                    "Claim held without pair start: call hub_pair_start or "
+                    "hub_release_task.",
+                ),
+                (
+                    "needs_info",
+                    config.STALE_NEEDS_INFO_MINUTES,
+                    False,
+                    "Question awaits a human hub_answer_question.",
+                ),
+                (
+                    "ci_check",
+                    config.STALE_CI_CHECK_MINUTES,
+                    False,
+                    "CI conveyor stalled: inspect the PR/CI or recover with "
+                    "hub_force_complete_task.",
+                ),
+                (
+                    "fix_requested",
+                    config.STALE_FIX_REQUESTED_MINUTES,
+                    False,
+                    "Fix dispatch stalled: inspect the job or recover with "
+                    "hub_force_complete_task.",
+                ),
+                (
+                    "pending_report",
+                    config.STALE_PENDING_REPORT_MINUTES,
+                    False,
+                    "Awaiting agent hub_report_done, or recover with "
+                    "hub_force_complete_task.",
+                ),
+            )
+            for status_name, threshold, null_review_job, action in stale_specs:
+                rows = await repo.list_stale_tasks(
+                    db,
+                    status_name,
+                    threshold,
+                    require_null_review_job=null_review_job,
+                )
+                for row in rows:
+                    task = dict(row)
+                    if await repo.has_stale_alert(db, task["id"], status_name):
+                        continue
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"Task stale in {status_name}: no updates for "
+                        f"{threshold}+ minutes. {action}",
+                    )
+                    await db.commit()
+                    await log_activity(
+                        db,
+                        "task_stale",
+                        f"Task #{task['id']} stale in {status_name} "
+                        f"for {threshold}+ min",
+                    )
+                    log.warning(
+                        "Poll: task #%d is stale in %s (no updates for %d+ min)",
+                        task["id"],
+                        status_name,
+                        threshold,
+                    )
+
+            # Claim lease expiry (#417): a claim held past the lease without a
+            # pair start is auto-released back to open so the task returns to
+            # the queue instead of sitting owned by a dead session forever.
+            # Status change makes this idempotent — an expired claim is only
+            # seen once. Release does not dispatch; the task waits in open.
+            expired_claims = await repo.list_expired_claims(
+                db, config.CLAIM_LEASE_MINUTES
+            )
+            for row in expired_claims:
+                task = dict(row)
+                await repo.update_task(
+                    db,
+                    task["id"],
+                    status="open",
+                    claimed_by=None,
+                    claim_session_id=None,
+                    claimed_at=None,
+                )
+                await repo.insert_event(
+                    db,
+                    kind="claim_expired",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "claim_lease_expired"},
+                )
+                await db.commit()
+                log.info(
+                    "Poll: task #%d claim lease expired → open", task["id"]
+                )
+
+            # Machine-owned deadline backstop (#418): the ownership/deadline
+            # matrix is the source of truth. Any machine-owned instance that
+            # sits past its (generous) deadline is transitioned to
+            # needs_decision once, so no status+discriminator combination can
+            # stay stuck without an owner. claimed → open is handled above.
+            for policy in lifecycle_matrix.machine_deadline_policies():
+                if policy.escalation != "needs_decision":
+                    continue
+                threshold = getattr(config, policy.deadline_config)
+                overdue = await repo.list_past_status_deadline(
+                    db,
+                    policy.status,
+                    threshold,
+                    require_job_id=policy.require_job_id,
+                    require_review_job_id=policy.require_review_job_id,
+                )
+                for row in overdue:
+                    task = dict(row)
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"{policy.instance} exceeded its {threshold}m deadline. "
+                        "Manual decision required.",
+                    )
+                    await repo.update_task(
+                        db, task["id"], status="needs_decision"
+                    )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": policy.reason},
+                    )
+                    await db.commit()
+                    log.warning(
+                        "Poll: task #%d past %s deadline (%dm) → needs_decision",
+                        task["id"],
+                        policy.instance,
+                        threshold,
+                    )
+                    await services.maybe_destroy_vast(db, task)
+
+            # Arbiter dispatch ambiguity (#421): a marker stuck in 'dispatching'
+            # past the grace means submit started but the job id was never
+            # recorded — a crash window. Fail safe to needs_decision rather than
+            # risk a duplicate paid dispatch; never re-submit automatically.
+            stale_arbiter = await repo.list_stale_arbiter_dispatching(
+                db, config.ARBITER_DISPATCH_GRACE_MINUTES
+            )
+            for row in stale_arbiter:
+                task = dict(row)
+                await repo.add_task_update(
+                    db,
+                    task["id"],
+                    "hub",
+                    "alert",
+                    "Arbiter dispatch ambiguous: submit started but no job id "
+                    "recorded. Manual decision required.",
+                )
+                await repo.update_task(
+                    db, task["id"], status="needs_decision", arbiter_state="finished"
+                )
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "arbiter_dispatch_ambiguous"},
+                )
+                await db.commit()
+                log.warning(
+                    "Poll: task #%d arbiter dispatch ambiguous → needs_decision",
+                    task["id"],
+                )
+
+            # Events feed retention (#349): the feed is a notification
+            # channel, not an archive — activity_log keeps the history.
+            pruned = await repo.prune_events(db, keep_days=14)
+            if pruned:
+                await db.commit()
+                log.info("Poll: pruned %d events older than 14 days", pruned)
 
         except Exception:
             log.exception("Poll error")

@@ -15,8 +15,14 @@ decisions, and completion reports.
   with a `plan` argument or `hub_task_update(..., kind="status")`.
 - Ask requirement questions through `hub_ask_question`.
 - Record blockers through `hub_task_update(..., kind="blocker")`.
-- Complete normal work through `hub_report_done` with changed files, behavior
-  change, validation commands, and results.
+- Pass the Universal Review Gate: submit finished work with
+  `hub_submit_for_review`; a separate reviewer (never yourself) runs
+  `hub_get_review_brief` and `hub_submit_review`; fix `changes_requested`
+  findings by number and resubmit.
+- Complete normal work through `hub_report_done` (changed files, behavior
+  change, validation commands, results) only after a current APPROVED
+  review — the server routes unreviewed done reports to `review`, not to
+  completion.
 - Create new out-of-scope work through `hub_propose_task` as a draft proposal.
 - Do not close or force-complete a task with failed CI, unresolved blockers, or
   review changes requested.

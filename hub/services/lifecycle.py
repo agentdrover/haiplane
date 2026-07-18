@@ -4,20 +4,44 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 
 from hub import config
 from hub import db as db_module
+from hub.actionable_errors import (
+    done_report_error_detail,
+    hierarchy_error_detail,
+    self_review_forbidden_detail,
+    withdraw_own_draft_error_detail,
+)
 from hub import repository as repo
+from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
+from hub.mcp_envelope import enrich_error_payload
+from hub.services.task_idempotency import (
+    IdempotencyRecord,
+    hash_task_create_payload,
+    idempotency_conflict_detail,
+    normalize_task_create,
+    resolve_client_request_id,
+)
 from hub.models import (
+    ACTIVE_STATUSES,
+    BatchApprove,
+    BatchApproveResult,
+    BatchApproveSkipped,
     BulkChildTasksCreate,
     FINAL_STATUSES,
+    FindingScope,
+    LatestReview,
+    ReviewFinding,
+    SelfReviewWarning,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
@@ -28,13 +52,16 @@ from hub.models import (
     TaskForceComplete,
     TaskPairStart,
     TaskProgress,
+    TaskProjectRef,
     TaskQuestion,
     TaskRefine,
     TaskReject,
     TaskRelease,
     TaskReorder,
+    TaskReviewVerdict,
     TaskSource,
     TaskStart,
+    TaskSubmitReview,
     TaskType,
     TaskUpdateCreate,
     TaskUpdateView,
@@ -42,12 +69,17 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError
 from hub.services.orchestration import (
+    completion_requires_review,
+    detect_branch_stacking,
     dispatch_task,
     prepare_pair_branch,
+    restore_pair_workspace_base,
+    review_approved_for_current_submission,
     transition_after_agent_done,
 )
 from hub.services.refinement import (
     TaskNotFoundError,
+    get_readiness,
     get_write_lock,
     list_acceptance_criteria,
 )
@@ -55,6 +87,21 @@ from hub.services.refinement import (
 log = logging.getLogger("hub")
 
 _ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+async def _try_restore_pair_workspace(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
+    try:
+        await restore_pair_workspace_base(db, task_id)
+    except Exception:
+        log.warning(
+            "Failed to restore pair workspace base for task #%s",
+            task_id,
+            exc_info=True,
+        )
 
 
 def compute_lifecycle_hint(task: dict[str, Any]) -> str | None:
@@ -159,12 +206,12 @@ def _done_report_error(
     hint: str,
     required_status: str,
 ) -> dict[str, Any]:
-    return {
-        "reason": reason,
-        "hint": hint,
-        "required_status": required_status,
-        "current_status": task["status"],
-    }
+    return done_report_error_detail(
+        task,
+        reason=reason,
+        hint=hint,
+        required_status=required_status,
+    )
 
 
 def _validate_done_report(task: dict[str, Any]) -> None:
@@ -225,6 +272,137 @@ def _validate_done_report(task: dict[str, Any]) -> None:
     )
 
 
+def ensure_reviewer_independence(
+    task: dict[str, Any],
+    *,
+    is_agent: bool,
+    principal_id: int | None,
+    username: str,
+) -> bool:
+    """Raise 403 when the caller implemented the task (#318/#320).
+
+    Shared by the REST endpoint and the web review panel so verdict
+    independence has exactly one definition. Principal comparison wins;
+    the name-based check is the fallback for env tokens and legacy tasks.
+    Humans and the solo opt-out (OPENCLAW_REVIEW_SELF_APPROVE=allow) pass.
+
+    Returns True only when the caller IS the implementer and passed solely
+    because of the solo opt-out — so the verdict can be audited as
+    self-approved (#434). Independent reviewers and humans return False.
+    """
+    if not is_agent:
+        return False
+    if not caller_implemented_task(task, principal_id=principal_id, username=username):
+        return False
+    if config.REVIEW_SELF_APPROVE == "allow":
+        return True
+    raise HTTPException(403, detail=self_review_forbidden_detail(username))
+
+
+def caller_implemented_task(
+    task: dict[str, Any],
+    *,
+    principal_id: int | None,
+    username: str,
+) -> bool:
+    """True when the caller is the implementer of the task (#318/#320).
+
+    Single definition of implementer identity, shared by the verdict gate
+    and the review-brief warning (#433). Principal comparison wins; the
+    name-based check (assigned_agent/claimed_by) is the fallback for env
+    tokens and legacy tasks.
+    """
+    implementer_pid = task.get("implementer_principal_id")
+    if (
+        implementer_pid is not None
+        and principal_id is not None
+        and principal_id == implementer_pid
+    ):
+        return True
+    implementers = {
+        (task.get("assigned_agent") or "").strip(),
+        (task.get("claimed_by") or "").strip(),
+    } - {""}
+    return username in implementers
+
+
+def self_review_brief_warning(
+    task: dict[str, Any],
+    *,
+    is_agent: bool,
+    principal_id: int | None,
+    username: str,
+) -> SelfReviewWarning | None:
+    """Fail-fast self-review notice for the review brief (#433).
+
+    Mirrors ensure_reviewer_independence but warns instead of raising: the
+    implementer may still read the brief for self-checking, yet must know
+    BEFORE spending review effort that hub_submit_review will reject the
+    verdict. With OPENCLAW_REVIEW_SELF_APPROVE=allow the warning becomes an
+    informational solo-mode note. Humans and non-implementers get None.
+    """
+    if not is_agent:
+        return None
+    if not caller_implemented_task(task, principal_id=principal_id, username=username):
+        return None
+    if config.REVIEW_SELF_APPROVE == "allow":
+        return SelfReviewWarning(
+            reason="solo_mode_self_review",
+            message=(
+                f"agent '{username}' implemented this task; solo mode permits "
+                "self-review"
+            ),
+            hint=(
+                "OPENCLAW_REVIEW_SELF_APPROVE=allow is active: hub_submit_review "
+                "will accept your verdict. This note is informational."
+            ),
+            required_role=None,
+        )
+    return SelfReviewWarning(
+        reason="self_review_forbidden",
+        message=(f"agent '{username}' implemented this task and cannot review it"),
+        hint=(
+            "Stop before running the review: hub_submit_review will reject "
+            "your verdict. The Universal Review Gate requires an independent "
+            "reviewer — another agent principal or a human token. You may "
+            "still use this brief for self-checking. "
+            "Solo mode: set OPENCLAW_REVIEW_SELF_APPROVE=allow."
+        ),
+        required_role="independent_reviewer",
+    )
+
+
+def parse_review_findings(raw: Any) -> list[ReviewFinding]:
+    """Decode the review_findings JSON column into models, failing soft.
+
+    Malformed rows return an empty list rather than breaking every task
+    view: findings are advisory review data, not lifecycle-critical state.
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return [ReviewFinding(**f) for f in data]
+    except (ValueError, TypeError):
+        log.warning("Malformed review_findings JSON ignored: %.80r", raw)
+        return []
+
+
+def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
+    """Build the latest-review projection for status/context (#308)."""
+    verdict = task.get("review_verdict")
+    if not verdict:
+        return None
+    verdict_generation = task.get("review_verdict_generation") or 0
+    return LatestReview(
+        verdict=verdict,
+        submission_generation=verdict_generation,
+        is_current=verdict_generation == (task.get("submission_generation") or 0),
+        self_approved=bool(task.get("review_self_approved") or 0),
+        findings=parse_review_findings(task.get("review_findings")),
+    )
+
+
 def row_to_task(
     row: aiosqlite.Row,
     updates: list[aiosqlite.Row] | None = None,
@@ -267,6 +445,11 @@ def row_to_task(
         ci_fix_cycle=d.get("ci_fix_cycle", 0),
         auto_review=bool(d.get("auto_review", 1)),
         review_job_id=d.get("review_job_id"),
+        submission_generation=d.get("submission_generation", 0) or 0,
+        review_verdict=d.get("review_verdict"),
+        review_verdict_generation=d.get("review_verdict_generation"),
+        review_approved_current=review_approved_for_current_submission(d),
+        latest_review=latest_review_projection(d),
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
         claimed_by=d.get("claimed_by"),
@@ -314,50 +497,150 @@ async def enrich_task_view(
     if row:
         task_view.lifecycle_hint = compute_lifecycle_hint(dict(row))
 
+    project_row = await repo.resolve_project_for_task(db, task_view.id)
+    if project_row is not None:
+        task_view.project = TaskProjectRef(
+            id=project_row["id"], slug=project_row["slug"]
+        )
+
     return task_view
 
 
-async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
+@dataclass(frozen=True)
+class CreateTaskOutcome:
+    task: TaskView
+    is_new: bool = True
+
+    def __getattr__(self, name: str) -> Any:
+        # Backward-compat: before idempotency (#20) create_task returned the
+        # TaskView directly. Delegate unknown attributes to the wrapped view so
+        # callers that treat the result as a TaskView keep working. Guard
+        # ``task`` to avoid infinite recursion before the field is set.
+        if name == "task":
+            raise AttributeError(name)
+        return getattr(self.task, name)
+
+
+async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
+    row = await repo.get_task(db, task_id)
+    return row_to_task(row)  # type: ignore[arg-type]
+
+
+async def create_task(
+    db: aiosqlite.Connection,
+    body: TaskCreate,
+    *,
+    client_request_id: str | None = None,
+) -> CreateTaskOutcome:
     """Create a new task, optionally dispatching it immediately."""
+    idem_key = resolve_client_request_id(
+        None, client_request_id or body.client_request_id
+    )
+
     err = await db_module.validate_hierarchy(db, body.task_type.value, body.parent_id)
     if err:
-        raise HTTPException(400, err)
+        raise HTTPException(
+            400,
+            detail=hierarchy_error_detail(
+                err,
+                task_type=body.task_type.value,
+                parent_id=body.parent_id,
+            ),
+        )
 
-    if body.task_type in (TaskType.epic, TaskType.feature):
-        initial_status = "open"
-        body.run_immediately = False
-        body.auto_review = False
-    elif body.source == TaskSource.agent:
-        initial_status = "draft"
-    elif body.run_immediately:
-        initial_status = "running"
-    else:
-        initial_status = "open"
+    # Bind an epic to a project at creation (#346). Only epics carry
+    # project_id — children resolve it by walking up to the root epic.
+    project_id: int | None = None
+    if body.project:
+        if body.task_type != TaskType.epic:
+            raise HTTPException(
+                422, "project can only be set on epics; children inherit it"
+            )
+        project_row = await repo.get_project_by_slug(db, body.project)
+        if project_row is None:
+            raise HTTPException(422, f"unknown project slug: {body.project!r}")
+        if project_row["archived"] or project_row["status"] != "active":
+            raise HTTPException(
+                422,
+                f"project {body.project!r} is not active "
+                "(pending proposals and archived projects cannot take epics)",
+            )
+        project_id = project_row["id"]
 
-    if body.task_type == TaskType.subtask and body.auto_review:
-        body.auto_review = False
+    initial_status, normalized = normalize_task_create(body)
+    request_hash = hash_task_create_payload(normalized) if idem_key else None
 
-    # Use the structured-aware insert so all fields from TaskCreate
-    # (work_type, scope_in/out, user_story, etc.) actually persist.
-    # The legacy repo.create_task only knew about the original columns
-    # and silently dropped the rest of the payload (#46 / review C1).
-    task_id = await repo.create_task_full(db, body, status=initial_status)
-    await db.commit()
+    try:
+        if idem_key:
+            existing = await repo.get_task_idempotency_key(db, idem_key)
+            if existing:
+                if existing["request_hash"] != request_hash:
+                    record = IdempotencyRecord(
+                        client_request_id=idem_key,
+                        task_id=int(existing["task_id"]),
+                        request_hash=existing["request_hash"],
+                    )
+                    raise HTTPException(
+                        409,
+                        idempotency_conflict_detail(record),
+                    )
+                await db.commit()
+                task = await _load_task_view(db, int(existing["task_id"]))
+                return CreateTaskOutcome(task=task, is_new=False)
+
+        # Structured-aware insert so all fields from TaskCreate (work_type,
+        # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
+        # the lifecycle normalizations that also feed the idempotency hash.
+        task_id = await repo.create_task_full(db, normalized, status=initial_status)
+        if project_id is not None:
+            await repo.update_task(db, task_id, project_id=project_id)
+
+        if idem_key and request_hash is not None:
+            await repo.insert_task_idempotency_key(
+                db,
+                client_request_id=idem_key,
+                task_id=task_id,
+                request_hash=request_hash,
+            )
+
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except aiosqlite.IntegrityError:
+        await db.rollback()
+        if not idem_key:
+            raise
+        existing = await repo.get_task_idempotency_key(db, idem_key)
+        if not existing:
+            raise
+        if existing["request_hash"] != request_hash:
+            record = IdempotencyRecord(
+                client_request_id=idem_key,
+                task_id=int(existing["task_id"]),
+                request_hash=existing["request_hash"],
+            )
+            raise HTTPException(
+                409,
+                idempotency_conflict_detail(record),
+            ) from None
+        task = await _load_task_view(db, int(existing["task_id"]))
+        return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if body.run_immediately and body.source != TaskSource.agent:
+    if normalized.run_immediately and normalized.source != TaskSource.agent:
         row = await repo.get_task(db, task_id)
         result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
     await log_activity(
         db,
         "task_created",
-        f"{body.task_type.value.capitalize()} #{task_id}: {body.title}",
+        f"{normalized.task_type.value.capitalize()} #{task_id}: {normalized.title}",
         json.dumps(result, ensure_ascii=False) if result else None,
     )
 
-    row = await repo.get_task(db, task_id)
-    return row_to_task(row)  # type: ignore[arg-type]
+    task = await _load_task_view(db, task_id)
+    return CreateTaskOutcome(task=task, is_new=True)
 
 
 async def create_subtasks_bulk(
@@ -374,7 +657,14 @@ async def create_subtasks_bulk(
 
     err = await db_module.validate_hierarchy(db, body.task_type.value, parent_id)
     if err:
-        raise HTTPException(400, err)
+        raise HTTPException(
+            400,
+            detail=hierarchy_error_detail(
+                err,
+                task_type=body.task_type.value,
+                parent_id=parent_id,
+            ),
+        )
 
     if await repo.get_task(db, parent_id) is None:
         raise HTTPException(404, "parent task not found")
@@ -543,6 +833,14 @@ async def approve_task(
     transitioned = await repo.transition_status_if(
         db, task_id, expected_from="draft", new_status="open"
     )
+    if transitioned:
+        await repo.insert_event(
+            db,
+            kind="task_approved",
+            task_id=task_id,
+            actor="human",
+            payload={"run": bool(body.run), "force": bool(body.force)},
+        )
     await db.commit()
     if not transitioned:
         raise HTTPException(409, "task is no longer draft (concurrent approve?)")
@@ -562,11 +860,84 @@ async def approve_task(
         db,
         "task_approved",
         f"Task #{task_id} approved{activity_suffix}",
+        detail=mutation_activity_detail(),
     )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def batch_approve_tasks(
+    db: aiosqlite.Connection,
+    body: BatchApprove,
+) -> BatchApproveResult:
+    """Approve many drafts with per-task guards and partial success (#252).
+
+    Каждая задача проверяется независимо: не-draft, непройденный DoR,
+    низкий readiness или high-риски дают skipped с причиной, не ломая
+    остальную пачку. force не поддерживается намеренно — override
+    остаётся одиночным, аудируемым действием.
+    """
+    result = BatchApproveResult()
+    for task_id in body.task_ids:
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason="not_found")
+            )
+            continue
+        task = dict(row)
+        if task["status"] != "draft":
+            result.skipped.append(
+                BatchApproveSkipped(
+                    task_id=task_id,
+                    reason=f"not_draft:{task['status']}",
+                )
+            )
+            continue
+
+        dor_passed = task.get("dor_passed")
+        score = task.get("readiness_score")
+        if dor_passed is None or score is None:
+            # Legacy row without persisted readiness (#250): compute lazily.
+            report = await get_readiness(db, task_id)
+            dor_passed = report.dor_passed
+            score = report.score
+        if body.require_dor_passed and not dor_passed:
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason="dor_failed")
+            )
+            continue
+        if body.min_readiness is not None and (score or 0) < body.min_readiness:
+            result.skipped.append(
+                BatchApproveSkipped(
+                    task_id=task_id,
+                    reason=f"readiness_below_{body.min_readiness}",
+                )
+            )
+            continue
+        if body.exclude_high_risks:
+            risks = db_module.deserialize_risks(task.get("risks"))
+            if any(r.get("severity") == "high" for r in risks):
+                result.skipped.append(
+                    BatchApproveSkipped(task_id=task_id, reason="high_risk")
+                )
+                continue
+
+        try:
+            await approve_task(db, task_id, TaskApprove(comment=body.comment))
+        except HTTPException as exc:
+            reason = "approve_failed"
+            detail = exc.detail
+            if isinstance(detail, dict):
+                reason = detail.get("reason") or detail.get("error") or reason
+            result.skipped.append(
+                BatchApproveSkipped(task_id=task_id, reason=f"{reason}")
+            )
+            continue
+        result.approved.append(task_id)
+    return result
 
 
 async def reject_task(
@@ -592,8 +963,14 @@ async def reject_task(
         )
 
     await repo.update_task(db, task_id, status="rejected")
+    await repo.insert_event(db, kind="task_rejected", task_id=task_id, actor="human")
     await db.commit()
-    await log_activity(db, "task_rejected", f"Task #{task_id} rejected")
+    await log_activity(
+        db,
+        "task_rejected",
+        f"Task #{task_id} rejected",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     return row_to_task(row)  # type: ignore[arg-type]
@@ -639,7 +1016,12 @@ async def start_task(
         task["runtime"] = body.runtime.value
 
     await dispatch_task(db, task_id, task)
-    await log_activity(db, "task_started", f"Task #{task_id} dispatched")
+    await log_activity(
+        db,
+        "task_started",
+        f"Task #{task_id} dispatched",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -652,8 +1034,15 @@ async def pair_start_task(
     body: TaskPairStart | None = None,
     *,
     caller: str = "",
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Start an open task in pair mode: running without headless dispatch."""
+    """Start an open task in pair mode: running without headless dispatch.
+
+    ``implementer_principal_id`` records WHO implements as an authenticated
+    principal (#320) so the self-review ban can compare identities instead
+    of free-text agent names. None (env tokens, anonymous, humans) keeps
+    the name-based fallback of #318.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -699,7 +1088,7 @@ async def pair_start_task(
             db, task_id, task, branch_slug=(body.branch_slug or "").strip()
         )
     except PairBranchConflictError as exc:
-        raise HTTPException(422, str(exc)) from exc
+        raise HTTPException(422, detail=exc.to_detail()) from exc
     if branch:
         task["branch"] = branch
 
@@ -712,12 +1101,396 @@ async def pair_start_task(
         "job_id": None,
         "assigned_agent": assigned_agent,
     }
+    if implementer_principal_id is not None:
+        update_fields["implementer_principal_id"] = implementer_principal_id
     if branch:
         update_fields["branch"] = branch
 
     await repo.update_task(db, task_id, **update_fields)
     await db.commit()
-    await log_activity(db, "task_pair_started", f"Task #{task_id} pair session started")
+    await log_activity(
+        db,
+        "task_pair_started",
+        f"Task #{task_id} pair session started",
+        detail=mutation_activity_detail(),
+    )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def submit_for_review(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskSubmitReview | None = None,
+) -> TaskView:
+    """Submit the current work of a pair task for client-driven review (#305).
+
+    Valid only from pair ``running`` (no ``job_id``): headless tasks are
+    submitted by their done report and reviewed by the poller conveyor.
+    Bumps the submission generation — which invalidates any APPROVED verdict
+    recorded for earlier work — and moves the task into ``status=review``
+    with no ``review_job_id``, marking the review as client-driven.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    body = body or TaskSubmitReview()
+
+    if task["status"] != "running" or task.get("job_id"):
+        if task.get("job_id"):
+            raise HTTPException(
+                400,
+                "headless tasks are submitted for review by their done report; "
+                "submit-for-review is only for pair tasks without a dispatch job",
+            )
+        raise HTTPException(
+            400,
+            f"can only submit running pair tasks for review, "
+            f"current status: {task['status']}",
+        )
+
+    async with get_write_lock(db):
+        if not await repo.transition_status_if(
+            db, task_id, expected_from="running", new_status="review"
+        ):
+            raise HTTPException(
+                409,
+                f"Task #{task_id} left running state during submit; retry from "
+                "its current status",
+            )
+        generation = await repo.bump_submission_generation(db, task_id)
+        # Client-driven review: no dispatch job. A stale review_job_id from a
+        # previous headless cycle would make the poller treat this task as its
+        # own, so clear it explicitly.
+        await repo.update_task(db, task_id, review_job_id=None)
+        agent = (body.agent or "").strip() or task.get("assigned_agent", "")
+        summary = (body.summary or "").strip()
+        content = f"Submitted for review (submission #{generation})."
+        if summary:
+            content += f" {summary}"
+        await repo.add_task_update(db, task_id, agent, "status", content)
+        await db.commit()
+        await log_activity(
+            db,
+            "task_submitted_for_review",
+            f"Task #{task_id} submitted for review (generation {generation})",
+            detail=mutation_activity_detail(),
+        )
+
+    # Advisory branch-stacking detection (#438): warn — never block — when
+    # this branch carries commits of another unmerged task branch. A stack
+    # can be a deliberate decision, so the finding is an alert update plus
+    # a response hint, not a failed submission.
+    stacking = await detect_branch_stacking(db, task_id, task.get("branch") or "")
+    if stacking:
+        await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
+        await db.commit()
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+    # Machine-review policy (#382): tell the submitting agent right away
+    # when the harness run is expected before the human verdict.
+    from hub.services.orchestration import machine_review_gap
+
+    gap = await machine_review_gap(db, dict(row))
+    if gap:
+        view.lifecycle_hint = (
+            f"Machine-review требуется ({gap}): hub_get_skill('multi-agent-review') "
+            "→ прогон → hub_submit_machine_review — до человеческого вердикта."
+        )
+    if stacking:
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{stacking['message']}"
+            if view.lifecycle_hint
+            else stacking["message"]
+        )
+    await _try_restore_pair_workspace(db, task_id)
+    return view
+
+
+def out_of_scope_draft_marker(task_id: int, finding_id: int) -> str:
+    """Back-reference marker stamped into auto-created draft descriptions (#436).
+
+    Encodes source task + finding id (NOT submission generation), so a
+    resubmitted verdict maps the same finding to the same draft instead of
+    creating a duplicate.
+    """
+    return f"[auto-draft: task #{task_id} finding #{finding_id}]"
+
+
+async def create_drafts_for_out_of_scope_findings(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    body: TaskReviewVerdict,
+) -> list[int]:
+    """Auto-create DRAFT follow-up tasks for unlinked out-of-scope findings (#436).
+
+    For each ``out_of_scope`` finding without ``linked_task_id``, creates a
+    draft task (source=agent → DoR gate stays: a human decides whether to
+    take it into work) and stamps the created id into the finding, so the
+    stored verdict references the follow-up. Returns ids created in THIS
+    call. Idempotency: findings already linked are skipped, and an existing
+    draft carrying the same back-reference marker is reused (incident #392:
+    out-of-scope findings got lost until #424–#427 were created manually).
+    """
+    pending = [
+        f
+        for f in body.findings
+        if f.scope == FindingScope.out_of_scope and not f.linked_task_id
+    ]
+    if not pending:
+        return []
+
+    # Drafts land under the reviewed task's feature parent so triage sees
+    # them in context. Any other parent kind (or none) → top-level draft;
+    # the strict hierarchy only allows feature as a task's parent.
+    parent_id: int | None = None
+    if task.get("parent_id"):
+        parent_row = await repo.get_task(db, task["parent_id"])
+        if parent_row is not None and parent_row["task_type"] == "feature":
+            parent_id = int(parent_row["id"])
+
+    source_task_id = int(task["id"])
+    generation = task.get("submission_generation") or 0
+    created: list[int] = []
+    for f in pending:
+        marker = out_of_scope_draft_marker(source_task_id, f.id)
+        existing = await repo.find_task_id_by_description_marker(db, marker)
+        if existing is not None:
+            f.linked_task_id = existing
+            continue
+
+        place = f"{f.file}:{f.line}" if f.file and f.line else f.file
+        lines = [
+            f"Out-of-scope review finding #{f.id} from review of task "
+            f"#{source_task_id} (submission #{generation}).",
+            "",
+            f"Severity: {f.severity.value}",
+        ]
+        if place:
+            lines.append(f"Location: {place}")
+        lines.append(f"Finding: {f.message}")
+        if f.recommendation:
+            lines.append(f"Recommendation: {f.recommendation}")
+        lines.extend(["", marker])
+
+        title = f"Review follow-up: {f.message}"
+        if len(title) > 500:
+            title = title[:499] + "…"
+
+        view = (
+            await create_task(
+                db,
+                TaskCreate(
+                    title=title,
+                    description="\n".join(lines),
+                    task_type=TaskType.task,
+                    parent_id=parent_id,
+                    source=TaskSource.agent,
+                    agent=(body.agent or "").strip() or "reviewer",
+                    rationale=(
+                        f"Auto-created from out-of-scope review finding #{f.id} "
+                        f"on task #{source_task_id} (#436)"
+                    ),
+                    run_immediately=False,
+                ),
+            )
+        ).task
+        f.linked_task_id = view.id
+        created.append(view.id)
+    return created
+
+
+async def record_review_verdict(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskReviewVerdict,
+    *,
+    self_approved: bool = False,
+) -> TaskView:
+    """Record an explicit review verdict for the current submission (#305).
+
+    Persists the verdict bound to the current submission generation, so a
+    later resubmission automatically invalidates an APPROVED verdict. For
+    client-driven review (status=review, no review_job_id) the task returns
+    to ``running`` so the developer can fix findings or report done (#307);
+    headless transitions remain with the poller. Never a completion path.
+
+    Finding scope (#435): a ``changes_requested`` verdict with findings must
+    include at least one ``in_scope`` finding — if everything is out of
+    scope there is nothing to fix in this task, so the verdict should be
+    ``approved`` with the out-of-scope findings kept as recommendations
+    (incident #392: the source task hung in review while every finding went
+    to parallel tasks). Out-of-scope findings without ``linked_task_id``
+    produce a non-blocking warning in the review update.
+
+    ``self_approved=True`` (the ensure_reviewer_independence solo opt-out
+    result) marks the verdict as non-independent: the flag is persisted on
+    the task row, echoed in the task update, and logged as a warning so a
+    weakened Review Gate stays visible in hindsight (#434).
+
+    ``create_tasks_for_out_of_scope`` (#436): opt-in auto-creation of DRAFT
+    follow-up tasks for unlinked out-of-scope findings, so they cannot get
+    lost when the reviewer forgets to create tasks manually. See
+    :func:`create_drafts_for_out_of_scope_findings`.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+
+    if (task.get("submission_generation") or 0) == 0:
+        raise HTTPException(
+            400,
+            "no submission to review yet: the task has never been submitted for review",
+        )
+
+    if body.verdict.value == "changes_requested" and body.findings:
+        if all(f.scope == FindingScope.out_of_scope for f in body.findings):
+            raise HTTPException(
+                422,
+                detail=enrich_error_payload(
+                    {
+                        "reason": "changes_requested_requires_in_scope_finding",
+                        "message": (
+                            "changes_requested requires at least one in_scope "
+                            "finding; all findings are out_of_scope"
+                        ),
+                        "hint": (
+                            "If nothing needs fixing in this task, submit "
+                            "verdict=approved and keep out-of-scope findings "
+                            "as recommendations (linked to follow-up tasks "
+                            "via linked_task_id)."
+                        ),
+                        "suggested_tool": "hub_submit_review",
+                    }
+                ),
+            )
+
+    # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require,
+    # and only for APPROVED — the reviewer must always be able to reject work
+    # (changes_requested), harness or no harness. Default 'warn' keeps every
+    # verdict available; the panel shows the gap.
+    if config.MACHINE_REVIEW_MODE == "require" and body.verdict.value == "approved":
+        from hub.services.orchestration import machine_review_gap
+
+        gap = await machine_review_gap(db, task)
+        if gap:
+            raise HTTPException(
+                422,
+                f"machine-review обязателен для аппрува этой задачи: {gap}",
+            )
+
+    # Auto-draft follow-ups BEFORE persisting the verdict so the created
+    # ids land in the stored findings (create_task commits on its own, so
+    # it must run outside the verdict's write-lock critical section).
+    auto_created: list[int] = []
+    if body.create_tasks_for_out_of_scope and body.findings:
+        auto_created = await create_drafts_for_out_of_scope_findings(db, task, body)
+
+    async with get_write_lock(db):
+        findings_json = json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.findings],
+            ensure_ascii=False,
+        )
+        await repo.record_review_verdict(
+            db,
+            task_id,
+            body.verdict.value,
+            findings_json=findings_json,
+            self_approved=self_approved,
+        )
+        agent = (body.agent or "").strip() or "reviewer"
+        content = f"Review verdict: {body.verdict.value.upper()}"
+        if self_approved:
+            content += " [self-approved: solo mode, OPENCLAW_REVIEW_SELF_APPROVE=allow]"
+            log.warning(
+                "Task #%s: review verdict %s accepted via "
+                "OPENCLAW_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
+                "implemented this task (no independent review)",
+                task_id,
+                body.verdict.value,
+                agent,
+            )
+        if body.findings:
+            # Human-readable echo only; the canonical structured findings
+            # live on the task row, so the update text can stay compact.
+            for f in body.findings[:20]:
+                place = (
+                    f" ({f.file}:{f.line})"
+                    if f.file and f.line
+                    else (f" ({f.file})" if f.file else "")
+                )
+                scope_mark = ""
+                if f.scope == FindingScope.out_of_scope:
+                    scope_mark = (
+                        f" [out-of-scope → #{f.linked_task_id}]"
+                        if f.linked_task_id
+                        else " [out-of-scope]"
+                    )
+                content += (
+                    f"\n{f.id}. [{f.severity.value}]{place}{scope_mark} {f.message}"
+                )
+            if len(body.findings) > 20:
+                content += f"\n… and {len(body.findings) - 20} more findings"
+            unlinked = [
+                f.id
+                for f in body.findings
+                if f.scope == FindingScope.out_of_scope and not f.linked_task_id
+            ]
+            if unlinked:
+                ids = ", ".join(str(i) for i in unlinked)
+                content += (
+                    f"\nWarning: out-of-scope finding(s) {ids} have no "
+                    "linked_task_id — create follow-up task(s) and link them."
+                )
+            if auto_created:
+                ids = ", ".join(f"#{i}" for i in auto_created)
+                content += (
+                    f"\nAuto-created draft task(s) for out-of-scope "
+                    f"findings: {ids} (awaiting human DoR approval)."
+                )
+        if body.comments.strip():
+            content += f"\n{body.comments.strip()}"
+        await repo.add_task_update(db, task_id, agent, "review", content)
+
+        # Client-driven review only (status=review, no review_job_id): hand
+        # the task back to the developer so the loop continues — fix findings
+        # on CHANGES_REQUESTED, or report done on APPROVED. Headless review
+        # transitions stay with the poller, which owns tasks that carry a
+        # review_job_id (#307).
+        if task["status"] == "review" and not task.get("review_job_id"):
+            await repo.transition_status_if(
+                db, task_id, expected_from="review", new_status="running"
+            )
+            if body.verdict.value == "changes_requested":
+                await repo.update_task(
+                    db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
+                )
+
+        await repo.insert_event(
+            db,
+            kind="review_verdict_recorded",
+            task_id=task_id,
+            actor=agent,
+            payload={
+                "verdict": body.verdict.value,
+                "submission_generation": task.get("submission_generation") or 0,
+                "self_approved": self_approved,
+            },
+        )
+        await db.commit()
+        await log_activity(
+            db,
+            "task_review_verdict",
+            f"Task #{task_id} review verdict: {body.verdict.value}",
+            detail=mutation_activity_detail(),
+        )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -728,8 +1501,14 @@ async def claim_task(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskClaim,
+    *,
+    implementer_principal_id: int | None = None,
 ) -> TaskView:
-    """Claim an open task for a single Cursor agent/session."""
+    """Claim an open task for a single Cursor agent/session.
+
+    ``implementer_principal_id`` records the claiming agent's authenticated
+    principal (#320) for the identity-based self-review ban.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -766,14 +1545,15 @@ async def claim_task(
         raise HTTPException(409, f"Task #{task_id} claim conflict")
 
     session_note = f" session={body.session_id}" if body.session_id else ""
-    await repo.update_task(
-        db,
-        task_id,
-        claimed_by=body.agent,
-        claim_session_id=body.session_id or None,
-        claimed_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
-        assigned_agent=body.agent,
-    )
+    claim_fields: dict[str, Any] = {
+        "claimed_by": body.agent,
+        "claim_session_id": body.session_id or None,
+        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "assigned_agent": body.agent,
+    }
+    if implementer_principal_id is not None:
+        claim_fields["implementer_principal_id"] = implementer_principal_id
+    await repo.update_task(db, task_id, **claim_fields)
     await repo.add_task_update(
         db,
         task_id,
@@ -782,7 +1562,12 @@ async def claim_task(
         f"Claimed by {body.agent}{session_note}",
     )
     await db.commit()
-    await log_activity(db, "task_claimed", f"Task #{task_id} claimed by {body.agent}")
+    await log_activity(
+        db,
+        "task_claimed",
+        f"Task #{task_id} claimed by {body.agent}",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -829,6 +1614,9 @@ async def release_task(
         claimed_by=None,
         claim_session_id=None,
         claimed_at=None,
+        # The claim is the implementer's reservation: releasing it also
+        # releases the recorded implementer identity (#320).
+        implementer_principal_id=None,
     )
     await repo.add_task_update(
         db,
@@ -838,7 +1626,14 @@ async def release_task(
         f"Claim released by {body.agent}",
     )
     await db.commit()
-    await log_activity(db, "task_released", f"Task #{task_id} claim released")
+    await log_activity(
+        db,
+        "task_released",
+        f"Task #{task_id} claim released",
+        detail=mutation_activity_detail(),
+    )
+
+    await _try_restore_pair_workspace(db, task_id)
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -877,7 +1672,12 @@ async def ask_question(
     await repo.add_task_update(db, task_id, body.agent, "question", body.question)
     await repo.update_task(db, task_id, status="needs_info")
     await db.commit()
-    await log_activity(db, "task_question", f"Task #{task_id}: agent asked a question")
+    await log_activity(
+        db,
+        "task_question",
+        f"Task #{task_id}: agent asked a question",
+        detail=mutation_activity_detail(),
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -913,6 +1713,13 @@ async def answer_question(
         )
 
     await repo.add_task_update(db, task_id, "", "answer", body.answer)
+    await repo.insert_event(
+        db,
+        kind="question_answered",
+        task_id=task_id,
+        actor="human",
+        payload={"resume": bool(body.resume)},
+    )
     await db.commit()
 
     if body.resume:
@@ -924,6 +1731,7 @@ async def answer_question(
                 db,
                 "task_answered",
                 f"Task #{task_id}: answered, pair resumed to {resume_status}",
+                detail=mutation_activity_detail(),
             )
         else:
             row = await repo.get_task(db, task_id)
@@ -932,6 +1740,7 @@ async def answer_question(
                 db,
                 "task_answered",
                 f"Task #{task_id}: answered and re-dispatched",
+                detail=mutation_activity_detail(),
             )
     else:
         await repo.update_task(db, task_id, status="open")
@@ -940,6 +1749,7 @@ async def answer_question(
             db,
             "task_answered",
             f"Task #{task_id}: answered, moved to open",
+            detail=mutation_activity_detail(),
         )
 
     row = await repo.get_task(db, task_id)
@@ -980,12 +1790,20 @@ async def decide_task(
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
         await repo.update_task(db, task_id, status="completed")
+        await repo.insert_event(
+            db,
+            kind="task_completed",
+            task_id=task_id,
+            actor="human",
+            payload={"via": "decide_accept"},
+        )
         await db.commit()
         await maybe_rollup_parent(db, task_id)
         await log_activity(
             db,
             "task_decided",
             f"Task #{task_id}: accepted after arbitration",
+            detail=mutation_activity_detail(),
         )
     else:
         instructions = body.instructions or "Fix remaining issues."
@@ -993,7 +1811,11 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
+        # Rework is the boundary that closes the old arbiter/verdict window
+        # (#422): reset the cycle and clear the arbiter marker so the reworked
+        # submission starts clean and the stale verdict cannot count as current.
         await repo.update_task(db, task_id, review_cycle=0)
+        await repo.reset_arbiter_state(db, task_id)
         await db.commit()
 
         message = plugins.dispatch.build_fix_message(
@@ -1018,6 +1840,7 @@ async def decide_task(
             db,
             "task_decided",
             f"Task #{task_id}: rework requested after arbitration",
+            detail=mutation_activity_detail(),
         )
 
     if body.record_decision and summary_text:
@@ -1066,13 +1889,39 @@ async def add_update(
 
         if body.kind == "done":
             if task["status"] == "pending_report":
-                await repo.update_task(db, task_id, status="completed")
-                await log_activity(
-                    db,
-                    "task_completed",
-                    f"Task #{task_id} completed with report from {body.agent}",
-                )
-                await maybe_rollup_parent(db, task_id)
+                if completion_requires_review(task):
+                    # Universal Review Gate (#306): even the pending_report
+                    # path may not complete unreviewed work — the done
+                    # report becomes a submission for client-driven review.
+                    generation = await repo.bump_submission_generation(db, task_id)
+                    await repo.update_task(
+                        db, task_id, status="review", review_job_id=None
+                    )
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "status",
+                        f"Universal Review Gate: done report routed to review "
+                        f"(submission #{generation}). Obtain an APPROVED "
+                        "verdict via hub_submit_review, then report done "
+                        "again.",
+                    )
+                    await log_activity(
+                        db,
+                        "task_review_required",
+                        f"Task #{task_id} → review (gate) on report from {body.agent}",
+                        detail=mutation_activity_detail(),
+                    )
+                else:
+                    await repo.update_task(db, task_id, status="completed")
+                    await log_activity(
+                        db,
+                        "task_completed",
+                        f"Task #{task_id} completed with report from {body.agent}",
+                        detail=mutation_activity_detail(),
+                    )
+                    await maybe_rollup_parent(db, task_id)
             elif task["status"] in ("running", "claimed") and not task.get("job_id"):
                 # A done report on a pair-running task OR on a reserved (claimed)
                 # task must never be silently dropped: route both through the
@@ -1088,6 +1937,7 @@ async def add_update(
                         db,
                         "task_needs_decision",
                         f"Task #{task_id} → needs_decision (blocker in done flow)",
+                        detail=mutation_activity_detail(),
                     )
                 else:
                     await transition_after_agent_done(db, task, has_done=True)
@@ -1107,7 +1957,11 @@ async def add_update(
             db,
             "task_update",
             f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
+            detail=mutation_activity_detail(),
         )
+
+    if body.kind == "done":
+        await _try_restore_pair_workspace(db, task_id)
 
     update_row = await repo.get_task_update_by_id(db, update_id)
     return TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
@@ -1128,22 +1982,29 @@ async def refresh_task(
 
     job = plugins.dispatch.get_job(job_id)
     if job:
-        new_status = task["status"]
         if job.get("status") == "completed":
-            new_status = "completed"
-        elif job.get("status") == "failed":
-            new_status = "failed"
-        elif job.get("status") == "running":
-            new_status = "running"
-
-        await repo.update_task(
-            db,
-            task_id,
-            status=new_status,
-            exit_code=job.get("exit_code"),
-            result_text=job.get("result_text"),
-        )
-        await db.commit()
+            # Universal Review Gate (#309): a finished dispatch job must go
+            # through the same gate-checked post-done transition as the
+            # poller, not straight to completed — otherwise a manual
+            # refresh call bypasses the review requirement.
+            has_done = await repo.has_done_updates(db, task_id)
+            await transition_after_agent_done(
+                db,
+                task,
+                has_done=has_done,
+                exit_code=job.get("exit_code"),
+                result_text=job.get("result_text"),
+            )
+            await db.commit()
+        elif job.get("status") in ("failed", "running"):
+            await repo.update_task(
+                db,
+                task_id,
+                status=job["status"],
+                exit_code=job.get("exit_code"),
+                result_text=job.get("result_text"),
+            )
+            await db.commit()
 
     row = await repo.get_task(db, task_id)
     return row_to_task(row)  # type: ignore[arg-type]
@@ -1164,6 +2025,78 @@ async def reorder_task(
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+_TERMINAL_DISPATCH_JOB_STATUSES = frozenset({"completed", "failed"})
+
+
+def _dispatch_job_blocks_force_complete(
+    job_id: str,
+    job: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Return (blocks, dispatch_status_or_missing)."""
+    if job is None:
+        return False, "missing"
+    job_status = (job.get("status") or "").strip() or "unknown"
+    if job_status in _TERMINAL_DISPATCH_JOB_STATUSES:
+        return False, job_status
+    return True, job_status
+
+
+def _force_complete_job_overlay_note(
+    field: str,
+    job_id: str,
+    dispatch_status: str | None,
+) -> str:
+    if dispatch_status == "missing":
+        return f"Closed over {field}={job_id!r} (dispatch job missing from registry)."
+    return (
+        f"Closed over {field}={job_id!r} "
+        f"(dispatch job terminal status={dispatch_status!r})."
+    )
+
+
+def _build_force_complete_comment(
+    base_comment: str,
+    *,
+    from_status: str,
+    job_id: str | None,
+    review_job_id: str | None,
+    overlay_notes: list[str],
+) -> str:
+    audit_bits = [f"from_status={from_status}"]
+    if job_id:
+        audit_bits.append(f"job_id={job_id}")
+    if review_job_id:
+        audit_bits.append(f"review_job_id={review_job_id}")
+    parts = [base_comment, "[force-complete audit] " + ", ".join(audit_bits)]
+    parts.extend(overlay_notes)
+    return "\n".join(parts)
+
+
+async def _has_incomplete_descendants(
+    db: aiosqlite.Connection,
+    root_id: int,
+) -> bool:
+    rows = await db.execute_fetchall(
+        """
+        WITH RECURSIVE sub(id) AS (
+            SELECT id FROM tasks WHERE parent_id = ?
+            UNION ALL
+            SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+        )
+        SELECT 1 FROM tasks t
+        JOIN sub ON t.id = sub.id
+        WHERE t.archived = 0
+          AND t.status NOT IN ('completed', 'failed', 'rejected')
+        LIMIT 1
+        """,
+        (root_id,),
+    )
+    return bool(rows)
+
+
+_FORCE_COMPLETE_DEFAULT_COMMENT_STATUSES = frozenset({"pending_report", "claimed"})
+
+
 async def force_complete_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1171,11 +2104,11 @@ async def force_complete_task(
 ) -> TaskView:
     """Force-complete a stuck task without going through review.
 
-    Human override escape hatch for non-headless tasks that cannot otherwise
-    reach a terminal state: ``pending_report`` (agent never reported),
-    ``claimed`` (reserved but no pair-start), and pair ``running`` (no
-    headless ``job_id``). Headless ``running`` tasks (with a ``job_id``) are
-    excluded — the poller owns those.
+    Human-only audited override: allowed from any non-terminal ``task`` or
+    ``subtask`` when no *active* dispatch job backs ``job_id`` or
+    ``review_job_id``. Missing or terminal dispatch jobs are permitted and
+    noted in the audit trail. ``epic``/``feature`` rows are rejected when
+    they still have incomplete descendants.
 
     The optional ``body.comment`` is recorded as the audit-trail message; if
     omitted, a default human-override message is used.
@@ -1185,30 +2118,170 @@ async def force_complete_task(
         raise HTTPException(404, "task not found")
     task = dict(row)
     status = task["status"]
-    is_pair_running = status == "running" and not task.get("job_id")
-    if status not in ("pending_report", "claimed") and not is_pair_running:
+    final_values = {s.value for s in FINAL_STATUSES}
+    if status in final_values:
         raise HTTPException(
             400,
-            "can only force-complete pending_report, claimed, or pair-running "
-            f"tasks, current: {status}",
+            f"cannot force-complete terminal task, current status: {status}",
         )
-    comment = (body.comment.strip() if body else "") or (
-        "Force-completed by human without agent report."
+
+    task_type = task.get("task_type") or "task"
+    if task_type in ("epic", "feature"):
+        if await _has_incomplete_descendants(db, task_id):
+            raise HTTPException(
+                400,
+                f"cannot force-complete {task_type} with incomplete descendants",
+            )
+
+    overlay_notes: list[str] = []
+    for field, label in (("job_id", "job_id"), ("review_job_id", "review_job_id")):
+        job_ref = (task.get(field) or "").strip()
+        if not job_ref:
+            continue
+        job = plugins.dispatch.get_job(job_ref)
+        blocks, dispatch_status = _dispatch_job_blocks_force_complete(job_ref, job)
+        if blocks:
+            raise HTTPException(
+                409,
+                f"active dispatch {label} {job_ref!r} status={dispatch_status!r} "
+                "blocks force-complete",
+            )
+        overlay_notes.append(
+            _force_complete_job_overlay_note(label, job_ref, dispatch_status)
+        )
+
+    comment_raw = body.comment.strip() if body else ""
+    active_statuses = {s.value for s in ACTIVE_STATUSES}
+    if (
+        status in active_statuses
+        and status not in _FORCE_COMPLETE_DEFAULT_COMMENT_STATUSES
+        and not comment_raw
+    ):
+        raise HTTPException(
+            400,
+            f"force-complete from active status {status!r} requires a non-empty comment",
+        )
+
+    base_comment = comment_raw or ("Force-completed by human without agent report.")
+    comment = _build_force_complete_comment(
+        base_comment,
+        from_status=status,
+        job_id=(task.get("job_id") or None),
+        review_job_id=(task.get("review_job_id") or None),
+        overlay_notes=overlay_notes,
     )
+
+    update_fields: dict[str, Any] = {"status": "completed"}
+    if task.get("claimed_by") or task.get("claim_session_id") or task.get("claimed_at"):
+        update_fields["claimed_by"] = None
+        update_fields["claim_session_id"] = None
+        update_fields["claimed_at"] = None
+
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with get_write_lock(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
-        if status == "claimed":
-            await repo.update_task(
-                db, task_id, status="completed", claimed_by=None, claim_session_id=None
-            )
-        else:
-            await repo.update_task(db, task_id, status="completed")
+        await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def withdraw_own_draft(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    caller: str,
+    caller_principal_id: int | None = None,
+) -> TaskView:
+    """Archive a single agent-owned draft (no cascade). Agent-only narrow path."""
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise TaskNotFoundError(f"task {task_id} not found")
+    task = dict(row)
+
+    if task.get("source") != TaskSource.agent.value:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="not_agent_draft",
+                message="only agent-created drafts can be withdrawn",
+                hint=(
+                    "hub_withdraw_own_draft applies to source=agent drafts you own. "
+                    "For other tasks ask a human to archive."
+                ),
+                suggested_tool="hub_archive_task",
+                required_role="human",
+            ),
+        )
+
+    if task.get("status") != "draft":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="invalid_status_for_withdraw",
+                message=f"can only withdraw draft tasks, current: {task.get('status')}",
+                hint="Only draft tasks can be withdrawn. Approved or active work cannot.",
+                current_status=task.get("status"),
+                required_status="draft",
+                suggested_tool="hub_task_status",
+            ),
+        )
+
+    assigned = (task.get("assigned_agent") or "").strip()
+    principal_match = (
+        caller_principal_id is not None
+        and task.get("implementer_principal_id") is not None
+        and task.get("implementer_principal_id") == caller_principal_id
+    )
+    if assigned != caller.strip() and not principal_match:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="not_task_owner",
+                message="caller is not the assigned agent for this draft",
+                hint=(
+                    "You can only withdraw drafts assigned to you "
+                    "(assigned_agent must match your token identity)."
+                ),
+            ),
+        )
+
+    children = await db_module.get_children(db, task_id)
+    if children:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=withdraw_own_draft_error_detail(
+                reason="withdraw_has_children",
+                message="draft has non-archived child tasks",
+                hint=(
+                    "Archive or delete child tasks first, or ask a human to "
+                    "hub_archive_task with cascade."
+                ),
+                suggested_tool="hub_archive_task",
+                required_role="human",
+            ),
+        )
+
+    await repo.set_tasks_archived(db, [task_id], 1)
+    await db.commit()
+    detail_payload = {
+        **json.loads(mutation_activity_detail()),
+        "actor": caller.strip(),
+        "action": "withdraw_own_draft",
+    }
+    await log_activity(
+        db,
+        "task_withdrawn",
+        f"Agent {caller} withdrew draft #{task_id}",
+        json.dumps(detail_payload, ensure_ascii=False),
+    )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    task_view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    return await enrich_task_view(db, task_view)
 
 
 async def archive_task(
@@ -1228,6 +2301,7 @@ async def archive_task(
         db,
         "task_archived",
         f"Task #{task_id} archived (cascade={cascade}, count={len(ids)})",
+        detail=mutation_activity_detail(),
     )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1252,6 +2326,7 @@ async def unarchive_task(
         db,
         "task_unarchived",
         f"Task #{task_id} unarchived (cascade={cascade}, count={len(ids)})",
+        detail=mutation_activity_detail(),
     )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1270,4 +2345,5 @@ async def delete_task_tree(db: aiosqlite.Connection, task_id: int) -> None:
         db,
         "task_deleted",
         f"Deleted task subtree rooted at #{task_id} ({n} tasks)",
+        detail=mutation_activity_detail(),
     )
