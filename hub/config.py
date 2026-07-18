@@ -73,6 +73,17 @@ STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "24
 STALE_NEEDS_INFO_MINUTES = int(
     os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
 )
+# Machine-owned dead-end statuses (#393): visible via stale alerts until the
+# durable deadline transitions from F2 land. F1 only alerts — status unchanged.
+STALE_CI_CHECK_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60")
+)
+STALE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_FIX_REQUESTED_MINUTES", "60")
+)
+STALE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_PENDING_REPORT_MINUTES", "30")
+)
 
 # Bounded recovery (#417): a headless dispatch/review job that stays missing
 # past the grace escalates to needs_decision; a claim held past the lease is

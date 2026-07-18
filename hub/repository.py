@@ -1390,11 +1390,31 @@ async def has_plan_updates(
 async def has_stale_alert(
     db: aiosqlite.Connection,
     task_id: int,
+    status: str,
 ) -> bool:
+    """Whether ``task_id`` already has a stale alert for the current window.
+
+    Dedup is scoped two ways so a single lifetime alert can't silence the
+    watchdog forever (#393): by ``status`` (an alert raised in ``running``
+    must not suppress one in ``ci_check``) and by window. The window boundary
+    is the id of the latest update that is NOT itself a stale alert — any real
+    activity opens a fresh window. A stale alert counts only when it names
+    ``status`` and is newer than that boundary, so re-entering the same status
+    after real work alerts again. Until F2 persists a status-entered clock this
+    boundary is a heuristic: any non-alert update resets the window, not only a
+    status transition. All stale alerts embed ``stale in {status}`` so the
+    scope key is parseable from content.
+    """
+    boundary_rows = await db.execute_fetchall(
+        "SELECT COALESCE(MAX(id), 0) AS boundary FROM task_updates "
+        "WHERE task_id=? AND NOT (kind='alert' AND content LIKE '%stale%')",
+        (task_id,),
+    )
+    boundary = boundary_rows[0]["boundary"] if boundary_rows else 0
     rows = await db.execute_fetchall(
         "SELECT id FROM task_updates WHERE task_id=? AND kind='alert' "
-        "AND content LIKE '%stale%' ORDER BY id DESC LIMIT 1",
-        (task_id,),
+        "AND content LIKE ? AND id > ? ORDER BY id DESC LIMIT 1",
+        (task_id, f"%stale in {status}%", boundary),
     )
     return bool(rows)
 

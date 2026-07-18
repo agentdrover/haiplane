@@ -34,6 +34,18 @@ def _make_app(db) -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(db=db))
 
 
+async def _run_poll_once(db) -> None:
+    """Run the poll body exactly once with a fresh break counter.
+
+    The shared ``_sleep_once`` mock keeps its counter for a whole test, so a
+    second ``_poll_running_tasks`` call would break before its body runs. A
+    fresh mock per invocation lets a test drive several real poll passes.
+    """
+    with patch("hub.poller.asyncio.sleep", new_callable=_sleep_once):
+        with pytest.raises(_BreakLoop):
+            await _poll_running_tasks(_make_app(db))
+
+
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_poll_no_running_tasks(mock_sleep, db):
     await db.commit()
@@ -348,6 +360,70 @@ async def test_stale_headless_review_not_alerted(mock_sleep, db):
     with pytest.raises(_BreakLoop):
         await _poll_running_tasks(_make_app(db))
     assert await _stale_alerts(db, task_id) == []
+
+
+async def test_stale_machine_dead_ends_alerted(db):
+    # AC-1/AC-3 (#393): ci_check, fix_requested and pending_report past their
+    # thresholds each get exactly one alert naming the status; the status is
+    # unchanged and a second real pass does not duplicate the alert. The durable
+    # ci_no_pr_attempts counter (#416) stays under MAX_CI_NO_PR_ATTEMPTS across
+    # these two passes, so the CI conveyor does not escalate ci_check.
+    ci_id = await _make_stale_task(db, status="ci_check")
+    fix_id = await _make_stale_task(db, status="fix_requested")
+    pending_id = await _make_stale_task(db, status="pending_report")
+
+    await _run_poll_once(db)
+
+    for tid, status in (
+        (ci_id, "ci_check"),
+        (fix_id, "fix_requested"),
+        (pending_id, "pending_report"),
+    ):
+        alerts = await _stale_alerts(db, tid)
+        assert len(alerts) == 1, status
+        assert f"stale in {status}" in alerts[0]
+        assert "hub_force_complete_task" in alerts[0]
+        assert dict(await repo.get_task(db, tid))["status"] == status
+
+    await _run_poll_once(db)
+    for tid in (ci_id, fix_id, pending_id):
+        assert len(await _stale_alerts(db, tid)) == 1
+
+
+async def test_stale_pending_report_threshold_from_config(db):
+    # AC-5 (#393): the threshold is read from config, not a literal —
+    # pending_report has no conveyor, so the same task is silent under a 30m
+    # threshold and alerted under a 5m one.
+    task_id = await _make_stale_task(db, status="pending_report", minutes=10)
+
+    with patch("hub.poller.config.STALE_PENDING_REPORT_MINUTES", 30):
+        await _run_poll_once(db)
+    assert await _stale_alerts(db, task_id) == []
+
+    with patch("hub.poller.config.STALE_PENDING_REPORT_MINUTES", 5):
+        await _run_poll_once(db)
+    assert len(await _stale_alerts(db, task_id)) == 1
+
+
+async def test_stale_alert_not_suppressed_across_statuses(db):
+    # AC-2 (#393): a historical stale alert in one status must not suppress a
+    # later stale alert in a different status. Uses claimed→needs_info, both
+    # free of conveyor interference, to isolate the watchdog dedup.
+    task_id = await _make_stale_task(db, status="claimed")
+    await _run_poll_once(db)
+    assert len(await _stale_alerts(db, task_id)) == 1
+
+    await repo.update_task(db, task_id, status="needs_info")
+    await db.execute(
+        "UPDATE tasks SET updated_at = datetime('now', '-999 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    await _run_poll_once(db)
+    alerts = await _stale_alerts(db, task_id)
+    assert len(alerts) == 2
+    assert any("stale in needs_info" in a for a in alerts)
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)

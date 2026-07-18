@@ -117,6 +117,20 @@ async def get_inbox_data(
         limit=20,
         **person,
     )
+    ci_check_rows = await repo.list_tasks_by_status(
+        db,
+        "ci_check",
+        order_by="updated_at ASC",
+        limit=20,
+        **person,
+    )
+    fix_requested_rows = await repo.list_tasks_by_status(
+        db,
+        "fix_requested",
+        order_by="updated_at ASC",
+        limit=20,
+        **person,
+    )
     stale_rows = await repo.list_stale_running(
         db,
         config.STALE_THRESHOLD_MINUTES,
@@ -136,6 +150,8 @@ async def get_inbox_data(
         "questions": questions,
         "decisions": [row_to_task(r) for r in needs_decision_rows],
         "pending_reports": [row_to_task(r) for r in pending_report_rows],
+        "ci_check_tasks": [row_to_task(r) for r in ci_check_rows],
+        "fix_requested_tasks": [row_to_task(r) for r in fix_requested_rows],
         "stale_tasks": [row_to_task(r) for r in stale_rows],
         "filter_human_owner": human_owner or "",
         "filter_claimed_by": claimed_by or "",

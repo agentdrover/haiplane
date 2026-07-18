@@ -467,6 +467,45 @@ async def test_list_stale_tasks_filters_status_and_review_job(
     assert headless_review not in ids
 
 
+async def test_has_stale_alert_scoped_by_status(db: aiosqlite.Connection):
+    # #393: an alert in one status must not suppress a later one in another.
+    task_id = await _make_task(db, status="running")
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", "Task stale in running: no updates."
+    )
+    await db.commit()
+
+    assert await repo.has_stale_alert(db, task_id, "running") is True
+    assert await repo.has_stale_alert(db, task_id, "ci_check") is False
+
+
+async def test_has_stale_alert_dedups_within_window(db: aiosqlite.Connection):
+    # #393: repeated checks in the same window (no real activity) stay deduped.
+    task_id = await _make_task(db, status="ci_check")
+    assert await repo.has_stale_alert(db, task_id, "ci_check") is False
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", "Task stale in ci_check: no updates."
+    )
+    await db.commit()
+    assert await repo.has_stale_alert(db, task_id, "ci_check") is True
+
+
+async def test_has_stale_alert_reopens_after_real_activity(db: aiosqlite.Connection):
+    # #393: any non-alert update opens a new window, so the same status can be
+    # alerted again — a lifetime alert no longer silences the watchdog forever.
+    task_id = await _make_task(db, status="ci_check")
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", "Task stale in ci_check: no updates."
+    )
+    await db.commit()
+    assert await repo.has_stale_alert(db, task_id, "ci_check") is True
+
+    # Real activity (a non-stale update) closes the window.
+    await repo.add_task_update(db, task_id, "dev", "status", "Picked back up.")
+    await db.commit()
+    assert await repo.has_stale_alert(db, task_id, "ci_check") is False
+
+
 async def test_resolve_project_for_task_walks_to_epic(db: aiosqlite.Connection):
     from hub.db import seed_default_project
 
