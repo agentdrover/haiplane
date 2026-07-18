@@ -848,3 +848,63 @@ async def test_worktree_reuse_switches_branch_cleanly(tmp_path, git_ops):
     )
     assert b == "task-6/b"
     assert _current_branch(wt) == "task-6/b"  # truly switched, no false success
+
+
+async def test_worktree_reuse_base_ahead_guard(tmp_path, git_ops):
+    # #459 review: the base-ahead guard on the REUSE path (new slug on an existing
+    # worktree) must also fire, not just the fresh-worktree path.
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "main"
+    subprocess.run(
+        ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+    )
+    for args in (
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "develop"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Existing clean worktree on task-6/a.
+    await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    # Local develop now diverges ahead of origin/develop.
+    (repo / "g.txt").write_text("y")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "local-only"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Reuse path cutting a new branch task-6/b must hit the guard.
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            6, "Task", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+    assert exc.value.to_detail()["reason"] == "pair_base_ahead_of_origin"
+
+
+async def test_worktree_remove_unregistered_is_idempotent(tmp_path, git_ops):
+    # #459 review: removing a worktree for a task that has none prunes and
+    # returns True (idempotent cleanup), never raises or returns False.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    assert await git_ops.pair_remove_worktree(99, repo=str(repo)) is True
