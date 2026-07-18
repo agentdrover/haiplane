@@ -16,6 +16,7 @@ from hub import db as db_module
 from hub.actionable_errors import (
     done_report_error_detail,
     hierarchy_error_detail,
+    pair_start_claim_mismatch_detail,
     self_review_forbidden_detail,
     withdraw_own_draft_error_detail,
 )
@@ -1054,10 +1055,24 @@ async def pair_start_task(
     if task["status"] == "claimed":
         holder = (task.get("claimed_by") or "").strip()
         if holder and assigned_agent and holder != assigned_agent:
-            raise HTTPException(
-                409,
-                f"Task #{task_id} is claimed by {holder}; pair-start denied",
+            # Principal is truth, name is presentational (#453): if the caller
+            # authenticated as the same principal that holds the claim, allow
+            # the pair-start even when the agent names differ.
+            claim_principal = task.get("implementer_principal_id")
+            same_principal = (
+                implementer_principal_id is not None
+                and claim_principal is not None
+                and implementer_principal_id == claim_principal
             )
+            if not same_principal:
+                raise HTTPException(
+                    409,
+                    detail=pair_start_claim_mismatch_detail(
+                        task_id=task_id,
+                        holder=holder,
+                        caller=assigned_agent,
+                    ),
+                )
     elif task["status"] != "open":
         raise HTTPException(
             400,

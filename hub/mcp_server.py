@@ -1036,10 +1036,18 @@ async def hub_pair_start(
     Use this when a human works with a Cursor agent locally instead of
     ``hub_start_task``, which always calls oc-dev-dispatch.
 
+    If the task is already claimed, ``assigned_agent`` must match the claim
+    holder's name — i.e. the ``agent`` you passed to hub_claim_task. A mismatch
+    returns a structured ``pair_start_claim_mismatch`` error naming the holder
+    and the identity the server resolved. Pair-start by the same authenticated
+    principal is accepted even when the presentational name differs.
+
     Args:
         task_id: The open task ID to pair-start
         plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
-        assigned_agent: Agent name to record on the task. Empty uses caller identity.
+        assigned_agent: Agent name to record on the task; for a claimed task it
+            must equal the claim holder (hub_claim_task agent). Empty uses caller
+            identity, which may not match the holder — pass it explicitly.
         branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
     """
     prior_task = await _read_task(task_id)
@@ -1299,9 +1307,13 @@ async def hub_claim_task(
 ) -> str:
     """Claim an open task for one Cursor agent/session (409 if already claimed).
 
+    Remember the ``agent`` name you pass here: a later hub_pair_start must use
+    the same value as its ``assigned_agent`` (the name is how the holder is
+    matched), unless you pair-start under the same authenticated principal.
+
     Args:
         task_id: The open task ID
-        agent: Agent name taking the claim
+        agent: Agent name taking the claim; reuse it as assigned_agent in hub_pair_start
         session_id: Optional Cursor session id for conflict detection
     """
     prior_task = await _read_task(task_id)
