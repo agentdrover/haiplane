@@ -2491,8 +2491,8 @@ async def test_hub_my_context_without_task_id(mock_api_get: AsyncMock) -> None:
     assert "Identity: cursor" in text
     assert "#451" in text
     assert "Workflow reference" in text
-    # Identity is resolved via whoami first.
-    assert mock_api_get.await_args_list[0].args[0] == "/api/whoami"
+    # Identity + workspace mode resolved via diagnostics first (#530).
+    assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"
     structured = _mcp_structured(out)
     assert structured["identity"]["username"] == "cursor"
     assert structured["instance"] in ("prod", "local")
@@ -2507,8 +2507,8 @@ async def test_hub_my_context_without_task_id_anonymous(
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
     assert "Workflow reference" in text
-    # No username → no task lookup, only the whoami probe.
-    mock_api_get.assert_awaited_once_with("/api/whoami")
+    # No username → no task lookup, only the diagnostics probe (#530).
+    mock_api_get.assert_awaited_once_with("/api/diagnostics/identity")
 
 
 async def test_hub_my_context_brief_alias(mock_api_get: AsyncMock) -> None:
@@ -2580,3 +2580,60 @@ async def test_hub_admin_my_identity_warns_on_mismatch(
     text = _mcp_text(out)
     assert "CONFIG MISMATCH" in text
     assert "Connected via: https://agenthai.ru" in text
+
+
+# --- hub_pair_start / hub_my_context surface worktree mode (#530) ---
+
+
+async def test_hub_pair_start_announces_worktree(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    # AC-1 (#530): worktree mode → response names the isolated worktree path.
+    mock_api_post.return_value = {
+        "id": 5,
+        "status": "running",
+        "branch": "task-5/wt",
+        "assigned_agent": "dev",
+        "job_id": None,
+        "workspace_mode": "worktree",
+        "worktree_path": "/srv/.ws-worktrees/task-5",
+    }
+    mock_api_get.return_value = {"id": 5, "status": "running", "branch": "task-5/wt"}
+    text = _mcp_text(await hub_pair_start(5))
+    assert "Workspace mode: worktree" in text
+    assert "/srv/.ws-worktrees/task-5" in text
+
+
+async def test_hub_pair_start_legacy_no_worktree_note(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    # AC-2 (#530): legacy mode → no worktree line, message unchanged.
+    mock_api_post.return_value = {
+        "id": 5,
+        "status": "running",
+        "branch": "task-5/x",
+        "assigned_agent": "dev",
+        "job_id": None,
+        "workspace_mode": "legacy",
+        "worktree_path": "",
+    }
+    mock_api_get.return_value = {"id": 5, "status": "running", "branch": "task-5/x"}
+    text = _mcp_text(await hub_pair_start(5))
+    assert "Workspace mode: worktree" not in text
+    assert "pair-started" in text
+
+
+async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> None:
+    # AC-3 (#530): general context reports the active workspace mode.
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        [],
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "Workspace mode: worktree" in text
+    assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"

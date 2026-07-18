@@ -73,6 +73,7 @@ from hub.services.orchestration import (
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
+    pair_worktree_info,
     prepare_pair_branch,
     restore_pair_workspace_base,
     review_approved_for_current_submission,
@@ -1148,7 +1149,10 @@ async def pair_start_task(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    # Tell the agent where its isolated worktree is and the active mode (#530).
+    tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
+    return tv
 
 
 async def submit_for_review(
