@@ -569,14 +569,15 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             )
             for row in stale_rows:
                 task = dict(row)
-                if await repo.has_stale_alert(db, task["id"]):
+                if await repo.has_stale_alert(db, task["id"], "running"):
                     continue
                 await repo.add_task_update(
                     db,
                     task["id"],
                     "hub",
                     "alert",
-                    f"Task stale: no updates for {config.STALE_THRESHOLD_MINUTES}+ minutes.",
+                    "Task stale in running: no updates for "
+                    f"{config.STALE_THRESHOLD_MINUTES}+ minutes.",
                 )
                 await db.commit()
                 await log_activity(
@@ -590,9 +591,11 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     config.STALE_THRESHOLD_MINUTES,
                 )
 
-            # Stale watchdog for silent dead-end statuses (#319). Only
+            # Stale watchdog for silent dead-end statuses (#319, #393). Only
             # client-driven review is watched (headless review belongs to
-            # this conveyor); statuses never change here — alerts only.
+            # this conveyor); statuses never change here — alerts only. The
+            # machine-owned dead-ends (ci_check, fix_requested, pending_report)
+            # get visibility here until F2 lands durable deadline transitions.
             stale_specs = (
                 (
                     "review",
@@ -614,6 +617,27 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     False,
                     "Question awaits a human hub_answer_question.",
                 ),
+                (
+                    "ci_check",
+                    config.STALE_CI_CHECK_MINUTES,
+                    False,
+                    "CI conveyor stalled: inspect the PR/CI or recover with "
+                    "hub_force_complete_task.",
+                ),
+                (
+                    "fix_requested",
+                    config.STALE_FIX_REQUESTED_MINUTES,
+                    False,
+                    "Fix dispatch stalled: inspect the job or recover with "
+                    "hub_force_complete_task.",
+                ),
+                (
+                    "pending_report",
+                    config.STALE_PENDING_REPORT_MINUTES,
+                    False,
+                    "Awaiting agent hub_report_done, or recover with "
+                    "hub_force_complete_task.",
+                ),
             )
             for status_name, threshold, null_review_job, action in stale_specs:
                 rows = await repo.list_stale_tasks(
@@ -624,7 +648,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 )
                 for row in rows:
                     task = dict(row)
-                    if await repo.has_stale_alert(db, task["id"]):
+                    if await repo.has_stale_alert(db, task["id"], status_name):
                         continue
                     await repo.add_task_update(
                         db,

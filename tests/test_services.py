@@ -960,6 +960,53 @@ async def test_get_inbox_data(db: aiosqlite.Connection):
     assert "pending_reports" in inbox
 
 
+async def test_get_inbox_data_includes_ci_check_and_fix_requested(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#393): ci_check and fix_requested get their own inbox buckets,
+    # respect person filters, and pending_report keeps its existing bucket.
+    ci_id = await repo.create_task(
+        db,
+        title="CI item",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, ci_id, human_owner="alice")
+    fix_id = await repo.create_task(
+        db,
+        title="Fix item",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="fix_requested",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, fix_id, human_owner="bob")
+    await db.commit()
+
+    inbox = await services.get_inbox_data(db)
+    assert ci_id in [t.id for t in inbox["ci_check_tasks"]]
+    assert fix_id in [t.id for t in inbox["fix_requested_tasks"]]
+    assert "pending_reports" in inbox
+
+    mine = await services.get_inbox_data(db, human_owner="alice")
+    assert [t.id for t in mine["ci_check_tasks"]] == [ci_id]
+    assert [t.id for t in mine["fix_requested_tasks"]] == []
+
+
 async def test_get_inbox_data_filters_by_mine(db: aiosqlite.Connection):
     alice_draft = await repo.create_task(
         db,
