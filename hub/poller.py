@@ -92,9 +92,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["job_id"])
                 if not job:
-                    await _handle_missing_job(
-                        db, task, reason="dispatch_job_missing"
-                    )
+                    await _handle_missing_job(db, task, reason="dispatch_job_missing")
                     continue
                 if task.get("job_missing_since"):
                     await repo.clear_job_missing(db, task["id"])
@@ -186,9 +184,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 task = dict(row)
                 job = plugins.dispatch.get_job(task["review_job_id"])
                 if not job:
-                    await _handle_missing_job(
-                        db, task, reason="review_job_missing"
-                    )
+                    await _handle_missing_job(db, task, reason="review_job_missing")
                     continue
                 if task.get("job_missing_since"):
                     await repo.clear_job_missing(db, task["id"])
@@ -698,9 +694,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     payload={"reason": "claim_lease_expired"},
                 )
                 await db.commit()
-                log.info(
-                    "Poll: task #%d claim lease expired → open", task["id"]
-                )
+                log.info("Poll: task #%d claim lease expired → open", task["id"])
 
             # Machine-owned deadline backstop (#418): the ownership/deadline
             # matrix is the source of truth. Any machine-owned instance that
@@ -728,9 +722,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         f"{policy.instance} exceeded its {threshold}m deadline. "
                         "Manual decision required.",
                     )
-                    await repo.update_task(
-                        db, task["id"], status="needs_decision"
-                    )
+                    await repo.update_task(db, task["id"], status="needs_decision")
                     await repo.insert_event(
                         db,
                         kind="needs_decision",

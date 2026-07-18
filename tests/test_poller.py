@@ -648,9 +648,7 @@ async def test_expired_claim_released_to_open(mock_sleep, db):
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(
-        db, task_id, claimed_by="dev", claim_session_id="sess-1"
-    )
+    await repo.update_task(db, task_id, claimed_by="dev", claim_session_id="sess-1")
     await db.execute(
         "UPDATE tasks SET claimed_at = datetime('now', '-300 minutes') WHERE id=?",
         (task_id,),
@@ -713,9 +711,18 @@ def test_lifecycle_matrix_covers_all_instances():
     )
 
     expected = {
-        "draft", "open", "claimed", "needs_info", "needs_decision",
-        "running:headless", "running:pair", "review:headless", "review:client",
-        "fix_requested", "ci_check", "pending_report",
+        "draft",
+        "open",
+        "claimed",
+        "needs_info",
+        "needs_decision",
+        "running:headless",
+        "running:pair",
+        "review:headless",
+        "review:client",
+        "fix_requested",
+        "ci_check",
+        "pending_report",
     }
     assert set(LIFECYCLE_MATRIX) == expected
 
@@ -731,7 +738,11 @@ def test_lifecycle_matrix_covers_all_instances():
     # claimed escalates to open (handled by #417); the rest to needs_decision.
     dec = [p for p in machine_deadline_policies() if p.escalation == "needs_decision"]
     assert {p.status for p in dec} == {
-        "running", "review", "fix_requested", "ci_check", "pending_report",
+        "running",
+        "review",
+        "fix_requested",
+        "ci_check",
+        "pending_report",
     }
 
 

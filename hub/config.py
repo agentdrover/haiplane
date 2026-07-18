@@ -75,9 +75,7 @@ STALE_NEEDS_INFO_MINUTES = int(
 )
 # Machine-owned dead-end statuses (#393): visible via stale alerts until the
 # durable deadline transitions from F2 land. F1 only alerts — status unchanged.
-STALE_CI_CHECK_MINUTES = int(
-    os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60")
-)
+STALE_CI_CHECK_MINUTES = int(os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60"))
 STALE_FIX_REQUESTED_MINUTES = int(
     os.environ.get("OPENCLAW_STALE_FIX_REQUESTED_MINUTES", "60")
 )
@@ -110,9 +108,7 @@ DEADLINE_PENDING_REPORT_MINUTES = int(
 DEADLINE_RUNNING_MINUTES = int(
     os.environ.get("OPENCLAW_DEADLINE_RUNNING_MINUTES", "360")
 )
-DEADLINE_REVIEW_MINUTES = int(
-    os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180")
-)
+DEADLINE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180"))
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
