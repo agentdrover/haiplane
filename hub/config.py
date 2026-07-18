@@ -77,6 +77,26 @@ MISSING_JOB_GRACE_MINUTES = int(
 )
 CLAIM_LEASE_MINUTES = int(os.environ.get("OPENCLAW_CLAIM_LEASE_MINUTES", "240"))
 
+# Machine-owned deadlines (#418): a backstop, deliberately generous so normal
+# work never trips them — the stale watchdog (#393) alerts long before. When a
+# machine-owned instance sits past its deadline the watchdog transitions it to
+# needs_decision, so no combination stays stuck without an owner.
+DEADLINE_CI_CHECK_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_CI_CHECK_MINUTES", "180")
+)
+DEADLINE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_FIX_REQUESTED_MINUTES", "180")
+)
+DEADLINE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_PENDING_REPORT_MINUTES", "120")
+)
+DEADLINE_RUNNING_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_RUNNING_MINUTES", "360")
+)
+DEADLINE_REVIEW_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180")
+)
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 

@@ -618,3 +618,77 @@ async def test_missing_job_decision_uses_persisted_timestamp(mock_sleep, db):
     await db.commit()
     await _run_poll_once(db)
     assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+
+# ---- Ownership/deadline matrix (#418) ----
+
+
+def test_lifecycle_matrix_covers_all_instances():
+    # AC-1 (#418): every status plus each running/review discriminator resolves
+    # to a policy with an owner, next actor, surface, and — for machine-owned
+    # instances — a finite deadline config, escalation and reason.
+    from hub import config
+    from hub.lifecycle_matrix import (
+        LIFECYCLE_MATRIX,
+        OWNER_MACHINE,
+        machine_deadline_policies,
+    )
+
+    expected = {
+        "draft", "open", "claimed", "needs_info", "needs_decision",
+        "running:headless", "running:pair", "review:headless", "review:client",
+        "fix_requested", "ci_check", "pending_report",
+    }
+    assert set(LIFECYCLE_MATRIX) == expected
+
+    for p in LIFECYCLE_MATRIX.values():
+        assert p.next_actor
+        assert p.surface
+        if p.owner == OWNER_MACHINE:
+            assert p.deadline_config is not None
+            assert isinstance(getattr(config, p.deadline_config), int)
+            assert p.escalation in ("needs_decision", "open")
+            assert p.reason
+
+    # claimed escalates to open (handled by #417); the rest to needs_decision.
+    dec = [p for p in machine_deadline_policies() if p.escalation == "needs_decision"]
+    assert {p.status for p in dec} == {
+        "running", "review", "fix_requested", "ci_check", "pending_report",
+    }
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_machine_deadline_transitions_to_needs_decision(mock_sleep, db):
+    # AC-2 (#418): a machine-owned instance past its deadline is transitioned
+    # once to needs_decision with a reason-coded event. pending_report has no
+    # conveyor, so the matrix backstop is the only thing that acts.
+    task_id = await _make_stale_task(db, status="pending_report", minutes=0)
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', '-500 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    plugins.dispatch = NoopDispatch()
+
+    await _run_poll_once(db)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert len(events) == 1
+    assert "pending_report_deadline" in (events[0]["payload"] or "")
+
+    # Idempotent: needs_decision is not machine-owned, so no second escalation.
+    await _run_poll_once(db)
+    assert len(await _events_for(db, task_id, "needs_decision")) == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_machine_deadline_leaves_fresh_task_untouched(mock_sleep, db):
+    # AC-2 guard (#418): a task within its deadline is never transitioned — the
+    # backstop must not yank live work.
+    task_id = await _make_stale_task(db, status="pending_report", minutes=0)
+    await db.commit()  # status_entered_at is now (fresh)
+    plugins.dispatch = NoopDispatch()
+
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
