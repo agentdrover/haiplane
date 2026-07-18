@@ -779,7 +779,35 @@ class GitOpsIntegration:
                     ),
                     task_id=task_id,
                 )
-            await _git("checkout", branch, repo=wt_path, check=False)
+            # Switch the reused worktree to the target branch. Ensure the branch
+            # exists (create from base when missing) and verify the checkout —
+            # never return a branch we failed to check out, which would record a
+            # wrong branch and push the wrong work (silent false success).
+            rc, _, _ = await _git(
+                "rev-parse", "--verify", branch, repo=repo, check=False
+            )
+            if rc == 0:
+                rc, _, err = await _git("checkout", branch, repo=wt_path, check=False)
+            else:
+                if await _base_ahead_of_origin(base, repo):
+                    raise _pair_branch_conflict(
+                        f"Local {base!r} is ahead of origin/{base!r} in {repo}; "
+                        f"refusing to cut {branch!r} onto unpushed base commits",
+                        repo=repo,
+                        reason="pair_base_ahead_of_origin",
+                        task_id=task_id,
+                    )
+                rc, _, err = await _git(
+                    "checkout", "-b", branch, base, repo=wt_path, check=False
+                )
+            if rc != 0:
+                raise _pair_branch_conflict(
+                    f"Failed to switch worktree {wt_path} to {branch}: "
+                    f"{(err or '').strip() or 'git checkout failed'}",
+                    repo=wt_path,
+                    reason="pair_worktree_create_failed",
+                    task_id=task_id,
+                )
             return branch
 
         # Fresh worktree. Keep the main clone's base current (best-effort).

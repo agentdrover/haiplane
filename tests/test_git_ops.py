@@ -831,3 +831,20 @@ async def test_worktree_base_ahead_guard(tmp_path, git_ops):
             7, "Ahead", repo=str(repo), base_branch="develop", branch_slug="new"
         )
     assert exc.value.to_detail()["reason"] == "pair_base_ahead_of_origin"
+
+
+async def test_worktree_reuse_switches_branch_cleanly(tmp_path, git_ops):
+    # #459 review HIGH: reusing a clean worktree for a new slug must actually
+    # create+switch the branch, not silently return one it never checked out.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = _worktree_path(6, str(repo))
+
+    b = await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="b"
+    )
+    assert b == "task-6/b"
+    assert _current_branch(wt) == "task-6/b"  # truly switched, no false success
