@@ -200,86 +200,84 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 updates_rows = await repo.get_task_updates(db, task["id"])
                 updates_list = [dict(r) for r in updates_rows]
 
-                last_rework_at = ""
-                for u in reversed(updates_list):
-                    if (
-                        u.get("agent") == "human"
-                        and u.get("kind") == "status"
-                        and "rework" in u.get("content", "").lower()
-                    ):
-                        last_rework_at = u.get("created_at", "")
-                        break
-
-                recent_updates = (
-                    [
-                        u
-                        for u in updates_list
-                        if u.get("created_at", "") > last_rework_at
-                    ]
-                    if last_rework_at
-                    else updates_list
+                # Server-owned arbiter termination (#422): when the current
+                # review job IS the arbiter job, the Hub — not a voluntary
+                # agent update — ends the arbiter phase. Any terminal state
+                # routes to the human Decision Gate with an audit summary taken
+                # from the job result/log; a free-text APPROVED never
+                # auto-completes. This replaces the old kind="arbitration"
+                # inference (and the never-matching last_rework_at filter).
+                is_arbiter_job = bool(
+                    task.get("arbiter_state") == "running"
+                    and task.get("arbiter_job_id")
+                    and task.get("arbiter_job_id") == task.get("review_job_id")
                 )
-
-                has_alert = any(
-                    u.get("kind") == "alert"
-                    and "cycle limit" in u.get("content", "").lower()
-                    for u in recent_updates
-                )
-                has_arbitration = any(
-                    u.get("kind") == "arbitration" for u in recent_updates
-                )
+                if is_arbiter_job:
+                    summary = (job.get("result_text") or "").strip()
+                    if not summary:
+                        summary = _extract_agent_summary(
+                            plugins.dispatch.job_log_full(task["review_job_id"])
+                        )
+                    reason = (
+                        "arbiter_job_failed"
+                        if job_status == "failed"
+                        else "arbitration_finished"
+                    )
+                    await repo.mark_arbiter_finished(db, task["id"])
+                    await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": reason},
+                    )
+                    await db.commit()
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        "Arbiter phase finished — human decision required "
+                        "(hub_decide_task)."
+                        + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
+                    )
+                    await db.commit()
+                    log.info(
+                        "Poll: task #%d arbiter %s → needs_decision",
+                        task["id"],
+                        job_status,
+                    )
+                    await services.maybe_destroy_vast(db, task)
+                    continue
 
                 if job_status == "failed":
-                    if has_alert or has_arbitration:
-                        await repo.update_task(db, task["id"], status="needs_decision")
-                        await repo.insert_event(
-                            db,
-                            kind="needs_decision",
-                            task_id=task["id"],
-                            actor="hub",
-                            payload={"reason": "review_job_failed_after_limit"},
-                        )
-                        await db.commit()
-                        await repo.add_task_update(
-                            db,
-                            task["id"],
-                            "hub",
-                            "alert",
-                            f"Review/arbiter job failed (exit={job.get('exit_code')}). Manual decision required.",
-                        )
-                        await db.commit()
-                        log.info(
-                            "Poll: review/arbiter job failed for task #%d after cycle limit → needs_decision",
-                            task["id"],
-                        )
-                        await services.maybe_destroy_vast(db, task)
-                    else:
-                        # Universal Review Gate (#309): a crashed review job
-                        # must never complete the task — no verdict exists.
-                        await repo.update_task(db, task["id"], status="needs_decision")
-                        await repo.insert_event(
-                            db,
-                            kind="needs_decision",
-                            task_id=task["id"],
-                            actor="hub",
-                            payload={"reason": "review_job_failed"},
-                        )
-                        await db.commit()
-                        await repo.add_task_update(
-                            db,
-                            task["id"],
-                            "hub",
-                            "alert",
-                            f"Review job failed (exit={job.get('exit_code')}) "
-                            "without a verdict. Universal Review Gate: manual "
-                            "decision required (hub_decide_task).",
-                        )
-                        await db.commit()
-                        log.info(
-                            "Poll: review job failed for task #%d → needs_decision",
-                            task["id"],
-                        )
-                        await services.maybe_destroy_vast(db, task)
+                    # Universal Review Gate (#309): a crashed review job must
+                    # never complete the task — no verdict exists.
+                    await repo.update_task(db, task["id"], status="needs_decision")
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task["id"],
+                        actor="hub",
+                        payload={"reason": "review_job_failed"},
+                    )
+                    await db.commit()
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"Review job failed (exit={job.get('exit_code')}) "
+                        "without a verdict. Universal Review Gate: manual "
+                        "decision required (hub_decide_task).",
+                    )
+                    await db.commit()
+                    log.info(
+                        "Poll: review job failed for task #%d → needs_decision",
+                        task["id"],
+                    )
+                    await services.maybe_destroy_vast(db, task)
                     continue
 
                 # Structured channel first (#326): a persisted verdict for
@@ -299,20 +297,6 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     verdict = services.extract_review_verdict(
                         task["id"], task["review_job_id"], updates_list
                     )
-
-                if has_arbitration:
-                    await repo.update_task(db, task["id"], status="needs_decision")
-                    await repo.insert_event(
-                        db,
-                        kind="needs_decision",
-                        task_id=task["id"],
-                        actor="hub",
-                        payload={"reason": "arbitration_finished"},
-                    )
-                    await db.commit()
-                    log.info("Poll: task #%d arbiter done → needs_decision", task["id"])
-                    await services.maybe_destroy_vast(db, task)
-                    continue
 
                 if verdict:
                     # Canonical verdict state (#305): bind the verdict to the

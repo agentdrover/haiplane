@@ -1738,7 +1738,11 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
+        # Rework is the boundary that closes the old arbiter/verdict window
+        # (#422): reset the cycle and clear the arbiter marker so the reworked
+        # submission starts clean and the stale verdict cannot count as current.
         await repo.update_task(db, task_id, review_cycle=0)
+        await repo.reset_arbiter_state(db, task_id)
         await db.commit()
 
         message = plugins.dispatch.build_fix_message(

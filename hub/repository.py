@@ -956,6 +956,29 @@ async def mark_arbiter_running(
     )
 
 
+async def mark_arbiter_finished(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Close the arbiter marker once the Hub ends the arbiter phase (#422)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state='finished' WHERE id=?",
+        (task_id,),
+    )
+
+
+async def reset_arbiter_state(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear the arbiter marker so a reworked submission starts clean (#422)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state=NULL, arbiter_job_id=NULL, "
+        "arbiter_generation=NULL, arbiter_dispatch_at=NULL WHERE id=?",
+        (task_id,),
+    )
+
+
 async def list_stale_arbiter_dispatching(
     db: aiosqlite.Connection,
     threshold_minutes: int,
