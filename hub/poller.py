@@ -739,6 +739,39 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     )
                     await services.maybe_destroy_vast(db, task)
 
+            # Arbiter dispatch ambiguity (#421): a marker stuck in 'dispatching'
+            # past the grace means submit started but the job id was never
+            # recorded — a crash window. Fail safe to needs_decision rather than
+            # risk a duplicate paid dispatch; never re-submit automatically.
+            stale_arbiter = await repo.list_stale_arbiter_dispatching(
+                db, config.ARBITER_DISPATCH_GRACE_MINUTES
+            )
+            for row in stale_arbiter:
+                task = dict(row)
+                await repo.add_task_update(
+                    db,
+                    task["id"],
+                    "hub",
+                    "alert",
+                    "Arbiter dispatch ambiguous: submit started but no job id "
+                    "recorded. Manual decision required.",
+                )
+                await repo.update_task(
+                    db, task["id"], status="needs_decision", arbiter_state="finished"
+                )
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "arbiter_dispatch_ambiguous"},
+                )
+                await db.commit()
+                log.warning(
+                    "Poll: task #%d arbiter dispatch ambiguous → needs_decision",
+                    task["id"],
+                )
+
             # Events feed retention (#349): the feed is a notification
             # channel, not an archive — activity_log keeps the history.
             pruned = await repo.prune_events(db, keep_days=14)

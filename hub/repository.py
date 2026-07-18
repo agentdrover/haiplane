@@ -915,6 +915,60 @@ async def list_expired_claims(
     )
 
 
+async def claim_arbiter_dispatch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+) -> bool:
+    """Conditionally claim an arbiter dispatch for a submission generation (#421).
+
+    Returns ``True`` only if no active marker already exists for this
+    generation — the claim is a single atomic UPDATE that sets state
+    ``dispatching`` and the dispatch clock BEFORE any external submit, so a
+    repeat poll or a restart finds the marker and does not dispatch again.
+    A newer submission generation does not match the old marker, so it opens a
+    fresh window. The caller must commit before the external side effect.
+    """
+    # Positive form so SQL three-valued logic on NULL columns still matches on
+    # the first claim: succeed when there is no ACTIVE marker for this exact
+    # generation (different generation, or a non-active/NULL state).
+    cur = await db.execute(
+        "UPDATE tasks SET arbiter_state='dispatching', arbiter_generation=?, "
+        "arbiter_job_id=NULL, arbiter_dispatch_at=datetime('now') "
+        "WHERE id=? AND ("
+        "arbiter_generation IS NULL OR arbiter_generation != ? "
+        "OR arbiter_state IS NULL "
+        "OR arbiter_state NOT IN ('dispatching', 'running', 'finished'))",
+        (generation, task_id, generation),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+async def mark_arbiter_running(
+    db: aiosqlite.Connection,
+    task_id: int,
+    arbiter_job_id: str,
+) -> None:
+    """Record the arbiter job id and move the marker to ``running`` (#421)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state='running', arbiter_job_id=? WHERE id=?",
+        (arbiter_job_id, task_id),
+    )
+
+
+async def list_stale_arbiter_dispatching(
+    db: aiosqlite.Connection,
+    threshold_minutes: int,
+) -> list[aiosqlite.Row]:
+    """Tasks stuck mid-dispatch (submit started, no job id) past the grace (#421)."""
+    return await db.execute_fetchall(
+        "SELECT * FROM tasks WHERE archived=0 AND arbiter_state='dispatching' "
+        "AND arbiter_job_id IS NULL AND arbiter_dispatch_at IS NOT NULL "
+        "AND arbiter_dispatch_at < datetime('now', ?)",
+        (f"-{threshold_minutes} minutes",),
+    )
+
+
 async def list_past_status_deadline(
     db: aiosqlite.Connection,
     status: str,

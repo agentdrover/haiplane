@@ -58,6 +58,12 @@ REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
 
 ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
 ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
+# At-most-once arbiter dispatch (#421): if the marker sits in 'dispatching'
+# (submit started, job id never recorded — a crash window) past this grace, the
+# task fails safe to needs_decision rather than risk a duplicate paid dispatch.
+ARBITER_DISPATCH_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_ARBITER_DISPATCH_GRACE_MINUTES", "15")
+)
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
 # Stale watchdog (#319): silent dead-end statuses get their own, longer

@@ -725,10 +725,30 @@ async def dispatch_arbiter(
     task: dict[str, Any],
     updates_list: list[dict[str, Any]],
 ) -> None:
-    """Dispatch an arbiter (Claude Sonnet) when review cycle limit is reached."""
-    task_id = task["id"]
-    review_cycle = task.get("review_cycle", 0)
+    """Dispatch an arbiter (Claude Sonnet) when review cycle limit is reached.
 
+    At-most-once per submission generation (#421): a conditional claim persists
+    a ``dispatching`` marker BEFORE the external submit, so a repeat poll or a
+    restart finds it and never dispatches a second paid job. The marker moves to
+    ``running`` with the job id on success; a crash between submit and job id
+    leaves ``dispatching`` for the poller's ambiguity watchdog to resolve.
+    """
+    task_id = task["id"]
+    generation = task.get("submission_generation") or 0
+
+    claimed = await repo.claim_arbiter_dispatch(db, task_id, generation)
+    if not claimed:
+        await db.commit()
+        log.info(
+            "Poll: task #%d arbiter already claimed for generation %d, skipping",
+            task_id,
+            generation,
+        )
+        return
+    # The marker must be durable before the external side effect.
+    await db.commit()
+
+    review_cycle = task.get("review_cycle", 0)
     review_history = [
         u
         for u in updates_list
@@ -767,17 +787,23 @@ async def dispatch_arbiter(
     )
     arbiter_job_id = result.get("job_id")
     if arbiter_job_id:
+        await repo.mark_arbiter_running(db, task_id, arbiter_job_id)
         await repo.update_task(
             db, task_id, status="review", review_job_id=arbiter_job_id
         )
         log.info("Poll: task #%d → arbiter review (job=%s)", task_id, arbiter_job_id)
     else:
+        # A definite submit failure (the call returned, no job id): finish the
+        # marker and escalate. Do not leave it dispatching — that is only for
+        # the crash window where the call never returned.
         log.warning(
             "Poll: failed to dispatch arbiter for task #%d: %s",
             task_id,
             result.get("error"),
         )
-        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.update_task(
+            db, task_id, status="needs_decision", arbiter_state="finished"
+        )
         await repo.insert_event(
             db,
             kind="needs_decision",
