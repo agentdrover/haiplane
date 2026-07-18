@@ -1,4 +1,4 @@
-{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + stale_tasks|length %}
+{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
 <div class="inbox-filter-bar">
@@ -38,6 +38,15 @@
         Proposals <span class="inbox-count">{{ drafts|length }}</span>
     </summary>
     <div class="inbox-proposals-body">
+    <div class="inbox-item-actions inbox-batch-actions">
+        <button class="btn btn-success btn-xs"
+                hx-post="/tasks/web-batch-approve-ready"
+                hx-target="#inbox-proposals"
+                hx-swap="outerHTML"
+                hx-confirm="Approve all DoR-ready drafts without high risks?">
+            Approve ready ({{ drafts|selectattr('dor_passed')|list|length }})
+        </button>
+    </div>
     {% for t in drafts %}
     <article class="inbox-item" id="inbox-task-{{ t.id }}">
         <div class="inbox-item-header">
@@ -49,6 +58,18 @@
         {% if t.assigned_agent %}
         <div class="inbox-item-meta">from {{ t.assigned_agent }}</div>
         {% endif %}
+        <div class="inbox-item-meta inbox-draft-rank">
+            {% if t.dor_passed %}
+            <span class="badge badge-completed">ready · score {{ t.readiness_score }}</span>
+            {% elif t.readiness_score is not none %}
+            <span class="badge badge-draft">score {{ t.readiness_score }}</span>
+            {% else %}
+            <span class="badge badge-draft">not refined</span>
+            {% endif %}
+            {% for r in t.risks %}{% if r.severity.value == 'high' %}<span class="badge badge-failed">high risk</span>{% endif %}{% endfor %}
+            {% if t.prepared_by %}<span class="inbox-item-meta">prep: {{ t.prepared_by }}</span>{% endif %}
+            <span class="inbox-item-meta">{{ t.created_at[:10] }}</span>
+        </div>
         {% if t.description %}
         <div class="inbox-item-desc">{{ t.description[:120] }}{% if t.description|length > 120 %}…{% endif %}</div>
         {% endif %}
@@ -148,6 +169,62 @@
         <div class="inbox-item-desc">Job finished — agent must submit a done report to complete this task.</div>
         <div class="inbox-item-actions">
             <a href="/tasks/{{ t.id }}" class="btn btn-primary btn-xs">View &amp; Report</a>
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-force-complete"
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-prompt="Reason for force-completing #{{ t.id }} (recorded in audit trail):">Force Complete</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if ci_check_tasks %}
+<section class="inbox-group inbox-ci-check">
+    <h3 class="inbox-group-title">
+        ⚙ CI Check <span class="inbox-count inbox-count-warn">{{ ci_check_tasks|length }}</span>
+    </h3>
+    {% for t in ci_check_tasks %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-ci_check">ci check</span>
+        </div>
+        {% if t.assigned_agent %}
+        <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
+        {% endif %}
+        <div class="inbox-item-desc">Waiting on the CI conveyor — inspect the PR/CI if it has stalled.</div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ t.id }}" class="btn btn-primary btn-xs">View</a>
+            <button class="btn btn-success btn-xs"
+                    hx-post="/tasks/{{ t.id }}/web-force-complete"
+                    hx-target="#inbox-task-{{ t.id }}"
+                    hx-swap="outerHTML"
+                    hx-prompt="Reason for force-completing #{{ t.id }} (recorded in audit trail):">Force Complete</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if fix_requested_tasks %}
+<section class="inbox-group inbox-fix-requested">
+    <h3 class="inbox-group-title">
+        ✎ Fix Requested <span class="inbox-count inbox-count-warn">{{ fix_requested_tasks|length }}</span>
+    </h3>
+    {% for t in fix_requested_tasks %}
+    <article class="inbox-item" id="inbox-task-{{ t.id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-fix_requested">fix requested</span>
+        </div>
+        {% if t.assigned_agent %}
+        <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
+        {% endif %}
+        <div class="inbox-item-desc">Fix dispatch in flight — inspect the job if it has stalled.</div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ t.id }}" class="btn btn-primary btn-xs">View</a>
             <button class="btn btn-success btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-force-complete"
                     hx-target="#inbox-task-{{ t.id }}"

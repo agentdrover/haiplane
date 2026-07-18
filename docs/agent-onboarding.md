@@ -92,6 +92,9 @@ stateDiagram-v2
 
 - Токен для Cursor лежит на сервере: `~/openclaw-hub-cursor-token.txt`
   (только наличие проверяй, **в чат токены не печатай**).
+- Каждый ответ MCP-инструмента содержит поля **`instance`** (`prod`|`local`) и
+  **`base_url`** (значение `OPENCLAW_HUB_URL` на сервере). Для JSON-ответов парси
+  `json.loads(result)`; для mutation-envelope поля рядом с `status`/`awaiting`.
 
 ---
 
@@ -157,6 +160,25 @@ curl -sS \
 8. **Не закрывай задачу** при падающем CI, неразрешённом блокере или запрошенных
    правках ревью. Используй `hub_decide_task` или человеческий гейт.
 
+> **Resubmit-цикл:** `review` → `changes_requested` → `running` → правки в
+> **той же ветке** → `hub_submit_for_review` → повторное ревью. Ревью видит
+> только новый сабмишен; прежние вердикты и отчёты протухают автоматически.
+> Подробности: `docs/repository-rules.md` («Жизненный цикл ветки задачи»).
+
+### Цикл ревью и маршрутизация находок
+
+Каждая находка ревью имеет scope (`in_scope`|`out_of_scope`, #435) и
+закрывается ровно одним маршрутом:
+
+- **in-scope** → вердикт `changes_requested` + фикс в той же ветке +
+  resubmit **той же задачи** (resubmit-цикл выше);
+- **out-of-scope** → отдельная задача (`hub_propose_task`) + ссылка
+  `linked_task_id` в находке вердикта; вердикт при этом не блокируется.
+
+Маршруты не смешивать: **не заводи параллельные задачи на in-scope
+находки** — это ломает порядок merge (инцидент #392). Правило целиком:
+`docs/repository-rules.md` («Цикл ревью и маршрутизация находок»).
+
 ---
 
 ## 5. Два пути исполнения после approve
@@ -182,6 +204,9 @@ curl -sS \
 - **Ветки задач:** `task-<hub-id>/<short-slug>` от `develop`, merge обратно в
   `develop`. Без задачи — `fix/<slug>` или `chore/<slug>`.
 - **Одна задача — одна ветка.** Не смешивай несвязанные изменения.
+- **Не базируй новую task-ветку на невлитой ветке на ревью** — только от
+  актуального `develop`. Правки после `changes_requested` — в той же ветке +
+  `hub_submit_for_review` (см. `docs/repository-rules.md`).
 - **Push явным именем ветки**, не `HEAD`.
 - После pair-start сверь `tasks.branch` в hub с `git branch --show-current`.
 - **Merge в `main` = релиз и автодеплой.** Сначала `develop`, в `main` —
@@ -198,6 +223,70 @@ curl -sS \
 - **Решение после арбитража:** `hub_decide_task`.
 
 Агент не имитирует человеческий гейт и не «дожимает» статус сам.
+
+### Reviewer-идентичность: не ревьюй под токеном исполнителя (#432)
+
+Universal Review Gate сравнивает **принципалов**, а не тип токена: вердикт
+(`hub_submit_review` / `POST /api/tasks/{id}/review-verdict`) от той же
+идентичности, что делала `hub_pair_start`/`hub_claim_task`, отклоняется с
+403 `self_review_forbidden`. Сравнение идёт по `principal_id` (DB-токены),
+для env-токенов — по имени против `assigned_agent`/`claimed_by`. Поэтому
+один токен `cursor` на «имплементацию + ревью» стопорит цикл ревью.
+
+Решение — вторая агентская идентичность в `OPENCLAW_HUB_TOKENS` (код менять
+не нужно, поддерживается любое число токенов):
+
+```bash
+# .env.local / /etc/openclaw-hub/openclaw-hub.env — только плейсхолдеры!
+OPENCLAW_HUB_TOKENS=you:your-human-token:human,cursor:your-agent-token:agent,cursor-reviewer:your-reviewer-token:agent
+```
+
+Требования к reviewer-токену:
+
+- роль `agent` (третье поле), **имя отличается** от исполнителя;
+- значение токена уникально (токен — ключ словаря идентичностей);
+- секрет генерируй локально (`openssl rand -hex 32`), в git и чат не печатай.
+
+Передача ревью другой идентичности (оркестратор): у MCP/CLI-клиента hub
+токен берётся из `OPENCLAW_HUB_TOKEN`. Reviewer-сессия (отдельный агент,
+subagent или профиль MCP-сервера) запускается с reviewer-токеном:
+
+```bash
+# сессия исполнителя
+OPENCLAW_HUB_TOKEN=your-agent-token      # identity: cursor
+# сессия ревьюера — другой env-профиль / MCP-конфиг
+OPENCLAW_HUB_TOKEN=your-reviewer-token   # identity: cursor-reviewer
+```
+
+Проверить, кто ты сейчас: `hub_admin_my_identity`. Solo-режим без второго
+токена — явный opt-out `OPENCLAW_REVIEW_SELF_APPROVE=allow` (не для прода).
+Роли: `agents/python-senior-developer.md` (исполнитель) и
+`agents/code-reviewer.md` (ревьюер).
+
+### Соло-режим: `OPENCLAW_REVIEW_SELF_APPROVE`
+
+Universal Review Gate требует независимого ревьюера: агент, который
+реализовал задачу (`assigned_agent`/`claimed_by`/principal), не может сам
+принять вердикт. `OPENCLAW_REVIEW_SELF_APPROVE=allow` — осознанное
+ослабление гейта для соло-работы. Допустимо: локальная разработка в
+одиночку (один человек + один агент, второго агента-ревьюера нет),
+прототипы, личные стенды. Недопустимо: общий/продакшн-инстанс с
+несколькими агентами и задачи с высоким риском — там держи дефолт
+`forbid`.
+
+Риск: вердикт перестаёт быть независимым — слепые зоны исполнителя
+проходят ревью без второй пары глаз. Поэтому ослабленный гейт всегда
+аудируется (#434):
+
+- вердикт помечается `latest_review.self_approved=true` (REST/MCP);
+- в task update дописывается `[self-approved: solo mode, ...]`;
+- сервер пишет WARNING в лог;
+- Web показывает бейдж `self-approved` рядом с вердиктом;
+- `hub_task_status` и review brief выводят
+  `[SELF-APPROVED: solo mode, not independent]`.
+
+Семантика флага не меняется: `allow` по-прежнему пропускает вердикт —
+он просто больше не выглядит как независимый.
 
 ---
 
@@ -287,8 +376,12 @@ curl -sS \
 - `hub_task_update` — статус/блокер/отчёт
 - `hub_ask_question` / `hub_answer_question`
 - `hub_report_done`
-- `hub_force_complete_task` — человеческий override; работает из
-  `pending_report`, `claimed` и pair-`running` (без job)
+- `hub_force_complete_task` — human-only audited override; completes any
+  non-terminal ``task``/``subtask`` when no active dispatch job backs
+  ``job_id`` or ``review_job_id`` (409 if active). Missing/terminal jobs are
+  audited. Non-empty comment required for active lifecycle states except
+  ``pending_report``/``claimed``. Rejects terminal tasks and epic/feature
+  rows with incomplete descendants. See ``docs/agent-context/invariants.md``.
 - `hub_decide_task` (решение после арбитража)
 - `hub_archive_task` / `hub_unarchive_task` / `hub_delete_task`
 

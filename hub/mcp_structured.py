@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 from mcp.types import CallToolResult, TextContent
+
+from hub.hub_instance import with_instance_echo
 
 MCP_STRUCTURED_SCHEMA_VERSION = "1"
 
@@ -56,9 +59,29 @@ HubReadinessTreeResult = Annotated[CallToolResult, HubReadinessTreeStructured]
 HubTaskStatusResult = Annotated[CallToolResult, HubTaskStatusStructured]
 
 
+def structured_echo_result(summary: str, **payload: Any) -> CallToolResult:
+    """Read-tool result (#248): human-readable text plus structuredContent
+    carrying the machine payload as a real object — no JSON-inside-JSON.
+    The text part keeps the {"message": ...} echo shape for backward
+    compatibility with clients that parse it."""
+    data = with_instance_echo(
+        {"schema_version": MCP_STRUCTURED_SCHEMA_VERSION, **payload}
+    )
+    echo_text = json.dumps(with_instance_echo({"message": summary}), ensure_ascii=False)
+    return CallToolResult(
+        content=[TextContent(type="text", text=echo_text)],
+        structuredContent=data,
+    )
+
+
 def structured_tool_result(summary: str, payload: BaseModel) -> CallToolResult:
     """Return MCP CallToolResult with human text and machine-readable structuredContent."""
+    data = with_instance_echo(payload.model_dump(mode="json"))
+    echo_text = json.dumps(
+        with_instance_echo({"message": summary}),
+        ensure_ascii=False,
+    )
     return CallToolResult(
-        content=[TextContent(type="text", text=summary)],
-        structuredContent=payload.model_dump(mode="json"),
+        content=[TextContent(type="text", text=echo_text)],
+        structuredContent=data,
     )

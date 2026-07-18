@@ -41,7 +41,10 @@ def normalize_task_create(body: TaskCreate) -> tuple[str, TaskCreate]:
     """Apply the same lifecycle normalizations used before insert."""
     normalized = body.model_copy(deep=True)
     if normalized.task_type in (TaskType.epic, TaskType.feature):
-        initial_status = "open"
+        # Agents PROPOSE features/epics as drafts (#323) — the human approval
+        # gate owns the decomposition. Human-created ones stay open (the
+        # pre-#323 invariant, now scoped to source=human).
+        initial_status = "draft" if normalized.source == TaskSource.agent else "open"
         normalized.run_immediately = False
         normalized.auto_review = False
     elif normalized.source == TaskSource.agent:

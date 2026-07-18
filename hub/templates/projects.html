@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% set active = "projects" %}
+{% block title %}Projects — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Projects</h1>
+</header>
+
+{% if project_error %}
+<div class="task-action-note task-action-note--warning project-error-note">
+    {{ project_error }}
+</div>
+{% endif %}
+
+<details class="task-action-stack project-create">
+    <summary class="btn btn-primary">+ New Project</summary>
+    <form method="post" action="/projects/web-create" class="task-action-stack project-form">
+        <label class="task-action-label" for="np-slug">Slug (a-z, 0-9, dashes)</label>
+        <input id="np-slug" name="slug" class="task-action-control" required pattern="[a-z0-9][a-z0-9-]*" placeholder="calc-kids">
+        <label class="task-action-label" for="np-name">Name</label>
+        <input id="np-name" name="name" class="task-action-control" required placeholder="Calc Kids">
+        <label class="task-action-label" for="np-repo">Repo (owner/repo)</label>
+        <input id="np-repo" name="repo" class="task-action-control" placeholder="mrPDA/calc-kids">
+        <label class="task-action-label" for="np-workspace">Workspace path</label>
+        <input id="np-workspace" name="workspace_path" class="task-action-control" placeholder="/srv/workspaces/calc-kids">
+        <label class="task-action-label" for="np-branch">Default branch</label>
+        <input id="np-branch" name="default_branch" class="task-action-control" value="develop">
+        <label class="task-action-label" for="np-policy">Branch policy (JSON, optional)</label>
+        <textarea id="np-policy" name="default_branch_policy" class="task-action-control task-action-textarea" placeholder='{"release_base": "main"}'></textarea>
+        <button class="btn btn-success task-action-btn" type="submit">Create Project</button>
+    </form>
+</details>
+
+<table class="task-table">
+    <thead>
+        <tr><th>Slug</th><th>Name</th><th>Repo</th><th>Base branch</th><th>Workspace</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody>
+        {% for p in projects %}
+        <tr>
+            <td><a href="/tasks?project={{ p.slug }}">{{ p.slug }}</a></td>
+            <td>{{ p.name }}</td>
+            <td>{{ p.repo or '—' }}</td>
+            <td>{{ p.default_branch }}</td>
+            <td>{{ p.workspace_path or '—' }}</td>
+            <td>
+                {% if p.archived %}<span class="badge badge-failed">archived</span>
+                {% elif p.status == 'pending' %}<span class="badge badge-review">pending</span>
+                {% else %}<span class="badge badge-completed">active</span>{% endif %}
+                {% if p.provision_status == 'ok' %}
+                <span class="badge badge-completed" title="{{ p.provision_detail }}">ws&nbsp;ok</span>
+                {% elif p.provision_status == 'error' %}
+                <span class="badge badge-failed" title="{{ p.provision_detail }}">ws&nbsp;error</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if p.repo and not p.archived %}
+                <form method="post" action="/projects/{{ p.id }}/web-provision" class="project-inline-form">
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Клонировать/проверить workspace проекта {{ p.slug }}?')">Provision</button>
+                </form>
+                {% endif %}
+                {% if p.status == 'pending' and not p.archived %}
+                <form method="post" action="/projects/{{ p.id }}/web-activate" class="project-inline-form">
+                    <button class="btn btn-success" type="submit"
+                            onclick="return confirm('Активировать проект {{ p.slug }}? Он попадёт в git-маршрутизацию.')">Activate</button>
+                </form>
+                {% endif %}
+                {% if p.slug != 'default' %}
+                <form method="post" action="/projects/{{ p.id }}/web-archive" class="project-inline-form">
+                    <input type="hidden" name="archived" value="{{ 'false' if p.archived else 'true' }}">
+                    <button class="btn btn-ghost" type="submit"
+                            onclick="return confirm('{{ 'Разархивировать' if p.archived else 'Архивировать' }} проект {{ p.slug }}?')">
+                        {{ 'Unarchive' if p.archived else 'Archive' }}
+                    </button>
+                </form>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td colspan="7" class="project-edit-cell">
+                <details>
+                    <summary class="project-edit-summary">edit</summary>
+                    <form method="post" action="/projects/{{ p.id }}/web-edit" class="task-action-stack project-form">
+                        <label class="task-action-label">Name</label>
+                        <input name="name" class="task-action-control" value="{{ p.name }}">
+                        <label class="task-action-label">Repo (owner/repo)</label>
+                        <input name="repo" class="task-action-control" value="{{ p.repo }}">
+                        <label class="task-action-label">Workspace path</label>
+                        <input name="workspace_path" class="task-action-control" value="{{ p.workspace_path }}">
+                        <label class="task-action-label">Default branch</label>
+                        <input name="default_branch" class="task-action-control" value="{{ p.default_branch }}">
+                        <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
+                        <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ p.default_branch_policy if p.default_branch_policy and p.default_branch_policy != '{}' else '' }}</textarea>
+                        <button class="btn btn-primary task-action-btn" type="submit">Save</button>
+                    </form>
+                </details>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

@@ -200,6 +200,8 @@ def _cmd_create_typed(task_type: str) -> Any:
             body["human_owner"] = args.owner
         if getattr(args, "reviewer", None):
             body["human_reviewer"] = args.reviewer
+        if getattr(args, "project", None):
+            body["project"] = args.project
         result = _api("POST", "/api/tasks", body)
         _print_json(result)
         return 0
@@ -208,7 +210,15 @@ def _cmd_create_typed(task_type: str) -> Any:
 
 
 def cmd_tree(args: argparse.Namespace) -> int:
-    result = _api("GET", f"/api/tasks/{args.task_id}/tree")
+    params: dict[str, str] = {}
+    if getattr(args, "depth", None) is not None:
+        params["depth"] = str(args.depth)
+    if getattr(args, "max_nodes", None) is not None:
+        params["max_nodes"] = str(args.max_nodes)
+    if getattr(args, "mode", "full") != "full":
+        params["mode"] = args.mode
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/tasks/{args.task_id}/tree{query}")
     _print_tree(result, indent=0)
     return 0
 
@@ -229,7 +239,13 @@ def _print_tree(node: dict[str, Any], indent: int = 0) -> None:
 
 
 def cmd_context(args: argparse.Namespace) -> int:
-    result = _api("GET", f"/api/tasks/{args.task_id}/context")
+    params: dict[str, str] = {}
+    if getattr(args, "max_chars", None) is not None:
+        params["max_chars"] = str(args.max_chars)
+    if getattr(args, "mode", "full") != "full":
+        params["mode"] = args.mode
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/tasks/{args.task_id}/context{query}")
     print(result.get("context_text", ""))
     return 0
 
@@ -289,6 +305,78 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
     if getattr(args, "branch_slug", None):
         body["branch_slug"] = args.branch_slug
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_projects_list(args: argparse.Namespace) -> int:
+    query = "?include_archived=true" if args.include_archived else ""
+    result = _api("GET", f"/api/projects{query}")
+    _print_json(result)
+    return 0
+
+
+def cmd_projects_create(args: argparse.Namespace) -> int:
+    body = {
+        "slug": args.slug,
+        "name": args.name,
+        "repo": args.repo,
+        "workspace_path": args.workspace_path,
+        "default_branch": args.default_branch,
+    }
+    result = _api("POST", "/api/projects", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_approve_batch(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "task_ids": args.task_ids,
+        "require_dor_passed": not args.no_require_dor,
+        "exclude_high_risks": not args.allow_high_risks,
+    }
+    if args.min_readiness is not None:
+        body["min_readiness"] = args.min_readiness
+    if args.comment:
+        body["comment"] = args.comment
+    result = _api("POST", "/api/tasks/batch-approve", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_submit_review(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {}
+    if args.agent:
+        body["agent"] = args.agent
+    if args.summary:
+        body["summary"] = args.summary
+    result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
+    _print_json(result)
+    return 0
+
+
+def cmd_review_brief(args: argparse.Namespace) -> int:
+    result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
+    _print_json(result)
+    return 0
+
+
+def cmd_review_verdict(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {"verdict": args.verdict}
+    if args.comments:
+        body["comments"] = args.comments
+    if args.agent:
+        body["agent"] = args.agent
+    if args.findings_json:
+        try:
+            findings = json.loads(args.findings_json)
+        except json.JSONDecodeError as exc:
+            print(f"invalid --findings-json: {exc}", file=sys.stderr)
+            return 2
+        body["findings"] = findings
+    if getattr(args, "create_tasks_for_out_of_scope", False):
+        body["create_tasks_for_out_of_scope"] = True
+    result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0
 
@@ -414,6 +502,12 @@ def cmd_archive(args: argparse.Namespace) -> int:
         f"/api/tasks/{args.task_id}/archive",
         {"cascade": cascade},
     )
+    _print_json(result)
+    return 0
+
+
+def cmd_withdraw(args: argparse.Namespace) -> int:
+    result = _api("POST", f"/api/tasks/{args.task_id}/withdraw")
     _print_json(result)
     return 0
 
@@ -1001,6 +1095,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_epic.add_argument("--owner", default="", help="Human owner")
     p_epic.add_argument("--reviewer", default="", help="Human reviewer")
+    p_epic.add_argument(
+        "--project", default=None, help="Project slug to attach the epic to"
+    )
     p_epic.set_defaults(func=_cmd_create_typed("epic"))
 
     # feature — create a feature under an epic
@@ -1054,6 +1151,14 @@ def build_parser() -> argparse.ArgumentParser:
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
     p_tree.add_argument("task_id", type=int)
+    p_tree.add_argument("--depth", type=int, default=None, help="Max depth from root")
+    p_tree.add_argument("--max-nodes", dest="max_nodes", type=int, default=None)
+    p_tree.add_argument(
+        "--mode",
+        choices=["full", "summary"],
+        default="full",
+        help="summary applies depth=2 and max_nodes=50 by default",
+    )
     p_tree.set_defaults(func=cmd_tree)
 
     # context — get agent work context
@@ -1061,6 +1166,13 @@ def build_parser() -> argparse.ArgumentParser:
         "context", help="Get full work context (breadcrumb, siblings, progress)"
     )
     p_context.add_argument("task_id", type=int)
+    p_context.add_argument("--max-chars", dest="max_chars", type=int, default=None)
+    p_context.add_argument(
+        "--mode",
+        choices=["full", "summary"],
+        default="full",
+        help="summary caps digest to 4000 chars unless --max-chars is set",
+    )
     p_context.set_defaults(func=cmd_context)
 
     # propose — agent proposes a task (creates draft)
@@ -1122,6 +1234,88 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
+    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
+    pp_list = projects_sub.add_parser("list", help="List projects")
+    pp_list.add_argument(
+        "--include-archived", dest="include_archived", action="store_true"
+    )
+    pp_list.set_defaults(func=cmd_projects_list)
+    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
+    pp_create.add_argument("slug")
+    pp_create.add_argument("--name", required=True)
+    pp_create.add_argument("--repo", default="")
+    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
+    pp_create.add_argument("--default-branch", dest="default_branch", default="develop")
+    pp_create.set_defaults(func=cmd_projects_create)
+
+    p_approve_batch = sub.add_parser(
+        "approve-batch",
+        help="Approve many draft tasks with DoR/risk guards (human token)",
+    )
+    p_approve_batch.add_argument("task_ids", type=int, nargs="+")
+    p_approve_batch.add_argument(
+        "--min-readiness", dest="min_readiness", type=int, default=None
+    )
+    p_approve_batch.add_argument(
+        "--no-require-dor", dest="no_require_dor", action="store_true"
+    )
+    p_approve_batch.add_argument(
+        "--allow-high-risks", dest="allow_high_risks", action="store_true"
+    )
+    p_approve_batch.add_argument("--comment", default="")
+    p_approve_batch.set_defaults(func=cmd_approve_batch)
+
+    p_submit_review = sub.add_parser(
+        "submit-review",
+        help="Submit a running pair task for client-driven review (status=review)",
+    )
+    p_submit_review.add_argument("task_id", type=int)
+    p_submit_review.add_argument("--agent", default="", help="Submitting agent name")
+    p_submit_review.add_argument(
+        "--summary", default="", help="Short note on what is being submitted"
+    )
+    p_submit_review.set_defaults(func=cmd_submit_review)
+
+    p_review_brief = sub.add_parser(
+        "review-brief",
+        help="Get the full review brief (ACs, scope, validation, latest verdict)",
+    )
+    p_review_brief.add_argument("task_id", type=int)
+    p_review_brief.set_defaults(func=cmd_review_brief)
+
+    p_review_verdict = sub.add_parser(
+        "review-verdict",
+        help="Record a review verdict; never completes the task",
+    )
+    p_review_verdict.add_argument("task_id", type=int)
+    p_review_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
+    p_review_verdict.add_argument("--comments", default="", help="Review summary")
+    p_review_verdict.add_argument("--agent", default="", help="Reviewer agent name")
+    p_review_verdict.add_argument(
+        "--findings-json",
+        dest="findings_json",
+        default="",
+        help=(
+            "JSON list of findings: "
+            '[{"id":1,"severity":"high","message":"...",'
+            '"scope":"in_scope|out_of_scope","linked_task_id":123}]. '
+            "scope defaults to in_scope; changes_requested requires at "
+            "least one in_scope finding; linked_task_id references the "
+            "follow-up task for out_of_scope findings."
+        ),
+    )
+    p_review_verdict.add_argument(
+        "--create-tasks-for-out-of-scope",
+        dest="create_tasks_for_out_of_scope",
+        action="store_true",
+        help=(
+            "Auto-create DRAFT follow-up tasks for out_of_scope findings "
+            "without linked_task_id (#436); drafts still need human approval"
+        ),
+    )
+    p_review_verdict.set_defaults(func=cmd_review_verdict)
 
     p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
     p_claim.add_argument("task_id", type=int)
@@ -1256,7 +1450,11 @@ def build_parser() -> argparse.ArgumentParser:
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
         "force-complete",
-        help="Force-complete a stuck task (pending_report/claimed/pair-running) without a done report (audited human override)",
+        help=(
+            "Human-only override: complete non-terminal task/subtask without "
+            "active dispatch jobs (409 if job_id/review_job_id active); comment "
+            "required for most active lifecycle states"
+        ),
     )
     p_force_complete.add_argument("task_id", type=int)
     p_force_complete.add_argument(
@@ -1277,6 +1475,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archive only this task, not descendants",
     )
     p_archive.set_defaults(func=cmd_archive)
+
+    p_withdraw = sub.add_parser(
+        "withdraw",
+        help="Withdraw your own agent draft (agent token; no children)",
+    )
+    p_withdraw.add_argument("task_id", type=int)
+    p_withdraw.set_defaults(func=cmd_withdraw)
 
     p_unarchive = sub.add_parser(
         "unarchive",

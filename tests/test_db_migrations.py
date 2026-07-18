@@ -344,3 +344,167 @@ def test_deserialize_risks_drops_non_dict_items():
 def test_deserialize_risks_invalid_json_returns_empty():
     assert deserialize_risks("not-json") == []
     assert deserialize_risks('"some string"') == []
+
+
+async def test_review_generation_columns_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        gen = cols.get("submission_generation")
+        assert gen is not None
+        assert gen["notnull"] == 1
+        assert gen["dflt_value"] == "0"
+        verdict = cols.get("review_verdict")
+        assert verdict is not None
+        assert verdict["notnull"] == 0
+        verdict_gen = cols.get("review_verdict_generation")
+        assert verdict_gen is not None
+        assert verdict_gen["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_review_generation_defaults_for_existing_rows():
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (title, description, status) VALUES ('t', '', 'open')"
+        )
+        row = (
+            await conn.execute_fetchall(
+                "SELECT submission_generation, review_verdict, "
+                "review_verdict_generation FROM tasks"
+            )
+        )[0]
+        assert row["submission_generation"] == 0
+        assert row["review_verdict"] is None
+        assert row["review_verdict_generation"] is None
+    finally:
+        await conn.close()
+
+
+async def test_implementer_principal_id_column_present():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        col = cols.get("implementer_principal_id")
+        assert col is not None
+        assert col["notnull"] == 0  # nullable: legacy tasks use name fallback
+    finally:
+        await conn.close()
+
+
+async def test_projects_table_and_project_id_column():
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "projects")
+        for col in (
+            "slug",
+            "name",
+            "repo",
+            "workspace_path",
+            "default_branch",
+            "default_branch_policy",
+            "archived",
+        ):
+            assert col in cols, col
+        task_cols = await _table_columns(conn, "tasks")
+        assert "project_id" in task_cols
+        assert task_cols["project_id"]["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_seed_default_project_idempotent_and_backfills_epics():
+    from hub.db import seed_default_project
+
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (title, description, status, task_type) "
+            "VALUES ('E', '', 'open', 'epic')"
+        )
+        await conn.commit()
+        await seed_default_project(conn)
+        await seed_default_project(conn)  # idempotent
+
+        projects = await conn.execute_fetchall(
+            "SELECT id, slug FROM projects WHERE slug='default'"
+        )
+        assert len(projects) == 1
+        epics = await conn.execute_fetchall(
+            "SELECT project_id FROM tasks WHERE task_type='epic'"
+        )
+        assert all(e["project_id"] == projects[0]["id"] for e in epics)
+    finally:
+        await conn.close()
+
+
+# ---- Durable poller state (#416) ----
+
+
+async def test_durable_poller_columns_present_with_defaults():
+    # AC-1: a fresh database exposes the three durable columns with valid
+    # defaults — a NOT NULL zero retry budget and nullable clocks.
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        for name in (
+            "status_entered_at",
+            "ci_check_started_at",
+            "ci_no_pr_attempts",
+        ):
+            assert name in cols, f"missing column {name}"
+        assert cols["ci_no_pr_attempts"]["notnull"] == 1
+        assert cols["ci_no_pr_attempts"]["dflt_value"] == "0"
+        assert cols["status_entered_at"]["notnull"] == 0
+        assert cols["ci_check_started_at"]["notnull"] == 0
+    finally:
+        await conn.close()
+
+
+async def test_status_entered_at_backfilled_for_existing_rows(monkeypatch):
+    # AC-2: an existing database with active rows that predate the new columns
+    # gets safe defaults on migration — status is preserved, the retry budget
+    # starts at 0, and status_entered_at is backfilled to migration time so the
+    # row receives a full grace window, never an instant escalation.
+    from hub import db as db_module
+
+    original = list(db_module._MIGRATIONS)
+    new_names = {
+        "add_status_entered_at_column",
+        "add_ci_check_started_at_column",
+        "add_ci_no_pr_attempts_column",
+        "backfill_status_entered_at",
+    }
+    legacy = [m for m in original if m[0] not in new_names]
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", legacy)
+        await _migrate(conn)
+        cols = await _table_columns(conn, "tasks")
+        assert "status_entered_at" not in cols
+
+        await conn.execute(
+            "INSERT INTO tasks (title, description, status) "
+            "VALUES ('legacy', '', 'ci_check')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", original)
+        await _migrate(conn)
+
+        row = (
+            await conn.execute_fetchall(
+                "SELECT status, status_entered_at, ci_no_pr_attempts FROM tasks"
+            )
+        )[0]
+        assert row["status"] == "ci_check"
+        assert row["status_entered_at"] is not None
+        assert row["ci_no_pr_attempts"] == 0
+    finally:
+        await conn.close()

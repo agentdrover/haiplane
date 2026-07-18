@@ -6,9 +6,36 @@ Hub core depends only on these protocols, never on concrete implementations.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 import aiosqlite
+
+
+class CIProbeOutcome(str, Enum):
+    """Every observable result of probing a PR's CI checks (#419).
+
+    The old string return collapsed running checks, an empty check set, a gh
+    error and unparseable output all into ``pending`` — the single biggest
+    CI dead-end. These five outcomes keep them distinct so the poller can
+    branch on a typed value, never on free-form text.
+    """
+
+    passed = "pass"
+    failed = "fail"
+    pending = "pending"  # checks exist and are still running
+    absent = "absent"  # the PR has no checks at all → skip the conveyor
+    unavailable = "unavailable"  # gh error / invalid JSON / unknown state
+
+
+@dataclass(frozen=True)
+class CIProbeResult:
+    """A CI probe outcome plus a stable, machine-usable reason (#419)."""
+
+    outcome: CIProbeOutcome
+    reason: str
+    details: str | None = None
 
 
 @runtime_checkable
@@ -90,9 +117,32 @@ class DispatchPlugin(Protocol):
 @runtime_checkable
 class GitOpsPlugin(Protocol):
     async def current_branch(self, repo: str | None = None) -> str: ...
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool: ...
     async def create_branch(
         self, task_id: int, title: str, repo: str | None = None
     ) -> str: ...
+    async def pair_prepare_branch(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str: ...
+    async def pair_restore_workspace_base(
+        self,
+        task_id: int,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool: ...
     async def checkout(self, branch: str, repo: str | None = None) -> bool: ...
     async def auto_commit(
         self,
@@ -122,12 +172,23 @@ class GitOpsPlugin(Protocol):
         branch: str,
         max_log_chars: int = 4000,
         repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> dict[str, Any]: ...
-    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str: ...
+    async def check_pr_ci(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult: ...
     async def merge_pr(
-        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool: ...
     async def delete_branch(self, branch: str, repo: str | None = None) -> None: ...
+    async def clone_repo(
+        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+    ) -> tuple[bool, str]: ...
 
 
 @runtime_checkable

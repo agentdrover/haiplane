@@ -65,3 +65,64 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
   curl -sf http://127.0.0.1:8080/healthz
 '
 ```
+
+## Rollout note: Universal Review Gate (2026-07)
+
+С релиза эпика #300 (задачи #305–#311) хаб **сервером** требует ревью перед
+завершением: `hub_report_done` остаётся совместимой точкой входа, но в
+pair/client-флоу его результат изменился — без APPROVED-вердикта для текущего
+сабмишена задача уходит в `review` (client-driven) или `ci_check`, а не в
+`completed`. Клиенты, ожидавшие немедленного `completed`, должны читать
+envelope ответа:
+
+```json
+{
+  "status": "review",
+  "awaiting": "review",
+  "actor_hint": "agent",
+  "next_action": "Obtain a review verdict: reviewer runs hub_get_review_brief and hub_submit_review; after APPROVED, report done again."
+}
+```
+
+Откат этого поведения — только откатом релиза (см. выше): конфиг-флага нет,
+гейт — инвариант жизненного цикла. Явный опт-аут на уровне задачи —
+`auto_review=false`; human overrides (`hub_decide_task` accept,
+`hub_force_complete_task`) работают и аудируются.
+
+## Git-доступ workspace (провижининг проектов, #347/#348)
+
+Хаб клонирует workspace проектов сам (`POST /api/projects/{id}/provision`,
+кнопка **Provision** на `/projects`, MCP `hub_provision_project`). Для этого
+пользователю, под которым работает сервис хаба, нужен git-доступ к репозиторию
+проекта. **Публичные репозитории читаются анонимно по https — настройка не
+нужна** (#377: короткая форма `owner/repo` сначала пробует https, затем ssh).
+Для приватных — один из двух вариантов:
+
+1. **Deploy key (рекомендуется для приватных репо):** ssh-ключ
+   `~/.ssh/id_ed25519` пользователя сервиса добавлен как Deploy key
+   репозитория (read-only достаточно). `git_ops` подхватывает его
+   автоматически через `GIT_SSH_COMMAND`.
+2. **gh auth:** `gh auth login` под пользователем сервиса (тогда repo можно
+   указывать как `owner/repo`, https-доступ пойдёт через gh-креды).
+
+Проверочная команда (под пользователем сервиса):
+
+```bash
+sudo -u <svc-user> git ls-remote git@github.com:<owner>/<repo>.git HEAD
+```
+
+Именно её эквивалент хаб выполняет перед клоном: если доступа нет, провижининг
+вернёт `provision_status=error` с текстом ошибки ls-remote — это штатная
+диагностика, а не падение.
+
+Онбординг проекта за минуту: создать проект на `/projects` (repo +
+workspace path) → провижининг стартует автоматически (или кнопкой
+Provision) → привязать эпик (`project` при создании эпика, #346) — задачи
+проекта едут по его репозиторию и веткам.
+
+### OPENCLAW_WORKSPACE_REPO (#378)
+
+Нужен ТОЛЬКО для pair-конвейера задач default-проекта (подготовка веток на
+сервере). Провижининг проектов и git-операции проектных workspace работают
+без него. Если переменная не указывает на git-клон, pair_start для
+default-задач вернёт читаемую 422-ошибку с подсказкой.

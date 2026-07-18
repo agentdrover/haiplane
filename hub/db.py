@@ -354,6 +354,200 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN claim_session_id TEXT",
     ),
     ("add_claimed_at_column", "ALTER TABLE tasks ADD COLUMN claimed_at TEXT"),
+    # ---- Universal Review Gate (#305): review submission generations ----
+    (
+        "add_submission_generation_column",
+        "ALTER TABLE tasks ADD COLUMN submission_generation INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "add_review_verdict_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict TEXT",
+    ),
+    (
+        "add_review_verdict_generation_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_generation INTEGER",
+    ),
+    # ---- Universal Review Gate (#308): structured findings of the latest verdict
+    (
+        "add_review_findings_column",
+        "ALTER TABLE tasks ADD COLUMN review_findings TEXT NOT NULL DEFAULT '[]'",
+    ),
+    # ---- Projects V1.1 (#335): multi-project foundation ----
+    (
+        "create_projects_table",
+        """CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            repo TEXT NOT NULL DEFAULT '',
+            workspace_path TEXT NOT NULL DEFAULT '',
+            default_branch TEXT NOT NULL DEFAULT 'develop',
+            default_branch_policy TEXT NOT NULL DEFAULT '{}',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "add_tasks_project_id_column",
+        "ALTER TABLE tasks ADD COLUMN project_id INTEGER",
+    ),
+    (
+        "idx_tasks_project_id",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)",
+    ),
+    (
+        "add_projects_status_column",
+        "ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    ),
+    # ---- Separation of duties (#320): implementer identity as a principal.
+    # Plain INTEGER on purpose (no FK): the value is an identity snapshot for
+    # the self-review comparison, and it must survive principal deletion and
+    # non-DB token sources without integrity errors.
+    (
+        "add_implementer_principal_id_column",
+        "ALTER TABLE tasks ADD COLUMN implementer_principal_id INTEGER",
+    ),
+    # ---- Events feed (#349): typed, cursor-addressable transition events.
+    # task_id/project_id are plain INTEGERs (no FK) for the same snapshot
+    # semantics as implementer_principal_id: an event must outlive its task.
+    (
+        "create_events_table",
+        "CREATE TABLE IF NOT EXISTS events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "kind TEXT NOT NULL, "
+        "task_id INTEGER, "
+        "project_id INTEGER, "
+        "actor TEXT NOT NULL DEFAULT '', "
+        "payload TEXT NOT NULL DEFAULT '{}', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    ),
+    (
+        "idx_events_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
+    ),
+    # ---- Skills library (#380): versioned prompts/checklists for agents.
+    # Every INSERT is a new (name, version) row; the live one is the highest
+    # version with status='active' — history is immutable by construction.
+    (
+        "create_skills_table",
+        "CREATE TABLE IF NOT EXISTS skills ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "kind TEXT NOT NULL DEFAULT 'prompt', "
+        "version INTEGER NOT NULL, "
+        "content TEXT NOT NULL, "
+        "tags TEXT NOT NULL DEFAULT '[]', "
+        "project_id INTEGER, "
+        "status TEXT NOT NULL DEFAULT 'draft', "
+        "created_by TEXT NOT NULL DEFAULT '', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+        "UNIQUE(name, version))",
+    ),
+    (
+        "idx_skills_name_status",
+        "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
+    ),
+    # ---- Machine review policy (#382): project default + task override.
+    (
+        "add_projects_machine_review_column",
+        "ALTER TABLE projects ADD COLUMN machine_review TEXT NOT NULL DEFAULT 'auto'",
+    ),
+    (
+        "add_tasks_machine_review_override_column",
+        "ALTER TABLE tasks ADD COLUMN machine_review_override TEXT",
+    ),
+    # ---- Machine review reports (#381): structured multi-agent review
+    # outcomes bound to a submission generation; metrics fields (#384)
+    # are nullable — clients that can't count tokens still report.
+    (
+        "create_machine_reviews_table",
+        "CREATE TABLE IF NOT EXISTS machine_reviews ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "task_id INTEGER NOT NULL, "
+        "submission_generation INTEGER NOT NULL, "
+        "harness_skill TEXT NOT NULL DEFAULT '', "
+        "harness_version INTEGER, "
+        "agent_count INTEGER, "
+        "tokens_spent INTEGER, "
+        "duration_ms INTEGER, "
+        "orchestrator TEXT NOT NULL DEFAULT '', "
+        "model TEXT NOT NULL DEFAULT '', "
+        "raw_count INTEGER NOT NULL DEFAULT 0, "
+        "findings_confirmed TEXT NOT NULL DEFAULT '[]', "
+        "findings_rejected TEXT NOT NULL DEFAULT '[]', "
+        "submitted_by TEXT NOT NULL DEFAULT '', "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    ),
+    (
+        "idx_machine_reviews_task",
+        "CREATE INDEX IF NOT EXISTS idx_machine_reviews_task "
+        "ON machine_reviews(task_id, submission_generation)",
+    ),
+    # ---- Workspace provisioning (#347): clone state lives on the project.
+    (
+        "add_projects_provision_status_column",
+        "ALTER TABLE projects ADD COLUMN provision_status TEXT NOT NULL DEFAULT 'none'",
+    ),
+    (
+        "add_projects_provision_detail_column",
+        "ALTER TABLE projects ADD COLUMN provision_detail TEXT NOT NULL DEFAULT ''",
+    ),
+    # ---- Audited solo mode (#434): verdicts accepted only because of
+    # OPENCLAW_REVIEW_SELF_APPROVE=allow stay distinguishable in hindsight.
+    (
+        "add_review_self_approved_column",
+        "ALTER TABLE tasks ADD COLUMN review_self_approved INTEGER NOT NULL DEFAULT 0",
+    ),
+    # ---- Durable poller state (#416): orchestration clocks and CI retry
+    # budget move out of process memory into the row, so a hub restart no
+    # longer resets grace periods or retry counts. status_entered_at is the
+    # clock a status transition sets (F2 deadlines read it); ci_check_started_at
+    # replaces the in-memory push time; ci_no_pr_attempts replaces the
+    # in-memory retry counter. Existing rows get status_entered_at backfilled to
+    # migration time so they receive a full grace window, never an instant
+    # escalation.
+    (
+        "add_status_entered_at_column",
+        "ALTER TABLE tasks ADD COLUMN status_entered_at TEXT",
+    ),
+    (
+        "add_ci_check_started_at_column",
+        "ALTER TABLE tasks ADD COLUMN ci_check_started_at TEXT",
+    ),
+    (
+        "add_ci_no_pr_attempts_column",
+        "ALTER TABLE tasks ADD COLUMN ci_no_pr_attempts INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "backfill_status_entered_at",
+        "UPDATE tasks SET status_entered_at = datetime('now') "
+        "WHERE status_entered_at IS NULL",
+    ),
+    # ---- Bounded recovery for missing jobs (#417): the durable clock that
+    # marks when a headless dispatch/review job was first seen missing, so the
+    # grace-then-escalate decision survives a restart. NULL means the job is
+    # present (or the task is not headless).
+    (
+        "add_job_missing_since_column",
+        "ALTER TABLE tasks ADD COLUMN job_missing_since TEXT",
+    ),
+    # ---- At-most-once arbiter dispatch (#421): the arbiter fact used to be
+    # inferred from an agent-written update, so a repeat poll or restart could
+    # re-dispatch a paid arbiter job. These columns make the dispatch a durable
+    # conditional claim per submission generation: state dispatching→running→
+    # finished, with the job id and the dispatch clock. Existing rows start with
+    # NULL state (no arbiter in flight).
+    (
+        "add_arbiter_generation_column",
+        "ALTER TABLE tasks ADD COLUMN arbiter_generation INTEGER",
+    ),
+    ("add_arbiter_state_column", "ALTER TABLE tasks ADD COLUMN arbiter_state TEXT"),
+    ("add_arbiter_job_id_column", "ALTER TABLE tasks ADD COLUMN arbiter_job_id TEXT"),
+    (
+        "add_arbiter_dispatch_at_column",
+        "ALTER TABLE tasks ADD COLUMN arbiter_dispatch_at TEXT",
+    ),
     (
         "create_task_idempotency_keys_table",
         """
@@ -476,6 +670,10 @@ def structured_fields_to_db(
     out: dict[str, Any] = {}
     for key, value in data.items():
         if key == "acceptance_criteria":
+            continue
+        if key == "project":
+            # Virtual refine field (#338): binds an epic to a project via
+            # slug in the service layer; there is no 'project' column.
             continue
         if key == "risks":
             if value is None:
@@ -647,6 +845,10 @@ async def get_db() -> aiosqlite.Connection:
     await repair_stale_parent_completions(db)
     if await _table_exists(db, "roles"):
         await seed_system_roles(db)
+    if await _table_exists(db, "projects"):
+        await seed_default_project(db)
+    if await _table_exists(db, "skills"):
+        await seed_default_skills(db)
     return db
 
 
@@ -946,6 +1148,160 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         ("admin.read", "admin.audit.read"),
     ),
 )
+
+
+async def seed_default_project(db: aiosqlite.Connection) -> None:
+    """Seed the 'default' project from env and backfill epics (#335).
+
+    Idempotent: an existing default row is reused, and only epics without a
+    project are assigned. Until consumers land (V1.2+), this changes no
+    behavior — it only gives every existing task a resolvable project.
+    """
+    from hub import config as cfg
+
+    rows = await db.execute_fetchall("SELECT id FROM projects WHERE slug='default'")
+    if rows:
+        default_id = rows[0][0]
+    else:
+        cur = await db.execute(
+            "INSERT INTO projects (slug, name, repo, workspace_path, "
+            "default_branch) VALUES ('default', 'Default', ?, ?, ?)",
+            (
+                cfg.REPO_NAME,
+                str(cfg.WORKSPACE_REPO_LINK),
+                cfg.PAIR_BASE_BRANCH,
+            ),
+        )
+        default_id = cur.lastrowid
+    await db.execute(
+        "UPDATE tasks SET project_id=? WHERE task_type='epic' AND project_id IS NULL",
+        (default_id,),
+    )
+    await db.commit()
+
+
+MULTI_AGENT_REVIEW_SKILL = """\
+# Multi-agent review harness (v1)
+
+Прогони ревью диффа через несколько независимых агентов по схеме
+«измерения → адверсариальная верификация → единогласие».
+
+## Фаза 1 — ревьюверы по измерениям (параллельно, по одному агенту на роль)
+Каждому: узкий мандат, контекст задачи (постановка + ограничения из хаба),
+схема ответа findings[] = {title, file, line, severity: high|medium|low,
+detail, category}.
+
+1. security — только реально эксплуатируемое: инъекции, XSS, обход
+   авторизации/гейтов, утечки. Запрещено флагать паттерн, который кодовая
+   база уже принимает, если дифф не делает хуже.
+2. correctness — реальные баги с конкретным сценарием отказа: краевые
+   значения, семантика пустых/отсутствующих полей, гонки, потеря состояния.
+   Требование: «опиши вход и наблюдаемый неправильный результат».
+3. consistency — сравнение с конвенциями ЭТОГО репозитория, не с
+   абстрактными best practices; нарушение ограничений из постановки —
+   всегда находка.
+4. tests — только пробелы, при которых регрессия проходит зелёной; не
+   требовать тестов на поведение фреймворка.
+
+Всем: «Верни только находки, которые готов защищать перед автором.
+Каждая привязана к file:line. Лучше 2 настоящих, чем 10 предположительных».
+
+## Фаза 2 — адверсариальная верификация (на КАЖДУЮ находку, 2 агента)
+Без барьера: находки измерения уходят на проверку сразу.
+- Опровергатель: «Попробуй ОПРОВЕРГНУТЬ: прочитай реальный код, проверь
+  достижимость и вред, не принят ли паттерн в репо. По умолчанию
+  refuted=true, если вред спекулятивен, недостижим или конвенционален».
+- Валидатор: «Независимо воспроизведи рассуждение по коду. refuted=true,
+  если не можешь указать точные строки, делающие проблему реальной».
+Схема ответа: {refuted: bool, reasoning}.
+Находка подтверждена ТОЛЬКО единогласно (оба refuted=false).
+
+## Фаза 3 — итог
+confirmed[] (severity, file:line, detail, цитаты голосов), rejected[]
+(title + причина), строка «N сырых → K подтверждено, M опровергнуто».
+Отклонённые не выбрасывать: иногда это долг вне скоупа диффа.
+
+## Правила
+- Агенты работают с реальными файлами и командами, не с пересказом диффа.
+- Конвенция репо сильнее общего best practice.
+- Находок > ~20 — дедупликация по file+суть между фазами.
+- После прогона: исправить confirmed, прогнать тесты, сдать отчёт в хаб
+  (machine-review), затем submit_for_review.
+"""
+
+
+MACHINE_REVIEW_CYCLE_SKILL = """\
+# Machine-review cycle (v1) — контракт для любого агента-клиента
+
+Как выполнить machine-review задачи в OpenClaw Hub без контекста чужих
+сессий. Оркестратор любой (Claude Code Workflow, Cursor, свой скрипт) —
+контракт один.
+
+## Когда обязателен
+Политика (#382): каскад override задачи > политика проекта (off|auto|always)
+> автоправила (docs/chore/spike и размеры XS/S — нет; refactor и
+feature/bug M+ — да; риск high или security — всегда). Хаб сам сообщает:
+`lifecycle_hint` в ответе `hub_submit_for_review`, предупреждение в панели
+ревью, событие `machine_review_requested` в фиде. Режим
+OPENCLAW_MACHINE_REVIEW=require блокирует человеческий вердикт без
+актуального отчёта; дефолт warn — только предупреждает.
+
+## Шаги
+1. `hub_get_skill("multi-agent-review")` — актуальная версия промта-харнесса
+   (измерения → пара опровергатель+валидатор на находку → единогласие).
+2. Прогнать харнесс над диффом задачи СВОИМ оркестратором: измерения
+   параллельно, на каждую находку два независимых верификатора
+   («default to refuted»), подтверждение только единогласное.
+3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
+   отдельным echo, не через пайп).
+4. `hub_submit_machine_review(task_id, raw_count, findings_confirmed,
+   findings_rejected, harness_skill, harness_version, agent_count,
+   tokens_spent, duration_ms, orchestrator, model)` — метрики опциональны,
+   но токены/время питают экономику практики (#384). Отчёт привязывается к
+   текущему submission_generation: пересдача работы делает его stale.
+5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
+   отчёт его информирует, не заменяет.
+
+## Формат находок
+confirmed: {title, severity high|medium|low, category slug, file, line,
+detail}; rejected: {title, category, reason}. category питает метрики
+повторяемости — используй устойчивые слаги (security, correctness,
+consistency, tests, …).
+"""
+
+
+async def seed_default_skills(db: aiosqlite.Connection) -> None:
+    """Seed built-in skills (#380, #383).
+
+    Idempotent per skill: only inserts when the name has no versions at
+    all, so operator edits and newer versions are never overwritten.
+    """
+    seeds = (
+        (
+            "multi-agent-review",
+            "prompt",
+            MULTI_AGENT_REVIEW_SKILL,
+            '["review", "quality", "workflow"]',
+        ),
+        (
+            "machine-review-cycle",
+            "skill",
+            MACHINE_REVIEW_CYCLE_SKILL,
+            '["review", "workflow", "contract"]',
+        ),
+    )
+    for name, kind, content, tags in seeds:
+        rows = await db.execute_fetchall(
+            "SELECT id FROM skills WHERE name=? LIMIT 1", (name,)
+        )
+        if rows:
+            continue
+        await db.execute(
+            "INSERT INTO skills (name, kind, version, content, tags, status, "
+            "created_by) VALUES (?, ?, 1, ?, ?, 'active', 'seed')",
+            (name, kind, content, tags),
+        )
+    await db.commit()
 
 
 async def seed_system_roles(db: aiosqlite.Connection) -> None:

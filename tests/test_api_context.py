@@ -227,3 +227,113 @@ async def test_context_text_renders_risks_via_enum_value(client: AsyncClient):
     assert "security:high" in text
     assert "RiskKind" not in text
     assert "RiskSeverity" not in text
+
+
+# ---- Universal Review Gate (#308): latest review projection ----
+
+
+async def _pair_submit(client: AsyncClient, title: str) -> int:
+    resp = await client.post("/api/tasks", json={"title": title})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "First submission"},
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_latest_review_projection_in_status_and_context(client: AsyncClient, db):
+    from hub import services
+    from hub.models import (
+        ReviewFinding,
+        ReviewSeverity,
+        ReviewVerdict,
+        TaskReviewVerdict,
+    )
+
+    task_id = await _pair_submit(client, "Reviewed task")
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="see findings",
+            findings=[
+                ReviewFinding(
+                    id=1,
+                    severity=ReviewSeverity.high,
+                    message="Race in bump",
+                    file="hub/repository.py",
+                    line=10,
+                    recommendation="Do the increment in SQL",
+                ),
+                ReviewFinding(
+                    id=2, severity=ReviewSeverity.low, message="Typo in docstring"
+                ),
+            ],
+        ),
+    )
+
+    # Task status: structured projection with numbered findings (AC-2).
+    resp = await client.get(f"/api/tasks/{task_id}")
+    assert resp.status_code == 200
+    lr = resp.json()["latest_review"]
+    assert lr["verdict"] == "changes_requested"
+    assert lr["is_current"] is True
+    assert [f["id"] for f in lr["findings"]] == [1, 2]
+    assert lr["findings"][0]["severity"] == "high"
+    assert lr["findings"][0]["file"] == "hub/repository.py"
+
+    # Context: same structured data on the embedded task + digest line.
+    resp = await client.get(f"/api/tasks/{task_id}/context")
+    assert resp.status_code == 200
+    data = resp.json()
+    embedded = data["task"]["latest_review"]
+    assert embedded["verdict"] == "changes_requested"
+    assert embedded["findings"][0]["message"] == "Race in bump"
+    assert "Latest review: CHANGES_REQUESTED" in data["context_text"]
+    assert "1. [high] Race in bump" in data["context_text"]
+
+
+async def test_latest_review_marked_stale_after_resubmission(client: AsyncClient, db):
+    from hub import services
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+
+    task_id = await _pair_submit(client, "Stale review task")
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    # Simulate rework + resubmission: back to running, then an explicit new
+    # submit-for-review. (A done report on approved work now completes the
+    # task instead of resubmitting — Universal Review Gate, #306.)
+    from hub import repository as repo_module
+
+    await repo_module.update_task(db, task_id, status="running")
+    await db.commit()
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={"agent": "dev", "summary": "Second submission"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get(f"/api/tasks/{task_id}")
+    body = resp.json()
+    assert body["submission_generation"] == 2
+    assert body["latest_review"]["is_current"] is False
+    assert body["review_approved_current"] is False
+    resp = await client.get(f"/api/tasks/{task_id}/context")
+    assert "stale — work resubmitted" in resp.json()["context_text"]

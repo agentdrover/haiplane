@@ -312,6 +312,15 @@
 
                 {% if task.status.value == 'draft' %}
                 <div class="task-action-state">Approval Required</div>
+                {% if approve_error == 'dor_failed' %}
+                <div class="task-action-note task-action-note--warning">
+                    <strong>Задача не готова к одобрению (DoR не пройден).</strong>
+                    {% if readiness.missing_required %}
+                    <div>Не хватает: {{ readiness.missing_required | join(', ') }}.</div>
+                    {% endif %}
+                    <div>Заполните недостающие поля (см. раздел «Readiness») и повторите одобрение.</div>
+                </div>
+                {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-approve" class="task-action-stack">
                     <label class="task-action-label" for="task-runtime-approve">Runtime</label>
                     <select id="task-runtime-approve" name="runtime" class="task-action-control">
@@ -382,6 +391,71 @@
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 
+                {% elif task.status.value == 'review' and not task.review_job_id %}
+                <div class="task-action-state task-action-state--danger">Review Required</div>
+                {% if review_error %}
+                <div class="task-action-note">{{ review_error }}</div>
+                {% endif %}
+                {% if machine_review_gap %}
+                <div class="task-action-note task-action-note--warning">
+                    {{ machine_review_gap }}
+                    <form method="post" action="/tasks/{{ task.id }}/web-request-machine-review" class="project-inline-form">
+                        <button class="btn btn-ghost" type="submit">Request machine review</button>
+                    </form>
+                </div>
+                {% endif %}
+                {% if machine_review %}
+                <div class="task-action-note">
+                    Machine review: {{ machine_review.raw_count }} raw &rarr;
+                    {{ machine_review.findings_confirmed|length }} confirmed /
+                    {{ machine_review.findings_rejected|length }} rejected
+                    {% if not machine_review.is_current %}
+                    <span class="badge badge-failed">stale — работа пересдана</span>
+                    {% endif %}
+                    {% if machine_review.findings_confirmed %}
+                    <details>
+                        <summary class="project-edit-summary">confirmed findings</summary>
+                        <ul class="task-review-findings">
+                            {% for f in machine_review.findings_confirmed %}
+                            <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
+                                {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
+                                {{ f.title }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                </div>
+                {% endif %}
+                {% if task.latest_review %}
+                <div class="task-action-note">
+                    Last verdict: {{ task.latest_review.verdict.value|upper }}
+                    for submission #{{ task.latest_review.submission_generation }}
+                    ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
+                    {% if task.latest_review.self_approved %}
+                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via OPENCLAW_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
+                    {% endif %}
+                    {% if task.latest_review.findings %}
+                    <ul class="task-review-findings">
+                        {% for f in task.latest_review.findings %}
+                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}
+                            {% if f.scope.value == 'out_of_scope' %}
+                            <span class="badge badge--xs badge-type-subtask">out of scope{% if f.linked_task_id %} &rarr; <a href="/tasks/{{ f.linked_task_id }}">#{{ f.linked_task_id }}</a>{% endif %}</span>
+                            {% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
+                </div>
+                {% endif %}
+                <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack">
+                    <label class="task-action-label" for="review-comments">Review comments</label>
+                    <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
+                    <button class="btn btn-success task-action-btn" type="submit" name="verdict" value="approved">Approve</button>
+                    <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...)</label>
+                    <textarea id="review-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: race condition in bump&#10;low: typo in docstring"></textarea>
+                    <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
+                </form>
+
                 {% elif task.status.value in ('running', 'review', 'fix_requested', 'ci_check') %}
                 <div class="task-action-state">In Progress</div>
                 <button class="btn btn-primary task-action-btn"
@@ -402,6 +476,10 @@
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Task Metadata</div>
                 <dl class="task-meta-list">
+                    {% if task.project %}
+                    <dt>Project</dt>
+                    <dd><span class="badge badge-type-epic">{{ task.project.slug }}</span></dd>
+                    {% endif %}
                     <dt>Status</dt>
                     <dd><span class="badge badge-{{ task.status.value }}">{{ task.status.value }}</span></dd>
                     <dt>Type</dt>
