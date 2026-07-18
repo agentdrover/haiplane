@@ -93,6 +93,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     project_git_context,
     provision_project,
+    restore_pair_workspace_base,
     scan_text_for_verdict,
     transition_after_agent_done,
 )
@@ -163,6 +164,7 @@ __all__ = [
     "pair_start_task",
     "parse_review_findings",
     "prepare_pair_branch",
+    "restore_pair_workspace_base",
     "practice_metrics",
     "project_git_context",
     "provision_project",
