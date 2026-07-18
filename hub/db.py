@@ -493,6 +493,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_projects_provision_detail_column",
         "ALTER TABLE projects ADD COLUMN provision_detail TEXT NOT NULL DEFAULT ''",
     ),
+    # ---- Audited solo mode (#434): verdicts accepted only because of
+    # OPENCLAW_REVIEW_SELF_APPROVE=allow stay distinguishable in hindsight.
+    (
+        "add_review_self_approved_column",
+        "ALTER TABLE tasks ADD COLUMN review_self_approved INTEGER NOT NULL DEFAULT 0",
+    ),
 ]
 
 

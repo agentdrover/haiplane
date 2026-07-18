@@ -61,6 +61,18 @@ class ReviewSeverity(str, Enum):
     low = "low"
 
 
+class FindingScope(str, Enum):
+    """Whether a review finding belongs to the reviewed task (#435).
+
+    ``in_scope`` findings must be fixed in the same task via the
+    CHANGES_REQUESTED loop; ``out_of_scope`` findings are moved to separate
+    tasks (referenced by ``linked_task_id``) and never block the verdict.
+    """
+
+    in_scope = "in_scope"
+    out_of_scope = "out_of_scope"
+
+
 class TaskType(str, Enum):
     epic = "epic"
     feature = "feature"
@@ -328,6 +340,10 @@ class ReviewFinding(BaseModel):
 
     ``id`` is stable within a single review submission so a developer agent
     can address findings by number in the CHANGES_REQUESTED loop.
+
+    ``scope``/``linked_task_id`` (#435): ``in_scope`` findings are fixed in
+    the same task via resubmit; ``out_of_scope`` findings are moved to
+    separate tasks and reference the created task via ``linked_task_id``.
     """
 
     id: int = Field(..., ge=1)
@@ -336,6 +352,8 @@ class ReviewFinding(BaseModel):
     file: str = Field("", max_length=500)
     line: int | None = Field(default=None, ge=1)
     recommendation: str = Field("", max_length=2000)
+    scope: FindingScope = FindingScope.in_scope
+    linked_task_id: int | None = Field(default=None, ge=1)
 
 
 class TaskReviewVerdict(BaseModel):
@@ -344,12 +362,20 @@ class TaskReviewVerdict(BaseModel):
     Extended in #308 with structured findings: they are persisted on the
     task row (not in the update text), so the payload stays machine-readable
     without stressing TaskUpdate content limits.
+
+    ``create_tasks_for_out_of_scope`` (#436): when true, every
+    ``out_of_scope`` finding without a ``linked_task_id`` gets a DRAFT
+    follow-up task auto-created (DoR gate stays — a human decides whether to
+    take it into work) and the created id is stamped into the stored
+    finding. Idempotent: already-linked findings are skipped and resubmits
+    reuse the existing draft via a back-reference marker in its description.
     """
 
     verdict: ReviewVerdict
     agent: str = Field("", max_length=100)
     comments: str = Field("", max_length=50000)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=50)
+    create_tasks_for_out_of_scope: bool = False
 
 
 class LatestReview(BaseModel):
@@ -357,12 +383,31 @@ class LatestReview(BaseModel):
 
     ``is_current`` is False when work was resubmitted after the verdict was
     recorded — the verdict is history, not a judgement of the latest work.
+    ``self_approved`` is True when the verdict was accepted only because of
+    the ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
+    reviewed their own work, so the verdict is not independent (#434).
     """
 
     verdict: ReviewVerdict
     submission_generation: int = 0
     is_current: bool = False
+    self_approved: bool = False
     findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class SelfReviewWarning(BaseModel):
+    """Fail-fast self-review notice on the review brief (#433).
+
+    Emitted when the caller requesting the brief is the agent that
+    implemented the task, BEFORE any review effort is spent. Advisory, not
+    a hard-fail: the implementer may still read the brief for self-checking,
+    but hub_submit_review will reject the verdict (unless solo mode).
+    """
+
+    reason: str
+    message: str
+    hint: str
+    required_role: str | None = None
 
 
 class ReviewBrief(BaseModel):
@@ -397,6 +442,11 @@ class ReviewBrief(BaseModel):
     # #381: latest machine-review report; forward ref — MachineReviewView is
     # declared later in this module, rebuilt below.
     machine_review: "MachineReviewView | None" = None
+    # #433: fail-fast notice when the caller implemented this task.
+    self_review_warning: SelfReviewWarning | None = None
+    # #438: advisory — non-empty when the branch carries commits of another
+    # unmerged task branch (stacked branches). Never blocks the review.
+    stacking_warning: str = ""
 
 
 class TaskClaim(BaseModel):

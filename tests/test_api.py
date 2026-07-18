@@ -255,14 +255,17 @@ async def test_force_complete_api(client: AsyncClient, db):
     )
 
 
-async def test_force_complete_api_rejects_wrong_status(client: AsyncClient):
-    create_resp = await client.post("/api/tasks", json={"title": "Open task"})
+async def test_force_complete_api_rejects_terminal_status(client: AsyncClient, db):
+    create_resp = await client.post("/api/tasks", json={"title": "Completed task"})
     task_id = create_resp.json()["id"]
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
 
     resp = await client.post(f"/api/tasks/{task_id}/force-complete")
 
     assert resp.status_code == 400
-    assert "pending_report" in resp.text
+    assert "terminal" in resp.text
+    assert "completed" in resp.text
 
 
 async def test_force_complete_api_records_human_comment(client: AsyncClient, db):
@@ -281,7 +284,8 @@ async def test_force_complete_api_records_human_comment(client: AsyncClient, db)
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["content"].startswith("reviewed manually, accepting risk")
+    assert "from_status=pending_report" in done_updates[0]["content"]
     assert done_updates[0]["agent"] == "human"
 
 
@@ -982,6 +986,133 @@ async def test_review_verdict_api_changes_requested_returns_to_running(
     assert body["review_approved_current"] is False
 
 
+async def test_review_verdict_api_finding_scope_roundtrip(client: AsyncClient):
+    # #435: scope defaults to in_scope; out_of_scope findings carry the
+    # linked follow-up task through the review brief.
+    task_id = await _running_pair_task(client, "Scope roundtrip API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                    "linked_task_id": 436,
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    findings = resp.json()["latest_review"]["findings"]
+    assert findings[0]["scope"] == "in_scope"
+    assert findings[0]["linked_task_id"] is None
+    assert findings[1]["scope"] == "out_of_scope"
+    assert findings[1]["linked_task_id"] == 436
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    brief_findings = brief["latest_review"]["findings"]
+    assert brief_findings[1]["scope"] == "out_of_scope"
+    assert brief_findings[1]["linked_task_id"] == 436
+
+
+async def test_review_verdict_api_auto_creates_drafts_for_out_of_scope(
+    client: AsyncClient,
+):
+    # #436: create_tasks_for_out_of_scope=true auto-creates a DRAFT
+    # follow-up task and stamps its id into the stored finding.
+    task_id = await _running_pair_task(client, "Auto draft API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "create_tasks_for_out_of_scope": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    findings = resp.json()["latest_review"]["findings"]
+    linked_id = findings[1]["linked_task_id"]
+    assert linked_id is not None
+    assert findings[0]["linked_task_id"] is None
+
+    draft = (await client.get(f"/api/tasks/{linked_id}")).json()
+    assert draft["status"] == "draft"
+    assert draft["task_type"] == "task"
+    assert draft["parent_id"] is None
+    assert f"from review of task #{task_id}" in draft["description"]
+
+
+async def test_review_verdict_api_flag_off_keeps_findings_unlinked(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "Flag off API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Move elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["latest_review"]["findings"][1]["linked_task_id"] is None
+
+
+async def test_review_verdict_api_rejects_all_out_of_scope_findings(
+    client: AsyncClient,
+):
+    task_id = await _running_pair_task(client, "All out of scope API")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {
+                    "id": 1,
+                    "severity": "high",
+                    "message": "Different subsystem",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "changes_requested_requires_in_scope_finding"
+    assert "approved" in detail["hint"]
+
+
 async def test_review_verdict_api_approved_returns_to_running_current(
     client: AsyncClient,
 ):
@@ -1076,17 +1207,19 @@ def _review_tokens() -> dict:
     }
 
 
-async def _task_in_review(client: AsyncClient, title: str, headers: dict) -> int:
+async def _task_in_review(
+    client: AsyncClient, title: str, headers: dict, agent: str = "impl-bot"
+) -> int:
     resp = await client.post("/api/tasks", json={"title": title}, headers=headers)
     task_id = resp.json()["id"]
     await client.post(
         f"/api/tasks/{task_id}/updates",
-        json={"agent": "impl-bot", "kind": "status", "content": "Plan: work"},
+        json={"agent": agent, "kind": "status", "content": "Plan: work"},
         headers=headers,
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "impl-bot"},
+        json={"assigned_agent": agent},
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -1154,6 +1287,8 @@ async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypa
     )
     assert resp.status_code == 200
     assert resp.json()["review_approved_current"] is True
+    # Independent verdicts are never marked as self-approved (#434).
+    assert resp.json()["latest_review"]["self_approved"] is False
 
 
 async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkeypatch):
@@ -1171,7 +1306,119 @@ async def test_self_review_allowed_with_solo_opt_out(client: AsyncClient, monkey
         headers=impl,
     )
     assert resp.status_code == 200
-    assert resp.json()["review_approved_current"] is True
+    body = resp.json()
+    assert body["review_approved_current"] is True
+    # #434: the weakened gate is audited — the verdict is marked.
+    assert body["latest_review"]["self_approved"] is True
+    assert any(
+        u["kind"] == "review" and "[self-approved: solo mode" in u["content"]
+        for u in body["updates"] or []
+    )
+
+
+# ---- Fail-fast self-review warning in the review brief (#433) ----
+
+
+async def test_review_brief_warns_implementer_of_self_review(
+    client: AsyncClient, monkeypatch
+):
+    # AC-1: the implementer gets a structured warning BEFORE running the
+    # review; independent reviewers and humans get a clean brief.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-token"}
+    reviewer = {"Authorization": "Bearer reviewer-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await _task_in_review(client, "Brief self-review warning", impl)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "self_review_forbidden"
+    assert "impl-bot" in warning["message"]
+    assert "independent" in warning["hint"]
+    assert warning["required_role"] == "independent_reviewer"
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=reviewer)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=human)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
+
+
+async def test_review_brief_solo_mode_note_for_implementer(
+    client: AsyncClient, monkeypatch
+):
+    # AC-2: with OPENCLAW_REVIEW_SELF_APPROVE=allow the warning turns into
+    # an informational solo-mode note instead.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    impl = {"Authorization": "Bearer impl-token"}
+
+    task_id = await _task_in_review(client, "Brief solo-mode note", impl)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "solo_mode_self_review"
+    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in warning["hint"]
+    assert warning["required_role"] is None
+
+
+async def test_review_brief_warns_implementer_by_principal_id(
+    client: AsyncClient, monkeypatch
+):
+    # AC-3: principal binding (#320) — the warning fires even when
+    # assigned_agent holds a different free-text name than the token
+    # username, matching ensure_reviewer_independence semantics.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Brief principal warning"}, headers=impl
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "someone", "kind": "status", "content": "Plan: work"},
+        headers=impl,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "claude-code"},
+        headers=impl,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=impl
+    )
+    assert resp.json()["status"] == "review"
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=impl)
+    assert resp.status_code == 200
+    warning = resp.json()["self_review_warning"]
+    assert warning is not None
+    assert warning["reason"] == "self_review_forbidden"
+
+    other = {"Authorization": "Bearer other-pid-token"}
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief", headers=other)
+    assert resp.status_code == 200
+    assert resp.json()["self_review_warning"] is None
 
 
 # ---- Implementer principal binding (#320) ----
@@ -1270,6 +1517,83 @@ async def test_claim_records_and_release_clears_implementer_principal(
     assert resp.status_code == 200
     d = dict(await repo_module.get_task(db, task_id))
     assert d["implementer_principal_id"] is None
+
+
+# ---- Reviewer identity provisioning (#432) ----
+#
+# The documented deploy setup (deploy/local-hub.env.example,
+# docs/agent-onboarding.md): TWO env tokens with role `agent` — the
+# implementer (`cursor`) and a dedicated reviewer (`cursor-reviewer`).
+# Parsed straight from the OPENCLAW_HUB_TOKENS format so the tests pin the
+# exact configuration operators are told to provision.
+
+
+def _provisioned_reviewer_tokens() -> dict:
+    from hub import config
+
+    return config.parse_tokens(
+        "denis:human-tok:human,"
+        "cursor:cursor-tok:agent,"
+        "cursor-reviewer:reviewer-tok:agent"
+    )
+
+
+async def test_provisioned_reviewer_identity_verdict_passes_gate(
+    client: AsyncClient, monkeypatch
+):
+    # AC (#432): a verdict from a DIFFERENT agent principal passes the gate.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _provisioned_reviewer_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer cursor-tok"}
+    reviewer = {"Authorization": "Bearer reviewer-tok"}
+
+    task_id = await _task_in_review(
+        client, "Reviewer identity passes", impl, agent="cursor"
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "cursor-reviewer"},
+        headers=reviewer,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["review_approved_current"] is True
+    assert body["status"] == "running"
+
+
+async def test_provisioned_implementer_identity_verdict_rejected(
+    client: AsyncClient, monkeypatch
+):
+    # AC (#432): the implementing principal is rejected with a structured
+    # reason; the gate compares principals, not the token role — both tokens
+    # here share role `agent`.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _provisioned_reviewer_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    impl = {"Authorization": "Bearer cursor-tok"}
+
+    task_id = await _task_in_review(
+        client, "Implementer verdict blocked", impl, agent="cursor"
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "cursor"},
+        headers=impl,
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "self_review_forbidden"
+    assert detail["required_role"] == "independent_reviewer"
+    assert "independent reviewer" in detail["hint"]
+    # No verdict recorded; the task stays in review for a real reviewer.
+    body = (await client.get(f"/api/tasks/{task_id}", headers=impl)).json()
+    assert body["review_verdict"] is None
+    assert body["status"] == "review"
 
 
 # ---- Batch approve (#252) ----

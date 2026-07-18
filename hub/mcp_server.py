@@ -227,6 +227,18 @@ async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
         return resp.json(), resp.status_code
 
 
+def _finding_line(finding: dict[str, Any]) -> str:
+    """One-line rendering of a review finding with its scope marker (#435)."""
+    scope_mark = ""
+    if finding.get("scope") == "out_of_scope":
+        linked = finding.get("linked_task_id")
+        scope_mark = f" [out-of-scope → #{linked}]" if linked else " [out-of-scope]"
+    return (
+        f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}]"
+        f"{scope_mark} {finding.get('message', '')}"
+    )
+
+
 def _format_task(t: dict[str, Any]) -> str:
     src = (
         f" [agent:{t.get('assigned_agent', '')}]" if t.get("source") == "agent" else ""
@@ -542,16 +554,18 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         freshness = (
             "current" if latest_review.get("is_current") else "stale — work resubmitted"
         )
+        solo = (
+            " [SELF-APPROVED: solo mode, not independent]"
+            if latest_review.get("self_approved")
+            else ""
+        )
         parts.append(
             f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
             f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness})"
+            f"({freshness}){solo}"
         )
         for finding in (latest_review.get("findings") or [])[:10]:
-            parts.append(
-                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
-                f"{finding.get('message', '')}"
-            )
+            parts.append(_finding_line(finding))
     acs = task.get("acceptance_criteria") or []
     if acs:
         parts.append("\nAcceptance criteria:")
@@ -1002,6 +1016,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     checklist, branch/PR metadata with an advisory diff command, the latest
     submission summary, and the latest recorded verdict with findings.
 
+    Fail-fast self-review check (#433): if YOU implemented this task, the
+    response starts with a self_review_warning — stop and hand the review
+    to an independent reviewer instead of running it (hub_submit_review
+    would reject your verdict).
+
     Args:
         task_id: The task ID to review
     """
@@ -1009,11 +1028,22 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
-    parts = [
-        f"Review brief for task #{brief['task_id']}: {brief['title']}",
-        f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
-        f"| review cycle {brief.get('review_cycle', 0)}",
-    ]
+    parts = []
+    # #433: fail-fast self-review notice goes FIRST so the reviewer stops
+    # before spending review effort — hub_submit_review would reject anyway.
+    warning = brief.get("self_review_warning")
+    if warning:
+        parts.append(
+            f"WARNING [{warning.get('reason', 'self_review_forbidden')}]: "
+            f"{warning.get('message', '')}\n{warning.get('hint', '')}\n"
+        )
+    parts.extend(
+        [
+            f"Review brief for task #{brief['task_id']}: {brief['title']}",
+            f"Status: {brief['status']} | submission #{brief.get('submission_generation', 0)} "
+            f"| review cycle {brief.get('review_cycle', 0)}",
+        ]
+    )
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []
@@ -1050,6 +1080,8 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         parts.append(f"\nBranch: {brief['branch']}{pr}")
         if brief.get("diff_command"):
             parts.append(f"Diff: {brief['diff_command']}")
+    if brief.get("stacking_warning"):
+        parts.append(f"\n{brief['stacking_warning']}")
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")
@@ -1057,19 +1089,22 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         freshness = (
             "current" if latest_review.get("is_current") else "stale — work resubmitted"
         )
+        solo = (
+            " [SELF-APPROVED: solo mode, not independent]"
+            if latest_review.get("self_approved")
+            else ""
+        )
         parts.append(
             f"\nLatest verdict: {(latest_review.get('verdict') or '?').upper()} "
             f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness})"
+            f"({freshness}){solo}"
         )
         for finding in (latest_review.get("findings") or [])[:20]:
-            parts.append(
-                f"  {finding.get('id', '?')}. [{finding.get('severity', '?')}] "
-                f"{finding.get('message', '')}"
-            )
+            parts.append(_finding_line(finding))
     parts.append(
         "\nSubmit the verdict with hub_submit_review "
-        "(verdict=approved|changes_requested, findings for changes_requested)."
+        "(verdict=approved|changes_requested, findings for changes_requested; "
+        "changes_requested needs at least one scope=in_scope finding)."
     )
     return structured_echo_result("\n".join(parts), brief=brief)
 
@@ -1081,6 +1116,7 @@ async def hub_submit_review(
     comments: str = "",
     agent: str = "",
     findings: list[dict[str, Any]] | None = None,
+    create_tasks_for_out_of_scope: bool = False,
 ) -> str:
     """Submit a review verdict for the current submission of a task (#307).
 
@@ -1090,6 +1126,19 @@ async def hub_submit_review(
     path, with CHANGES_REQUESTED the developer fixes the findings and
     resubmits via hub_submit_for_review.
 
+    Finding scope (#435): every finding carries scope
+    (in_scope|out_of_scope, default in_scope). changes_requested with
+    findings requires at least one in_scope finding — if everything is out
+    of scope, submit approved and keep out-of-scope findings as
+    recommendations linked to follow-up tasks. Out-of-scope findings
+    without linked_task_id get a non-blocking warning.
+
+    Auto-drafts (#436): create_tasks_for_out_of_scope=true auto-creates a
+    DRAFT follow-up task for every out_of_scope finding without
+    linked_task_id (same feature parent as the reviewed task when
+    applicable) and stamps the created id into the stored finding. Drafts
+    still need human DoR approval. Idempotent on resubmit.
+
     Args:
         task_id: The task under review
         verdict: 'approved' or 'changes_requested'
@@ -1097,7 +1146,11 @@ async def hub_submit_review(
         agent: Reviewer agent name
         findings: For changes_requested — list of dicts with id (int, stable
             within this submission), severity (high|medium|low), message,
-            and optional file, line, recommendation.
+            and optional file, line, recommendation,
+            scope (in_scope|out_of_scope, default in_scope),
+            linked_task_id (int — follow-up task for out_of_scope findings).
+        create_tasks_for_out_of_scope: Auto-create draft follow-up tasks
+            for unlinked out_of_scope findings (default false).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1108,6 +1161,8 @@ async def hub_submit_review(
         body["agent"] = agent
     if findings:
         body["findings"] = findings
+    if create_tasks_for_out_of_scope:
+        body["create_tasks_for_out_of_scope"] = True
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:
@@ -1199,15 +1254,17 @@ async def hub_release_task(
 async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     """Human force-completes a stuck task without an agent done report.
 
-    Works from pending_report, claimed (reserved but never pair-started), and
-    pair-running (no headless job) tasks. Use this only when a human has
-    inspected the result and intentionally accepts responsibility for completing
-    a task that lacks a normal done report. The comment is recorded as the
-    audit-trail message on the task update.
+    Audited override for any non-terminal ``task`` or ``subtask`` when no *active*
+    dispatch job backs ``job_id`` or ``review_job_id`` (409 if active). Missing
+    or terminal dispatch jobs are allowed and noted in the audit trail. A
+    non-empty ``comment`` is required for active lifecycle states other than
+    ``pending_report`` and ``claimed``; those two may use the default message.
+    Rejects terminal tasks and ``epic``/``feature`` rows with incomplete
+    descendants.
 
     Args:
-        task_id: The task ID to complete (pending_report / claimed / pair-running)
-        comment: Reason for the override; recorded as the audit-trail message
+        task_id: Task or subtask to complete
+        comment: Audit-trail reason; required for most active lifecycle states
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None

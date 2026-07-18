@@ -634,7 +634,8 @@ async def test_web_force_complete_records_hx_prompt(client: AsyncClient, db):
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "reviewed manually, accepting risk"
+    assert done_updates[0]["content"].startswith("reviewed manually, accepting risk")
+    assert "from_status=pending_report" in done_updates[0]["content"]
     assert done_updates[0]["agent"] == "human"
 
 
@@ -656,7 +657,8 @@ async def test_web_force_complete_falls_back_to_form_comment(client: AsyncClient
     assert data["status"] == "completed"
     done_updates = [u for u in data["updates"] if u["kind"] == "done"]
     assert len(done_updates) == 1
-    assert done_updates[0]["content"] == "form-based override"
+    assert done_updates[0]["content"].startswith("form-based override")
+    assert "from_status=pending_report" in done_updates[0]["content"]
 
 
 async def test_htmx_done_fragment_escapes_xss_title(client: AsyncClient, db):
@@ -757,6 +759,43 @@ async def test_web_changes_requested_with_findings(client: AsyncClient):
     assert findings[2]["severity"] == "low"
 
 
+async def test_task_detail_shows_finding_scope_and_linked_task(client: AsyncClient):
+    # #435: out-of-scope findings render a scope badge and a link to the
+    # follow-up task in the review panel.
+    linked = await client.post("/api/tasks", json={"title": "Follow-up work"})
+    linked_id = linked.json()["id"]
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix in this task"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Handled separately",
+                    "scope": "out_of_scope",
+                    "linked_task_id": linked_id,
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    # Resubmit so the task is back in client-driven review and the panel
+    # (including the stale latest verdict with findings) is rendered.
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "Fix in this task" in page.text
+    assert "Handled separately" in page.text
+    assert "out of scope" in page.text
+    assert f'href="/tasks/{linked_id}"' in page.text
+    assert f"#{linked_id}" in page.text
+
+
 async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient):
     task_id = await _web_task_in_review(client)
     resp = await client.post(
@@ -771,6 +810,77 @@ async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient)
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["status"] == "review"
     assert body["review_verdict"] is None
+
+
+async def test_web_solo_verdict_marked_and_badge_rendered(
+    client: AsyncClient, monkeypatch
+):
+    """#434: a verdict accepted via OPENCLAW_REVIEW_SELF_APPROVE=allow is
+    persisted as self-approved and badged next to the verdict in the panel."""
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post("/api/tasks", json={"title": "Solo web"}, headers=agent)
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "bot", "kind": "status", "content": "Plan: work"},
+        headers=agent,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+
+    # The implementer reviews their own work through the web panel.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "changes_requested", "comments": "self check"},
+        headers=agent,
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}", headers=agent)).json()
+    assert body["latest_review"]["self_approved"] is True
+
+    # Back in review, the panel badges the solo verdict.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+    page = await client.get(f"/tasks/{task_id}", headers=agent)
+    assert page.status_code == 200
+    assert "badge-self-approved" in page.text
+
+
+async def test_web_independent_verdict_has_no_solo_badge(client: AsyncClient):
+    """#434: without the opt-out nothing changes — no badge, no mark."""
+    task_id = await _web_task_in_review(client)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "changes_requested", "comments": "rework"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["latest_review"]["self_approved"] is False
+
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.json()["status"] == "review"
+    page = await client.get(f"/tasks/{task_id}")
+    assert "badge-self-approved" not in page.text
 
 
 # ---- Draft queue ranking (#253) ----
@@ -1153,6 +1263,162 @@ async def test_web_patch_routes_reject_agent_token(
     assert row["status"] == "pending"
     assert row["name"] == "Gate"
     assert row["archived"] == 0
+
+
+async def test_web_human_only_routes_reject_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    """#427: agent bearer must not bypass human-only web lifecycle gates."""
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    draft_id = await repo_module.create_task(
+        db,
+        title="Draft gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    open_id = await repo_module.create_task(
+        db,
+        title="Open gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    needs_info_id = await repo_module.create_task(
+        db,
+        title="Needs info gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    needs_decision_id = await repo_module.create_task(
+        db,
+        title="Needs decision gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    pending_id = await repo_module.create_task(
+        db,
+        title="Pending report gate",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    proposal_id = await repo_module.create_task(
+        db,
+        title="Agent proposal",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    routes = [
+        (f"/tasks/{draft_id}/web-approve", {}),
+        (f"/tasks/{draft_id}/web-reject", {}),
+        (f"/tasks/{open_id}/web-start", {}),
+        (f"/tasks/{needs_info_id}/web-answer", {"answer": "ok"}),
+        (
+            f"/tasks/{needs_decision_id}/web-decide",
+            {"action": "accept", "decision_summary": "yes"},
+        ),
+        (f"/tasks/{pending_id}/web-force-complete", {"comment": "override"}),
+        (f"/proposals/{proposal_id}/approve", {}),
+        (f"/proposals/{proposal_id}/reject", {}),
+    ]
+    for url, data in routes:
+        resp = await client.post(url, data=data, headers=agent, follow_redirects=False)
+        assert resp.status_code == 403, url
+
+    assert (await repo_module.get_task(db, draft_id))["status"] == "draft"
+    assert (await repo_module.get_task(db, open_id))["status"] == "open"
+    assert (await repo_module.get_task(db, pending_id))["status"] == "pending_report"
+
+
+async def test_web_force_complete_human_token_still_works(
+    client: AsyncClient, monkeypatch, db
+):
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await repo_module.create_task(
+        db,
+        title="Human override",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-force-complete",
+        data={"comment": "human approved override"},
+        headers=human,
+        follow_redirects=False,
+    )
+    assert resp.status_code in (200, 303)
+    row = await repo_module.get_task(db, task_id)
+    assert row["status"] == "completed"
 
 
 async def test_web_create_project_agent_token_creates_pending(

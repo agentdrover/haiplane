@@ -206,10 +206,25 @@ ssh user1@194.113.34.33 '
 
 ```bash
 OPENCLAW_HUB_DB=/absolute/path/.local/state/hub.db
-OPENCLAW_HUB_TOKENS=name:token:human,agent-name:token:agent
+OPENCLAW_HUB_TOKENS=name:token:human,cursor:token:agent,cursor-reviewer:token2:agent
 OPENCLAW_WORKSPACE_REPO=/absolute/path/to/workspace-clone
 OPENCLAW_HUB_REPO=org/repo-name
 ```
+
+### Reviewer-токен (Universal Review Gate, #432)
+
+Кроме токена агента-исполнителя, провижинь **отдельную reviewer-идентичность**
+(`cursor-reviewer` в примере выше): роль `agent`, имя отличается от
+исполнителя, значение токена уникально. Без неё вердикт ревью от исполнителя
+блокируется gate'ом (`self_review_forbidden`) и цикл ревью стопорится.
+
+- Генерация секрета: `openssl rand -hex 32` (в чат/git не выводить).
+- На production токен добавляется в `OPENCLAW_HUB_TOKENS` в
+  `/etc/openclaw-hub/openclaw-hub.env` (проверять наличие через `grep -q`,
+  как в разделе 2, без вывода значений) + restart `openclaw-hub`.
+- Reviewer-сессия (агент/subagent, который вызывает `hub_submit_review`)
+  запускается с `OPENCLAW_HUB_TOKEN=<reviewer-token>`; исполнитель — со своим
+  токеном. Детали: `docs/agent-onboarding.md`, раздел про reviewer-идентичность.
 
 ### `OPENCLAW_WORKSPACE_REPO` и pair mode
 
@@ -226,9 +241,13 @@ OPENCLAW_HUB_REPO=org/repo-name
 
 1. Hub DB и lifecycle — локально или на agenthai; git push — в общий `origin`.
 2. Перед `hub_pair_start` — commit или stash в workspace repo.
-3. После pair-start сверить `tasks.branch` в UI/API с `git branch --show-current`.
-4. Push и PR — с машины, где написан код; server hub не заменяет push с ноутбука.
-5. Не копировать production `hub.db` на laptop без понимания, что approve/running state общий snapshot, а git remote один.
+3. После pair-start Hub может автоматически переключить workspace с **чистой,
+   запушенной** ветки другой задачи (`task-N/*`) на base branch (#451); грязное
+   дерево или незапушенная чужая ветка по-прежнему дают 422 с путём workspace и hint.
+4. После `hub_submit_for_review`, `hub_report_done` или `hub_release_task` Hub
+   best-effort возвращает workspace на base branch, если он на ветке этой задачи и чистый.
+5. Push и PR — с машины, где написан код; server hub не заменяет push с ноутбука.
+6. Не копировать production `hub.db` на laptop без понимания, что approve/running state общий snapshot, а git remote один.
 
 Подробнее: [software-development-workflow.md](../software-development-workflow.md#pair-mode-git-policy), [task-workflow.html](task-workflow.html#pair-git-policy).
 

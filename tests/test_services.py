@@ -11,12 +11,16 @@ from hub import services
 from hub.models import (
     BulkChildTaskItem,
     BulkChildTasksCreate,
+    FindingScope,
+    ReviewFinding,
+    ReviewSeverity,
     ReviewVerdict,
     TaskAnswer,
     TaskApprove,
     TaskClaim,
     TaskCreate,
     TaskDecide,
+    TaskForceComplete,
     TaskPairStart,
     TaskPriority,
     TaskQuestion,
@@ -774,15 +778,28 @@ async def test_force_complete_task(db: aiosqlite.Connection):
     )
 
 
-async def test_force_complete_wrong_status(db: aiosqlite.Connection):
-    body = TaskCreate(title="Still open")
-    tv = await services.create_task(db, body)
-    assert tv.status.value == "open"
+async def test_force_complete_rejects_terminal_status(db: aiosqlite.Connection):
+    task_id = await repo.create_task(
+        db,
+        title="Already done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        await services.force_complete_task(db, tv.id)
+        await services.force_complete_task(db, task_id)
     assert exc_info.value.status_code == 400
-    assert "pending_report" in str(exc_info.value.detail)
+    assert "terminal" in str(exc_info.value.detail)
+    assert "completed" in str(exc_info.value.detail)
 
 
 async def test_reorder_task(db: aiosqlite.Connection):
@@ -1312,12 +1329,22 @@ async def test_force_complete_from_pair_running(db: aiosqlite.Connection):
         priority="medium",
     )
     await db.commit()  # job_id stays NULL → pair task
-    tv = await services.force_complete_task(db, task_id)
+    tv = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Pair running human override"),
+    )
     assert tv.status.value == "completed"
 
 
-async def test_force_complete_rejected_for_headless_running(db: aiosqlite.Connection):
-    """Headless running (job_id set) is poller-owned and must NOT force-complete."""
+async def test_force_complete_rejects_active_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Active dispatch job blocks force-complete with 409 (AC-2)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
     task_id = await repo.create_task(
         db,
         title="Headless running",
@@ -1332,13 +1359,577 @@ async def test_force_complete_rejected_for_headless_running(db: aiosqlite.Connec
         parent_id=None,
         priority="medium",
     )
-    await repo.update_task(db, task_id, job_id="job-xyz")
+    await repo.update_task(
+        db,
+        task_id,
+        job_id="job-xyz",
+        claimed_by="dev",
+        claim_session_id="sess-1",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
     await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "running", "exit_code": None}
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, task_id)
+    assert exc_info.value.status_code == 409
+    assert "job-xyz" in str(exc_info.value.detail)
+    assert "running" in str(exc_info.value.detail)
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "running"
+    assert row["claimed_by"] == "dev"
+
+
+async def test_force_complete_rejects_active_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Review dispatch running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        review_job_id="review-job-active",
+        claimed_by="dev",
+        claim_session_id="sess-r",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "running", "exit_code": None}
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(
+            db,
+            task_id,
+            TaskForceComplete(comment="Should not apply"),
+        )
+    assert exc_info.value.status_code == 409
+    assert "review-job-active" in str(exc_info.value.detail)
+    assert "running" in str(exc_info.value.detail)
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "review"
+    assert row["claimed_by"] == "dev"
+
+
+async def test_force_complete_allows_missing_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Missing review job",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, review_job_id="review-job-missing")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(return_value=None)
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover stale review dispatch"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "review_job_id=review-job-missing" in done.content
+    assert "missing from registry" in done.content
+
+
+async def test_force_complete_allows_terminal_review_job(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Terminal review job",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="fix_requested",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, review_job_id="review-job-done")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Close over finished review job"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "review_job_id=review-job-done" in done.content
+    assert "terminal status='completed'" in done.content
+
+
+async def test_force_complete_allows_missing_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Missing dispatch registry entry does not block recovery (AC-3)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Headless running",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-missing")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(return_value=None)
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover stale headless task"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "from_status=running" in done.content
+    assert "job_id=job-missing" in done.content
+    assert "missing from registry" in done.content
+
+
+async def test_force_complete_allows_terminal_dispatch_job(
+    db: aiosqlite.Connection,
+):
+    """Terminal dispatch job reference is allowed and audited (AC-3)."""
+    from unittest.mock import MagicMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await repo.create_task(
+        db,
+        title="Stale ci_check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id="job-failed")
+    await db.commit()
+
+    plugins.dispatch.get_job = MagicMock(
+        return_value={"status": "failed", "exit_code": 1}
+    )
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Recover after terminal dispatch job"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "from_status=ci_check" in done.content
+    assert "terminal status='failed'" in done.content
+
+
+async def test_force_complete_from_open(db: aiosqlite.Connection):
+    body = TaskCreate(title="Still open")
+    tv = await services.create_task(db, body)
+    assert tv.status.value == "open"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, tv.id)
+    assert exc_info.value.status_code == 400
+    assert "comment" in str(exc_info.value.detail)
+    assert "open" in str(exc_info.value.detail)
+
+    completed = await services.force_complete_task(
+        db, tv.id, TaskForceComplete(comment="Human shutdown from open")
+    )
+    assert completed.status.value == "completed"
+
+
+async def test_force_complete_requires_comment_from_active_ci_check(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Stuck ci",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
     with pytest.raises(HTTPException) as exc_info:
         await services.force_complete_task(db, task_id)
     assert exc_info.value.status_code == 400
+    assert "ci_check" in str(exc_info.value.detail)
+
+
+async def test_force_complete_default_comment_from_pending_report(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Awaiting report",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="pending_report",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
+
+
+async def test_force_complete_default_comment_from_draft(
+    db: aiosqlite.Connection,
+):
+    """draft is not an ACTIVE_STATUS, so the default comment path applies."""
+    task_id = await repo.create_task(
+        db,
+        title="Abandoned draft",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(db, task_id)
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert "Force-completed by human without agent report." in done.content
+    assert "from_status=draft" in done.content
+
+
+async def test_force_complete_clears_stale_claim_metadata(
+    db: aiosqlite.Connection,
+):
+    task_id = await repo.create_task(
+        db,
+        title="Stuck ci_check",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by="dev",
+        claim_session_id="sess-stale",
+        claimed_at="2026-07-17T12:00:00+00:00",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment="Clear stale claim after ci_check stuck"),
+    )
+    assert view.status.value == "completed"
+    assert view.claimed_by in (None, "")
+    assert view.claim_session_id in (None, "")
+    assert view.claimed_at in (None, "")
     row = await repo.get_task(db, task_id)
-    assert row["status"] == "running"
+    assert row["claimed_at"] in (None, "")
+
+
+async def test_force_complete_rejects_epic_with_incomplete_descendants(
+    db: aiosqlite.Connection,
+):
+    epic_id = await repo.create_task(
+        db,
+        title="Epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Child feature",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(db, epic_id)
+    assert exc_info.value.status_code == 400
+    assert "incomplete descendants" in str(exc_info.value.detail)
+
+
+async def test_force_complete_feature_all_terminal_children_succeeds(
+    db: aiosqlite.Connection,
+):
+    feature_id = await repo.create_task(
+        db,
+        title="Feature rollup",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="feature",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Done child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Failed child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="failed",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        feature_id,
+        TaskForceComplete(comment="Human closes feature after terminal children"),
+    )
+    assert view.status.value == "completed"
+
+
+async def test_force_complete_epic_nested_descendants_cte(
+    db: aiosqlite.Connection,
+):
+    epic_id = await repo.create_task(
+        db,
+        title="Epic nested",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    feature_id = await repo.create_task(
+        db,
+        title="Feature under epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="feature",
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Open task under feature",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.force_complete_task(
+            db,
+            epic_id,
+            TaskForceComplete(comment="Should block on open grandchild"),
+        )
+    assert exc_info.value.status_code == 400
+    assert "incomplete descendants" in str(exc_info.value.detail)
+
+    await repo.update_task(db, feature_id, status="completed")
+    grandchild = await db.execute_fetchall(
+        "SELECT id FROM tasks WHERE parent_id=? LIMIT 1", (feature_id,)
+    )
+    await repo.update_task(db, grandchild[0]["id"], status="completed")
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        epic_id,
+        TaskForceComplete(comment="All nested descendants terminal"),
+    )
+    assert view.status.value == "completed"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "draft",
+        "open",
+        "claimed",
+        "running",
+        "needs_info",
+        "review",
+        "fix_requested",
+        "ci_check",
+        "needs_decision",
+        "pending_report",
+    ],
+)
+async def test_force_complete_from_all_non_terminal_statuses(
+    db: aiosqlite.Connection,
+    status: str,
+):
+
+    task_id = await repo.create_task(
+        db,
+        title=f"Force from {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="subtask" if status == "draft" else "task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    view = await services.force_complete_task(
+        db,
+        task_id,
+        TaskForceComplete(comment=f"override from {status}"),
+    )
+    assert view.status.value == "completed"
+    done = next(u for u in view.updates if u.kind == "done")
+    assert f"from_status={status}" in done.content
+    assert f"override from {status}" in done.content
 
 
 async def test_claim_task_conflict(db: aiosqlite.Connection):
@@ -1708,6 +2299,124 @@ async def test_record_verdict_with_findings_persists_structured_data(
     assert view.review_approved_current is True
 
 
+# ---- Audited solo mode (#434) ----
+
+
+async def test_solo_self_approved_verdict_is_marked(db: aiosqlite.Connection, caplog):
+    task_id = await _pair_running_task(db, title="Solo verdict")
+    await services.submit_for_review(db, task_id)
+
+    with caplog.at_level("WARNING"):
+        view = await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="dev-agent"),
+            self_approved=True,
+        )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is True
+    assert view.review_approved_current is True
+    assert any(
+        u.kind == "review" and "[self-approved: solo mode" in u.content
+        for u in view.updates or []
+    )
+    assert any(
+        "OPENCLAW_REVIEW_SELF_APPROVE=allow" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_independent_verdict_is_not_marked_self_approved(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Independent verdict")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is False
+    assert all("self-approved" not in u.content for u in view.updates or [])
+
+
+async def test_new_independent_verdict_clears_self_approved_mark(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Solo then independent")
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="dev-agent"),
+        self_approved=True,
+    )
+
+    # Client-driven verdict returned the task to running; resubmit and let
+    # an independent reviewer approve — the mark belongs to the verdict.
+    await services.submit_for_review(db, task_id)
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    assert view.latest_review is not None
+    assert view.latest_review.self_approved is False
+
+
+def test_ensure_reviewer_independence_flags_solo_opt_out(monkeypatch):
+    from hub import config
+
+    task = {"assigned_agent": "impl-bot", "claimed_by": ""}
+
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
+    # The implementer passes only because of the opt-out — flagged.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="impl-bot"
+        )
+        is True
+    )
+    # An independent agent reviewer is never flagged, even in solo mode.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="reviewer-bot"
+        )
+        is False
+    )
+    # Humans always pass unflagged.
+    assert (
+        services.ensure_reviewer_independence(
+            task, is_agent=False, principal_id=None, username="impl-bot"
+        )
+        is False
+    )
+    # Principal-based implementer match is flagged too (#320 identity wins).
+    ptask = {
+        "implementer_principal_id": 7,
+        "assigned_agent": "other-name",
+        "claimed_by": "",
+    }
+    assert (
+        services.ensure_reviewer_independence(
+            ptask, is_agent=True, principal_id=7, username="display-x"
+        )
+        is True
+    )
+
+    # With the flag off the implementer is still rejected — unchanged (#318).
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    with pytest.raises(HTTPException) as exc_info:
+        services.ensure_reviewer_independence(
+            task, is_agent=True, principal_id=None, username="impl-bot"
+        )
+    assert exc_info.value.status_code == 403
+
+
 def test_parse_review_findings_malformed_json_is_ignored():
     assert services.parse_review_findings("not-json") == []
     assert services.parse_review_findings('{"id": 1}') == []
@@ -1726,6 +2435,305 @@ def test_review_finding_model_rejects_invalid_payloads():
         ReviewFinding(id=1, severity="catastrophic", message="bad severity")
     with pytest.raises(ValidationError):
         ReviewFinding(id=1, severity="low", message="")
+
+
+def test_review_finding_scope_defaults_and_validation():
+    from pydantic import ValidationError
+
+    finding = ReviewFinding(id=1, severity="low", message="legacy payload")
+    assert finding.scope == FindingScope.in_scope
+    assert finding.linked_task_id is None
+
+    linked = ReviewFinding(
+        id=2,
+        severity="medium",
+        message="belongs elsewhere",
+        scope="out_of_scope",
+        linked_task_id=436,
+    )
+    assert linked.scope == FindingScope.out_of_scope
+    assert linked.linked_task_id == 436
+
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="low", message="bad scope", scope="elsewhere")
+    with pytest.raises(ValidationError):
+        ReviewFinding(id=1, severity="low", message="bad link", linked_task_id=0)
+
+
+def test_parse_review_findings_legacy_json_defaults_to_in_scope():
+    # Rows persisted before #435 have no scope key: they must parse as
+    # in_scope so old verdicts keep their meaning.
+    legacy = '[{"id": 1, "severity": "high", "message": "old finding"}]'
+    findings = services.parse_review_findings(legacy)
+    assert findings[0].scope == FindingScope.in_scope
+    assert findings[0].linked_task_id is None
+
+
+async def test_changes_requested_all_out_of_scope_findings_rejected(
+    db: aiosqlite.Connection,
+):
+    # #435 (incident #392): if every finding is out of scope there is
+    # nothing to fix in this task — the verdict must be approved instead.
+    task_id = await _pair_running_task(db, title="All out of scope")
+    await services.submit_for_review(db, task_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            TaskReviewVerdict(
+                verdict=ReviewVerdict.changes_requested,
+                agent="reviewer",
+                findings=[
+                    ReviewFinding(
+                        id=1,
+                        severity=ReviewSeverity.high,
+                        message="Refactor another module",
+                        scope=FindingScope.out_of_scope,
+                        linked_task_id=436,
+                    ),
+                ],
+            ),
+        )
+    assert exc_info.value.status_code == 422
+    detail = exc_info.value.detail
+    assert detail["reason"] == "changes_requested_requires_in_scope_finding"
+    assert "approved" in detail["hint"]
+
+    # The rejected verdict must not have been recorded.
+    task = dict(await repo.get_task(db, task_id))
+    assert task["review_verdict"] is None
+    assert task["status"] == "review"
+
+
+async def test_out_of_scope_finding_without_link_warns_not_blocks(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Unlinked out of scope")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[
+                ReviewFinding(
+                    id=1, severity=ReviewSeverity.high, message="Fix the race"
+                ),
+                ReviewFinding(
+                    id=2,
+                    severity=ReviewSeverity.low,
+                    message="Cleanup elsewhere",
+                    scope=FindingScope.out_of_scope,
+                ),
+            ],
+        ),
+    )
+    # Non-blocking: the verdict is recorded, task returns to running.
+    assert view.status.value == "running"
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "Warning: out-of-scope finding(s) 2 have no linked_task_id" in (
+        review_update.content
+    )
+    assert "[out-of-scope]" in review_update.content
+
+
+async def test_finding_scope_and_linked_task_persist_roundtrip(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Scope roundtrip")
+    await services.submit_for_review(db, task_id)
+
+    view = await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            findings=[
+                ReviewFinding(
+                    id=1, severity=ReviewSeverity.high, message="In-task bug"
+                ),
+                ReviewFinding(
+                    id=2,
+                    severity=ReviewSeverity.medium,
+                    message="Follow-up work",
+                    scope=FindingScope.out_of_scope,
+                    linked_task_id=436,
+                ),
+            ],
+        ),
+    )
+    findings = view.latest_review.findings
+    assert findings[0].scope == FindingScope.in_scope
+    assert findings[0].linked_task_id is None
+    assert findings[1].scope == FindingScope.out_of_scope
+    assert findings[1].linked_task_id == 436
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "[out-of-scope → #436]" in review_update.content
+    assert "Warning:" not in review_update.content
+
+
+# ---- Auto-draft follow-ups for out-of-scope findings (#436) ----
+
+
+async def _count_tasks(db: aiosqlite.Connection) -> int:
+    cur = await db.execute("SELECT COUNT(*) FROM tasks")
+    row = await cur.fetchone()
+    return int(row[0])
+
+
+def _mixed_scope_verdict(
+    *,
+    create_tasks: bool,
+    linked_task_id: int | None = None,
+) -> TaskReviewVerdict:
+    return TaskReviewVerdict(
+        verdict=ReviewVerdict.changes_requested,
+        agent="reviewer",
+        create_tasks_for_out_of_scope=create_tasks,
+        findings=[
+            ReviewFinding(id=1, severity=ReviewSeverity.high, message="In-task bug"),
+            ReviewFinding(
+                id=2,
+                severity=ReviewSeverity.medium,
+                message="Race in the poller retry loop",
+                file="hub/poller.py",
+                line=42,
+                recommendation="Serialize the retry path",
+                scope=FindingScope.out_of_scope,
+                linked_task_id=linked_task_id,
+            ),
+        ],
+    )
+
+
+async def test_out_of_scope_auto_draft_flag_off_creates_nothing(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Flag off")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=False)
+    )
+
+    assert await _count_tasks(db) == before
+    assert view.latest_review.findings[1].linked_task_id is None
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert "Auto-created" not in review_update.content
+    assert "Warning: out-of-scope finding(s) 2" in review_update.content
+
+
+async def test_out_of_scope_auto_draft_creates_draft_and_links(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Auto draft")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    assert await _count_tasks(db) == before + 1
+    linked_id = view.latest_review.findings[1].linked_task_id
+    assert linked_id is not None
+    assert view.latest_review.findings[0].linked_task_id is None
+
+    draft = dict(await repo.get_task(db, linked_id))
+    assert draft["status"] == "draft"
+    assert draft["task_type"] == "task"
+    assert draft["source"] == "agent"
+    assert draft["parent_id"] is None  # reviewed task has no feature parent
+    assert draft["title"] == "Review follow-up: Race in the poller retry loop"
+    marker = services.out_of_scope_draft_marker(task_id, 2)
+    assert marker in draft["description"]
+    assert f"from review of task #{task_id} (submission #1)" in draft["description"]
+    assert "Severity: medium" in draft["description"]
+    assert "Location: hub/poller.py:42" in draft["description"]
+    assert "Recommendation: Serialize the retry path" in draft["description"]
+
+    review_update = next(u for u in view.updates if u.kind == "review")
+    assert f"Auto-created draft task(s) for out-of-scope findings: #{linked_id}" in (
+        review_update.content
+    )
+    assert "Warning:" not in review_update.content
+
+
+async def test_out_of_scope_auto_draft_inherits_feature_parent(
+    db: aiosqlite.Connection,
+):
+    epic = await services.create_task(
+        db, TaskCreate(title="Parent epic", task_type=TaskType.epic)
+    )
+    feature = await services.create_task(
+        db,
+        TaskCreate(
+            title="Parent feature",
+            task_type=TaskType.feature,
+            parent_id=epic.id,
+        ),
+    )
+    tv = await services.create_task(
+        db, TaskCreate(title="Child under feature", parent_id=feature.id)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: do the work")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev-agent")
+    await services.submit_for_review(db, tv.id)
+
+    view = await services.record_review_verdict(
+        db, tv.id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    linked_id = view.latest_review.findings[1].linked_task_id
+    draft = dict(await repo.get_task(db, linked_id))
+    assert draft["parent_id"] == feature.id
+    assert draft["status"] == "draft"
+
+
+async def test_out_of_scope_auto_draft_skips_already_linked_findings(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Already linked")
+    await services.submit_for_review(db, task_id)
+    before = await _count_tasks(db)
+
+    view = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True, linked_task_id=424)
+    )
+
+    assert await _count_tasks(db) == before
+    assert view.latest_review.findings[1].linked_task_id == 424
+
+
+async def test_out_of_scope_auto_draft_resubmit_does_not_duplicate(
+    db: aiosqlite.Connection,
+):
+    task_id = await _pair_running_task(db, title="Idempotent resubmit")
+    await services.submit_for_review(db, task_id)
+
+    first = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+    linked_id = first.latest_review.findings[1].linked_task_id
+    assert linked_id is not None
+    after_first = await _count_tasks(db)
+
+    # Developer fixes finding 1 and resubmits; the reviewer sends the same
+    # out-of-scope finding again WITHOUT a link — the existing draft must
+    # be reused, not duplicated.
+    await services.submit_for_review(db, task_id)
+    second = await services.record_review_verdict(
+        db, task_id, _mixed_scope_verdict(create_tasks=True)
+    )
+
+    assert await _count_tasks(db) == after_first
+    assert second.latest_review.findings[1].linked_task_id == linked_id
 
 
 # ---- Universal Review Gate (#306): completion enforcement ----
@@ -1884,7 +2892,6 @@ async def test_gate_review_cycle_limit_escalates_to_decision(
 async def test_force_complete_bypasses_gate_as_audited_override(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await _pair_running_task(db, title="Gate force override")
     await repo.update_task(db, task_id, branch=None)
@@ -2105,7 +3112,6 @@ async def test_claimed_done_with_current_approval_completes_and_clears_claim(
 async def test_force_complete_from_pending_report_bypasses_gate(
     db: aiosqlite.Connection,
 ):
-    from hub.models import TaskForceComplete
 
     task_id = await repo.create_task(
         db,
@@ -2239,6 +3245,102 @@ async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
     await services.pair_start_task(db, tv.id, caller="dev")
     kwargs = prep.await_args.kwargs
     assert "repo" not in kwargs and "base_branch" not in kwargs
+
+
+# --- pair workspace restore (#451) ---
+
+
+async def test_submit_for_review_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    task_id = await _pair_running_task(db)
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.submit_for_review(db, task_id)
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == task_id
+
+
+async def test_report_done_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(
+        db,
+        TaskCreate(title="Done restore", auto_review=False),
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: finish")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.add_update(
+        db,
+        tv.id,
+        TaskUpdateCreate(agent="dev", kind="done", content="All done"),
+    )
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == tv.id
+
+
+async def test_release_task_restores_pair_workspace(db: aiosqlite.Connection):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(db, TaskCreate(title="Release restore"))
+    claimed = await services.claim_task(
+        db, tv.id, TaskClaim(agent="dev-agent", session_id="sess-1")
+    )
+    assert claimed.status.value == "claimed"
+
+    restore = AsyncMock(return_value=True)
+    plugins.git_ops.pair_restore_workspace_base = restore
+
+    await services.release_task(
+        db, tv.id, TaskRelease(agent="dev-agent", session_id="sess-1")
+    )
+
+    restore.assert_awaited_once()
+    assert restore.await_args.args[0] == tv.id
+
+
+async def test_pair_start_conflict_returns_structured_detail(db: aiosqlite.Connection):
+    from hub.integrations.git_ops import PairBranchConflictError
+    from hub.integrations.registry import plugins
+
+    tv = await services.create_task(db, TaskCreate(title="Conflict task"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: go")
+    await db.commit()
+
+    async def boom(*args, **kwargs):
+        raise PairBranchConflictError(
+            "Uncommitted changes in workspace; commit or stash before pair-start",
+            reason="pair_branch_dirty",
+            hint="Commit or stash, then hub_pair_start.",
+            workspace_path="/var/lib/openclaw-hub/workspaces/_default",
+            hostname="agenthai",
+        )
+
+    plugins.git_ops.pair_prepare_branch = boom
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services.pair_start_task(db, tv.id, caller="dev")
+
+    assert exc_info.value.status_code == 422
+    detail = exc_info.value.detail
+    assert detail["reason"] == "pair_branch_dirty"
+    assert detail["workspace_path"] == "/var/lib/openclaw-hub/workspaces/_default"
+    assert detail["hostname"] == "agenthai"
+    assert "hub_pair_start" in detail["hint"]
 
 
 # --- project binding at epic creation (#346) ---

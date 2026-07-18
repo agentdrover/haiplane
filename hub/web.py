@@ -215,6 +215,12 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request") == "true"
 
 
+def _require_human_web(request: Request) -> None:
+    """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
+    if current_identity(request).is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+
+
 def _dispatch_available() -> bool:
     return plugins.dispatch.is_available()
 
@@ -1017,6 +1023,7 @@ async def web_approve_task(
     affordance in the sidebar) set ``force=true`` as a hidden form value;
     plain 'Approve' keeps the gate active.
     """
+    _require_human_web(request)
     body = TaskApprove(
         comment=comment,
         run=run,
@@ -1050,6 +1057,7 @@ async def web_reject_task(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), task_id, body)
     if _is_htmx(request):
@@ -1063,6 +1071,7 @@ async def web_start_task(
     request: Request,
     runtime: str = Form("auto"),
 ):
+    _require_human_web(request)
     body = TaskStart(
         plan="Developer-agent dispatch requested from Hub UI.",
         runtime=RuntimeChoice(runtime) if runtime else None,
@@ -1080,6 +1089,7 @@ async def web_answer_task(
     answer: str = Form(...),
     resume: bool = Form(True),
 ):
+    _require_human_web(request)
     body = TaskAnswer(answer=answer, resume=resume)
     await services.answer_question(_db(request), task_id, body)
     if _is_htmx(request):
@@ -1096,6 +1106,7 @@ async def web_decide_task(
     decision_summary: str = Form(""),
     record_decision: bool = Form(False),
 ):
+    _require_human_web(request)
     body = TaskDecide(
         action=action,
         instructions=instructions,
@@ -1184,7 +1195,7 @@ async def web_review_verdict(
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
-    services.ensure_reviewer_independence(
+    self_approved = services.ensure_reviewer_independence(
         dict(row),
         is_agent=identity.is_agent,
         principal_id=identity.principal_id,
@@ -1207,7 +1218,7 @@ async def web_review_verdict(
         return RedirectResponse(
             f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
         )
-    await services.record_review_verdict(db, task_id, body)
+    await services.record_review_verdict(db, task_id, body, self_approved=self_approved)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
@@ -1219,12 +1230,18 @@ async def web_force_complete_task(
     request: Request,
     comment: str = Form(""),
 ):
-    """Force-complete a pending_report task from the Web UI.
+    """Force-complete a non-terminal task/subtask from the Web UI (human-only).
+
+    Same semantics as REST/MCP force-complete: any non-terminal task/subtask when
+    no active dispatch job backs job_id or review_job_id; 409 if active.
+    Missing/terminal jobs are audited. Comment required for most active
+    lifecycle states (pending_report/claimed may use the default).
 
     The audit-trail comment can be supplied either via the ``HX-Prompt``
     header (populated by htmx ``hx-prompt``) or via a ``comment`` form field
     for non-htmx clients. The header takes precedence.
     """
+    _require_human_web(request)
     reason = request.headers.get("HX-Prompt", "") or comment
     body = TaskForceComplete(comment=reason) if reason else None
     await services.force_complete_task(_db(request), task_id, body)
@@ -1285,6 +1302,7 @@ async def web_approve_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskApprove(comment=comment, run=True)
     await services.approve_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)
@@ -1296,6 +1314,7 @@ async def web_reject_proposal_compat(
     request: Request,
     comment: str = Form(""),
 ):
+    _require_human_web(request)
     body = TaskReject(comment=comment)
     await services.reject_task(_db(request), proposal_id, body)
     return RedirectResponse("/", status_code=303)

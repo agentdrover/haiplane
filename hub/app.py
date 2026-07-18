@@ -40,6 +40,7 @@ from hub.models import (
     ReadinessTreeReport,
     BatchApprove,
     BatchApproveResult,
+    FindingScope,
     ReviewBrief,
     TaskAnswer,
     TaskReviewVerdict,
@@ -800,13 +801,22 @@ async def api_task_context(
     if task_view.latest_review:
         lr = task_view.latest_review
         freshness = "current" if lr.is_current else "stale — work resubmitted"
+        solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
         lines.append(
             f"Latest review: {lr.verdict.value.upper()} "
-            f"for submission #{lr.submission_generation} ({freshness})"
+            f"for submission #{lr.submission_generation} ({freshness}){solo}"
         )
         for finding in lr.findings[:10]:
+            scope_mark = ""
+            if finding.scope == FindingScope.out_of_scope:
+                scope_mark = (
+                    f" [out-of-scope → #{finding.linked_task_id}]"
+                    if finding.linked_task_id
+                    else " [out-of-scope]"
+                )
             lines.append(
-                f"  {finding.id}. [{finding.severity.value}] {finding.message}"
+                f"  {finding.id}. [{finding.severity.value}]{scope_mark} "
+                f"{finding.message}"
             )
     lines.append(
         f"Readiness: score={readiness_summary['score']} "
@@ -946,32 +956,62 @@ async def api_review_verdict(
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
     ``running``; this endpoint never completes a task.
+
+    Finding scope (#435): each finding carries ``scope``
+    (in_scope|out_of_scope, default in_scope) and an optional
+    ``linked_task_id`` referencing the follow-up task for out-of-scope
+    findings. ``changes_requested`` with findings requires at least one
+    in_scope finding (422 otherwise); out-of-scope findings without a
+    linked task produce a non-blocking warning in the review update.
+
+    Auto-drafts (#436): ``create_tasks_for_out_of_scope=true`` creates a
+    DRAFT follow-up task for each unlinked out-of-scope finding and stamps
+    its id into the stored finding; idempotent on resubmit.
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
+    self_approved = False
     if row is not None:
-        services.ensure_reviewer_independence(
+        self_approved = services.ensure_reviewer_independence(
             dict(row),
             is_agent=identity.is_agent,
             principal_id=identity.principal_id,
             username=identity.username,
         )
-    return await services.record_review_verdict(db, task_id, body)
+    return await services.record_review_verdict(
+        db, task_id, body, self_approved=self_approved
+    )
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
-async def api_review_brief(task_id: int, request: Request):
+async def api_review_brief(
+    task_id: int,
+    request: Request,
+    identity=Depends(current_identity),
+):
     """Everything a reviewer agent needs in one response (#308).
 
     Bundles acceptance criteria, scope, validation commands, review
     checklist, branch/PR metadata with an advisory diff command, and the
     latest submission context — so review never depends on scraping task
     prose. Works without a GitHub PR: ``pr_number`` is optional metadata.
+
+    Fail-fast self-review check (#433): when the caller is the agent that
+    implemented the task, the brief carries a ``self_review_warning`` so
+    the reviewer stops BEFORE spending review effort — hub_submit_review
+    (the source of truth) would reject the verdict anyway. Not a hard-fail:
+    the implementer may still read the brief for self-checking.
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
+    self_review_warning = services.self_review_brief_warning(
+        dict(row),
+        is_agent=identity.is_agent,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
     task_view = services.row_to_task(row)
     project_row = await repo.resolve_project_for_task(db, task_id)
     if project_row is not None:
@@ -1004,6 +1044,15 @@ async def api_review_brief(task_id: int, request: Request):
             task_view.submission_generation or 0
         )
 
+    # Advisory branch-stacking check (#438): the reviewer should know when
+    # the diff includes another task's unmerged work. Best-effort — no repo
+    # access means no warning, never an error.
+    stacking_warning = ""
+    if task_view.branch:
+        stacking = await services.detect_branch_stacking(db, task_id, task_view.branch)
+        if stacking:
+            stacking_warning = stacking["message"]
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1026,6 +1075,8 @@ async def api_review_brief(task_id: int, request: Request):
         latest_submission_summary=latest_submission_summary,
         latest_review=task_view.latest_review,
         machine_review=machine_review,
+        self_review_warning=self_review_warning,
+        stacking_warning=stacking_warning,
     )
 
 
@@ -1167,7 +1218,12 @@ async def api_force_complete_task(
     body: TaskForceComplete | None = None,
     _identity=Depends(require_human_or_admin),
 ):
-    """Force-complete a stuck task (pending_report/claimed/pair-running)."""
+    """Force-complete a non-terminal task/subtask (human-only audited override).
+
+    Allowed when no active dispatch job backs job_id or review_job_id; 409 if
+    active. Missing/terminal jobs are audited. Comment required for active
+    lifecycle states except pending_report/claimed.
+    """
     return await services.force_complete_task(_db(request), task_id, body)
 
 

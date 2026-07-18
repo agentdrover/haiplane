@@ -361,6 +361,8 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
             print(f"invalid --findings-json: {exc}", file=sys.stderr)
             return 2
         body["findings"] = findings
+    if getattr(args, "create_tasks_for_out_of_scope", False):
+        body["create_tasks_for_out_of_scope"] = True
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0
@@ -1276,7 +1278,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--findings-json",
         dest="findings_json",
         default="",
-        help='JSON list of findings: [{"id":1,"severity":"high","message":"..."}]',
+        help=(
+            "JSON list of findings: "
+            '[{"id":1,"severity":"high","message":"...",'
+            '"scope":"in_scope|out_of_scope","linked_task_id":123}]. '
+            "scope defaults to in_scope; changes_requested requires at "
+            "least one in_scope finding; linked_task_id references the "
+            "follow-up task for out_of_scope findings."
+        ),
+    )
+    p_review_verdict.add_argument(
+        "--create-tasks-for-out-of-scope",
+        dest="create_tasks_for_out_of_scope",
+        action="store_true",
+        help=(
+            "Auto-create DRAFT follow-up tasks for out_of_scope findings "
+            "without linked_task_id (#436); drafts still need human approval"
+        ),
     )
     p_review_verdict.set_defaults(func=cmd_review_verdict)
 
@@ -1413,7 +1431,11 @@ def build_parser() -> argparse.ArgumentParser:
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
         "force-complete",
-        help="Force-complete a stuck task (pending_report/claimed/pair-running) without a done report (audited human override)",
+        help=(
+            "Human-only override: complete non-terminal task/subtask without "
+            "active dispatch jobs (409 if job_id/review_job_id active); comment "
+            "required for most active lifecycle states"
+        ),
     )
     p_force_complete.add_argument("task_id", type=int)
     p_force_complete.add_argument(

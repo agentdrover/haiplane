@@ -90,9 +90,32 @@ class DispatchPlugin(Protocol):
 @runtime_checkable
 class GitOpsPlugin(Protocol):
     async def current_branch(self, repo: str | None = None) -> str: ...
+    async def branch_contains_unmerged_commits_of(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str = "develop",
+        repo: str | None = None,
+    ) -> bool: ...
     async def create_branch(
         self, task_id: int, title: str, repo: str | None = None
     ) -> str: ...
+    async def pair_prepare_branch(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str: ...
+    async def pair_restore_workspace_base(
+        self,
+        task_id: int,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool: ...
     async def checkout(self, branch: str, repo: str | None = None) -> bool: ...
     async def auto_commit(
         self,

@@ -200,6 +200,22 @@ async def list_tasks_by_status(
     )
 
 
+async def list_unmerged_branch_tasks(
+    db: aiosqlite.Connection,
+    *,
+    exclude_task_id: int,
+    statuses: list[str],
+) -> list[aiosqlite.Row]:
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    placeholders = ",".join("?" for _ in statuses)
+    return await db.execute_fetchall(
+        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
+        "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
+        (exclude_task_id, *statuses),
+    )
+
+
 async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
@@ -646,6 +662,26 @@ async def get_siblings(
     )
 
 
+async def find_task_id_by_description_marker(
+    db: aiosqlite.Connection,
+    marker: str,
+) -> int | None:
+    """Return the oldest non-archived task whose description contains ``marker``.
+
+    Used by the out-of-scope auto-draft flow (#436) to keep draft creation
+    idempotent across verdict resubmissions: the marker encodes the source
+    task + finding id, so an existing draft is reused instead of duplicated.
+    ``instr`` is a literal substring match — no LIKE wildcard escaping needed.
+    """
+    cur = await db.execute(
+        "SELECT id FROM tasks WHERE instr(description, ?) > 0 AND archived=0 "
+        "ORDER BY id ASC LIMIT 1",
+        (marker,),
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Tasks — Write
 # ---------------------------------------------------------------------------
@@ -733,6 +769,7 @@ async def record_review_verdict(
     task_id: int,
     verdict: str,
     findings_json: str = "[]",
+    self_approved: bool = False,
 ) -> None:
     """Persist a review verdict bound to the CURRENT submission generation.
 
@@ -741,13 +778,17 @@ async def record_review_verdict(
     before a concurrent resubmission bumped it. ``findings_json`` replaces
     the stored findings wholesale: findings belong to their verdict, so a
     verdict without findings clears the previous list (#308).
+    ``self_approved`` marks verdicts accepted only via the
+    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
+    to the verdict, so every new verdict overwrites the flag.
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
+        "review_self_approved=?, "
         "updated_at=datetime('now') WHERE id=?",
-        (verdict, findings_json, task_id),
+        (verdict, findings_json, 1 if self_approved else 0, task_id),
     )
 
 

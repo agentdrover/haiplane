@@ -1660,6 +1660,109 @@ async def test_hub_task_status_renders_latest_review(
     assert "2. [low] Polish docs" in text
     structured = _mcp_structured(out)
     assert structured["task"]["latest_review"]["findings"][0]["id"] == 1
+    # Independent verdict — no solo-mode marker (#434).
+    assert "SELF-APPROVED" not in text
+
+
+async def test_hub_task_status_marks_self_approved_verdict(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#434: a solo-mode verdict is called out in the status text."""
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Solo reviewed",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": True,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert (
+        "Latest review: APPROVED for submission #1 (current) "
+        "[SELF-APPROVED: solo mode, not independent]" in text
+    )
+    structured = _mcp_structured(out)
+    assert structured["task"]["latest_review"]["self_approved"] is True
+
+
+async def test_hub_review_brief_marks_self_approved_verdict(
+    mock_api_get: AsyncMock,
+) -> None:
+    """#434: the review brief flags a prior solo-mode verdict."""
+    mock_api_get.return_value = {
+        "task_id": 43,
+        "title": "Solo brief",
+        "status": "review",
+        "submission_generation": 2,
+        "review_cycle": 1,
+        "acceptance_criteria": [],
+        "scope_in": [],
+        "review_checklist": [],
+        "validation_commands": [],
+        "branch": None,
+        "pr_number": None,
+        "diff_command": None,
+        "latest_submission_summary": "",
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 1,
+            "is_current": False,
+            "self_approved": True,
+            "findings": [],
+        },
+    }
+    out = await hub_get_review_brief(43)
+    text = json.loads(_mcp_text(out))["message"]
+    assert (
+        "Latest verdict: APPROVED for submission #1 "
+        "(stale — work resubmitted) [SELF-APPROVED: solo mode, not independent]" in text
+    )
+
+
+async def test_hub_task_status_renders_finding_scope(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: out-of-scope findings show their scope and linked follow-up task.
+    mock_api_post.return_value = {}
+    mock_api_get.return_value = {
+        "id": 78,
+        "title": "Scoped findings",
+        "status": "review",
+        "created_at": "2026-01-01T00:00:00Z",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 1,
+            "is_current": True,
+            "findings": [
+                {"id": 1, "severity": "high", "message": "Fix here"},
+                {
+                    "id": 2,
+                    "severity": "low",
+                    "message": "Linked elsewhere",
+                    "scope": "out_of_scope",
+                    "linked_task_id": 436,
+                },
+                {
+                    "id": 3,
+                    "severity": "low",
+                    "message": "Unlinked elsewhere",
+                    "scope": "out_of_scope",
+                },
+            ],
+        },
+    }
+    out = await hub_task_status(78)
+    text = _mcp_text(out)
+    assert "1. [high] Fix here" in text
+    assert "2. [low] [out-of-scope → #436] Linked elsewhere" in text
+    assert "3. [low] [out-of-scope] Unlinked elsewhere" in text
 
 
 async def test_hub_submit_for_review(
@@ -1718,8 +1821,60 @@ async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
     assert "uv run pytest -q" in text
     assert "git diff develop...task-42/x" in text
     assert "hub_submit_review" in text
+    assert "WARNING" not in text
     assert payload["brief"]["task_id"] == 42
     mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_self_review_warning(
+    mock_api_get: AsyncMock,
+) -> None:
+    # #433: the REST brief carries self_review_warning for the implementer;
+    # MCP must surface it FIRST in the text and pass it through structured.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Reviewed task",
+        "status": "review",
+        "submission_generation": 1,
+        "review_cycle": 0,
+        "self_review_warning": {
+            "reason": "self_review_forbidden",
+            "message": "agent 'impl-bot' implemented this task and cannot review it",
+            "hint": "Stop before running the review: hand off to an "
+            "independent reviewer.",
+            "required_role": "independent_reviewer",
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [self_review_forbidden]:")
+    assert "impl-bot" in text
+    assert "independent reviewer" in text
+    structured = _mcp_structured(out)
+    assert (
+        structured["brief"]["self_review_warning"]["reason"] == "self_review_forbidden"
+    )
+    mock_api_get.assert_awaited_once_with("/api/tasks/42/review-brief")
+
+
+async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> None:
+    # #433: OPENCLAW_REVIEW_SELF_APPROVE=allow — solo-mode note, not a stop.
+    mock_api_get.return_value = {
+        "task_id": 42,
+        "title": "Solo task",
+        "status": "review",
+        "self_review_warning": {
+            "reason": "solo_mode_self_review",
+            "message": "agent 'impl-bot' implemented this task; solo mode "
+            "permits self-review",
+            "hint": "OPENCLAW_REVIEW_SELF_APPROVE=allow is active.",
+            "required_role": None,
+        },
+    }
+    out = await hub_get_review_brief(42)
+    text = json.loads(_mcp_text(out))["message"]
+    assert text.startswith("WARNING [solo_mode_self_review]:")
+    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in text
 
 
 async def test_hub_submit_review_changes_requested(
@@ -1747,6 +1902,61 @@ async def test_hub_submit_review_changes_requested(
             "comments": "see findings",
             "agent": "reviewer",
             "findings": findings,
+        },
+    )
+
+
+async def test_hub_submit_review_forwards_scope_fields(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #435: scope/linked_task_id pass through to the canonical REST body.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {"id": 1, "severity": "high", "message": "Fix here"},
+        {
+            "id": 2,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+            "linked_task_id": 436,
+        },
+    ]
+    await hub_submit_review(42, verdict="changes_requested", findings=findings)
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {"verdict": "changes_requested", "findings": findings},
+    )
+
+
+async def test_hub_submit_review_forwards_auto_draft_flag(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    # #436: create_tasks_for_out_of_scope passes through to the REST body
+    # only when set — the default keeps the canonical payload unchanged.
+    mock_api_get.return_value = {"id": 42, "status": "review"}
+    mock_api_post.return_value = {"id": 42, "status": "running"}
+    findings = [
+        {
+            "id": 1,
+            "severity": "low",
+            "message": "Move elsewhere",
+            "scope": "out_of_scope",
+        },
+        {"id": 2, "severity": "high", "message": "Fix here"},
+    ]
+    await hub_submit_review(
+        42,
+        verdict="changes_requested",
+        findings=findings,
+        create_tasks_for_out_of_scope=True,
+    )
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/review-verdict",
+        {
+            "verdict": "changes_requested",
+            "findings": findings,
+            "create_tasks_for_out_of_scope": True,
         },
     )
 
