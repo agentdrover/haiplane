@@ -354,6 +354,24 @@ async def prepare_pair_branch(
     )
 
 
+async def pair_worktree_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> tuple[str, str]:
+    """Return (workspace_mode, worktree_path) for a pair task (#530).
+
+    In worktree mode gives the deterministic worktree path so the caller can
+    tell the agent where its isolated tree lives; legacy mode returns
+    ("legacy", "") and no path.
+    """
+    if not worktree_per_task_enabled():
+        return "legacy", ""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    path = plugins.git_ops.worktree_path(task_id, local_kw.get("repo"))
+    return "worktree", path or ""
+
+
 async def restore_pair_workspace_base(
     db: aiosqlite.Connection,
     task_id: int,
