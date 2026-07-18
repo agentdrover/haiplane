@@ -185,3 +185,43 @@ async def test_diagnostics_identity_endpoint(client, monkeypatch):
     assert data["connected_via"]
     # The test client reaches the app as 'testserver', not 127.0.0.1 → mismatch.
     assert data["config_mismatch"] is True
+
+
+# --- default workspace origin health-check (#455) ---
+
+
+async def test_check_default_workspace_origin_warns(monkeypatch, tmp_path, caplog):
+    from unittest.mock import AsyncMock
+
+    import hub.services.diagnostics as diag
+    from hub.integrations.registry import plugins
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    plugins.git_ops.origin_reachable = AsyncMock(return_value=False)
+
+    with caplog.at_level("WARNING", logger="hub"):
+        ok = await diag.check_default_workspace_origin()
+
+    assert ok is False
+    assert any("cannot reach origin" in r.getMessage() for r in caplog.records)
+
+
+async def test_check_default_workspace_origin_ok(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
+    import hub.services.diagnostics as diag
+    from hub.integrations.registry import plugins
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    plugins.git_ops.origin_reachable = AsyncMock(return_value=True)
+
+    assert await diag.check_default_workspace_origin() is True
+
+
+async def test_check_default_workspace_origin_none_when_not_git(monkeypatch, tmp_path):
+    import hub.services.diagnostics as diag
+
+    monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
+    assert await diag.check_default_workspace_origin() is None

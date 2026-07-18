@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,17 @@ async def lifespan(app: FastAPI):
                 log.info(
                     "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
                 )
+
+            # Workspace git health-check (#455): opt-in network probe so a
+            # broken deploy key on the default workspace is loud, not silent.
+            # Off by default to keep startup (and tests) free of network I/O.
+            if os.environ.get("OPENCLAW_WORKSPACE_HEALTHCHECK") == "1":
+                from hub.services.diagnostics import check_default_workspace_origin
+
+                try:
+                    await check_default_workspace_origin()
+                except Exception:
+                    log.warning("workspace origin health-check failed", exc_info=True)
 
             # Bootstrap token guard
             if config.HUB_BOOTSTRAP_TOKEN:

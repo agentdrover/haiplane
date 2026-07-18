@@ -151,6 +151,9 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         base_branch: str | None = None,
     ) -> bool: ...
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool: ...
     async def checkout(self, branch: str, repo: str | None = None) -> bool: ...
     async def auto_commit(
         self,

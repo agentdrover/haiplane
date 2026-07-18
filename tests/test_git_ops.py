@@ -632,3 +632,26 @@ async def test_pair_switch_to_task_branch_noop_off_base(
         ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
     assert ok is False
     assert ("checkout", "task-5/x") not in calls
+
+
+# --- origin reachability health-check (#455) ---
+
+
+async def test_origin_reachable_true(git_ops: GitOpsIntegration) -> None:
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:1] == ("ls-remote",):
+            return 0, "abc123\trefs/heads/develop", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        assert await git_ops.origin_reachable(repo="/srv/ws") is True
+
+
+async def test_origin_reachable_false(git_ops: GitOpsIntegration) -> None:
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:1] == ("ls-remote",):
+            return 128, "", "Could not read from remote repository"
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        assert await git_ops.origin_reachable(repo="/srv/ws") is False

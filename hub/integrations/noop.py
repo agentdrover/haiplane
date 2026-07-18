@@ -160,6 +160,11 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool:
+        return False
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 

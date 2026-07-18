@@ -688,6 +688,26 @@ class GitOpsIntegration:
         )
         return True
 
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool:
+        """True when ``git ls-remote origin`` succeeds (#455).
+
+        A live check that the workspace can actually reach GitHub (deploy key,
+        ssh/network). Used to surface a silently stale base — pair branches cut
+        from a workspace whose fetch fails check=False land on old refs.
+        """
+        repo = repo or _repo_root()
+        rc, _, _ = await _git(
+            "ls-remote",
+            "--heads",
+            "origin",
+            repo=repo,
+            check=False,
+            timeout=timeout,
+        )
+        return rc == 0
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         rc, _, _ = await _git("checkout", branch, repo=repo, check=False)
         return rc == 0

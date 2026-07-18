@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from urllib.parse import urlparse
 
 from hub import config
@@ -11,6 +13,33 @@ from hub.hub_instance import instance_echo_fields
 from hub.integrations.registry import plugins
 from hub.models import HealthView, IdentityDiagnosticsView, WhoamiView
 from hub.version import get_app_version
+
+log = logging.getLogger("hub")
+
+
+async def check_default_workspace_origin() -> bool | None:
+    """Probe the default workspace's origin reachability, warning if broken (#455).
+
+    The default ``_default`` workspace is set up manually (not via
+    provision_project), so a broken deploy key leaves pair branches cut from a
+    silently stale base. This makes that failure loud. Returns None when the
+    workspace is not a git repository (nothing to probe).
+    """
+    repo = str(WORKSPACE_REPO_LINK)
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return None
+    try:
+        ok = await plugins.git_ops.origin_reachable(repo=repo, timeout=15)
+    except Exception:
+        ok = False
+    if not ok:
+        log.warning(
+            "Default workspace %s cannot reach origin: pair branches would be "
+            "cut from a possibly stale base. Fix the openclaw service git access "
+            "(deploy key / ssh) — see docs/agent-deploy-runbook.md.",
+            repo,
+        )
+    return ok
 
 
 def _effective_permissions(identity: TokenIdentity) -> list[str]:
