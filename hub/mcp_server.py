@@ -2918,25 +2918,61 @@ async def hub_readiness_tree(
 
 
 # ---------------------------------------------------------------------------
-# Admin: read-only identity diagnostic (Stage 4)
+# Diagnostics: identity and health (Stage 4 / epic #11)
 # ---------------------------------------------------------------------------
+
+
+def _format_whoami(data: dict[str, Any]) -> str:
+    lines = [
+        f"User: {data['username']} (role: {data['role']})",
+        f"Auth source: {data['auth_source']}",
+        f"Permissions ({data['permissions_count']}): "
+        f"{', '.join(data.get('permissions_summary') or [])}",
+        f"App version: {data['app_version']}",
+    ]
+    if data.get("api_key_id") is not None:
+        lines.insert(2, f"API key id: {data['api_key_id']}")
+    if data.get("principal_id") is not None:
+        lines.insert(2, f"Principal id: {data['principal_id']}")
+    return "\n".join(lines)
+
+
+def _format_health(data: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"Status: {data['status']}",
+            f"App version: {data['app_version']}",
+            f"Bind: {data['bind_host']}:{data['bind_port']}",
+            f"Auth required: {data['auth_required']}",
+            f"Auth disabled: {data['auth_disabled']}",
+            f"Env tokens configured: {data['env_tokens_configured']}",
+            f"Vast enabled: {data['vast_enabled']}",
+        ]
+    )
+
+
+@mcp.tool()
+async def hub_whoami() -> str:
+    """Show the current caller identity: role, permissions summary, and auth source.
+
+    Auth source is ``env`` for OPENCLAW_HUB_TOKENS map entries or ``db`` for
+    DB-backed API keys (includes api_key_id, never the secret).
+    """
+    data = await _api_get("/api/whoami")
+    return _format_whoami(data)
+
+
+@mcp.tool()
+async def hub_health() -> str:
+    """Show public Hub health: bind host/port and auth/vast flags (no secrets)."""
+    data = await _api_get("/health")
+    return _format_health(data)
 
 
 @mcp.tool()
 async def hub_admin_my_identity() -> str:
-    """Diagnostic: show the current identity, roles, and permissions of the caller.
-
-    This is a read-only tool that helps agents verify their identity and
-    understand what operations they are authorized to perform.
-    """
-    try:
-        await _api_get("/api/tasks?limit=1")
-        return format_echo_response(
-            "Identity check: API access confirmed. "
-            "Use the Hub Web UI or CLI for detailed identity info."
-        )
-    except Exception as e:
-        return format_echo_response(f"Identity check failed: {e}")
+    """Deprecated alias for :func:`hub_whoami`."""
+    return await hub_whoami()
 
 
 def main():

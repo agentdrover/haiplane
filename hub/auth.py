@@ -122,7 +122,28 @@ _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 _PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
 
 ANONYMOUS_USER: Final[str] = "anonymous"
-ANONYMOUS_IDENTITY: Final[TokenIdentity] = TokenIdentity("anonymous", "human")
+ANONYMOUS_IDENTITY: Final[TokenIdentity] = TokenIdentity(
+    "anonymous", "human", auth_source="anonymous"
+)
+OPEN_MODE_IDENTITY: Final[TokenIdentity] = TokenIdentity(
+    "anonymous", "human", auth_source="open_mode"
+)
+
+
+def _with_auth_source(
+    identity: TokenIdentity,
+    auth_source: str,
+    *,
+    api_key_id: int | None = None,
+) -> TokenIdentity:
+    return TokenIdentity(
+        identity.username,
+        identity.role,
+        identity.principal_id,
+        identity.permissions,
+        auth_source=auth_source,
+        api_key_id=api_key_id,
+    )
 
 
 def _looks_public(path: str) -> bool:
@@ -205,7 +226,7 @@ async def _resolve_identity(request: Request) -> TokenIdentity | None:
             return identity
         identity = _resolve_env_token(bearer)
         if identity:
-            return identity
+            return _with_auth_source(identity, "env")
 
     cookie = _extract_cookie(request)
     if cookie:
@@ -214,7 +235,7 @@ async def _resolve_identity(request: Request) -> TokenIdentity | None:
             return identity
         identity = _resolve_env_token(cookie)
         if identity:
-            return identity
+            return _with_auth_source(identity, "env")
 
     return None
 
@@ -243,7 +264,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
             if _is_open_mode():
                 request.state.user = ANONYMOUS_USER
-                request.state.identity = ANONYMOUS_IDENTITY
+                request.state.identity = OPEN_MODE_IDENTITY
                 return await call_next(request)
 
             identity = await _resolve_identity(request)

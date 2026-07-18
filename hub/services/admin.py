@@ -486,6 +486,8 @@ async def resolve_api_key(
         role=role,
         principal_id=row["principal_id"],
         permissions=perms,
+        auth_source="db_api_key",
+        api_key_id=row["id"],
     )
 
 
@@ -569,6 +571,7 @@ async def resolve_browser_session(
         role=role,
         principal_id=row["principal_id"],
         permissions=perms,
+        auth_source="db_session",
     )
 
 
