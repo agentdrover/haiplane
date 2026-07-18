@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hub.integrations.git_ops import GitOpsIntegration, PairBranchConflictError
+from hub.integrations.git_ops import (
+    GitOpsIntegration,
+    PairBranchConflictError,
+    _worktree_path,
+)
 
 
 @pytest.fixture
@@ -655,3 +663,104 @@ async def test_origin_reachable_false(git_ops: GitOpsIntegration) -> None:
 
     with patch("hub.integrations.git_ops._git", side_effect=fake_git):
         assert await git_ops.origin_reachable(repo="/srv/ws") is False
+
+
+# --- worktree-per-task isolation (#459) ---
+
+
+def _git_setup(repo):
+    repo.mkdir()
+    for args in (
+        ("init", "-q", "-b", "develop"),
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+
+
+def _current_branch(path):
+    return subprocess.run(
+        ["git", "branch", "--show-current"], cwd=path, capture_output=True, text=True
+    ).stdout.strip()
+
+
+async def test_worktree_parallel_isolation(tmp_path, git_ops):
+    # AC-1 (#459): two prepares → two independent worktrees; main clone stays on base.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+
+    b1 = await git_ops.pair_prepare_worktree(
+        1, "Task one", repo=str(repo), base_branch="develop"
+    )
+    b2 = await git_ops.pair_prepare_worktree(
+        2, "Task two", repo=str(repo), base_branch="develop"
+    )
+    assert b1.startswith("task-1/") and b2.startswith("task-2/")
+
+    wt1, wt2 = _worktree_path(1, str(repo)), _worktree_path(2, str(repo))
+    assert os.path.isdir(wt1) and os.path.isdir(wt2)
+    # Each worktree on its own branch, both alive at once, main clone untouched.
+    assert _current_branch(wt1) == b1
+    assert _current_branch(wt2) == b2
+    assert _current_branch(repo) == "develop"
+
+
+async def test_worktree_remove_clean(tmp_path, git_ops):
+    # AC-2 (#459): cleanup removes a clean worktree; main clone stays on base.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        3, "Cleanup", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(3, str(repo))
+    assert os.path.isdir(wt)
+
+    assert await git_ops.pair_remove_worktree(3, repo=str(repo)) is True
+    assert not os.path.isdir(wt)
+    assert _current_branch(repo) == "develop"
+
+
+async def test_worktree_remove_skips_dirty(tmp_path, git_ops):
+    # AC-3 (#459): a dirty worktree is not removed — no data loss.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        4, "Dirty", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(4, str(repo))
+    (Path(wt) / "wip.txt").write_text("unsaved")
+
+    assert await git_ops.pair_remove_worktree(4, repo=str(repo)) is False
+    assert os.path.isdir(wt)
+
+
+async def test_worktree_reuse_and_stale(tmp_path, git_ops):
+    # AC-4 (#459): re-prepare reuses the branch and prunes a stale registration.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    b = await git_ops.pair_prepare_worktree(
+        5, "Reuse", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(5, str(repo))
+
+    # Reuse: same call returns same branch, no error.
+    assert (
+        await git_ops.pair_prepare_worktree(
+            5, "Reuse", repo=str(repo), base_branch="develop"
+        )
+        == b
+    )
+
+    # Stale: delete the worktree dir out from under git, then re-prepare recreates.
+    shutil.rmtree(wt)
+    b2 = await git_ops.pair_prepare_worktree(
+        5, "Reuse", repo=str(repo), base_branch="develop"
+    )
+    assert b2 == b
+    assert os.path.isdir(wt)
+    assert _current_branch(wt) == b

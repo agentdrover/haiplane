@@ -160,6 +160,22 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    async def pair_prepare_worktree(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str:
+        return f"task-{task_id}/{branch_slug or 'work'}"
+
+    async def pair_remove_worktree(
+        self, task_id: int, *, repo: str | None = None
+    ) -> bool:
+        return False
+
     async def origin_reachable(
         self, repo: str | None = None, *, timeout: int = 30
     ) -> bool:

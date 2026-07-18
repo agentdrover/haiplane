@@ -302,6 +302,30 @@ async def dispatch_task(
     return result
 
 
+def worktree_per_task_enabled() -> bool:
+    """Opt-in git-worktree isolation for pair tasks (#459).
+
+    Default OFF keeps the single-working-tree behavior of #451/#457 unchanged
+    in production; set OPENCLAW_WORKTREE_PER_TASK=1 to give each task its own
+    worktree so concurrent pair-starts never share a working tree.
+    """
+    import os
+
+    return os.environ.get("OPENCLAW_WORKTREE_PER_TASK") == "1"
+
+
+def _slug_for_task(task_id: int, task: dict[str, Any], branch_slug: str) -> str:
+    """Reuse an existing task branch's slug so its worktree stays stable (#459)."""
+    slug = (branch_slug or "").strip()
+    if slug:
+        return slug
+    existing = (task.get("branch") or "").strip()
+    prefix = f"task-{task_id}/"
+    if existing.startswith(prefix):
+        return existing[len(prefix) :]
+    return ""
+
+
 async def prepare_pair_branch(
     db: aiosqlite.Connection,
     task_id: int,
@@ -312,6 +336,13 @@ async def prepare_pair_branch(
     """Create or checkout a task branch without dispatching a headless agent."""
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
+    if worktree_per_task_enabled():
+        return await plugins.git_ops.pair_prepare_worktree(
+            task_id,
+            task["title"],
+            branch_slug=_slug_for_task(task_id, task, branch_slug),
+            **local_kw,
+        )
     branch = (task.get("branch") or "").strip()
     if branch:
         await plugins.git_ops.checkout(branch, repo=local_kw.get("repo"))
@@ -328,9 +359,16 @@ async def restore_pair_workspace_base(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> None:
-    """Best-effort: return the project workspace to its base branch (#451)."""
+    """Best-effort cleanup after a pair task leaves running (#451/#459).
+
+    Worktree mode (#459): remove the task's worktree. Legacy mode: return the
+    single working tree to its base branch. Either way the main clone ends on base.
+    """
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
+    if worktree_per_task_enabled():
+        await plugins.git_ops.pair_remove_worktree(task_id, **local_kw)
+        return
     await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
 
 
@@ -338,17 +376,27 @@ async def switch_pair_workspace_to_task(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> None:
-    """Best-effort: put the project workspace on the task branch for rework (#457).
+    """Best-effort: make the task branch available for rework after CHANGES_REQUESTED.
 
-    Called after a CHANGES_REQUESTED verdict (review→running) so pair-mode
-    fixes land on the task branch instead of the local base restored by #451.
+    Worktree mode (#459): re-create the task's worktree (removed on submit) so
+    fixes land there. Legacy mode (#457): switch the single working tree to the
+    task branch instead of the local base restored by #451.
     """
     row = await repo.get_task(db, task_id)
-    branch = (dict(row).get("branch") or "").strip() if row else ""
+    task = dict(row) if row else {}
+    branch = (task.get("branch") or "").strip()
     if not branch:
         return
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
+    if worktree_per_task_enabled():
+        await plugins.git_ops.pair_prepare_worktree(
+            task_id,
+            task.get("title") or "",
+            branch_slug=_slug_for_task(task_id, task, ""),
+            **local_kw,
+        )
+        return
     await plugins.git_ops.pair_switch_to_task_branch(task_id, branch, **local_kw)
 
 

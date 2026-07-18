@@ -232,6 +232,7 @@ OPENCLAW_HUB_REPO=org/repo-name
 |------------|------------|
 | `OPENCLAW_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при `hub_start_task` и **`hub_pair_start`** |
 | `OPENCLAW_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
+| `OPENCLAW_WORKTREE_PER_TASK` | `1` включает изоляцию pair-задач через `git worktree` (#459): каждая задача получает своё дерево `.<repo>-worktrees/task-<id>`, основной клон остаётся на base. По умолчанию выкл — поведение как раньше. Требует git ≥ 2.15 и место под несколько деревьев. Подробнее: [workspace-safety-policy.md](workspace-safety-policy.md#worktree-per-task-opt-in-459) |
 
 **Production (agenthai.ru):** `OPENCLAW_WORKSPACE_REPO` обычно указывает на server clone (`/opt/openclaw-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**.
 

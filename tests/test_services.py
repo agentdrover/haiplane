@@ -4077,3 +4077,73 @@ async def test_approved_verdict_does_not_switch_pair_workspace(
     )
 
     switch.assert_not_awaited()
+
+
+# --- worktree-per-task mode routing (#459) ---
+
+
+async def test_worktree_mode_prepare_and_cleanup(db: aiosqlite.Connection, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    prep = AsyncMock(return_value="task-1/worktree-task")
+    remove = AsyncMock(return_value=True)
+    plugins.git_ops.pair_prepare_worktree = prep
+    plugins.git_ops.pair_remove_worktree = remove
+
+    tv = await services.create_task(db, TaskCreate(title="Worktree task"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="dev")
+    assert started.status.value == "running"
+    prep.assert_awaited()  # worktree created, main clone not switched
+
+    await services.submit_for_review(db, tv.id)
+    remove.assert_awaited()  # worktree removed on submit
+    assert remove.await_args.args[0] == tv.id
+
+
+async def test_worktree_mode_rework_recreates_worktree(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    prep = AsyncMock(return_value="task-1/worktree-task")
+    plugins.git_ops.pair_prepare_worktree = prep
+    plugins.git_ops.pair_remove_worktree = AsyncMock(return_value=True)
+
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    prep.reset_mock()
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested, agent="reviewer", comments="1. fix"
+        ),
+    )
+    prep.assert_awaited()  # worktree re-created for rework
+
+
+async def test_worktree_mode_off_uses_legacy(db: aiosqlite.Connection, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.delenv("OPENCLAW_WORKTREE_PER_TASK", raising=False)
+    prep_wt = AsyncMock()
+    plugins.git_ops.pair_prepare_worktree = prep_wt
+
+    tv = await services.create_task(db, TaskCreate(title="Legacy path"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+
+    prep_wt.assert_not_awaited()  # legacy branch-switching path, not worktrees

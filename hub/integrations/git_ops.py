@@ -160,6 +160,37 @@ async def _base_ahead_of_origin(base: str, repo: str) -> bool:
         return False
 
 
+def _worktree_path(task_id: int, repo: str) -> str:
+    """Deterministic per-task worktree path, a sibling of the main clone (#459).
+
+    Placed next to (not inside) the main working tree so the main clone never
+    sees it as untracked content. Derivable from task_id alone, so no DB column
+    is needed to locate a task's worktree.
+    """
+    import os
+
+    repo = os.path.abspath(repo.rstrip("/"))
+    parent = os.path.dirname(repo)
+    name = os.path.basename(repo)
+    return os.path.join(parent, f".{name}-worktrees", f"task-{task_id}")
+
+
+async def _worktree_registered(path: str, repo: str) -> bool:
+    """True when ``path`` is a registered worktree of ``repo`` (#459)."""
+    import os
+
+    rc, out, _ = await _git("worktree", "list", "--porcelain", repo=repo, check=False)
+    if rc != 0:
+        return False
+    target = os.path.abspath(path)
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            wt = os.path.abspath(line[len("worktree ") :].strip())
+            if wt == target:
+                return True
+    return False
+
+
 async def _default_workspace_error() -> str | None:
     """Readable reason when the default-project workspace is unusable (#378).
 
@@ -686,6 +717,145 @@ class GitOpsIntegration:
             branch,
             current,
         )
+        return True
+
+    async def pair_prepare_worktree(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str:
+        """Create/reuse a per-task git worktree; the main clone stays on base (#459).
+
+        Returns the branch name (same contract as ``pair_prepare_branch``), but
+        instead of switching the single working tree it gives each task its own
+        worktree at a deterministic sibling path. Two pair-starts therefore never
+        share a working tree — no mutual checkout, no cross-task clobber. The main
+        clone is never moved off the base branch.
+        """
+        import os
+
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                raise PairBranchConflictError(reason)
+        repo = repo or _repo_root()
+        base = base_branch or PAIR_BASE_BRANCH
+        slug = (branch_slug or "").strip() or _slugify(title)
+        branch = f"task-{task_id}/{slug}"
+        wt_path = _worktree_path(task_id, repo)
+
+        # Clear stale registrations (a worktree dir deleted out from under git)
+        # so a fresh add for the same task never trips a false conflict (AC-4).
+        await _git("worktree", "prune", repo=repo, check=False)
+
+        # Reuse this task's existing worktree; never clobber its uncommitted work.
+        if await _worktree_registered(wt_path, repo) and os.path.isdir(wt_path):
+            rc, cur, _ = await _git(
+                "branch", "--show-current", repo=wt_path, check=False
+            )
+            cur = (cur or "").strip()
+            if cur == branch:
+                return branch
+            rc, dirty, _ = await _git(
+                "status", "--porcelain", repo=wt_path, check=False
+            )
+            if dirty.strip():
+                raise _pair_branch_conflict(
+                    f"Worktree {wt_path} is on {cur!r} with uncommitted changes; "
+                    f"refusing to switch it to {branch!r}",
+                    repo=wt_path,
+                    reason="pair_worktree_dirty",
+                    hint=(
+                        f"Commit or stash changes in {wt_path} (host {_hostname()}), "
+                        f"then retry pair-start for #{task_id}."
+                    ),
+                    task_id=task_id,
+                )
+            await _git("checkout", branch, repo=wt_path, check=False)
+            return branch
+
+        # Fresh worktree. Keep the main clone's base current (best-effort).
+        await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
+        os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+
+        rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+        if rc == 0:
+            rc, _, err = await _git(
+                "worktree", "add", wt_path, branch, repo=repo, check=False
+            )
+        else:
+            # New branch cut from base — guard against a base that diverged from
+            # origin (broken fetch → foreign commits, #457/#392).
+            if await _base_ahead_of_origin(base, repo):
+                raise _pair_branch_conflict(
+                    f"Local {base!r} is ahead of origin/{base!r} in {repo}; "
+                    f"refusing to cut {branch!r} onto unpushed base commits",
+                    repo=repo,
+                    reason="pair_base_ahead_of_origin",
+                    hint=(
+                        f"On {_hostname()}: cd {repo} && git log origin/{base}..{base} "
+                        f"to inspect, then reconcile before pair-start for #{task_id}."
+                    ),
+                    task_id=task_id,
+                )
+            rc, _, err = await _git(
+                "worktree", "add", "-b", branch, wt_path, base, repo=repo, check=False
+            )
+        if rc != 0:
+            raise _pair_branch_conflict(
+                f"Failed to create worktree for {branch} at {wt_path}: "
+                f"{(err or '').strip() or 'git worktree add failed'}",
+                repo=repo,
+                reason="pair_worktree_create_failed",
+                task_id=task_id,
+            )
+        log.info(
+            "pair_prepare_worktree: %s at %s (main clone stays on %s)",
+            branch,
+            wt_path,
+            base,
+        )
+        return branch
+
+    async def pair_remove_worktree(
+        self, task_id: int, *, repo: str | None = None
+    ) -> bool:
+        """Remove a task's worktree if clean; never lose uncommitted work (#459)."""
+        import os
+
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                log.warning("pair_remove_worktree: %s", reason)
+                return False
+        repo = repo or _repo_root()
+        wt_path = _worktree_path(task_id, repo)
+
+        if not await _worktree_registered(wt_path, repo):
+            await _git("worktree", "prune", repo=repo, check=False)
+            return True
+
+        if os.path.isdir(wt_path):
+            rc, dirty, _ = await _git(
+                "status", "--porcelain", repo=wt_path, check=False
+            )
+            if dirty.strip():
+                log.warning(
+                    "pair_remove_worktree: %s has uncommitted changes, skipping",
+                    wt_path,
+                )
+                return False
+
+        rc, _, err = await _git("worktree", "remove", wt_path, repo=repo, check=False)
+        await _git("worktree", "prune", repo=repo, check=False)
+        if rc != 0:
+            log.warning("pair_remove_worktree: remove %s failed: %s", wt_path, err)
+            return False
+        log.info("pair_remove_worktree: removed %s", wt_path)
         return True
 
     async def origin_reachable(
