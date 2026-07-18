@@ -705,8 +705,9 @@ async def create_task(
 ) -> int:
     cur = await db.execute(
         "INSERT INTO tasks (title, description, runtime, source, assigned_agent, "
-        "rationale, status, auto_review, task_type, parent_id, priority, position) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "rationale, status, auto_review, task_type, parent_id, priority, position, "
+        "status_entered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         (
             title,
             description,
@@ -730,10 +731,23 @@ async def update_task(
     task_id: int,
     **fields: Any,
 ) -> None:
-    """Update arbitrary task columns and always bump ``updated_at``."""
+    """Update arbitrary task columns and always bump ``updated_at``.
+
+    When ``status`` is among the updated fields, ``status_entered_at`` advances
+    only if the status actually changes (#416). SQLite evaluates SET
+    right-hand sides against the pre-update row, so ``CASE WHEN status != ?``
+    compares the stored status to the new one — re-writing the same status
+    leaves the clock untouched, and a plain field PATCH never advances it.
+    """
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
     values = list(fields.values())
+    if "status" in fields:
+        sets.append(
+            "status_entered_at = CASE WHEN status != ? "
+            "THEN datetime('now') ELSE status_entered_at END"
+        )
+        values.append(fields["status"])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -807,10 +821,205 @@ async def transition_status_if(
     409 Conflict instead of double-processing the task. Review I5.
     """
     cur = await db.execute(
-        "UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=? AND status=?",
+        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "
+        "updated_at=datetime('now') WHERE id=? AND status=?",
         (new_status, task_id, expected_from),
     )
     return (cur.rowcount or 0) > 0
+
+
+async def mark_ci_check_started(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Stamp the CI push time durably (#416).
+
+    Replaces the in-memory ``_ci_pushed_at`` clock so the grace period is
+    measured from the real push time and survives a hub restart. Deliberately
+    does not touch ``updated_at`` — CI conveyor bookkeeping must not reset the
+    stale watchdog.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at=datetime('now') WHERE id=?",
+        (task_id,),
+    )
+
+
+async def increment_ci_no_pr_attempts(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int:
+    """Atomically bump the no-PR retry counter and return the new value (#416).
+
+    The increment is a single ``x = x + 1`` UPDATE so concurrent polls cannot
+    lose a count, replacing the in-memory ``_ci_no_pr_retries`` dict.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_no_pr_attempts = ci_no_pr_attempts + 1 WHERE id=?",
+        (task_id,),
+    )
+    cur = await db.execute("SELECT ci_no_pr_attempts FROM tasks WHERE id=?", (task_id,))
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def reset_ci_check_state(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear durable CI state when a task leaves the ci_check conveyor (#416)."""
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at=NULL, ci_no_pr_attempts=0 WHERE id=?",
+        (task_id,),
+    )
+
+
+async def mark_job_missing(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Stamp when a headless job was first observed missing (#417).
+
+    The ``IS NULL`` guard means the clock is set once and never overwritten, so
+    the grace window is measured from the first miss and survives a restart.
+    """
+    await db.execute(
+        "UPDATE tasks SET job_missing_since=datetime('now') "
+        "WHERE id=? AND job_missing_since IS NULL",
+        (task_id,),
+    )
+
+
+async def clear_job_missing(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear the missing-job clock when the job reappears or is escalated (#417)."""
+    await db.execute(
+        "UPDATE tasks SET job_missing_since=NULL WHERE id=?",
+        (task_id,),
+    )
+
+
+async def list_expired_claims(
+    db: aiosqlite.Connection,
+    threshold_minutes: int,
+) -> list[aiosqlite.Row]:
+    """Claimed tasks whose lease passed without a pair start (#417)."""
+    return await db.execute_fetchall(
+        "SELECT * FROM tasks WHERE archived=0 AND status='claimed' "
+        "AND claimed_at IS NOT NULL AND claimed_at < datetime('now', ?)",
+        (f"-{threshold_minutes} minutes",),
+    )
+
+
+async def claim_arbiter_dispatch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+) -> bool:
+    """Conditionally claim an arbiter dispatch for a submission generation (#421).
+
+    Returns ``True`` only if no active marker already exists for this
+    generation — the claim is a single atomic UPDATE that sets state
+    ``dispatching`` and the dispatch clock BEFORE any external submit, so a
+    repeat poll or a restart finds the marker and does not dispatch again.
+    A newer submission generation does not match the old marker, so it opens a
+    fresh window. The caller must commit before the external side effect.
+    """
+    # Positive form so SQL three-valued logic on NULL columns still matches on
+    # the first claim: succeed when there is no ACTIVE marker for this exact
+    # generation (different generation, or a non-active/NULL state).
+    cur = await db.execute(
+        "UPDATE tasks SET arbiter_state='dispatching', arbiter_generation=?, "
+        "arbiter_job_id=NULL, arbiter_dispatch_at=datetime('now') "
+        "WHERE id=? AND ("
+        "arbiter_generation IS NULL OR arbiter_generation != ? "
+        "OR arbiter_state IS NULL "
+        "OR arbiter_state NOT IN ('dispatching', 'running', 'finished'))",
+        (generation, task_id, generation),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+async def mark_arbiter_running(
+    db: aiosqlite.Connection,
+    task_id: int,
+    arbiter_job_id: str,
+) -> None:
+    """Record the arbiter job id and move the marker to ``running`` (#421)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state='running', arbiter_job_id=? WHERE id=?",
+        (arbiter_job_id, task_id),
+    )
+
+
+async def mark_arbiter_finished(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Close the arbiter marker once the Hub ends the arbiter phase (#422)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state='finished' WHERE id=?",
+        (task_id,),
+    )
+
+
+async def reset_arbiter_state(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear the arbiter marker so a reworked submission starts clean (#422)."""
+    await db.execute(
+        "UPDATE tasks SET arbiter_state=NULL, arbiter_job_id=NULL, "
+        "arbiter_generation=NULL, arbiter_dispatch_at=NULL WHERE id=?",
+        (task_id,),
+    )
+
+
+async def list_stale_arbiter_dispatching(
+    db: aiosqlite.Connection,
+    threshold_minutes: int,
+) -> list[aiosqlite.Row]:
+    """Tasks stuck mid-dispatch (submit started, no job id) past the grace (#421)."""
+    return await db.execute_fetchall(
+        "SELECT * FROM tasks WHERE archived=0 AND arbiter_state='dispatching' "
+        "AND arbiter_job_id IS NULL AND arbiter_dispatch_at IS NOT NULL "
+        "AND arbiter_dispatch_at < datetime('now', ?)",
+        (f"-{threshold_minutes} minutes",),
+    )
+
+
+async def list_past_status_deadline(
+    db: aiosqlite.Connection,
+    status: str,
+    threshold_minutes: int,
+    *,
+    require_job_id: bool = False,
+    require_review_job_id: bool = False,
+) -> list[aiosqlite.Row]:
+    """Tasks that entered ``status`` longer than ``threshold_minutes`` ago (#418).
+
+    Uses the durable ``status_entered_at`` clock (#416), so the deadline
+    measures time-in-status and survives a restart. The discriminator flags
+    keep headless running/review distinct from their pair/client variants.
+    """
+    conditions = [
+        "archived=0",
+        "status=?",
+        "status_entered_at IS NOT NULL",
+        "status_entered_at < datetime('now', ?)",
+    ]
+    params: list[Any] = [status, f"-{threshold_minutes} minutes"]
+    if require_job_id:
+        conditions.append("job_id IS NOT NULL")
+    if require_review_job_id:
+        conditions.append("review_job_id IS NOT NULL")
+    where = " AND ".join(conditions)
+    return await db.execute_fetchall(
+        f"SELECT * FROM tasks WHERE {where}",  # nosec B608
+        tuple(params),
+    )
 
 
 async def create_task_full(
@@ -857,7 +1066,10 @@ async def create_task_full(
     ]
     placeholders = ", ".join("?" for _ in columns)
     cur = await db.execute(
-        f"INSERT INTO tasks ({', '.join(columns)}) VALUES ({placeholders})",  # nosec B608
+        # status_entered_at is stamped in SQL so it shares datetime('now')
+        # format with created_at/updated_at (#416).
+        f"INSERT INTO tasks ({', '.join(columns)}, status_entered_at) "  # nosec B608
+        f"VALUES ({placeholders}, datetime('now'))",
         tuple(values),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1176,11 +1388,31 @@ async def has_plan_updates(
 async def has_stale_alert(
     db: aiosqlite.Connection,
     task_id: int,
+    status: str,
 ) -> bool:
+    """Whether ``task_id`` already has a stale alert for the current window.
+
+    Dedup is scoped two ways so a single lifetime alert can't silence the
+    watchdog forever (#393): by ``status`` (an alert raised in ``running``
+    must not suppress one in ``ci_check``) and by window. The window boundary
+    is the id of the latest update that is NOT itself a stale alert — any real
+    activity opens a fresh window. A stale alert counts only when it names
+    ``status`` and is newer than that boundary, so re-entering the same status
+    after real work alerts again. Until F2 persists a status-entered clock this
+    boundary is a heuristic: any non-alert update resets the window, not only a
+    status transition. All stale alerts embed ``stale in {status}`` so the
+    scope key is parseable from content.
+    """
+    boundary_rows = await db.execute_fetchall(
+        "SELECT COALESCE(MAX(id), 0) AS boundary FROM task_updates "
+        "WHERE task_id=? AND NOT (kind='alert' AND content LIKE '%stale%')",
+        (task_id,),
+    )
+    boundary = boundary_rows[0]["boundary"] if boundary_rows else 0
     rows = await db.execute_fetchall(
         "SELECT id FROM task_updates WHERE task_id=? AND kind='alert' "
-        "AND content LIKE '%stale%' ORDER BY id DESC LIMIT 1",
-        (task_id,),
+        "AND content LIKE ? AND id > ? ORDER BY id DESC LIMIT 1",
+        (task_id, f"%stale in {status}%", boundary),
     )
     return bool(rows)
 
@@ -1216,4 +1448,37 @@ async def list_activity(
     return await db.execute_fetchall(
         "SELECT * FROM activity_log ORDER BY id DESC LIMIT ?",
         (limit,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task create idempotency
+# ---------------------------------------------------------------------------
+
+
+async def get_task_idempotency_key(
+    db: aiosqlite.Connection,
+    client_request_id: str,
+) -> dict[str, Any] | None:
+    rows = await db.execute_fetchall(
+        "SELECT client_request_id, task_id, request_hash "
+        "FROM task_idempotency_keys WHERE client_request_id = ?",
+        (client_request_id,),
+    )
+    if not rows:
+        return None
+    return dict(rows[0])
+
+
+async def insert_task_idempotency_key(
+    db: aiosqlite.Connection,
+    *,
+    client_request_id: str,
+    task_id: int,
+    request_hash: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO task_idempotency_keys "
+        "(client_request_id, task_id, request_hash) VALUES (?, ?, ?)",
+        (client_request_id, task_id, request_hash),
     )

@@ -10,6 +10,8 @@ from typing import Any
 
 import aiosqlite
 
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
 
 class NoopDispatch:
     def is_available(self) -> bool:
@@ -148,6 +150,21 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    async def pair_switch_to_task_branch(
+        self,
+        task_id: int,
+        branch: str,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        return False
+
+    async def origin_reachable(
+        self, repo: str | None = None, *, timeout: int = 30
+    ) -> bool:
+        return False
+
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 
@@ -191,14 +208,22 @@ class NoopGitOps:
         branch: str,
         max_log_chars: int = 4000,
         repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> dict[str, Any]:
         return {}
 
-    async def check_pr_ci(self, pr_number: int, repo: str | None = None) -> str:
-        return "pending"
+    async def check_pr_ci(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.pending, "noop")
 
     async def merge_pr(
-        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool:
         return False
 

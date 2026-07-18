@@ -2,9 +2,30 @@
 set -eu
 
 remote_name="${1:-}"
+zero="0000000000000000000000000000000000000000"
 
 while read -r local_ref local_oid remote_ref remote_oid; do
-  [ "$local_ref" = "delete" ] && continue
+  # Branch deletion (git push origin --delete <branch> / git push origin :ref):
+  # git sets local_ref to the literal "(delete)" and local_oid to all-zeros.
+  # A deletion publishes no code, so skip the branch-name and dirty-tree checks —
+  # but still refuse to delete the protected branches.
+  is_delete=0
+  case "$local_oid" in
+    "$zero" | "") is_delete=1 ;;
+  esac
+  case "$local_ref" in
+    "(delete)" | "delete") is_delete=1 ;;
+  esac
+  if [ "$is_delete" = "1" ]; then
+    case "$remote_ref" in
+      refs/heads/main | refs/heads/develop)
+        echo "Blocked delete of protected branch '${remote_ref#refs/heads/}' on ${remote_name}." >&2
+        echo "Protected branches (main, develop) must not be deleted." >&2
+        exit 1
+        ;;
+    esac
+    continue
+  fi
 
   case "$local_ref" in
     refs/heads/main)

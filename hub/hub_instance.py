@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from hub import config
 
 InstanceLabel = Literal["prod", "local"]
+
+
+def hub_hostname() -> str:
+    """Server hostname — a config-independent instance fact (#452).
+
+    Unlike ``base_url``/``instance`` (echoed from OPENCLAW_HUB_URL), the
+    hostname cannot be faked by a misconfigured env var, so it disambiguates
+    which machine actually served the response.
+    """
+    try:
+        return socket.gethostname()
+    except OSError:
+        return ""
 
 
 def hub_base_url() -> str:
@@ -31,7 +45,11 @@ def hub_instance_label(base_url: str | None = None) -> InstanceLabel:
 
 def instance_echo_fields() -> dict[str, str]:
     base = hub_base_url()
-    return {"instance": hub_instance_label(base), "base_url": base}
+    return {
+        "instance": hub_instance_label(base),
+        "base_url": base,
+        "server_id": hub_hostname(),
+    }
 
 
 def with_instance_echo(payload: dict[str, Any]) -> dict[str, Any]:

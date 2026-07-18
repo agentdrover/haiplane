@@ -363,6 +363,8 @@ async def web_partial_inbox(
             "questions",
             "decisions",
             "pending_reports",
+            "ci_check_tasks",
+            "fix_requested_tasks",
             "stale_tasks",
         ):
             inbox[key] = _filter_by_ids(inbox[key], allowed)
@@ -507,6 +509,8 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
             "questions",
             "decisions",
             "pending_reports",
+            "ci_check_tasks",
+            "fix_requested_tasks",
             "stale_tasks",
         ):
             inbox[key] = _filter_by_ids(inbox[key], allowed)
@@ -523,6 +527,8 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["questions"])
         + len(inbox["decisions"])
         + len(inbox["pending_reports"])
+        + len(inbox["ci_check_tasks"])
+        + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
     )
     ctx: dict[str, Any] = {
@@ -1002,7 +1008,7 @@ async def web_create_task(
         human_reviewer=human_reviewer,
         agent=user,
     )
-    created = await services.create_task(_db(request), body)
+    created = (await services.create_task(_db(request), body)).task
     if after_create == "refine":
         return RedirectResponse(f"/tasks/{created.id}", status_code=303)
     return RedirectResponse("/tasks", status_code=303)

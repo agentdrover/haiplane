@@ -246,6 +246,11 @@ class TaskCreate(BaseModel):
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
+    client_request_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional idempotency key; duplicates return the original task",
+    )
 
 
 MAX_BULK_CHILD_TASKS = 20
@@ -1256,6 +1261,53 @@ class AdminBootstrap(BaseModel):
     @classmethod
     def validate_password(cls, v: str) -> str:
         return _check_password_complexity(v)
+
+
+class WhoamiView(BaseModel):
+    username: str
+    role: str
+    permissions_summary: list[str] = Field(default_factory=list)
+    permissions_count: int = 0
+    auth_source: str
+    api_key_id: int | None = None
+    principal_id: int | None = None
+    app_version: str
+
+
+class HealthView(BaseModel):
+    status: str = "ok"
+    app_version: str
+    bind_host: str
+    bind_port: int
+    auth_required: bool
+    auth_disabled: bool
+    env_tokens_configured: bool
+    vast_enabled: bool
+
+
+class IdentityDiagnosticsView(BaseModel):
+    """One-call identity + environment truth for agents (#452).
+
+    ``connected_via`` is the base URL the client actually reached (from the
+    request Host), independent of ``base_url`` echoed from OPENCLAW_HUB_URL;
+    ``config_mismatch`` flags when the two disagree so an operator never acts
+    on the wrong instance. ``workspace_path``/``workspace_branch`` expose the
+    server-side git workspace state in the same response.
+    """
+
+    username: str
+    role: str
+    principal_id: int | None = None
+    auth_source: str
+    permissions_count: int = 0
+    instance: str
+    base_url: str
+    server_id: str = ""
+    connected_via: str = ""
+    config_mismatch: bool = False
+    workspace_path: str = ""
+    workspace_branch: str = ""
+    app_version: str
 
 
 # --- Deprecated aliases for backward compatibility ---

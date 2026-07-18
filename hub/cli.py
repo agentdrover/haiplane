@@ -30,7 +30,13 @@ def _validated_hub_base_url() -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
-def _api(method: str, path: str, body: Any | None = None) -> Any:
+def _api(
+    method: str,
+    path: str,
+    body: Any | None = None,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     """Call the Hub HTTP API.
 
     - ``body`` may be a dict OR a list (PUT for replace_acceptance_criteria
@@ -46,6 +52,8 @@ def _api(method: str, path: str, body: Any | None = None) -> Any:
         req.add_header("Content-Type", "application/json")
     if HUB_TOKEN:
         req.add_header("Authorization", f"Bearer {HUB_TOKEN}")
+    for key, value in (extra_headers or {}).items():
+        req.add_header(key, value)
     try:
         # URL is built from _validated_hub_base_url(), which only permits
         # explicit http/https Hub endpoints.
@@ -165,7 +173,12 @@ def cmd_task(args: argparse.Namespace) -> int:
         body["human_owner"] = args.owner
     if getattr(args, "reviewer", None):
         body["human_reviewer"] = args.reviewer
-    result = _api("POST", "/api/tasks", body)
+    extra_headers: dict[str, str] = {}
+    request_id = getattr(args, "request_id", "") or ""
+    if request_id.strip():
+        body["client_request_id"] = request_id.strip()
+        extra_headers["X-Client-Request-Id"] = request_id.strip()
+    result = _api("POST", "/api/tasks", body, extra_headers=extra_headers or None)
     _print_json(result)
     return 0
 
@@ -850,6 +863,40 @@ def cmd_template(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whoami(args: argparse.Namespace) -> int:
+    result = _api("GET", "/api/whoami")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"User: {result['username']} (role: {result['role']})")
+    print(f"Auth source: {result['auth_source']}")
+    if result.get("api_key_id") is not None:
+        print(f"API key id: {result['api_key_id']}")
+    if result.get("principal_id") is not None:
+        print(f"Principal id: {result['principal_id']}")
+    print(
+        f"Permissions ({result['permissions_count']}): "
+        f"{', '.join(result.get('permissions_summary') or [])}"
+    )
+    print(f"App version: {result['app_version']}")
+    return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    result = _api("GET", "/health")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Status: {result['status']}")
+    print(f"App version: {result['app_version']}")
+    print(f"Bind: {result['bind_host']}:{result['bind_port']}")
+    print(f"Auth required: {result['auth_required']}")
+    print(f"Auth disabled: {result['auth_disabled']}")
+    print(f"Env tokens configured: {result['env_tokens_configured']}")
+    print(f"Vast enabled: {result['vast_enabled']}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Admin commands (Stage 4)
 # ---------------------------------------------------------------------------
@@ -1065,6 +1112,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_task.add_argument("--owner", default="", help="Human owner of the task")
     p_task.add_argument("--reviewer", default="", help="Human reviewer of the task")
+    p_task.add_argument(
+        "--request-id",
+        dest="request_id",
+        default="",
+        help="Idempotency key for safe retries (maps to X-Client-Request-Id)",
+    )
     p_task.set_defaults(func=cmd_task, task_type="task")
 
     # epic — create an epic
@@ -1756,6 +1809,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_readiness_tree.add_argument("--json", action="store_true", help="Print raw JSON")
     p_readiness_tree.set_defaults(func=cmd_readiness_tree)
+
+    p_whoami = sub.add_parser(
+        "whoami", help="Show current API identity and permissions"
+    )
+    p_whoami.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_whoami.set_defaults(func=cmd_whoami)
+
+    p_health = sub.add_parser(
+        "health", help="Show Hub bind/auth/vast configuration (no secrets)"
+    )
+    p_health.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_health.set_defaults(func=cmd_health)
 
     # ---- Admin commands (Stage 4) ----------------------------------------
 

@@ -58,6 +58,12 @@ REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
 
 ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
 ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
+# At-most-once arbiter dispatch (#421): if the marker sits in 'dispatching'
+# (submit started, job id never recorded — a crash window) past this grace, the
+# task fails safe to needs_decision rather than risk a duplicate paid dispatch.
+ARBITER_DISPATCH_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_ARBITER_DISPATCH_GRACE_MINUTES", "15")
+)
 
 STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
 # Stale watchdog (#319): silent dead-end statuses get their own, longer
@@ -67,6 +73,42 @@ STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "24
 STALE_NEEDS_INFO_MINUTES = int(
     os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
 )
+# Machine-owned dead-end statuses (#393): visible via stale alerts until the
+# durable deadline transitions from F2 land. F1 only alerts — status unchanged.
+STALE_CI_CHECK_MINUTES = int(os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60"))
+STALE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_FIX_REQUESTED_MINUTES", "60")
+)
+STALE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_STALE_PENDING_REPORT_MINUTES", "30")
+)
+
+# Bounded recovery (#417): a headless dispatch/review job that stays missing
+# past the grace escalates to needs_decision; a claim held past the lease is
+# auto-released back to open. Both decisions read persisted timestamps so a
+# restart never resets them.
+MISSING_JOB_GRACE_MINUTES = int(
+    os.environ.get("OPENCLAW_MISSING_JOB_GRACE_MINUTES", "5")
+)
+CLAIM_LEASE_MINUTES = int(os.environ.get("OPENCLAW_CLAIM_LEASE_MINUTES", "240"))
+
+# Machine-owned deadlines (#418): a backstop, deliberately generous so normal
+# work never trips them — the stale watchdog (#393) alerts long before. When a
+# machine-owned instance sits past its deadline the watchdog transitions it to
+# needs_decision, so no combination stays stuck without an owner.
+DEADLINE_CI_CHECK_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_CI_CHECK_MINUTES", "180")
+)
+DEADLINE_FIX_REQUESTED_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_FIX_REQUESTED_MINUTES", "180")
+)
+DEADLINE_PENDING_REPORT_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_PENDING_REPORT_MINUTES", "120")
+)
+DEADLINE_RUNNING_MINUTES = int(
+    os.environ.get("OPENCLAW_DEADLINE_RUNNING_MINUTES", "360")
+)
+DEADLINE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180"))
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
@@ -112,7 +154,14 @@ class TokenIdentity:
     from role_permissions, and role is the effective legacy role.
     """
 
-    __slots__ = ("username", "role", "principal_id", "permissions")
+    __slots__ = (
+        "username",
+        "role",
+        "principal_id",
+        "permissions",
+        "auth_source",
+        "api_key_id",
+    )
 
     def __init__(
         self,
@@ -120,11 +169,15 @@ class TokenIdentity:
         role: str = "human",
         principal_id: int | None = None,
         permissions: frozenset[str] | None = None,
+        auth_source: str | None = None,
+        api_key_id: int | None = None,
     ) -> None:
         self.username = username
         self.role = role
         self.principal_id = principal_id
         self.permissions = permissions or frozenset()
+        self.auth_source = auth_source
+        self.api_key_id = api_key_id
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"

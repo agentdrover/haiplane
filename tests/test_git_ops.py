@@ -261,6 +261,100 @@ async def test_pair_prepare_branch_explicit_repo_skips_default_guard(tmp_path):
     assert branch == "task-3/proj-task"
 
 
+# ---- Typed CI probe outcomes (#419) ----
+
+
+@pytest.mark.parametrize(
+    "rc, out, expected_outcome, expected_reason",
+    [
+        (0, '[{"name": "build", "state": "SUCCESS"}]', "pass", "checks_passed"),
+        (0, '[{"name": "build", "state": "NEUTRAL"}]', "pass", "checks_passed"),
+        (0, '[{"name": "build", "state": "FAILURE"}]', "fail", "checks_failed"),
+        (0, '[{"name": "build", "state": "IN_PROGRESS"}]', "pending", "checks_running"),
+        (
+            0,
+            '[{"name": "a", "state": "SUCCESS"}, {"name": "b", "state": "QUEUED"}]',
+            "pending",
+            "checks_running",
+        ),
+        (0, "[]", "absent", "no_checks"),
+        (1, "", "unavailable", "gh_error"),
+        (0, "not json at all", "unavailable", "invalid_json"),
+        (0, '[{"name": "x", "state": "WEIRD"}]', "unavailable", "unknown_state"),
+    ],
+)
+async def test_check_pr_ci_typed_outcomes(
+    git_ops: GitOpsIntegration, rc, out, expected_outcome, expected_reason
+):
+    # AC-1 (#419): every observable gh response maps to a distinct outcome with
+    # a stable, non-empty reason — running checks, an empty set, a gh error and
+    # unparseable output are no longer all "pending".
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(rc, out, "boom" if rc else ""),
+    ):
+        result = await git_ops.check_pr_ci(42)
+    assert result.outcome.value == expected_outcome
+    assert result.reason == expected_reason
+    assert result.reason  # never empty
+
+
+# ---- Project repo context in CI/review calls (#420) ----
+
+
+@pytest.mark.parametrize(
+    "gh_repo",
+    ["mrPDA/calc-kids", None],
+)
+async def test_check_pr_ci_targets_project_repo(git_ops: GitOpsIntegration, gh_repo):
+    # AC-1/AC-2 (#420): --repo is the resolved project gh_repo (calc-kids), or
+    # the default REPO_NAME when none is given; the workspace is the cwd.
+    from hub.config import REPO_NAME
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "[]", ""),
+    ) as mock_gh:
+        await git_ops.check_pr_ci(7, repo="/ws/proj", gh_repo=gh_repo)
+
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == (gh_repo or REPO_NAME)
+    assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
+
+
+async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
+    # AC-2/AC-3 (#420): merge targets the resolved project repo and workspace,
+    # never the global default.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        await git_ops.merge_pr(
+            7, 1, "feat: x", repo="/ws/proj", gh_repo="mrPDA/calc-kids"
+        )
+
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == "mrPDA/calc-kids"
+    assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
+
+
+async def test_get_ci_failure_logs_targets_project_repo(git_ops: GitOpsIntegration):
+    # AC-2 (#420): failure-log lookup also uses the project repo.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "[]", ""),
+    ) as mock_gh:
+        await git_ops.get_ci_failure_logs(
+            7, "task-x/b", repo="/ws/proj", gh_repo="mrPDA/calc-kids"
+        )
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == "mrPDA/calc-kids"
+
+
 # --- pair workspace auto-switch and restore (#451) ---
 
 
@@ -407,3 +501,157 @@ async def test_pair_restore_workspace_base_skips_dirty_tree(
         ok = await git_ops.pair_restore_workspace_base(5, repo="/srv/ws")
 
     assert ok is False
+
+
+# --- pair workspace: base-ahead guard + forward switch (#457) ---
+
+
+async def test_pair_prepare_branch_rejects_base_ahead_of_origin(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-3 (#457): local base ahead of origin/base → structured 422, no branch cut.
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2] == "task-7/new"
+        ):
+            return 1, "", ""  # target branch does not exist yet
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2].startswith("origin/develop")
+        ):
+            return 0, "abc123", ""  # origin/develop known
+        if (
+            cmd[:2] == ("rev-list", "--count")
+            and len(cmd) > 2
+            and "origin/develop..develop" in cmd[2]
+        ):
+            return 0, "3", ""  # local develop is 3 commits ahead
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+        patch("hub.integrations.git_ops._hostname", return_value="prod"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(7, "New", branch_slug="new")
+
+    detail = exc.value.to_detail()
+    assert detail["reason"] == "pair_base_ahead_of_origin"
+    assert detail["workspace_path"] == "/srv/ws"
+    assert "origin/develop..develop" in detail["hint"]
+
+
+async def test_pair_prepare_branch_allows_base_in_sync_with_origin(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Guard is silent when local base matches origin (count 0).
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2] == "task-8/new"
+        ):
+            return 1, "", ""
+        if (
+            cmd[:2] == ("rev-list", "--count")
+            and len(cmd) > 2
+            and "origin/develop..develop" in cmd[2]
+        ):
+            return 0, "0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+    ):
+        branch = await git_ops.pair_prepare_branch(8, "New", branch_slug="new")
+    assert branch == "task-8/new"
+
+
+async def test_pair_switch_to_task_branch_switches_from_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-1 (#457): clean tree on base → checkout the task branch.
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is True
+    assert ("checkout", "task-5/x") in calls
+
+
+async def test_pair_switch_to_task_branch_skips_dirty(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-2 (#457): dirty tree → no switch, no data loss.
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, " M file.py", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is False
+
+
+async def test_pair_switch_to_task_branch_noop_off_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Safety: never yank a different task's branch — only leave the base.
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "task-9/other", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is False
+    assert ("checkout", "task-5/x") not in calls
+
+
+# --- origin reachability health-check (#455) ---
+
+
+async def test_origin_reachable_true(git_ops: GitOpsIntegration) -> None:
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:1] == ("ls-remote",):
+            return 0, "abc123\trefs/heads/develop", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        assert await git_ops.origin_reachable(repo="/srv/ws") is True
+
+
+async def test_origin_reachable_false(git_ops: GitOpsIntegration) -> None:
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:1] == ("ls-remote",):
+            return 128, "", "Could not read from remote repository"
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        assert await git_ops.origin_reachable(repo="/srv/ws") is False

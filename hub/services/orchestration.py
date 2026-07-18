@@ -334,6 +334,24 @@ async def restore_pair_workspace_base(
     await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
 
 
+async def switch_pair_workspace_to_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort: put the project workspace on the task branch for rework (#457).
+
+    Called after a CHANGES_REQUESTED verdict (review→running) so pair-mode
+    fixes land on the task branch instead of the local base restored by #451.
+    """
+    row = await repo.get_task(db, task_id)
+    branch = (dict(row).get("branch") or "").strip() if row else ""
+    if not branch:
+        return
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    await plugins.git_ops.pair_switch_to_task_branch(task_id, branch, **local_kw)
+
+
 # Statuses whose branch is active-but-unmerged: work in progress or waiting
 # for a review verdict. Stacking on top of such a branch is what incident
 # #392 produced (#424→#425→#426 on top of unmerged task-392).
@@ -480,7 +498,7 @@ async def transition_after_agent_done(
 
     if (
         task.get("auto_review")
-        and task.get("review_cycle", 0) < config.MAX_REVIEW_CYCLES
+        and not review_budget_exhausted(task.get("review_cycle", 0))
         and has_done
         and branch
     ):
@@ -520,7 +538,7 @@ async def transition_after_agent_done(
         log.info("Task #%d → ci_check after done report", task_id)
         return "ci_check"
 
-    if has_done and task.get("review_cycle", 0) >= config.MAX_REVIEW_CYCLES:
+    if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human
         # Decision Gate instead of looping through review forever (#306).
         await repo.update_task(
@@ -586,6 +604,21 @@ async def transition_after_agent_done(
     )
     log.info("Task #%d → pending_report after done report", task_id)
     return "pending_report"
+
+
+def review_budget_exhausted(review_cycle: int, max_cycles: int | None = None) -> bool:
+    """Whether the review fix budget is spent (#423) — one source of truth.
+
+    ``review_cycle`` is the number of developer fix iterations already
+    dispatched. The budget is exhausted — the next CHANGES_REQUESTED escalates
+    (to arbiter / needs_decision) instead of dispatching another fix — once that
+    count reaches ``max_cycles``. Pair and headless share this, so at MAX=3 both
+    run fixes 1, 2 and 3 and escalate the 4th. ``MAX <= 0`` is exhausted
+    immediately. No flow may compare review_cycle to MAX_REVIEW_CYCLES itself.
+    """
+    if max_cycles is None:
+        max_cycles = config.MAX_REVIEW_CYCLES
+    return review_cycle >= max_cycles
 
 
 async def dispatch_review(
@@ -725,10 +758,30 @@ async def dispatch_arbiter(
     task: dict[str, Any],
     updates_list: list[dict[str, Any]],
 ) -> None:
-    """Dispatch an arbiter (Claude Sonnet) when review cycle limit is reached."""
-    task_id = task["id"]
-    review_cycle = task.get("review_cycle", 0)
+    """Dispatch an arbiter (Claude Sonnet) when review cycle limit is reached.
 
+    At-most-once per submission generation (#421): a conditional claim persists
+    a ``dispatching`` marker BEFORE the external submit, so a repeat poll or a
+    restart finds it and never dispatches a second paid job. The marker moves to
+    ``running`` with the job id on success; a crash between submit and job id
+    leaves ``dispatching`` for the poller's ambiguity watchdog to resolve.
+    """
+    task_id = task["id"]
+    generation = task.get("submission_generation") or 0
+
+    claimed = await repo.claim_arbiter_dispatch(db, task_id, generation)
+    if not claimed:
+        await db.commit()
+        log.info(
+            "Poll: task #%d arbiter already claimed for generation %d, skipping",
+            task_id,
+            generation,
+        )
+        return
+    # The marker must be durable before the external side effect.
+    await db.commit()
+
+    review_cycle = task.get("review_cycle", 0)
     review_history = [
         u
         for u in updates_list
@@ -767,17 +820,23 @@ async def dispatch_arbiter(
     )
     arbiter_job_id = result.get("job_id")
     if arbiter_job_id:
+        await repo.mark_arbiter_running(db, task_id, arbiter_job_id)
         await repo.update_task(
             db, task_id, status="review", review_job_id=arbiter_job_id
         )
         log.info("Poll: task #%d → arbiter review (job=%s)", task_id, arbiter_job_id)
     else:
+        # A definite submit failure (the call returned, no job id): finish the
+        # marker and escalate. Do not leave it dispatching — that is only for
+        # the crash window where the call never returned.
         log.warning(
             "Poll: failed to dispatch arbiter for task #%d: %s",
             task_id,
             result.get("error"),
         )
-        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.update_task(
+            db, task_id, status="needs_decision", arbiter_state="finished"
+        )
         await repo.insert_event(
             db,
             kind="needs_decision",
