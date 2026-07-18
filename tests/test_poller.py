@@ -997,3 +997,44 @@ async def test_new_submission_completes_despite_old_arbitration(mock_sleep, db):
         await _poll_running_tasks(_make_app(db))
 
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+# ---- Unified review budget: headless boundary (#423) ----
+
+
+@pytest.mark.parametrize("review_cycle, expects_arbiter", [(2, False), (3, True)])
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_headless_review_budget_boundary(
+    mock_sleep, db, review_cycle, expects_arbiter
+):
+    # AC-1 (#423): with MAX=3 the headless flow dispatches fixes 1,2,3 and only
+    # escalates to arbiter at review_cycle=3 — the same budget as pair (no more
+    # off-by-one that stopped headless one fix early).
+    task_id = await _make_review_task(db, review_job_id="rev-1", generation=1)
+    await repo.update_task(db, task_id, review_cycle=review_cycle)
+    await repo.record_review_verdict(db, task_id, "changes_requested")
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.checkout = AsyncMock(return_value=True)
+    plugins.git_ops = mock_git
+
+    with (
+        patch("hub.poller.services.dispatch_fix", new_callable=AsyncMock) as m_fix,
+        patch("hub.poller.services.dispatch_arbiter", new_callable=AsyncMock) as m_arb,
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    if expects_arbiter:
+        m_arb.assert_called_once()
+        m_fix.assert_not_called()
+    else:
+        m_fix.assert_called_once()
+        m_arb.assert_not_called()

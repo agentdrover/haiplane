@@ -383,7 +383,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             "не удалось извлечь. Проверь git diff и исправь проблемы."
                         )
 
-                    if task.get("review_cycle", 0) + 1 >= config.MAX_REVIEW_CYCLES:
+                    if services.review_budget_exhausted(task.get("review_cycle", 0)):
                         await repo.update_task(
                             db,
                             task["id"],
