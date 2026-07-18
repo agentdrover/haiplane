@@ -785,3 +785,49 @@ async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
     assert detail["reason"] == "pair_worktree_dirty"
     assert detail["workspace_path"] == wt
     assert (Path(wt) / "wip.txt").exists()  # data preserved
+
+
+async def test_worktree_base_ahead_guard(tmp_path, git_ops):
+    # #459 review MEDIUM: pair_prepare_worktree must reject cutting a new branch
+    # when local base is ahead of origin/base (broken fetch → foreign commits).
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "main"
+    subprocess.run(
+        ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+    )
+    for args in (
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "develop"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    # Local develop now diverges ahead of origin/develop (commit, no push).
+    (repo / "g.txt").write_text("y")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "local-only"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            7, "Ahead", repo=str(repo), base_branch="develop", branch_slug="new"
+        )
+    assert exc.value.to_detail()["reason"] == "pair_base_ahead_of_origin"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import aiosqlite
@@ -309,8 +310,6 @@ def worktree_per_task_enabled() -> bool:
     in production; set OPENCLAW_WORKTREE_PER_TASK=1 to give each task its own
     worktree so concurrent pair-starts never share a working tree.
     """
-    import os
-
     return os.environ.get("OPENCLAW_WORKTREE_PER_TASK") == "1"
 
 
@@ -552,15 +551,17 @@ async def transition_after_agent_done(
     ):
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
-        # Worktree mode (#459): the task branch is checked out in its own
-        # worktree, and the main clone stays on base. Running commit/squash/push
-        # against the main clone would silently fail its checkout and let
-        # squash_branch reset --soft the base branch — so target the worktree,
-        # where the branch (and the agent's changes) actually live.
+        # Worktree mode (#459): a PAIR task's branch is checked out in its own
+        # worktree while the main clone stays on base; targeting the main clone
+        # would silently fail checkout and let squash_branch reset the base
+        # branch. Only redirect for pair tasks (no job_id) whose worktree
+        # actually exists — headless dispatch tasks (job_id set) build their
+        # branch in the main clone and never create a worktree, so redirecting
+        # them at a nonexistent path would crash the poller's done-pipeline.
         git_repo = workspace
-        if worktree_per_task_enabled():
+        if worktree_per_task_enabled() and not task.get("job_id"):
             wt = plugins.git_ops.worktree_path(task_id, workspace)
-            if wt:
+            if wt and os.path.isdir(wt):
                 git_repo = wt
         await plugins.git_ops.checkout(branch, repo=git_repo)
         await plugins.git_ops.auto_commit(
