@@ -49,6 +49,11 @@ class MockGitOps(NoopGitOps):
         slug = branch_slug or _slugify(title)
         return f"task-{task_id}/{slug}"
 
+    async def pair_restore_workspace_base(
+        self, task_id, *, repo=None, base_branch=None
+    ):
+        return False
+
     async def checkout(self, branch, repo=None):
         return True
 

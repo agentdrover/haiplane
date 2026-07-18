@@ -85,3 +85,4 @@ These are the rules most likely to be broken by “small” changes.
 - Core code depends on plugin protocols, not concrete integrations.
 - No-op plugins are valid runtime behavior and should keep the app usable without external binaries.
 - Dispatch, git, GitHub, notes, transcripts, and Vast integrations are optional adapters, not prerequisites for core task CRUD.
+- Shared project workspace (`workspace_path`): pair-start may auto-switch away from a **clean, pushed** `task-N/*` branch (#451); dirty or unpushed foreign branches still block with 422. After submit-for-review, report-done, or release, Hub best-effort checks out the project base branch when the workspace is clean and on that task's branch.

@@ -324,6 +324,16 @@ async def prepare_pair_branch(
     )
 
 
+async def restore_pair_workspace_base(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort: return the project workspace to its base branch (#451)."""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
+
+
 # Statuses whose branch is active-but-unmerged: work in progress or waiting
 # for a review verdict. Stacking on top of such a branch is what incident
 # #392 produced (#424→#425→#426 on top of unmerged task-392).

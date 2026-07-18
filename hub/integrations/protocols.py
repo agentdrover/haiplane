@@ -127,6 +127,22 @@ class GitOpsPlugin(Protocol):
     async def create_branch(
         self, task_id: int, title: str, repo: str | None = None
     ) -> str: ...
+    async def pair_prepare_branch(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str: ...
+    async def pair_restore_workspace_base(
+        self,
+        task_id: int,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool: ...
     async def checkout(self, branch: str, repo: str | None = None) -> bool: ...
     async def auto_commit(
         self,

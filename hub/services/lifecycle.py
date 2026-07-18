@@ -65,6 +65,7 @@ from hub.services.orchestration import (
     detect_branch_stacking,
     dispatch_task,
     prepare_pair_branch,
+    restore_pair_workspace_base,
     review_approved_for_current_submission,
     transition_after_agent_done,
 )
@@ -78,6 +79,21 @@ from hub.services.refinement import (
 log = logging.getLogger("hub")
 
 _ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+async def _try_restore_pair_workspace(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
+    try:
+        await restore_pair_workspace_base(db, task_id)
+    except Exception:
+        log.warning(
+            "Failed to restore pair workspace base for task #%s",
+            task_id,
+            exc_info=True,
+        )
 
 
 def compute_lifecycle_hint(task: dict[str, Any]) -> str | None:
@@ -1001,7 +1017,7 @@ async def pair_start_task(
             db, task_id, task, branch_slug=(body.branch_slug or "").strip()
         )
     except PairBranchConflictError as exc:
-        raise HTTPException(422, str(exc)) from exc
+        raise HTTPException(422, detail=exc.to_detail()) from exc
     if branch:
         task["branch"] = branch
 
@@ -1122,6 +1138,7 @@ async def submit_for_review(
             if view.lifecycle_hint
             else stacking["message"]
         )
+    await _try_restore_pair_workspace(db, task_id)
     return view
 
 
@@ -1543,6 +1560,8 @@ async def release_task(
         detail=mutation_activity_detail(),
     )
 
+    await _try_restore_pair_workspace(db, task_id)
+
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
@@ -1867,6 +1886,9 @@ async def add_update(
             f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
             detail=mutation_activity_detail(),
         )
+
+    if body.kind == "done":
+        await _try_restore_pair_workspace(db, task_id)
 
     update_row = await repo.get_task_update_by_id(db, update_id)
     return TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
