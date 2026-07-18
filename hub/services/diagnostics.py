@@ -93,10 +93,13 @@ async def build_identity_diagnostics(
     ``config_mismatch`` is set so an operator is never misled about which
     instance served the call.
     """
+    from hub.services.orchestration import worktree_per_task_enabled
+
     whoami = build_whoami(identity)
     inst = instance_echo_fields()
     workspace = str(WORKSPACE_REPO_LINK)
     branch = await _workspace_branch(workspace)
+    workspace_mode = "worktree" if worktree_per_task_enabled() else "legacy"
 
     configured_host = (urlparse(inst["base_url"]).hostname or "").lower()
     connected_host = (urlparse(connected_via).hostname or "").lower()
@@ -115,6 +118,7 @@ async def build_identity_diagnostics(
         config_mismatch=mismatch,
         workspace_path=workspace,
         workspace_branch=branch,
+        workspace_mode=workspace_mode,
         app_version=whoami.app_version,
     )
 

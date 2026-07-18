@@ -835,9 +835,14 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
     identity: dict[str, Any] = {}
     my_tasks: list[dict[str, Any]] = []
     try:
-        identity = await _api_get("/api/whoami")
+        # Diagnostics carries identity + the active workspace mode (#530), so an
+        # onboarding agent sees whether worktree isolation is in effect.
+        identity = await _api_get("/api/diagnostics/identity")
     except HubApiError:
-        identity = {}
+        try:
+            identity = await _api_get("/api/whoami")
+        except HubApiError:
+            identity = {}
     username = (identity.get("username") or "").strip()
     if username:
         try:
@@ -859,6 +864,16 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         )
     else:
         lines.append("Identity: unavailable")
+    workspace_mode = identity.get("workspace_mode") or "legacy"
+    lines.append(
+        f"Workspace mode: {workspace_mode}"
+        + (
+            " — pair-start gives each task its own git worktree; "
+            "hub_pair_start returns the path"
+            if workspace_mode == "worktree"
+            else " — single shared working tree (branch switching)"
+        )
+    )
     if my_tasks:
         task_strs = [
             f"#{t.get('id')} {t.get('title', '')} ({t.get('status', '?')})"
@@ -1040,6 +1055,11 @@ async def hub_pair_start(
     and the identity the server resolved. Pair-start by the same authenticated
     principal is accepted even when the presentational name differs.
 
+    Workspace mode (#530/#459): when the server runs with
+    OPENCLAW_WORKTREE_PER_TASK=1 the response names your task's isolated git
+    worktree path — work THERE, not in the shared clone (the main clone stays
+    on the base branch). In legacy mode the response is unchanged.
+
     Args:
         task_id: The open task ID to pair-start
         plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
@@ -1071,6 +1091,16 @@ async def hub_pair_start(
         f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
         f"agent: {agent_name}, {job_note})."
     )
+    # Worktree isolation (#530): the mode/path live on the pair-start response
+    # (not the DB re-read), so read them from `result` and tell the agent where
+    # its isolated tree is — otherwise it would keep working in the shared clone.
+    workspace_mode = (result or {}).get("workspace_mode") or "legacy"
+    worktree_path = (result or {}).get("worktree_path") or ""
+    if workspace_mode == "worktree" and worktree_path:
+        message += (
+            f"\nWorkspace mode: worktree — your isolated working tree is at "
+            f"{worktree_path}. Work THERE; the main clone stays on the base branch."
+        )
     return await _task_mutation_response(
         task_id,
         message,

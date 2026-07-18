@@ -782,6 +782,10 @@ class TaskView(BaseModel):
     latest_review: LatestReview | None = None
     branch: str | None = None
     pr_number: int | None = None
+    # Pair-start workspace signal (#530): set only on pair-start so an agent
+    # learns where its isolated worktree is. "" elsewhere.
+    workspace_mode: str = ""
+    worktree_path: str = ""
     claimed_by: str | None = None
     claim_session_id: str | None = None
     claimed_at: str | None = None
@@ -1307,6 +1311,7 @@ class IdentityDiagnosticsView(BaseModel):
     config_mismatch: bool = False
     workspace_path: str = ""
     workspace_branch: str = ""
+    workspace_mode: str = "legacy"
     app_version: str
 
 

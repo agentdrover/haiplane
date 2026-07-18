@@ -4232,3 +4232,46 @@ async def test_worktree_mode_headless_uses_main_clone(
     # None of the git ops targeted the (nonexistent) worktree — they used workspace.
     assert plugins.git_ops.squash_branch.await_args.kwargs["repo"] == workspace
     assert plugins.git_ops.checkout.await_args.kwargs["repo"] == workspace
+
+
+# --- pair-start surfaces worktree path/mode to the agent (#530) ---
+
+
+async def test_pair_start_surfaces_worktree_path(db: aiosqlite.Connection, monkeypatch):
+    # AC-1 (#530): worktree mode → TaskView carries workspace_mode + worktree_path.
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    plugins.git_ops.pair_prepare_worktree = AsyncMock(return_value="task-1/wt")
+    plugins.git_ops.worktree_path = MagicMock(return_value="/srv/.ws-worktrees/task-1")
+
+    tv = await services.create_task(db, TaskCreate(title="WT surface"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="dev")
+    assert started.status.value == "running"
+    assert started.workspace_mode == "worktree"
+    assert started.worktree_path == "/srv/.ws-worktrees/task-1"
+
+
+async def test_pair_start_legacy_no_worktree_path(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#530): legacy mode → workspace_mode=legacy, no worktree path.
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.delenv("OPENCLAW_WORKTREE_PER_TASK", raising=False)
+    plugins.git_ops.pair_prepare_branch = AsyncMock(return_value="task-1/leg")
+
+    tv = await services.create_task(db, TaskCreate(title="Legacy surface"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="dev")
+    assert started.workspace_mode == "legacy"
+    assert started.worktree_path == ""
