@@ -51,8 +51,17 @@ class LifecyclePolicy:
     require_review_job_id: bool = False
 
 
-def _machine(instance, status, *, deadline_config, reason, escalation="needs_decision",
-             discriminator=None, require_job_id=False, require_review_job_id=False):
+def _machine(
+    instance,
+    status,
+    *,
+    deadline_config,
+    reason,
+    escalation="needs_decision",
+    discriminator=None,
+    require_job_id=False,
+    require_review_job_id=False,
+):
     return LifecyclePolicy(
         instance=instance,
         status=status,
@@ -85,53 +94,89 @@ def _waiting(instance, status, *, owner, next_actor, surface, discriminator=None
 LIFECYCLE_MATRIX: dict[str, LifecyclePolicy] = {
     # --- human-owned: a person must act; no auto-transition, inbox surface ---
     "draft": _waiting(
-        "draft", "draft", owner=OWNER_HUMAN,
-        next_actor="human", surface="inbox:drafts",
+        "draft",
+        "draft",
+        owner=OWNER_HUMAN,
+        next_actor="human",
+        surface="inbox:drafts",
     ),
     "needs_info": _waiting(
-        "needs_info", "needs_info", owner=OWNER_HUMAN,
-        next_actor="human", surface="inbox:questions",
+        "needs_info",
+        "needs_info",
+        owner=OWNER_HUMAN,
+        next_actor="human",
+        surface="inbox:questions",
     ),
     "needs_decision": _waiting(
-        "needs_decision", "needs_decision", owner=OWNER_HUMAN,
-        next_actor="human", surface="inbox:decisions",
+        "needs_decision",
+        "needs_decision",
+        owner=OWNER_HUMAN,
+        next_actor="human",
+        surface="inbox:decisions",
     ),
     "review:client": _waiting(
-        "review:client", "review", owner=OWNER_HUMAN, discriminator="client",
-        next_actor="human", surface="inbox:review",
+        "review:client",
+        "review",
+        owner=OWNER_HUMAN,
+        discriminator="client",
+        next_actor="human",
+        surface="inbox:review",
     ),
     # --- agent_queue: waiting for an agent to pick up or drive interactively ---
     "open": _waiting(
-        "open", "open", owner=OWNER_AGENT_QUEUE,
-        next_actor="agent", surface="board",
+        "open",
+        "open",
+        owner=OWNER_AGENT_QUEUE,
+        next_actor="agent",
+        surface="board",
     ),
     "running:pair": _waiting(
-        "running:pair", "running", owner=OWNER_AGENT_QUEUE, discriminator="pair",
-        next_actor="agent", surface="stale-alert",
+        "running:pair",
+        "running",
+        owner=OWNER_AGENT_QUEUE,
+        discriminator="pair",
+        next_actor="agent",
+        surface="stale-alert",
     ),
     # --- machine-owned: the poller must auto-transition on deadline ---
     "claimed": _machine(
-        "claimed", "claimed", deadline_config="CLAIM_LEASE_MINUTES",
-        reason="claim_lease_expired", escalation="open",
+        "claimed",
+        "claimed",
+        deadline_config="CLAIM_LEASE_MINUTES",
+        reason="claim_lease_expired",
+        escalation="open",
     ),
     "running:headless": _machine(
-        "running:headless", "running", deadline_config="DEADLINE_RUNNING_MINUTES",
-        reason="running_deadline", discriminator="headless", require_job_id=True,
+        "running:headless",
+        "running",
+        deadline_config="DEADLINE_RUNNING_MINUTES",
+        reason="running_deadline",
+        discriminator="headless",
+        require_job_id=True,
     ),
     "review:headless": _machine(
-        "review:headless", "review", deadline_config="DEADLINE_REVIEW_MINUTES",
-        reason="review_deadline", discriminator="headless", require_review_job_id=True,
+        "review:headless",
+        "review",
+        deadline_config="DEADLINE_REVIEW_MINUTES",
+        reason="review_deadline",
+        discriminator="headless",
+        require_review_job_id=True,
     ),
     "fix_requested": _machine(
-        "fix_requested", "fix_requested",
-        deadline_config="DEADLINE_FIX_REQUESTED_MINUTES", reason="fix_deadline",
+        "fix_requested",
+        "fix_requested",
+        deadline_config="DEADLINE_FIX_REQUESTED_MINUTES",
+        reason="fix_deadline",
     ),
     "ci_check": _machine(
-        "ci_check", "ci_check", deadline_config="DEADLINE_CI_CHECK_MINUTES",
+        "ci_check",
+        "ci_check",
+        deadline_config="DEADLINE_CI_CHECK_MINUTES",
         reason="ci_check_deadline",
     ),
     "pending_report": _machine(
-        "pending_report", "pending_report",
+        "pending_report",
+        "pending_report",
         deadline_config="DEADLINE_PENDING_REPORT_MINUTES",
         reason="pending_report_deadline",
     ),
@@ -157,7 +202,9 @@ def resolve_instance(
 def policy_for(
     status: str, *, job_id: str | None = None, review_job_id: str | None = None
 ) -> LifecyclePolicy:
-    return LIFECYCLE_MATRIX[resolve_instance(status, job_id=job_id, review_job_id=review_job_id)]
+    return LIFECYCLE_MATRIX[
+        resolve_instance(status, job_id=job_id, review_job_id=review_job_id)
+    ]
 
 
 def machine_deadline_policies() -> list[LifecyclePolicy]:

@@ -858,9 +858,7 @@ async def increment_ci_no_pr_attempts(
         "UPDATE tasks SET ci_no_pr_attempts = ci_no_pr_attempts + 1 WHERE id=?",
         (task_id,),
     )
-    cur = await db.execute(
-        "SELECT ci_no_pr_attempts FROM tasks WHERE id=?", (task_id,)
-    )
+    cur = await db.execute("SELECT ci_no_pr_attempts FROM tasks WHERE id=?", (task_id,))
     row = await cur.fetchone()
     return int(row[0]) if row else 0
 
