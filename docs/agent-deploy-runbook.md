@@ -241,9 +241,13 @@ OPENCLAW_HUB_REPO=org/repo-name
 
 1. Hub DB и lifecycle — локально или на agenthai; git push — в общий `origin`.
 2. Перед `hub_pair_start` — commit или stash в workspace repo.
-3. После pair-start сверить `tasks.branch` в UI/API с `git branch --show-current`.
-4. Push и PR — с машины, где написан код; server hub не заменяет push с ноутбука.
-5. Не копировать production `hub.db` на laptop без понимания, что approve/running state общий snapshot, а git remote один.
+3. После pair-start Hub может автоматически переключить workspace с **чистой,
+   запушенной** ветки другой задачи (`task-N/*`) на base branch (#451); грязное
+   дерево или незапушенная чужая ветка по-прежнему дают 422 с путём workspace и hint.
+4. После `hub_submit_for_review`, `hub_report_done` или `hub_release_task` Hub
+   best-effort возвращает workspace на base branch, если он на ветке этой задачи и чистый.
+5. Push и PR — с машины, где написан код; server hub не заменяет push с ноутбука.
+6. Не копировать production `hub.db` на laptop без понимания, что approve/running state общий snapshot, а git remote один.
 
 Подробнее: [software-development-workflow.md](../software-development-workflow.md#pair-mode-git-policy), [task-workflow.html](task-workflow.html#pair-git-policy).
 
