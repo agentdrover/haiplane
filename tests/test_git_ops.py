@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hub.integrations.git_ops import GitOpsIntegration, PairBranchConflictError
+from hub.integrations.git_ops import (
+    GitOpsIntegration,
+    PairBranchConflictError,
+    _worktree_path,
+)
 
 
 @pytest.fixture
@@ -655,3 +663,248 @@ async def test_origin_reachable_false(git_ops: GitOpsIntegration) -> None:
 
     with patch("hub.integrations.git_ops._git", side_effect=fake_git):
         assert await git_ops.origin_reachable(repo="/srv/ws") is False
+
+
+# --- worktree-per-task isolation (#459) ---
+
+
+def _git_setup(repo):
+    repo.mkdir()
+    for args in (
+        ("init", "-q", "-b", "develop"),
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+
+
+def _current_branch(path):
+    return subprocess.run(
+        ["git", "branch", "--show-current"], cwd=path, capture_output=True, text=True
+    ).stdout.strip()
+
+
+async def test_worktree_parallel_isolation(tmp_path, git_ops):
+    # AC-1 (#459): two prepares → two independent worktrees; main clone stays on base.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+
+    b1 = await git_ops.pair_prepare_worktree(
+        1, "Task one", repo=str(repo), base_branch="develop"
+    )
+    b2 = await git_ops.pair_prepare_worktree(
+        2, "Task two", repo=str(repo), base_branch="develop"
+    )
+    assert b1.startswith("task-1/") and b2.startswith("task-2/")
+
+    wt1, wt2 = _worktree_path(1, str(repo)), _worktree_path(2, str(repo))
+    assert os.path.isdir(wt1) and os.path.isdir(wt2)
+    # Each worktree on its own branch, both alive at once, main clone untouched.
+    assert _current_branch(wt1) == b1
+    assert _current_branch(wt2) == b2
+    assert _current_branch(repo) == "develop"
+
+
+async def test_worktree_remove_clean(tmp_path, git_ops):
+    # AC-2 (#459): cleanup removes a clean worktree; main clone stays on base.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        3, "Cleanup", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(3, str(repo))
+    assert os.path.isdir(wt)
+
+    assert await git_ops.pair_remove_worktree(3, repo=str(repo)) is True
+    assert not os.path.isdir(wt)
+    assert _current_branch(repo) == "develop"
+
+
+async def test_worktree_remove_skips_dirty(tmp_path, git_ops):
+    # AC-3 (#459): a dirty worktree is not removed — no data loss.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        4, "Dirty", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(4, str(repo))
+    (Path(wt) / "wip.txt").write_text("unsaved")
+
+    assert await git_ops.pair_remove_worktree(4, repo=str(repo)) is False
+    assert os.path.isdir(wt)
+
+
+async def test_worktree_reuse_and_stale(tmp_path, git_ops):
+    # AC-4 (#459): re-prepare reuses the branch and prunes a stale registration.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    b = await git_ops.pair_prepare_worktree(
+        5, "Reuse", repo=str(repo), base_branch="develop"
+    )
+    wt = _worktree_path(5, str(repo))
+
+    # Reuse: same call returns same branch, no error.
+    assert (
+        await git_ops.pair_prepare_worktree(
+            5, "Reuse", repo=str(repo), base_branch="develop"
+        )
+        == b
+    )
+
+    # Stale: delete the worktree dir out from under git, then re-prepare recreates.
+    shutil.rmtree(wt)
+    b2 = await git_ops.pair_prepare_worktree(
+        5, "Reuse", repo=str(repo), base_branch="develop"
+    )
+    assert b2 == b
+    assert os.path.isdir(wt)
+    assert _current_branch(wt) == b
+
+
+async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
+    # AC-3 / #459 review MEDIUM: switching a dirty reused worktree to another
+    # branch is refused with a structural error — uncommitted work is preserved.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        6, "Task A", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = _worktree_path(6, str(repo))
+    (Path(wt) / "wip.txt").write_text("unsaved")
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            6, "Task A", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+    detail = exc.value.to_detail()
+    assert detail["reason"] == "pair_worktree_dirty"
+    assert detail["workspace_path"] == wt
+    assert (Path(wt) / "wip.txt").exists()  # data preserved
+
+
+async def test_worktree_base_ahead_guard(tmp_path, git_ops):
+    # #459 review MEDIUM: pair_prepare_worktree must reject cutting a new branch
+    # when local base is ahead of origin/base (broken fetch → foreign commits).
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "main"
+    subprocess.run(
+        ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+    )
+    for args in (
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "develop"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    # Local develop now diverges ahead of origin/develop (commit, no push).
+    (repo / "g.txt").write_text("y")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "local-only"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            7, "Ahead", repo=str(repo), base_branch="develop", branch_slug="new"
+        )
+    assert exc.value.to_detail()["reason"] == "pair_base_ahead_of_origin"
+
+
+async def test_worktree_reuse_switches_branch_cleanly(tmp_path, git_ops):
+    # #459 review HIGH: reusing a clean worktree for a new slug must actually
+    # create+switch the branch, not silently return one it never checked out.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = _worktree_path(6, str(repo))
+
+    b = await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="b"
+    )
+    assert b == "task-6/b"
+    assert _current_branch(wt) == "task-6/b"  # truly switched, no false success
+
+
+async def test_worktree_reuse_base_ahead_guard(tmp_path, git_ops):
+    # #459 review: the base-ahead guard on the REUSE path (new slug on an existing
+    # worktree) must also fire, not just the fresh-worktree path.
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "main"
+    subprocess.run(
+        ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+    )
+    for args in (
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "develop"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Existing clean worktree on task-6/a.
+    await git_ops.pair_prepare_worktree(
+        6, "Task", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    # Local develop now diverges ahead of origin/develop.
+    (repo / "g.txt").write_text("y")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "local-only"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Reuse path cutting a new branch task-6/b must hit the guard.
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            6, "Task", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+    assert exc.value.to_detail()["reason"] == "pair_base_ahead_of_origin"
+
+
+async def test_worktree_remove_unregistered_is_idempotent(tmp_path, git_ops):
+    # #459 review: removing a worktree for a task that has none prunes and
+    # returns True (idempotent cleanup), never raises or returns False.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    assert await git_ops.pair_remove_worktree(99, repo=str(repo)) is True

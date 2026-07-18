@@ -80,6 +80,29 @@ Pair mode не запускает headless dispatch. GitHub CI и reviewer agent
 
 Подробные шаги: [software-development-workflow.md § Pair mode: git policy](software-development-workflow.md#pair-mode-git-policy).
 
+## Worktree-per-task (opt-in, #459)
+
+По умолчанию Hub держит один workspace на проект и переключает ветки в нём
+(`git checkout`), поэтому две задачи не могут держать разные ветки
+одновременно (#451/#457 лишь возвращают дерево на base между задачами).
+
+При `OPENCLAW_WORKTREE_PER_TASK=1` включается изоляция через `git worktree`:
+
+- pair-start создаёт для задачи **отдельное рабочее дерево** по детерминированному
+  пути (`.<repo>-worktrees/task-<id>`, sibling основного клона), а основной клон
+  (`_default`) **всегда остаётся на base branch** и не переключается.
+- Две задачи получают независимые worktree с общим `.git` — параллельный
+  pair-start не сводит их в одну ветку и не перетирает работу друг друга.
+- Worktree убирается (`git worktree remove` + `prune`) при уходе задачи из
+  `running` (submit / done / release); при CHANGES_REQUESTED дерево создаётся
+  заново для доработки.
+- Инварианты сохраняются: **грязный worktree не удаляется** (изменения не
+  теряются), stale-регистрация чистится `prune` перед созданием, ветка задачи
+  от base отклоняется при `base ahead of origin` (см. #457).
+
+Флаг по умолчанию выключен — боевое поведение не меняется, пока опс не включит
+его осознанно. Мульти-репозиторные workspace остаются вне объёма.
+
 ## Аудит
 
 Любое нарушение политики должно быть видимым постфактум:
