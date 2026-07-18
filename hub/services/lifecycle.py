@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,6 +24,13 @@ from hub.hub_instance import mutation_activity_detail
 from hub.db import log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.mcp_envelope import enrich_error_payload
+from hub.services.task_idempotency import (
+    IdempotencyRecord,
+    hash_task_create_payload,
+    idempotency_conflict_detail,
+    normalize_task_create,
+    resolve_client_request_id,
+)
 from hub.models import (
     ACTIVE_STATUSES,
     BatchApprove,
@@ -498,8 +506,37 @@ async def enrich_task_view(
     return task_view
 
 
-async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
+@dataclass(frozen=True)
+class CreateTaskOutcome:
+    task: TaskView
+    is_new: bool = True
+
+    def __getattr__(self, name: str) -> Any:
+        # Backward-compat: before idempotency (#20) create_task returned the
+        # TaskView directly. Delegate unknown attributes to the wrapped view so
+        # callers that treat the result as a TaskView keep working. Guard
+        # ``task`` to avoid infinite recursion before the field is set.
+        if name == "task":
+            raise AttributeError(name)
+        return getattr(self.task, name)
+
+
+async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
+    row = await repo.get_task(db, task_id)
+    return row_to_task(row)  # type: ignore[arg-type]
+
+
+async def create_task(
+    db: aiosqlite.Connection,
+    body: TaskCreate,
+    *,
+    client_request_id: str | None = None,
+) -> CreateTaskOutcome:
     """Create a new task, optionally dispatching it immediately."""
+    idem_key = resolve_client_request_id(
+        None, client_request_id or body.client_request_id
+    )
+
     err = await db_module.validate_hierarchy(db, body.task_type.value, body.parent_id)
     if err:
         raise HTTPException(
@@ -530,46 +567,80 @@ async def create_task(db: aiosqlite.Connection, body: TaskCreate) -> TaskView:
             )
         project_id = project_row["id"]
 
-    if body.task_type in (TaskType.epic, TaskType.feature):
-        # Agents PROPOSE features/epics as drafts (#323) — the human
-        # approval gate owns the decomposition. Human-created ones stay
-        # open (the pre-#323 invariant, now scoped to source=human).
-        initial_status = "draft" if body.source == TaskSource.agent else "open"
-        body.run_immediately = False
-        body.auto_review = False
-    elif body.source == TaskSource.agent:
-        initial_status = "draft"
-    elif body.run_immediately:
-        initial_status = "running"
-    else:
-        initial_status = "open"
+    initial_status, normalized = normalize_task_create(body)
+    request_hash = hash_task_create_payload(normalized) if idem_key else None
 
-    if body.task_type == TaskType.subtask and body.auto_review:
-        body.auto_review = False
+    try:
+        if idem_key:
+            existing = await repo.get_task_idempotency_key(db, idem_key)
+            if existing:
+                if existing["request_hash"] != request_hash:
+                    record = IdempotencyRecord(
+                        client_request_id=idem_key,
+                        task_id=int(existing["task_id"]),
+                        request_hash=existing["request_hash"],
+                    )
+                    raise HTTPException(
+                        409,
+                        idempotency_conflict_detail(record),
+                    )
+                await db.commit()
+                task = await _load_task_view(db, int(existing["task_id"]))
+                return CreateTaskOutcome(task=task, is_new=False)
 
-    # Use the structured-aware insert so all fields from TaskCreate
-    # (work_type, scope_in/out, user_story, etc.) actually persist.
-    # The legacy repo.create_task only knew about the original columns
-    # and silently dropped the rest of the payload (#46 / review C1).
-    task_id = await repo.create_task_full(db, body, status=initial_status)
-    if project_id is not None:
-        await repo.update_task(db, task_id, project_id=project_id)
-    await db.commit()
+        # Structured-aware insert so all fields from TaskCreate (work_type,
+        # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
+        # the lifecycle normalizations that also feed the idempotency hash.
+        task_id = await repo.create_task_full(db, normalized, status=initial_status)
+        if project_id is not None:
+            await repo.update_task(db, task_id, project_id=project_id)
+
+        if idem_key and request_hash is not None:
+            await repo.insert_task_idempotency_key(
+                db,
+                client_request_id=idem_key,
+                task_id=task_id,
+                request_hash=request_hash,
+            )
+
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except aiosqlite.IntegrityError:
+        await db.rollback()
+        if not idem_key:
+            raise
+        existing = await repo.get_task_idempotency_key(db, idem_key)
+        if not existing:
+            raise
+        if existing["request_hash"] != request_hash:
+            record = IdempotencyRecord(
+                client_request_id=idem_key,
+                task_id=int(existing["task_id"]),
+                request_hash=existing["request_hash"],
+            )
+            raise HTTPException(
+                409,
+                idempotency_conflict_detail(record),
+            ) from None
+        task = await _load_task_view(db, int(existing["task_id"]))
+        return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if body.run_immediately and body.source != TaskSource.agent:
+    if normalized.run_immediately and normalized.source != TaskSource.agent:
         row = await repo.get_task(db, task_id)
         result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
     await log_activity(
         db,
         "task_created",
-        f"{body.task_type.value.capitalize()} #{task_id}: {body.title}",
+        f"{normalized.task_type.value.capitalize()} #{task_id}: {normalized.title}",
         json.dumps(result, ensure_ascii=False) if result else None,
     )
 
-    row = await repo.get_task(db, task_id)
-    return row_to_task(row)  # type: ignore[arg-type]
+    task = await _load_task_view(db, task_id)
+    return CreateTaskOutcome(task=task, is_new=True)
 
 
 async def create_subtasks_bulk(
@@ -1212,22 +1283,24 @@ async def create_drafts_for_out_of_scope_findings(
         if len(title) > 500:
             title = title[:499] + "…"
 
-        view = await create_task(
-            db,
-            TaskCreate(
-                title=title,
-                description="\n".join(lines),
-                task_type=TaskType.task,
-                parent_id=parent_id,
-                source=TaskSource.agent,
-                agent=(body.agent or "").strip() or "reviewer",
-                rationale=(
-                    f"Auto-created from out-of-scope review finding #{f.id} "
-                    f"on task #{source_task_id} (#436)"
+        view = (
+            await create_task(
+                db,
+                TaskCreate(
+                    title=title,
+                    description="\n".join(lines),
+                    task_type=TaskType.task,
+                    parent_id=parent_id,
+                    source=TaskSource.agent,
+                    agent=(body.agent or "").strip() or "reviewer",
+                    rationale=(
+                        f"Auto-created from out-of-scope review finding #{f.id} "
+                        f"on task #{source_task_id} (#436)"
+                    ),
+                    run_immediately=False,
                 ),
-                run_immediately=False,
-            ),
-        )
+            )
+        ).task
         f.linked_task_id = view.id
         created.append(view.id)
     return created

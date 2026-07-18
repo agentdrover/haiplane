@@ -128,12 +128,20 @@ async def _api_get(path: str, *, timeout: float = 15) -> Any:
         return resp.json()
 
 
-async def _api_post(path: str, body: dict[str, Any] | None = None) -> Any:
+async def _api_post(
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     import httpx
 
+    headers = _auth_headers()
+    if extra_headers:
+        headers.update(extra_headers)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+            f"{_hub_url()}{path}", json=body or {}, headers=headers
         )
         try:
             resp.raise_for_status()
@@ -364,6 +372,7 @@ async def hub_create_task(
     run_immediately: bool = False,
     human_owner: str = "",
     human_reviewer: str = "",
+    client_request_id: str = "",
 ) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask.
 
@@ -377,6 +386,7 @@ async def hub_create_task(
         run_immediately: If True, dispatch immediately (not applicable for epic/feature)
         human_owner: Person who owns / is accountable for this task
         human_reviewer: Person who will review and accept the result
+        client_request_id: Optional idempotency key; safe to retry on timeout
     """
     body: dict[str, Any] = {
         "title": title,
@@ -391,7 +401,16 @@ async def hub_create_task(
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
-    result = await _api_post("/api/tasks", body)
+    extra_headers: dict[str, str] = {}
+    idem_key = client_request_id.strip()
+    if idem_key:
+        body["client_request_id"] = idem_key
+        extra_headers["X-Client-Request-Id"] = idem_key
+    result = await _api_post(
+        "/api/tasks",
+        body,
+        extra_headers=extra_headers or None,
+    )
     status = result.get("status", "?")
     summary = f"{task_type.capitalize()} #{result['id']} created (status: {status})."
     return structured_tool_result(summary, HubCreateTaskStructured(task=result))

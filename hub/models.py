@@ -246,6 +246,11 @@ class TaskCreate(BaseModel):
     validation_commands: list[str] = Field(default_factory=list, max_length=10)
     out_of_scope_for_review: list[str] = Field(default_factory=list, max_length=10)
     review_checklist: list[str] = Field(default_factory=list, max_length=10)
+    client_request_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional idempotency key; duplicates return the original task",
+    )
 
 
 MAX_BULK_CHILD_TASKS = 20

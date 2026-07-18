@@ -96,6 +96,7 @@ from hub.services.tree_output import (
     apply_tree_limits,
     truncate_text,
 )
+from hub.services.task_idempotency import resolve_client_request_id
 from hub.poller import start_poller
 from hub.web import router as web_router
 
@@ -220,8 +221,21 @@ async def healthz() -> str:
 
 
 @app.post("/api/tasks", response_model=TaskView)
-async def api_create_task(body: TaskCreate, request: Request):
-    return await services.create_task(_db(request), body)
+async def api_create_task(body: TaskCreate, request: Request, response: Response):
+    idem_key = resolve_client_request_id(
+        request.headers.get("X-Client-Request-Id"),
+        body.client_request_id,
+    )
+    outcome = await services.create_task(
+        _db(request),
+        body,
+        client_request_id=idem_key,
+    )
+    if idem_key:
+        response.status_code = (
+            status.HTTP_201_CREATED if outcome.is_new else status.HTTP_200_OK
+        )
+    return outcome.task
 
 
 @app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
@@ -1500,7 +1514,7 @@ async def api_create_proposal_compat(request: Request):
         agent=raw.get("agent", ""),
         rationale=raw.get("rationale", ""),
     )
-    return await services.create_task(_db(request), body)
+    return (await services.create_task(_db(request), body)).task
 
 
 @app.get("/api/proposals", response_model=list[TaskView])

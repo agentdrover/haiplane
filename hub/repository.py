@@ -1451,3 +1451,36 @@ async def list_activity(
         "SELECT * FROM activity_log ORDER BY id DESC LIMIT ?",
         (limit,),
     )
+
+
+# ---------------------------------------------------------------------------
+# Task create idempotency
+# ---------------------------------------------------------------------------
+
+
+async def get_task_idempotency_key(
+    db: aiosqlite.Connection,
+    client_request_id: str,
+) -> dict[str, Any] | None:
+    rows = await db.execute_fetchall(
+        "SELECT client_request_id, task_id, request_hash "
+        "FROM task_idempotency_keys WHERE client_request_id = ?",
+        (client_request_id,),
+    )
+    if not rows:
+        return None
+    return dict(rows[0])
+
+
+async def insert_task_idempotency_key(
+    db: aiosqlite.Connection,
+    *,
+    client_request_id: str,
+    task_id: int,
+    request_hash: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO task_idempotency_keys "
+        "(client_request_id, task_id, request_hash) VALUES (?, ?, ?)",
+        (client_request_id, task_id, request_hash),
+    )

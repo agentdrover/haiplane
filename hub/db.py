@@ -548,6 +548,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_arbiter_dispatch_at_column",
         "ALTER TABLE tasks ADD COLUMN arbiter_dispatch_at TEXT",
     ),
+    (
+        "create_task_idempotency_keys_table",
+        """
+        CREATE TABLE IF NOT EXISTS task_idempotency_keys (
+            client_request_id TEXT PRIMARY KEY,
+            task_id INTEGER NOT NULL REFERENCES tasks(id),
+            request_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """,
+    ),
 ]
 
 
