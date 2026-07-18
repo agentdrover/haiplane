@@ -418,3 +418,31 @@ async def test_events_pruning(db):
     assert removed == 1
     kinds = {r["kind"] for r in await repo_module.list_events(db, since=0)}
     assert kinds == {"fresh"}
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_no_pr_attempts_persist_across_restart(mock_sleep, db):
+    # AC-4 (#416): the no-PR retry budget lives in the row, so a restart — a
+    # fresh process with no in-memory state — keeps counting from the DB
+    # instead of restarting at zero. The module holds no CI state at all.
+    import hub.poller as poller_mod
+
+    assert not hasattr(poller_mod, "_ci_no_pr_retries")
+    assert not hasattr(poller_mod, "_ci_pushed_at")
+
+    task_id = await _make_stale_task(db, status="ci_check", minutes=0)
+    # Two attempts were already burned before the "restart".
+    await repo.update_task(db, task_id, ci_no_pr_attempts=2)
+    await db.commit()
+
+    plugins.git_ops = NoopGitOps()
+    plugins.dispatch = NoopDispatch()
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    # 2 (from DB) + 1 = 3 → escalated, proving the counter was not reset by
+    # the restart. The budget is cleared as the task leaves the conveyor.
+    assert row["status"] == "needs_decision"
+    assert row["ci_no_pr_attempts"] == 0

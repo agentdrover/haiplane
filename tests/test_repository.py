@@ -526,3 +526,69 @@ async def test_resolve_project_for_task_walks_to_epic(db: aiosqlite.Connection):
     loose_id = await _make_task(db, status="open")
     project = await repo.resolve_project_for_task(db, loose_id)
     assert project is not None and project["slug"] == "default"
+
+
+async def test_status_entered_at_advances_only_on_status_change(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#416): a status transition stamps status_entered_at atomically, but
+    # re-writing the same status or PATCHing other fields must not reset it.
+    task_id = await _make_task(db, status="open")
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', '-60 minutes') "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    pinned = dict(await repo.get_task(db, task_id))["status_entered_at"]
+    assert pinned is not None
+
+    # Re-writing the same status leaves the clock untouched.
+    await repo.update_task(db, task_id, status="open")
+    assert dict(await repo.get_task(db, task_id))["status_entered_at"] == pinned
+
+    # A non-status field PATCH also leaves it untouched.
+    await repo.update_task(db, task_id, priority="high")
+    assert dict(await repo.get_task(db, task_id))["status_entered_at"] == pinned
+
+    # An actual status change advances the clock past the pinned past value.
+    await repo.update_task(db, task_id, status="running")
+    advanced = dict(await repo.get_task(db, task_id))["status_entered_at"]
+    assert advanced > pinned
+
+
+async def test_transition_status_if_stamps_status_entered_at(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#416): the CAS transition helper advances status_entered_at too.
+    task_id = await _make_task(db, status="open")
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', '-60 minutes') "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    old = dict(await repo.get_task(db, task_id))["status_entered_at"]
+
+    assert await repo.transition_status_if(
+        db, task_id, expected_from="open", new_status="claimed"
+    )
+    assert dict(await repo.get_task(db, task_id))["status_entered_at"] > old
+
+
+async def test_ci_no_pr_attempts_increment_and_reset(db: aiosqlite.Connection):
+    # AC-4 support (#416): the retry counter increments atomically and resets
+    # with the CI clock when a task leaves the conveyor.
+    task_id = await _make_task(db, status="ci_check")
+    await db.commit()
+
+    assert await repo.increment_ci_no_pr_attempts(db, task_id) == 1
+    assert await repo.increment_ci_no_pr_attempts(db, task_id) == 2
+
+    await repo.mark_ci_check_started(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["ci_check_started_at"] is not None
+
+    await repo.reset_ci_check_state(db, task_id)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["ci_no_pr_attempts"] == 0
+    assert row["ci_check_started_at"] is None

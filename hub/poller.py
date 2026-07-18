@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
@@ -19,8 +19,23 @@ POLL_INTERVAL = 30  # seconds
 
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
 
-_ci_no_pr_retries: dict[int, int] = {}
-_ci_pushed_at: dict[int, float] = {}  # task_id → time.monotonic() of last push
+MAX_CI_NO_PR_ATTEMPTS = 3  # give up creating a PR after this many polls
+
+
+def _seconds_since(iso_ts: str | None) -> float | None:
+    """Seconds elapsed since a stored ``datetime('now')`` timestamp (#416).
+
+    CI push time now lives in the row (``ci_check_started_at``) as a naive-UTC
+    ``YYYY-MM-DD HH:MM:SS`` string, so the grace period is measured from the
+    real push and survives a restart. Returns ``None`` when unset/unparseable.
+    """
+    if not iso_ts:
+        return None
+    try:
+        started = datetime.strptime(iso_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return (datetime.now(UTC) - started).total_seconds()
 
 
 async def _poll_running_tasks(app: FastAPI) -> None:
@@ -108,7 +123,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     result_text=job.get("result_text"),
                 )
                 if next_status == "ci_check":
-                    _ci_pushed_at[task["id"]] = time.monotonic()
+                    await repo.mark_ci_check_started(db, task["id"])
                 log.info(
                     "Poll: task #%d → %s (exit=%s)",
                     task["id"],
@@ -378,21 +393,22 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         if pr_num:
                             await repo.update_task(db, task["id"], pr_number=pr_num)
                             task["pr_number"] = pr_num
+                            await repo.mark_ci_check_started(db, task["id"])
                             await db.commit()
-                            _ci_pushed_at[task["id"]] = time.monotonic()
                             log.info(
                                 "Poll: task #%d created PR #%d (was missing)",
                                 task["id"],
                                 pr_num,
                             )
                     if not task.get("pr_number"):
-                        _ci_no_pr_retries[task["id"]] = (
-                            _ci_no_pr_retries.get(task["id"], 0) + 1
+                        attempts = await repo.increment_ci_no_pr_attempts(
+                            db, task["id"]
                         )
-                        if _ci_no_pr_retries[task["id"]] >= 3:
+                        if attempts >= MAX_CI_NO_PR_ATTEMPTS:
                             log.warning(
-                                "Poll: task #%d ci_check without PR after 3 retries → needs_decision",
+                                "Poll: task #%d ci_check without PR after %d retries → needs_decision",
                                 task["id"],
+                                MAX_CI_NO_PR_ATTEMPTS,
                             )
                             await repo.add_task_update(
                                 db,
@@ -404,22 +420,24 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             await repo.update_task(
                                 db, task["id"], status="needs_decision"
                             )
+                            await repo.reset_ci_check_state(db, task["id"])
                             await db.commit()
-                            _ci_no_pr_retries.pop(task["id"], None)
                             await services.maybe_destroy_vast(db, task)
+                        else:
+                            await db.commit()
                         continue
-                pushed_at = _ci_pushed_at.get(task["id"], 0.0)
-                if pushed_at and (time.monotonic() - pushed_at) < CI_GRACE_PERIOD:
+                elapsed = _seconds_since(task.get("ci_check_started_at"))
+                if elapsed is not None and elapsed < CI_GRACE_PERIOD:
                     log.debug(
                         "Poll: task #%d CI grace period (%ds remaining)",
                         task["id"],
-                        int(CI_GRACE_PERIOD - (time.monotonic() - pushed_at)),
+                        int(CI_GRACE_PERIOD - elapsed),
                     )
                     continue
                 ci = await plugins.git_ops.check_pr_ci(task["pr_number"])
                 if ci == "pending":
                     continue
-                _ci_pushed_at.pop(task["id"], None)
+                await repo.reset_ci_check_state(db, task["id"])
                 if ci == "pass":
                     log.info(
                         "Poll: task #%d CI passed on PR #%s, dispatching review",
@@ -459,7 +477,6 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             payload={"reason": "ci_fix_cycle_limit"},
                         )
                         await db.commit()
-                        _ci_pushed_at.pop(task["id"], None)
                         log.info(
                             "Poll: task #%d CI fix cycle limit → needs_decision",
                             task["id"],
