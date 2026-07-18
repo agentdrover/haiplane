@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.db import log_activity
+from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
@@ -325,7 +326,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     merged = False
                     if pr_num:
                         ci = await plugins.git_ops.check_pr_ci(pr_num)
-                        if ci == "pass":
+                        if ci.outcome == CIProbeOutcome.passed:
                             merged = await plugins.git_ops.merge_pr(
                                 pr_num, task["id"], task["title"]
                             )
@@ -338,7 +339,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                                     task["id"],
                                     pr_num,
                                 )
-                        elif ci == "fail":
+                        elif ci.outcome == CIProbeOutcome.failed:
                             log.warning(
                                 "Poll: task #%d CI failed on PR #%d", task["id"], pr_num
                             )
@@ -351,8 +352,9 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             )
                         else:
                             log.info(
-                                "Poll: task #%d CI pending on PR #%d, will retry",
+                                "Poll: task #%d CI %s on PR #%d, will retry",
                                 task["id"],
+                                ci.outcome.value,
                                 pr_num,
                             )
                             continue
@@ -488,17 +490,42 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     )
                     continue
                 ci = await plugins.git_ops.check_pr_ci(task["pr_number"])
-                if ci == "pending":
+                if ci.outcome == CIProbeOutcome.pending:
+                    continue
+                if ci.outcome == CIProbeOutcome.unavailable:
+                    # The probe could not be read. Keep the diagnostic and retry;
+                    # the #418 deadline backstop escalates if it persists (#419).
+                    log.warning(
+                        "Poll: task #%d CI probe unavailable (%s), will retry",
+                        task["id"],
+                        ci.reason,
+                    )
                     continue
                 await repo.reset_ci_check_state(db, task["id"])
-                if ci == "pass":
+                if ci.outcome == CIProbeOutcome.absent:
+                    # A PR with no checks is a definite answer, not a wait: skip
+                    # the CI conveyor and go straight to review (#419).
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "status",
+                        "CI checks absent on PR — skipping CI, dispatching review.",
+                    )
+                    log.info(
+                        "Poll: task #%d CI absent on PR #%s, dispatching review",
+                        task["id"],
+                        task.get("pr_number"),
+                    )
+                    await services.dispatch_review(db, task)
+                elif ci.outcome == CIProbeOutcome.passed:
                     log.info(
                         "Poll: task #%d CI passed on PR #%s, dispatching review",
                         task["id"],
                         task.get("pr_number"),
                     )
                     await services.dispatch_review(db, task)
-                elif ci == "fail":
+                elif ci.outcome == CIProbeOutcome.failed:
                     ci_fix_cycle = task.get("ci_fix_cycle", 0)
                     if ci_fix_cycle < config.MAX_CI_FIX_CYCLES:
                         ci_details = await plugins.git_ops.get_ci_failure_logs(

@@ -7,6 +7,7 @@ import pytest
 
 from hub import repository as repo
 from hub.integrations.noop import NoopDispatch, NoopGitOps
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.poller import _poll_running_tasks
 
@@ -692,3 +693,100 @@ async def test_machine_deadline_leaves_fresh_task_untouched(mock_sleep, db):
 
     await _run_poll_once(db)
     assert dict(await repo.get_task(db, task_id))["status"] == "pending_report"
+
+
+# ---- Typed CI outcome → poller transitions (#419) ----
+
+
+async def _make_ci_task(db, *, pr_number=99):
+    task_id = await repo.create_task(
+        db,
+        title="CI task",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="ci_check",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, pr_number=pr_number, branch="task-x/b")
+    # Past the CI grace so the loop actually probes the PR.
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at = datetime('now', '-30 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    return task_id
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_absent_dispatches_review(mock_sleep, db):
+    # AC-2 (#419): a PR with no checks skips the CI wait, records an audit
+    # update and goes to review instead of waiting forever.
+    task_id = await _make_ci_task(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "rev-1"})
+    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.absent, "no_checks")
+    )
+    plugins.git_ops = mock_git
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("CI checks absent" in u["content"] for u in updates)
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_pending_stays_in_ci_check(mock_sleep, db):
+    # AC-3 (#419): pending within the deadline keeps the task in ci_check with
+    # no escalation and no duplicate alert.
+    task_id = await _make_ci_task(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_running")
+    )
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "ci_check"
+    assert await _events_for(db, task_id, "needs_decision") == []
+
+
+async def test_ci_unavailable_before_and_after_deadline(db):
+    # AC-4 (#419): unavailable keeps a diagnostic and retries before the
+    # deadline; past the #418 deadline the task escalates to needs_decision,
+    # idempotently.
+    task_id = await _make_ci_task(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.unavailable, "gh_error")
+    )
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "ci_check"
+
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', '-500 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+    await _run_poll_once(db)
+    assert len(await _events_for(db, task_id, "needs_decision")) == 1
