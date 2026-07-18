@@ -160,6 +160,9 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    def worktree_path(self, task_id: int, repo: str | None = None) -> str:
+        return ""
+
     async def pair_prepare_worktree(
         self,
         task_id: int,

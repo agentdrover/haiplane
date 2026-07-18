@@ -764,3 +764,24 @@ async def test_worktree_reuse_and_stale(tmp_path, git_ops):
     assert b2 == b
     assert os.path.isdir(wt)
     assert _current_branch(wt) == b
+
+
+async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
+    # AC-3 / #459 review MEDIUM: switching a dirty reused worktree to another
+    # branch is refused with a structural error — uncommitted work is preserved.
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        6, "Task A", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = _worktree_path(6, str(repo))
+    (Path(wt) / "wip.txt").write_text("unsaved")
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            6, "Task A", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+    detail = exc.value.to_detail()
+    assert detail["reason"] == "pair_worktree_dirty"
+    assert detail["workspace_path"] == wt
+    assert (Path(wt) / "wip.txt").exists()  # data preserved

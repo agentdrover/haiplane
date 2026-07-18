@@ -4147,3 +4147,51 @@ async def test_worktree_mode_off_uses_legacy(db: aiosqlite.Connection, monkeypat
     await services.pair_start_task(db, tv.id, caller="dev")
 
     prep_wt.assert_not_awaited()  # legacy branch-switching path, not worktrees
+
+
+async def test_worktree_mode_done_pipeline_targets_worktree(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # #459 review HIGH: in worktree mode the done→squash/push pipeline must run
+    # in the task worktree, NOT the main clone (else squash resets the base branch).
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    task_id = await repo.create_task(
+        db,
+        title="WT done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/wt")
+    await db.commit()
+
+    wt = f"/tmp/.main-worktrees/task-{task_id}"
+    plugins.git_ops.worktree_path = MagicMock(return_value=wt)
+    plugins.git_ops.checkout = AsyncMock(return_value=True)
+    plugins.git_ops.auto_commit = AsyncMock(return_value=True)
+    plugins.git_ops.squash_branch = AsyncMock(return_value=True)
+    plugins.git_ops.push_branch = AsyncMock(return_value=True)
+    plugins.git_ops.create_pr = AsyncMock(return_value=None)
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status == "ci_check"
+    assert plugins.git_ops.squash_branch.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.push_branch.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.checkout.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.create_pr.await_args.kwargs["repo"] == wt

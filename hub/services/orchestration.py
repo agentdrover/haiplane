@@ -552,24 +552,34 @@ async def transition_after_agent_done(
     ):
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
-        await plugins.git_ops.checkout(branch, repo=workspace)
+        # Worktree mode (#459): the task branch is checked out in its own
+        # worktree, and the main clone stays on base. Running commit/squash/push
+        # against the main clone would silently fail its checkout and let
+        # squash_branch reset --soft the base branch — so target the worktree,
+        # where the branch (and the agent's changes) actually live.
+        git_repo = workspace
+        if worktree_per_task_enabled():
+            wt = plugins.git_ops.worktree_path(task_id, workspace)
+            if wt:
+                git_repo = wt
+        await plugins.git_ops.checkout(branch, repo=git_repo)
         await plugins.git_ops.auto_commit(
-            task_id, title=task.get("title", ""), repo=workspace
+            task_id, title=task.get("title", ""), repo=git_repo
         )
         squashed = await plugins.git_ops.squash_branch(
             task_id,
             task.get("title", ""),
             branch,
-            repo=workspace,
+            repo=git_repo,
         )
-        await plugins.git_ops.push_branch(branch, repo=workspace, force=squashed)
+        await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
         if not task.get("pr_number"):
             pr_num = await plugins.git_ops.create_pr(
                 task_id,
                 task["title"],
                 task.get("description", ""),
                 branch,
-                repo=workspace,
+                repo=git_repo,
                 gh_repo=ctx.get("gh_repo"),
                 base_branch=ctx.get("base_branch"),
             )

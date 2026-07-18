@@ -719,6 +719,10 @@ class GitOpsIntegration:
         )
         return True
 
+    def worktree_path(self, task_id: int, repo: str | None = None) -> str:
+        """Deterministic worktree path for a task (#459); where its branch lives."""
+        return _worktree_path(task_id, repo or _repo_root())
+
     async def pair_prepare_worktree(
         self,
         task_id: int,
