@@ -3833,9 +3833,15 @@ def test_matrix_covers_every_non_terminal_status_and_discriminator():
         assert s.value in covered, f"no lifecycle policy covers status {s.value}"
 
     for job_id, review_job_id in ((("j"), None), (None, None)):
-        assert resolve_instance("running", job_id=job_id, review_job_id=None) in LIFECYCLE_MATRIX
+        assert (
+            resolve_instance("running", job_id=job_id, review_job_id=None)
+            in LIFECYCLE_MATRIX
+        )
     for review_job_id in ("r", None):
-        assert resolve_instance("review", job_id=None, review_job_id=review_job_id) in LIFECYCLE_MATRIX
+        assert (
+            resolve_instance("review", job_id=None, review_job_id=review_job_id)
+            in LIFECYCLE_MATRIX
+        )
 
 
 # ---- Noop GitOps accepts project context keywords (#420) ----
@@ -3910,10 +3916,10 @@ async def test_decide_rework_closes_arbiter_marker(db: aiosqlite.Connection):
         (0, 3, False),
         (1, 3, False),
         (2, 3, False),
-        (3, 3, True),   # AC-2: budget spent at MAX
+        (3, 3, True),  # AC-2: budget spent at MAX
         (4, 3, True),
-        (5, 3, True),   # review_cycle > MAX
-        (0, 0, True),   # AC-3: MAX<=0 exhausted immediately
+        (5, 3, True),  # review_cycle > MAX
+        (0, 0, True),  # AC-3: MAX<=0 exhausted immediately
         (0, 1, False),
         (1, 1, True),
     ],
@@ -4019,3 +4025,55 @@ async def test_pair_start_matching_name_still_allowed(db: aiosqlite.Connection):
         db, task_id, TaskPairStart(assigned_agent="alice"), caller="alice"
     )
     assert started.status.value == "running"
+
+
+# --- pair workspace switch back to task branch on rework (#457) ---
+
+
+async def test_changes_requested_switches_pair_workspace_to_task(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    # AC-1 (#457): CHANGES_REQUESTED (review→running) switches workspace to branch.
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    switch = AsyncMock(return_value=True)
+    plugins.git_ops.pair_switch_to_task_branch = switch
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="1. fix the tests",
+        ),
+    )
+
+    switch.assert_awaited_once()
+    assert switch.await_args.args[0] == task_id
+
+
+async def test_approved_verdict_does_not_switch_pair_workspace(
+    db: aiosqlite.Connection,
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    # Symmetry check: APPROVED needs no switch (task moves on to report_done).
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    switch = AsyncMock(return_value=True)
+    plugins.git_ops.pair_switch_to_task_branch = switch
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+
+    switch.assert_not_awaited()

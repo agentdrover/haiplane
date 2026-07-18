@@ -501,3 +501,134 @@ async def test_pair_restore_workspace_base_skips_dirty_tree(
         ok = await git_ops.pair_restore_workspace_base(5, repo="/srv/ws")
 
     assert ok is False
+
+
+# --- pair workspace: base-ahead guard + forward switch (#457) ---
+
+
+async def test_pair_prepare_branch_rejects_base_ahead_of_origin(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-3 (#457): local base ahead of origin/base → structured 422, no branch cut.
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2] == "task-7/new"
+        ):
+            return 1, "", ""  # target branch does not exist yet
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2].startswith("origin/develop")
+        ):
+            return 0, "abc123", ""  # origin/develop known
+        if (
+            cmd[:2] == ("rev-list", "--count")
+            and len(cmd) > 2
+            and "origin/develop..develop" in cmd[2]
+        ):
+            return 0, "3", ""  # local develop is 3 commits ahead
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+        patch("hub.integrations.git_ops._hostname", return_value="prod"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(7, "New", branch_slug="new")
+
+    detail = exc.value.to_detail()
+    assert detail["reason"] == "pair_base_ahead_of_origin"
+    assert detail["workspace_path"] == "/srv/ws"
+    assert "origin/develop..develop" in detail["hint"]
+
+
+async def test_pair_prepare_branch_allows_base_in_sync_with_origin(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Guard is silent when local base matches origin (count 0).
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if (
+            cmd[:2] == ("rev-parse", "--verify")
+            and len(cmd) > 2
+            and cmd[2] == "task-8/new"
+        ):
+            return 1, "", ""
+        if (
+            cmd[:2] == ("rev-list", "--count")
+            and len(cmd) > 2
+            and "origin/develop..develop" in cmd[2]
+        ):
+            return 0, "0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+    ):
+        branch = await git_ops.pair_prepare_branch(8, "New", branch_slug="new")
+    assert branch == "task-8/new"
+
+
+async def test_pair_switch_to_task_branch_switches_from_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-1 (#457): clean tree on base → checkout the task branch.
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is True
+    assert ("checkout", "task-5/x") in calls
+
+
+async def test_pair_switch_to_task_branch_skips_dirty(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-2 (#457): dirty tree → no switch, no data loss.
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "develop", ""
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, " M file.py", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is False
+
+
+async def test_pair_switch_to_task_branch_noop_off_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Safety: never yank a different task's branch — only leave the base.
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "task-9/other", ""
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        ok = await git_ops.pair_switch_to_task_branch(5, "task-5/x", repo="/srv/ws")
+    assert ok is False
+    assert ("checkout", "task-5/x") not in calls

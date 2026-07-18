@@ -334,6 +334,24 @@ async def restore_pair_workspace_base(
     await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
 
 
+async def switch_pair_workspace_to_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Best-effort: put the project workspace on the task branch for rework (#457).
+
+    Called after a CHANGES_REQUESTED verdict (review→running) so pair-mode
+    fixes land on the task branch instead of the local base restored by #451.
+    """
+    row = await repo.get_task(db, task_id)
+    branch = (dict(row).get("branch") or "").strip() if row else ""
+    if not branch:
+        return
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    await plugins.git_ops.pair_switch_to_task_branch(task_id, branch, **local_kw)
+
+
 # Statuses whose branch is active-but-unmerged: work in progress or waiting
 # for a review verdict. Stacking on top of such a branch is what incident
 # #392 produced (#424→#425→#426 on top of unmerged task-392).

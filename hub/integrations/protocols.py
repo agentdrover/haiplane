@@ -143,6 +143,14 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         base_branch: str | None = None,
     ) -> bool: ...
+    async def pair_switch_to_task_branch(
+        self,
+        task_id: int,
+        branch: str,
+        *,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool: ...
     async def checkout(self, branch: str, repo: str | None = None) -> bool: ...
     async def auto_commit(
         self,
