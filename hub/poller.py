@@ -325,15 +325,26 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     branch = task.get("branch")
                     merged = False
                     if pr_num:
-                        ci = await plugins.git_ops.check_pr_ci(pr_num)
+                        mctx = await services.project_git_context(db, task["id"])
+                        mworkspace = mctx.get("repo")
+                        mgh_repo = mctx.get("gh_repo")
+                        ci = await plugins.git_ops.check_pr_ci(
+                            pr_num, repo=mworkspace, gh_repo=mgh_repo
+                        )
                         if ci.outcome == CIProbeOutcome.passed:
                             merged = await plugins.git_ops.merge_pr(
-                                pr_num, task["id"], task["title"]
+                                pr_num,
+                                task["id"],
+                                task["title"],
+                                repo=mworkspace,
+                                gh_repo=mgh_repo,
                             )
                             if merged:
-                                await plugins.git_ops.pull_main()
+                                await plugins.git_ops.pull_main(repo=mworkspace)
                                 if branch:
-                                    await plugins.git_ops.delete_branch(branch)
+                                    await plugins.git_ops.delete_branch(
+                                        branch, repo=mworkspace
+                                    )
                                 log.info(
                                     "Poll: task #%d PR #%d merged on GitHub",
                                     task["id"],
@@ -489,7 +500,11 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         int(CI_GRACE_PERIOD - elapsed),
                     )
                     continue
-                ci = await plugins.git_ops.check_pr_ci(task["pr_number"])
+                ci = await plugins.git_ops.check_pr_ci(
+                    task["pr_number"],
+                    repo=workspace,
+                    gh_repo=ctx.get("gh_repo"),
+                )
                 if ci.outcome == CIProbeOutcome.pending:
                     continue
                 if ci.outcome == CIProbeOutcome.unavailable:
@@ -531,6 +546,8 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         ci_details = await plugins.git_ops.get_ci_failure_logs(
                             task["pr_number"],
                             task.get("branch", ""),
+                            repo=workspace,
+                            gh_repo=ctx.get("gh_repo"),
                         )
                         log.info(
                             "Poll: task #%d CI failed (cycle %d/%d), dispatching CI fix",

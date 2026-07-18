@@ -3789,3 +3789,18 @@ def test_matrix_covers_every_non_terminal_status_and_discriminator():
         assert resolve_instance("running", job_id=job_id, review_job_id=None) in LIFECYCLE_MATRIX
     for review_job_id in ("r", None):
         assert resolve_instance("review", job_id=None, review_job_id=review_job_id) in LIFECYCLE_MATRIX
+
+
+# ---- Noop GitOps accepts project context keywords (#420) ----
+
+
+async def test_noop_gitops_accepts_project_context_keywords():
+    # AC-4 (#420): the noop (and any protocol implementation) accepts the
+    # project-context keywords, so the core lifecycle keeps working.
+    from hub.integrations.noop import NoopGitOps
+
+    g = NoopGitOps()
+    probe = await g.check_pr_ci(1, repo="/ws", gh_repo="owner/repo")
+    assert probe.outcome.value == "pending"
+    assert await g.merge_pr(1, 2, "t", repo="/ws", gh_repo="owner/repo") is False
+    assert await g.get_ci_failure_logs(1, "b", repo="/ws", gh_repo="owner/repo") == {}

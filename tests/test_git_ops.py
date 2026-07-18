@@ -300,6 +300,61 @@ async def test_check_pr_ci_typed_outcomes(
     assert result.reason  # never empty
 
 
+# ---- Project repo context in CI/review calls (#420) ----
+
+
+@pytest.mark.parametrize(
+    "gh_repo",
+    ["mrPDA/calc-kids", None],
+)
+async def test_check_pr_ci_targets_project_repo(git_ops: GitOpsIntegration, gh_repo):
+    # AC-1/AC-2 (#420): --repo is the resolved project gh_repo (calc-kids), or
+    # the default REPO_NAME when none is given; the workspace is the cwd.
+    from hub.config import REPO_NAME
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "[]", ""),
+    ) as mock_gh:
+        await git_ops.check_pr_ci(7, repo="/ws/proj", gh_repo=gh_repo)
+
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == (gh_repo or REPO_NAME)
+    assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
+
+
+async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
+    # AC-2/AC-3 (#420): merge targets the resolved project repo and workspace,
+    # never the global default.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        await git_ops.merge_pr(
+            7, 1, "feat: x", repo="/ws/proj", gh_repo="mrPDA/calc-kids"
+        )
+
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == "mrPDA/calc-kids"
+    assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
+
+
+async def test_get_ci_failure_logs_targets_project_repo(git_ops: GitOpsIntegration):
+    # AC-2 (#420): failure-log lookup also uses the project repo.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "[]", ""),
+    ) as mock_gh:
+        await git_ops.get_ci_failure_logs(
+            7, "task-x/b", repo="/ws/proj", gh_repo="mrPDA/calc-kids"
+        )
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == "mrPDA/calc-kids"
+
+
 # --- pair workspace auto-switch and restore (#451) ---
 
 

@@ -790,3 +790,27 @@ async def test_ci_unavailable_before_and_after_deadline(db):
 
     await _run_poll_once(db)
     assert len(await _events_for(db, task_id, "needs_decision")) == 1
+
+
+# ---- Project repo context propagation (#420) ----
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_check_passes_project_context(mock_sleep, db):
+    # AC-1/AC-3 (#420): the ci_check conveyor resolves project context and
+    # passes repo + gh_repo to the CI probe, not the global default.
+    await _make_ci_task(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_running")
+    )
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.check_pr_ci.await_count >= 1
+    kwargs = mock_git.check_pr_ci.await_args.kwargs
+    assert "gh_repo" in kwargs
+    assert "repo" in kwargs

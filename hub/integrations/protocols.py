@@ -172,12 +172,18 @@ class GitOpsPlugin(Protocol):
         branch: str,
         max_log_chars: int = 4000,
         repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> dict[str, Any]: ...
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...
     async def merge_pr(
-        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool: ...
     async def delete_branch(self, branch: str, repo: str | None = None) -> None: ...
     async def clone_repo(

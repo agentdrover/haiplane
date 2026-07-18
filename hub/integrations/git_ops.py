@@ -303,12 +303,14 @@ def _parse_pr_number(gh_output: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-async def _find_pr_for_branch(branch: str, repo: str | None = None) -> int | None:
+async def _find_pr_for_branch(
+    branch: str, repo: str | None = None, *, gh_repo: str | None = None
+) -> int | None:
     rc, out, _ = await _gh(
         "pr",
         "list",
         "--repo",
-        REPO_NAME,
+        gh_repo or REPO_NAME,
         "--head",
         branch,
         "--state",
@@ -748,7 +750,7 @@ class GitOpsIntegration:
         )
         if rc != 0:
             if "already exists" in err:
-                return await _find_pr_for_branch(branch, repo)
+                return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
             log.error("Failed to create PR for %s: %s", branch, err)
             return None
 
@@ -763,6 +765,7 @@ class GitOpsIntegration:
         branch: str,
         max_log_chars: int = 12000,
         repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {"failed_checks": [], "log_summary": "", "run_url": ""}
 
@@ -771,7 +774,7 @@ class GitOpsIntegration:
             "checks",
             str(pr_number),
             "--repo",
-            REPO_NAME,
+            gh_repo or REPO_NAME,
             "--json",
             "name,state",
             repo=repo,
@@ -793,7 +796,7 @@ class GitOpsIntegration:
             "run",
             "list",
             "--repo",
-            REPO_NAME,
+            gh_repo or REPO_NAME,
             "--branch",
             branch,
             "--limit",
@@ -819,7 +822,7 @@ class GitOpsIntegration:
                 "view",
                 str(run_id),
                 "--repo",
-                REPO_NAME,
+                gh_repo or REPO_NAME,
                 "--log-failed",
                 repo=repo,
                 check=False,
@@ -834,14 +837,14 @@ class GitOpsIntegration:
         return result
 
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult:
         rc, out, err = await _gh(
             "pr",
             "checks",
             str(pr_number),
             "--repo",
-            REPO_NAME,
+            gh_repo or REPO_NAME,
             "--json",
             "name,state",
             repo=repo,
@@ -879,7 +882,12 @@ class GitOpsIntegration:
         )
 
     async def merge_pr(
-        self, pr_number: int, task_id: int, title: str, repo: str | None = None
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool:
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
@@ -890,7 +898,7 @@ class GitOpsIntegration:
             "merge",
             str(pr_number),
             "--repo",
-            REPO_NAME,
+            gh_repo or REPO_NAME,
             "--squash",
             "--admin",
             "--delete-branch",
