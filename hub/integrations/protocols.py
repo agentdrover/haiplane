@@ -151,6 +151,19 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         base_branch: str | None = None,
     ) -> bool: ...
+    def worktree_path(self, task_id: int, repo: str | None = None) -> str: ...
+    async def pair_prepare_worktree(
+        self,
+        task_id: int,
+        title: str,
+        *,
+        branch_slug: str = "",
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> str: ...
+    async def pair_remove_worktree(
+        self, task_id: int, *, repo: str | None = None
+    ) -> bool: ...
     async def origin_reachable(
         self, repo: str | None = None, *, timeout: int = 30
     ) -> bool: ...

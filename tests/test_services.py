@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import aiosqlite
 import pytest
@@ -4077,3 +4078,157 @@ async def test_approved_verdict_does_not_switch_pair_workspace(
     )
 
     switch.assert_not_awaited()
+
+
+# --- worktree-per-task mode routing (#459) ---
+
+
+async def test_worktree_mode_prepare_and_cleanup(db: aiosqlite.Connection, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    prep = AsyncMock(return_value="task-1/worktree-task")
+    remove = AsyncMock(return_value=True)
+    plugins.git_ops.pair_prepare_worktree = prep
+    plugins.git_ops.pair_remove_worktree = remove
+
+    tv = await services.create_task(db, TaskCreate(title="Worktree task"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+
+    started = await services.pair_start_task(db, tv.id, caller="dev")
+    assert started.status.value == "running"
+    prep.assert_awaited()  # worktree created, main clone not switched
+
+    await services.submit_for_review(db, tv.id)
+    remove.assert_awaited()  # worktree removed on submit
+    assert remove.await_args.args[0] == tv.id
+
+
+async def test_worktree_mode_rework_recreates_worktree(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    prep = AsyncMock(return_value="task-1/worktree-task")
+    plugins.git_ops.pair_prepare_worktree = prep
+    plugins.git_ops.pair_remove_worktree = AsyncMock(return_value=True)
+
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)
+    prep.reset_mock()
+
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested, agent="reviewer", comments="1. fix"
+        ),
+    )
+    prep.assert_awaited()  # worktree re-created for rework
+
+
+async def test_worktree_mode_off_uses_legacy(db: aiosqlite.Connection, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.delenv("OPENCLAW_WORKTREE_PER_TASK", raising=False)
+    prep_wt = AsyncMock()
+    plugins.git_ops.pair_prepare_worktree = prep_wt
+
+    tv = await services.create_task(db, TaskCreate(title="Legacy path"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+
+    prep_wt.assert_not_awaited()  # legacy branch-switching path, not worktrees
+
+
+async def _wt_done_task(db, *, job_id):
+    task_id = await repo.create_task(
+        db,
+        title="WT done",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/wt", job_id=job_id)
+    await db.commit()
+    return task_id
+
+
+def _mock_git_ops(plugins, wt):
+    from unittest.mock import AsyncMock, MagicMock
+
+    plugins.git_ops.worktree_path = MagicMock(return_value=wt)
+    plugins.git_ops.checkout = AsyncMock(return_value=True)
+    plugins.git_ops.auto_commit = AsyncMock(return_value=True)
+    plugins.git_ops.squash_branch = AsyncMock(return_value=True)
+    plugins.git_ops.push_branch = AsyncMock(return_value=True)
+    plugins.git_ops.create_pr = AsyncMock(return_value=None)
+
+
+async def test_worktree_mode_done_pipeline_targets_worktree(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # #459 review HIGH: in worktree mode the done→squash/push pipeline must run
+    # in the task worktree, NOT the main clone (else squash resets the base branch).
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    task_id = await _wt_done_task(db, job_id=None)  # pair task
+    wt = str(tmp_path / f".main-worktrees/task-{task_id}")
+    os.makedirs(wt, exist_ok=True)  # worktree exists → redirect applies
+    _mock_git_ops(plugins, wt)
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status == "ci_check"
+    assert plugins.git_ops.squash_branch.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.push_branch.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.checkout.await_args.kwargs["repo"] == wt
+    assert plugins.git_ops.create_pr.await_args.kwargs["repo"] == wt
+
+
+async def test_worktree_mode_headless_uses_main_clone(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # #459 review re-run HIGH: a headless task (job_id set) has no worktree, so
+    # even with the flag on the done-pipeline must stay on the main clone — never
+    # redirect to a nonexistent worktree path (which would crash the poller).
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    task_id = await _wt_done_task(db, job_id="dispatch-42")  # headless task
+    ctx = await orchestration.project_git_context(db, task_id)
+    workspace = ctx.get("repo")
+    # worktree_path returns a real-looking but nonexistent sibling path
+    _mock_git_ops(plugins, str(tmp_path / f".main-worktrees/task-{task_id}"))
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status == "ci_check"
+    # None of the git ops targeted the (nonexistent) worktree — they used workspace.
+    assert plugins.git_ops.squash_branch.await_args.kwargs["repo"] == workspace
+    assert plugins.git_ops.checkout.await_args.kwargs["repo"] == workspace
