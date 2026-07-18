@@ -37,6 +37,7 @@ from hub.models import (
     ActivityItem,
     DashboardData,
     HealthView,
+    IdentityDiagnosticsView,
     ReadinessReport,
     ReadinessTreeReport,
     BatchApprove,
@@ -93,7 +94,11 @@ from hub.services.refinement import (
     TaskNotFoundError,
     get_write_lock,
 )
-from hub.services.diagnostics import build_health, build_whoami
+from hub.services.diagnostics import (
+    build_health,
+    build_identity_diagnostics,
+    build_whoami,
+)
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -228,6 +233,21 @@ async def health() -> HealthView:
 async def api_whoami(request: Request) -> WhoamiView:
     """Return the authenticated caller identity and permission summary."""
     return build_whoami(current_identity(request))
+
+
+@app.get("/api/diagnostics/identity", response_model=IdentityDiagnosticsView)
+async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
+    """Caller identity plus honest instance and workspace state (#452).
+
+    ``connected_via`` reflects the address the client actually reached (the
+    request Host), so ``config_mismatch`` catches a server whose
+    OPENCLAW_HUB_URL disagrees with reality — the trap that had an operator
+    editing prod while believing it was local.
+    """
+    connected_via = str(request.base_url).rstrip("/")
+    return await build_identity_diagnostics(
+        current_identity(request), connected_via=connected_via
+    )
 
 
 # ---------------------------------------------------------------------------

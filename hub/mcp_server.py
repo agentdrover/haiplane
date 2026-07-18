@@ -824,9 +824,7 @@ def _normalize_context_mode(mode: str) -> str:
     return normalized
 
 
-async def _general_hub_context(
-    *, max_chars: int | None, mode: str
-) -> CallToolResult:
+async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
     Combines the connected instance, the caller's identity, their active
@@ -3072,10 +3070,50 @@ async def hub_health() -> str:
     return _format_health(data)
 
 
+def _format_identity_diagnostics(data: dict[str, Any]) -> str:
+    lines = [
+        f"User: {data['username']} (role: {data['role']})",
+        f"Auth source: {data['auth_source']}",
+    ]
+    if data.get("principal_id") is not None:
+        lines.append(f"Principal id: {data['principal_id']}")
+    lines.append(f"Permissions: {data.get('permissions_count', 0)}")
+    lines.append(
+        f"Instance: {data['instance']} "
+        f"(base_url: {data['base_url']}, server_id: {data.get('server_id') or '?'})"
+    )
+    connected = data.get("connected_via")
+    if connected:
+        lines.append(f"Connected via: {connected}")
+    if data.get("config_mismatch"):
+        lines.append(
+            "⚠ CONFIG MISMATCH: the server's configured base_url host differs "
+            "from the address you actually reached — verify you are acting on "
+            "the intended instance before any destructive operation."
+        )
+    lines.append(
+        f"Workspace: {data.get('workspace_path') or '?'} "
+        f"(branch: {data.get('workspace_branch') or '?'})"
+    )
+    lines.append(f"App version: {data['app_version']}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def hub_admin_my_identity() -> str:
-    """Deprecated alias for :func:`hub_whoami`."""
-    return await hub_whoami()
+    """Show who you are and which instance/workspace you are really on (#452).
+
+    One call returns caller identity, the server instance (base_url + server_id),
+    the address you actually connected through, a mismatch warning when the
+    server's configured URL disagrees with reality, and the workspace path and
+    current branch. Read this before any destructive operation to avoid acting
+    on the wrong instance.
+    """
+    try:
+        data = await _api_get("/api/diagnostics/identity")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return _format_identity_diagnostics(data)
 
 
 def main():

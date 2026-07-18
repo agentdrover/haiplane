@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from hub import config
 from hub.config import TokenIdentity, _AGENT_DEFAULT_PERMS, _HUMAN_DEFAULT_PERMS
-from hub.models import HealthView, WhoamiView
+from hub.config import WORKSPACE_REPO_LINK
+from hub.hub_instance import instance_echo_fields
+from hub.integrations.registry import plugins
+from hub.models import HealthView, IdentityDiagnosticsView, WhoamiView
 from hub.version import get_app_version
 
 
@@ -38,6 +43,50 @@ def build_whoami(identity: TokenIdentity) -> WhoamiView:
         else None,
         principal_id=identity.principal_id,
         app_version=get_app_version(),
+    )
+
+
+async def _workspace_branch(repo: str) -> str:
+    """Current branch of the server workspace; empty on any failure (#452)."""
+    try:
+        return (await plugins.git_ops.current_branch(repo=repo)) or ""
+    except Exception:
+        return ""
+
+
+async def build_identity_diagnostics(
+    identity: TokenIdentity, *, connected_via: str = ""
+) -> IdentityDiagnosticsView:
+    """Caller identity + honest instance/workspace state in one response (#452).
+
+    ``connected_via`` is the base URL the client actually reached (request
+    Host); when its host differs from the configured ``base_url`` host,
+    ``config_mismatch`` is set so an operator is never misled about which
+    instance served the call.
+    """
+    whoami = build_whoami(identity)
+    inst = instance_echo_fields()
+    workspace = str(WORKSPACE_REPO_LINK)
+    branch = await _workspace_branch(workspace)
+
+    configured_host = (urlparse(inst["base_url"]).hostname or "").lower()
+    connected_host = (urlparse(connected_via).hostname or "").lower()
+    mismatch = bool(connected_host) and configured_host != connected_host
+
+    return IdentityDiagnosticsView(
+        username=whoami.username,
+        role=whoami.role,
+        principal_id=whoami.principal_id,
+        auth_source=whoami.auth_source,
+        permissions_count=whoami.permissions_count,
+        instance=inst["instance"],
+        base_url=inst["base_url"],
+        server_id=inst.get("server_id", ""),
+        connected_via=connected_via,
+        config_mismatch=mismatch,
+        workspace_path=workspace,
+        workspace_branch=branch,
+        app_version=whoami.app_version,
     )
 
 

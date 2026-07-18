@@ -1285,6 +1285,31 @@ class HealthView(BaseModel):
     vast_enabled: bool
 
 
+class IdentityDiagnosticsView(BaseModel):
+    """One-call identity + environment truth for agents (#452).
+
+    ``connected_via`` is the base URL the client actually reached (from the
+    request Host), independent of ``base_url`` echoed from OPENCLAW_HUB_URL;
+    ``config_mismatch`` flags when the two disagree so an operator never acts
+    on the wrong instance. ``workspace_path``/``workspace_branch`` expose the
+    server-side git workspace state in the same response.
+    """
+
+    username: str
+    role: str
+    principal_id: int | None = None
+    auth_source: str
+    permissions_count: int = 0
+    instance: str
+    base_url: str
+    server_id: str = ""
+    connected_via: str = ""
+    config_mismatch: bool = False
+    workspace_path: str = ""
+    workspace_branch: str = ""
+    app_version: str
+
+
 # --- Deprecated aliases for backward compatibility ---
 
 ProposalStatus = TaskStatus
