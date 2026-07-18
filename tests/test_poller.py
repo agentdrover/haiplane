@@ -446,3 +446,175 @@ async def test_ci_no_pr_attempts_persist_across_restart(mock_sleep, db):
     # the restart. The budget is cleared as the task leaves the conveyor.
     assert row["status"] == "needs_decision"
     assert row["ci_no_pr_attempts"] == 0
+
+
+# ---- Bounded recovery for missing jobs and expired claims (#417) ----
+
+
+async def _run_poll_once(db) -> None:
+    """Run the poll body once with a fresh break counter (see #416 tests)."""
+    with patch("hub.poller.asyncio.sleep", new_callable=_sleep_once):
+        with pytest.raises(_BreakLoop):
+            await _poll_running_tasks(_make_app(db))
+
+
+async def _make_headless(db, *, status, job_field="job_id", job_value="gone-1"):
+    task_id = await repo.create_task(
+        db,
+        title=f"Headless {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, **{job_field: job_value})
+    await db.commit()
+    return task_id
+
+
+async def _events_for(db, task_id, kind):
+    rows = await repo.list_events(db, kinds=[kind])
+    return [dict(r) for r in rows if dict(r)["task_id"] == task_id]
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_missing_dispatch_job_escalates_after_grace(mock_sleep, db):
+    # AC-1 (#417): a headless running task whose dispatch job is gone starts a
+    # grace clock on first miss and escalates once to needs_decision after it.
+    task_id = await _make_headless(db, status="running")
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value=None)
+    plugins.dispatch = mock_dispatch
+
+    # First miss: clock starts, status unchanged (within grace).
+    await _run_poll_once(db)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "running"
+    assert row["job_missing_since"] is not None
+
+    # Past the grace: escalate once with a machine reason.
+    await db.execute(
+        "UPDATE tasks SET job_missing_since = datetime('now', '-10 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    await _run_poll_once(db)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert len(events) == 1
+    assert "dispatch_job_missing" in (events[0]["payload"] or "")
+
+    # Idempotent: needs_decision is not re-selected, so no second event.
+    await _run_poll_once(db)
+    assert len(await _events_for(db, task_id, "needs_decision")) == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_missing_review_job_escalates_client_review_untouched(mock_sleep, db):
+    # AC-2 (#417): a headless review with an unknown review_job_id escalates,
+    # while a client-driven review (no review_job_id) is never touched.
+    headless = await _make_headless(
+        db, status="review", job_field="review_job_id", job_value="rev-gone"
+    )
+    await db.execute(
+        "UPDATE tasks SET job_missing_since = datetime('now', '-10 minutes') WHERE id=?",
+        (headless,),
+    )
+    client = await repo.create_task(
+        db,
+        title="Client review",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value=None)
+    plugins.dispatch = mock_dispatch
+
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, headless))["status"] == "needs_decision"
+    assert dict(await repo.get_task(db, client))["status"] == "review"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_expired_claim_released_to_open(mock_sleep, db):
+    # AC-3 (#417): a claim held past the lease is released back to open, all
+    # claim fields cleared, with exactly one claim_expired event.
+    task_id = await repo.create_task(
+        db,
+        title="Abandoned claim",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="claimed",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db, task_id, claimed_by="dev", claim_session_id="sess-1"
+    )
+    await db.execute(
+        "UPDATE tasks SET claimed_at = datetime('now', '-300 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    plugins.dispatch = NoopDispatch()
+
+    await _run_poll_once(db)
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "open"
+    assert row["claimed_by"] is None
+    assert row["claim_session_id"] is None
+    assert row["claimed_at"] is None
+    assert len(await _events_for(db, task_id, "claim_expired")) == 1
+
+    # Idempotent: an already-released task is not re-expired.
+    await _run_poll_once(db)
+    assert len(await _events_for(db, task_id, "claim_expired")) == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_missing_job_decision_uses_persisted_timestamp(mock_sleep, db):
+    # AC-4 (#417): the grace decision reads the persisted job_missing_since, so
+    # it is identical whether or not the process restarted — a timestamp within
+    # grace never escalates, one past it always does, in a single poll.
+    task_id = await _make_headless(db, status="running")
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(return_value=None)
+    plugins.dispatch = mock_dispatch
+
+    await db.execute(
+        "UPDATE tasks SET job_missing_since = datetime('now', '-4 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+    await db.execute(
+        "UPDATE tasks SET job_missing_since = datetime('now', '-6 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    await _run_poll_once(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"

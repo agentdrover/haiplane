@@ -876,6 +876,45 @@ async def reset_ci_check_state(
     )
 
 
+async def mark_job_missing(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Stamp when a headless job was first observed missing (#417).
+
+    The ``IS NULL`` guard means the clock is set once and never overwritten, so
+    the grace window is measured from the first miss and survives a restart.
+    """
+    await db.execute(
+        "UPDATE tasks SET job_missing_since=datetime('now') "
+        "WHERE id=? AND job_missing_since IS NULL",
+        (task_id,),
+    )
+
+
+async def clear_job_missing(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> None:
+    """Clear the missing-job clock when the job reappears or is escalated (#417)."""
+    await db.execute(
+        "UPDATE tasks SET job_missing_since=NULL WHERE id=?",
+        (task_id,),
+    )
+
+
+async def list_expired_claims(
+    db: aiosqlite.Connection,
+    threshold_minutes: int,
+) -> list[aiosqlite.Row]:
+    """Claimed tasks whose lease passed without a pair start (#417)."""
+    return await db.execute_fetchall(
+        "SELECT * FROM tasks WHERE archived=0 AND status='claimed' "
+        "AND claimed_at IS NOT NULL AND claimed_at < datetime('now', ?)",
+        (f"-{threshold_minutes} minutes",),
+    )
+
+
 async def create_task_full(
     db: aiosqlite.Connection,
     payload: Any,
