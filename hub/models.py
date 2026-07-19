@@ -415,6 +415,18 @@ class SelfReviewWarning(BaseModel):
     required_role: str | None = None
 
 
+class ACTestResultView(BaseModel):
+    """Recorded pass/fail of a verifiable_by=test AC's bound test (#507).
+
+    ``is_current`` is True only while the result's generation matches the
+    task's submission_generation — a resubmission makes it stale.
+    """
+
+    ac_id: str
+    status: str  # pass | fail | not_found
+    is_current: bool = False
+
+
 class ACLocatorResolution(BaseModel):
     """Whether a verifiable_by=test AC's locator resolves to a real test (#506).
 
@@ -446,6 +458,8 @@ class ReviewBrief(BaseModel):
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     # #506: per verifiable_by=test AC, whether its locator resolves to a real test.
     locator_resolution: list[ACLocatorResolution] = Field(default_factory=list)
+    # #507: recorded pass/fail of each test-AC's bound test for this generation.
+    ac_test_results: list[ACTestResultView] = Field(default_factory=list)
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
