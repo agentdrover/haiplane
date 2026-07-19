@@ -923,3 +923,29 @@ async def test_refine_ac_locator_off_allows_free_text(client: AsyncClient, monke
         json={"acceptance_criteria": [_ac_payload(1, test_ref="legacy free text")]},
     )
     assert resp.status_code == 200
+
+
+# ---- Verifiable SDD: AC locator existence in review brief (#506) ----
+
+
+async def test_review_brief_includes_locator_resolution(client: AsyncClient, monkeypatch):
+    # #506: the brief resolves each verifiable_by=test AC's locator against the
+    # collected tests — present → resolvable, absent → missing.
+    async def _fake_collect(_repo_path):
+        return {"tests/test_x.py::test_present"}
+
+    monkeypatch.setattr("hub.app.collect_test_nodeids", _fake_collect)
+    task = await _create_task(client)
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={
+            "acceptance_criteria": [
+                _ac_payload(1, test_ref="tests/test_x.py::test_present"),
+                _ac_payload(2, test_ref="tests/test_x.py::test_absent"),
+            ]
+        },
+    )
+    resp = await client.get(f"/api/tasks/{task['id']}/review-brief")
+    assert resp.status_code == 200
+    res = {r["ac_id"]: r["status"] for r in resp.json()["locator_resolution"]}
+    assert res == {"AC-1": "resolvable", "AC-2": "missing"}

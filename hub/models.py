@@ -415,6 +415,20 @@ class SelfReviewWarning(BaseModel):
     required_role: str | None = None
 
 
+class ACLocatorResolution(BaseModel):
+    """Whether a verifiable_by=test AC's locator resolves to a real test (#506).
+
+    ``status`` is ``resolvable`` (test found by collection), ``missing`` (valid
+    locator but no such test, or no valid locator at all), or ``unknown`` (test
+    collection could not run in this environment — never a false ``missing``).
+    """
+
+    ac_id: str
+    locator: str | None = None
+    status: str
+    reason: str = ""
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -430,6 +444,8 @@ class ReviewBrief(BaseModel):
     description: str = ""
     project: TaskProjectRef | None = None
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    # #506: per verifiable_by=test AC, whether its locator resolves to a real test.
+    locator_resolution: list[ACLocatorResolution] = Field(default_factory=list)
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
