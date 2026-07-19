@@ -62,6 +62,9 @@ SDD_AC_LOCATOR = os.environ.get("OPENCLAW_SDD_AC_LOCATOR", "off")
 # verifiable_by=test AC is green. Only APPROVED is gated — CHANGES_REQUESTED
 # always passes so a reviewer can always reject (lesson from #382).
 SDD_AC_TESTS = os.environ.get("OPENCLAW_SDD_AC_TESTS", "warn")
+# Verifiable SDD (#510): 'warn' (default) — a failed validation_commands run only
+# warns; 'require' blocks completion until the current validation run is green.
+SDD_VALIDATION = os.environ.get("OPENCLAW_SDD_VALIDATION", "warn")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
