@@ -1421,6 +1421,16 @@ async def record_review_verdict(
                 f"machine-review обязателен для аппрува этой задачи: {gap}",
             )
 
+    # Verifiable SDD (#508): under 'require', an APPROVED verdict needs every
+    # current verifiable_by=test AC green. Only APPROVED is gated — a reviewer
+    # must always be able to reject red work (lesson from #382).
+    if config.SDD_AC_TESTS == "require" and body.verdict.value == "approved":
+        from hub.services.ac_tests import ac_tests_gap
+
+        ac_gap = await ac_tests_gap(db, task)
+        if ac_gap:
+            raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
+
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
     # it must run outside the verdict's write-lock critical section).

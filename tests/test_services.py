@@ -4275,3 +4275,72 @@ async def test_pair_start_legacy_no_worktree_path(
     started = await services.pair_start_task(db, tv.id, caller="dev")
     assert started.workspace_mode == "legacy"
     assert started.worktree_path == ""
+
+
+# ---- Verifiable SDD: AC-tests verdict gate (#508) ----
+
+
+async def _review_task_with_ac_result(db, *, status_result: str):
+    from hub.models import AcceptanceCriterion
+
+    task_id = await _pair_running_task(db)
+    await services.submit_for_review(db, task_id)  # generation 1, status review
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            AcceptanceCriterion(
+                id="AC-1", given="g", when="w", then="t",
+                verifiable_by="test", test_ref="tests/test_x.py::test_a",
+            )
+        ],
+    )
+    await repo.upsert_ac_test_result(db, task_id, "AC-1", 1, status_result)
+    await db.commit()
+    return task_id
+
+
+async def test_ac_tests_gate_require_blocks_approved_when_red(db, monkeypatch):
+    # AC-1 (#508): require + a red current test-AC blocks APPROVED with 422.
+    monkeypatch.setattr("hub.config.SDD_AC_TESTS", "require")
+    task_id = await _review_task_with_ac_result(db, status_result="fail")
+    with pytest.raises(HTTPException) as exc:
+        await services.record_review_verdict(
+            db, task_id,
+            TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+        )
+    assert exc.value.status_code == 422
+    assert "ac_tests_not_green" in str(exc.value.detail)
+
+
+async def test_ac_tests_gate_warn_allows_approved_when_red(db, monkeypatch):
+    # AC-2 (#508): warn never blocks — the red status is only shown in the brief.
+    monkeypatch.setattr("hub.config.SDD_AC_TESTS", "warn")
+    task_id = await _review_task_with_ac_result(db, status_result="fail")
+    view = await services.record_review_verdict(
+        db, task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert view.review_verdict == ReviewVerdict.approved
+
+
+async def test_ac_tests_gate_require_allows_changes_requested_when_red(db, monkeypatch):
+    # AC-3 (#508): the gate never blocks a rejection — reviewer can always reject.
+    monkeypatch.setattr("hub.config.SDD_AC_TESTS", "require")
+    task_id = await _review_task_with_ac_result(db, status_result="fail")
+    view = await services.record_review_verdict(
+        db, task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+    )
+    assert view.review_verdict == ReviewVerdict.changes_requested
+
+
+async def test_ac_tests_gate_require_allows_approved_when_green(db, monkeypatch):
+    # require + all current test-AC green → APPROVED passes.
+    monkeypatch.setattr("hub.config.SDD_AC_TESTS", "require")
+    task_id = await _review_task_with_ac_result(db, status_result="pass")
+    view = await services.record_review_verdict(
+        db, task_id,
+        TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
+    )
+    assert view.review_verdict == ReviewVerdict.approved
