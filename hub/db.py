@@ -576,6 +576,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         )
         """,
     ),
+    # ---- Verifiable SDD (#509): result of running task.validation_commands,
+    # stamped with the submission_generation. One result per task (the commands
+    # are a single set); current only while the generation matches.
+    (
+        "add_validation_generation_column",
+        "ALTER TABLE tasks ADD COLUMN validation_generation INTEGER",
+    ),
+    ("add_validation_status_column", "ALTER TABLE tasks ADD COLUMN validation_status TEXT"),
+    ("add_validation_log_column", "ALTER TABLE tasks ADD COLUMN validation_log TEXT"),
 ]
 
 
