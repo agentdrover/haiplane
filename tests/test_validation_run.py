@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from hub import repository as repo
+from hub.services import validation_run
 from hub.services.validation_run import (
     FAIL,
     PASS,
@@ -83,3 +85,30 @@ def test_safe_env_strips_secrets(monkeypatch):
     assert "MY_API_KEY" not in env
     assert "DB_PASSWORD" not in env
     assert env.get("SAFE_VAR") == "ok"
+
+
+async def test_runner_kills_timed_out_command(monkeypatch, tmp_path):
+    # The timed-out child used to survive: wait_for cancels only the read, and
+    # every retry leaked another live process into the workspace.
+    monkeypatch.setattr(validation_run, "_RUN_TIMEOUT", 0.3)
+    marker = tmp_path / "still_alive"
+    cmd = (
+        f"python3 -c \"import time,pathlib;"
+        f"time.sleep(1.5);pathlib.Path(r'{marker}').write_text('x')\""
+    )
+    assert await validation_run.default_validation_runner([cmd], str(tmp_path)) is None
+    await asyncio.sleep(2.0)
+    assert not marker.exists(), "timed-out command kept running after the hub gave up"
+
+
+async def test_runner_caps_output_in_memory(monkeypatch, tmp_path):
+    # A chatty command must not be buffered whole: the cap bounds what we keep,
+    # the rest is drained and counted.
+    monkeypatch.setattr(validation_run, "_MAX_OUTPUT", 1000)
+    cmd = "python3 -c \"print('x' * 200000)\""
+    result = await validation_run.default_validation_runner([cmd], str(tmp_path))
+    assert result is not None
+    rc, log_tail = result
+    assert rc == 0
+    assert "bytes dropped" in log_tail
+    assert len(log_tail) <= validation_run._LOG_TAIL

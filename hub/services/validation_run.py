@@ -11,6 +11,7 @@ the recorded log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -28,6 +29,11 @@ UNKNOWN = "unknown"
 
 _RUN_TIMEOUT = 300
 _LOG_TAIL = 4000
+# Bytes kept in memory per command. The tail is 4000 chars, but the whole
+# stream used to be buffered before truncation — a chatty or looping command
+# can emit gigabytes inside the timeout window and OOM the whole hub process,
+# not just its own task. Read up to the cap, drain the rest without keeping it.
+_MAX_OUTPUT = 1_000_000
 
 # runner(commands, repo_path) -> (returncode, log_tail) or None if it could not run.
 ValidationRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str] | None]]
@@ -44,6 +50,29 @@ def _safe_env() -> dict[str, str]:
     }
 
 
+async def _collect(proc: Any) -> tuple[bytes, int]:
+    """Read the child's output up to ``_MAX_OUTPUT``, then reap it (#509).
+
+    Everything past the cap is read and discarded rather than buffered: we must
+    keep draining, otherwise the child blocks on a full pipe and only dies at
+    the timeout. Returns the kept bytes and how many were dropped.
+    """
+    kept: list[bytes] = []
+    size = 0
+    dropped = 0
+    while True:
+        chunk = await proc.stdout.read(65536)
+        if not chunk:
+            break
+        room = _MAX_OUTPUT - size
+        if room > 0:
+            kept.append(chunk[:room])
+            size += min(room, len(chunk))
+        dropped += max(0, len(chunk) - max(room, 0))
+    await proc.wait()
+    return b"".join(kept), dropped
+
+
 async def default_validation_runner(
     commands: list[str], repo_path: str | None
 ) -> tuple[int, str] | None:
@@ -54,6 +83,7 @@ async def default_validation_runner(
     logs: list[str] = []
     rc = 0
     for cmd in commands:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -62,11 +92,18 @@ async def default_validation_runner(
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_RUN_TIMEOUT)
+            out, dropped = await asyncio.wait_for(_collect(proc), timeout=_RUN_TIMEOUT)
         except (OSError, TimeoutError, asyncio.TimeoutError):
+            # wait_for cancels only the await — the command keeps running in the
+            # workspace, and every retry leaks another one. Kill and reap it.
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
+                    await proc.wait()
             log.warning("validation command failed to run in %s", repo_path)
             return None
-        logs.append(f"$ {cmd}\n{out.decode(errors='replace')}")
+        tail = f"\n[... {dropped} bytes dropped]" if dropped else ""
+        logs.append(f"$ {cmd}\n{out.decode(errors='replace')}{tail}")
         rc = proc.returncode or 0
         if rc != 0:
             break
