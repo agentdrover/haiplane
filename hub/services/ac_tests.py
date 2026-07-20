@@ -126,32 +126,41 @@ async def run_ac_tests(
 async def ac_tests_gap(db: Any, task: dict) -> str | None:
     """None when every current test-AC is green; else a human-readable gap (#508).
 
-    A gap exists when any verifiable_by=test AC (with a valid locator) has no
-    result for the current submission_generation, or its recorded result is not
-    ``pass``. Non-test AC and unlocatable AC never contribute — they are not
-    gated by this policy.
+    A gap exists when any verifiable_by=test AC has no result for the current
+    submission_generation, has a result that is not ``pass``, or carries a
+    locator no runner can resolve. That last case must count: an unlocatable AC
+    is never run by #507, so exempting it here let an AC declared
+    machine-verifiable pass the require gate with zero test evidence — and
+    SDD_AC_LOCATOR defaults to off, so refine accepts such a locator. Non-test
+    AC never contribute; they are not gated by this policy.
     """
     task_id = task["id"]
     ac_models = [row_to_ac(r) for r in await repo.list_acceptance_criteria(db, task_id)]
-    test_ac_ids = [
-        ac.id
-        for ac in ac_models
-        if ac.verifiable_by.value == "test" and parse_test_locator(ac.test_ref)
-    ]
-    if not test_ac_ids:
+    test_acs = [ac for ac in ac_models if ac.verifiable_by.value == "test"]
+    if not test_acs:
         return None
+    unlocatable = [ac.id for ac in test_acs if not parse_test_locator(ac.test_ref)]
     generation = task.get("submission_generation") or 0
     rows = {dict(r)["ac_id"]: dict(r) for r in await repo.list_ac_test_results(db, task_id)}
     not_green = [
-        ac_id
-        for ac_id in test_ac_ids
-        if (r := rows.get(ac_id)) is None
-        or r["submission_generation"] != generation
-        or r["status"] != PASS
+        ac.id
+        for ac in test_acs
+        if ac.id not in unlocatable
+        and (
+            (r := rows.get(ac.id)) is None
+            or r["submission_generation"] != generation
+            or r["status"] != PASS
+        )
     ]
+    gaps = []
     if not_green:
-        return "AC-тесты не зелёные для текущего поколения: " + ", ".join(not_green)
-    return None
+        gaps.append("AC-тесты не зелёные для текущего поколения: " + ", ".join(not_green))
+    if unlocatable:
+        gaps.append(
+            "AC объявлены verifiable_by=test, но локатор теста не разрешается: "
+            + ", ".join(unlocatable)
+        )
+    return "; ".join(gaps) if gaps else None
 
 
 def current_ac_test_results(rows: Any, generation: int) -> list[dict]:
