@@ -84,3 +84,57 @@ async def test_run_ac_tests_not_found_when_runner_unavailable(db):
 
     recorded = await run_ac_tests(db, task_id, runner=none_runner)
     assert all(r["status"] == NOT_FOUND for r in recorded)
+
+
+# ---- default_test_runner output parsing (#507 machine-review HIGH) ----
+
+
+class _FakeProc:
+    def __init__(self, out: str, rc: int = 0):
+        self._out = out.encode()
+        self.returncode = rc
+
+    async def communicate(self):
+        return self._out, b""
+
+
+async def _run_with_output(monkeypatch, nodeids, output):
+    from hub.services.ac_tests import default_test_runner
+
+    async def _fake_exec(*_a, **_kw):
+        return _FakeProc(output)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+    return await default_test_runner(nodeids, "/repo")
+
+
+async def test_runner_matches_exact_nodeid_not_prefix(monkeypatch):
+    # HIGH (#507): substring matching let "::test_a" absorb the verdict of
+    # "::test_a_extra" (and the last line won), flipping pass/fail.
+    out = (
+        "tests/t.py::test_a PASSED   [ 50%]\n"
+        "tests/t.py::test_a_extra FAILED [100%]\n"
+    )
+    res = await _run_with_output(monkeypatch, ["tests/t.py::test_a"], out)
+    assert res == {"tests/t.py::test_a": True}
+
+
+async def test_runner_aggregates_parametrized_any_failure_fails(monkeypatch):
+    # A bare locator covers every parametrized case; one red case fails the AC.
+    out = (
+        "tests/t.py::test_p[c1] PASSED [ 50%]\n"
+        "tests/t.py::test_p[c2] FAILED [100%]\n"
+    )
+    res = await _run_with_output(monkeypatch, ["tests/t.py::test_p"], out)
+    assert res == {"tests/t.py::test_p": False}
+
+
+async def test_runner_reports_plain_pass_and_fail(monkeypatch):
+    out = (
+        "tests/t.py::test_ok PASSED [ 50%]\n"
+        "tests/t.py::test_bad FAILED [100%]\n"
+    )
+    res = await _run_with_output(
+        monkeypatch, ["tests/t.py::test_ok", "tests/t.py::test_bad"], out
+    )
+    assert res == {"tests/t.py::test_ok": True, "tests/t.py::test_bad": False}

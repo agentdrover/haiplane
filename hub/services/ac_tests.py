@@ -56,13 +56,28 @@ async def default_test_runner(
         log.warning("AC test run failed in %s", repo_path)
         return None
     results: dict[str, bool] = {}
+    wanted = set(nodeids)
     for raw in out.decode(errors="replace").splitlines():
-        for nodeid in nodeids:
-            if nodeid in raw:
-                if "PASSED" in raw:
-                    results[nodeid] = True
-                elif "FAILED" in raw or "ERROR" in raw:
-                    results[nodeid] = False
+        parts = raw.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        reported, rest = parts
+        # pytest -v prints the nodeid first, then the outcome. Match the EXACT
+        # nodeid (or its parametrized base) — substring matching let
+        # "…::test_a" absorb the verdict of "…::test_a_extra", and the last
+        # matching line silently overwrote earlier ones, so a passing AC could
+        # be recorded as failed or vice versa (#507).
+        key = reported if reported in wanted else reported.split("[", 1)[0]
+        if key not in wanted:
+            continue
+        if "PASSED" in rest:
+            passed = True
+        elif "FAILED" in rest or "ERROR" in rest:
+            passed = False
+        else:
+            continue
+        # Aggregate parametrized cases: any failing case fails the AC.
+        results[key] = results.get(key, True) and passed
     return results
 
 
