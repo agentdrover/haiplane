@@ -41,3 +41,18 @@ def test_resolve_unknown_when_collection_unavailable():
 async def test_collect_returns_none_without_repo_path():
     assert await collect_test_nodeids(None) is None
     assert await collect_test_nodeids("") is None
+
+
+def test_resolve_matches_parametrized_test_by_bare_locator():
+    # #506 fix: pytest emits only the parametrized ids; a bare function locator
+    # (the documented common form) still runs every case and must resolve.
+    collected = {"tests/test_a.py::test_p[case1]", "tests/test_a.py::test_p[case2]"}
+    acs = [_AC("AC-1", "test", "tests/test_a.py::test_p")]
+    assert resolve_ac_locators(acs, collected)[0]["status"] == RESOLVABLE
+
+
+def test_resolve_still_missing_for_unknown_base():
+    # The base-nodeid relaxation must not turn a genuinely absent test green.
+    collected = {"tests/test_a.py::test_p[case1]"}
+    acs = [_AC("AC-1", "test", "tests/test_a.py::test_other")]
+    assert resolve_ac_locators(acs, collected)[0]["status"] == MISSING

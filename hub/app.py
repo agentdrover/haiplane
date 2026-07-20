@@ -1123,7 +1123,19 @@ async def api_review_brief(
     locator_resolution: list[ACLocatorResolution] = []
     if any(a.verifiable_by.value == "test" for a in ac_models):
         ctx = await services.project_git_context(db, task_id)
-        collected = await collect_test_nodeids(ctx.get("repo"))
+        workspace = ctx.get("repo")
+        # #506: the workspace is shared across a project's tasks and the pair
+        # flow switches its branch. Collecting while HEAD sits on another task's
+        # branch would report THIS task's tests as missing. Only trust the
+        # collection when HEAD matches the task's branch; otherwise leave it
+        # unavailable so the status is `unknown`, never a false `missing`.
+        collected = None
+        if task_view.branch:
+            head = await plugins.git_ops.current_branch(repo=workspace)
+            if head == task_view.branch:
+                # collect_test_nodeids itself returns None without a workspace,
+                # so an unresolvable repo still degrades to `unknown`.
+                collected = await collect_test_nodeids(workspace)
         locator_resolution = [
             ACLocatorResolution(**r) for r in resolve_ac_locators(ac_models, collected)
         ]

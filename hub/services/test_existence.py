@@ -11,6 +11,7 @@ hole. Best-effort: when the workspace or pytest is unavailable the status is
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -35,6 +36,7 @@ async def collect_test_nodeids(repo_path: str | None) -> set[str] | None:
     """
     if not repo_path:
         return None
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "uv",
@@ -49,6 +51,12 @@ async def collect_test_nodeids(repo_path: str | None) -> set[str] | None:
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_COLLECT_TIMEOUT)
     except (OSError, TimeoutError, asyncio.TimeoutError):
+        # wait_for only cancels the await — the child keeps running and would
+        # accumulate orphaned collectors on every brief read. Kill it (#506).
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+                await proc.wait()
         log.warning("AC locator collect-only failed in %s", repo_path)
         return None
     if proc.returncode != 0:
@@ -67,6 +75,17 @@ def _verifiable_by(ac: Any) -> str:
     return getattr(vb, "value", vb)
 
 
+def _base_nodeids(collected: set[str]) -> set[str]:
+    """Parametrized nodeids reduced to their bare function form (#506).
+
+    pytest only emits the parametrized ids (``…::test_x[case]``) and never the
+    bare ``…::test_x``, but a bare locator is the documented common form and
+    runs every case. Without this, a perfectly valid AC binding is reported as
+    ``missing`` — the false-missing the module promises never to produce.
+    """
+    return {c.split("[", 1)[0] for c in collected if "[" in c}
+
+
 def resolve_ac_locators(acs: Any, collected: set[str] | None) -> list[dict]:
     """Resolution status for each verifiable_by=test AC against ``collected`` (#506).
 
@@ -74,6 +93,7 @@ def resolve_ac_locators(acs: Any, collected: set[str] | None) -> list[dict]:
     could not run (→ ``unknown``). Non-test AC are skipped — they need no test.
     """
     resolutions: list[dict] = []
+    bases = _base_nodeids(collected) if collected else set()
     for ac in acs:
         if _verifiable_by(ac) != "test":
             continue
@@ -83,7 +103,7 @@ def resolve_ac_locators(acs: Any, collected: set[str] | None) -> list[dict]:
             status, reason = MISSING, "no valid pytest locator in test_ref"
         elif collected is None:
             status, reason = UNKNOWN, "test collection unavailable in this environment"
-        elif parsed[1] in collected:
+        elif parsed[1] in collected or parsed[1] in bases:
             status, reason = RESOLVABLE, "test found by collection"
         else:
             status, reason = MISSING, "locator does not match any collected test"
