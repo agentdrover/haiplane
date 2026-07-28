@@ -1641,8 +1641,18 @@ async def api_list_proposals_compat(
 
 
 @app.post("/api/proposals/{proposal_id}/action", response_model=TaskView)
-async def api_proposal_action_compat(proposal_id: int, request: Request):
-    """Deprecated: approve/reject via the old proposal action format."""
+async def api_proposal_action_compat(
+    proposal_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Deprecated: approve/reject via the old proposal action format.
+
+    Human-gated like its canonical twins (#359). Without the gate this route
+    handed an agent the whole approval flow: it reaches approve_task directly
+    and builds TaskApprove(run=True), so a single call approved AND dispatched.
+    DoR was no obstacle — an agent may refine its own draft past it.
+    """
     raw = await request.json()
     action = raw.get("action", "")
     comment = raw.get("comment", "")

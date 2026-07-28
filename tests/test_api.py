@@ -2525,3 +2525,130 @@ async def test_metrics_page_renders(client: AsyncClient, db):
     resp = await client.get("/metrics")
     assert resp.status_code == 200
     assert "Practice Metrics" in resp.text
+
+
+# ---- Deprecated proposal action route: human gate (#359) ------------------
+
+
+def _proposal_action_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        "agent-token": TokenIdentity("bot", "agent"),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+async def _draft_ready_for_approval(client: AsyncClient, headers: dict) -> int:
+    """A draft that already passes DoR, refined by the agent itself.
+
+    This detail is the whole point of the test. The pre-fix route was not
+    unreachable for an agent — it answered 422 dor_failed, which reads like a
+    gate but is only an unready task. An agent may refine its own draft
+    (tasks.refine), so it clears DoR by itself and the route then approves.
+    A test built on an unrefined draft would pass against the vulnerable code.
+    """
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Proposal action draft", "source": "agent"},
+        headers=headers,
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "user_story": "As an agent I want my draft ready so that DoR passes.",
+            "problem_statement": "Draft must clear DoR before approval.",
+            "business_value": "Makes the gate the only thing left standing.",
+            "scope_in": ["approval path"],
+            "size": "S",
+            "wip_tag": "bugfix",
+            "validation_commands": ["uv run pytest -q"],
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "manual",
+                }
+            ],
+        },
+        headers=headers,
+    )
+    return task_id
+
+
+async def test_proposal_action_compat_rejects_agent_token(
+    client: AsyncClient, monkeypatch
+):
+    # AC-1 (#359): the agent must not approve its own draft through the
+    # deprecated route. Before the gate this returned 200 and the task went
+    # straight to running with a dispatched job — approve and dispatch in one
+    # call, because the route builds TaskApprove(run=True).
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _proposal_action_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    task_id = await _draft_ready_for_approval(client, agent)
+
+    resp = await client.post(
+        f"/api/proposals/{task_id}/action",
+        json={"action": "approved"},
+        headers=agent,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "human_only_gate"
+    after = await client.get(f"/api/tasks/{task_id}", headers=agent)
+    assert after.json()["status"] == "draft"
+
+
+async def test_proposal_action_compat_rejects_agent_rejection_too(
+    client: AsyncClient, monkeypatch
+):
+    # The gate covers the whole route, not just the approve branch: letting an
+    # agent reject drafts is the same human decision in the other direction.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _proposal_action_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    task_id = await _draft_ready_for_approval(client, agent)
+
+    resp = await client.post(
+        f"/api/proposals/{task_id}/action",
+        json={"action": "rejected"},
+        headers=agent,
+    )
+
+    assert resp.status_code == 403
+    after = await client.get(f"/api/tasks/{task_id}", headers=agent)
+    assert after.json()["status"] == "draft"
+
+
+async def test_proposal_action_compat_human_still_approves(
+    client: AsyncClient, monkeypatch
+):
+    # AC-2 (#359): the route is gated, not removed — a human keeps the
+    # deprecated path working.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _proposal_action_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    task_id = await _draft_ready_for_approval(client, agent)
+
+    resp = await client.post(
+        f"/api/proposals/{task_id}/action",
+        json={"action": "approved"},
+        headers=human,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] != "draft"
