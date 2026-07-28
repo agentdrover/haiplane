@@ -103,6 +103,7 @@ from hub.services.diagnostics import (
     build_whoami,
 )
 from hub.services.ac_tests import current_ac_test_results, run_ac_tests
+from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
 from hub.services.tree_output import (
@@ -1059,6 +1060,15 @@ async def api_run_ac_tests(task_id: int, request: Request):
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return {"results": await run_ac_tests(db, task_id)}
+
+
+@app.post("/api/tasks/{task_id}/run-validation")
+async def api_run_validation(task_id: int, request: Request):
+    """Run a task's declared validation_commands and record the result (#509)."""
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return await run_validation_commands(db, task_id)
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
