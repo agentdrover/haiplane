@@ -138,6 +138,8 @@ sudo -u openclaw /opt/openclaw-hub/venv/bin/oc-hub --help
 # --- сетевые параметры ---
 OPENCLAW_HUB_HOST=127.0.0.1
 OPENCLAW_HUB_PORT=8080
+# Публичный URL за reverse proxy — echo в MCP (instance/base_url, #174).
+OPENCLAW_HUB_URL=https://__DOMAIN__
 
 # --- хранилище ---
 OPENCLAW_HUB_HOME=/var/lib/openclaw-hub

@@ -31,6 +31,7 @@ from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    ACLocatorResolution,
     BulkChildTasksCreate,
     BulkRefine,
     BulkRefineResult,
@@ -101,6 +102,7 @@ from hub.services.diagnostics import (
     build_whoami,
 )
 from hub.services.task_idempotency import resolve_client_request_id
+from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
 from hub.services.tree_output import (
     TreeOutputOptions,
     apply_tree_limits,
@@ -1114,13 +1116,38 @@ async def api_review_brief(
         if stacking:
             stacking_warning = stacking["message"]
 
+    # #506: resolve each verifiable_by=test AC's locator to a real test via
+    # pytest collect-only (best-effort). Only pays the collection cost when the
+    # brief actually has test-AC to check.
+    ac_models = [services.row_to_ac(r) for r in ac_rows]
+    locator_resolution: list[ACLocatorResolution] = []
+    if any(a.verifiable_by.value == "test" for a in ac_models):
+        ctx = await services.project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        # #506: the workspace is shared across a project's tasks and the pair
+        # flow switches its branch. Collecting while HEAD sits on another task's
+        # branch would report THIS task's tests as missing. Only trust the
+        # collection when HEAD matches the task's branch; otherwise leave it
+        # unavailable so the status is `unknown`, never a false `missing`.
+        collected = None
+        if task_view.branch:
+            head = await plugins.git_ops.current_branch(repo=workspace)
+            if head == task_view.branch:
+                # collect_test_nodeids itself returns None without a workspace,
+                # so an unresolvable repo still degrades to `unknown`.
+                collected = await collect_test_nodeids(workspace)
+        locator_resolution = [
+            ACLocatorResolution(**r) for r in resolve_ac_locators(ac_models, collected)
+        ]
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
         status=task_view.status,
         description=task_view.description,
         project=task_view.project,
-        acceptance_criteria=[services.row_to_ac(r) for r in ac_rows],
+        acceptance_criteria=ac_models,
+        locator_resolution=locator_resolution,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
         out_of_scope_for_review=task_view.out_of_scope_for_review,

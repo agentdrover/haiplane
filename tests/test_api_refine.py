@@ -923,3 +923,73 @@ async def test_refine_ac_locator_off_allows_free_text(client: AsyncClient, monke
         json={"acceptance_criteria": [_ac_payload(1, test_ref="legacy free text")]},
     )
     assert resp.status_code == 200
+
+
+# ---- Verifiable SDD: AC locator existence in review brief (#506) ----
+
+
+async def test_review_brief_includes_locator_resolution(client: AsyncClient, db, monkeypatch):
+    # #506: the brief resolves each verifiable_by=test AC's locator against the
+    # collected tests — present → resolvable, absent → missing.
+    from hub import repository as repo
+
+    async def _fake_collect(_repo_path):
+        return {"tests/test_x.py::test_present"}
+
+    async def _fake_head(repo=None):
+        return "task-x/b"
+
+    monkeypatch.setattr("hub.app.collect_test_nodeids", _fake_collect)
+    monkeypatch.setattr("hub.app.plugins.git_ops.current_branch", _fake_head)
+    task = await _create_task(client)
+    # Collection is only trusted while the workspace HEAD matches the task
+    # branch, so put both on the same branch.
+    await repo.update_task(db, task["id"], branch="task-x/b")
+    await db.commit()
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={
+            "acceptance_criteria": [
+                _ac_payload(1, test_ref="tests/test_x.py::test_present"),
+                _ac_payload(2, test_ref="tests/test_x.py::test_absent"),
+            ]
+        },
+    )
+    resp = await client.get(f"/api/tasks/{task['id']}/review-brief")
+    assert resp.status_code == 200
+    res = {r["ac_id"]: r["status"] for r in resp.json()["locator_resolution"]}
+    assert res == {"AC-1": "resolvable", "AC-2": "missing"}
+
+
+async def test_review_brief_locator_unknown_when_workspace_on_other_branch(
+    client: AsyncClient, db, monkeypatch
+):
+    # #506 fix: the workspace is shared across a project's tasks. When its HEAD
+    # sits on another branch the collection says nothing about THIS task, so the
+    # status must be `unknown` — never a false `missing`.
+    from hub import repository as repo
+
+    called = {"collect": False}
+
+    async def _fake_collect(_repo_path):
+        called["collect"] = True
+        return {"tests/test_x.py::test_present"}
+
+    async def _fake_head(repo=None):
+        return "some-other-task/branch"
+
+    monkeypatch.setattr("hub.app.collect_test_nodeids", _fake_collect)
+    monkeypatch.setattr("hub.app.plugins.git_ops.current_branch", _fake_head)
+    task = await _create_task(client)
+    await repo.update_task(db, task["id"], branch="task-x/b")
+    await db.commit()
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"acceptance_criteria": [_ac_payload(1, test_ref="tests/test_x.py::test_absent")]},
+    )
+
+    resp = await client.get(f"/api/tasks/{task['id']}/review-brief")
+    assert resp.status_code == 200
+    res = {r["ac_id"]: r["status"] for r in resp.json()["locator_resolution"]}
+    assert res == {"AC-1": "unknown"}
+    assert called["collect"] is False  # collection skipped entirely
