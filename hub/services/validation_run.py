@@ -11,7 +11,6 @@ the recorded log.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -19,6 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from hub import repository as repo
 from hub.services.orchestration import project_git_context
+from hub.services.process_kill import kill_process_group
 
 log = logging.getLogger("hub")
 
@@ -91,15 +91,17 @@ async def default_validation_runner(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                # Own session, so the timeout path can signal the whole group
+                # rather than just the shell we spawned (#544).
+                start_new_session=True,
             )
             out, dropped = await asyncio.wait_for(_collect(proc), timeout=_RUN_TIMEOUT)
         except (OSError, TimeoutError, asyncio.TimeoutError):
             # wait_for cancels only the await — the command keeps running in the
-            # workspace, and every retry leaks another one. Kill and reap it.
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
-                    await proc.wait()
+            # workspace, and every retry leaks another one. Kill the group: the
+            # shell may not have exec'd the payload, in which case killing its
+            # pid alone leaves the real command alive (#544).
+            await kill_process_group(proc)
             log.warning("validation command failed to run in %s", repo_path)
             return None
         tail = f"\n[... {dropped} bytes dropped]" if dropped else ""
