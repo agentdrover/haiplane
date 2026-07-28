@@ -530,6 +530,37 @@ async def get_latest_machine_review(
     return rows[0] if rows else None
 
 
+# --- AC test results (#507) ------------------------------------------------
+
+
+async def upsert_ac_test_result(
+    db: aiosqlite.Connection,
+    task_id: int,
+    ac_id: str,
+    generation: int,
+    status: str,
+) -> None:
+    """Record the latest test result for one AC, stamped with its generation."""
+    await db.execute(
+        "INSERT INTO ac_test_results (task_id, ac_id, submission_generation, "
+        "status, created_at) VALUES (?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(task_id, ac_id) DO UPDATE SET "
+        "submission_generation=excluded.submission_generation, "
+        "status=excluded.status, created_at=excluded.created_at",
+        (task_id, ac_id, generation, status),
+    )
+
+
+async def list_ac_test_results(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    """All recorded AC test results for a task (any generation)."""
+    return await db.execute_fetchall(
+        "SELECT * FROM ac_test_results WHERE task_id=?",
+        (task_id,),
+    )
+
+
 # --- events feed (#349) ----------------------------------------------------
 
 

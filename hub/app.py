@@ -32,6 +32,7 @@ from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     ACLocatorResolution,
+    ACTestResultView,
     BulkChildTasksCreate,
     BulkRefine,
     BulkRefineResult,
@@ -101,6 +102,7 @@ from hub.services.diagnostics import (
     build_identity_diagnostics,
     build_whoami,
 )
+from hub.services.ac_tests import current_ac_test_results, run_ac_tests
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
 from hub.services.tree_output import (
@@ -1046,6 +1048,19 @@ async def api_review_verdict(
     )
 
 
+@app.post("/api/tasks/{task_id}/run-ac-tests")
+async def api_run_ac_tests(task_id: int, request: Request):
+    """Run the tests bound to a task's verifiable_by=test AC and record them (#507).
+
+    Best-effort: an unavailable workspace records ``not_found`` rather than a
+    false ``fail``. Results are stamped with the current submission_generation.
+    """
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return {"results": await run_ac_tests(db, task_id)}
+
+
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
 async def api_review_brief(
     task_id: int,
@@ -1140,6 +1155,15 @@ async def api_review_brief(
             ACLocatorResolution(**r) for r in resolve_ac_locators(ac_models, collected)
         ]
 
+    # #507: recorded pass/fail of each test-AC for the current generation.
+    ac_result_rows = await repo.list_ac_test_results(db, task_id)
+    ac_test_results = [
+        ACTestResultView(**r)
+        for r in current_ac_test_results(
+            ac_result_rows, task_view.submission_generation or 0
+        )
+    ]
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1148,6 +1172,7 @@ async def api_review_brief(
         project=task_view.project,
         acceptance_criteria=ac_models,
         locator_resolution=locator_resolution,
+        ac_test_results=ac_test_results,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
         out_of_scope_for_review=task_view.out_of_scope_for_review,

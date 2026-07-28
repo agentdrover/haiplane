@@ -993,3 +993,32 @@ async def test_review_brief_locator_unknown_when_workspace_on_other_branch(
     res = {r["ac_id"]: r["status"] for r in resp.json()["locator_resolution"]}
     assert res == {"AC-1": "unknown"}
     assert called["collect"] is False  # collection skipped entirely
+# ---- Verifiable SDD: AC test results in review brief (#507) ----
+
+
+async def test_review_brief_shows_ac_test_results(client: AsyncClient, monkeypatch):
+    # AC-3 (#507): the brief shows recorded pass/fail per test-AC for the
+    # current generation.
+    async def _fake_default(nodeids, _repo_path):
+        return {n: (i == 0) for i, n in enumerate(nodeids)}
+
+    monkeypatch.setattr("hub.services.ac_tests.default_test_runner", _fake_default)
+    task = await _create_task(client)
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={
+            "acceptance_criteria": [
+                _ac_payload(1, test_ref="tests/test_x.py::test_a"),
+                _ac_payload(2, test_ref="tests/test_x.py::test_b"),
+            ]
+        },
+    )
+    run = await client.post(f"/api/tasks/{task['id']}/run-ac-tests")
+    assert run.status_code == 200
+
+    brief = await client.get(f"/api/tasks/{task['id']}/review-brief")
+    res = {
+        r["ac_id"]: (r["status"], r["is_current"])
+        for r in brief.json()["ac_test_results"]
+    }
+    assert res == {"AC-1": ("pass", True), "AC-2": ("fail", True)}
