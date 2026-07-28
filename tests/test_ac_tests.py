@@ -34,12 +34,20 @@ async def _task_with_test_acs(db):
         task_id,
         [
             AcceptanceCriterion(
-                id="AC-1", given="g", when="w", then="t",
-                verifiable_by="test", test_ref="tests/test_x.py::test_a",
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
             ),
             AcceptanceCriterion(
-                id="AC-2", given="g", when="w", then="t",
-                verifiable_by="test", test_ref="tests/test_x.py::test_b",
+                id="AC-2",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_b",
             ),
         ],
     )
@@ -57,7 +65,10 @@ async def test_run_ac_tests_records_on_current_generation(db):
     recorded = await run_ac_tests(db, task_id, runner=fake_runner)
     assert {r["ac_id"]: r["status"] for r in recorded} == {"AC-1": PASS, "AC-2": FAIL}
     rows = [dict(r) for r in await repo.list_ac_test_results(db, task_id)]
-    assert {r["ac_id"]: r["submission_generation"] for r in rows} == {"AC-1": 1, "AC-2": 1}
+    assert {r["ac_id"]: r["submission_generation"] for r in rows} == {
+        "AC-1": 1,
+        "AC-2": 1,
+    }
 
 
 async def test_ac_results_go_stale_after_resubmission(db):
@@ -111,29 +122,20 @@ async def _run_with_output(monkeypatch, nodeids, output):
 async def test_runner_matches_exact_nodeid_not_prefix(monkeypatch):
     # HIGH (#507): substring matching let "::test_a" absorb the verdict of
     # "::test_a_extra" (and the last line won), flipping pass/fail.
-    out = (
-        "tests/t.py::test_a PASSED   [ 50%]\n"
-        "tests/t.py::test_a_extra FAILED [100%]\n"
-    )
+    out = "tests/t.py::test_a PASSED   [ 50%]\ntests/t.py::test_a_extra FAILED [100%]\n"
     res = await _run_with_output(monkeypatch, ["tests/t.py::test_a"], out)
     assert res == {"tests/t.py::test_a": True}
 
 
 async def test_runner_aggregates_parametrized_any_failure_fails(monkeypatch):
     # A bare locator covers every parametrized case; one red case fails the AC.
-    out = (
-        "tests/t.py::test_p[c1] PASSED [ 50%]\n"
-        "tests/t.py::test_p[c2] FAILED [100%]\n"
-    )
+    out = "tests/t.py::test_p[c1] PASSED [ 50%]\ntests/t.py::test_p[c2] FAILED [100%]\n"
     res = await _run_with_output(monkeypatch, ["tests/t.py::test_p"], out)
     assert res == {"tests/t.py::test_p": False}
 
 
 async def test_runner_reports_plain_pass_and_fail(monkeypatch):
-    out = (
-        "tests/t.py::test_ok PASSED [ 50%]\n"
-        "tests/t.py::test_bad FAILED [100%]\n"
-    )
+    out = "tests/t.py::test_ok PASSED [ 50%]\ntests/t.py::test_bad FAILED [100%]\n"
     res = await _run_with_output(
         monkeypatch, ["tests/t.py::test_ok", "tests/t.py::test_bad"], out
     )

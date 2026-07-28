@@ -4290,8 +4290,12 @@ async def _review_task_with_ac_result(db, *, status_result: str):
         task_id,
         [
             AcceptanceCriterion(
-                id="AC-1", given="g", when="w", then="t",
-                verifiable_by="test", test_ref="tests/test_x.py::test_a",
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
             )
         ],
     )
@@ -4306,7 +4310,8 @@ async def test_ac_tests_gate_require_blocks_approved_when_red(db, monkeypatch):
     task_id = await _review_task_with_ac_result(db, status_result="fail")
     with pytest.raises(HTTPException) as exc:
         await services.record_review_verdict(
-            db, task_id,
+            db,
+            task_id,
             TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
         )
     assert exc.value.status_code == 422
@@ -4318,7 +4323,8 @@ async def test_ac_tests_gate_warn_allows_approved_when_red(db, monkeypatch):
     monkeypatch.setattr("hub.config.SDD_AC_TESTS", "warn")
     task_id = await _review_task_with_ac_result(db, status_result="fail")
     view = await services.record_review_verdict(
-        db, task_id,
+        db,
+        task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
     )
     assert view.review_verdict == ReviewVerdict.approved
@@ -4329,7 +4335,8 @@ async def test_ac_tests_gate_require_allows_changes_requested_when_red(db, monke
     monkeypatch.setattr("hub.config.SDD_AC_TESTS", "require")
     task_id = await _review_task_with_ac_result(db, status_result="fail")
     view = await services.record_review_verdict(
-        db, task_id,
+        db,
+        task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
     )
     assert view.review_verdict == ReviewVerdict.changes_requested
@@ -4340,7 +4347,8 @@ async def test_ac_tests_gate_require_allows_approved_when_green(db, monkeypatch)
     monkeypatch.setattr("hub.config.SDD_AC_TESTS", "require")
     task_id = await _review_task_with_ac_result(db, status_result="pass")
     view = await services.record_review_verdict(
-        db, task_id,
+        db,
+        task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
     )
     assert view.review_verdict == ReviewVerdict.approved
@@ -4356,8 +4364,12 @@ async def _review_task_with_test_ac(db, *, test_ref):
         task_id,
         [
             AcceptanceCriterion(
-                id="AC-1", given="g", when="w", then="t",
-                verifiable_by="test", test_ref=test_ref,
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref=test_ref,
             )
         ],
     )
@@ -4368,7 +4380,9 @@ async def _review_task_with_test_ac(db, *, test_ref):
 # ---- Verifiable SDD: validation_commands completion gate (#510) ----
 
 
-async def _completing_task_with_validation(db, *, validation_status=None, commands=None):
+async def _completing_task_with_validation(
+    db, *, validation_status=None, commands=None
+):
     task_id = await repo.create_task(
         db,
         title="v",
@@ -4398,7 +4412,6 @@ async def _completing_task_with_validation(db, *, validation_status=None, comman
     return task_id
 
 
-
 async def test_ac_tests_gate_require_blocks_unlocatable_test_ac(db, monkeypatch):
     # An AC declared verifiable_by=test whose locator no runner can resolve is a
     # gap, not an exemption: #507 never runs it, so silently passing it here let
@@ -4408,7 +4421,8 @@ async def test_ac_tests_gate_require_blocks_unlocatable_test_ac(db, monkeypatch)
     task_id = await _review_task_with_test_ac(db, test_ref="см. ручной QA")
     with pytest.raises(HTTPException) as exc:
         await services.record_review_verdict(
-            db, task_id,
+            db,
+            task_id,
             TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
         )
     assert exc.value.status_code == 422
@@ -4420,7 +4434,8 @@ async def test_ac_tests_gate_warn_allows_unlocatable_test_ac(db, monkeypatch):
     monkeypatch.setattr("hub.config.SDD_AC_TESTS", "warn")
     task_id = await _review_task_with_test_ac(db, test_ref="см. ручной QA")
     view = await services.record_review_verdict(
-        db, task_id,
+        db,
+        task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
     )
     assert view.review_verdict == ReviewVerdict.approved
@@ -4438,14 +4453,19 @@ async def test_ac_tests_gate_ignores_non_test_ac_without_locator(db, monkeypatch
         task_id,
         [
             AcceptanceCriterion(
-                id="AC-1", given="g", when="w", then="t",
-                verifiable_by="manual", test_ref=None,
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="manual",
+                test_ref=None,
             )
         ],
     )
     await db.commit()
     view = await services.record_review_verdict(
-        db, task_id,
+        db,
+        task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent="reviewer"),
     )
     assert view.review_verdict == ReviewVerdict.approved
@@ -4490,7 +4510,9 @@ async def test_validation_gate_require_allows_completion_when_pass(db, monkeypat
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
-async def test_validation_gate_require_allows_completion_without_commands(db, monkeypatch):
+async def test_validation_gate_require_allows_completion_without_commands(
+    db, monkeypatch
+):
     # No validation_commands → no gap → completion passes even under require.
     monkeypatch.setattr("hub.config.SDD_VALIDATION", "require")
     task_id = await _completing_task_with_validation(db)

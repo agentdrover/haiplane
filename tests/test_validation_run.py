@@ -93,7 +93,7 @@ async def test_runner_kills_timed_out_command(monkeypatch, tmp_path):
     monkeypatch.setattr(validation_run, "_RUN_TIMEOUT", 0.3)
     marker = tmp_path / "still_alive"
     cmd = (
-        f"python3 -c \"import time,pathlib;"
+        f'python3 -c "import time,pathlib;'
         f"time.sleep(1.5);pathlib.Path(r'{marker}').write_text('x')\""
     )
     assert await validation_run.default_validation_runner([cmd], str(tmp_path)) is None
