@@ -90,12 +90,19 @@ def test_safe_env_strips_secrets(monkeypatch):
 async def test_runner_kills_timed_out_command(monkeypatch, tmp_path):
     # The timed-out child used to survive: wait_for cancels only the read, and
     # every retry leaked another live process into the workspace.
+    #
+    # The trailing `; :` matters (#544). A shell handed one simple command may
+    # exec it, making the payload the very pid we signalled — which is why the
+    # first version of this test passed on macOS while the leak was still wide
+    # open on the Linux production host. A compound command forces sh to fork,
+    # so the payload is a grandchild and only a process-group kill reaches it.
     monkeypatch.setattr(validation_run, "_RUN_TIMEOUT", 0.3)
     marker = tmp_path / "still_alive"
-    cmd = (
+    payload = (
         f'python3 -c "import time,pathlib;'
         f"time.sleep(1.5);pathlib.Path(r'{marker}').write_text('x')\""
     )
+    cmd = f"{payload}; :"
     assert await validation_run.default_validation_runner([cmd], str(tmp_path)) is None
     await asyncio.sleep(2.0)
     assert not marker.exists(), "timed-out command kept running after the hub gave up"

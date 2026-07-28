@@ -11,10 +11,10 @@ hole. Best-effort: when the workspace or pytest is unavailable the status is
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import Any
 
+from hub.services.process_kill import kill_process_group
 from hub.services.test_locator import parse_test_locator
 
 log = logging.getLogger("hub")
@@ -48,15 +48,16 @@ async def collect_test_nodeids(repo_path: str | None) -> set[str] | None:
             cwd=repo_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Own session, so the timeout path can signal the whole group (#544).
+            start_new_session=True,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_COLLECT_TIMEOUT)
     except (OSError, TimeoutError, asyncio.TimeoutError):
         # wait_for only cancels the await — the child keeps running and would
-        # accumulate orphaned collectors on every brief read. Kill it (#506).
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-                await proc.wait()
+        # accumulate orphaned collectors on every brief read (#506). Kill the
+        # group, not the pid: we spawn `uv`, which runs pytest as a child, so
+        # killing `uv` alone leaves the collector running (#544).
+        await kill_process_group(proc)
         log.warning("AC locator collect-only failed in %s", repo_path)
         return None
     if proc.returncode != 0:
