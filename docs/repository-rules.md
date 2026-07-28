@@ -217,8 +217,16 @@ uv run pytest -q
 ## CI/CD и авто-деплой
 
 - CI и CD описаны в `.github/workflows/ci.yml`.
-- На каждый `pull_request` в `main` и `push` в `main` запускается job `test`:
-  `ruff check`, `ruff format --check`, `pytest`.
+- На каждый `pull_request` и `push` в `main` **и в `develop`** запускается job
+  `test`: `ruff check`, `ruff format --check`, `pytest`, `pip-audit`, `bandit`,
+  `detect-secrets`.
+- **`mergeStateStatus=CLEAN` не означает «CI прошёл».** Это ответ GitHub
+  «обязательных проверок нет» — на приватном репо без branch protection он
+  выглядит одинаково и когда проверки прошли, и когда их не запускали вовсе.
+  Перед merge смотреть `gh pr checks <N>`, а не `mergeStateStatus`.
+  Инцидент 28.07.2026: стек #505–#510 слит в `develop` при `CLEAN` на всех
+  шести PR — CI не запускался ни разу (триггеры были только на `main`), и в
+  `develop` уехали три дефекта, найденные лишь релизным PR (#543).
 - **Любой merge в `main` автоматически выкатывается на сервер.** Job `deploy`
   стартует только после успешного `test` и только на `push` в `main`
   (на pull_request деплой не идёт).
