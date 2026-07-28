@@ -35,6 +35,7 @@ from hub.mcp_server import (
     hub_list_projects,
     hub_list_proposals,
     hub_list_tasks,
+    BASE_VALIDATION_COMMANDS,
     hub_prepare_developer_task,
     hub_propose_task,
     hub_pair_start,
@@ -1531,6 +1532,8 @@ async def test_hub_prepare_developer_task_risk_replace_uses_refine(
             "risks": [risk],
             "prepared_by": "analyst-agent",
             "prepared_at": ANY,
+            # #543: the task names no validation commands, so it gets the base set.
+            "validation_commands": BASE_VALIDATION_COMMANDS,
         },
     )
     assert all(
@@ -1633,8 +1636,108 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
             "problem_statement": "Bug needs detail.",
             "prepared_by": "analyst-agent",
             "prepared_at": ANY,
+            # #543: a code task that names no validation commands now gets the
+            # base set instead of being handed over with nothing to prove.
+            "validation_commands": BASE_VALIDATION_COMMANDS,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_prepare_developer_task_defaults_validation_commands(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    # The format gate reached a task only when the analyst remembered it, and
+    # no PR into develop ran CI — together that let the #505–#510 stack land
+    # six unformatted files. The base set must not depend on memory (#543).
+    mock_api_post.side_effect = [{"updated_columns": []}, {"id": 90}]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": [],
+        "recommendations": [],
+        "risks": [],
+    }
+
+    await hub_prepare_developer_task(task_id=25, work_type="feature")
+
+    body = mock_api_post.await_args_list[0].args[1]
+    assert body["validation_commands"] == BASE_VALIDATION_COMMANDS
+    assert "uv run ruff format --check hub tests" in body["validation_commands"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_developer_task_keeps_explicit_validation_commands(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    # An explicit list always wins — including an empty one, which means "no
+    # commands", not "fall back to the default" (#543).
+    mock_api_post.side_effect = [{"updated_columns": []}, {"id": 91}]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": [],
+        "recommendations": [],
+        "risks": [],
+    }
+
+    await hub_prepare_developer_task(
+        task_id=25,
+        work_type="chore",
+        validation_commands=["Проверка ручная: hub_task_tree 501 показывает 100%"],
+    )
+
+    body = mock_api_post.await_args_list[0].args[1]
+    assert body["validation_commands"] == [
+        "Проверка ручная: hub_task_tree 501 показывает 100%"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_developer_task_skips_default_for_docs(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    # A docs task has no code to lint; forcing pytest on it would make the
+    # default noise the analyst learns to override blindly (#543).
+    mock_api_post.side_effect = [{"updated_columns": []}, {"id": 92}]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": [],
+        "recommendations": [],
+        "risks": [],
+    }
+
+    await hub_prepare_developer_task(task_id=25, work_type="docs")
+
+    body = mock_api_post.await_args_list[0].args[1]
+    assert "validation_commands" not in body
+
+
+@pytest.mark.asyncio
+async def test_prepare_developer_task_keeps_task_own_validation_commands(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    # The task already carries commands from an earlier refine — the default
+    # must not overwrite them (#543).
+    mock_api_post.side_effect = [{"updated_columns": []}, {"id": 93}]
+    mock_api_get.return_value = {
+        "score": 70,
+        "dor_passed": False,
+        "missing_required": [],
+        "recommendations": [],
+        "risks": [],
+        "validation_commands": ["uv run pytest tests/test_poller.py -q"],
+    }
+
+    await hub_prepare_developer_task(task_id=25, work_type="feature")
+
+    body = mock_api_post.await_args_list[0].args[1]
+    assert "validation_commands" not in body
 
 
 @pytest.mark.asyncio

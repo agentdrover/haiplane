@@ -2411,6 +2411,16 @@ def _developer_handoff_text(
     return format_echo_response("\n".join(lines))
 
 
+# What a code task must prove before it is handed to a developer (#543). Kept
+# in step with the CI job so a task cannot pass its own validation and then
+# fail the release; see .github/workflows/ci.yml.
+BASE_VALIDATION_COMMANDS = [
+    "uv run ruff check hub tests",
+    "uv run ruff format --check hub tests",
+    "uv run pytest -q",
+]
+
+
 def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(risk.get("kind", "")),
@@ -2499,6 +2509,22 @@ async def hub_prepare_developer_task(
             refine_body[key] = val
 
     current_task = await _api_get(f"/api/tasks/{task_id}")
+
+    # #543: hand code tasks the base validation set when neither the caller nor
+    # the task already names one. The format gate used to reach a task only if
+    # the analyst happened to remember it, and CI never ran on develop — that
+    # pair let the #505–#510 stack land six unformatted files. An explicit
+    # argument always wins, including an explicit empty list, which means "no
+    # commands" rather than "use the default". Docs tasks get nothing: there is
+    # no code to lint.
+    effective_work_type = work_type or current_task.get("work_type")
+    if (
+        validation_commands is None
+        and effective_work_type != "docs"
+        and not (current_task.get("validation_commands") or [])
+    ):
+        refine_body["validation_commands"] = list(BASE_VALIDATION_COMMANDS)
+
     existing_acs: list[dict[str, Any]] = []
     if acceptance_criteria is not None:
         existing_acs = await _api_get(f"/api/tasks/{task_id}/acceptance_criteria")
