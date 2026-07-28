@@ -864,6 +864,67 @@ async def test_web_solo_verdict_marked_and_badge_rendered(
     assert "badge-self-approved" in page.text
 
 
+async def test_web_review_verdict_rejects_self_review(client: AsyncClient, monkeypatch):
+    """#358 T6: the implementer cannot pass a verdict on their own work through
+    the web panel.
+
+    The protection already lives in the shared service, but until now it was
+    asserted only through REST and MCP — self_review_forbidden appeared nowhere
+    in this file. The two neighbours below cover the other branches: the solo
+    opt-out (REVIEW_SELF_APPROVE=allow) and an independent reviewer.
+
+    Verified by mutation: drop the raise from ensure_reviewer_independence and
+    keep its self_approved return, and only this test fails — both neighbours
+    stay green. So the refusal on the web route was genuinely unguarded, not
+    merely covered somewhere less obvious.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    # The default, spelled out: this test is about the forbidding branch, and
+    # a neighbour flipping the global would silently turn it into a no-op.
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Self review web"}, headers=agent
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "bot", "kind": "status", "content": "Plan: work"},
+        headers=agent,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+
+    # The implementer approves their own work through the web panel.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "looks good to me"},
+        headers=agent,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "self_review_forbidden"
+
+    # No verdict recorded, and the task is still waiting for a real reviewer.
+    body = (await client.get(f"/api/tasks/{task_id}", headers=agent)).json()
+    assert body["latest_review"] is None
+    assert body["review_approved_current"] is False
+    assert body["status"] == "review"
+
+
 async def test_web_independent_verdict_has_no_solo_badge(client: AsyncClient):
     """#434: without the opt-out nothing changes — no badge, no mark."""
     task_id = await _web_task_in_review(client)
