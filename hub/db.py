@@ -583,7 +583,10 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_validation_generation_column",
         "ALTER TABLE tasks ADD COLUMN validation_generation INTEGER",
     ),
-    ("add_validation_status_column", "ALTER TABLE tasks ADD COLUMN validation_status TEXT"),
+    (
+        "add_validation_status_column",
+        "ALTER TABLE tasks ADD COLUMN validation_status TEXT",
+    ),
     ("add_validation_log_column", "ALTER TABLE tasks ADD COLUMN validation_log TEXT"),
 ]
 

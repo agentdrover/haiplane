@@ -141,7 +141,9 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
         return None
     unlocatable = [ac.id for ac in test_acs if not parse_test_locator(ac.test_ref)]
     generation = task.get("submission_generation") or 0
-    rows = {dict(r)["ac_id"]: dict(r) for r in await repo.list_ac_test_results(db, task_id)}
+    rows = {
+        dict(r)["ac_id"]: dict(r) for r in await repo.list_ac_test_results(db, task_id)
+    }
     not_green = [
         ac.id
         for ac in test_acs
@@ -154,7 +156,9 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
     ]
     gaps = []
     if not_green:
-        gaps.append("AC-тесты не зелёные для текущего поколения: " + ", ".join(not_green))
+        gaps.append(
+            "AC-тесты не зелёные для текущего поколения: " + ", ".join(not_green)
+        )
     if unlocatable:
         gaps.append(
             "AC объявлены verifiable_by=test, но локатор теста не разрешается: "

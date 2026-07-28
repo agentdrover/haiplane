@@ -886,7 +886,9 @@ async def test_get_readiness_lazily_repairs_stale_persisted_values(
 # ---- Verifiable SDD: AC test-locator enforcement (#505) ----
 
 
-async def test_refine_ac_locator_required_rejects_invalid(client: AsyncClient, monkeypatch):
+async def test_refine_ac_locator_required_rejects_invalid(
+    client: AsyncClient, monkeypatch
+):
     # AC-1 (#505): with SDD_AC_LOCATOR=require, a verifiable_by=test AC without a
     # valid pytest locator is rejected at refine time with an actionable error.
     monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
@@ -899,7 +901,9 @@ async def test_refine_ac_locator_required_rejects_invalid(client: AsyncClient, m
     assert "AC-1" in resp.text
 
 
-async def test_refine_ac_locator_required_allows_non_test(client: AsyncClient, monkeypatch):
+async def test_refine_ac_locator_required_allows_non_test(
+    client: AsyncClient, monkeypatch
+):
     # AC-2 (#505): a non-test AC never requires a locator, even under require.
     monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
     task = await _create_task(client)
@@ -928,7 +932,9 @@ async def test_refine_ac_locator_off_allows_free_text(client: AsyncClient, monke
 # ---- Verifiable SDD: AC locator existence in review brief (#506) ----
 
 
-async def test_review_brief_includes_locator_resolution(client: AsyncClient, db, monkeypatch):
+async def test_review_brief_includes_locator_resolution(
+    client: AsyncClient, db, monkeypatch
+):
     # #506: the brief resolves each verifiable_by=test AC's locator against the
     # collected tests — present → resolvable, absent → missing.
     from hub import repository as repo
@@ -985,7 +991,11 @@ async def test_review_brief_locator_unknown_when_workspace_on_other_branch(
     await db.commit()
     await client.post(
         f"/api/tasks/{task['id']}/refine",
-        json={"acceptance_criteria": [_ac_payload(1, test_ref="tests/test_x.py::test_absent")]},
+        json={
+            "acceptance_criteria": [
+                _ac_payload(1, test_ref="tests/test_x.py::test_absent")
+            ]
+        },
     )
 
     resp = await client.get(f"/api/tasks/{task['id']}/review-brief")
@@ -993,6 +1003,8 @@ async def test_review_brief_locator_unknown_when_workspace_on_other_branch(
     res = {r["ac_id"]: r["status"] for r in resp.json()["locator_resolution"]}
     assert res == {"AC-1": "unknown"}
     assert called["collect"] is False  # collection skipped entirely
+
+
 # ---- Verifiable SDD: AC test results in review brief (#507) ----
 
 
