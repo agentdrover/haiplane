@@ -17,6 +17,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.models import (
     AcceptanceCriterion,
@@ -30,6 +31,7 @@ from hub.models import (
     TaskRisk,
 )
 from hub.services.recommendations import calculate_readiness_with_recommendations
+from hub.services.test_locator import validate_test_locators
 
 
 # Statuses where the Definition of Ready gate still applies. DoR is a
@@ -210,6 +212,13 @@ async def _apply_refine_writes(
 
     ac_count: int | None = None
     if payload.acceptance_criteria is not None:
+        # Verifiable SDD (#505): reject verifiable_by=test AC without a
+        # resolvable pytest locator when the project opts in. Gated by config
+        # so the default-off policy leaves existing refine flows untouched.
+        validate_test_locators(
+            payload.acceptance_criteria,
+            enforce=config.SDD_AC_LOCATOR == "require",
+        )
         try:
             ac_count = await repo.replace_acceptance_criteria(
                 db, task_id, payload.acceptance_criteria

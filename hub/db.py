@@ -559,6 +559,35 @@ _MIGRATIONS: list[tuple[str, str]] = [
         )
         """,
     ),
+    # ---- Verifiable SDD (#507): pass/fail of each verifiable_by=test AC's
+    # bound test, stamped with the submission_generation it was run for. One row
+    # per (task, ac) — upserted on each run; a result counts as current only
+    # while its generation matches the task's submission_generation.
+    (
+        "create_ac_test_results_table",
+        """
+        CREATE TABLE IF NOT EXISTS ac_test_results (
+            task_id INTEGER NOT NULL REFERENCES tasks(id),
+            ac_id TEXT NOT NULL,
+            submission_generation INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (task_id, ac_id)
+        )
+        """,
+    ),
+    # ---- Verifiable SDD (#509): result of running task.validation_commands,
+    # stamped with the submission_generation. One result per task (the commands
+    # are a single set); current only while the generation matches.
+    (
+        "add_validation_generation_column",
+        "ALTER TABLE tasks ADD COLUMN validation_generation INTEGER",
+    ),
+    (
+        "add_validation_status_column",
+        "ALTER TABLE tasks ADD COLUMN validation_status TEXT",
+    ),
+    ("add_validation_log_column", "ALTER TABLE tasks ADD COLUMN validation_log TEXT"),
 ]
 
 

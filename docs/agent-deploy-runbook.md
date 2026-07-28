@@ -59,6 +59,8 @@ ssh user1@194.113.34.33 '
   sudo test -s /etc/openclaw-hub/secrets.env && echo secrets_env_present || true
   sudo grep -q "^OPENCLAW_HUB_TOKENS=" /etc/openclaw-hub/openclaw-hub.env \
     && echo hub_tokens_configured || echo hub_tokens_missing
+  sudo grep -q "^OPENCLAW_HUB_URL=https://agenthai.ru$" /etc/openclaw-hub/openclaw-hub.env \
+    && echo hub_public_url_ok || echo hub_public_url_missing
 '
 ```
 
@@ -234,7 +236,7 @@ OPENCLAW_HUB_REPO=org/repo-name
 | `OPENCLAW_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
 | `OPENCLAW_WORKTREE_PER_TASK` | `1` включает изоляцию pair-задач через `git worktree` (#459): каждая задача получает своё дерево `.<repo>-worktrees/task-<id>`, основной клон остаётся на base. По умолчанию выкл — поведение как раньше. Требует git ≥ 2.15 и место под несколько деревьев. Подробнее: [workspace-safety-policy.md](workspace-safety-policy.md#worktree-per-task-opt-in-459) |
 
-**Production (agenthai.ru):** `OPENCLAW_WORKSPACE_REPO` обычно указывает на server clone (`/opt/openclaw-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**.
+**Production (agenthai.ru):** `OPENCLAW_WORKSPACE_REPO` обычно указывает на server clone (`/opt/openclaw-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**. В `/etc/openclaw-hub/openclaw-hub.env` обязателен `OPENCLAW_HUB_URL=https://agenthai.ru` — без него MCP echo `instance: local` и `base_url: http://127.0.0.1:8080` (#174, #452).
 
 **Local dev:** часто `OPENCLAW_WORKSPACE_REPO` = тот же каталог, что открыт в Cursor. Тогда pair-start **переключает и чистит этот clone** — см. [Pair mode: git policy](../software-development-workflow.md#pair-mode-git-policy).
 
