@@ -20,7 +20,8 @@ from hub.services.test_locator import parse_test_locator
 
 log = logging.getLogger("hub")
 
-PASS = "pass"
+# A test outcome, not a credential — bandit's B105 matches the name alone.
+PASS = "pass"  # nosec B105
 FAIL = "fail"
 NOT_FOUND = "not_found"
 

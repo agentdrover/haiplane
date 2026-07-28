@@ -22,7 +22,8 @@ from hub.services.process_kill import kill_process_group
 
 log = logging.getLogger("hub")
 
-PASS = "pass"
+# A validation outcome, not a credential — bandit's B105 matches the name alone.
+PASS = "pass"  # nosec B105
 FAIL = "fail"
 SKIPPED = "skipped"
 UNKNOWN = "unknown"
