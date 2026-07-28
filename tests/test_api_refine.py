@@ -881,3 +881,45 @@ async def test_get_readiness_lazily_repairs_stale_persisted_values(
     body = (await client.get(f"/api/tasks/{task['id']}")).json()
     assert body["dor_passed"] is True
     assert body["readiness_score"] == resp.json()["score"]
+
+
+# ---- Verifiable SDD: AC test-locator enforcement (#505) ----
+
+
+async def test_refine_ac_locator_required_rejects_invalid(client: AsyncClient, monkeypatch):
+    # AC-1 (#505): with SDD_AC_LOCATOR=require, a verifiable_by=test AC without a
+    # valid pytest locator is rejected at refine time with an actionable error.
+    monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"acceptance_criteria": [_ac_payload(1, test_ref=None)]},
+    )
+    assert resp.status_code == 422
+    assert "AC-1" in resp.text
+
+
+async def test_refine_ac_locator_required_allows_non_test(client: AsyncClient, monkeypatch):
+    # AC-2 (#505): a non-test AC never requires a locator, even under require.
+    monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={
+            "acceptance_criteria": [
+                _ac_payload(1, verifiable_by="manual", test_ref=None)
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+
+async def test_refine_ac_locator_off_allows_free_text(client: AsyncClient, monkeypatch):
+    # Default off (#505): no enforcement — legacy free-text test_ref still refines.
+    monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "off")
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"acceptance_criteria": [_ac_payload(1, test_ref="legacy free text")]},
+    )
+    assert resp.status_code == 200

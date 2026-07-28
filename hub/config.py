@@ -52,6 +52,11 @@ ALLOW_AGENT_PROJECTS = os.environ.get("OPENCLAW_ALLOW_AGENT_PROJECTS", "propose"
 # only warns in the review panel; 'require' blocks the human verdict until a
 # current report exists. Applies only where policy says a review is needed.
 MACHINE_REVIEW_MODE = os.environ.get("OPENCLAW_MACHINE_REVIEW", "warn")
+# Verifiable SDD (#501/#505): 'off' (default) — refine does not enforce that a
+# verifiable_by=test AC carries a resolvable pytest test locator; 'require'
+# rejects such AC at refine time. Default off so existing refine flows and the
+# hub's own tasks (which predate locators) keep working; opt in per project.
+SDD_AC_LOCATOR = os.environ.get("OPENCLAW_SDD_AC_LOCATOR", "off")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
