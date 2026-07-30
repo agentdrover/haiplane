@@ -374,7 +374,12 @@ async def hub_create_task(
     human_reviewer: str = "",
     client_request_id: str = "",
 ) -> HubCreateTaskResult:
-    """Create a new task, epic, feature, or subtask.
+    """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
+
+    Creates work that is already approved, so an agent token gets 403
+    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which
+    creates a draft for human approval. The refusal is enforced by the API, not
+    here, so it also holds for a token calling POST /api/tasks directly.
 
     Args:
         title: Short title (required)
@@ -432,7 +437,8 @@ async def hub_create_subtasks(
             optional acceptance_criteria (list of Given/When/Then dicts) and
             risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
-        source: agent (draft) or human (open).
+        source: agent (draft) or human (open). ``human`` is human-only (#360):
+            an agent token asking for it gets 403 agent_create_forbidden.
         agent: Assigned agent name when source is agent.
     """
     if not items:

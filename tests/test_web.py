@@ -824,7 +824,12 @@ async def test_web_solo_verdict_marked_and_badge_rendered(
     monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
     agent = {"Authorization": "Bearer agent-token"}
 
-    resp = await client.post("/api/tasks", json={"title": "Solo web"}, headers=agent)
+    # Created by the human (#360): an agent token cannot make ready work.
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Solo web"},
+        headers={"Authorization": "Bearer human-token"},
+    )
     task_id = resp.json()["id"]
     await client.post(
         f"/api/tasks/{task_id}/updates",
@@ -887,8 +892,11 @@ async def test_web_review_verdict_rejects_self_review(client: AsyncClient, monke
     monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
     agent = {"Authorization": "Bearer agent-token"}
 
+    # Created by the human (#360): an agent token cannot make ready work.
     resp = await client.post(
-        "/api/tasks", json={"title": "Self review web"}, headers=agent
+        "/api/tasks",
+        json={"title": "Self review web"},
+        headers={"Authorization": "Bearer human-token"},
     )
     task_id = resp.json()["id"]
     await client.post(
