@@ -11,6 +11,7 @@ import aiosqlite
 from hub import commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, get_breadcrumb, log_activity
+from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
@@ -502,7 +503,7 @@ async def detect_branch_stacking(
         return None
 
     ctx = await project_git_context(db, task_id)
-    base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+    base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
     rows = await repo.list_unmerged_branch_tasks(
         db, exclude_task_id=task_id, statuses=STACK_ADVISORY_STATUSES
@@ -795,6 +796,7 @@ async def transition_after_agent_done(
             task.get("title", ""),
             branch,
             repo=git_repo,
+            base_branch=ctx.get("base_branch"),
         )
         await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
         if not task.get("pr_number"):

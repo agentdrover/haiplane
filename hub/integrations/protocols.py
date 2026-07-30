@@ -179,7 +179,12 @@ class GitOpsPlugin(Protocol):
     ) -> bool: ...
     async def pull_main(self, repo: str | None = None) -> bool: ...
     async def squash_branch(
-        self, task_id: int, title: str, branch: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        branch: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> bool: ...
     async def push_branch(
         self, branch: str, repo: str | None = None, force: bool = False

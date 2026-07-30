@@ -381,6 +381,20 @@ def _parse_pr_number(gh_output: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _resolve_base(base_branch: str | None) -> str:
+    """The base a task's work is cut from AND its PR targets (#362 I4).
+
+    One function on purpose. create_branch used to default to "main" while
+    create_pr defaulted to PAIR_BASE_BRANCH, so on the default project (whose
+    git context is empty) every headless branch was cut from main and its PR
+    aimed at develop. The damage is not a cosmetic diff: with a stale
+    merge-base, a change develop made to a line the task never touched shows
+    up as a conflict against the task branch. Two defaults that must agree
+    are a defect waiting to happen; there is now only one.
+    """
+    return base_branch or PAIR_BASE_BRANCH
+
+
 async def _find_pr_for_branch(
     branch: str, repo: str | None = None, *, gh_repo: str | None = None
 ) -> int | None:
@@ -424,7 +438,7 @@ class GitOpsIntegration:
         self,
         branch: str,
         other_branch: str,
-        base_branch: str = "develop",
+        base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool:
         """True when ``branch`` carries commits unique to ``other_branch`` (#438).
@@ -442,7 +456,7 @@ class GitOpsIntegration:
         repo = repo or _repo_root()
         head = await _resolve_ref(branch, repo)
         other = await _resolve_ref(other_branch, repo)
-        base = await _resolve_ref(base_branch, repo)
+        base = await _resolve_ref(_resolve_base(base_branch), repo)
         if not (head and other and base):
             return False
 
@@ -477,7 +491,7 @@ class GitOpsIntegration:
         repo = repo or _repo_root()
         # Project git context (#337): headless branches historically cut
         # from main; a project may define its own integration branch.
-        base = base_branch or "main"
+        base = _resolve_base(base_branch)
         slug = _slugify(title)
         branch = f"task-{task_id}/{slug}"
 
@@ -546,7 +560,7 @@ class GitOpsIntegration:
             if reason:
                 raise PairBranchConflictError(reason)  # readable 422 (#378)
         repo = repo or _repo_root()
-        base = base_branch or PAIR_BASE_BRANCH
+        base = _resolve_base(base_branch)
 
         rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
         if dirty.strip():
@@ -678,7 +692,7 @@ class GitOpsIntegration:
                 log.warning("pair_restore_workspace_base: %s", reason)
                 return False
         repo = repo or _repo_root()
-        base = base_branch or PAIR_BASE_BRANCH
+        base = _resolve_base(base_branch)
 
         rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
         if dirty.strip():
@@ -735,7 +749,7 @@ class GitOpsIntegration:
                 log.warning("pair_switch_to_task_branch: %s", reason)
                 return False
         repo = repo or _repo_root()
-        base = base_branch or PAIR_BASE_BRANCH
+        base = _resolve_base(base_branch)
 
         rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
         current = (current or "").strip()
@@ -798,7 +812,7 @@ class GitOpsIntegration:
             if reason:
                 raise PairBranchConflictError(reason)
         repo = repo or _repo_root()
-        base = base_branch or PAIR_BASE_BRANCH
+        base = _resolve_base(base_branch)
         slug = (branch_slug or "").strip() or _slugify(title)
         branch = f"task-{task_id}/{slug}"
         wt_path = _worktree_path(task_id, repo)
@@ -1060,22 +1074,44 @@ class GitOpsIntegration:
         return rc == 0
 
     async def squash_branch(
-        self, task_id: int, title: str, branch: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        branch: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> bool:
+        """Collapse the task's commits into one, measured from its own base.
+
+        The squash point must be the branch's base — the same one create_branch
+        cut from and create_pr targets. It used to be hardcoded to origin/main,
+        which agreed with create_branch only while that also defaulted to main.
+        Once #362 moved the cut to the integration branch, merge-base against
+        origin/main became the point where the two branches forked, so the
+        reset swallowed every commit the base had gained since: the PR then
+        showed the base's own work as the task's, and merging it raised
+        add/add conflicts on files the task never touched. Reproduced on a
+        real repository before this was changed.
+        """
         repo = repo or _repo_root()
+        base = _resolve_base(base_branch)
 
         await _git("checkout", branch, repo=repo, check=False)
-        await _git("fetch", "origin", "main", repo=repo, check=False)
+        await _git("fetch", "origin", base, repo=repo, check=False)
 
         rc, merge_base, _ = await _git(
             "merge-base",
-            "origin/main",
+            f"origin/{base}",
             branch,
             repo=repo,
             check=False,
         )
         if rc != 0 or not merge_base.strip():
-            log.warning("squash_branch: cannot find merge-base for %s", branch)
+            log.warning(
+                "squash_branch: cannot find merge-base for %s against origin/%s",
+                branch,
+                base,
+            )
             return False
 
         rc, rev_count, _ = await _git(
@@ -1159,7 +1195,7 @@ class GitOpsIntegration:
             "--repo",
             gh_repo or REPO_NAME,
             "--base",
-            base_branch or PAIR_BASE_BRANCH,
+            _resolve_base(base_branch),
             "--head",
             branch,
             "--title",
@@ -1342,7 +1378,7 @@ class GitOpsIntegration:
         log.info("Deleted local branch %s", branch)
 
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+        self, repo_url: str, workspace_path: str, base_branch: str | None = None
     ) -> tuple[bool, str]:
         """Provision a project workspace (#347, #377). Returns (ok, detail).
 
@@ -1354,6 +1390,7 @@ class GitOpsIntegration:
         origin (owner/repo) and fetched instead of re-cloned — the fetch
         itself validates access, no ls-remote needed.
         """
+        base_branch = _resolve_base(base_branch)
         import os
 
         git_dir = os.path.join(workspace_path, ".git")

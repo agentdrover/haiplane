@@ -1125,3 +1125,124 @@ async def test_headless_review_budget_boundary(
     else:
         m_fix.assert_called_once()
         m_arb.assert_not_called()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_check_passes_the_projects_actual_gh_repo(mock_sleep, db):
+    """#362 AC-1: the VALUE must reach gh, not merely the keyword.
+
+    The neighbouring test asserts only that "gh_repo" is in kwargs, which a
+    None would satisfy. A wrong repo here means gh operates on a same-numbered
+    PR in the global repository — the high risk recorded on this task.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(
+        db,
+        slug="other-proj",
+        name="Other",
+        repo_name="org/other-repo",
+        workspace_path="/srv/other",
+        default_branch="develop",
+    )
+    task_id = await _make_ci_task(db)
+    await repo.update_task(db, task_id, project_id=pid)
+    await db.commit()
+
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_running")
+    )
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    kwargs = mock_git.check_pr_ci.await_args.kwargs
+    assert kwargs["gh_repo"] == "org/other-repo"
+    assert kwargs["repo"] == "/srv/other"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_approved_merge_targets_the_projects_repo(mock_sleep, db):
+    """#362 AC-1, the dangerous half: merging.
+
+    check_pr_ci had a poller-level test; merge_pr did not. A merge aimed at the
+    wrong repository merges a stranger's PR that happens to share the number.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(
+        db,
+        slug="other-proj-2",
+        name="Other 2",
+        repo_name="org/other-repo",
+        workspace_path="/srv/other",
+        default_branch="develop",
+    )
+    task_id = await _make_review_task(db)
+    await repo.update_task(db, task_id, project_id=pid, pr_number=99, branch="task-x/b")
+    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await db.commit()
+
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "ok")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=False)
+    plugins.git_ops = mock_git
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0}
+    )
+    plugins.dispatch = mock_dispatch
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.merge_pr.await_count >= 1, "the approved path must reach merge_pr"
+    assert mock_git.merge_pr.await_args.kwargs["gh_repo"] == "org/other-repo"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_poller_creates_the_pr_in_the_projects_repo(mock_sleep, db):
+    """#362 AC-1, third gh call site. Found by mutation, not by reading.
+
+    A ci_check task without a PR gets one from the poller. Replacing this
+    call's gh_repo with None survived the whole poller suite, so the PR could
+    have been opened against the global repository with nothing to notice.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    pid = await repo.create_project(
+        db,
+        slug="other-proj-3",
+        name="Other 3",
+        repo_name="org/other-repo",
+        workspace_path="/srv/other",
+        default_branch="develop",
+    )
+    task_id = await _make_ci_task(db)
+    await repo.update_task(db, task_id, project_id=pid, pr_number=None)
+    await db.commit()
+
+    mock_git = NoopGitOps()
+    mock_git.push_branch = AsyncMock(return_value=True)
+    mock_git.create_pr = AsyncMock(return_value=None)
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.create_pr.await_count >= 1
+    kwargs = mock_git.create_pr.await_args.kwargs
+    assert kwargs["gh_repo"] == "org/other-repo"
+    assert kwargs["base_branch"] == "develop"
