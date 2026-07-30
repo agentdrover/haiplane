@@ -2803,3 +2803,62 @@ async def test_agent_cannot_create_ready_subtasks(client: AsyncClient, monkeypat
 
     children = await client.get(f"/api/tasks?parent_id={parent_id}", headers=agent)
     assert children.json() == []
+
+
+async def test_agent_create_refusal_envelope_points_at_a_human(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding (#360): a refusal must not tell the refused caller
+    that it is still the actor.
+
+    enrich_error_payload only forces actor_hint="human" for reasons listed in
+    its special-case tuple. agent_create_forbidden was missing from it, so the
+    403 carried required_role="human" and actor_hint="agent" at the same time —
+    and per the MCP envelope contract actor_hint is what a client reads to
+    decide who acts next. The obvious response to "you are still the actor" is
+    to retry a call that can never succeed.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Envelope check"}, headers=agent
+    )
+
+    detail = resp.json()["detail"]
+    assert detail["actor_hint"] == "human"
+    assert detail["awaiting"] == "none"
+    assert detail["suggested_tool"] == "hub_propose_task"
+    assert "hub_propose_task" in detail["next_action"]
+
+
+async def test_admin_token_may_still_create_ready_work(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding (#360): only the 'human' role was covered.
+
+    is_agent is not simply role == "agent" — it falls back to
+    ``not is_human and principal_id``. Admin passes because is_human covers
+    admin/super_admin, but nothing pinned that, so a future change to either
+    property could lock admins out of task creation silently.
+    """
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"admin-token": TokenIdentity("root", "admin")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = {"Authorization": "Bearer admin-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Admin made this"}, headers=admin
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"

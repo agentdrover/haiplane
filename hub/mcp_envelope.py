@@ -69,6 +69,8 @@ def compute_next_action(
         return "Retry with a human or admin token, or use suggested_tool if provided."
     if reason == "human_only_gate":
         return "Retry with a human or admin Bearer token."
+    if reason == "agent_create_forbidden":
+        return "Propose the work with hub_propose_task and let a human approve it."
     if reason == "self_review_forbidden":
         return (
             "Hand the verdict to an independent reviewer: another agent "
@@ -175,7 +177,16 @@ def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
         status=status,
         reason=reason,
     )
-    if reason in ("permission_denied", "human_only_gate", "forbidden"):
+    # Refusals that hand the next move to a human. Leaving a reason out of this
+    # tuple is not cosmetic: actor_hint falls through to "agent", so the
+    # envelope tells the very caller we just refused that it is still the
+    # responsible actor, and the obvious response to that is to retry (#360).
+    if reason in (
+        "permission_denied",
+        "human_only_gate",
+        "forbidden",
+        "agent_create_forbidden",
+    ):
         envelope["actor_hint"] = "human"
         envelope["awaiting"] = "none"
         envelope["transition"] = None
