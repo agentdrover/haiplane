@@ -81,6 +81,7 @@ from hub.models import (
     TaskView,
     WhoamiView,
 )
+from hub.actionable_errors import agent_create_forbidden_detail
 from hub.auth import (
     AuthMiddleware,
     current_identity,
@@ -234,6 +235,22 @@ def _db(request: Request) -> aiosqlite.Connection:
     return request.app.state.db
 
 
+def _reject_agent_authored_source(request: Request, source: TaskSource) -> None:
+    """Agents propose, humans create (#360).
+
+    Initial status is derived from ``source``, and ``source`` used to be taken
+    from the request body — so an agent could label its own request "human" and
+    land a task in ``open``, or in ``running`` with run_immediately, past the
+    draft gate. The gate lives here rather than in the MCP tool because a token
+    reaches this endpoint directly; closing only the tool would be decoration.
+
+    ``source=agent`` stays open to agents: that is the path hub_propose_task
+    itself takes.
+    """
+    if source != TaskSource.agent and current_identity(request).is_agent:
+        raise HTTPException(403, detail=agent_create_forbidden_detail())
+
+
 @app.get("/healthz", response_class=PlainTextResponse)
 async def healthz() -> str:
     """Liveness probe — always public, used by VPN / load balancer health checks."""
@@ -274,6 +291,7 @@ async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
 
 @app.post("/api/tasks", response_model=TaskView)
 async def api_create_task(body: TaskCreate, request: Request, response: Response):
+    _reject_agent_authored_source(request, body.source)
     idem_key = resolve_client_request_id(
         request.headers.get("X-Client-Request-Id"),
         body.client_request_id,
@@ -297,6 +315,7 @@ async def api_create_subtasks_bulk(
     request: Request,
 ):
     """Atomically create multiple child tasks under ``parent_id``."""
+    _reject_agent_authored_source(request, body.source)
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 

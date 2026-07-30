@@ -124,6 +124,29 @@ def human_only_gate_detail(message: str | None = None) -> dict[str, Any]:
     )
 
 
+def agent_create_forbidden_detail() -> dict[str, Any]:
+    """Agents propose, humans create (#360).
+
+    Task creation used to trust ``source`` from the request body, so an agent
+    could label its own request "human" and land a task straight in ``open`` —
+    or in ``running`` with run_immediately — skipping the draft gate that
+    ``hub_propose_task`` exists to enforce. Source now follows the caller's
+    identity, and asking for anything else is refused rather than quietly
+    downgraded: a silent draft would look like the tool worked.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "agent_create_forbidden",
+            "message": "agents may not create tasks directly; propose them instead",
+            "hint": "Task creation with source=human is human-only. Agents use "
+            "hub_propose_task (or source=agent), which creates a draft for "
+            "human approval.",
+            "required_role": "human",
+            "suggested_tool": "hub_propose_task",
+        }
+    )
+
+
 def self_review_forbidden_detail(agent: str) -> dict[str, Any]:
     """Universal Review Gate (#318): implementer may not review own work."""
     return enrich_error_payload(

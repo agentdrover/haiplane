@@ -1208,9 +1208,23 @@ def _review_tokens() -> dict:
 
 
 async def _task_in_review(
-    client: AsyncClient, title: str, headers: dict, agent: str = "impl-bot"
+    client: AsyncClient,
+    title: str,
+    headers: dict,
+    agent: str = "impl-bot",
+    human_headers: dict | None = None,
 ) -> int:
-    resp = await client.post("/api/tasks", json={"title": title}, headers=headers)
+    # Ready work is created by a human (#360) — an agent token here would get
+    # 403 agent_create_forbidden. These tests are about the review gate, so the
+    # task is born under the human token and everything after it runs as the
+    # agent in ``headers``. Most token maps here name that token "human-token";
+    # _provisioned_reviewer_tokens spells it "human-tok", which is what
+    # ``human_headers`` is for — so do not collapse this back to a default.
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": title},
+        headers=human_headers or {"Authorization": "Bearer human-token"},
+    )
     task_id = resp.json()["id"]
     await client.post(
         f"/api/tasks/{task_id}/updates",
@@ -1390,7 +1404,10 @@ async def test_review_brief_warns_implementer_by_principal_id(
     impl = {"Authorization": "Bearer impl-pid-token"}
 
     resp = await client.post(
-        "/api/tasks", json={"title": "Brief principal warning"}, headers=impl
+        "/api/tasks",
+        json={"title": "Brief principal warning"},
+        # Created by the human (#360); the subject is principal matching.
+        headers={"Authorization": "Bearer human-token"},
     )
     task_id = resp.json()["id"]
     await client.post(
@@ -1448,7 +1465,10 @@ async def test_self_review_blocked_by_principal_despite_name_mismatch(
     impl = {"Authorization": "Bearer impl-pid-token"}
 
     resp = await client.post(
-        "/api/tasks", json={"title": "Principal gate"}, headers=impl
+        "/api/tasks",
+        json={"title": "Principal gate"},
+        # Created by the human (#360); the subject is principal matching.
+        headers={"Authorization": "Bearer human-token"},
     )
     task_id = resp.json()["id"]
     await client.post(
@@ -1498,8 +1518,11 @@ async def test_claim_records_and_release_clears_implementer_principal(
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     impl = {"Authorization": "Bearer impl-pid-token"}
 
+    # Created by the human (#360); the subject is what claiming records.
     resp = await client.post(
-        "/api/tasks", json={"title": "Claim principal"}, headers=impl
+        "/api/tasks",
+        json={"title": "Claim principal"},
+        headers={"Authorization": "Bearer human-token"},
     )
     task_id = resp.json()["id"]
     resp = await client.post(
@@ -1551,7 +1574,12 @@ async def test_provisioned_reviewer_identity_verdict_passes_gate(
     reviewer = {"Authorization": "Bearer reviewer-tok"}
 
     task_id = await _task_in_review(
-        client, "Reviewer identity passes", impl, agent="cursor"
+        client,
+        "Reviewer identity passes",
+        impl,
+        agent="cursor",
+        # This map spells its human token "human-tok" (#360).
+        human_headers={"Authorization": "Bearer human-tok"},
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
@@ -1578,7 +1606,12 @@ async def test_provisioned_implementer_identity_verdict_rejected(
     impl = {"Authorization": "Bearer cursor-tok"}
 
     task_id = await _task_in_review(
-        client, "Implementer verdict blocked", impl, agent="cursor"
+        client,
+        "Implementer verdict blocked",
+        impl,
+        agent="cursor",
+        # This map spells its human token "human-tok" (#360).
+        human_headers={"Authorization": "Bearer human-tok"},
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
@@ -2652,3 +2685,219 @@ async def test_proposal_action_compat_human_still_approves(
 
     assert resp.status_code == 200
     assert resp.json()["status"] != "draft"
+
+
+# ---- Agents propose, humans create (#360) ---------------------------------
+
+
+def _create_gate_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        "agent-token": TokenIdentity("bot", "agent"),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+async def test_agent_cannot_create_ready_task(client: AsyncClient, monkeypatch):
+    # AC-1 (#360): source used to be trusted from the body, so an agent could
+    # call itself human and land a task in open — with run_immediately, straight
+    # into running plus a dispatch. Refused outright, not downgraded to a draft:
+    # a silent draft would look like the call succeeded.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Agent made this", "source": "human", "run_immediately": True},
+        headers=agent,
+    )
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "agent_create_forbidden"
+    assert detail["suggested_tool"] == "hub_propose_task"
+
+    listing = await client.get("/api/tasks", headers=agent)
+    assert all(t["title"] != "Agent made this" for t in listing.json())
+
+
+async def test_agent_default_source_is_also_refused(client: AsyncClient, monkeypatch):
+    # TaskCreate defaults source to human, so omitting the field is the same
+    # request in disguise — the gate must not depend on it being spelled out.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "No source field"}, headers=agent
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "agent_create_forbidden"
+
+
+async def test_agent_may_still_propose_a_draft(client: AsyncClient, monkeypatch):
+    # The gate must not close the path hub_propose_task uses: source=agent is
+    # how an agent legitimately asks for work, and it lands in draft.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Proposed properly", "source": "agent"},
+        headers=agent,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "draft"
+
+
+async def test_human_creation_still_lands_open(client: AsyncClient, monkeypatch):
+    # AC-2 (#360): the human path is untouched — this is the whole point of
+    # gating by identity rather than removing the endpoint.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Human made this"}, headers=human
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"
+
+
+async def test_agent_cannot_create_ready_subtasks(client: AsyncClient, monkeypatch):
+    # AC-3 (#360): the bulk route takes source from the body too, and
+    # hub_create_subtasks lets the caller name it — same hole, same gate.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    parent = await client.post(
+        "/api/tasks", json={"title": "Parent for subtasks"}, headers=human
+    )
+    parent_id = parent.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={"items": [{"title": "Ready child"}], "source": "human"},
+        headers=agent,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "agent_create_forbidden"
+
+    children = await client.get(f"/api/tasks?parent_id={parent_id}", headers=agent)
+    assert children.json() == []
+
+
+async def test_agent_create_refusal_envelope_points_at_a_human(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding (#360): a refusal must not tell the refused caller
+    that it is still the actor.
+
+    enrich_error_payload only forces actor_hint="human" for reasons listed in
+    its special-case tuple. agent_create_forbidden was missing from it, so the
+    403 carried required_role="human" and actor_hint="agent" at the same time —
+    and per the MCP envelope contract actor_hint is what a client reads to
+    decide who acts next. The obvious response to "you are still the actor" is
+    to retry a call that can never succeed.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Envelope check"}, headers=agent
+    )
+
+    detail = resp.json()["detail"]
+    assert detail["actor_hint"] == "human"
+    assert detail["awaiting"] == "none"
+    assert detail["suggested_tool"] == "hub_propose_task"
+    assert "hub_propose_task" in detail["next_action"]
+
+
+async def test_admin_token_may_still_create_ready_work(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding (#360): only the 'human' role was covered.
+
+    is_agent is not simply role == "agent" — it falls back to
+    ``not is_human and principal_id``. Admin passes because is_human covers
+    admin/super_admin, but nothing pinned that, so a future change to either
+    property could lock admins out of task creation silently.
+    """
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"admin-token": TokenIdentity("root", "admin")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = {"Authorization": "Bearer admin-token"}
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "Admin made this"}, headers=admin
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"
+
+
+async def test_agent_may_still_bulk_create_default_source_subtasks(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding left UNRESOLVED in round 1 (its only refuter died).
+
+    BulkChildTasksCreate.source defaults to agent, so the sanctioned shape —
+    hub_create_subtasks with no explicit source — must still succeed. Only the
+    refusal was covered, and a wiring mistake at this call site (a hardcoded
+    source, or an inverted condition that still happens to reject the explicit
+    source=human case) would leave that negative test green while breaking
+    every agent's bulk subtask creation.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    parent = await client.post(
+        "/api/tasks",
+        json={"title": "Parent for default-source children"},
+        headers=human,
+    )
+    parent_id = parent.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={"items": [{"title": "Proposed child"}]},
+        headers=agent,
+    )
+
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert len(created) == 1
+    assert created[0]["status"] == "draft"

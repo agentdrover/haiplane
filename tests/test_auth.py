@@ -294,9 +294,11 @@ async def test_agent_token_cannot_approve(client, monkeypatch):
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
 
+    # source=agent because that is all an agent may create (#360); the subject
+    # here is the approve gate, and any task will do.
     resp = await client.post(
         "/api/tasks",
-        json={"title": "test task"},
+        json={"title": "test task", "source": "agent"},
         headers={"Authorization": "Bearer secret-token"},
     )
     task_id = resp.json()["id"]
