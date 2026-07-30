@@ -986,6 +986,11 @@ async def web_create_task(
     human_reviewer: str = Form(""),
     after_create: str = Form("backlog"),
 ):
+    # Ready work is human-only (#360). This form builds TaskCreate with the
+    # default source=human and honours run_immediately, so without the gate an
+    # agent token created a task straight in running — the same bypass the REST
+    # endpoint was closed against, through a different door.
+    _require_human_web(request)
     user = current_user(request)
     # scope_in arrives as a textarea, one item per line
     scope_in_items: list[str] = [

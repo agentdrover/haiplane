@@ -1453,6 +1453,58 @@ async def test_web_human_only_routes_reject_agent_token(
     assert (await repo_module.get_task(db, pending_id))["status"] == "pending_report"
 
 
+async def test_web_create_form_rejects_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    """#360: the web create form is the third door onto ready work.
+
+    The REST endpoints were gated first; this form was not, and it builds
+    TaskCreate with the default source=human while honouring run_immediately —
+    so an agent token landed a task in `running` with a dispatched job. Found
+    while assembling context for a machine review of the REST-only fix.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/tasks/create",
+        data={"title": "Agent via web form", "run_immediately": "true"},
+        headers=agent,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+    listing = await client.get("/api/tasks", headers=agent)
+    assert all(t["title"] != "Agent via web form" for t in listing.json())
+
+
+async def test_web_create_form_human_token_still_works(
+    client: AsyncClient, monkeypatch
+):
+    # The gate must not close the form for the people it exists for.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+
+    resp = await client.post(
+        "/tasks/create",
+        data={"title": "Human via web form"},
+        headers=human,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    listing = await client.get("/api/tasks", headers=human)
+    made = [t for t in listing.json() if t["title"] == "Human via web form"]
+    assert len(made) == 1
+    assert made[0]["status"] == "open"
+
+
 async def test_web_force_complete_human_token_still_works(
     client: AsyncClient, monkeypatch, db
 ):
