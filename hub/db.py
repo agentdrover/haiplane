@@ -588,6 +588,24 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN validation_status TEXT",
     ),
     ("add_validation_log_column", "ALTER TABLE tasks ADD COLUMN validation_log TEXT"),
+    # ---- Machine-review honest incompleteness (#549). The harness core rule is
+    # that a missing voice never equals a missing defect, but the report schema
+    # carried no way to say so — the skill told authors to write it as prose in
+    # the first finding. Nullable on purpose: rows written before this column
+    # made no completeness claim, and defaulting them to 0 would assert one.
+    (
+        "add_machine_reviews_incomplete_column",
+        "ALTER TABLE machine_reviews ADD COLUMN incomplete INTEGER",
+    ),
+    (
+        "add_machine_reviews_unresolved_column",
+        "ALTER TABLE machine_reviews ADD COLUMN unresolved TEXT NOT NULL DEFAULT '[]'",
+    ),
+    (
+        "add_machine_reviews_lost_dimensions_column",
+        "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
+        "NOT NULL DEFAULT '[]'",
+    ),
 ]
 
 

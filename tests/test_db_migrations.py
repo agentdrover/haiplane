@@ -508,3 +508,48 @@ async def test_status_entered_at_backfilled_for_existing_rows(monkeypatch):
         assert row["ci_no_pr_attempts"] == 0
     finally:
         await conn.close()
+
+
+async def test_machine_review_incompleteness_columns_present():
+    # #549: incomplete is NULLABLE on purpose. A NOT NULL DEFAULT 0 would make
+    # every report written before this column assert a completeness it never
+    # claimed — the same substitution the column exists to prevent.
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "machine_reviews")
+        incomplete = cols.get("incomplete")
+        assert incomplete is not None
+        assert incomplete["notnull"] == 0, "must stay nullable: NULL means 'not stated'"
+        assert incomplete["dflt_value"] is None
+        for name in ("unresolved", "lost_dimensions"):
+            col = cols.get(name)
+            assert col is not None
+            assert col["notnull"] == 1
+            assert col["dflt_value"] == "'[]'"
+    finally:
+        await conn.close()
+
+
+async def test_machine_review_incompleteness_migration_preserves_rows():
+    # AC-4: reports written before the migration keep their findings and read
+    # back as "completeness not stated", not as complete.
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, "
+            "raw_count, findings_confirmed, findings_rejected, submitted_by) "
+            "VALUES (1, 1, 5, '[{\"title\": \"old finding\"}]', '[]', 'pda_claude')"
+        )
+        row = (
+            await conn.execute_fetchall(
+                "SELECT raw_count, findings_confirmed, incomplete, unresolved, "
+                "lost_dimensions FROM machine_reviews"
+            )
+        )[0]
+        assert row["raw_count"] == 5
+        assert "old finding" in row["findings_confirmed"]
+        assert row["incomplete"] is None, "pre-migration rows claim nothing"
+        assert row["unresolved"] == "[]"
+        assert row["lost_dimensions"] == "[]"
+    finally:
+        await conn.close()

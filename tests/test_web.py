@@ -1801,6 +1801,7 @@ async def test_review_panel_shows_machine_review(client: AsyncClient, db):
         f"/api/tasks/{tv.id}/machine-review",
         json={
             "raw_count": 5,
+            "incomplete": False,
             "findings_confirmed": [
                 {"title": "missing test", "severity": "low", "category": "tests"}
             ],
