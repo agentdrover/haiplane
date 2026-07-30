@@ -2541,6 +2541,7 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
     out = await hub_submit_machine_review(
         42,
         raw_count=4,
+        incomplete=False,
         findings_confirmed=[{"title": "x", "severity": "low"}],
         tokens_spent=1000,
         agent="claude-code",

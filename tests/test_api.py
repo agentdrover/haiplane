@@ -2370,6 +2370,8 @@ async def test_machine_review_submit_and_brief(client: AsyncClient, db):
         f"/api/tasks/{task_id}/machine-review",
         json={
             "raw_count": 16,
+            # #549: required, no default — a submission that omits it is a 422.
+            "incomplete": False,
             "agent_count": 36,
             "tokens_spent": 1428876,
             "duration_ms": 716827,
@@ -2416,7 +2418,12 @@ async def test_machine_review_stale_after_resubmit(client: AsyncClient, db):
     task_id = await _reviewable_task(client, db)
     await client.post(
         f"/api/tasks/{task_id}/machine-review",
-        json={"raw_count": 3, "findings_confirmed": [], "findings_rejected": []},
+        json={
+            "raw_count": 3,
+            "incomplete": False,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+        },
     )
     # resubmit bumps generation → report goes stale
     await repo_module.update_task(db, task_id, status="running")
@@ -2434,7 +2441,7 @@ async def test_machine_review_requires_submission(client: AsyncClient, db):
     tv = await services_module.create_task(db, TaskCreate(title="No submission"))
     resp = await client.post(
         f"/api/tasks/{tv.id}/machine-review",
-        json={"raw_count": 1},
+        json={"raw_count": 1, "incomplete": False},
     )
     assert resp.status_code == 400
     assert "submit_for_review" in resp.text
@@ -2479,6 +2486,7 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
         f"/api/tasks/{t1}/machine-review",
         json={
             "raw_count": 10,
+            "incomplete": False,
             "tokens_spent": 1_000_000,
             "duration_ms": 60_000,
             "harness_skill": "multi-agent-review",
@@ -2498,6 +2506,7 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
         f"/api/tasks/{t2}/machine-review",
         json={
             "raw_count": 6,
+            "incomplete": False,
             "harness_skill": "multi-agent-review",
             "harness_version": 2,
             "findings_confirmed": [
@@ -2901,3 +2910,92 @@ async def test_agent_may_still_bulk_create_default_source_subtasks(
     created = resp.json()
     assert len(created) == 1
     assert created[0]["status"] == "draft"
+
+
+# ---- Machine-review honest incompleteness (#549) --------------------------
+
+
+async def test_machine_review_carries_incomplete_and_unresolved(
+    client: AsyncClient, db
+):
+    """AC-1: a run that lost agents says so in fields, not in prose.
+
+    Before this, the harness skill instructed authors to write incompleteness as
+    the first line of findings_confirmed, and a finding nobody could judge went
+    into findings_rejected with a note saying "this is NOT a refutation". Both
+    are readable by a human and invisible to anything automated.
+    """
+    task_id = await _reviewable_task(client, db)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "raw_count": 5,
+            "incomplete": True,
+            "agent_count": 10,
+            "findings_confirmed": [],
+            "findings_rejected": [
+                {"title": "really refuted", "category": "perf", "reason": "traced"}
+            ],
+            "unresolved": [
+                {"title": "no verifier survived", "why": "connection closed"}
+            ],
+            "lost_dimensions": ["safety-resources"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    mr = resp.json()
+    assert mr["incomplete"] is True
+    assert [u["title"] for u in mr["unresolved"]] == ["no verifier survived"]
+    assert mr["unresolved"][0]["why"] == "connection closed"
+    assert mr["lost_dimensions"] == ["safety-resources"]
+    # The whole point: unresolved is not rejected.
+    assert [f["title"] for f in mr["findings_rejected"]] == ["really refuted"]
+
+
+async def test_review_brief_exposes_machine_review_incompleteness(
+    client: AsyncClient, db
+):
+    """AC-2: two runs, both "0 confirmed", must be machine-distinguishable."""
+    clean_id = await _reviewable_task(client, db)
+    await client.post(
+        f"/api/tasks/{clean_id}/machine-review",
+        json={"raw_count": 0, "incomplete": False},
+    )
+    dirty_id = await _reviewable_task(client, db)
+    await client.post(
+        f"/api/tasks/{dirty_id}/machine-review",
+        json={
+            "raw_count": 0,
+            "incomplete": True,
+            "unresolved": [{"title": "unjudged", "why": "agent died"}],
+        },
+    )
+
+    clean = (await client.get(f"/api/tasks/{clean_id}/review-brief")).json()
+    dirty = (await client.get(f"/api/tasks/{dirty_id}/review-brief")).json()
+
+    assert clean["machine_review"]["findings_confirmed"] == []
+    assert dirty["machine_review"]["findings_confirmed"] == []
+    # Identical on findings, opposite on trustworthiness — without reading prose.
+    assert clean["machine_review"]["incomplete"] is False
+    assert dirty["machine_review"]["incomplete"] is True
+    assert len(dirty["machine_review"]["unresolved"]) == 1
+
+
+async def test_machine_review_requires_explicit_incomplete(client: AsyncClient, db):
+    """AC-3: omitting the field is a 422, not a silent False.
+
+    A default would be filled in by every client that forgot it, which is the
+    substitution the field exists to prevent.
+    """
+    task_id = await _reviewable_task(client, db)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={"raw_count": 0, "findings_confirmed": []},
+    )
+
+    assert resp.status_code == 422
+    assert "incomplete" in resp.text
