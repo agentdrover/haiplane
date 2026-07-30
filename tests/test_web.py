@@ -1477,6 +1477,17 @@ async def test_web_create_form_rejects_agent_token(
     )
 
     assert resp.status_code == 403
+    # Round-2 machine-review finding: the refusal must point at the alternative
+    # the agent can actually take. human_only_gate says "retry with a human
+    # token" and offers no tool — a dead end for the only actor that can hit
+    # this. The REST endpoints answer agent_create_forbidden with
+    # hub_propose_task for the identical violation, so this route must too.
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "agent_create_forbidden"
+    assert detail["suggested_tool"] == "hub_propose_task"
+    assert "hub_propose_task" in detail["next_action"]
+    assert detail["actor_hint"] == "human"
+
     listing = await client.get("/api/tasks", headers=agent)
     assert all(t["title"] != "Agent via web form" for t in listing.json())
 

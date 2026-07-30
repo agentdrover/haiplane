@@ -19,7 +19,10 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
-from hub.actionable_errors import human_only_gate_detail
+from hub.actionable_errors import (
+    agent_create_forbidden_detail,
+    human_only_gate_detail,
+)
 from hub.auth import (
     CSRF_COOKIE_NAME,
     current_user,
@@ -990,7 +993,15 @@ async def web_create_task(
     # default source=human and honours run_immediately, so without the gate an
     # agent token created a task straight in running — the same bypass the REST
     # endpoint was closed against, through a different door.
-    _require_human_web(request)
+    #
+    # Deliberately NOT _require_human_web: that helper answers human_only_gate,
+    # whose remediation is "retry with a human token" — something an agent
+    # cannot do. Creation is the one refusal with an agent-reachable
+    # alternative, so it must point at hub_propose_task exactly as the REST
+    # endpoints do. The other web routes keep human_only_gate, because for
+    # approve/reject/decide "a human must do this" really is the whole answer.
+    if current_identity(request).is_agent:
+        raise HTTPException(403, detail=agent_create_forbidden_detail())
     user = current_user(request)
     # scope_in arrives as a textarea, one item per line
     scope_in_items: list[str] = [
