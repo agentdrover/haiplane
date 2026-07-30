@@ -2862,3 +2862,41 @@ async def test_admin_token_may_still_create_ready_work(
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "open"
+
+
+async def test_agent_may_still_bulk_create_default_source_subtasks(
+    client: AsyncClient, monkeypatch
+):
+    """Machine-review finding left UNRESOLVED in round 1 (its only refuter died).
+
+    BulkChildTasksCreate.source defaults to agent, so the sanctioned shape —
+    hub_create_subtasks with no explicit source — must still succeed. Only the
+    refusal was covered, and a wiring mistake at this call site (a hardcoded
+    source, or an inverted condition that still happens to reject the explicit
+    source=human case) would leave that negative test green while breaking
+    every agent's bulk subtask creation.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _create_gate_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+    human = {"Authorization": "Bearer human-token"}
+
+    parent = await client.post(
+        "/api/tasks",
+        json={"title": "Parent for default-source children"},
+        headers=human,
+    )
+    parent_id = parent.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{parent_id}/subtasks",
+        json={"items": [{"title": "Proposed child"}]},
+        headers=agent,
+    )
+
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert len(created) == 1
+    assert created[0]["status"] == "draft"
