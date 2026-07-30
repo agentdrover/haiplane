@@ -187,12 +187,16 @@ class NoopGitOps:
     async def checkout(self, branch: str, repo: str | None = None) -> bool:
         return False
 
+    async def dirty_paths(self, repo: str | None = None) -> list[str]:
+        return []
+
     async def auto_commit(
         self,
         task_id: int,
         title: str = "",
         message: str | None = None,
         repo: str | None = None,
+        expected_branch: str | None = None,
     ) -> bool:
         return False
 

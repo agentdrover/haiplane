@@ -13,6 +13,8 @@ import pytest
 from hub.integrations.git_ops import (
     GitOpsIntegration,
     PairBranchConflictError,
+    WorkspaceBranchMismatchError,
+    WorkspaceNotReadyError,
     _worktree_path,
 )
 
@@ -908,3 +910,219 @@ async def test_worktree_remove_unregistered_is_idempotent(tmp_path, git_ops):
     repo = tmp_path / "main"
     _git_setup(repo)
     assert await git_ops.pair_remove_worktree(99, repo=str(repo)) is True
+
+
+# --- Shared-workspace safety on the headless path (#361) -------------------
+#
+# These run against a real git repository on purpose. The defects they cover
+# are destructive filesystem behaviour, and a mocked _git would have let the
+# original code "pass" while still deleting a person's work.
+
+
+def _run_git(*args: str, cwd) -> None:
+    import subprocess
+
+    subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+
+def _seed_repo(tmp_path):
+    repo = tmp_path / "shared-workspace"
+    repo.mkdir()
+    _run_git("git", "init", "-b", "main", cwd=repo)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "t", cwd=repo)
+    (repo / "app.py").write_text("original\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "init", cwd=repo)
+    return repo
+
+
+async def test_create_branch_refuses_dirty_workspace_instead_of_cleaning(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    # #361 I2. Reproduced before the fix: the tracked edit was reverted to
+    # 'original' and the untracked file was deleted outright, because
+    # create_branch ran `checkout .` + `clean -fd` on a dirty tree.
+    repo = _seed_repo(tmp_path)
+    (repo / "app.py").write_text("a person is editing this\n")
+    (repo / "notes.txt").write_text("draft, not staged yet\n")
+
+    # Refusal must RAISE, not return "": an empty string also means "no git
+    # integration configured", and collapsing the two turned an unconfigured
+    # hub into a blocked one (caught by test_start_task_dispatch_failure_*).
+    with pytest.raises(WorkspaceNotReadyError):
+        await git_ops.create_branch(1, "headless task", repo=str(repo))
+
+    assert (repo / "app.py").read_text() == "a person is editing this\n"
+    assert (repo / "notes.txt").exists()
+
+
+async def test_create_branch_still_works_on_clean_workspace(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    # The refusal must not cost the normal headless flow.
+    repo = _seed_repo(tmp_path)
+
+    branch = await git_ops.create_branch(7, "normal task", repo=str(repo))
+
+    assert branch == "task-7/normal-task"
+    import subprocess
+
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert current == branch
+
+
+async def test_auto_commit_refuses_when_checkout_left_a_foreign_branch(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    # #361 I1, second half. The done-pipeline checks out the task branch and
+    # never inspects the result; a failed checkout used to leave the commit
+    # landing on whatever branch was still current.
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-b", "someone-elses-branch", cwd=repo)
+    (repo / "task_file.py").write_text("task work\n")
+
+    # Raises rather than returning False, which auto_commit also returns for
+    # the innocent "nothing to commit" — the collapse made the guard inert.
+    with pytest.raises(WorkspaceBranchMismatchError):
+        await git_ops.auto_commit(
+            2, title="work", repo=str(repo), expected_branch="task-2/work"
+        )
+
+    import subprocess
+
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert log.count("\n") == 1, "no commit may land on the foreign branch"
+
+
+async def test_auto_commit_commits_on_the_expected_branch(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-b", "task-3/work", cwd=repo)
+    (repo / "task_file.py").write_text("task work\n")
+
+    committed = await git_ops.auto_commit(
+        3, title="work", repo=str(repo), expected_branch="task-3/work"
+    )
+
+    assert committed is True
+    import subprocess
+
+    files = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert files == ["task_file.py"]
+
+
+async def test_pair_prepare_branch_refuses_when_head_is_not_on_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """The honest version of a test that used to assert the opposite.
+
+    test_pair_prepare_branch_raises_when_not_on_base_after_checkout is named for
+    this guard but simulates BEING on base and asserts the happy path. Deleting
+    the guard left every test green — found by mutating the pair path before
+    copying it to the headless one.
+    """
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            # checkout reports success but HEAD is somewhere else entirely
+            return 0, "some-other-branch", ""
+        if cmd[:2] == ("rev-parse", "--verify"):
+            return 1, "", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/tmp/repo"),
+    ):
+        with pytest.raises(PairBranchConflictError, match="Expected base branch"):
+            await git_ops.pair_prepare_branch(11, "Wrong branch", branch_slug="slug")
+
+
+async def test_create_branch_refuses_when_head_is_not_on_base(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """The headless twin of the guard whose pair-mode version had no test.
+
+    On a real repository a successful `git checkout base` always leaves HEAD on
+    base, so this divergence is only reachable through a mock — which is
+    precisely why the pair-mode guard went untested and why mutating it changed
+    nothing. Caught here by mutating my own guard right after writing it.
+    """
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("checkout", "main"):
+            return 0, "", ""  # reports success...
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "somewhere-else", ""  # ...but HEAD is elsewhere
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        with pytest.raises(WorkspaceNotReadyError):
+            await git_ops.create_branch(42, "task", repo="/tmp/repo")
+
+
+# --- #361 AC-1: commit-scope gate ---
+
+
+def test_parse_porcelain_handles_renames_and_quotes() -> None:
+    from hub.commit_scope import parse_porcelain_paths
+
+    out = parse_porcelain_paths(
+        '?? notes.txt\n M hub/app.py\nR  old/a.py -> new/b.py\n M "has space.py"\n'
+    )
+    assert out == ["notes.txt", "hub/app.py", "old/a.py", "new/b.py", "has space.py"]
+
+
+def test_foreign_paths_flags_only_what_is_outside_declared_areas() -> None:
+    from hub.commit_scope import foreign_paths
+
+    areas = ["hub/integrations/git_ops.py", "tests"]
+    dirty = ["hub/integrations/git_ops.py", "tests/test_git_ops.py", "notes.txt"]
+
+    assert foreign_paths(dirty, areas) == ["notes.txt"]
+
+
+def test_foreign_paths_reports_nothing_when_no_areas_declared() -> None:
+    """Absence of a declared scope is "cannot check", not "checked and clean".
+
+    The caller must say so out loud; this function only reports what it can
+    actually compare.
+    """
+    from hub.commit_scope import foreign_paths
+
+    assert foreign_paths(["anything.py"], []) == []
+
+
+def test_foreign_paths_does_not_match_a_partial_directory_name() -> None:
+    from hub.commit_scope import foreign_paths
+
+    # "hub" must not swallow "hubris/"; prefix matching without the separator
+    # would let a foreign file pass as in-scope.
+    assert foreign_paths(["hubris/x.py"], ["hub"]) == ["hubris/x.py"]
+
+
+async def test_dirty_paths_reads_the_real_worktree(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    repo = _seed_repo(tmp_path)
+    (repo / "app.py").write_text("edited\n")
+    (repo / "brand_new.txt").write_text("new\n")
+
+    paths = await git_ops.dirty_paths(repo=str(repo))
+
+    assert sorted(paths) == ["app.py", "brand_new.txt"]
