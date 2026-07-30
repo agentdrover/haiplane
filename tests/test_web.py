@@ -824,7 +824,12 @@ async def test_web_solo_verdict_marked_and_badge_rendered(
     monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "allow")
     agent = {"Authorization": "Bearer agent-token"}
 
-    resp = await client.post("/api/tasks", json={"title": "Solo web"}, headers=agent)
+    # Created by the human (#360): an agent token cannot make ready work.
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Solo web"},
+        headers={"Authorization": "Bearer human-token"},
+    )
     task_id = resp.json()["id"]
     await client.post(
         f"/api/tasks/{task_id}/updates",
@@ -862,6 +867,70 @@ async def test_web_solo_verdict_marked_and_badge_rendered(
     page = await client.get(f"/tasks/{task_id}", headers=agent)
     assert page.status_code == 200
     assert "badge-self-approved" in page.text
+
+
+async def test_web_review_verdict_rejects_self_review(client: AsyncClient, monkeypatch):
+    """#358 T6: the implementer cannot pass a verdict on their own work through
+    the web panel.
+
+    The protection already lives in the shared service, but until now it was
+    asserted only through REST and MCP — self_review_forbidden appeared nowhere
+    in this file. The two neighbours below cover the other branches: the solo
+    opt-out (REVIEW_SELF_APPROVE=allow) and an independent reviewer.
+
+    Verified by mutation: drop the raise from ensure_reviewer_independence and
+    keep its self_approved return, and only this test fails — both neighbours
+    stay green. So the refusal on the web route was genuinely unguarded, not
+    merely covered somewhere less obvious.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    # The default, spelled out: this test is about the forbidding branch, and
+    # a neighbour flipping the global would silently turn it into a no-op.
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    agent = {"Authorization": "Bearer agent-token"}
+
+    # Created by the human (#360): an agent token cannot make ready work.
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "Self review web"},
+        headers={"Authorization": "Bearer human-token"},
+    )
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "bot", "kind": "status", "content": "Plan: work"},
+        headers=agent,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={}, headers=agent
+    )
+    assert resp.json()["status"] == "review"
+
+    # The implementer approves their own work through the web panel.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "looks good to me"},
+        headers=agent,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "self_review_forbidden"
+
+    # No verdict recorded, and the task is still waiting for a real reviewer.
+    body = (await client.get(f"/api/tasks/{task_id}", headers=agent)).json()
+    assert body["latest_review"] is None
+    assert body["review_approved_current"] is False
+    assert body["status"] == "review"
 
 
 async def test_web_independent_verdict_has_no_solo_badge(client: AsyncClient):
@@ -1382,6 +1451,69 @@ async def test_web_human_only_routes_reject_agent_token(
     assert (await repo_module.get_task(db, draft_id))["status"] == "draft"
     assert (await repo_module.get_task(db, open_id))["status"] == "open"
     assert (await repo_module.get_task(db, pending_id))["status"] == "pending_report"
+
+
+async def test_web_create_form_rejects_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    """#360: the web create form is the third door onto ready work.
+
+    The REST endpoints were gated first; this form was not, and it builds
+    TaskCreate with the default source=human while honouring run_immediately —
+    so an agent token landed a task in `running` with a dispatched job. Found
+    while assembling context for a machine review of the REST-only fix.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = {"Authorization": "Bearer agent-token"}
+
+    resp = await client.post(
+        "/tasks/create",
+        data={"title": "Agent via web form", "run_immediately": "true"},
+        headers=agent,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+    # Round-2 machine-review finding: the refusal must point at the alternative
+    # the agent can actually take. human_only_gate says "retry with a human
+    # token" and offers no tool — a dead end for the only actor that can hit
+    # this. The REST endpoints answer agent_create_forbidden with
+    # hub_propose_task for the identical violation, so this route must too.
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "agent_create_forbidden"
+    assert detail["suggested_tool"] == "hub_propose_task"
+    assert "hub_propose_task" in detail["next_action"]
+    assert detail["actor_hint"] == "human"
+
+    listing = await client.get("/api/tasks", headers=agent)
+    assert all(t["title"] != "Agent via web form" for t in listing.json())
+
+
+async def test_web_create_form_human_token_still_works(
+    client: AsyncClient, monkeypatch
+):
+    # The gate must not close the form for the people it exists for.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+
+    resp = await client.post(
+        "/tasks/create",
+        data={"title": "Human via web form"},
+        headers=human,
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    listing = await client.get("/api/tasks", headers=human)
+    made = [t for t in listing.json() if t["title"] == "Human via web form"]
+    assert len(made) == 1
+    assert made[0]["status"] == "open"
 
 
 async def test_web_force_complete_human_token_still_works(

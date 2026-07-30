@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Literal
 
 from hub.hub_instance import with_instance_echo
+
+log = logging.getLogger("hub")
 
 Awaiting = Literal["none", "human_decision", "ci", "review"]
 ActorHint = Literal["agent", "human", "ci", "none"]
@@ -69,6 +72,8 @@ def compute_next_action(
         return "Retry with a human or admin token, or use suggested_tool if provided."
     if reason == "human_only_gate":
         return "Retry with a human or admin Bearer token."
+    if reason == "agent_create_forbidden":
+        return "Propose the work with hub_propose_task and let a human approve it."
     if reason == "self_review_forbidden":
         return (
             "Hand the verdict to an independent reviewer: another agent "
@@ -175,10 +180,43 @@ def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
         status=status,
         reason=reason,
     )
-    if reason in ("permission_denied", "human_only_gate", "forbidden"):
-        envelope["actor_hint"] = "human"
+    # The call changed nothing, so it never reports a transition.
+    envelope["transition"] = None
+    # ``awaiting`` is NOT forced: it describes the task's gate, not this call.
+    # human_decision_required legitimately awaits a human decision, and
+    # awaiting_ci_conveyor awaits CI — an existing test caught this when the
+    # first version of #548 zeroed it for every refusal. Force it only when the
+    # payload carries no status at all, where nothing can be computed from it.
+    if status == "?":
         envelope["awaiting"] = "none"
-        envelope["transition"] = None
+
+    # Who acts next is DECLARED by the refusal itself, not guessed from a status
+    # that refusals do not carry (#548). The old shape was a tuple of reasons to
+    # force "human", and anything absent fell through compute_actor_hint to
+    # "agent" — telling the caller we had just refused that it was still the
+    # responsible actor. That silent default shipped the same defect twice:
+    # agent_create_forbidden (#360) and then self_review_forbidden and
+    # withdraw_agent_only (#548). A default that is wrong only by omission gets
+    # forgotten again, so omission is now loud.
+    declared = payload.get("actor_hint")
+    if declared is None:
+        # Second choice, not a fallthrough: required_role is a field the refusal
+        # actually carries, so deriving from it states something the payload
+        # already asserts. compute_actor_hint's default is the opposite — it
+        # guesses from a status refusals never set, and always lands on "agent".
+        role = payload.get("required_role")
+        if role in ("human", "agent"):
+            declared = role
+    if declared is not None:
+        envelope["actor_hint"] = declared
+    else:
+        log.warning(
+            "refusal reason %r declares neither actor_hint nor a usable "
+            "required_role; falling back to %r. Declare it in the *_detail "
+            "helper — see hub/actionable_errors.py.",
+            reason,
+            envelope.get("actor_hint"),
+        )
     merged = with_instance_echo({**payload, **envelope})
     if "message" not in merged:
         merged["message"] = payload.get("hint") or payload.get("message") or ""
