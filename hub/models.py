@@ -972,6 +972,18 @@ class MachineRejectedFinding(BaseModel):
     reason: str = Field("", max_length=2000)
 
 
+class MachineUnresolvedFinding(BaseModel):
+    """A finding no verifier managed to judge (#549).
+
+    Deliberately NOT a rejected finding: "nobody voted" and "someone refuted
+    it" are opposite outcomes, and collapsing them is how a run with dead
+    agents reads as clean. ``why`` records what stopped the verification.
+    """
+
+    title: str = Field(..., min_length=1, max_length=300)
+    why: str = Field("", max_length=2000)
+
+
 class MachineReviewSubmit(BaseModel):
     """Structured multi-agent review report (#381).
 
@@ -993,6 +1005,15 @@ class MachineReviewSubmit(BaseModel):
     findings_rejected: list[MachineRejectedFinding] = Field(
         default_factory=list, max_length=200
     )
+    # Required with NO default (#549). A default of false would be filled in
+    # silently by every client that forgot the field, which reproduces exactly
+    # the substitution this field exists to prevent: a run that lost agents
+    # reading as a clean one. Forgetting must fail loudly at the schema.
+    incomplete: bool
+    unresolved: list[MachineUnresolvedFinding] = Field(
+        default_factory=list, max_length=200
+    )
+    lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
 
 
@@ -1011,6 +1032,12 @@ class MachineReviewView(BaseModel):
     raw_count: int = 0
     findings_confirmed: list[MachineFinding] = Field(default_factory=list)
     findings_rejected: list[MachineRejectedFinding] = Field(default_factory=list)
+    # None means "never stated", not "complete" — reports written before this
+    # field existed made no such claim, and back-filling false would put words
+    # in their mouth (#549).
+    incomplete: bool | None = None
+    unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
+    lost_dimensions: list[str] = Field(default_factory=list)
     submitted_by: str = ""
     created_at: str = ""
 
@@ -1019,7 +1046,13 @@ class MachineReviewView(BaseModel):
     def _mr_iso_ts(cls, v: str | None) -> str | None:
         return to_iso_utc(v)
 
-    @field_validator("findings_confirmed", "findings_rejected", mode="before")
+    @field_validator(
+        "findings_confirmed",
+        "findings_rejected",
+        "unresolved",
+        "lost_dimensions",
+        mode="before",
+    )
     @classmethod
     def _mr_findings_json(cls, v: Any) -> Any:
         if isinstance(v, str):

@@ -412,6 +412,33 @@
                     {% if not machine_review.is_current %}
                     <span class="badge badge-failed">stale — работа пересдана</span>
                     {% endif %}
+                    {# #549: «0 подтверждённых» значит что-то только рядом с полнотой
+                       прогона. Агенты и unresolved показаны здесь же, чтобы
+                       расхождение было видно глазом, а не выводилось из тишины. #}
+                    {% if machine_review.incomplete %}
+                    <span class="badge badge-failed">прогон неполный</span>
+                    {% elif machine_review.incomplete is none %}
+                    <span class="badge badge-self-approved">полнота не заявлена</span>
+                    {% endif %}
+                    {% if machine_review.agent_count %}
+                    <span class="badge badge--xs">{{ machine_review.agent_count }} агентов</span>
+                    {% endif %}
+                    {% if machine_review.unresolved %}
+                    <span class="badge badge-failed">{{ machine_review.unresolved|length }} не проверено</span>
+                    {% endif %}
+                    {% if machine_review.lost_dimensions %}
+                    <span class="badge badge-failed">потеряно измерений: {{ machine_review.lost_dimensions|join(', ') }}</span>
+                    {% endif %}
+                    {% if machine_review.unresolved %}
+                    <details>
+                        <summary class="project-edit-summary">unresolved — НЕ опровергнуты, никто не смог судить</summary>
+                        <ul class="task-review-findings">
+                            {% for f in machine_review.unresolved %}
+                            <li>{{ f.title }}{% if f.why %} — {{ f.why }}{% endif %}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
                     {% if machine_review.findings_confirmed %}
                     <details>
                         <summary class="project-edit-summary">confirmed findings</summary>

@@ -23,11 +23,19 @@ OPENCLAW_MACHINE_REVIEW=require блокирует человеческий ве
    («default to refuted»), подтверждение только единогласное.
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
-4. `hub_submit_machine_review(task_id, raw_count, findings_confirmed,
-   findings_rejected, harness_skill, harness_version, agent_count,
-   tokens_spent, duration_ms, orchestrator, model)` — метрики опциональны,
-   но токены/время питают экономику практики (#384). Отчёт привязывается к
-   текущему submission_generation: пересдача работы делает его stale.
+4. `hub_submit_machine_review(task_id, raw_count, incomplete,
+   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
+   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
+   orchestrator, model)`. Метрики опциональны, но токены/время питают экономику
+   практики (#384). Отчёт привязывается к текущему submission_generation:
+   пересдача работы делает его stale.
+
+   `incomplete` **обязателен и без дефолта** (#549): пропуск даёт 422. Дефолт
+   `false` подставлялся бы молча у всех, кто поле забыл, — то есть прогон с
+   умершими агентами читался бы как чистый. `unresolved` — находки, которые
+   никто не смог рассудить; они НЕ идут в `findings_rejected`, потому что
+   «никто не голосовал» и «кто-то опроверг» — противоположные исходы.
+   `lost_dimensions` — измерения, не вернувшие результат.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 

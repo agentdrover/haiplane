@@ -1745,8 +1745,11 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
 async def hub_submit_machine_review(
     task_id: int,
     raw_count: int,
+    incomplete: bool,
     findings_confirmed: list[dict[str, Any]] | None = None,
     findings_rejected: list[dict[str, Any]] | None = None,
+    unresolved: list[dict[str, Any]] | None = None,
+    lost_dimensions: list[str] | None = None,
     harness_skill: str = "multi-agent-review",
     harness_version: int | None = None,
     agent_count: int | None = None,
@@ -1763,11 +1766,23 @@ async def hub_submit_machine_review(
     are optional but strongly encouraged: tokens_spent/duration_ms feed
     the practice economics.
 
+    Honest incompleteness (#549) is not optional: ``incomplete`` is REQUIRED
+    and has no default. A missing voice never equals a missing defect, so
+    "0 confirmed" only means anything next to ``incomplete=False``. A finding
+    nobody managed to judge belongs in ``unresolved``, NOT in
+    ``findings_rejected`` — "nobody voted" and "someone refuted it" are
+    opposite outcomes.
+
     Args:
         task_id: Reviewed task.
         raw_count: Findings before adversarial verification.
+        incomplete: True when any agent died, any dimension was lost, context
+            was truncated, or a budget ran out. No default on purpose: a
+            silently-defaulted False is how a run with dead agents reads clean.
         findings_confirmed: [{title, severity, category?, file?, line?, detail?}]
-        findings_rejected: [{title, category?, reason?}]
+        findings_rejected: [{title, category?, reason?}] — actually refuted.
+        unresolved: [{title, why}] — nobody could judge these. Never rejected.
+        lost_dimensions: names of dimensions that returned nothing.
         harness_skill: Skill name used (hub_get_skill source).
         harness_version: Skill version executed.
         agent_count: Total subagents in the run.
@@ -1781,6 +1796,9 @@ async def hub_submit_machine_review(
         "raw_count": raw_count,
         "findings_confirmed": findings_confirmed or [],
         "findings_rejected": findings_rejected or [],
+        "incomplete": incomplete,
+        "unresolved": unresolved or [],
+        "lost_dimensions": lost_dimensions or [],
         "harness_skill": harness_skill,
         "orchestrator": orchestrator,
         "model": model,

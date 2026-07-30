@@ -996,6 +996,12 @@ async def api_submit_machine_review(
             ensure_ascii=False,
         ),
         submitted_by=(body.agent or identity.username)[:100],
+        incomplete=body.incomplete,
+        unresolved=_json.dumps(
+            [f.model_dump(exclude_none=True) for f in body.unresolved],
+            ensure_ascii=False,
+        ),
+        lost_dimensions=_json.dumps(body.lost_dimensions, ensure_ascii=False),
     )
     await repo.insert_event(
         db,
