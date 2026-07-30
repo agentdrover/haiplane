@@ -8,9 +8,13 @@ from typing import Any
 
 import aiosqlite
 
-from hub import config
+from hub import commit_scope, config
 from hub import repository as repo
-from hub.db import get_breadcrumb, log_activity
+from hub.db import deserialize_str_list, get_breadcrumb, log_activity
+from hub.integrations.git_ops import (
+    WorkspaceBranchMismatchError,
+    WorkspaceNotReadyError,
+)
 from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
@@ -246,13 +250,64 @@ async def dispatch_task(
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     branch = task.get("branch") or ""
+    prepared = True
+    refusal = ""
     if not branch:
-        branch = await plugins.git_ops.create_branch(task_id, task["title"], **local_kw)
+        # An empty return means "no branch created" — the ordinary state of a
+        # hub without git integration. A REFUSAL raises, so an unconfigured hub
+        # keeps dispatching while a dirty workspace stops the task (#361).
+        try:
+            branch = await plugins.git_ops.create_branch(
+                task_id, task["title"], **local_kw
+            )
+        except WorkspaceNotReadyError as exc:
+            prepared, refusal = False, str(exc)
         if branch:
             await repo.update_task(db, task_id, branch=branch)
             await db.commit()
     else:
-        await plugins.git_ops.checkout(branch, repo=local_kw.get("repo"))
+        # A redispatched task skips create_branch entirely, so its dirty-tree
+        # refusal never runs for this path — the checkout result is the only
+        # signal there is, and it used to be discarded too (#361).
+        # A branch is only ever recorded by a working git integration, so an
+        # unconfigured hub cannot reach this line with one; if it somehow does,
+        # False means "cannot read the workspace" and escalating is exactly what
+        # invariant 4 of docs/workspace-safety-policy.md asks for.
+        prepared = await plugins.git_ops.checkout(branch, repo=local_kw.get("repo"))
+
+    if not prepared:
+        # Dispatching now would put the agent on whatever tree is current, with
+        # no branch of its own: its work would land in someone else's checkout,
+        # and — because the task row carries no branch — the done-pipeline's
+        # "and branch" gate would skip its git tail entirely, leaving that work
+        # uncommitted for the next task's `git add -A` to sweep up (#361).
+        error = (
+            f"git workspace not ready for #{task_id}: "
+            + (refusal or f"could not check out {branch!r}")
+            + ". Dispatch refused."
+        )
+        await repo.update_task(
+            db, task_id, status="needs_decision", job_id=None, result_text=error
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "blocker",
+            f"{error} Обычная причина — незакоммиченные изменения в общем "
+            f"рабочем каталоге. Закоммитьте или спрячьте их и решите через "
+            f"hub_decide_task.",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "dispatch_workspace_not_ready", "branch": branch},
+        )
+        await db.commit()
+        log.error("Task #%d → needs_decision: %s", task_id, error)
+        return {"error": error}
 
     updates_rows = await repo.get_task_updates(db, task_id)
     updates = [dict(r) for r in updates_rows] if updates_rows else None
@@ -581,10 +636,160 @@ async def transition_after_agent_done(
             wt = plugins.git_ops.worktree_path(task_id, workspace)
             if wt and os.path.isdir(wt):
                 git_repo = wt
-        await plugins.git_ops.checkout(branch, repo=git_repo)
-        await plugins.git_ops.auto_commit(
-            task_id, title=task.get("title", ""), repo=git_repo
-        )
+        # #361 I1: the result of this checkout was never inspected, and the
+        # comment above already names the consequence — squash_branch resetting
+        # the wrong branch. checkout() has always returned a bool; nobody read
+        # it. Every step below rewrites history or pushes, so a failed checkout
+        # must stop the tail rather than run it against whatever branch is
+        # current. Silence here is what docs/workspace-safety-policy.md
+        # invariant 4 forbids.
+        if not await plugins.git_ops.checkout(branch, repo=git_repo):
+            await repo.update_task(
+                db,
+                task_id,
+                status="needs_decision",
+                exit_code=exit_code,
+                result_text=result_text,
+            )
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "blocker",
+                f"Не удалось перейти на ветку {branch!r} в {git_repo} — "
+                "git-хвост done-конвейера (commit, squash, push, PR) не "
+                "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
+                "рабочего каталога и решите через hub_decide_task.",
+            )
+            await repo.insert_event(
+                db,
+                kind="needs_decision",
+                task_id=task_id,
+                actor="hub",
+                payload={"reason": "done_checkout_failed", "branch": branch},
+            )
+            log.error(
+                "Task #%d → needs_decision: cannot check out %r in %s",
+                task_id,
+                branch,
+                git_repo,
+            )
+            return "needs_decision"
+        # Commit-scope gate (#361 AC-1). auto_commit stages the whole tree, and
+        # the tree was only proven clean at branch creation — a headless task
+        # then shares the main clone for its entire run, so an edit made by
+        # anyone else in that window is dirty here and looks exactly like the
+        # task's own work. affected_areas is the only attribution the hub has.
+        # It is a weak one (an agent may legitimately touch more than the task
+        # predicted), which is why 'require' escalates to a human rather than
+        # dropping files, and why the default is 'warn'.
+        scope_mode = (config.COMMIT_SCOPE_GATE or "warn").strip().lower()
+        if scope_mode != "off":
+            areas = deserialize_str_list(task.get("affected_areas"))
+            dirty = await plugins.git_ops.dirty_paths(repo=git_repo)
+            if not areas:
+                # No declared scope means the check could not run. Say so —
+                # silence here would read as "checked and clean" (#537).
+                if dirty:
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "status",
+                        "Проверка области коммита не выполнялась: у задачи не "
+                        f"объявлены affected_areas. В коммит уйдут {len(dirty)} "
+                        "файлов без сверки с областью задачи.",
+                    )
+            else:
+                foreign = commit_scope.foreign_paths(dirty, areas)
+                if foreign and scope_mode == "require":
+                    listed = ", ".join(foreign[:10])
+                    error = (
+                        f"В рабочем каталоге {git_repo} есть изменения вне "
+                        f"объявленной области задачи #{task_id}: {listed}. "
+                        "git-хвост остановлен, чтобы чужая работа не ушла в PR "
+                        "задачи."
+                    )
+                    await repo.update_task(
+                        db,
+                        task_id,
+                        status="needs_decision",
+                        exit_code=exit_code,
+                        result_text=error,
+                    )
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "blocker",
+                        f"{error} Объявленная область: {', '.join(areas)}. "
+                        "Решите через hub_decide_task: расширить область, "
+                        "убрать чужие правки или закоммитить как есть.",
+                    )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task_id,
+                        actor="hub",
+                        payload={
+                            "reason": "commit_scope_violation",
+                            "branch": branch,
+                            "foreign": foreign[:20],
+                        },
+                    )
+                    log.error(
+                        "Task #%d → needs_decision: %d file(s) outside scope",
+                        task_id,
+                        len(foreign),
+                    )
+                    return "needs_decision"
+                if foreign:
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "status",
+                        f"В коммит задачи уходят {len(foreign)} файлов вне "
+                        f"объявленной области: {', '.join(foreign[:10])}. "
+                        "Режим проверки — warn, коммит выполнен. Включите "
+                        "OPENCLAW_COMMIT_SCOPE=require, чтобы останавливать.",
+                    )
+        # expected_branch is defence in depth: the checkout above may report
+        # success while HEAD ends up elsewhere. Its refusal RAISES rather than
+        # returning False, because False also means "nothing to commit" and
+        # collapsing the two left the guard inert — squash and push ran anyway.
+        try:
+            await plugins.git_ops.auto_commit(
+                task_id,
+                title=task.get("title", ""),
+                repo=git_repo,
+                expected_branch=branch,
+            )
+        except WorkspaceBranchMismatchError as exc:
+            await repo.update_task(
+                db,
+                task_id,
+                status="needs_decision",
+                exit_code=exit_code,
+                result_text=str(exc),
+            )
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "blocker",
+                f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
+                f"переписать историю чужой ветки. Решите через hub_decide_task.",
+            )
+            await repo.insert_event(
+                db,
+                kind="needs_decision",
+                task_id=task_id,
+                actor="hub",
+                payload={"reason": "done_branch_mismatch", "branch": branch},
+            )
+            log.error("Task #%d → needs_decision: %s", task_id, exc)
+            return "needs_decision"
         squashed = await plugins.git_ops.squash_branch(
             task_id,
             task.get("title", ""),

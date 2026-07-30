@@ -7,6 +7,8 @@ import aiosqlite
 import pytest
 from fastapi import HTTPException
 
+from hub import config
+from hub.models import TaskRefine
 from hub import repository as repo
 from hub import services
 from hub.models import (
@@ -357,6 +359,48 @@ async def test_start_task_dispatch_failure_keeps_task_recoverable(
     assert any(
         "dispatch plugin not configured" in update.content for update in started.updates
     )
+
+
+async def test_start_task_escalates_when_git_refuses_the_workspace(
+    db: aiosqlite.Connection,
+):
+    """#361: a refused workspace must stop dispatch, not be dispatched anyway.
+
+    The mutation that removes the guard survives every other test in the suite:
+    the refusal path and the dispatch path only meet here.
+    """
+    from hub.integrations.git_ops import WorkspaceNotReadyError
+    from hub.integrations.noop import NoopDispatch, NoopGitOps
+    from hub.integrations.registry import plugins
+
+    submitted: list[str] = []
+
+    class RefusingGitOps(NoopGitOps):
+        async def create_branch(self, task_id, title, repo=None, base_branch=None):
+            raise WorkspaceNotReadyError("dirty workspace: app.py")
+
+    class RecordingDispatch(NoopDispatch):
+        def is_available(self) -> bool:
+            return True
+
+        async def submit_task(self, *args, **kwargs):
+            submitted.append("called")
+            return {"job_id": "j1"}
+
+    plugins.dispatch = RecordingDispatch()
+    plugins.git_ops = RefusingGitOps()
+
+    tv = await services.create_task(db, TaskCreate(title="Headless work"))
+    await repo.add_task_update(db, tv.id, "human", "status", "Plan: do the work")
+    await db.commit()
+
+    started = await services.start_task(db, tv.id)
+
+    assert not submitted, "dispatch must not run on a workspace git refused"
+    assert started.status.value == "needs_decision"
+    assert any(
+        "dirty workspace: app.py" in update.content for update in started.updates
+    ), "the human deciding must see why the workspace was refused"
 
 
 async def test_ask_question(db: aiosqlite.Connection):
@@ -4175,6 +4219,7 @@ def _mock_git_ops(plugins, wt):
 
     plugins.git_ops.worktree_path = MagicMock(return_value=wt)
     plugins.git_ops.checkout = AsyncMock(return_value=True)
+    plugins.git_ops.dirty_paths = AsyncMock(return_value=[])
     plugins.git_ops.auto_commit = AsyncMock(return_value=True)
     plugins.git_ops.squash_branch = AsyncMock(return_value=True)
     plugins.git_ops.push_branch = AsyncMock(return_value=True)
@@ -4520,3 +4565,136 @@ async def test_validation_gate_require_allows_completion_without_commands(
         db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="done")
     )
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
+async def test_commit_scope_gate_escalates_on_foreign_files(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#361 AC-1: files outside the task's declared scope must not be committed.
+
+    create_branch's dirty-refusal only proves the tree was clean at t=0, and a
+    headless task then shares the main clone for its whole run. affected_areas
+    is the only attribution the hub has, so 'require' hands the call to a human
+    rather than dropping files or committing them silently.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setattr(config, "COMMIT_SCOPE_GATE", "require")
+    task_id = await _wt_done_task(db, job_id="dispatch-77")
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(affected_areas=["hub/services"])
+    )
+    await db.commit()
+    _mock_git_ops(plugins, str(tmp_path / "unused"))
+    plugins.git_ops.dirty_paths = AsyncMock(
+        return_value=["hub/services/orchestration.py", "notes.txt"]
+    )
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status == "needs_decision"
+    plugins.git_ops.auto_commit.assert_not_awaited()
+    plugins.git_ops.push_branch.assert_not_awaited()
+    updates = await repo.get_task_updates(db, task_id)
+    assert any("notes.txt" in u["content"] for u in updates), (
+        "the human deciding must be told which file is out of scope"
+    )
+    assert not any("orchestration.py" in u["content"] for u in updates), (
+        "in-scope files are the task's own work and must not be reported"
+    )
+
+
+async def test_commit_scope_gate_warns_but_commits_by_default(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Default is warn: the same finding is recorded, the pipeline continues."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setattr(config, "COMMIT_SCOPE_GATE", "warn")
+    task_id = await _wt_done_task(db, job_id="dispatch-78")
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(affected_areas=["hub/services"])
+    )
+    await db.commit()
+    _mock_git_ops(plugins, str(tmp_path / "unused"))
+    plugins.git_ops.dirty_paths = AsyncMock(return_value=["notes.txt"])
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status != "needs_decision"
+    plugins.git_ops.auto_commit.assert_awaited()
+    updates = await repo.get_task_updates(db, task_id)
+    assert any("notes.txt" in u["content"] for u in updates)
+
+
+async def test_commit_scope_gate_says_so_when_it_cannot_check(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """No affected_areas means the check did not run — silence would read as
+    'checked and clean'."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    monkeypatch.setattr(config, "COMMIT_SCOPE_GATE", "require")
+    task_id = await _wt_done_task(db, job_id="dispatch-79")  # no affected_areas
+    _mock_git_ops(plugins, str(tmp_path / "unused"))
+    plugins.git_ops.dirty_paths = AsyncMock(return_value=["notes.txt"])
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status != "needs_decision", "cannot check is not the same as violated"
+    updates = await repo.get_task_updates(db, task_id)
+    assert any("не выполнялась" in u["content"] for u in updates)
+
+
+async def test_done_pipeline_stops_when_checkout_fails(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#361 I1: a failed checkout must stop the tail, not run it elsewhere.
+
+    checkout() has always returned a bool and nobody read it, while the comment
+    directly above the call already named the consequence — squash_branch
+    resetting the wrong branch. Gating auto_commit alone was not enough: its
+    result was ignored too, so squash_branch (reset --soft) and push_branch ran
+    regardless. Per docs/workspace-safety-policy.md invariant 4 the task
+    escalates instead of reporting readiness it does not have.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    task_id = await _wt_done_task(db, job_id="dispatch-99")
+    _mock_git_ops(plugins, str(tmp_path / "unused"))
+    from unittest.mock import AsyncMock
+
+    plugins.git_ops.checkout = AsyncMock(return_value=False)  # checkout fails
+
+    row = await repo.get_task(db, task_id)
+    status = await orchestration.transition_after_agent_done(
+        db, dict(row), has_done=True
+    )
+
+    assert status == "needs_decision", "must not claim ci_check with nothing pushed"
+    plugins.git_ops.auto_commit.assert_not_awaited()
+    plugins.git_ops.squash_branch.assert_not_awaited()
+    plugins.git_ops.push_branch.assert_not_awaited()
+    plugins.git_ops.create_pr.assert_not_awaited()
+
+    updated = dict(await repo.get_task(db, task_id))
+    assert updated["status"] == "needs_decision"

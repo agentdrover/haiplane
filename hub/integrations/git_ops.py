@@ -17,7 +17,30 @@ from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.mcp_envelope import enrich_error_payload
 
+from hub.commit_scope import parse_porcelain_paths
+
 log = logging.getLogger(__name__)
+
+
+class WorkspaceNotReadyError(Exception):
+    """create_branch refused to prepare a branch (#361).
+
+    Distinct from returning "": that means "no branch was created" and covers
+    the perfectly ordinary case of a hub running without git integration
+    (NoopGitOps). Collapsing a refusal into it would turn an unconfigured hub
+    into a blocked one — the same ambiguity that made auto_commit's False
+    useless to its caller.
+    """
+
+
+class WorkspaceBranchMismatchError(Exception):
+    """auto_commit was asked to commit onto a branch that is not current (#361).
+
+    A distinct type on purpose: auto_commit returns False both for "nothing to
+    commit" and, previously, for "refused". The caller could not tell those
+    apart, so the refusal was ignored and the destructive tail (squash --soft,
+    push) ran anyway — the guard was inert.
+    """
 
 
 class PairBranchConflictError(Exception):
@@ -458,13 +481,41 @@ class GitOpsIntegration:
         slug = _slugify(title)
         branch = f"task-{task_id}/{slug}"
 
-        await _git("checkout", base, repo=repo, check=False)
-
+        # Refuse before touching anything (#361 I2). The old shape checked out
+        # base without looking at the result, then ran `checkout .` + `clean -fd`
+        # on a dirty tree — destroying a person's uncommitted work in the shared
+        # workspace. Worse, the checkout's rc was immediately overwritten by the
+        # next call, so its failure could not be noticed even in principle: the
+        # clean then ran on whatever branch happened to still be checked out.
+        #
+        # docs/workspace-safety-policy.md invariant 4 prescribes the opposite:
+        # when the automation cannot reliably interpret git state, escalate
+        # rather than proceed. P1 of that policy documents the destructive
+        # behaviour as a known wart with "commit or stash first" as the
+        # workaround; this removes the need for the workaround.
         rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
         if dirty.strip():
-            log.warning("create_branch: dirty worktree on main, cleaning up")
-            await _git("checkout", ".", repo=repo, check=False)
-            await _git("clean", "-fd", repo=repo, check=False)
+            raise WorkspaceNotReadyError(
+                f"refusing to prepare #{task_id} in dirty workspace {repo} — "
+                f"commit or stash first. Files: "
+                + ", ".join(dirty.strip().splitlines()[:10])
+            )
+
+        rc, _, err = await _git("checkout", base, repo=repo, check=False)
+        if rc != 0:
+            raise WorkspaceNotReadyError(
+                f"failed to checkout base {base!r} in {repo}: "
+                + ((err or "").strip() or "git checkout failed")
+            )
+
+        # Confirm the checkout actually landed. rc alone is not enough — this is
+        # the guard whose pair-mode twin had no honest test (see the test file).
+        rc, current, _ = await _git("branch", "--show-current", repo=repo, check=False)
+        current = (current or "").strip()
+        if rc != 0 or current != base:
+            raise WorkspaceNotReadyError(
+                f"expected base {base!r} in {repo}, currently on {current!r}"
+            )
 
         await _git("pull", "origin", base, "--ff-only", repo=repo, check=False)
 
@@ -914,14 +965,61 @@ class GitOpsIntegration:
         rc, _, _ = await _git("checkout", branch, repo=repo, check=False)
         return rc == 0
 
+    async def dirty_paths(self, repo: str | None = None) -> list[str]:
+        """Repo-relative paths git would stage right now (#361 commit-scope).
+
+        Read before auto_commit so the caller can compare what is about to land
+        against the task's declared scope. Returns [] both for a clean tree and
+        for an unreadable one — the caller must not read that as proof of
+        cleanliness; a failed status is logged here and surfaces there as
+        "cannot check".
+        """
+        rc, out, err = await _git("status", "--porcelain", repo=repo, check=False)
+        if rc != 0:
+            log.error(
+                "dirty_paths: git status failed in %s: %s",
+                repo or _repo_root(),
+                (err or "").strip(),
+            )
+            return []
+        return parse_porcelain_paths(out or "")
+
     async def auto_commit(
         self,
         task_id: int,
         title: str = "",
         message: str | None = None,
         repo: str | None = None,
+        expected_branch: str | None = None,
     ) -> bool:
+        """Commit the task's work. Refuses to commit onto a foreign branch.
+
+        ``expected_branch`` closes the other half of #361 I1. The done-pipeline
+        checks out the task branch and then calls this — but it never looked at
+        whether the checkout succeeded, so a failed checkout (a dirty tree is
+        enough) left the commit landing on whichever branch was still current.
+        With the branch named, a mismatch refuses instead.
+
+        The blanket ``git add -A`` below stages whatever is dirty. Do NOT read
+        that as "everything dirty belongs to the task": create_branch's refusal
+        to start on a dirty tree (#361 I2) only proves the tree was clean at
+        t=0, and a headless task then shares the main clone for its whole run.
+        Attribution lives one level up, in the commit-scope gate
+        (hub/commit_scope.py), which compares the dirty set against
+        the task's declared affected_areas before this is called.
+        """
         repo = repo or _repo_root()
+
+        if expected_branch:
+            rc, current, _ = await _git(
+                "branch", "--show-current", repo=repo, check=False
+            )
+            current = (current or "").strip()
+            if rc != 0 or current != expected_branch:
+                raise WorkspaceBranchMismatchError(
+                    f"refusing to commit #{task_id} onto {current!r} — "
+                    f"expected {expected_branch!r} in {repo}"
+                )
 
         reverted = await _reject_broken_files(repo)
         if reverted:

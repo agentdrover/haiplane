@@ -65,6 +65,12 @@ SDD_AC_TESTS = os.environ.get("OPENCLAW_SDD_AC_TESTS", "warn")
 # Verifiable SDD (#510): 'warn' (default) — a failed validation_commands run only
 # warns; 'require' blocks completion until the current validation run is green.
 SDD_VALIDATION = os.environ.get("OPENCLAW_SDD_VALIDATION", "warn")
+# Commit scope (#361): 'warn' (default) — files dirty at commit time that fall
+# outside the task's declared affected_areas are named in a task update and
+# committed anyway; 'require' stops the git tail and escalates to
+# needs_decision instead. 'off' disables the check. Headless tasks share the
+# main clone for their whole run, so this is the only attribution the hub has.
+COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
