@@ -46,6 +46,16 @@ _DONE_SUGGESTED_TOOLS: dict[str, str | None] = {
     "invalid_status_for_done": "hub_pair_start",
 }
 
+# Who acts next per done-report reason. Two of these are emphatically not the
+# agent's to resolve, and the old silent default called them all "agent" (#548).
+_DONE_ACTORS: dict[str, str] = {
+    "pair_start_required": "agent",
+    "human_decision_required": "human",
+    "awaiting_ci_conveyor": "ci",
+    "task_already_terminal": "none",
+    "invalid_status_for_done": "agent",
+}
+
 _HIERARCHY_PARENT_RE = re.compile(r"requires parent of type (\w+), got (\w+)")
 _HIERARCHY_NEEDS_PARENT_RE = re.compile(r"requires a parent of type (\w+)")
 
@@ -64,6 +74,7 @@ def permission_denied_detail(permission: str) -> dict[str, Any]:
     return enrich_error_payload(
         {
             "reason": "permission_denied",
+            "actor_hint": "human",
             "message": f"missing permission: {permission}",
             "hint": meta["hint"],
             "required_role": meta["required_role"],
@@ -77,6 +88,9 @@ def withdraw_agent_only_detail() -> dict[str, Any]:
     return enrich_error_payload(
         {
             "reason": "withdraw_agent_only",
+            # Raised by require_agent_caller, i.e. the refused caller is a
+            # human/admin, and hub_archive_task is theirs as well (#548).
+            "actor_hint": "human",
             "message": "withdraw is only for agent tokens",
             "hint": (
                 "hub_withdraw_own_draft is agent-only. Humans and admins should use "
@@ -116,6 +130,7 @@ def human_only_gate_detail(message: str | None = None) -> dict[str, Any]:
     return enrich_error_payload(
         {
             "reason": "human_only_gate",
+            "actor_hint": "human",
             "message": message or "this operation requires human or admin role",
             "hint": "This operation requires a human or admin token, not an agent token.",
             "required_role": "human",
@@ -137,6 +152,7 @@ def agent_create_forbidden_detail() -> dict[str, Any]:
     return enrich_error_payload(
         {
             "reason": "agent_create_forbidden",
+            "actor_hint": "human",
             "message": "agents may not create tasks directly; propose them instead",
             "hint": "Task creation with source=human is human-only. Agents use "
             "hub_propose_task (or source=agent), which creates a draft for "
@@ -152,6 +168,13 @@ def self_review_forbidden_detail(agent: str) -> dict[str, Any]:
     return enrich_error_payload(
         {
             "reason": "self_review_forbidden",
+            # Another agent principal may pass this verdict (#432), so the
+            # actor really is an agent — just not this one. actor_hint cannot
+            # express "a different principal of the same kind", so the
+            # constraint is a field of its own: an orchestrator dispatching on
+            # actor_hint alone would re-send the very agent it just refused.
+            "actor_hint": "agent",
+            "same_principal_forbidden": True,
             "message": f"agent '{agent}' implemented this task and cannot review it",
             "hint": "The Universal Review Gate requires an independent reviewer: "
             "another agent principal or a human token must submit the verdict. "
@@ -176,6 +199,7 @@ def pair_start_claim_mismatch_detail(
     return enrich_error_payload(
         {
             "reason": "pair_start_claim_mismatch",
+            "actor_hint": "agent",
             "message": (
                 f"Task #{task_id} is claimed by '{holder}'; "
                 f"pair-start denied for '{caller_repr}'"
@@ -241,6 +265,8 @@ def hierarchy_error_detail(
 
     payload: dict[str, Any] = {
         "reason": "invalid_hierarchy",
+        # The caller passed a parent the hierarchy rules reject — its own to fix.
+        "actor_hint": "agent",
         "message": raw_message,
         "hint": hint,
         "suggested_tool": "hub_create_task",
@@ -267,6 +293,7 @@ def done_report_error_detail(
             "required_status": required_status,
             "current_status": task["status"],
             "suggested_tool": _DONE_SUGGESTED_TOOLS.get(reason),
+            "actor_hint": _DONE_ACTORS.get(reason, "agent"),
         }
     )
 
@@ -281,6 +308,8 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
             "suggested_tool"
         ):
             payload["suggested_tool"] = _DONE_SUGGESTED_TOOLS[payload["reason"]]
+        if payload.get("reason") in _DONE_ACTORS and not payload.get("actor_hint"):
+            payload["actor_hint"] = _DONE_ACTORS[payload["reason"]]
         return enrich_error_payload(payload)
 
     if isinstance(detail, str):
@@ -307,6 +336,7 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
                 "reason": "forbidden",
                 "message": msg,
                 "hint": msg,
+                "actor_hint": "human",
                 "required_role": "human",
                 "suggested_tool": None,
             }
@@ -316,6 +346,8 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
             "reason": "api_error",
             "message": msg,
             "hint": msg,
+            # Malformed input is the caller's to fix, so the agent really is next.
+            "actor_hint": "agent",
             "suggested_tool": None,
             "status_code": status_code,
         }
