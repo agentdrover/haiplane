@@ -204,7 +204,12 @@ class NoopGitOps:
         return False
 
     async def squash_branch(
-        self, task_id: int, title: str, branch: str, repo: str | None = None
+        self,
+        task_id: int,
+        title: str,
+        branch: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
     ) -> bool:
         return False
 

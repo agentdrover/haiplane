@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from hub import config
 from hub.integrations.git_ops import (
     GitOpsIntegration,
     PairBranchConflictError,
@@ -962,6 +963,10 @@ async def test_create_branch_still_works_on_clean_workspace(
 ) -> None:
     # The refusal must not cost the normal headless flow.
     repo = _seed_repo(tmp_path)
+    # A real workspace has the base branch the PRs target; since #362 that is
+    # the branch create_branch cuts from, so the fixture must model it.
+    _run_git("git", "checkout", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    _run_git("git", "checkout", "main", cwd=repo)
 
     branch = await git_ops.create_branch(7, "normal task", repo=str(repo))
 
@@ -1126,3 +1131,222 @@ async def test_dirty_paths_reads_the_real_worktree(
     paths = await git_ops.dirty_paths(repo=str(repo))
 
     assert sorted(paths) == ["app.py", "brand_new.txt"]
+
+
+# --- #362 I4: branch base must equal PR target ---
+
+
+def test_resolve_base_is_the_only_default_for_branch_and_pr() -> None:
+    """create_branch defaulted to "main" while create_pr defaulted to develop.
+
+    Two independent defaults that must agree is the defect; asserting they are
+    equal by value would let them drift apart again, so this asserts both call
+    sites read the SAME function.
+    """
+    import inspect
+
+    from hub.integrations.git_ops import _resolve_base
+
+    assert _resolve_base(None) == config.PAIR_BASE_BRANCH
+    assert _resolve_base("release/x") == "release/x"
+
+    src = inspect.getsource(GitOpsIntegration.create_branch)
+    assert "_resolve_base(base_branch)" in src
+    assert '"main"' not in src, "no second default may reappear in create_branch"
+    assert "_resolve_base(base_branch)" in inspect.getsource(
+        GitOpsIntegration.create_pr
+    )
+
+
+async def test_headless_branch_is_cut_from_the_pr_target(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#362 I4, reproduced before the fix on a live repository.
+
+    The default project's git context is empty, so base_branch is never passed
+    and the old default applied every time — not in a corner case.
+    """
+    repo = _seed_repo(tmp_path)  # seeds main
+    _run_git("git", "checkout", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "landed_in_base.py").write_text("work that is already in the base\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "base moves ahead of main", cwd=repo)
+    _run_git("git", "checkout", "main", cwd=repo)
+
+    branch = await git_ops.create_branch(362, "headless work", repo=str(repo))
+
+    assert branch
+    import subprocess
+
+    merge_base = subprocess.run(
+        ["git", "merge-base", config.PAIR_BASE_BRANCH, "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    base_head = subprocess.run(
+        ["git", "rev-parse", config.PAIR_BASE_BRANCH],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert merge_base == base_head, "task branch must start at the PR target's tip"
+    assert (repo / "landed_in_base.py").exists(), "task must see work already in base"
+
+
+async def test_stale_base_no_longer_conflicts_on_untouched_lines(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """The concrete damage: a conflict on a line the task never edited.
+
+    Before the fix the task branch was cut from main, so a change the base made
+    to line 1 collided with the task branch's *unmodified* line 1 — the merge
+    base was too old to tell they were the same. Reproduced by hand before
+    writing this test.
+    """
+    import subprocess
+
+    repo = _seed_repo(tmp_path)
+    (repo / "shared.py").write_text("line1\nline2\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "shared file", cwd=repo)
+    _run_git("git", "checkout", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "shared.py").write_text("line1 REFACTORED IN BASE\nline2\n")
+    _run_git("git", "commit", "-am", "base refactors line 1", cwd=repo)
+    _run_git("git", "checkout", "main", cwd=repo)
+
+    branch = await git_ops.create_branch(362, "task work", repo=str(repo))
+    (repo / "shared.py").write_text("line1 REFACTORED IN BASE\nline2 CHANGED BY TASK\n")
+    _run_git("git", "commit", "-am", "task edits line 2 only", cwd=repo)
+
+    _run_git("git", "checkout", config.PAIR_BASE_BRANCH, cwd=repo)
+    merged = subprocess.run(
+        ["git", "merge", "--no-commit", "--no-ff", branch],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert merged.returncode == 0, (
+        "merging the task branch into its PR target must not conflict on a line "
+        f"the task never touched:\n{merged.stdout}{merged.stderr}"
+    )
+
+
+async def test_create_branch_refuses_when_the_base_branch_is_missing(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """Behaviour change introduced by #362, deliberate and covered here.
+
+    Aligning the branch base with the PR target means a repository without that
+    base can no longer be branched from. Falling back to another branch is
+    exactly the defect being fixed — the work would be cut from one base and
+    proposed against another — so this refuses, and the message names the
+    branch so the operator can create it.
+    """
+    repo = _seed_repo(tmp_path)  # main only, no PAIR_BASE_BRANCH
+
+    with pytest.raises(WorkspaceNotReadyError) as excinfo:
+        await git_ops.create_branch(9, "task", repo=str(repo))
+
+    assert config.PAIR_BASE_BRANCH in str(excinfo.value)
+    assert str(repo) in str(excinfo.value)
+
+
+def test_no_second_base_default_survives_anywhere() -> None:
+    """The set check from the review harness, as an executable rule.
+
+    Fixing create_branch's "main" was not enough: enumerating every place that
+    computed a base default found four more — two literal "develop" parameter
+    defaults in git_ops and a duplicated expression in orchestration. A claim
+    that the default lives in one place has to be enforced, not asserted.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path("hub/integrations/git_ops.py").read_text()
+    # _resolve_base itself is the one legitimate reference to the config value.
+    body = src.replace("    return base_branch or PAIR_BASE_BRANCH\n", "")
+    assert "base_branch or PAIR_BASE_BRANCH" not in body
+    assert not re.search(r'base_branch: str = "develop"', src)
+
+    # Machine review caught this test being green for the wrong reason: it only
+    # looked for the two spellings the fix happened to remove, so squash_branch
+    # — which named its base "origin/main" inline, with no base_branch
+    # parameter to grep for — stayed invisible while the docstring claimed no
+    # second default survived anywhere. A base named by literal counts.
+    for func in ("squash_branch", "create_branch", "create_pr"):
+        start = src.index(f"async def {func}(")
+        end = src.index("\n    async def ", start + 1)
+        assert '"origin/main"' not in src[start:end], (
+            f"{func} must resolve its base, not name a branch outright"
+        )
+
+    orch = Path("hub/services/orchestration.py").read_text()
+    assert "PAIR_BASE_BRANCH" not in orch, (
+        "orchestration must ask git_ops for the base default, not recompute it"
+    )
+
+
+async def test_squash_measures_from_the_branchs_own_base(tmp_path) -> None:
+    """#362, found by machine review: the squash point is a third base.
+
+    squash_branch is called on every headless task by the done-pipeline and is
+    followed by a force-push, yet every test in the suite replaced it with a
+    mock — its git logic had never executed. Moving the branch cut to the
+    integration branch while the squash still reckoned from origin/main
+    re-created the exact stale-merge-base damage this task set out to remove.
+    Reproduced by hand on a real repository before this test was written.
+    """
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True
+    )
+    repo = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "t", cwd=repo)
+
+    (repo / "app.py").write_text("v1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "init main", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "main", cwd=repo)
+
+    # The integration branch moves ahead of main — the normal state here.
+    _run_git("git", "checkout", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "landed.py").write_text("work already merged into the base\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "base gains a commit", cwd=repo)
+    _run_git("git", "push", "-q", "origin", config.PAIR_BASE_BRANCH, cwd=repo)
+
+    git_ops = GitOpsIntegration()
+    branch = await git_ops.create_branch(362, "task work", repo=str(repo))
+    for n in (1, 2):
+        (repo / f"task{n}.py").write_text(f"task commit {n}\n")
+        _run_git("git", "add", "-A", cwd=repo)
+        _run_git("git", "commit", "-m", f"task {n}", cwd=repo)
+
+    assert await git_ops.squash_branch(362, "task work", branch, repo=str(repo))
+
+    base_tip = subprocess.run(
+        ["git", "rev-parse", f"origin/{config.PAIR_BASE_BRANCH}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    parent = subprocess.run(
+        ["git", "rev-parse", "HEAD^"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert parent == base_tip, "the squashed commit must sit directly on the base"
+
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", f"origin/{config.PAIR_BASE_BRANCH}...HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert sorted(changed) == ["task1.py", "task2.py"], (
+        f"the PR must show the task's work only, not the base's own commits: {changed}"
+    )
