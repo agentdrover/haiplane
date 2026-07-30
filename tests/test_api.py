@@ -1217,8 +1217,9 @@ async def _task_in_review(
     # Ready work is created by a human (#360) — an agent token here would get
     # 403 agent_create_forbidden. These tests are about the review gate, so the
     # task is born under the human token and everything after it runs as the
-    # agent in ``headers``. Every token map used with this helper has
-    # "human-token".
+    # agent in ``headers``. Most token maps here name that token "human-token";
+    # _provisioned_reviewer_tokens spells it "human-tok", which is what
+    # ``human_headers`` is for — so do not collapse this back to a default.
     resp = await client.post(
         "/api/tasks",
         json={"title": title},
