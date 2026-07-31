@@ -76,24 +76,36 @@ async def test_ready_at_is_written_in_the_shape_of_its_neighbours(
 
 
 async def test_ready_at_compares_correctly_as_a_string(db: aiosqlite.Connection):
-    """AC-3, and the only assertion that can fail on the old format.
+    """AC-3, and the only assertion here that can fail on the old format.
 
-    Values and julianday() were always right, so a test on those proves
-    nothing. Ordering is what was broken."""
+    Values and julianday() were always right, so asserting on those proves
+    nothing. Ordering is what was broken — and only WITHIN a day.
+
+    The first version of this test compared against datetime('now', '-1 day')
+    and '+1 day'. Both passed on the old format and it could not have failed:
+    a one-day offset changes the date, which differs before the comparison
+    ever reaches character 11 where 'T' sits. Caught in review of submission
+    #1 — a test written to catch tautological assertions that was itself one.
+
+    The comparison has to stay inside the same day for 'T' (0x54) versus a
+    space (0x20) to decide the answer.
+    """
     task_id = await _task_that_passes_dor(db)
 
     rows = await db.execute_fetchall(
-        "SELECT ready_at >= datetime('now', '-1 day') AS recent, "
-        "ready_at <= datetime('now', '+1 day') AS not_future FROM tasks WHERE id=?",
+        "SELECT ready_at <= datetime('now', '+5 seconds') AS not_future, "
+        "ready_at >= datetime('now', '-5 seconds') AS just_now "
+        "FROM tasks WHERE id=?",
         (task_id,),
     )
     row = dict(rows[0])
 
-    assert row["recent"] == 1, "a task made ready just now is within the last day"
     assert row["not_future"] == 1, (
-        "the old 'T' shape sorted above any same-day SQLite value, so this "
-        "comparison returned 0 for a timestamp that is not in the future"
+        "stamped a moment ago, so it cannot sort after five seconds from now "
+        "— on the old format 'T' pushed it above every same-day value and "
+        "this returned 0"
     )
+    assert row["just_now"] == 1
 
 
 async def test_the_migration_converts_old_rows_without_moving_them(
