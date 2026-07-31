@@ -145,6 +145,33 @@ async def _ensure_task_exists(db: aiosqlite.Connection, task_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_project_binding(
+    db: aiosqlite.Connection,
+    project_slug: str | None,
+    task_row: Any,
+) -> int | None:
+    """Resolve the ``project`` refine field to a project id, or None if unset.
+
+    Shared by single and bulk refine. Bulk used to skip this entirely:
+    ``project`` is a virtual field that ``structured_fields_to_db`` drops, so
+    the binding silently did nothing while ``fields_set`` still reported
+    ``project`` as applied — the caller was told the write landed (#370).
+    """
+    if project_slug is None:
+        return None
+    # Epic-to-project binding (#338): projects live on epics only.
+    if task_row is None or task_row["task_type"] != "epic":
+        raise ProjectBindError(
+            "project can only be set on an epic; descendants inherit it"
+        )
+    project_row = await repo.get_project_by_slug(db, project_slug)
+    if project_row is None:
+        raise ProjectBindError(f"unknown project slug: {project_slug!r}")
+    if project_row["status"] != "active":
+        raise ProjectBindError(f"project {project_slug!r} is pending activation")
+    return int(project_row["id"])
+
+
 async def refine_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -167,19 +194,7 @@ async def refine_task(
     await _ensure_task_exists(db, task_id)
     old_row = await repo.get_task(db, task_id)
 
-    project_id: int | None = None
-    if payload.project is not None:
-        # Epic-to-project binding (#338): projects live on epics only.
-        if old_row is None or old_row["task_type"] != "epic":
-            raise ProjectBindError(
-                "project can only be set on an epic; descendants inherit it"
-            )
-        project_row = await repo.get_project_by_slug(db, payload.project)
-        if project_row is None:
-            raise ProjectBindError(f"unknown project slug: {payload.project!r}")
-        if project_row["status"] != "active":
-            raise ProjectBindError(f"project {payload.project!r} is pending activation")
-        project_id = project_row["id"]
+    project_id = await _resolve_project_binding(db, payload.project, old_row)
 
     async with _atomic(db, "refine_task"):
         updated_columns, ac_count = await _apply_refine_writes(
@@ -267,9 +282,12 @@ async def refine_tasks_bulk(
             refine = TaskRefine.model_validate(
                 item.model_dump(exclude={"task_id"}, exclude_unset=True)
             )
+            project_id = await _resolve_project_binding(db, refine.project, old_row)
             _updated_columns, ac_count = await _apply_refine_writes(
                 db, item.task_id, refine, old_row
             )
+            if project_id is not None:
+                await repo.update_task(db, item.task_id, project_id=project_id)
             # Unify with hub_refine_task: report the fields actually SENT in the
             # request (PATCH keys), not a post-write column diff. model_fields_set
             # reflects the keys provided (refine was validated with exclude_unset),

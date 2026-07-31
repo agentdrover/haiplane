@@ -578,7 +578,9 @@ async def test_decide_task_rework_with_summary_api(client: AsyncClient, db):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] in ("fix_requested", "open")
+    # #370 T5: accepting both branches meant this assertion could not fail.
+    assert data["status"] == "fix_requested"
+    assert data["job_id"]
     decision_updates = [u for u in data["updates"] if u["kind"] == "decision"]
     assert len(decision_updates) == 1
     assert "Auth bug must be resolved" in decision_updates[0]["content"]
