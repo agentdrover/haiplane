@@ -993,6 +993,23 @@ async def api_submit_machine_review(
             400,
             "no submission to review: submit_for_review must run at least once",
         )
+    # raw_count is self-reported and was stored unchecked, so reports arrived
+    # claiming fewer raw findings than the findings they themselves listed —
+    # on production one had raw_count=0 alongside two confirmed findings
+    # (#519). Normalised upward rather than rejected: the recorded risk asks
+    # not to break existing clients, and a report with a miscounted header is
+    # still worth keeping — its findings are real.
+    adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
+    raw_count = body.raw_count
+    if raw_count < adjudicated:
+        log.warning(
+            "machine review for task #%s: raw_count=%s is below the %s findings "
+            "it lists; normalised upward",
+            task_id,
+            raw_count,
+            adjudicated,
+        )
+        raw_count = adjudicated
     await repo.insert_machine_review(
         db,
         task_id=task_id,
@@ -1004,7 +1021,7 @@ async def api_submit_machine_review(
         duration_ms=body.duration_ms,
         orchestrator=body.orchestrator,
         model=body.model,
-        raw_count=body.raw_count,
+        raw_count=raw_count,
         findings_confirmed=_json.dumps(
             [f.model_dump(exclude_none=True) for f in body.findings_confirmed],
             ensure_ascii=False,
@@ -1029,7 +1046,7 @@ async def api_submit_machine_review(
         payload={
             "confirmed": len(body.findings_confirmed),
             "rejected": len(body.findings_rejected),
-            "raw": body.raw_count,
+            "raw": raw_count,
             "generation": generation,
         },
     )
@@ -1037,7 +1054,7 @@ async def api_submit_machine_review(
     await db_module.log_activity(
         db,
         "machine_review_completed",
-        f"Task #{task_id}: machine review — {body.raw_count} raw → "
+        f"Task #{task_id}: machine review — {raw_count} raw → "
         f"{len(body.findings_confirmed)} confirmed, "
         f"{len(body.findings_rejected)} rejected",
     )

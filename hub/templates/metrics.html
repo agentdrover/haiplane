@@ -14,6 +14,8 @@
             <td>{{ m.machine_reviews.raw_total }} → {{ m.machine_reviews.confirmed_total }} / {{ m.machine_reviews.rejected_total }}</td></tr>
         <tr><td>Filtration rate (отсев шума)</td>
             <td>{{ (m.machine_reviews.filtration_rate * 100) | round(1) if m.machine_reviews.filtration_rate is not none else '—' }}%</td></tr>
+        <tr><td>Находок не разобрано (ни подтверждены, ни отклонены)</td>
+            <td>{% if m.machine_reviews.findings_unaccounted %}{{ m.machine_reviews.findings_unaccounted }} из {{ m.machine_reviews.raw_total }}{% else %}—{% endif %}</td></tr>
         <tr><td>Tokens total / per confirmed finding</td>
             <td>{{ m.machine_reviews.tokens_total }} /
                 {% if m.machine_reviews.tokens_per_confirmed is not none %}{{ m.machine_reviews.tokens_per_confirmed }}{% else %}<span class="muted">нет данных</span>{% endif %}</td></tr>
@@ -23,6 +25,12 @@
                 / {{ m.machine_reviews.confirmed_with_tokens }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
     </tbody>
 </table>
+
+<p class="muted">Отсев считается по находкам, которые действительно разобраны —
+подтверждены или отклонены. Считать его от самоотчётного raw_count значит
+засчитывать в отсев те находки, которые никто не разбирал: на проде это 75 из
+192, и доля отсева поднималась с 0.573 до 0.740. Строка выше показывает
+неразобранный остаток.</p>
 
 <p class="muted">Цена за находку считается только по отчётам, назвавшим свою
 стоимость: делить все токены на все подтверждённые находки значит смешивать

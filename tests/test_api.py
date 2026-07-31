@@ -2535,7 +2535,12 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
     assert mr["confirmed_with_tokens"] == 2
     assert mr["tokens_per_confirmed"] == round(1_000_000 / 2)
     assert mr["reports_without_tokens"] == 1  # второй отчёт без токенов
-    assert abs(mr["filtration_rate"] - (1 - 3 / 16)) < 0.001
+    # #519: filtration divides by the findings actually adjudicated — here
+    # 3 confirmed + 2 rejected — not by the self-reported raw_count of 16.
+    # Against raw it read 0.813 while 11 of the 16 raw findings were never
+    # sorted into any bucket; those were being counted as filtered noise.
+    assert abs(mr["filtration_rate"] - (1 - 3 / 5)) < 0.001
+    assert mr["findings_unaccounted"] == 11
 
     versions = {(h["harness_skill"], h["harness_version"]) for h in data["by_harness"]}
     assert ("multi-agent-review", 1) in versions
