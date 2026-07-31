@@ -112,11 +112,12 @@ async def practice_metrics(
     """Practice economics (#384): machine-review costs, filtration rate,
     harness-version comparison, recurring finding categories, cycle times.
 
-    Aggregated on the fly from machine_reviews and task timestamps —
-    ``updated_at`` of a completed task is the completion proxy (the
-    dedicated completed_at column was never populated). Token/duration
-    fields are optional in reports, so aggregates carry ``reports_without_tokens``
-    instead of pretending coverage is full.
+    Aggregated on the fly from machine_reviews and task timestamps. Cycle time
+    is measured from ``completed_at`` (#517), falling back to ``updated_at``
+    for tasks finished before that column started being written; each row
+    carries ``estimated_tasks`` so the inferred share stays visible. Token and
+    duration fields are optional in reports, so aggregates carry
+    ``reports_without_tokens`` instead of pretending coverage is full.
     """
     import statistics
 
@@ -163,21 +164,45 @@ async def practice_metrics(
     )
     recurring = [dict(r) | {"recurring": r["tasks"] > 1} for r in category_rows]
 
+    # `completed_at` is the measured completion moment (#517); rows finished
+    # before it started being written fall back to `updated_at`.
+    #
+    # The fallback is a decision from the data, not a convenience. The obvious
+    # alternative — `status_entered_at` — is provably wrong for the older rows:
+    # the backfill migration stamped every NULL with its own run time, so on
+    # production 107 of the 145 rows in the window carry the migration date.
+    # Dropping them instead would discard three quarters of the sample to
+    # correct a bias measured at 0–13.3h against durations of 280–340h. The
+    # window rolls forward, so the estimated share shrinks to zero on its own.
+    #
+    # The same expression filters the window. It used to filter on `updated_at`
+    # while claiming to measure completion, so a task finished six months ago
+    # and touched yesterday entered a 90-day window carrying a six-month cycle
+    # time. Numerator and window must be the same clock or the metric is only
+    # half repaired.
     cycle_rows = await db.execute_fetchall(
-        "SELECT work_type, "
-        "(julianday(updated_at) - julianday(ready_at)) * 24.0 AS hours "
+        "SELECT work_type, completed_at IS NULL AS estimated, "
+        "(julianday(COALESCE(completed_at, updated_at)) - julianday(ready_at)) "
+        "* 24.0 AS hours "
         "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
-        "AND updated_at >= datetime('now', ?)",
+        "AND COALESCE(completed_at, updated_at) >= datetime('now', ?)",
         (since,),
     )
     by_type: dict[str, list[float]] = {}
+    estimated_by_type: dict[str, int] = {}
     for r in cycle_rows:
         if r["hours"] is not None and r["hours"] >= 0:
-            by_type.setdefault(r["work_type"] or "feature", []).append(r["hours"])
+            wt = r["work_type"] or "feature"
+            by_type.setdefault(wt, []).append(r["hours"])
+            estimated_by_type[wt] = estimated_by_type.get(wt, 0) + bool(r["estimated"])
+    # `estimated_tasks` is reported per row rather than folded into the median:
+    # a number that silently mixes measured and inferred values reads as fact.
+    # Same principle as n_excluded in #518 — say what is not known.
     cycle_times = [
         {
             "work_type": wt,
             "tasks": len(hours),
+            "estimated_tasks": estimated_by_type.get(wt, 0),
             "median_hours": round(statistics.median(hours), 2),
         }
         for wt, hours in sorted(by_type.items())

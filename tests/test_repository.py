@@ -615,6 +615,61 @@ async def test_transition_status_if_stamps_status_entered_at(
     assert dict(await repo.get_task(db, task_id))["status_entered_at"] > old
 
 
+async def test_completed_at_stamped_on_entering_completed(db: aiosqlite.Connection):
+    # AC-1 (#517): the completion moment is written when the task enters
+    # `completed` and does not drift afterwards. Four separate call sites
+    # complete a task, so the rule lives in the primitive — a test that went
+    # through one service path would say nothing about the other three.
+    task_id = await _make_task(db, status="running")
+    assert dict(await repo.get_task(db, task_id))["completed_at"] is None
+
+    await repo.update_task(db, task_id, status="completed")
+    stamped = dict(await repo.get_task(db, task_id))["completed_at"]
+    assert stamped is not None
+
+    # Pin it into the past so any later rewrite is detectable: datetime('now')
+    # has one-second resolution, and an unpinned value would compare equal to a
+    # rewrite happening in the same second — the test would pass while broken.
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', '-60 minutes') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    pinned = dict(await repo.get_task(db, task_id))["completed_at"]
+
+    # An ordinary field PATCH must not move it. This is the defect the task
+    # removes: a completion moment that follows every edit is updated_at again.
+    await repo.update_task(db, task_id, priority="high")
+    assert dict(await repo.get_task(db, task_id))["completed_at"] == pinned
+
+    # Re-writing the same status must not move it either.
+    await repo.update_task(db, task_id, status="completed")
+    assert dict(await repo.get_task(db, task_id))["completed_at"] == pinned
+
+    # Leaving `completed` keeps the recorded moment rather than clearing it.
+    await repo.update_task(db, task_id, status="running")
+    assert dict(await repo.get_task(db, task_id))["completed_at"] == pinned
+
+    # Completing again is a new completion, so the moment advances.
+    await repo.update_task(db, task_id, status="completed")
+    assert dict(await repo.get_task(db, task_id))["completed_at"] > pinned
+
+
+async def test_transition_status_if_stamps_completed_at(db: aiosqlite.Connection):
+    # AC-1 (#517): the CAS transition helper is the other way into `completed`
+    # (lifecycle.py:182) and must stamp the same column.
+    task_id = await _make_task(db, status="running")
+    assert await repo.transition_status_if(
+        db, task_id, expected_from="running", new_status="review"
+    )
+    assert dict(await repo.get_task(db, task_id))["completed_at"] is None
+
+    assert await repo.transition_status_if(
+        db, task_id, expected_from="review", new_status="completed"
+    )
+    assert dict(await repo.get_task(db, task_id))["completed_at"] is not None
+
+
 async def test_ci_no_pr_attempts_increment_and_reset(db: aiosqlite.Connection):
     # AC-4 support (#416): the retry counter increments atomically and resets
     # with the CI clock when a task leaves the conveyor.

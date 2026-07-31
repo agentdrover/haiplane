@@ -776,6 +776,13 @@ async def update_task(
     right-hand sides against the pre-update row, so ``CASE WHEN status != ?``
     compares the stored status to the new one — re-writing the same status
     leaves the clock untouched, and a plain field PATCH never advances it.
+
+    ``completed_at`` is stamped by the same rule, but only on the way into
+    ``completed`` (#517). It lives here rather than in the callers because four
+    separate paths complete a task; stamping in the primitive is what makes the
+    column impossible to forget. Any other field PATCH leaves it alone — a
+    completion moment that moved with every later edit would just be a second
+    ``updated_at``, which is the defect this task removes.
     """
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
@@ -786,6 +793,11 @@ async def update_task(
             "THEN datetime('now') ELSE status_entered_at END"
         )
         values.append(fields["status"])
+        sets.append(
+            "completed_at = CASE WHEN ? = 'completed' AND status != ? "
+            "THEN datetime('now') ELSE completed_at END"
+        )
+        values.extend([fields["status"], fields["status"]])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -860,8 +872,13 @@ async def transition_status_if(
     """
     cur = await db.execute(
         "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "
-        "updated_at=datetime('now') WHERE id=? AND status=?",
-        (new_status, task_id, expected_from),
+        "updated_at=datetime('now'), "
+        # Same rule as update_task (#517): stamp the completion moment on the
+        # way into `completed` and never on any other transition.
+        "completed_at = CASE WHEN ? = 'completed' AND status != ? "
+        "THEN datetime('now') ELSE completed_at END "
+        "WHERE id=? AND status=?",
+        (new_status, new_status, new_status, task_id, expected_from),
     )
     return (cur.rowcount or 0) > 0
 

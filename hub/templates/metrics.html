@@ -48,11 +48,17 @@
 </table>
 
 <h2>Cycle time (ready → completed), median</h2>
+<p class="muted">Считается по completed_at. У задач, завершённых до того, как эта
+колонка начала заполняться, момент завершения оценён по updated_at — такие строки
+показаны в отдельном столбце, чтобы измеренное не смешивалось с оценённым.
+Столбец убывает сам по мере ухода окна вперёд.</p>
 <table class="task-table">
-    <thead><tr><th>Work type</th><th>Tasks</th><th>Median, hours</th></tr></thead>
+    <thead><tr><th>Work type</th><th>Tasks</th><th>Из них оценка</th><th>Median, hours</th></tr></thead>
     <tbody>
         {% for c in m.cycle_times %}
-        <tr><td>{{ c.work_type }}</td><td>{{ c.tasks }}</td><td>{{ c.median_hours }}</td></tr>
+        <tr><td>{{ c.work_type }}</td><td>{{ c.tasks }}</td>
+            <td>{% if c.estimated_tasks %}{{ c.estimated_tasks }}{% else %}—{% endif %}</td>
+            <td>{{ c.median_hours }}</td></tr>
         {% endfor %}
     </tbody>
 </table>
