@@ -1084,13 +1084,19 @@ async def test_create_branch_refuses_when_head_is_not_on_base(
 # --- #361 AC-1: commit-scope gate ---
 
 
-def test_parse_porcelain_handles_renames_and_quotes() -> None:
+def test_parse_porcelain_handles_renames_and_spaces() -> None:
+    """The -z form: NUL-separated records, no quoting, no escaping.
+
+    A rename is two records — the status line carries the new name, the source
+    follows on its own with no status field — and both sides land in the
+    commit, so both are returned.
+    """
     from hub.commit_scope import parse_porcelain_paths
 
     out = parse_porcelain_paths(
-        '?? notes.txt\n M hub/app.py\nR  old/a.py -> new/b.py\n M "has space.py"\n'
+        "?? notes.txt\0 M hub/app.py\0R  new/b.py\0old/a.py\0 M has space.py\0"
     )
-    assert out == ["notes.txt", "hub/app.py", "old/a.py", "new/b.py", "has space.py"]
+    assert out == ["notes.txt", "hub/app.py", "new/b.py", "old/a.py", "has space.py"]
 
 
 def test_foreign_paths_flags_only_what_is_outside_declared_areas() -> None:
@@ -1585,3 +1591,26 @@ async def test_squash_branch_refuses_when_it_cannot_check_out_the_branch(
     assert await git_ops.squash_branch(9, "t", "task-9/work", repo=str(repo)) is False
     assert head() == before, "reset --soft must not run on the branch that stayed"
     assert current() == "someones-branch"
+
+
+async def test_dirty_paths_reads_non_ascii_names_unescaped(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#555 through the production call, not just the parser.
+
+    The unit tests in tests/test_commit_scope.py drive parse_porcelain_paths
+    directly, so they never see which git flags dirty_paths actually passes —
+    reverting -z left them green. This one exercises the real caller.
+    """
+    repo = _seed_repo(tmp_path)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "Тест.md").write_text("исходное\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "add russian doc", cwd=repo)
+    (repo / "docs" / "Тест.md").write_text("правка\n")
+
+    paths = await git_ops.dirty_paths(repo=str(repo))
+
+    assert paths == ["docs/Тест.md"], (
+        "the production call must yield the real name, not git's escaped form"
+    )
