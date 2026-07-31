@@ -190,22 +190,43 @@ async def practice_metrics(
     )
     by_type: dict[str, list[float]] = {}
     estimated_by_type: dict[str, int] = {}
+    unmeasurable_by_type: dict[str, int] = {}
     for r in cycle_rows:
-        if r["hours"] is not None and r["hours"] >= 0:
-            wt = r["work_type"] or "feature"
-            by_type.setdefault(wt, []).append(r["hours"])
-            estimated_by_type[wt] = estimated_by_type.get(wt, 0) + bool(r["estimated"])
+        if r["hours"] is None:
+            continue
+        wt = r["work_type"] or "feature"
+        if r["hours"] <= 0:
+            # A non-positive duration is not a fast task, it is a task whose
+            # start is unknown (#518). On production every such row carries the
+            # same ready_at — a bulk stamp applied to tasks that were already
+            # finished — so ready_at records when someone backfilled the
+            # column, not when the work became ready. Counting these as zero
+            # dragged the feature median from 70h down to 4h.
+            #
+            # Only equality occurs in the data; negatives were checked for and
+            # there are none. The condition stays <= so a clock skew that does
+            # produce one is excluded rather than averaged in.
+            unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
+            continue
+        by_type.setdefault(wt, []).append(r["hours"])
+        estimated_by_type[wt] = estimated_by_type.get(wt, 0) + bool(r["estimated"])
     # `estimated_tasks` is reported per row rather than folded into the median:
     # a number that silently mixes measured and inferred values reads as fact.
     # Same principle as n_excluded in #518 — say what is not known.
+    # A work type all of whose rows are unmeasurable still gets a line: saying
+    # "5 tasks, start unknown, no median" is information, while omitting the
+    # row entirely reads as "no work of this type happened" (#518).
     cycle_times = [
         {
             "work_type": wt,
-            "tasks": len(hours),
+            "tasks": len(by_type.get(wt, [])),
             "estimated_tasks": estimated_by_type.get(wt, 0),
-            "median_hours": round(statistics.median(hours), 2),
+            "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
+            "median_hours": (
+                round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
+            ),
         }
-        for wt, hours in sorted(by_type.items())
+        for wt in sorted(set(by_type) | set(unmeasurable_by_type))
     ]
 
     return {
