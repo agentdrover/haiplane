@@ -95,6 +95,7 @@ from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
     ProjectBindError,
+    LimitExceededError,
     TaskNotFoundError,
     get_write_lock,
 )
@@ -1500,6 +1501,8 @@ async def api_add_risk(task_id: int, body: TaskRisk, request: Request):
         await services.add_risk(db, task_id, body)
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
+    except LimitExceededError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1533,6 +1536,8 @@ async def api_add_acceptance_criterion(
         )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
+    except LimitExceededError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, status.HTTP_409_CONFLICT) from exc
     if not created:
@@ -1588,6 +1593,8 @@ async def api_upsert_acceptance_criterion(
         )
     except TaskNotFoundError as exc:
         raise _not_found_to_http(exc) from exc
+    except LimitExceededError as exc:
+        raise HTTPException(422, str(exc)) from exc
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return ac
 
