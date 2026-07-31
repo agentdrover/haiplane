@@ -1008,7 +1008,10 @@ class GitOpsIntegration:
         cleanliness; a failed status is logged here and surfaces there as
         "cannot check".
         """
-        rc, out, err = await _git("status", "--porcelain", repo=repo, check=False)
+        # -z, not plain --porcelain: git escapes non-ASCII paths in the plain
+        # form, and these paths are compared against the task's declared areas,
+        # so an escaped name would read as a foreign file (#555).
+        rc, out, err = await _git("status", "--porcelain", "-z", repo=repo, check=False)
         if rc != 0:
             log.error(
                 "dirty_paths: git status failed in %s: %s",

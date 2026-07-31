@@ -20,33 +20,45 @@ import re
 
 __all__ = ["parse_porcelain_paths", "foreign_paths"]
 
-# XY status field: one or two codes, then whitespace, then the path.
+# The XY status field, then whitespace, then the path. Not a fixed-column
+# slice: callers hand us stripped output, and a stripped " M app.py" loses the
+# leading space, so line[3:] would eat the first character of the name.
 _STATUS = re.compile(r"^[ MADRCU?!]{1,2}\s+")
 
 
 def parse_porcelain_paths(porcelain: str) -> list[str]:
-    """Repo-relative paths from ``git status --porcelain`` output.
+    """Repo-relative paths from ``git status --porcelain -z`` output.
 
-    Renames arrive as ``R  old -> new``; both sides land in the commit, so both
-    are returned. Paths containing whitespace or non-ASCII are quoted by git —
-    the quotes are stripped, the escapes are left alone, because the result is
-    shown to a human, never fed back to git.
+    The ``-z`` form is not a preference: without it git quotes and escapes any
+    path that is not plain ASCII, so ``docs/Тест.md`` arrives as
+    ``"docs/\\320\\242..."``. These paths are not only shown to a human — they
+    go to :func:`foreign_paths` and are COMPARED against the task's declared
+    areas, where an escaped name matches nothing and a file the task declared
+    reads as somebody else's (#555). The original docstring here justified
+    leaving the escapes because the result "is never fed back to git": true of
+    git, and wrong about the other consumer, written in the same commit.
+
+    Records are NUL-separated. A rename or copy is two records — ``R<sp>new``
+    followed by the source path with no status field of its own — and both
+    sides land in the commit, so both are returned.
     """
     paths: list[str] = []
-    for line in porcelain.splitlines():
-        # Not a fixed-column slice: callers hand us stripped output, and a
-        # stripped " M app.py" loses its leading space, so line[3:] would eat
-        # the first character of the name. Match the status letters instead.
-        m = _STATUS.match(line)
+    records = [r for r in porcelain.split("\0") if r]
+    expect_source = False
+    for record in records:
+        if expect_source:
+            # The bare second half of a rename: no status field to match on.
+            expect_source = False
+            if record.strip():
+                paths.append(record.strip())
+            continue
+        m = _STATUS.match(record)
         if not m:
             continue
-        entry = line[m.end() :].strip()
-        for part in entry.split(" -> ") if " -> " in entry else [entry]:
-            part = part.strip()
-            if part.startswith('"') and part.endswith('"') and len(part) > 1:
-                part = part[1:-1]
-            if part:
-                paths.append(part)
+        path = record[m.end() :].strip()
+        if path:
+            paths.append(path)
+        expect_source = record.lstrip()[:1] in ("R", "C")
     return paths
 
 
