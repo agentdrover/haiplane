@@ -1021,6 +1021,54 @@ class GitOpsIntegration:
             return []
         return parse_porcelain_paths(out or "")
 
+    async def branch_diff_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> list[str] | None:
+        """Files the branch changes relative to its base, or None if unknowable.
+
+        None and [] are deliberately different: [] means "the branch changes
+        nothing", None means "we could not find out". Collapsing the two is
+        how a check reports agreement it never established — the same
+        one-value-two-meanings mistake that surfaced three times in #361.
+
+        ``-z`` from the start: git escapes non-ASCII paths in the plain form
+        exactly as ``git status`` does, and these paths are compared against
+        the task's declared areas, so an escaped name would read as
+        undeclared. Verified against real output before writing this (#555).
+        """
+        repo = repo or _repo_root()
+        base = _resolve_base(base_branch)
+        if not (branch or "").strip():
+            return None
+        rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
+        if rc != 0:
+            log.warning("branch_diff_paths: base %r not found in %s", base, repo)
+            return None
+        rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+        if rc != 0:
+            log.warning("branch_diff_paths: branch %r not found in %s", branch, repo)
+            return None
+        rc, out, err = await _git(
+            "diff",
+            "--name-only",
+            "-z",
+            f"{base}...{branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.warning(
+                "branch_diff_paths: diff failed for %s...%s: %s",
+                base,
+                branch,
+                (err or "").strip(),
+            )
+            return None
+        return [p for p in (out or "").split("\0") if p.strip()]
+
     async def auto_commit(
         self,
         task_id: int,

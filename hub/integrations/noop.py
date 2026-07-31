@@ -190,6 +190,14 @@ class NoopGitOps:
     async def dirty_paths(self, repo: str | None = None) -> list[str]:
         return []
 
+    async def branch_diff_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> list[str] | None:
+        return None
+
     async def auto_commit(
         self,
         task_id: int,
