@@ -31,7 +31,37 @@ DOR_CHECK_KEYS: tuple[str, ...] = (
     "has_validation_commands",
     "has_size",
     "has_wip_tag",
+    # Discovery checks (#331). Advisory — see DOR_ADVISORY_KEYS below.
+    "has_outcome_hypothesis",
+    "has_redesign_decision",
+    "has_agent_fit",
 )
+
+# Checks that are visible but free. They appear in the DoR table and earn a
+# recommendation, but cost nothing in the readiness score.
+#
+# Why a separate set rather than "just leave them out of every required
+# profile": a non-required failing check still costs penalty_optional
+# (readiness.py). Since no task in an existing installation can have these
+# fields — they did not exist until this change — every task in the backlog
+# would silently lose points on the day this ships, and would look like it
+# had got worse without anyone touching it. Advisory keys are scored at
+# zero, following the precedent of the AC-quality warnings (#331).
+DOR_ADVISORY_KEYS: frozenset[str] = frozenset(
+    {
+        "has_outcome_hypothesis",
+        "has_redesign_decision",
+        "has_agent_fit",
+    }
+)
+
+# Which work types are actually ASKED for Discovery. The spec scopes the
+# Discovery block to the feature profile, and that scoping is what keeps the
+# nudges meaningful: a bugfix or a chore has no outcome hypothesis to state,
+# and three permanent suggestions on every task in the backlog would become
+# wallpaper within a week. Checks outside this set are still evaluated and
+# still rendered — they just do not generate a suggestion (#331).
+DOR_ADVISORY_WORK_TYPES: frozenset[str] = frozenset({WorkType.feature.value})
 
 # Required check sets per work type.
 #
@@ -115,6 +145,10 @@ class DoREvaluation:
     checks: list[DoRCheckItem]
     required: frozenset[str]
     missing_required: frozenset[str]
+    # Advisory keys that this work type is asked about (#331). Never part of
+    # ``required``, so never blocking and never scored — they only decide
+    # whether a suggestion is offered.
+    advisory: frozenset[str] = frozenset()
 
     @property
     def passed(self) -> bool:
@@ -151,6 +185,9 @@ def evaluate_from_data(
     size: str | None,
     wip_tag: str | None,
     ac_count: int,
+    outcome_metric: str | None = None,
+    redesign_decision: str | None = None,
+    agent_fit: str | None = None,
 ) -> DoREvaluation:
     """Pure, side-effect-free DoR evaluation from explicit data.
 
@@ -207,13 +244,46 @@ def evaluate_from_data(
             passed=bool(wip_tag),
             detail=f"wip_tag = {wip_tag}" if wip_tag else "wip_tag is not set",
         ),
+        "has_outcome_hypothesis": DoRCheckItem(
+            key="has_outcome_hypothesis",
+            passed=bool(outcome_metric and outcome_metric.strip()),
+            detail=(
+                "outcome_metric is filled"
+                if outcome_metric
+                else "outcome_metric is empty"
+            ),
+        ),
+        "has_redesign_decision": DoRCheckItem(
+            key="has_redesign_decision",
+            passed=bool(redesign_decision),
+            detail=(
+                f"redesign_decision = {redesign_decision}"
+                if redesign_decision
+                else "redesign_decision is not set"
+            ),
+        ),
+        "has_agent_fit": DoRCheckItem(
+            key="has_agent_fit",
+            passed=bool(agent_fit),
+            detail=f"agent_fit = {agent_fit}" if agent_fit else "agent_fit is not set",
+        ),
     }
 
     # Stable order — always DOR_CHECK_KEYS — for deterministic UI rendering.
     checks = [checks_by_key[k] for k in DOR_CHECK_KEYS]
     required = _required_for(work_type)
     missing = frozenset(c.key for c in checks if c.key in required and not c.passed)
-    return DoREvaluation(checks=checks, required=required, missing_required=missing)
+    advisory = (
+        DOR_ADVISORY_KEYS
+        if (work_type or WorkType.feature.value) in DOR_ADVISORY_WORK_TYPES
+        else frozenset()
+    )
+    return DoREvaluation(
+        checks=checks,
+        required=required,
+        missing_required=missing,
+        advisory=advisory,
+    )
 
 
 async def evaluate_dor(db, task_id: int) -> DoREvaluation:
@@ -237,10 +307,15 @@ async def evaluate_dor(db, task_id: int) -> DoREvaluation:
         size=row["size"],
         wip_tag=row["wip_tag"],
         ac_count=len(acs),
+        outcome_metric=row["outcome_metric"],
+        redesign_decision=row["redesign_decision"],
+        agent_fit=row["agent_fit"],
     )
 
 
 __all__ = [
+    "DOR_ADVISORY_KEYS",
+    "DOR_ADVISORY_WORK_TYPES",
     "DOR_CHECK_KEYS",
     "DOR_REQUIRED_BY_WORK_TYPE",
     "DoREvaluation",

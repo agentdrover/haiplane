@@ -97,8 +97,9 @@
                 {% endif %}
             </section>
 
+            {% set has_discovery = task.outcome_metric or task.outcome_indicator or task.outcome_deadline or task.outcome_revisit_condition or task.redesign_decision or task.agent_fit %}
             {% set has_brief = task.user_story or task.problem_statement or task.business_value or task.technical_hints or task.scope_in or task.scope_out or task.affected_areas or task.validation_commands or task.constraints or task.assumptions or task.out_of_scope_for_review %}
-            {% if has_brief %}
+            {% if has_brief or has_discovery %}
             <section class="task-content-card">
                 <div class="task-card-header">
                     <h2>Developer Brief</h2>
@@ -115,6 +116,30 @@
                     {% if task.business_value %}
                     <dt>Value</dt>
                     <dd class="u-pre-wrap">{{ task.business_value }}</dd>
+                    {% endif %}
+                    {% if task.outcome_metric %}
+                    <dt>Outcome Metric</dt>
+                    <dd class="u-pre-wrap">{{ task.outcome_metric }}</dd>
+                    {% endif %}
+                    {% if task.outcome_indicator %}
+                    <dt>Leading Indicator</dt>
+                    <dd class="u-pre-wrap">{{ task.outcome_indicator }}</dd>
+                    {% endif %}
+                    {% if task.outcome_deadline %}
+                    <dt>Checked By</dt>
+                    <dd class="u-pre-wrap">{{ task.outcome_deadline }}</dd>
+                    {% endif %}
+                    {% if task.outcome_revisit_condition %}
+                    <dt>Revisit If</dt>
+                    <dd class="u-pre-wrap">{{ task.outcome_revisit_condition }}</dd>
+                    {% endif %}
+                    {% if task.redesign_decision %}
+                    <dt>Redesign Decision</dt>
+                    <dd class="u-pre-wrap">{{ task.redesign_decision.value }}{% if task.redesign_rationale %} — {{ task.redesign_rationale }}{% endif %}</dd>
+                    {% endif %}
+                    {% if task.agent_fit %}
+                    <dt>Agent Fit</dt>
+                    <dd class="u-pre-wrap">{{ task.agent_fit.value }}</dd>
                     {% endif %}
                     {% if task.technical_hints %}
                     <dt>Technical Hints</dt>

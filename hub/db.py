@@ -622,6 +622,42 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE task_updates ADD COLUMN author_kind TEXT "
         "NOT NULL DEFAULT 'legacy'",
     ),
+    (
+        "add_outcome_metric_column",
+        "ALTER TABLE tasks ADD COLUMN outcome_metric TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_outcome_indicator_column",
+        "ALTER TABLE tasks ADD COLUMN outcome_indicator TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_outcome_deadline_column",
+        "ALTER TABLE tasks ADD COLUMN outcome_deadline TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_outcome_revisit_condition_column",
+        "ALTER TABLE tasks ADD COLUMN outcome_revisit_condition TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Nullable on purpose: this column holds an enum, and NULL is the
+        # only honest "not chosen". A NOT NULL DEFAULT '' would make the
+        # empty string a third state that is neither a valid choice nor
+        # absent, and TaskView would fail to coerce it (#331).
+        "add_redesign_decision_column",
+        "ALTER TABLE tasks ADD COLUMN redesign_decision TEXT",
+    ),
+    (
+        "add_redesign_rationale_column",
+        "ALTER TABLE tasks ADD COLUMN redesign_rationale TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Nullable on purpose: this column holds an enum, and NULL is the
+        # only honest "not chosen". A NOT NULL DEFAULT '' would make the
+        # empty string a third state that is neither a valid choice nor
+        # absent, and TaskView would fail to coerce it (#331).
+        "add_agent_fit_column",
+        "ALTER TABLE tasks ADD COLUMN agent_fit TEXT",
+    ),
 ]
 
 
@@ -713,6 +749,18 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "risks",
     "prepared_by",
     "prepared_at",
+    # Discovery block (#331). These names carry the read path too:
+    # structured_fields_to_db writes whatever the model has, but
+    # structured_fields_from_row — and therefore TaskView — only returns
+    # what is listed here. A field added to the model and forgotten here
+    # is stored and never seen again.
+    "outcome_metric",
+    "outcome_indicator",
+    "outcome_deadline",
+    "outcome_revisit_condition",
+    "redesign_decision",
+    "redesign_rationale",
+    "agent_fit",
 )
 
 

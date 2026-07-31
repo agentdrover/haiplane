@@ -31,7 +31,7 @@ from hub.models import (
     RiskSeverity,
     TaskRisk,
 )
-from hub.services.dor import DoREvaluation, evaluate_dor
+from hub.services.dor import DOR_ADVISORY_KEYS, DoREvaluation, evaluate_dor
 
 log = logging.getLogger("hub.services.readiness")
 
@@ -109,6 +109,13 @@ def calculate_score_from_data(
 
     for check in dor.checks:
         if check.passed:
+            continue
+        if check.key in DOR_ADVISORY_KEYS:
+            # Advisory checks are visible but free (#331): they surface in the
+            # DoR table and earn a recommendation, but never move the score.
+            # Charging even penalty_optional here would drop every task in an
+            # existing backlog on the day the check ships, since no task can
+            # have a field that did not exist yesterday.
             continue
         is_required = check.key in dor.required
         penalty = config.penalty_required if is_required else config.penalty_optional
