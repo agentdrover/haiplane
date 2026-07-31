@@ -1065,6 +1065,9 @@ async def pair_start_task(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    # The status the decision below is made from; the transition must start
+    # from exactly this value, not from whatever the row holds later.
+    starting_status = task["status"]
     assigned_agent = (body.assigned_agent or "").strip() if body else ""
     if not assigned_agent:
         assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
@@ -1129,7 +1132,6 @@ async def pair_start_task(
         assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
 
     update_fields: dict[str, Any] = {
-        "status": "running",
         "job_id": None,
         "assigned_agent": assigned_agent,
     }
@@ -1138,6 +1140,21 @@ async def pair_start_task(
     if branch:
         update_fields["branch"] = branch
 
+    # #365 K4: the status was written unconditionally, and everything between
+    # the check above and this line is a window — branch preparation talks to
+    # git and can take seconds. Another claim, a human decision or the poller
+    # could move the task meanwhile, and the last writer simply won. Transition
+    # from the status we actually read, so a lost race is reported instead of
+    # overwriting somebody else's move. expected_from is that status and not a
+    # literal: pair-start legitimately begins from `open` or from `claimed`.
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=starting_status, new_status="running"
+    ):
+        raise HTTPException(
+            409,
+            f"Task #{task_id} left {starting_status!r} during pair-start; "
+            "retry from its current status",
+        )
     await repo.update_task(db, task_id, **update_fields)
     await db.commit()
     await log_activity(
