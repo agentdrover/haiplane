@@ -416,6 +416,11 @@ async def test_readiness_full_feature_returns_100(client: AsyncClient):
             "size": "S",
             "wip_tag": "feature_work",
             "acceptance_criteria": [_ac_payload(1)],
+            # Discovery (#331): a complete feature answers "why this, in what
+            # form", not only "what to build".
+            "outcome_metric": "median lead time, 3d -> 1d",
+            "redesign_decision": "adapt",
+            "agent_fit": "sdd_native",
         },
     )
     resp = await client.get(f"/api/tasks/{task['id']}/readiness")

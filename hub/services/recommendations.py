@@ -26,7 +26,7 @@ from hub.models import (
     Recommendation,
     RecommendationSeverity,
 )
-from hub.services.dor import DoREvaluation, evaluate_dor
+from hub.services.dor import DOR_ADVISORY_KEYS, DoREvaluation, evaluate_dor
 from hub import repository as repo
 from hub.models import ReadinessReport
 from hub.services.readiness import (
@@ -119,6 +119,36 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
             "so this task counts against the right capacity bucket."
         ),
         "minutes": 1,
+    },
+    "has_outcome_hypothesis": {
+        "field": "outcome_metric",
+        "message": (
+            "State which number should move once this ships, and by when — "
+            "for example 'median time from task created to first commit, "
+            "from 3 days to 1, checked 4 weeks after release'. Without it "
+            "the value of the task can be argued but never checked."
+        ),
+        "minutes": 5,
+    },
+    "has_redesign_decision": {
+        "field": "redesign_decision",
+        "message": (
+            "Record whether this adapts the current process or reshapes it "
+            "(adapt / redesign), and why. Choosing 'adapt' is fine; choosing "
+            "it without noticing is how an old process gets automated onto "
+            "new technology."
+        ),
+        "minutes": 3,
+    },
+    "has_agent_fit": {
+        "field": "agent_fit",
+        "message": (
+            "Say how much agency this work wants: deterministic (scripted), "
+            "assistant (a human drives), sdd_native (the spec is the "
+            "contract), or agentic (the agent picks the steps). It decides "
+            "who does the work, not just how it is written down."
+        ),
+        "minutes": 2,
     },
 }
 
@@ -216,7 +246,13 @@ def _recommendation_for(
     if template is None:
         return None
     severity: RecommendationSeverity = "blocking" if is_required else "low"
-    delta = config.penalty_required if is_required else config.penalty_optional
+    if check.key in DOR_ADVISORY_KEYS:
+        # Advisory checks cost nothing in readiness (#331), so the promised
+        # delta must be zero too — a recommendation claiming +5 that never
+        # arrives teaches the author to distrust the number.
+        delta = 0
+    else:
+        delta = config.penalty_required if is_required else config.penalty_optional
     return Recommendation(
         field=template["field"],
         severity=severity,
@@ -244,6 +280,9 @@ def build_recommendations(
     recs: list[Recommendation] = []
     for check in dor.checks:
         if check.passed:
+            continue
+        if check.key in DOR_ADVISORY_KEYS and check.key not in dor.advisory:
+            # This work type is not asked for Discovery — stay quiet (#331).
             continue
         rec = _recommendation_for(
             check, is_required=check.key in dor.required, config=config
