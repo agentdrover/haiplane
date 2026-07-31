@@ -154,7 +154,21 @@ async def practice_metrics(
         if confirmed_with_tokens
         else None
     )
-    totals["filtration_rate"] = round(1 - confirmed / raw, 3) if raw else None
+    # Filtration is the share of raw findings that did not survive. Computed
+    # against the self-reported raw_count it counted findings that were never
+    # adjudicated at all as successfully filtered noise — 75 of 192 on
+    # production, 39% of the sample, inflating the rate from 0.573 to 0.740.
+    # That flatters the harness in exactly the direction nobody questions.
+    #
+    # The denominator is now what was actually accounted for. The gap is
+    # reported beside it rather than hidden: a rate over an unstated fraction
+    # of the findings is the same kind of half-truth (#519).
+    rejected = totals["rejected_total"] or 0
+    adjudicated = confirmed + rejected
+    totals["findings_unaccounted"] = max(raw - adjudicated, 0)
+    totals["filtration_rate"] = (
+        round(1 - confirmed / adjudicated, 3) if adjudicated else None
+    )
 
     harness_rows = await db.execute_fetchall(
         "SELECT harness_skill, harness_version, COUNT(*) AS reviews, "
