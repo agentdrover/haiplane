@@ -1010,7 +1010,12 @@ class ProjectCreate(BaseModel):
 
 
 class ProjectPatch(BaseModel):
-    """PATCH semantics: omitted fields stay unchanged (#338)."""
+    """PATCH semantics: omitted fields stay unchanged (#338).
+
+    ``None`` here means "not sent", never "set this to null" — every column
+    on ``projects`` is NOT NULL, so an explicit null has no valid meaning and
+    is rejected below (#366).
+    """
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
     repo: str | None = Field(default=None, max_length=200)
@@ -1019,6 +1024,32 @@ class ProjectPatch(BaseModel):
     default_branch_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_null(cls, data: Any) -> Any:
+        """Refuse a key that was sent with an explicit null.
+
+        The optional types above exist to express "omitted", which is what
+        PATCH needs. They also, accidentally, accepted a literal null, which
+        then travelled through model_dump(exclude_unset=True) into a NOT NULL
+        column and surfaced as a raw 500 from IntegrityError. Sending null is
+        a malformed request, so it belongs in 422 — and the distinction has
+        to be made here, on the raw input, because by the time the model is
+        built "sent as null" and "not sent" both read as None.
+        """
+        if not isinstance(data, dict):
+            return data
+        nulls = sorted(
+            k for k, v in data.items() if v is None and k in cls.model_fields
+        )
+        if nulls:
+            raise ValueError(
+                "null is not a valid value for "
+                + ", ".join(nulls)
+                + "; omit the field to leave it unchanged"
+            )
+        return data
 
 
 class MachineFinding(BaseModel):
