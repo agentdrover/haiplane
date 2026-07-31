@@ -187,3 +187,68 @@ async def test_non_test_criteria_never_need_a_locator(
     await services.add_acceptance_criterion(db, task_id, manual)
 
     assert len(await repo.list_acceptance_criteria(db, task_id)) == 1
+
+
+# --- the guard against a sixth path ----------------------------------------
+
+
+def test_every_repository_ac_write_sits_behind_the_gate():
+    """Whoever adds the next write path will not remember this rule.
+
+    Submission #1 guarded four paths, found by reading refinement.py. The
+    fifth lived in lifecycle.py and wrote acceptance criteria straight through
+    the repository — the review caught it, not me, because I enumerated by
+    module instead of by repository call.
+
+    So this test enumerates by repository call. It walks the source for every
+    AC-write on the repository and asserts the enclosing function also invokes
+    the locator guard. A sixth bypass fails here rather than being discovered
+    in a brief months later.
+    """
+    import ast
+    from pathlib import Path
+
+    writes = {
+        "replace_acceptance_criteria",
+        "add_acceptance_criterion",
+        "upsert_acceptance_criterion",
+    }
+    guards = {"_guard_ac_locator", "validate_test_locators"}
+    offenders: list[str] = []
+
+    for path in sorted(Path("hub").rglob("*.py")):
+        if path.name == "repository.py":
+            continue  # the repository IS the write; policy lives above it
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Only repository-level writes count. A route calling
+            # services.add_acceptance_criterion is already behind the gate, and
+            # matching the bare method name would flag it — turning this guard
+            # into noise that gets deleted.
+            repo_writes = {
+                node.func.attr
+                for node in ast.walk(func)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"repo", "repository"}
+                and node.func.attr in writes
+            }
+            called = {
+                node.func.attr
+                for node in ast.walk(func)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            } | {
+                node.func.id
+                for node in ast.walk(func)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            if repo_writes and not (called & guards):
+                offenders.append(f"{path}::{func.name}")
+
+    assert not offenders, (
+        "these functions write acceptance criteria without applying the "
+        f"locator policy: {offenders}"
+    )
