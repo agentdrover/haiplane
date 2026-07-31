@@ -1844,9 +1844,16 @@ async def hub_submit_machine_review(
         return _format_hub_api_error(exc)
     confirmed = len(result.get("findings_confirmed") or [])
     rejected = len(result.get("findings_rejected") or [])
+    # Every number in this line comes from what was STORED, not from what was
+    # sent. Intake normalises raw_count upward when a report claims fewer raw
+    # findings than it lists (#519), and echoing the input here would confirm
+    # a number the record does not hold — which the agent then quotes into the
+    # task log. A task about trustworthy numbers cannot ship a receipt that
+    # disagrees with the row it describes.
+    stored_raw = result.get("raw_count", raw_count)
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
-        f"#{result.get('submission_generation')}): {raw_count} raw → "
+        f"#{result.get('submission_generation')}): {stored_raw} raw → "
         f"{confirmed} confirmed / {rejected} rejected.",
         machine_review=result,
     )
