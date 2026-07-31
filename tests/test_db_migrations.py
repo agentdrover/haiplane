@@ -553,3 +553,60 @@ async def test_machine_review_incompleteness_migration_preserves_rows():
         assert row["lost_dimensions"] == "[]"
     finally:
         await conn.close()
+
+
+async def test_task_update_principal_migration_preserves_rows():
+    """#559 AC-2. Rows written before the field keep their content and are
+    distinguishable from "written by nobody we can name".
+
+    The DB default is 'legacy' precisely so history says what it is. A single
+    NULL would have meant three things at once — predates the field, written
+    by the hub, written without authentication — and that collapse is what
+    this task removes.
+    """
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        # A row as it would have been inserted before the migration.
+        await conn.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (1, 'pda_claude', 'status', 'written before the field')"
+        )
+        row = (
+            await conn.execute_fetchall(
+                "SELECT agent, content, principal_id, author_kind FROM task_updates"
+            )
+        )[0]
+        assert row["content"] == "written before the field", "no data lost"
+        assert row["agent"] == "pda_claude"
+        assert row["principal_id"] is None
+        assert row["author_kind"] == "legacy", (
+            "history must say it predates the field, not impersonate the hub"
+        )
+    finally:
+        await conn.close()
+
+
+async def test_hub_written_update_is_not_confused_with_history():
+    """The other half of AC-2: absence of a principal has distinct reasons."""
+    from hub import repository as repo
+
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        await repo.add_task_update(conn, 1, "hub", "alert", "conveyor said so")
+        row = (
+            await conn.execute_fetchall(
+                "SELECT principal_id, author_kind FROM task_updates"
+            )
+        )[0]
+        assert row["principal_id"] is None
+        assert row["author_kind"] == "hub", (
+            "the hub has no principal by nature; that is not the same as legacy"
+        )
+    finally:
+        await conn.close()

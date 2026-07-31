@@ -3041,3 +3041,144 @@ async def test_machine_review_requires_explicit_incomplete(client: AsyncClient, 
 
     assert resp.status_code == 422
     assert "incomplete" in resp.text
+
+
+# ---- Update authorship: principal, not the name in the body (#559) ----
+
+
+async def test_task_update_records_authenticated_principal(
+    client: AsyncClient, monkeypatch
+):
+    """#559 AC-1. The body may claim any name; the principal is the fact.
+
+    Observed live on 30.07.2026: a done report appeared "from pda_claude" out
+    of a parallel session, and telling whose it was took guesswork over
+    timestamps and writing style.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    created = await client.post(
+        "/api/tasks", json={"title": "Authorship"}, headers=human
+    )
+    task_id = created.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "somebody-elses-name", "kind": "status", "content": "x"},
+        headers=impl,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["principal_id"] == 7, "the principal must come from the token"
+    assert body["author_kind"] == "principal"
+    assert body["agent"] == "somebody-elses-name", (
+        "the display name is stored as sent — the task does not forbid it"
+    )
+
+
+async def test_update_feed_exposes_principal_when_known(
+    client: AsyncClient, monkeypatch
+):
+    """#559 AC-3. A hub-written update and a principal-written one must be
+    distinguishable without guessing from the name."""
+    from hub import config
+    from hub import repository as repo_module
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+    impl = {"Authorization": "Bearer impl-pid-token"}
+
+    created = await client.post("/api/tasks", json={"title": "Feed"}, headers=human)
+    task_id = created.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "hub", "kind": "status", "content": "by a principal"},
+        headers=impl,
+    )
+
+    feed = (await client.get(f"/api/tasks/{task_id}/updates", headers=human)).json()
+    mine = [u for u in feed if u["content"] == "by a principal"][0]
+    assert mine["principal_id"] == 7 and mine["author_kind"] == "principal"
+
+    # An update the hub writes itself has no principal, and says why.
+    assert repo_module.add_task_update  # writer used by the conveyor
+    hub_written = [u for u in feed if u["author_kind"] == "hub"]
+    for u in hub_written:
+        assert u["principal_id"] is None
+
+
+async def test_open_mode_update_has_no_principal(client: AsyncClient, monkeypatch):
+    """#559 AC-4. No tokens configured: the write still works, and "no identity"
+    is recorded as such rather than as the hub or as history."""
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", {})
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", True)
+
+    created = await client.post("/api/tasks", json={"title": "Open mode"})
+    task_id = created.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "anyone", "kind": "status", "content": "x"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["principal_id"] is None
+    assert resp.json()["author_kind"] == "anonymous"
+
+
+async def test_review_verdict_update_records_the_reviewer_principal(
+    client: AsyncClient, monkeypatch
+):
+    """#559 scope item 5: the verdict is authored by a principal too.
+
+    The endpoint already resolved an identity to check reviewer independence.
+    Filing the verdict without it would have labelled a principal-authored
+    update as hub-written — the very confusion this task removes, reintroduced
+    one function over.
+    """
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _principal_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    human = {"Authorization": "Bearer human-token"}
+    reviewer = {"Authorization": "Bearer other-pid-token"}
+
+    created = await client.post("/api/tasks", json={"title": "Verdict"}, headers=human)
+    task_id = created.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+        headers=human,
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "dev"},
+        headers={"Authorization": "Bearer impl-pid-token"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={},
+        headers={"Authorization": "Bearer impl-pid-token"},
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "any-display-name"},
+        headers=reviewer,
+    )
+    assert resp.status_code == 200, resp.text
+
+    feed = (await client.get(f"/api/tasks/{task_id}/updates", headers=human)).json()
+    verdicts = [u for u in feed if u["kind"] == "review"]
+    assert verdicts, "the verdict must appear in the feed"
+    assert verdicts[-1]["principal_id"] == 8
+    assert verdicts[-1]["author_kind"] == "principal"

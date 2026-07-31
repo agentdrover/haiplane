@@ -1070,7 +1070,11 @@ async def api_review_verdict(
             username=identity.username,
         )
     return await services.record_review_verdict(
-        db, task_id, body, self_approved=self_approved
+        db,
+        task_id,
+        body,
+        self_approved=self_approved,
+        principal_id=identity.principal_id,
     )
 
 
@@ -1380,7 +1384,14 @@ async def api_force_complete_task(
 
 @app.post("/api/tasks/{task_id}/updates", response_model=TaskUpdateView)
 async def api_add_task_update(task_id: int, body: TaskUpdateCreate, request: Request):
-    return await services.add_update(_db(request), task_id, body)
+    # Authorship is taken from the authenticated identity, not from the body
+    # (#559) — the same rule the review verdict already follows.
+    return await services.add_update(
+        _db(request),
+        task_id,
+        body,
+        principal_id=current_identity(request).principal_id,
+    )
 
 
 @app.get("/api/tasks/{task_id}/updates", response_model=list[TaskUpdateView])

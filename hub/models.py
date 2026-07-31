@@ -741,6 +741,13 @@ class TaskUpdateView(BaseModel):
     kind: str
     content: str
     created_at: str
+    # Authorship (#559). ``agent`` is a display name the client picks; these
+    # two are the fact. author_kind says WHY principal_id is absent when it is:
+    # "legacy" predates the field, "hub" is the hub writing its own updates,
+    # "anonymous" is a request with no authenticated identity. One NULL could
+    # not have told those apart.
+    principal_id: int | None = None
+    author_kind: str = "legacy"
 
     @field_validator("created_at", mode="before")
     @classmethod
