@@ -2528,7 +2528,12 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
     assert mr["raw_total"] == 16
     assert mr["confirmed_total"] == 3
     assert mr["tokens_total"] == 1_000_000
-    assert mr["tokens_per_confirmed"] == round(1_000_000 / 3)
+    # #516: cost per finding divides by the findings of the reports that
+    # actually reported a cost — 2 of the 3 here. Dividing by all 3 mixed a
+    # report that named its cost with one that did not, and understated the
+    # answer; this assertion used to pin that understatement in place.
+    assert mr["confirmed_with_tokens"] == 2
+    assert mr["tokens_per_confirmed"] == round(1_000_000 / 2)
     assert mr["reports_without_tokens"] == 1  # второй отчёт без токенов
     assert abs(mr["filtration_rate"] - (1 - 3 / 16)) < 0.001
 
