@@ -9,6 +9,10 @@ the author's macOS and left the command running on the Linux production host.
 
 Spawn with ``start_new_session=True`` and signal the whole process group; the
 outcome then does not depend on a shell optimisation.
+
+Lives at the top level rather than under ``hub.services`` because
+``hub.services.__init__`` imports the world: git_ops needs this helper for its
+subprocess timeout (#363), and importing it from there would be a cycle.
 """
 
 from __future__ import annotations

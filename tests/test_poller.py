@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hub import config
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopDispatch, NoopGitOps
@@ -1246,3 +1247,243 @@ async def test_poller_creates_the_pr_in_the_projects_repo(mock_sleep, db):
     kwargs = mock_git.create_pr.await_args.kwargs
     assert kwargs["gh_repo"] == "org/other-repo"
     assert kwargs["base_branch"] == "develop"
+
+
+# ---- #363 I5: one task's failure must not abandon the tick ----
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_a_failing_task_does_not_abandon_the_rest_of_the_tick(mock_sleep, db):
+    """#363 I5. The whole sweep sat in one try/except, so one exception skipped
+    every later stage — review, ci_check, stale sweeps, claim expiry — and did
+    so again every tick until the cause cleared. Reproduced before the fix: a
+    hung git call raised TimeoutError straight out of _run.
+    """
+    running_id = await repo.create_task(
+        db,
+        title="Running task that will blow up",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, running_id, job_id="job-boom")
+    ci_id = await _make_ci_task(db)
+    await db.commit()
+
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.get_job = MagicMock(side_effect=RuntimeError("hung git call"))
+    plugins.dispatch = mock_dispatch
+
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_running")
+    )
+    plugins.git_ops = mock_git
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.check_pr_ci.await_count >= 1, (
+        f"the ci_check stage must still run for task #{ci_id} after task "
+        f"#{running_id} raised"
+    )
+
+
+# ---- #363 T2: a red PR must never be auto-merged ----
+
+
+async def _approved_task_with_pr(db, *, pr_number=99):
+    task_id = await _make_review_task(db)
+    await repo.update_task(db, task_id, pr_number=pr_number, branch="task-x/b")
+    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await db.commit()
+    return task_id
+
+
+def _completed_job_dispatch():
+    d = NoopDispatch()
+    d.get_job = MagicMock(return_value={"status": "completed", "exit_code": 0})
+    return d
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_failed_ci_blocks_the_auto_merge(mock_sleep, db):
+    """#363 T2, the highest-value gap in this task.
+
+    Replacing the CI gate with `if True:` — auto-merging a RED pull request into
+    the integration branch — survived all 1119 tests before this. The positive
+    case had a test (#362); the refusal had none.
+    """
+    task_id = await _approved_task_with_pr(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    mock_git.merge_pr.assert_not_awaited()
+    updates = await repo.get_task_updates(db, task_id)
+    assert any("CI failed" in u["content"] for u in updates)
+
+    # An approved verdict is not delivery. Completing here would report a task
+    # as done while its work sits unmerged in a branch — the one thing the
+    # status exists to rule out.
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert len(events) == 1
+    assert "ci_failed" in str(events[0]["payload"])
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_pending_ci_also_blocks_the_auto_merge(mock_sleep, db):
+    """Only a passing probe may merge. "Not yet answered" is not "passed"."""
+    await _approved_task_with_pr(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_running")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    mock_git.merge_pr.assert_not_awaited()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_passing_ci_merges_exactly_once(mock_sleep, db):
+    await _approved_task_with_pr(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    mock_git.pull_main = AsyncMock(return_value=True)
+    mock_git.delete_branch = AsyncMock(return_value=None)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.merge_pr.await_count == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_a_refused_merge_also_stops_completion(mock_sleep, db):
+    """The second way a task used to reach `completed` unmerged.
+
+    CI is green, but GitHub refuses the merge. merge_pr returned False and
+    nobody read it: the completion branch ran regardless.
+    """
+    task_id = await _approved_task_with_pr(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=False)  # merge refused by GitHub
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    assert mock_git.merge_pr.await_count == 1
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert len(events) == 1
+    assert "merge_failed" in str(events[0]["payload"])
+
+
+# ---- #363 T3: the CI-fix loop had no coverage at all ----
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_failed_ci_dispatches_a_fix_below_the_limit(mock_sleep, db):
+    """#363 T3. Nothing in the suite mentioned ci_fix before this — removing the
+    cycle limit entirely survived all 1119 tests, so a task could loop forever.
+    """
+    task_id = await _make_ci_task(db)
+    await repo.update_task(db, task_id, ci_fix_cycle=0)
+    await db.commit()
+
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    mock_git.get_ci_failure_logs = AsyncMock(return_value="pytest exploded")
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with (
+        patch(
+            "hub.poller.services.dispatch_ci_fix", new_callable=AsyncMock
+        ) as dispatch_fix,
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    dispatch_fix.assert_awaited_once()
+    assert dispatch_fix.await_args.args[2] == "pytest exploded", (
+        "the fixing agent must receive the actual CI logs"
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] != "needs_decision"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_ci_fix_limit_escalates_instead_of_looping(mock_sleep, db):
+    """At the limit the loop must stop and hand the task to a human."""
+    task_id = await _make_ci_task(db)
+    await repo.update_task(db, task_id, ci_fix_cycle=config.MAX_CI_FIX_CYCLES)
+    await db.commit()
+
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    mock_git.get_ci_failure_logs = AsyncMock(return_value="still red")
+    plugins.git_ops = mock_git
+    plugins.dispatch = NoopDispatch()
+
+    with (
+        patch(
+            "hub.poller.services.dispatch_ci_fix", new_callable=AsyncMock
+        ) as dispatch_fix,
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    dispatch_fix.assert_not_awaited()
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    events = await _events_for(db, task_id, "needs_decision")
+    assert len(events) == 1
+    assert events[0]["payload"] and "ci_fix_cycle_limit" in str(events[0]["payload"])
+    updates = await repo.get_task_updates(db, task_id)
+    assert any("cycle limit reached" in u["content"] for u in updates)

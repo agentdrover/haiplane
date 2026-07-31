@@ -1350,3 +1350,78 @@ async def test_squash_measures_from_the_branchs_own_base(tmp_path) -> None:
     assert sorted(changed) == ["task1.py", "task2.py"], (
         f"the PR must show the task's work only, not the base's own commits: {changed}"
     )
+
+
+# --- #363 I5: a hung subprocess must not escape, and must not survive ---
+
+
+async def test_run_returns_a_controlled_error_on_timeout() -> None:
+    """#363 I5. This used to raise straight out of _run.
+
+    The poller wraps its whole tick in one try/except, so the escaping
+    TimeoutError abandoned every later stage of that tick — and did so again
+    every tick until the cause cleared.
+    """
+    import time
+
+    from hub.integrations.git_ops import _TIMEOUT_RC, _run
+
+    started = time.monotonic()
+    rc, out, err = await _run("sleep", "30", timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert rc == _TIMEOUT_RC, "a timeout must be reported, not raised"
+    assert out == ""
+    assert "timed out after 1s" in err and "sleep" in err
+    assert elapsed < 10, f"timeout took {elapsed:.1f}s — it waited for the command"
+
+
+async def test_run_kills_the_process_it_gave_up_on() -> None:
+    """asyncio cancels the read, not the process — the child outlived us.
+
+    Reproduced before the fix on a real subprocess: the command was still
+    running after _run returned. The shape here is deliberate. A one-command
+    ``sh -c`` execs itself away, taking the marker out of the command line and
+    leaving nothing for pgrep to find — that first draft passed with the kill
+    removed. Two statements keep the shell alive as a parent, and the unique
+    sleep duration identifies the grandchild, so this fails both when the kill
+    is dropped and when start_new_session is, which downgrades the group kill
+    to a single-pid kill that never reaches the grandchild.
+    """
+    import asyncio
+    import subprocess
+    import uuid
+
+    from hub.integrations.git_ops import _run
+
+    marker = f"hub-probe-{uuid.uuid4().hex[:8]}"
+    duration = f"30.{uuid.uuid4().int % 9000 + 1000}"
+
+    def survivors() -> list[str]:
+        out = subprocess.run(
+            ["pgrep", "-f", f"sleep {duration}"], capture_output=True, text=True
+        ).stdout.split()
+        return [p for p in out if p.strip()]
+
+    import time
+
+    started = time.monotonic()
+    rc, _, _ = await _run("sh", "-c", f"sleep {duration}; : {marker}", timeout=1)
+    elapsed = time.monotonic() - started
+    assert rc != 0
+    # A timeout that still waits for the command is not a timeout. Without
+    # start_new_session the group kill refuses to fire — it would signal the
+    # hub's own group — and the fallback reaches only the shell; the orphaned
+    # grandchild keeps the inherited pipes open, so the reap blocks for the
+    # command's full duration. Measured at 30s against 1s here.
+    assert elapsed < 10, f"timeout took {elapsed:.1f}s — it waited for the command"
+
+    for _ in range(20):  # the kill is a signal; give the reaper a moment
+        if not survivors():
+            break
+        await asyncio.sleep(0.1)
+
+    left = survivors()
+    for pid in left:  # never leave a stray behind, even when asserting
+        subprocess.run(["kill", "-9", pid], capture_output=True)
+    assert not left, f"process survived the timeout: {left}"
