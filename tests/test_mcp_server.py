@@ -10,6 +10,7 @@ from mcp.types import CallToolResult, TextContent
 
 from hub.mcp_structured import MCP_STRUCTURED_SCHEMA_VERSION
 from hub.mcp_server import (
+    hub_submit_machine_review,
     HubApiError,
     hub_add_acceptance_criterion,
     hub_add_risk,
@@ -2810,3 +2811,33 @@ async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> N
     text = _mcp_text(await hub_my_context())
     assert "Workspace mode: worktree" in text
     assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"
+
+
+async def test_machine_review_receipt_quotes_the_stored_raw_count(
+    mock_api_post: AsyncMock,
+) -> None:
+    """#519: the confirmation line must report what was stored, not what was
+    sent.
+
+    Intake normalises raw_count upward when a report claims fewer raw findings
+    than it lists. Echoing the input made the receipt disagree with the row it
+    describes — and the agent copies that line into the task log, so the wrong
+    number becomes the record. Found in review of submission #1.
+    """
+    mock_api_post.return_value = {
+        "submission_generation": 1,
+        "raw_count": 2,  # normalised up from the 0 that was sent
+        "findings_confirmed": [{"title": "a"}, {"title": "b"}],
+        "findings_rejected": [],
+    }
+
+    out = await hub_submit_machine_review(
+        7,
+        raw_count=0,
+        incomplete=False,
+        findings_confirmed=[{"title": "a"}, {"title": "b"}],
+    )
+
+    text = out.content[0].text if hasattr(out, "content") else str(out)
+    assert "2 raw" in text
+    assert "0 raw" not in text, "the receipt must not repeat the un-normalised input"
