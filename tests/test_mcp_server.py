@@ -10,6 +10,7 @@ from mcp.types import CallToolResult, TextContent
 
 from hub.mcp_structured import MCP_STRUCTURED_SCHEMA_VERSION
 from hub.mcp_server import (
+    HubApiError,
     hub_add_acceptance_criterion,
     hub_add_risk,
     hub_admin_my_identity,
@@ -272,24 +273,92 @@ async def test_hub_pair_start(
     )
 
 
-async def test_hub_ask_question(mock_api_post: AsyncMock) -> None:
+async def test_hub_ask_question(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#369 AC-1: asking a question is a lifecycle move, so it answers with the
+    same envelope as every neighbouring mutation tool."""
     mock_api_post.return_value = {"status": "needs_info"}
+    mock_api_get.side_effect = [
+        {"id": 39, "status": "running"},
+        {"id": 39, "status": "needs_info"},
+    ]
+
     msg = await hub_ask_question(39, "Which scope first?", agent="composer")
-    assert "needs_info" in msg
+
+    payload = json.loads(msg)
+    assert "needs_info" in payload["message"], "the human-readable text stays"
+    assert payload["status"] == "needs_info"
+    assert payload["transition"] == {"from": "running", "to": "needs_info"}
+    assert payload["awaiting"] == "human_decision"
+    assert payload["actor_hint"] == "human"
+    assert payload["next_action"]
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/39/question",
         {"agent": "composer", "question": "Which scope first?"},
     )
 
 
-async def test_hub_answer_question(mock_api_post: AsyncMock) -> None:
+async def test_hub_answer_question(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#369 AC-1, the way back out of needs_info."""
     mock_api_post.return_value = {"status": "open", "job_id": None}
+    mock_api_get.side_effect = [
+        {"id": 40, "status": "needs_info"},
+        {"id": 40, "status": "open", "job_id": None},
+    ]
+
     msg = await hub_answer_question(40, "Use REST", resume=True)
-    assert "status: open" in msg
+
+    payload = json.loads(msg)
+    assert "status: open" in payload["message"]
+    assert payload["status"] == "open"
+    assert payload["transition"] == {"from": "needs_info", "to": "open"}
+    assert payload["awaiting"] == "none"
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/40/answer",
         {"answer": "Use REST", "resume": True},
     )
+
+
+@pytest.mark.parametrize("tool", [hub_ask_question, hub_answer_question])
+async def test_ask_answer_refusal_is_structured_not_raised(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock, tool
+) -> None:
+    """#369 AC-2. Before the fix both let HubApiError escape, so an agent hit
+    by a human-only gate got a raw exception instead of a payload naming the
+    reason and the next step."""
+    mock_api_get.return_value = {"id": 41, "status": "running"}
+    mock_api_post.side_effect = HubApiError(
+        {"reason": "human_only_gate", "message": "human token required"}
+    )
+
+    out = await tool(41, "x")
+
+    payload = json.loads(out)
+    assert payload["reason"] == "human_only_gate"
+    assert payload.get("next_action"), "a refusal must say what to do instead"
+
+
+async def test_ask_question_reports_the_status_it_came_from(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """transition.from has to be read before the call.
+
+    Reading it afterwards is the easy mistake here: the task has already
+    moved, so the envelope would report needs_info -> needs_info and the
+    caller would see a move that never happened."""
+    mock_api_post.return_value = {"status": "needs_info"}
+    mock_api_get.side_effect = [
+        {"id": 42, "status": "open"},
+        {"id": 42, "status": "needs_info"},
+    ]
+
+    payload = json.loads(await hub_ask_question(42, "q"))
+
+    assert payload["transition"]["from"] == "open"
+    assert payload["transition"]["from"] != payload["transition"]["to"]
 
 
 async def test_hub_claim_task(
