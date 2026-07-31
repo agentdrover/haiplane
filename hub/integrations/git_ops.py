@@ -1085,11 +1085,33 @@ class GitOpsIntegration:
         log.warning("auto_commit failed for task #%d: %s", task_id, err)
         return False
 
-    async def pull_main(self, repo: str | None = None) -> bool:
+    async def pull_main(
+        self, repo: str | None = None, base_branch: str | None = None
+    ) -> bool:
+        """Return the shared workspace to its base branch and fast-forward it.
+
+        The branch is the task's base, not the literal "main" this used to
+        name (#552). Since #362 a task's work is cut from PAIR_BASE_BRANCH, so
+        naming main here left the clone parked on whatever branch was current
+        and pulled a branch nobody builds on — on a repository without main it
+        simply did nothing at all. Reproduced: after a merge the workspace was
+        still sitting on the task branch.
+
+        A failed checkout raises rather than falling through to the pull. The
+        old code discarded that rc; git happened to refuse the pull too, so no
+        damage was reachable, but the caller could not tell the difference
+        between "returned to base" and "still on someone's branch".
+        """
         repo = repo or _repo_root()
-        await _git("checkout", "main", repo=repo, check=False)
+        base = _resolve_base(base_branch)
+        rc, _, err = await _git("checkout", base, repo=repo, check=False)
+        if rc != 0:
+            raise WorkspaceNotReadyError(
+                f"cannot return {repo} to {base!r}: "
+                + ((err or "").strip() or "git checkout failed")
+            )
         rc, _, _ = await _git(
-            "pull", "origin", "main", "--ff-only", repo=repo, check=False
+            "pull", "origin", base, "--ff-only", repo=repo, check=False
         )
         return rc == 0
 
@@ -1116,7 +1138,17 @@ class GitOpsIntegration:
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
 
-        await _git("checkout", branch, repo=repo, check=False)
+        rc, _, err = await _git("checkout", branch, repo=repo, check=False)
+        if rc != 0:
+            # Everything below rewrites history. Running it on whatever branch
+            # stayed current is the one outcome worth refusing outright (#552).
+            log.error(
+                "squash_branch: cannot check out %s in %s: %s",
+                branch,
+                repo,
+                (err or "").strip() or "git checkout failed",
+            )
+            return False
         await _git("fetch", "origin", base, repo=repo, check=False)
 
         rc, merge_base, _ = await _git(
@@ -1392,10 +1424,42 @@ class GitOpsIntegration:
         log.error("Failed to merge PR #%d: %s", pr_number, err)
         return False
 
-    async def delete_branch(self, branch: str, repo: str | None = None) -> None:
-        await _git("checkout", "main", repo=repo, check=False)
-        await _git("branch", "-D", branch, repo=repo, check=False)
+    async def delete_branch(
+        self,
+        branch: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool:
+        """Remove a merged task branch. Returns whether it is actually gone.
+
+        Two fixes (#552). The checkout named "main" by literal, so once #362
+        moved task branches onto PAIR_BASE_BRANCH this could not step off the
+        very branch it was asked to delete — git then refused the delete and
+        the branches piled up. And the success line was logged unconditionally,
+        so the log claimed a deletion that had not happened.
+        """
+        repo = repo or _repo_root()
+        base = _resolve_base(base_branch)
+        rc, _, err = await _git("checkout", base, repo=repo, check=False)
+        if rc != 0:
+            log.error(
+                "delete_branch: cannot leave %s for %r in %s: %s",
+                branch,
+                base,
+                repo,
+                (err or "").strip() or "git checkout failed",
+            )
+            return False
+        rc, _, err = await _git("branch", "-D", branch, repo=repo, check=False)
+        if rc != 0:
+            log.error(
+                "delete_branch: %s not deleted: %s",
+                branch,
+                (err or "").strip() or "git branch -D failed",
+            )
+            return False
         log.info("Deleted local branch %s", branch)
+        return True
 
     async def clone_repo(
         self, repo_url: str, workspace_path: str, base_branch: str | None = None

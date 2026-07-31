@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
 from hub.db import log_activity
+from hub.integrations.git_ops import WorkspaceNotReadyError
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 
@@ -347,10 +348,37 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                                     gh_repo=mgh_repo,
                                 )
                                 if merged:
-                                    await plugins.git_ops.pull_main(repo=mworkspace)
-                                    if branch:
-                                        await plugins.git_ops.delete_branch(
-                                            branch, repo=mworkspace
+                                    mbase = mctx.get("base_branch")
+                                    # Post-merge tidying, not delivery: the work
+                                    # is already merged, so a workspace we
+                                    # cannot return to base is reported and
+                                    # left to a human rather than failing the
+                                    # task (#552).
+                                    try:
+                                        await plugins.git_ops.pull_main(
+                                            repo=mworkspace, base_branch=mbase
+                                        )
+                                        if branch:
+                                            await plugins.git_ops.delete_branch(
+                                                branch,
+                                                repo=mworkspace,
+                                                base_branch=mbase,
+                                            )
+                                    except WorkspaceNotReadyError as exc:
+                                        log.warning(
+                                            "Poll: task #%d merged, workspace not"
+                                            " tidied: %s",
+                                            task["id"],
+                                            exc,
+                                        )
+                                        await repo.add_task_update(
+                                            db,
+                                            task["id"],
+                                            "hub",
+                                            "alert",
+                                            f"PR #{pr_num} влит, но рабочий "
+                                            f"каталог не возвращён на базовую "
+                                            f"ветку: {exc}",
                                         )
                                     log.info(
                                         "Poll: task #%d PR #%d merged on GitHub",

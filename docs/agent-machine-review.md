@@ -41,6 +41,12 @@ OPENCLAW_MACHINE_REVIEW=require блокирует человеческий ве
 
 ## Формат находок
 confirmed: {title, severity high|medium|low, category slug, file, line,
-detail}; rejected: {title, category, reason}. category питает метрики
-повторяемости — используй устойчивые слаги (security, correctness,
-consistency, tests, …).
+detail}; rejected: {title, category, reason}; **unresolved: {title, why}**.
+category питает метрики повторяемости — используй устойчивые слаги
+(security, correctness, consistency, tests, …).
+
+Объяснение у `unresolved` называется **`why`**, а не `reason`: `reason`
+принадлежит `findings_rejected`. Имена соседние и легко путаются, поэтому
+лишние ключи теперь отвергаются, а не отбрасываются молча (#553) — до этого
+перепутанное имя давало сохранённую находку с пустым объяснением, то есть без
+того единственного, ради чего её и вынесли на решение человека.

@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 import re
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
@@ -958,6 +958,12 @@ class MachineFinding(BaseModel):
     """One machine-review finding (#381). Mirrors ReviewFinding plus a
     free-slug category feeding the recurrence metrics (#384)."""
 
+    # A key we do not know is a key we would drop, and a dropped key is
+    # invisible (#553). Harness output routinely carries extra fields —
+    # dimensions, duplicates, failure_scenario — and the submitter is expected
+    # to map them onto this shape rather than hope they land somewhere.
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(..., min_length=1, max_length=300)
     severity: ReviewSeverity
     category: str = Field("", max_length=60)
@@ -967,6 +973,8 @@ class MachineFinding(BaseModel):
 
 
 class MachineRejectedFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(..., min_length=1, max_length=300)
     category: str = Field("", max_length=60)
     reason: str = Field("", max_length=2000)
@@ -980,8 +988,30 @@ class MachineUnresolvedFinding(BaseModel):
     agents reads as clean. ``why`` records what stopped the verification.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(..., min_length=1, max_length=300)
     why: str = Field("", max_length=2000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _name_the_expected_field(cls, data: Any) -> Any:
+        """Point at ``why`` when the neighbouring field's name was used.
+
+        ``findings_rejected`` items carry ``reason`` and are documented on the
+        line directly above this one, so the two get swapped. Plain
+        extra="forbid" would say only that ``reason`` is not permitted, which
+        leaves the caller to guess — trading a silent loss for a loud puzzle.
+        Reproduced on machine_review#34: both unresolved findings were stored
+        with an empty explanation, which is the whole content of an unresolved
+        finding.
+        """
+        if isinstance(data, dict) and "reason" in data and "why" not in data:
+            raise ValueError(
+                "unresolved findings explain themselves in 'why', not "
+                "'reason' — 'reason' belongs to findings_rejected"
+            )
+        return data
 
 
 class MachineReviewSubmit(BaseModel):
