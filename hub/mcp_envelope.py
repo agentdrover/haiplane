@@ -44,7 +44,12 @@ def compute_actor_hint(awaiting: Awaiting, status: str) -> ActorHint:
         return "ci"
     if awaiting == "human_decision":
         return "human"
-    if status in ("open", "running", "claimed", "draft", "needs_info"):
+    # needs_info deliberately absent: it is answered two lines up, where
+    # awaiting=human_decision correctly says a human acts. Listing it here as
+    # agent-actionable said the opposite, and the final fallback returns
+    # "agent" anyway — so removing it changes no answer on any (awaiting,
+    # status) pair, checked exhaustively (#370).
+    if status in ("open", "running", "claimed", "draft"):
         return "agent"
     if status in ("completed", "failed", "rejected"):
         return "none"
