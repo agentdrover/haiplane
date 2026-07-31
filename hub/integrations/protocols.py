@@ -177,7 +177,9 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         expected_branch: str | None = None,
     ) -> bool: ...
-    async def pull_main(self, repo: str | None = None) -> bool: ...
+    async def pull_main(
+        self, repo: str | None = None, base_branch: str | None = None
+    ) -> bool: ...
     async def squash_branch(
         self,
         task_id: int,
@@ -216,7 +218,12 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool: ...
-    async def delete_branch(self, branch: str, repo: str | None = None) -> None: ...
+    async def delete_branch(
+        self,
+        branch: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
+    ) -> bool: ...
     async def clone_repo(
         self, repo_url: str, workspace_path: str, base_branch: str = "develop"
     ) -> tuple[bool, str]: ...

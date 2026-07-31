@@ -1275,12 +1275,25 @@ def test_no_second_base_default_survives_anywhere() -> None:
     # — which named its base "origin/main" inline, with no base_branch
     # parameter to grep for — stayed invisible while the docstring claimed no
     # second default survived anywhere. A base named by literal counts.
-    for func in ("squash_branch", "create_branch", "create_pr"):
+    for func in (
+        "squash_branch",
+        "create_branch",
+        "create_pr",
+        "pull_main",
+        "delete_branch",
+    ):
         start = src.index(f"async def {func}(")
         end = src.index("\n    async def ", start + 1)
-        assert '"origin/main"' not in src[start:end], (
-            f"{func} must resolve its base, not name a branch outright"
-        )
+        # Strip the docstring: prose is allowed to discuss the literal, code is not.
+        body = re.sub(r'"""(?:.|\n)*?"""', "", src[start:end])
+        # #552 added pull_main and delete_branch, which named the base as plain
+        # "main" rather than "origin/main" — the shape the guard knew about.
+        # A guard written alongside its fix only knows the spellings that fix
+        # removed, so it has to be re-checked against members it never covered.
+        for literal in ('"origin/main"', '"main"'):
+            assert literal not in body, (
+                f"{func} must resolve its base, not name a branch outright"
+            )
 
     orch = Path("hub/services/orchestration.py").read_text()
     assert "PAIR_BASE_BRANCH" not in orch, (
@@ -1425,3 +1438,150 @@ async def test_run_kills_the_process_it_gave_up_on() -> None:
     for pid in left:  # never leave a stray behind, even when asserting
         subprocess.run(["kill", "-9", pid], capture_output=True)
     assert not left, f"process survived the timeout: {left}"
+
+
+# --- #552: post-merge tidying works on the task's base, not on "main" ---
+
+
+def _seed_repo_with_origin(tmp_path, *, with_main: bool):
+    """A clone whose base is PAIR_BASE_BRANCH, optionally without main at all.
+
+    A repository with no main is not exotic: it is what any project gets whose
+    integration branch is the only long-lived one, and it is the state that
+    exposed both defects here.
+    """
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", config.PAIR_BASE_BRANCH, str(origin)],
+        check=True,
+    )
+    repo = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "t", cwd=repo)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "app.py").write_text("v1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "init", cwd=repo)
+    _run_git("git", "push", "-q", "origin", config.PAIR_BASE_BRANCH, cwd=repo)
+    if with_main:
+        _run_git("git", "branch", "main", cwd=repo)
+    return repo
+
+
+async def test_pull_main_returns_the_workspace_to_the_task_base(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#552, reproduced before the fix on a repository whose base is not main.
+
+    The clone was left sitting on the task branch, so the next task started
+    from the wrong place. Every mention of pull_main in the suite was a mock —
+    its git logic had never run.
+    """
+    import subprocess
+
+    repo = _seed_repo_with_origin(tmp_path, with_main=False)
+    _run_git("git", "checkout", "-q", "-b", "task-1/work", cwd=repo)
+    (repo / "w.py").write_text("task work\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "work", cwd=repo)
+
+    assert await git_ops.pull_main(repo=str(repo))
+
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert current == config.PAIR_BASE_BRANCH
+
+
+async def test_delete_branch_removes_the_branch_and_says_so(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """It could not step off the branch it was asked to delete, so git refused
+    and the branches piled up — while the log claimed success regardless."""
+    import subprocess
+
+    repo = _seed_repo_with_origin(tmp_path, with_main=False)
+    _run_git("git", "checkout", "-q", "-b", "task-2/work", cwd=repo)
+    (repo / "w.py").write_text("task work\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "work", cwd=repo)
+
+    assert await git_ops.delete_branch("task-2/work", repo=str(repo)) is True
+
+    gone = subprocess.run(
+        ["git", "rev-parse", "--verify", "task-2/work"], cwd=repo, capture_output=True
+    ).returncode
+    assert gone != 0, "the branch must actually be gone"
+
+
+async def test_delete_branch_reports_failure_instead_of_logging_success(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """The old code logged "Deleted local branch" whatever happened."""
+    repo = _seed_repo_with_origin(tmp_path, with_main=False)
+
+    assert await git_ops.delete_branch("never-existed", repo=str(repo)) is False
+
+
+async def test_pull_main_refuses_when_it_cannot_reach_the_base(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """A workspace still on someone else's branch must be distinguishable from
+    one returned to base. The old code discarded the checkout rc entirely."""
+    repo = _seed_repo_with_origin(tmp_path, with_main=False)
+    _run_git("git", "checkout", "-q", "-b", "someones-branch", cwd=repo)
+    (repo / "app.py").write_text("their uncommitted edit\n")
+    _run_git("git", "commit", "-am", "their commit", cwd=repo)
+    (repo / "app.py").write_text("dirty edit that blocks the checkout\n")
+
+    with pytest.raises(WorkspaceNotReadyError) as excinfo:
+        await git_ops.pull_main(repo=str(repo))
+
+    assert config.PAIR_BASE_BRANCH in str(excinfo.value)
+
+
+async def test_squash_branch_refuses_when_it_cannot_check_out_the_branch(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """Everything after the checkout rewrites history — on whatever branch stayed.
+
+    The obvious version of this test, squashing a branch that does not exist,
+    is green with the guard removed: merge-base fails for the same reason and
+    the return value is False either way. Verified by mutation. It has to be a
+    state where the checkout fails while everything after it would have
+    succeeded — a dirty tree blocking the switch, and a real branch to squash.
+    """
+    import subprocess
+
+    repo = _seed_repo_with_origin(tmp_path, with_main=False)
+    _run_git("git", "checkout", "-q", "-b", "task-9/work", cwd=repo)
+    for n in (1, 2):
+        (repo / f"t{n}.py").write_text(f"task {n}\n")
+        _run_git("git", "add", "-A", cwd=repo)
+        _run_git("git", "commit", "-m", f"task {n}", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "-b", "someones-branch", cwd=repo)
+    (repo / "app.py").write_text("their committed change\n")
+    _run_git("git", "commit", "-am", "their commit", cwd=repo)
+    (repo / "app.py").write_text("their uncommitted edit blocks the switch\n")
+
+    def head() -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        ).stdout.strip()
+
+    def current() -> str:
+        return subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    before = head()
+    assert await git_ops.squash_branch(9, "t", "task-9/work", repo=str(repo)) is False
+    assert head() == before, "reset --soft must not run on the branch that stayed"
+    assert current() == "someones-branch"
