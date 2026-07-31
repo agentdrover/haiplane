@@ -4766,3 +4766,95 @@ async def test_pair_start_still_works_from_open_and_from_claimed(
     assert (
         await services.pair_start_task(db, second.id, caller="dev-agent")
     ).status.value == "running"
+
+
+# --- #364 K3: a failing git tail must not leave a done report behind ---
+
+
+async def _task_ready_for_done_with_git_tail(db: aiosqlite.Connection) -> int:
+    """A task whose done report reaches the git steps.
+
+    auto_review matters: without it the tail is skipped entirely. A first
+    attempt at reproducing this defect set auto_review=False and concluded it
+    did not reproduce — the tail simply never ran.
+    """
+    tv = await services.create_task(db, TaskCreate(title="Done with git tail"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await repo.update_task(db, tv.id, auto_review=True, branch="task-x/b")
+    await db.commit()
+    return tv.id
+
+
+async def test_failing_git_tail_leaves_no_done_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#364 AC-1. Reproduced before the fix: one done row and generation 1
+    survived a git adapter that raised."""
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKSPACE_REPO", "/tmp")
+    task_id = await _task_ready_for_done_with_git_tail(db)
+
+    class _Exploding(NoopGitOps):
+        async def checkout(self, *args, **kwargs):
+            raise RuntimeError("git adapter exploded mid-flight")
+
+    plugins.git_ops = _Exploding()
+
+    with pytest.raises(RuntimeError):
+        await services.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="готово")
+        )
+
+    updates = await repo.get_task_updates(db, task_id)
+    assert not [u for u in updates if u["kind"] == "done"], (
+        "a done report that did not survive its own git steps must not remain"
+    )
+    assert dict(await repo.get_task(db, task_id))["submission_generation"] == 0, (
+        "the generation bump belongs to the same failed submission"
+    )
+
+
+async def test_retry_after_a_failing_git_tail_does_not_pile_up_done_rows(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#364 AC-2. Before the fix each attempt added its own row: two rows and
+    generation 2 after a single retry."""
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("OPENCLAW_WORKSPACE_REPO", "/tmp")
+    task_id = await _task_ready_for_done_with_git_tail(db)
+
+    class _Exploding(NoopGitOps):
+        async def checkout(self, *args, **kwargs):
+            raise RuntimeError("still broken")
+
+    plugins.git_ops = _Exploding()
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            await services.add_update(
+                db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="x")
+            )
+
+    updates = await repo.get_task_updates(db, task_id)
+    assert not [u for u in updates if u["kind"] == "done"]
+    assert dict(await repo.get_task(db, task_id))["submission_generation"] == 0
+
+
+async def test_successful_update_still_commits(db: aiosqlite.Connection):
+    """The savepoint must not swallow the ordinary path: a plain status update
+    is still there after the call returns."""
+    tv = await services.create_task(db, TaskCreate(title="Ordinary"))
+    await db.commit()
+
+    await services.add_update(
+        db, tv.id, TaskUpdateCreate(agent="dev", kind="status", content="just a note")
+    )
+
+    updates = await repo.get_task_updates(db, tv.id)
+    assert any(u["content"] == "just a note" for u in updates)

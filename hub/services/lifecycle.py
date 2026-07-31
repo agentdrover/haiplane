@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import contextlib
+import sqlite3
+
 import aiosqlite
 from fastapi import HTTPException, status
 
@@ -2009,6 +2012,24 @@ async def decide_task(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def _release_done_flow(
+    db: aiosqlite.Connection, *, rollback: bool = False
+) -> None:
+    """Close the done-flow savepoint, tolerating one that is already gone.
+
+    Several branches of this block call ``log_activity``, which commits, and a
+    commit ends the transaction and every savepoint in it. That is harmless —
+    a committed branch has nothing to undo — but the release afterwards would
+    then raise "no such savepoint". Found by the suite, not by reading: an
+    earlier probe showed no commit before the git steps and I took that for the
+    whole picture; it was true only of the path the probe walked (#364).
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        if rollback:
+            await db.execute("ROLLBACK TO SAVEPOINT done_flow")
+        await db.execute("RELEASE SAVEPOINT done_flow")
+
+
 async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2038,104 +2059,129 @@ async def add_update(
     # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
     # which is why it must run under the same lock.
     async with get_write_lock(db):
-        update_id = await repo.add_task_update(
-            db,
-            task_id,
-            body.agent,
-            body.kind,
-            body.content,
-            principal_id=principal_id,
-            # "anonymous" is not "hub": an open-mode request really has no
-            # identity, while the hub writing its own alerts has none by
-            # nature. Telling them apart is the point of the field.
-            author_kind="principal" if principal_id is not None else "anonymous",
-        )
+        # #364: the done row and the generation bump are written before the
+        # git tail runs, and a git adapter that raises used to leave both
+        # behind — reproduced: one done row and generation 1 after the
+        # failure, then two and 2 after a retry, so the feed accumulated
+        # completion reports that never happened. git itself cannot be rolled
+        # back, but the database can, and it is the database that made the
+        # false claim. Verified before writing this that no commit runs
+        # between the insert and the git steps on this path; a commit would
+        # have released the savepoint and defeated the rollback silently.
+        await db.execute("SAVEPOINT done_flow")
+        released = False
+        try:
+            update_id = await repo.add_task_update(
+                db,
+                task_id,
+                body.agent,
+                body.kind,
+                body.content,
+                principal_id=principal_id,
+                # "anonymous" is not "hub": an open-mode request really has no
+                # identity, while the hub writing its own alerts has none by
+                # nature. Telling them apart is the point of the field.
+                author_kind="principal" if principal_id is not None else "anonymous",
+            )
 
-        if body.kind == "done":
-            # Verifiable SDD (#510): under 'require', a done report that would
-            # complete the task is blocked while the current validation run is
-            # red/absent. Only completion-bound reports are gated — one that
-            # routes to review (completion_requires_review) is untouched, and
-            # the poller path (transition_after_agent_done) is not affected.
-            if config.SDD_VALIDATION == "require" and not completion_requires_review(
-                task
-            ):
-                from hub.services.validation_run import validation_gap
+            if body.kind == "done":
+                # Verifiable SDD (#510): under 'require', a done report that would
+                # complete the task is blocked while the current validation run is
+                # red/absent. Only completion-bound reports are gated — one that
+                # routes to review (completion_requires_review) is untouched, and
+                # the poller path (transition_after_agent_done) is not affected.
+                if (
+                    config.SDD_VALIDATION == "require"
+                    and not completion_requires_review(task)
+                ):
+                    from hub.services.validation_run import validation_gap
 
-                vgap = validation_gap(task)
-                if vgap:
-                    raise HTTPException(422, f"validation_failed: {vgap}")
-            if task["status"] == "pending_report":
-                if completion_requires_review(task):
-                    # Universal Review Gate (#306): even the pending_report
-                    # path may not complete unreviewed work — the done
-                    # report becomes a submission for client-driven review.
-                    generation = await repo.bump_submission_generation(db, task_id)
-                    await repo.update_task(
-                        db, task_id, status="review", review_job_id=None
-                    )
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "status",
-                        f"Universal Review Gate: done report routed to review "
-                        f"(submission #{generation}). Obtain an APPROVED "
-                        "verdict via hub_submit_review, then report done "
-                        "again.",
-                    )
-                    await log_activity(
-                        db,
-                        "task_review_required",
-                        f"Task #{task_id} → review (gate) on report from {body.agent}",
-                        detail=mutation_activity_detail(),
-                    )
-                else:
-                    await repo.update_task(db, task_id, status="completed")
-                    await log_activity(
-                        db,
-                        "task_completed",
-                        f"Task #{task_id} completed with report from {body.agent}",
-                        detail=mutation_activity_detail(),
-                    )
-                    await maybe_rollup_parent(db, task_id)
-            elif task["status"] in ("running", "claimed") and not task.get("job_id"):
-                # A done report on a pair-running task OR on a reserved (claimed)
-                # task must never be silently dropped: route both through the
-                # shared post-done transition. A claimed task never pair-started,
-                # so it has no branch — transition_after_agent_done then routes
-                # it to completed (no branch ⇒ ci_check is skipped).
-                was_claimed = task["status"] == "claimed"
-                updates_rows = await repo.get_task_updates(db, task_id)
-                updates_list = [dict(r) for r in updates_rows]
-                if any(u.get("kind") == "blocker" for u in updates_list):
-                    await repo.update_task(db, task_id, status="needs_decision")
-                    await log_activity(
-                        db,
-                        "task_needs_decision",
-                        f"Task #{task_id} → needs_decision (blocker in done flow)",
-                        detail=mutation_activity_detail(),
-                    )
-                else:
-                    await transition_after_agent_done(db, task, has_done=True)
-                if was_claimed:
-                    await repo.update_task(
-                        db, task_id, claimed_by=None, claim_session_id=None
-                    )
-                refreshed = await repo.get_task(db, task_id)
-                if refreshed and dict(refreshed)["status"] == "completed":
-                    await maybe_rollup_parent(db, task_id)
-            # open + done without pair-start: rejected before insert (AC-2)
-        else:
-            await repo.update_task(db, task_id)
+                    vgap = validation_gap(task)
+                    if vgap:
+                        raise HTTPException(422, f"validation_failed: {vgap}")
+                if task["status"] == "pending_report":
+                    if completion_requires_review(task):
+                        # Universal Review Gate (#306): even the pending_report
+                        # path may not complete unreviewed work — the done
+                        # report becomes a submission for client-driven review.
+                        generation = await repo.bump_submission_generation(db, task_id)
+                        await repo.update_task(
+                            db, task_id, status="review", review_job_id=None
+                        )
+                        await repo.add_task_update(
+                            db,
+                            task_id,
+                            "hub",
+                            "status",
+                            f"Universal Review Gate: done report routed to review "
+                            f"(submission #{generation}). Obtain an APPROVED "
+                            "verdict via hub_submit_review, then report done "
+                            "again.",
+                        )
+                        await log_activity(
+                            db,
+                            "task_review_required",
+                            f"Task #{task_id} → review (gate) on report from {body.agent}",
+                            detail=mutation_activity_detail(),
+                        )
+                    else:
+                        await repo.update_task(db, task_id, status="completed")
+                        await log_activity(
+                            db,
+                            "task_completed",
+                            f"Task #{task_id} completed with report from {body.agent}",
+                            detail=mutation_activity_detail(),
+                        )
+                        await maybe_rollup_parent(db, task_id)
+                elif task["status"] in ("running", "claimed") and not task.get(
+                    "job_id"
+                ):
+                    # A done report on a pair-running task OR on a reserved (claimed)
+                    # task must never be silently dropped: route both through the
+                    # shared post-done transition. A claimed task never pair-started,
+                    # so it has no branch — transition_after_agent_done then routes
+                    # it to completed (no branch ⇒ ci_check is skipped).
+                    was_claimed = task["status"] == "claimed"
+                    updates_rows = await repo.get_task_updates(db, task_id)
+                    updates_list = [dict(r) for r in updates_rows]
+                    if any(u.get("kind") == "blocker" for u in updates_list):
+                        await repo.update_task(db, task_id, status="needs_decision")
+                        await log_activity(
+                            db,
+                            "task_needs_decision",
+                            f"Task #{task_id} → needs_decision (blocker in done flow)",
+                            detail=mutation_activity_detail(),
+                        )
+                    else:
+                        await transition_after_agent_done(db, task, has_done=True)
+                    if was_claimed:
+                        await repo.update_task(
+                            db, task_id, claimed_by=None, claim_session_id=None
+                        )
+                    refreshed = await repo.get_task(db, task_id)
+                    if refreshed and dict(refreshed)["status"] == "completed":
+                        await maybe_rollup_parent(db, task_id)
+                # open + done without pair-start: rejected before insert (AC-2)
+            else:
+                await repo.update_task(db, task_id)
 
-        await db.commit()
-        await log_activity(
-            db,
-            "task_update",
-            f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
-            detail=mutation_activity_detail(),
-        )
+            await db.commit()
+            await log_activity(
+                db,
+                "task_update",
+                f"Task #{task_id} update from {body.agent}: {body.content[:80]}",
+                detail=mutation_activity_detail(),
+            )
+
+        except BaseException:
+            # Roll back to before the done row. RELEASE after ROLLBACK TO is
+            # required: rolling back to a savepoint does not remove it (#364).
+            await _release_done_flow(db, rollback=True)
+            released = True
+            raise
+        finally:
+            if not released:
+                await _release_done_flow(db)
 
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
