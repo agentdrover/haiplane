@@ -4698,3 +4698,71 @@ async def test_done_pipeline_stops_when_checkout_fails(
 
     updated = dict(await repo.get_task(db, task_id))
     assert updated["status"] == "needs_decision"
+
+
+# --- #365 K4: pair-start must not overwrite a status that moved under it ---
+
+
+async def test_pair_start_refuses_when_the_task_left_its_status(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """The check and the write were not atomic, and the gap is not theoretical:
+    branch preparation between them talks to git and can take seconds.
+
+    Simulated by moving the task while pair-start is mid-flight — the same
+    thing a competing claim, a human decision or the poller would do.
+    """
+    tv = await services.create_task(db, TaskCreate(title="Raced pair start"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: do the work")
+    await db.commit()
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    class _MovesTheTask(NoopGitOps):
+        async def pair_prepare_branch(self, *args, **kwargs):
+            # Somebody else moves the task while we are preparing the branch.
+            await repo.update_task(db, tv.id, status="needs_decision")
+            await db.commit()
+            return ""
+
+    plugins.git_ops = _MovesTheTask()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await services.pair_start_task(db, tv.id, caller="dev-agent")
+
+    assert excinfo.value.status_code == 409
+    assert dict(await repo.get_task(db, tv.id))["status"] == "needs_decision", (
+        "the other move must survive; pair-start must not overwrite it"
+    )
+
+
+async def test_pair_start_still_works_from_open_and_from_claimed(
+    db: aiosqlite.Connection,
+):
+    """Both legitimate starting states keep working.
+
+    transition_status_if takes a single expected_from, so the conditional
+    transition is driven by the status actually read rather than a literal —
+    a literal would have silently broken the claimed path.
+    """
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    plugins.git_ops = NoopGitOps()
+
+    first = await services.create_task(db, TaskCreate(title="From open"))
+    await repo.add_task_update(db, first.id, "dev", "status", "Plan: work")
+    await db.commit()
+    assert (
+        await services.pair_start_task(db, first.id, caller="dev-agent")
+    ).status.value == "running"
+
+    second = await services.create_task(db, TaskCreate(title="From claimed"))
+    await repo.add_task_update(db, second.id, "dev", "status", "Plan: work")
+    await db.commit()
+    await services.claim_task(db, second.id, TaskClaim(agent="dev-agent"))
+    assert dict(await repo.get_task(db, second.id))["status"] == "claimed"
+    assert (
+        await services.pair_start_task(db, second.id, caller="dev-agent")
+    ).status.value == "running"
