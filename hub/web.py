@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -68,6 +69,8 @@ TEMPLATES = Jinja2Templates(
 )
 
 router = APIRouter()
+
+log = logging.getLogger("hub.web")
 
 
 def _optional_int_query(value: str | int | None, field: str) -> int | None:
@@ -205,6 +208,26 @@ def _has_db_principals(request: Request) -> bool:
 
 @router.post("/logout")
 async def web_logout(request: Request):
+    """Log out: revoke the server-side session, then drop the cookie.
+
+    Dropping the cookie alone left the browser_sessions row live, so a
+    session token captured beforehand kept authenticating for the rest of
+    its lifetime — up to 30 days — and logging out did nothing to a
+    compromised session (#368).
+    """
+    from hub.services import admin as admin_svc
+
+    session_token = request.cookies.get(config.HUB_COOKIE_NAME)
+    if session_token:
+        try:
+            await admin_svc.revoke_browser_session(_db(request), session_token)
+        except Exception:
+            # Logging out must always end at the login page. A failure to
+            # reach the DB is worth a log line, not a 500 that strands the
+            # user on a page they are trying to leave — the cookie still
+            # goes away below.
+            log.exception("logout: could not revoke the server-side session")
+
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(config.HUB_COOKIE_NAME)
     return response

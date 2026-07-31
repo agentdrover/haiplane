@@ -575,6 +575,27 @@ async def resolve_browser_session(
     )
 
 
+async def revoke_browser_session(db: aiosqlite.Connection, session_token: str) -> bool:
+    """Revoke ONE browser session by its plaintext token. Returns whether a
+    live row was closed.
+
+    Deliberately not ``_revoke_all_sessions``: logging out of a laptop must
+    not sign the same person out of their phone. The narrow scope is the
+    point, not an optimisation (#368).
+
+    Idempotent — a token that is unknown, already revoked, or expired closes
+    nothing and returns False, so a double logout is not an error.
+    """
+    session_hash = hash_session_token(session_token)
+    cursor = await db.execute(
+        "UPDATE browser_sessions SET revoked_at = datetime('now') "
+        "WHERE session_hash = ? AND revoked_at IS NULL",
+        (session_hash,),
+    )
+    await db.commit()
+    return bool(cursor.rowcount)
+
+
 async def _revoke_all_sessions(db: aiosqlite.Connection, principal_id: int) -> None:
     await db.execute(
         "UPDATE browser_sessions SET revoked_at = datetime('now') "
