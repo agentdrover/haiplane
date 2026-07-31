@@ -20,6 +20,8 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.models import (
+    MAX_ACCEPTANCE_CRITERIA,
+    MAX_RISKS,
     AcceptanceCriterion,
     BulkRefine,
     BulkRefineResult,
@@ -30,6 +32,7 @@ from hub.models import (
     TaskRefineOutcome,
     TaskRisk,
 )
+from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
 from hub.services.test_locator import validate_test_locators
 
@@ -46,6 +49,14 @@ class TaskNotFoundError(LookupError):
 
 class DuplicateAcceptanceCriterionError(ValueError):
     """Raised when ac_id collides with an existing one for the same task."""
+
+
+class LimitExceededError(ValueError):
+    """Raised when an insert would push a task past a structured-form cap.
+
+    A ValueError so the API layer maps it to 422 like the other malformed-input
+    errors: asking for a 51st item is a bad request, not a server fault (#366).
+    """
 
 
 class ProjectBindError(ValueError):
@@ -342,6 +353,15 @@ async def add_risk(
     """Append one risk atomically without replacing the existing list."""
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "add_risk"):
+        # The 50-item cap lived only in the full-replace validator, so
+        # repeated single adds walked straight past it (#366). One limit,
+        # every path.
+        row = await repo.get_task(db, task_id)
+        existing = parse_risks_from_row(row["risks"]) if row is not None else []
+        if len(existing) >= MAX_RISKS:
+            raise LimitExceededError(
+                f"too many risks: {len(existing)} already at the limit of {MAX_RISKS}"
+            )
         updated = await repo.append_task_risk(db, task_id, risk)
         if not updated:
             raise TaskNotFoundError(f"task {task_id} not found")
@@ -362,6 +382,23 @@ async def list_acceptance_criteria(
     return [row_to_ac(r) for r in rows]
 
 
+async def _guard_ac_limit(db: aiosqlite.Connection, task_id: int) -> None:
+    """Refuse an insert that would push a task past MAX_ACCEPTANCE_CRITERIA.
+
+    The cap was enforced in the bulk-replace path only, so single adds could
+    accumulate without bound (#366).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM acceptance_criteria WHERE task_id=?", (task_id,)
+    )
+    count = dict(rows[0])["n"] if rows else 0
+    if count >= MAX_ACCEPTANCE_CRITERIA:
+        raise LimitExceededError(
+            f"too many acceptance criteria: {count} already at the limit "
+            f"of {MAX_ACCEPTANCE_CRITERIA}"
+        )
+
+
 async def add_acceptance_criterion(
     db: aiosqlite.Connection,
     task_id: int,
@@ -380,6 +417,9 @@ async def add_acceptance_criterion(
         )
         if rows:
             return row_to_ac(rows[0]), False
+        # Counted only when this call would actually add a row: resending an
+        # existing ac_id returned above without touching the count (#366).
+        await _guard_ac_limit(db, task_id)
         try:
             await repo.add_acceptance_criterion(db, task_id, ac)
         except aiosqlite.IntegrityError as exc:
@@ -408,6 +448,15 @@ async def upsert_acceptance_criterion(
     """
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "upsert_ac"):
+        # Overwriting an existing criterion must keep working at the limit —
+        # it does not add a row. Checking unconditionally here would make a
+        # task with 50 criteria impossible to edit (#366).
+        existing = await db.execute_fetchall(
+            "SELECT 1 FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
+            (task_id, ac.id),
+        )
+        if not existing:
+            await _guard_ac_limit(db, task_id)
         created = await repo.upsert_acceptance_criterion(db, task_id, ac)
         await recalc_readiness_inline(db, task_id)
     return ac, created
