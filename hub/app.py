@@ -865,6 +865,23 @@ async def api_task_context(
         lines.append(f"Problem: {task_view.problem_statement}")
     if task_view.business_value:
         lines.append(f"Value: {task_view.business_value}")
+    if task_view.outcome_metric:
+        # Discovery (#331): the number that should move, and when we check.
+        outcome = f"Outcome: {task_view.outcome_metric}"
+        if task_view.outcome_indicator:
+            outcome += f" (leading: {task_view.outcome_indicator})"
+        if task_view.outcome_deadline:
+            outcome += f" by {task_view.outcome_deadline}"
+        lines.append(outcome)
+    if task_view.outcome_revisit_condition:
+        lines.append(f"Revisit if: {task_view.outcome_revisit_condition}")
+    if task_view.redesign_decision:
+        decision = f"Redesign decision: {task_view.redesign_decision.value}"
+        if task_view.redesign_rationale:
+            decision += f" — {task_view.redesign_rationale}"
+        lines.append(decision)
+    if task_view.agent_fit:
+        lines.append(f"Agent fit: {task_view.agent_fit.value}")
     if task_view.scope_in:
         lines.append(f"In-scope: {', '.join(task_view.scope_in)}")
     if task_view.scope_out:
@@ -1219,6 +1236,13 @@ async def api_review_brief(
         validation_commands=task_view.validation_commands,
         constraints=task_view.constraints,
         technical_hints=task_view.technical_hints,
+        outcome_metric=task_view.outcome_metric,
+        outcome_indicator=task_view.outcome_indicator,
+        outcome_deadline=task_view.outcome_deadline,
+        outcome_revisit_condition=task_view.outcome_revisit_condition,
+        redesign_decision=task_view.redesign_decision,
+        redesign_rationale=task_view.redesign_rationale,
+        agent_fit=task_view.agent_fit,
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,

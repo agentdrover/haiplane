@@ -170,6 +170,33 @@ class RiskSeverity(str, Enum):
     high = "high"
 
 
+class RedesignDecision(str, Enum):
+    """Whether the task adapts the existing process or reshapes it (#331).
+
+    Recorded so a spec cannot quietly automate yesterday's process on new
+    technology: choosing ``adapt`` is legitimate, choosing it by default
+    without noticing is not.
+    """
+
+    adapt = "adapt"
+    redesign = "redesign"
+
+
+class AgentFit(str, Enum):
+    """How much agency the work wants (#331).
+
+    deterministic — scripted, no model in the loop.
+    assistant — a human drives, the model helps.
+    sdd_native — spec-driven: the spec is the contract, the agent implements.
+    agentic — the agent decides the steps, not just the code.
+    """
+
+    deterministic = "deterministic"
+    assistant = "assistant"
+    sdd_native = "sdd_native"
+    agentic = "agentic"
+
+
 # Allowed parent task_type -> child task_type mapping
 HIERARCHY_RULES: dict[TaskType, TaskType | None] = {
     TaskType.epic: None,
@@ -237,6 +264,14 @@ class TaskCreate(BaseModel):
     user_story: str = Field("", max_length=1000)
     problem_statement: str = Field("", max_length=2000)
     business_value: str = Field("", max_length=500)
+    # --- Discovery block (#331): why this, and in what form ---
+    outcome_metric: str = Field("", max_length=300)
+    outcome_indicator: str = Field("", max_length=300)
+    outcome_deadline: str = Field("", max_length=64)
+    outcome_revisit_condition: str = Field("", max_length=500)
+    redesign_decision: RedesignDecision | None = None
+    redesign_rationale: str = Field("", max_length=1000)
+    agent_fit: AgentFit | None = None
     scope_in: list[str] = Field(default_factory=list, max_length=20)
     scope_out: list[str] = Field(default_factory=list, max_length=20)
     affected_areas: list[str] = Field(default_factory=list, max_length=20)
@@ -467,6 +502,15 @@ class ReviewBrief(BaseModel):
     validation_commands: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     technical_hints: str = ""
+    # Discovery block (#331): a reviewer judging "does this do what it should"
+    # needs the outcome hypothesis, not only the build instructions.
+    outcome_metric: str = ""
+    outcome_indicator: str = ""
+    outcome_deadline: str = ""
+    outcome_revisit_condition: str = ""
+    redesign_decision: RedesignDecision | None = None
+    redesign_rationale: str = ""
+    agent_fit: AgentFit | None = None
     branch: str | None = None
     pr_number: int | None = None
     diff_command: str = ""
@@ -575,6 +619,14 @@ class TaskRefine(BaseModel):
     user_story: str | None = Field(default=None, max_length=1000)
     problem_statement: str | None = Field(default=None, max_length=2000)
     business_value: str | None = Field(default=None, max_length=500)
+    # --- Discovery block (#331) ---
+    outcome_metric: str | None = Field(default=None, max_length=300)
+    outcome_indicator: str | None = Field(default=None, max_length=300)
+    outcome_deadline: str | None = Field(default=None, max_length=64)
+    outcome_revisit_condition: str | None = Field(default=None, max_length=500)
+    redesign_decision: RedesignDecision | None = None
+    redesign_rationale: str | None = Field(default=None, max_length=1000)
+    agent_fit: AgentFit | None = None
     scope_in: list[str] | None = Field(default=None, max_length=20)
     scope_out: list[str] | None = Field(default=None, max_length=20)
     affected_areas: list[str] | None = Field(default=None, max_length=20)
@@ -844,6 +896,14 @@ class TaskView(BaseModel):
     user_story: str = ""
     problem_statement: str = ""
     business_value: str = ""
+    # --- Discovery block (#331) ---
+    outcome_metric: str = ""
+    outcome_indicator: str = ""
+    outcome_deadline: str = ""
+    outcome_revisit_condition: str = ""
+    redesign_decision: RedesignDecision | None = None
+    redesign_rationale: str = ""
+    agent_fit: AgentFit | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)

@@ -4,6 +4,8 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.models import (
+    AgentFit,
+    RedesignDecision,
     ACVerifiableBy,
     AcceptanceCriterion,
     Recommendation,
@@ -100,6 +102,9 @@ def test_perfect_task_yields_no_recommendations():
             size="S",
             wip_tag="feature_work",
             ac_count=1,
+            outcome_metric="median lead time, 3d -> 1d",
+            redesign_decision="adapt",
+            agent_fit="sdd_native",
         )
     )
     assert build_recommendations(dor) == []
@@ -200,6 +205,9 @@ def test_no_recommendations_for_risks_only():
             size="S",
             wip_tag="feature_work",
             ac_count=1,
+            outcome_metric="median lead time, 3d -> 1d",
+            redesign_decision="adapt",
+            agent_fit="sdd_native",
         )
     )
     recs = build_recommendations(dor)
@@ -227,6 +235,11 @@ async def _make_full_task(db: aiosqlite.Connection) -> int:
         validation_commands=["pytest"],
         size=TaskSize.S,
         wip_tag=WipTag.feature_work,
+        # Discovery (#331) is part of a complete feature task now: without it
+        # the task is not "full", it is merely fully specified.
+        outcome_metric="median lead time, 3d -> 1d",
+        redesign_decision=RedesignDecision.adapt,
+        agent_fit=AgentFit.sdd_native,
     )
     task_id = await repo.create_task_full(db, payload, status="draft")
     await repo.add_acceptance_criterion(db, task_id, _ac(1))
@@ -237,8 +250,15 @@ async def _make_full_task(db: aiosqlite.Connection) -> int:
 async def test_build_for_task_minimal(db: aiosqlite.Connection):
     task_id = await _make_minimal_task(db)
     recs = await build_for_task(db, task_id)
-    assert all(r.severity == "blocking" for r in recs)
     assert {r.field for r in recs} >= {"user_story", "scope_in", "size"}
+    discovery = {"outcome_metric", "redesign_decision", "agent_fit"}
+    assert all(r.severity == "blocking" for r in recs if r.field not in discovery)
+    # Discovery suggestions are offered but never charged for (#331).
+    assert all(
+        r.severity == "low" and r.expected_score_delta == 0
+        for r in recs
+        if r.field in discovery
+    )
 
 
 async def test_build_for_task_full_returns_empty(db: aiosqlite.Connection):

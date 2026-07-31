@@ -104,6 +104,11 @@ the form itself). Acceptance criteria live in a separate
 `work_type` selects which DoR checks are required. Optional checks are
 still computed and shown, but they don't block approval.
 
+The Discovery checks (`has_outcome_hypothesis`, `has_redesign_decision`,
+`has_agent_fit`) are advisory: they appear in the table and earn a
+suggestion on `feature` tasks, but they never block and never move the
+readiness score.
+
 | work_type   | required DoR checks                                                                                                                  | typical class_of_service |
 |-------------|---------------------------------------------------------------------------------------------------------------------------------------|--------------------------|
 | `feature`   | user_story, problem_statement, business_value, scope_in, AC, validation, size, wip_tag                                                | standard                 |
@@ -126,6 +131,16 @@ Set on `POST /api/tasks` (creation) or via `POST /api/tasks/{id}/refine`
   (`standard | expedite | fixed_date | intangible`), `size` (`XS|S|M|L|XL`),
   `wip_tag` (`feature_work | bugfix | tech_debt | support`), `due_date`.
 - **Why & what**: `user_story`, `problem_statement`, `business_value`.
+- **Discovery** (all optional): `outcome_metric` — which number should move
+  and from what to what; `outcome_indicator` — what moves before it does;
+  `outcome_deadline` — when we check; `outcome_revisit_condition` — what
+  would reopen the question; `redesign_decision`
+  (`adapt | redesign`) + `redesign_rationale` — whether the work fits the
+  current process or reshapes it; `agent_fit`
+  (`deterministic | assistant | sdd_native | agentic`) — how much agency the
+  work wants. These make `business_value` checkable instead of merely
+  arguable. They are suggested on `feature` tasks and never block or cost
+  readiness points.
 - **Scope**: `scope_in[]`, `scope_out[]`, `affected_areas[]`.
 - **How we'll know it works**: `validation_commands[]`, `acceptance_criteria[]`
   (each AC has Given/When/Then + `verifiable_by` and optional `test_ref`).

@@ -2467,6 +2467,13 @@ async def hub_prepare_developer_task(
     user_story: str | None = None,
     problem_statement: str | None = None,
     business_value: str | None = None,
+    outcome_metric: str | None = None,
+    outcome_indicator: str | None = None,
+    outcome_deadline: str | None = None,
+    outcome_revisit_condition: str | None = None,
+    redesign_decision: str | None = None,
+    redesign_rationale: str | None = None,
+    agent_fit: str | None = None,
     technical_hints: str | None = None,
     scope_in: list[str] | None = None,
     scope_out: list[str] | None = None,
@@ -2515,6 +2522,13 @@ async def hub_prepare_developer_task(
         ("user_story", user_story),
         ("problem_statement", problem_statement),
         ("business_value", business_value),
+        ("outcome_metric", outcome_metric),
+        ("outcome_indicator", outcome_indicator),
+        ("outcome_deadline", outcome_deadline),
+        ("outcome_revisit_condition", outcome_revisit_condition),
+        ("redesign_decision", redesign_decision),
+        ("redesign_rationale", redesign_rationale),
+        ("agent_fit", agent_fit),
         ("technical_hints", technical_hints),
         ("scope_in", scope_in),
         ("scope_out", scope_out),
@@ -2748,6 +2762,20 @@ async def hub_refine_task(
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken / why this work exists.
         business_value: Outcome / why it matters.
+        outcome_metric: Which number should move once this ships, and from
+            what to what — e.g. "median lead time, 3d -> 1d". This is what
+            makes business_value checkable instead of merely arguable.
+        outcome_indicator: A leading indicator visible before the metric
+            moves — e.g. "share of tasks with a filled hypothesis".
+        outcome_deadline: When the outcome will be checked (ISO date or a
+            phrase like "4 weeks after release").
+        outcome_revisit_condition: What would make us reopen this decision.
+        redesign_decision: adapt | redesign — whether the work fits the
+            current process or reshapes it.
+        redesign_rationale: Why that choice. An unargued "adapt" is how an
+            old process gets automated onto new technology.
+        agent_fit: deterministic | assistant | sdd_native | agentic — how
+            much agency the work wants.
         technical_hints: Hints, references, suggested approach.
         scope_in: In-scope items (REPLACES the list).
         scope_out: Out-of-scope items (REPLACES the list).
