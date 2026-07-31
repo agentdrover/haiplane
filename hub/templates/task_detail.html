@@ -250,6 +250,13 @@
                             <div class="task-timeline-meta">
                                 <span class="badge badge--xs badge-{{ u.kind }}">{{ u.kind }}</span>
                                 {% if u.agent %}<span>{{ u.agent }}</span>{% endif %}
+                                {# Authorship next to the display name (#559):
+                                   the name is whatever the client sent, the
+                                   principal is the fact. #}
+                                {% if u.principal_id %}<span class="badge badge--xs" title="Записано аутентифицированным принципалом">principal #{{ u.principal_id }}</span>
+                                {% elif u.author_kind == 'hub' %}<span class="badge badge--xs" title="Запись сделал сам хаб — принципала нет по природе">hub</span>
+                                {% elif u.author_kind == 'anonymous' %}<span class="badge badge--xs" title="Запрос без аутентификации — принципал неизвестен">без принципала</span>
+                                {% elif u.author_kind == 'legacy' %}<span class="badge badge--xs" title="Записано до появления поля авторства">до учёта авторства</span>{% endif %}
                                 <time>{{ u.created_at }}</time>
                             </div>
                             <div class="task-timeline-content u-pre-wrap">{{ u.content }}</div>

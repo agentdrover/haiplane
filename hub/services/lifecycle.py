@@ -1433,6 +1433,7 @@ async def record_review_verdict(
     body: TaskReviewVerdict,
     *,
     self_approved: bool = False,
+    principal_id: int | None = None,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -1588,7 +1589,18 @@ async def record_review_verdict(
                 )
         if body.comments.strip():
             content += f"\n{body.comments.strip()}"
-        await repo.add_task_update(db, task_id, agent, "review", content)
+        # The verdict is authored by a principal — the endpoint already
+        # resolved one to check reviewer independence. Without this it would
+        # be filed as "hub", which is exactly the confusion #559 removes.
+        await repo.add_task_update(
+            db,
+            task_id,
+            agent,
+            "review",
+            content,
+            principal_id=principal_id,
+            author_kind="principal" if principal_id is not None else "anonymous",
+        )
 
         # Client-driven review only (status=review, no review_job_id): hand
         # the task back to the developer so the loop continues — fix findings
@@ -2001,8 +2013,17 @@ async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskUpdateCreate,
+    *,
+    principal_id: int | None = None,
 ) -> TaskUpdateView:
-    """Add an update to a task; route done reports through shared post-done logic."""
+    """Add an update to a task; route done reports through shared post-done logic.
+
+    ``principal_id`` comes from the authenticated identity, never from the
+    body: ``body.agent`` is a display name the client chooses freely, so an
+    update claiming to be from a reviewer proved nothing (#559). The name is
+    still stored as sent — a display name is allowed to differ from the
+    principal — but now the fact sits next to it.
+    """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -2018,7 +2039,16 @@ async def add_update(
     # which is why it must run under the same lock.
     async with get_write_lock(db):
         update_id = await repo.add_task_update(
-            db, task_id, body.agent, body.kind, body.content
+            db,
+            task_id,
+            body.agent,
+            body.kind,
+            body.content,
+            principal_id=principal_id,
+            # "anonymous" is not "hub": an open-mode request really has no
+            # identity, while the hub writing its own alerts has none by
+            # nature. Telling them apart is the point of the field.
+            author_kind="principal" if principal_id is not None else "anonymous",
         )
 
         if body.kind == "done":

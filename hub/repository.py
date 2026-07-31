@@ -1483,10 +1483,24 @@ async def add_task_update(
     agent: str,
     kind: str,
     content: str,
+    *,
+    principal_id: int | None = None,
+    author_kind: str = "hub",
 ) -> int:
+    """Append an update. ``agent`` is display-only; authorship is the pair
+    (principal_id, author_kind) (#559).
+
+    ``author_kind`` defaults to "hub" rather than to the column default
+    "legacy": the column default exists to stamp rows written before the field
+    existed, and new rows must never claim to be history. The default is
+    truthful for the callers that dominate this function — the poller, the
+    conveyor and the timers, none of which have a principal by nature. Request
+    handlers pass "principal" or "anonymous" explicitly.
+    """
     cur = await db.execute(
-        "INSERT INTO task_updates (task_id, agent, kind, content) VALUES (?, ?, ?, ?)",
-        (task_id, agent, kind, content),
+        "INSERT INTO task_updates (task_id, agent, kind, content, principal_id, "
+        "author_kind) VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, agent, kind, content, principal_id, author_kind),
     )
     return cur.lastrowid  # type: ignore[return-value]
 

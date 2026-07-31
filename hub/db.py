@@ -606,6 +606,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
         "NOT NULL DEFAULT '[]'",
     ),
+    (
+        "add_task_updates_principal_id",
+        "ALTER TABLE task_updates ADD COLUMN principal_id INTEGER",
+    ),
+    (
+        # The DB default stamps HISTORY: every row that existed before this
+        # migration is honestly marked as written before the field existed.
+        # New rows never take it — they always come through add_task_update,
+        # whose own default is "hub" (#559). Without this split a NULL/blank
+        # would have meant three different things at once: predates the field,
+        # written by the hub itself, or written with no authentication. That
+        # collapse is the defect class this task exists to remove.
+        "add_task_updates_author_kind",
+        "ALTER TABLE task_updates ADD COLUMN author_kind TEXT "
+        "NOT NULL DEFAULT 'legacy'",
+    ),
 ]
 
 
