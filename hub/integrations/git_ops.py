@@ -18,8 +18,13 @@ from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.mcp_envelope import enrich_error_payload
 
 from hub.commit_scope import parse_porcelain_paths
+from hub.process_kill import kill_process_group
 
 log = logging.getLogger(__name__)
+
+# Exit code for a killed-on-timeout command: the shell convention, and distinct
+# from any rc git itself returns, so a caller can tell a timeout from a refusal.
+_TIMEOUT_RC = 124
 
 
 class WorkspaceNotReadyError(Exception):
@@ -283,8 +288,23 @@ async def _run(
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
         env=_git_env(),
+        # Required by kill_process_group: without its own session the child
+        # shares the hub's process group, and the group kill below would refuse
+        # to fire (killing our own group would take the hub down with it).
+        start_new_session=True,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        # #363 I5. This used to propagate. The poller wraps its entire tick in
+        # one try/except, so a single hung git call skipped every remaining
+        # stage of that tick — review, ci_check, stale sweeps, claim expiry —
+        # and did so again every tick until the cause went away. Worse, the
+        # child survived: asyncio cancels the read, not the process.
+        await kill_process_group(proc)
+        detail = f"timed out after {timeout}s: {' '.join(cmd[:4])}"
+        log.error("_run: %s", detail)
+        return _TIMEOUT_RC, "", detail
     rc = proc.returncode or 0
     out = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()

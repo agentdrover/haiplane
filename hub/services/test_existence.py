@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
-from hub.services.process_kill import kill_process_group
+from hub.process_kill import kill_process_group
 from hub.services.test_locator import parse_test_locator
 
 log = logging.getLogger("hub")

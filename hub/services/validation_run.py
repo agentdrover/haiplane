@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from hub import repository as repo
 from hub.services.orchestration import project_git_context
-from hub.services.process_kill import kill_process_group
+from hub.process_kill import kill_process_group
 
 log = logging.getLogger("hub")
 

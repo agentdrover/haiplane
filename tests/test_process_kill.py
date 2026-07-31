@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 
-from hub.services import process_kill
-from hub.services.process_kill import kill_process_group
+from hub import process_kill
+from hub.process_kill import kill_process_group
 
 
 async def test_kills_grandchild_the_shell_did_not_exec(tmp_path):
