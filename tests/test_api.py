@@ -2563,6 +2563,48 @@ async def test_practice_metrics_cycle_times(client: AsyncClient, db):
     assert 3.5 <= cycles["bug"]["median_hours"] <= 4.5  # медиана, не среднее
 
 
+async def test_practice_metrics_cycle_times_measure_completion(client: AsyncClient, db):
+    # AC-2 (#517): cycle time is measured from completed_at, and the same clock
+    # filters the window. Each case uses its own work_type so one median cannot
+    # hide another's error.
+    from hub import services as services_module
+    from hub.models import TaskCreate
+
+    async def _mk(work_type: str, ready: str, completed: str | None, updated: str):
+        tv = await services_module.create_task(
+            db, TaskCreate(title=f"Cycle {work_type}", work_type=work_type)
+        )
+        await db.execute(
+            "UPDATE tasks SET status='completed', ready_at=datetime('now', ?), "
+            "completed_at=CASE WHEN ? IS NULL THEN NULL "
+            "ELSE datetime('now', ?) END, updated_at=datetime('now', ?) WHERE id=?",
+            (ready, completed, completed, updated, tv.id),
+        )
+        return tv.id
+
+    # Finished 4h ago, edited since. updated_at would report 10h — the whole
+    # point is that a later edit is not a later completion.
+    await _mk("refactor", "-10 hours", "-4 hours", "-1 minutes")
+    # Finished 100 days ago, edited yesterday. Under the old query updated_at
+    # both admitted it to the 90-day window and gave it a 100-day cycle time.
+    await _mk("spike", "-200 days", "-100 days", "-1 days")
+    # Finished before completed_at was ever written: estimated from updated_at.
+    await _mk("docs", "-8 hours", None, "-2 hours")
+    await db.commit()
+
+    resp = await client.get("/api/metrics/practices")
+    cycles = {c["work_type"]: c for c in resp.json()["cycle_times"]}
+
+    assert 5.5 <= cycles["refactor"]["median_hours"] <= 6.5
+    assert cycles["refactor"]["estimated_tasks"] == 0
+    assert "spike" not in cycles, "row completed outside the window must not count"
+    assert 5.5 <= cycles["docs"]["median_hours"] <= 6.5
+    assert cycles["docs"]["estimated_tasks"] == 1, (
+        "a row measured by fallback has to be visible as such, "
+        "otherwise an inferred median reads as a measured one"
+    )
+
+
 async def test_metrics_page_renders(client: AsyncClient, db):
     resp = await client.get("/metrics")
     assert resp.status_code == 200

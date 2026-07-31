@@ -73,5 +73,8 @@ def validate_test_locators(acs: Any, *, enforce: bool) -> None:
             422,
             f"acceptance criteria {', '.join(bad)} have verifiable_by=test but "
             "no valid pytest test locator in test_ref. Provide a pytest nodeid, "
-            f"e.g. '{_EXAMPLE}'.",
+            f"e.g. '{_EXAMPLE}'. The whole request was rejected: no fields were "
+            "written, not even the ones that validated, and in a bulk refine no "
+            "task in the batch was touched — resend the whole request once the "
+            "locators are in place.",
         )
