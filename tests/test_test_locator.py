@@ -71,3 +71,57 @@ def test_validate_test_locators_rejects_invalid_test_ac():
     assert exc.value.status_code == 422
     assert "AC-2" in exc.value.detail
     assert "AC-1" not in exc.value.detail
+
+
+# ---- The rejection must own up to discarding the whole request (#573) ----
+
+
+def test_locator_rejection_says_nothing_was_written():
+    # AC-1 (#573): the refusal is total — the structured-field write is rolled
+    # back with the criteria. Naming only the offending AC reads as a partial
+    # failure, so a caller re-sends just the criteria and believes the rest
+    # landed. The message has to say the whole request was discarded.
+    with pytest.raises(HTTPException) as exc:
+        validate_test_locators([_AC("AC-1", "test", None)], enforce=True)
+    detail = exc.value.detail.lower()
+    assert "no fields were written" in detail
+    assert "resend the whole request" in detail
+
+
+async def test_rejected_refine_leaves_structured_fields_untouched(client, monkeypatch):
+    # AC-2 (#573): prove the claim the message makes, rather than trusting it.
+    # A message can honestly promise a rollback while the code writes anyway —
+    # asserting only the text would cover nothing. This also guards the
+    # reordering in #573: validation moved ahead of the write, and the batch
+    # path shares the same function.
+    monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
+    task = (await client.post("/api/tasks", json={"title": "t"})).json()
+
+    ok = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"problem_statement": "written before the rejection"},
+    )
+    assert ok.status_code == 200, ok.text
+
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={
+            "problem_statement": "must not survive",
+            "business_value": "must not survive either",
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                    "test_ref": None,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+    row = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert row["problem_statement"] == "written before the rejection"
+    assert row["business_value"] == ""

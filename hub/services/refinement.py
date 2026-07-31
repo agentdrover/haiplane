@@ -194,6 +194,19 @@ async def _apply_refine_writes(
     helper is reusable by both single (`refine_task`) and bulk
     (`refine_tasks_bulk`) flows. Returns ``(updated_columns, ac_count)``.
     """
+    # Validate the input BEFORE writing anything (#573). The surrounding
+    # SAVEPOINT rolls a late rejection back either way, so this changes no
+    # outcome — it just stops the code from writing rows it already knows it
+    # will discard, and keeps the order readable: check input, then persist.
+    if payload.acceptance_criteria is not None:
+        # Verifiable SDD (#505): reject verifiable_by=test AC without a
+        # resolvable pytest locator when the project opts in. Gated by config
+        # so the default-off policy leaves existing refine flows untouched.
+        validate_test_locators(
+            payload.acceptance_criteria,
+            enforce=config.SDD_AC_LOCATOR == "require",
+        )
+
     updated_columns = await repo.update_task_structured(db, task_id, payload)
 
     if (
@@ -212,13 +225,6 @@ async def _apply_refine_writes(
 
     ac_count: int | None = None
     if payload.acceptance_criteria is not None:
-        # Verifiable SDD (#505): reject verifiable_by=test AC without a
-        # resolvable pytest locator when the project opts in. Gated by config
-        # so the default-off policy leaves existing refine flows untouched.
-        validate_test_locators(
-            payload.acceptance_criteria,
-            enforce=config.SDD_AC_LOCATOR == "require",
-        )
         try:
             ac_count = await repo.replace_acceptance_criteria(
                 db, task_id, payload.acceptance_criteria

@@ -668,6 +668,33 @@ async def test_refine_bulk_empty_items_returns_422(client: AsyncClient):
     assert resp.status_code == 422
 
 
+async def test_refine_bulk_locator_rejection_rolls_back_earlier_items(
+    client: AsyncClient, monkeypatch
+):
+    # #573 moved the locator check ahead of the write inside the function the
+    # batch path shares. The batch must still discard EVERY item, including the
+    # ones that already validated and belong to a different task — otherwise the
+    # reorder would quietly turn an all-or-nothing batch into a partial one.
+    monkeypatch.setattr("hub.config.SDD_AC_LOCATOR", "require")
+    t1 = await _create_task(client)
+    t2 = await _create_task(client)
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {"task_id": t1["id"], "problem_statement": "should-rollback"},
+                {
+                    "task_id": t2["id"],
+                    "acceptance_criteria": [_ac_payload(1, test_ref=None)],
+                },
+            ]
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    got1 = (await client.get(f"/api/tasks/{t1['id']}")).json()
+    assert got1["problem_statement"] in (None, "")
+
+
 # ---------------------------------------------------------------------------
 # acceptance_criteria / risks at child-task creation
 # ---------------------------------------------------------------------------
