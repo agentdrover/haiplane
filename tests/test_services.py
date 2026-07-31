@@ -1248,11 +1248,52 @@ async def test_decide_task_rework_with_summary(db: aiosqlite.Connection):
         decision_summary="Edge case not handled for expired tokens.",
     )
     tv = await services.decide_task(db, task_id, body)
-    assert tv.status.value in ("fix_requested", "open")
+    # #370 T5: the assertion used to accept ("fix_requested", "open"), which is
+    # both branches of the dispatch outcome — inverting the branch in
+    # lifecycle.py left every decide test green. Name the branch this run took.
+    assert tv.status.value == "fix_requested"
+    assert tv.job_id, "a dispatched rework must carry the job it was dispatched as"
     decision_updates = [u for u in tv.updates if u.kind == "decision"]
     assert len(decision_updates) == 1
     assert "Edge case not handled" in decision_updates[0].content
     assert "Fix the edge case" in decision_updates[0].content
+
+
+async def test_decide_task_rework_without_dispatch_returns_to_open(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#370 T5, the other branch. Dispatch that hands back no job means nobody
+    is working on it, so the task goes back to open rather than sitting in
+    fix_requested waiting for an agent that was never started."""
+    from hub.integrations.registry import plugins
+
+    async def _no_job(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", _no_job)
+
+    task_id = await repo.create_task(
+        db,
+        title="Rework without dispatch",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_decision",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.commit()
+
+    tv = await services.decide_task(
+        db, task_id, TaskDecide(action="rework", instructions="fix it")
+    )
+
+    assert tv.status.value == "open"
+    assert not tv.job_id
 
 
 async def test_decide_task_record_decision_noop_does_not_break(

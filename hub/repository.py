@@ -102,9 +102,29 @@ async def list_tasks_filtered(
     limit: int = 50,
     include_archived: bool = False,
     after_id: int | None = None,
+    project_id: int | None = None,
 ) -> list[aiosqlite.Row]:
     conditions: list[str] = []
     params: list[Any] = []
+
+    if project_id is not None:
+        # The project filter has to run BEFORE the LIMIT. Applied afterwards in
+        # Python it discarded rows the page had already spent, so a page whose
+        # top limit+1 rows belonged to other projects came back empty with
+        # next_cursor=null — indistinguishable from "this project has no
+        # tasks" (#370). Same subtree rule as list_task_ids_for_project: the
+        # project sits on the epic and descendants inherit it.
+        conditions.append(
+            """id IN (
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT id FROM tasks WHERE project_id = ?
+                    UNION ALL
+                    SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
+                )
+                SELECT id FROM subtree
+            )"""
+        )
+        params.append(project_id)
 
     if not include_archived:
         conditions.append("archived=0")
