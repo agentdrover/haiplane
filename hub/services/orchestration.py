@@ -130,15 +130,29 @@ async def practice_metrics(
         "COALESCE(SUM(json_array_length(findings_rejected)), 0) AS rejected_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
         "COALESCE(SUM(duration_ms), 0) AS duration_ms_total, "
-        "SUM(CASE WHEN tokens_spent IS NULL THEN 1 ELSE 0 END) AS reports_without_tokens "
+        "SUM(CASE WHEN tokens_spent IS NULL THEN 1 ELSE 0 END) AS reports_without_tokens, "
+        # Findings from the reports that actually reported a cost. The ratio
+        # below divides by this, not by every confirmed finding in the window.
+        "COALESCE(SUM(CASE WHEN tokens_spent IS NOT NULL "
+        "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
+        "AS confirmed_with_tokens "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
         (since,),
     )
     totals = dict(totals_rows[0])
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
+    # Cost per finding has to take its numerator and denominator from the same
+    # rows. Dividing all tokens by ALL confirmed findings mixed reports that
+    # reported a cost with reports that did not, and understated the result by
+    # 38% on production — 268846 against an honest 433623. A plausible number
+    # is worse than a missing one: nobody double-checks a figure that looks
+    # right (#516).
+    confirmed_with_tokens = totals["confirmed_with_tokens"] or 0
     totals["tokens_per_confirmed"] = (
-        round(totals["tokens_total"] / confirmed) if confirmed else None
+        round(totals["tokens_total"] / confirmed_with_tokens)
+        if confirmed_with_tokens
+        else None
     )
     totals["filtration_rate"] = round(1 - confirmed / raw, 3) if raw else None
 

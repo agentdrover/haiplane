@@ -15,11 +15,20 @@
         <tr><td>Filtration rate (отсев шума)</td>
             <td>{{ (m.machine_reviews.filtration_rate * 100) | round(1) if m.machine_reviews.filtration_rate is not none else '—' }}%</td></tr>
         <tr><td>Tokens total / per confirmed finding</td>
-            <td>{{ m.machine_reviews.tokens_total }} / {{ m.machine_reviews.tokens_per_confirmed or '—' }}</td></tr>
+            <td>{{ m.machine_reviews.tokens_total }} /
+                {% if m.machine_reviews.tokens_per_confirmed is not none %}{{ m.machine_reviews.tokens_per_confirmed }}{% else %}<span class="muted">нет данных</span>{% endif %}</td></tr>
         <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
-        <tr><td>Reports without token data</td><td>{{ m.machine_reviews.reports_without_tokens or 0 }}</td></tr>
+        <tr><td>Покрытие: отчётов без токенов / находок в расчёте цены</td>
+            <td>{{ m.machine_reviews.reports_without_tokens or 0 }} из {{ m.machine_reviews.reviews }}
+                / {{ m.machine_reviews.confirmed_with_tokens }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
     </tbody>
 </table>
+
+<p class="muted">Цена за находку считается только по отчётам, назвавшим свою
+стоимость: делить все токены на все подтверждённые находки значит смешивать
+отчёты, сообщившие цену, с теми, что промолчали. На проде такое смешение
+занижало ответ на 38 процентов. Строка покрытия выше показывает, какая доля
+выборки вошла в расчёт.</p>
 
 <h2>By harness version</h2>
 <table class="task-table">
