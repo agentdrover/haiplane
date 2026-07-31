@@ -52,13 +52,21 @@
 колонка начала заполняться, момент завершения оценён по updated_at — такие строки
 показаны в отдельном столбце, чтобы измеренное не смешивалось с оценённым.
 Столбец убывает сам по мере ухода окна вперёд.</p>
+<p class="muted">Столбец «старт неизвестен» — задачи, у которых ready_at
+проставлен задним числом уже завершённым (массовая простановка 11.07), поэтому
+длительность у них не нулевая, а неизмеримая. В медиану они не входят: если
+считать их нулями, медиана feature падает с 70 часов до 4. Как и предыдущий,
+этот столбец убывает сам — новые задачи получают ready_at в момент
+прохождения DoR.</p>
 <table class="task-table">
-    <thead><tr><th>Work type</th><th>Tasks</th><th>Из них оценка</th><th>Median, hours</th></tr></thead>
+    <thead><tr><th>Work type</th><th>В медиане</th><th>Из них оценка</th>
+        <th>Старт неизвестен</th><th>Median, hours</th></tr></thead>
     <tbody>
         {% for c in m.cycle_times %}
         <tr><td>{{ c.work_type }}</td><td>{{ c.tasks }}</td>
             <td>{% if c.estimated_tasks %}{{ c.estimated_tasks }}{% else %}—{% endif %}</td>
-            <td>{{ c.median_hours }}</td></tr>
+            <td>{% if c.unmeasurable_tasks %}{{ c.unmeasurable_tasks }}{% else %}—{% endif %}</td>
+            <td>{% if c.median_hours is not none %}{{ c.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td></tr>
         {% endfor %}
     </tbody>
 </table>
