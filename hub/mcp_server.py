@@ -715,6 +715,17 @@ async def _read_task(task_id: int) -> dict[str, Any] | None:
         return None
 
 
+async def _prior_status(task_id: int) -> str | None:
+    """Read a task's status before a mutation, for ``transition.from``.
+
+    Returns None when the task cannot be read, which the envelope renders as
+    an unknown origin — honest, and better than naming the destination as the
+    origin.
+    """
+    task = await _read_task(task_id)
+    return task.get("status") if task else None
+
+
 async def _task_mutation_response(
     task_id: int,
     message: str,
@@ -1568,16 +1579,25 @@ async def hub_ask_question(task_id: int, question: str, agent: str = "") -> str:
         question: The question text
         agent: Name of the agent asking
     """
-    await _api_post(
-        f"/api/tasks/{task_id}/question",
-        {
-            "agent": agent,
-            "question": question,
-        },
+    # Read the status BEFORE the call: afterwards the task has already moved,
+    # and transition.from would report the destination as the origin (#369).
+    prior_status = await _prior_status(task_id)
+    try:
+        await _api_post(
+            f"/api/tasks/{task_id}/question",
+            {
+                "agent": agent,
+                "question": question,
+            },
+        )
+        task = await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    message = (
+        f"Question posted on task #{task_id}. Task is now paused (needs_info). "
+        "Waiting for human answer."
     )
-    return format_echo_response(
-        f"Question posted on task #{task_id}. Task is now paused (needs_info). Waiting for human answer."
-    )
+    return _format_mutation_success(message, task, transition_from=prior_status)
 
 
 @mcp.tool()
@@ -1593,15 +1613,21 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
         answer: The answer text
         resume: If True, resume work after the answer. Pair: no dispatch; headless: re-dispatch.
     """
-    result = await _api_post(
-        f"/api/tasks/{task_id}/answer",
-        {
-            "answer": answer,
-            "resume": resume,
-        },
-    )
-    status = result.get("status", "?")
-    return format_echo_response(f"Answer posted on task #{task_id} (status: {status}).")
+    prior_status = await _prior_status(task_id)
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/answer",
+            {
+                "answer": answer,
+                "resume": resume,
+            },
+        )
+        task = await _api_get(f"/api/tasks/{task_id}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    status = task.get("status", result.get("status", "?"))
+    message = f"Answer posted on task #{task_id} (status: {status})."
+    return _format_mutation_success(message, task, transition_from=prior_status)
 
 
 # ---------------------------------------------------------------------------
