@@ -73,6 +73,44 @@ router = APIRouter()
 log = logging.getLogger("hub.web")
 
 
+def _enum_from_form(enum_cls, value: str, field: str):
+    """Build an enum from a form field, refusing garbage with a 400.
+
+    Constructing the enum inline raised a bare ValueError out of the handler,
+    which reaches the client as a 500 — a server-fault answer to a malformed
+    request (#367). The message lists the accepted values, because the usual
+    cause is a renamed member, not an attack.
+    """
+    try:
+        return enum_cls(value)
+    except ValueError as exc:
+        allowed = ", ".join(m.value for m in enum_cls)
+        raise HTTPException(
+            400, f"{field} must be one of: {allowed} (got {value!r})"
+        ) from exc
+
+
+def _page_query(request: Request) -> int:
+    """Read a 1-based ``page`` query param.
+
+    Two different failures hide here, and only the first one looks like a bug.
+    A non-integer raised ValueError straight out of the handler — a 500. A
+    non-positive integer parsed fine and produced a negative OFFSET, which
+    SQLite quietly treats as none: the page rendered as if it were page 1
+    while the template still called it page 0, and the "previous" link walked
+    further into negative numbers. Guarding int() alone would have fixed the
+    crash and left that in place (#367).
+    """
+    raw = request.query_params.get("page", "")
+    if raw == "":
+        return 1
+    try:
+        page = int(raw)
+    except ValueError as exc:
+        raise HTTPException(400, f"page must be an integer (got {raw!r})") from exc
+    return max(page, 1)
+
+
 def _optional_int_query(value: str | int | None, field: str) -> int | None:
     """Treat empty HTMX form values as omitted optional integer query params."""
     if value is None or value == "":
@@ -1036,10 +1074,14 @@ async def web_create_task(
         description=description,
         runtime=runtime,
         run_immediately=run_immediately,
-        task_type=TaskType(task_type),
+        task_type=_enum_from_form(TaskType, task_type, "task_type"),
         parent_id=parent_id,
+        work_type=(
+            _enum_from_form(WorkType, work_type, "work_type")
+            if task_type == "task"
+            else WorkType.feature
+        ),
         priority=priority,
-        work_type=WorkType(work_type) if task_type == "task" else WorkType.feature,
         user_story=user_story,
         problem_statement=problem_statement,
         scope_in=scope_in_items,
@@ -1505,7 +1547,7 @@ async def web_admin_audit(request: Request):
     from hub.services import admin as admin_svc
 
     db = _db(request)
-    page = int(request.query_params.get("page", "1"))
+    page = _page_query(request)
     per_page = 50
     offset = (page - 1) * per_page
     filter_action = request.query_params.get("action", "")
