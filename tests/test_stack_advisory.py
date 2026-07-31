@@ -79,9 +79,15 @@ async def test_submit_for_review_warns_on_stacked_branch(db: aiosqlite.Connectio
     assert "ADVISORY branch stacking" in view.lifecycle_hint
     assert f"#{base_id}" in view.lifecycle_hint
     assert "task-392/base-work" in view.lifecycle_hint
-    alerts = [u for u in view.updates or [] if u.kind == "alert"]
+    # Filter by content, not by count: submit_for_review also reports whether
+    # the declared-areas check could run (#550), and this test is about the
+    # stacking advisory alone.
+    alerts = [
+        u
+        for u in view.updates or []
+        if u.kind == "alert" and "ADVISORY branch stacking" in u.content
+    ]
     assert len(alerts) == 1
-    assert "ADVISORY branch stacking" in alerts[0].content
     assert f"#{base_id}" in alerts[0].content
 
 
@@ -98,7 +104,11 @@ async def test_submit_for_review_no_warning_when_independent(
     assert view.status.value == "review"
     assert len(fake.calls) == 1  # the check ran against the other branch
     assert "ADVISORY branch stacking" not in (view.lifecycle_hint or "")
-    assert not [u for u in view.updates or [] if u.kind == "alert"]
+    assert not [
+        u
+        for u in view.updates or []
+        if u.kind == "alert" and "ADVISORY branch stacking" in u.content
+    ]
 
 
 async def test_submit_for_review_skips_silently_without_repo_access(
@@ -112,7 +122,11 @@ async def test_submit_for_review_skips_silently_without_repo_access(
 
     assert view.status.value == "review"
     assert "ADVISORY branch stacking" not in (view.lifecycle_hint or "")
-    assert not [u for u in view.updates or [] if u.kind == "alert"]
+    assert not [
+        u
+        for u in view.updates or []
+        if u.kind == "alert" and "ADVISORY branch stacking" in u.content
+    ]
 
 
 async def test_submit_for_review_skips_when_plugin_lacks_method(
@@ -129,7 +143,11 @@ async def test_submit_for_review_skips_when_plugin_lacks_method(
     view = await services.submit_for_review(db, task_id)
 
     assert view.status.value == "review"
-    assert not [u for u in view.updates or [] if u.kind == "alert"]
+    assert not [
+        u
+        for u in view.updates or []
+        if u.kind == "alert" and "ADVISORY branch stacking" in u.content
+    ]
 
 
 async def test_detect_branch_stacking_ignores_own_and_branchless_tasks(

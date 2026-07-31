@@ -1614,3 +1614,42 @@ async def test_dirty_paths_reads_non_ascii_names_unescaped(
     assert paths == ["docs/Тест.md"], (
         "the production call must yield the real name, not git's escaped form"
     )
+
+
+# --- #550: the branch diff, against a real repository ---
+
+
+async def test_branch_diff_paths_reads_non_ascii_and_reports_unknown(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """Real git, because the fakes in tests/test_surface_check.py cannot see
+    which flags the call actually passes — dropping -z survived them.
+
+    git diff escapes non-ASCII exactly as git status does, so without -z a
+    declared file would come back escaped and compare as undeclared. Verified
+    against real output before the code was written (#555's lesson, one file
+    over).
+    """
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "Тест.md").write_text("v1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "base", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "-b", "task-1/work", cwd=repo)
+    (repo / "docs" / "Тест.md").write_text("v2\n")
+    (repo / "docs" / "Новый файл.md").write_text("new\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "work", cwd=repo)
+
+    paths = await git_ops.branch_diff_paths("task-1/work", repo=str(repo))
+
+    assert paths is not None
+    assert sorted(paths) == ["docs/Новый файл.md", "docs/Тест.md"], (
+        "declared paths must come back as themselves, not escaped"
+    )
+
+    # A branch that does not exist is unknown, never an empty diff: silence
+    # would read as "the branch changes nothing".
+    assert await git_ops.branch_diff_paths("no-such-branch", repo=str(repo)) is None

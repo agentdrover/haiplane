@@ -71,6 +71,13 @@ SDD_VALIDATION = os.environ.get("OPENCLAW_SDD_VALIDATION", "warn")
 # needs_decision instead. 'off' disables the check. Headless tasks share the
 # main clone for their whole run, so this is the only attribution the hub has.
 COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
+# Declared surfaces vs the actual diff (#550): 'warn' (default) — files the
+# branch changes that no declared area covers are named in a task update and
+# the submission proceeds; 'require' refuses the submission; 'off' disables
+# the check. Compared against the branch diff, not against a prediction: on
+# submit the hub has the truth, so there are no name-matching heuristics and
+# no false positives by construction.
+SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")

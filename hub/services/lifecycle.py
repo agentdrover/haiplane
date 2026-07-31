@@ -11,7 +11,7 @@ from typing import Any
 import aiosqlite
 from fastapi import HTTPException, status
 
-from hub import config
+from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
     done_report_error_detail,
@@ -22,7 +22,7 @@ from hub.actionable_errors import (
 )
 from hub import repository as repo
 from hub.hub_instance import mutation_activity_detail
-from hub.db import log_activity, structured_fields_from_row
+from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.task_idempotency import (
@@ -1155,6 +1155,46 @@ async def pair_start_task(
     return tv
 
 
+async def _surface_check(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[str, list[str], str]:
+    """Compare the branch diff with the task's declared areas (#550).
+
+    Returns (verdict, undeclared, detail) where verdict is "ok", "undeclared"
+    or "unknown". "unknown" is never "ok": if the branch or the base cannot be
+    read, the check did not run, and saying nothing would read as agreement —
+    the mistake #506 made when it treated an unavailable environment as an
+    absent problem.
+
+    The comparison is with the diff, not with a prediction. On submit the hub
+    has the truth, so there is no name-matching heuristic here and no false
+    positive by construction — which is exactly why this check lives at
+    submission and not at DoR.
+    """
+    from hub.services.orchestration import project_git_context
+
+    areas = deserialize_str_list(task.get("affected_areas"))
+    if not areas:
+        return "unknown", [], "у задачи не объявлены affected_areas — сверять не с чем"
+
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return "unknown", [], "у задачи нет ветки"
+
+    ctx = await project_git_context(db, task["id"])
+    paths = await plugins.git_ops.branch_diff_paths(
+        branch, base_branch=ctx.get("base_branch"), repo=ctx.get("repo")
+    )
+    if paths is None:
+        return "unknown", [], f"не удалось прочитать дифф ветки {branch!r}"
+
+    candidates = [p for p in paths if p not in commit_scope.ROUTINE_PATHS]
+    undeclared = commit_scope.foreign_paths(candidates, areas)
+    if undeclared:
+        return "undeclared", undeclared, ""
+    return "ok", [], ""
+
+
 async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1187,6 +1227,33 @@ async def submit_for_review(
             f"current status: {task['status']}",
         )
 
+    # #550: before the transition, not after — a refusal has to happen while
+    # there is still something to refuse.
+    surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
+    surface_note = ""
+    if surfaces_mode != "off":
+        verdict, undeclared, detail = await _surface_check(db, task)
+        if verdict == "undeclared":
+            listed = ", ".join(undeclared[:10])
+            if surfaces_mode == "require":
+                raise HTTPException(
+                    422,
+                    f"ветка меняет файлы вне объявленной области: {listed}. "
+                    "Допишите их в affected_areas или объясните в сдаче, "
+                    "почему они здесь. Проверка сравнивает с фактическим "
+                    "диффом, а не с предсказанием.",
+                )
+            surface_note = (
+                f"Вне объявленной области изменены: {listed}. Режим проверки — "
+                "warn, сдача принята. Область стоит дописать: по ней "
+                "сверяется и commit-scope."
+            )
+        elif verdict == "unknown":
+            surface_note = (
+                f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
+                "Это не значит, что расхождений нет."
+            )
+
     async with get_write_lock(db):
         if not await repo.transition_status_if(
             db, task_id, expected_from="running", new_status="review"
@@ -1207,6 +1274,8 @@ async def submit_for_review(
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)
+        if surface_note:
+            await repo.add_task_update(db, task_id, "hub", "alert", surface_note)
         await db.commit()
         await log_activity(
             db,

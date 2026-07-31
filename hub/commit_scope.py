@@ -18,7 +18,15 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["parse_porcelain_paths", "foreign_paths"]
+__all__ = ["parse_porcelain_paths", "foreign_paths", "ROUTINE_PATHS"]
+
+# Files a task changes as a consequence of doing its work rather than as its
+# subject (#550). Declaring them would be noise, and demanding it would train
+# authors to pad affected_areas until the field means nothing. Kept short and
+# explicit on purpose: an open-ended ignore list would quietly swallow real
+# surfaces. Anything added here needs the same argument — changed BY the work,
+# never the point OF it.
+ROUTINE_PATHS = frozenset({"uv.lock", "poetry.lock", "package-lock.json"})
 
 # The XY status field, then whitespace, then the path. Not a fixed-column
 # slice: callers hand us stripped output, and a stripped " M app.py" loses the
