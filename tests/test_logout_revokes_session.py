@@ -15,7 +15,7 @@ from httpx import AsyncClient
 from hub import config
 from hub.services import admin as admin_svc
 
-TEST_PASSWORD = "correct-horse-battery-staple"
+TEST_PASSWORD = "s3cur3pw!"  # pragma: allowlist secret
 
 
 async def _user_with_session(
