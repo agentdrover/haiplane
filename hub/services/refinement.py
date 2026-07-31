@@ -423,6 +423,18 @@ async def _guard_ac_limit(db: aiosqlite.Connection, task_id: int) -> None:
         )
 
 
+def _guard_ac_locator(ac_or_list: Any) -> None:
+    """Apply the locator policy to any AC write.
+
+    The gate lived only on the bulk-refine payload, so add/upsert/replace
+    wrote unresolvable locators straight through with the policy on require.
+    The rule now stands on every write path — the same shape of hole as the
+    limits in #366 and the raw_count check in #519 (#596).
+    """
+    items = ac_or_list if isinstance(ac_or_list, list) else [ac_or_list]
+    validate_test_locators(items, enforce=config.SDD_AC_LOCATOR == "require")
+
+
 async def add_acceptance_criterion(
     db: aiosqlite.Connection,
     task_id: int,
@@ -433,6 +445,7 @@ async def add_acceptance_criterion(
     Returns ``(ac, created)`` where ``created`` is False when the same
     ``ac_id`` already exists (deterministic no-op, no 409).
     """
+    _guard_ac_locator(ac)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "add_ac"):
         rows = await db.execute_fetchall(
@@ -470,6 +483,7 @@ async def upsert_acceptance_criterion(
     Returns ``(ac, created)`` where ``created`` is True for a fresh insert
     and False when an existing criterion was overwritten.
     """
+    _guard_ac_locator(ac)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "upsert_ac"):
         # Overwriting an existing criterion must keep working at the limit —
@@ -491,6 +505,7 @@ async def replace_acceptance_criteria(
     task_id: int,
     items: list[AcceptanceCriterion],
 ) -> list[AcceptanceCriterion]:
+    _guard_ac_locator(items)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "replace_ac"):
         try:
