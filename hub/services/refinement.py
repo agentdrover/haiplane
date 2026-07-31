@@ -333,7 +333,13 @@ async def _persist_readiness_fields(
     }
     if report.dor_passed:
         if not row["ready_at"]:
-            fields["ready_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+            # Same shape as every other timestamp on the row. isoformat()
+            # produced "2026-07-11T08:58:30+00:00" while created_at/updated_at
+            # are written by SQLite as "2026-07-11 08:58:30". julianday()
+            # accepts both, so nothing broke — but 'T' sorts above a space, so
+            # the first string comparison against a datetime('now') value
+            # would silently return the wrong rows (#594).
+            fields["ready_at"] = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     else:
         # DoR regressed (e.g. a required AC was deleted): the persisted
         # readiness must not go stale.

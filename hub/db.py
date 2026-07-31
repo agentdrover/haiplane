@@ -658,6 +658,21 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_agent_fit_column",
         "ALTER TABLE tasks ADD COLUMN agent_fit TEXT",
     ),
+    (
+        # Bring the rows written before #594 to the same shape as their
+        # neighbours. datetime() rather than string surgery on purpose: it
+        # applies the offset, so a value stored as +03:00 converts correctly
+        # instead of shifting by three hours. Every row on production carries
+        # +00:00 today — checked, not assumed — but the migration must not
+        # depend on that staying true.
+        #
+        # The value does not change, only its representation: julianday()
+        # returns an identical number before and after. Idempotent — rows
+        # already in the target shape carry no 'T' and are skipped.
+        "normalize_ready_at_format",
+        "UPDATE tasks SET ready_at = datetime(ready_at) "
+        "WHERE ready_at IS NOT NULL AND ready_at LIKE '%T%'",
+    ),
 ]
 
 
