@@ -454,3 +454,100 @@ def test_task_view_accepts_structured_payload():
     assert view.readiness_score == 72
     assert view.dor_passed is True
     assert view.risks[0].kind == RiskKind.security
+
+
+# --- #553: an unresolved finding without its explanation is empty ---
+
+
+def test_unresolved_finding_keeps_its_explanation() -> None:
+    from hub.models import MachineUnresolvedFinding
+
+    f = MachineUnresolvedFinding(title="voices diverged", why="cheap said no")
+    assert f.why == "cheap said no"
+
+
+def test_unresolved_finding_with_no_explanation_still_loads() -> None:
+    """Reports written before the field existed carry an empty why (#549)."""
+    from hub.models import MachineUnresolvedFinding
+
+    assert MachineUnresolvedFinding(title="old report").why == ""
+
+
+def test_reason_instead_of_why_is_refused_and_names_the_right_field() -> None:
+    """Reproduced on machine_review#34: both unresolved findings were stored
+    with an empty explanation, which is the entire content of an unresolved
+    finding. The two field names sit on adjacent lines of the same docstring —
+    findings_rejected takes `reason` — so they get swapped.
+
+    Plain extra="forbid" would only say `reason` is not permitted, leaving the
+    caller to guess: that trades a silent loss for a loud puzzle. The message
+    has to name `why`.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    from hub.models import MachineUnresolvedFinding
+
+    with pytest.raises(ValidationError) as excinfo:
+        MachineUnresolvedFinding(title="t", reason="the explanation that was lost")
+
+    message = excinfo.value.errors()[0]["msg"]
+    assert "why" in message
+    assert "reason" in message
+
+
+def test_unknown_keys_on_findings_are_refused_not_dropped() -> None:
+    """Harness output carries dimensions/duplicates/failure_scenario. Mapping
+    those onto the stored shape is the submitter's job; silently dropping them
+    is how a field ends up empty with nobody noticing."""
+    import pytest
+    from pydantic import ValidationError
+
+    from hub.models import MachineFinding, MachineRejectedFinding
+
+    with pytest.raises(ValidationError):
+        MachineFinding(title="t", severity="high", dimensions=["correctness"])
+    with pytest.raises(ValidationError):
+        MachineRejectedFinding(title="t", why="wrong field for this model")
+
+
+def test_unresolved_refuses_unknown_keys_beyond_the_reason_confusion() -> None:
+    """The targeted validator fires before extra="forbid" is ever consulted,
+    so testing only the reason/why swap leaves the model's own guard uncovered:
+    removing it survived the suite until this test existed. Any other stray key
+    would have gone back to being dropped in silence.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    from hub.models import MachineUnresolvedFinding
+
+    with pytest.raises(ValidationError):
+        MachineUnresolvedFinding(title="t", why="ok", severity="high")
+
+
+def test_seeded_skill_names_every_unresolved_field_the_model_has() -> None:
+    """The skill text is the contract agents actually read (#553).
+
+    #549 updated the tool docstring and the docs but not this constant, so an
+    agent taking the contract from the hub kept submitting without honest
+    incompleteness — reproducing the defect the change had just fixed. Found by
+    an independent review of the task statement, not by me.
+
+    Derived from the model rather than hard-coded, so a field added later is
+    caught here instead of drifting the same way again.
+    """
+    from hub.db import MACHINE_REVIEW_CYCLE_SKILL
+    from hub.models import MachineReviewSubmit, MachineUnresolvedFinding
+
+    for field in MachineUnresolvedFinding.model_fields:
+        assert field in MACHINE_REVIEW_CYCLE_SKILL, (
+            f"unresolved field {field!r} missing from the seeded skill"
+        )
+    for field in ("incomplete", "unresolved", "lost_dimensions"):
+        assert field in MachineReviewSubmit.model_fields, (
+            f"{field} is expected on the submit model"
+        )
+        assert field in MACHINE_REVIEW_CYCLE_SKILL, (
+            f"{field!r} missing from the seeded skill agents read"
+        )

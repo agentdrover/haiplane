@@ -1301,19 +1301,32 @@ OPENCLAW_MACHINE_REVIEW=require блокирует человеческий ве
    («default to refuted»), подтверждение только единогласное.
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
-4. `hub_submit_machine_review(task_id, raw_count, findings_confirmed,
-   findings_rejected, harness_skill, harness_version, agent_count,
-   tokens_spent, duration_ms, orchestrator, model)` — метрики опциональны,
-   но токены/время питают экономику практики (#384). Отчёт привязывается к
-   текущему submission_generation: пересдача работы делает его stale.
+4. `hub_submit_machine_review(task_id, raw_count, incomplete,
+   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
+   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
+   orchestrator, model)` — метрики опциональны, но токены/время питают
+   экономику практики (#384). Отчёт привязывается к текущему
+   submission_generation: пересдача работы делает его stale.
+
+   `incomplete` **обязателен и без дефолта** (#549): пропуск даёт 422. Молча
+   подставленный `false` — это то, как прогон с умершими агентами читается
+   как чистый. `unresolved` — находки, которые никто не смог рассудить; они
+   НЕ идут в `findings_rejected`, потому что «никто не голосовал» и «кто-то
+   опроверг» — противоположные исходы. `lost_dimensions` — измерения, не
+   вернувшие результат.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 
 ## Формат находок
 confirmed: {title, severity high|medium|low, category slug, file, line,
-detail}; rejected: {title, category, reason}. category питает метрики
-повторяемости — используй устойчивые слаги (security, correctness,
-consistency, tests, …).
+detail}; rejected: {title, category, reason}; unresolved: {title, why}.
+category питает метрики повторяемости — используй устойчивые слаги
+(security, correctness, consistency, tests, …).
+
+Объяснение у `unresolved` называется `why`, а не `reason`: `reason`
+принадлежит `findings_rejected`. Лишние ключи отвергаются, а не отбрасываются
+молча (#553) — перепутанное имя раньше давало сохранённую находку с пустым
+объяснением.
 """
 
 
