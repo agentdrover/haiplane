@@ -1393,6 +1393,49 @@ async def test_passing_ci_merges_exactly_once(mock_sleep, db):
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_the_recorded_merge_is_the_one_this_pr_produced(mock_sleep, db):
+    """#534, third review round: the whitelist took the branch tip.
+
+    The SHA came from `head_sha` of the base branch right after the merge, so a
+    direct push that landed in between was written down as a pipeline merge —
+    excusing the intruder, and leaving the real merge to be reported as drift.
+    Exactly inverted. The pull request knows its own merge commit; ask it.
+    """
+    await _approved_task_with_pr(db)
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    # The merge produced M; a direct push then made D the tip of the base.
+    mock_git.merge_commit_sha = AsyncMock(return_value="mmm111")
+    mock_git.head_sha = AsyncMock(return_value="ddd222")
+    mock_git.pull_main = AsyncMock(return_value=True)
+    mock_git.delete_branch = AsyncMock(return_value=None)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT merge_sha FROM pipeline_merges")
+    ]
+    recorded = {r["merge_sha"] for r in rows}
+    assert recorded == {"mmm111"}, (
+        f"the pipeline merge must be the PR's own commit, recorded {recorded}"
+    )
+    assert "ddd222" not in recorded, (
+        "the tip of the base branch is whatever landed last — a direct push "
+        "there would have been whitelisted"
+    )
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_a_refused_merge_also_stops_completion(mock_sleep, db):
     """The second way a task used to reach `completed` unmerged.
 

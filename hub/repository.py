@@ -337,6 +337,91 @@ async def get_project_by_slug(
     return rows[0] if rows else None
 
 
+async def record_pipeline_merge(
+    db: aiosqlite.Connection,
+    *,
+    pr_number: int,
+    merge_sha: str = "",
+    project_id: int | None = None,
+    task_id: int | None = None,
+) -> None:
+    """Remember a merge the hub performed itself, by the commit it produced.
+
+    ``merge_sha`` is the evidence. The pull-request number is kept for
+    context only: it lives in the commit subject, which the person pushing
+    controls, so matching on it left the guard bypassable by typing a number
+    that had been merged before (#534, review of submission #2).
+    """
+    await db.execute(
+        "INSERT OR IGNORE INTO pipeline_merges "
+        "(project_id, pr_number, task_id, merge_sha) VALUES (?, ?, ?, ?)",
+        (project_id, int(pr_number), task_id, merge_sha or ""),
+    )
+    await db.commit()
+
+
+async def known_pipeline_shas(db: aiosqlite.Connection, project_id: int) -> set[str]:
+    """Merge commits this project's pipeline produced.
+
+    Scoped to the project on purpose. An earlier version also pulled in rows
+    with a NULL project_id, so a merge recorded for a task without a project
+    counted as legitimate everywhere (#534, review of submission #2).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT merge_sha FROM pipeline_merges "
+        "WHERE project_id = ? AND COALESCE(merge_sha, '') != ''",
+        (project_id,),
+    )
+    return {dict(r)["merge_sha"] for r in rows}
+
+
+async def set_drift_baseline(
+    db: aiosqlite.Connection, project_id: int, sha: str
+) -> None:
+    await db.execute(
+        "UPDATE projects SET drift_baseline_sha=? WHERE id=?", (sha, project_id)
+    )
+    await db.commit()
+
+
+async def record_drift_commit(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int,
+    sha: str,
+    branch: str,
+    subject: str = "",
+    author: str = "",
+) -> bool:
+    """Record a drift commit; True when it was not already known (#534).
+
+    INSERT OR IGNORE on the (project_id, sha) key: the second sighting of the
+    same commit returns False and nothing is written, so a periodic check
+    cannot turn one violation into a stream of alerts.
+    """
+    cur = await db.execute(
+        "INSERT OR IGNORE INTO base_branch_drift "
+        "(project_id, sha, branch, subject, author) VALUES (?, ?, ?, ?, ?)",
+        (project_id, sha, branch, subject, author),
+    )
+    await db.commit()
+    return bool(cur.rowcount)
+
+
+async def list_drift_commits(
+    db: aiosqlite.Connection, project_id: int | None = None
+) -> list[aiosqlite.Row]:
+    if project_id is None:
+        return await db.execute_fetchall(
+            "SELECT * FROM base_branch_drift ORDER BY detected_at DESC, id DESC"
+        )
+    return await db.execute_fetchall(
+        "SELECT * FROM base_branch_drift WHERE project_id=? "
+        "ORDER BY detected_at DESC, id DESC",
+        (project_id,),
+    )
+
+
 async def list_projects(
     db: aiosqlite.Connection,
     *,

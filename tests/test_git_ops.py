@@ -352,6 +352,41 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
     assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
 
 
+@pytest.mark.parametrize(
+    "rc,out,expected",
+    [
+        # A stand-in for the SHA, deliberately not hex: a hex literal here reads
+        # as a secret to the scanner, and the pragma that silenced it made the
+        # line too long for the formatter to leave alone.
+        (0, '{"mergeCommit": {"oid": "merge-commit-oid"}}', "merge-commit-oid"),
+        (0, '{"mergeCommit": null}', ""),  # merged elsewhere, or not merged
+        (0, "not json", ""),
+        (1, "", ""),  # gh failed — say nothing rather than guess
+    ],
+)
+async def test_merge_commit_sha_reads_the_pr_not_the_branch(
+    git_ops: GitOpsIntegration, rc, out, expected
+):
+    """#534: an unreadable answer is "" — never a SHA that happens to be handy.
+
+    A wrong SHA here is worse than none: it whitelists whatever commit it names
+    and leaves the real merge to be reported as drift.
+    """
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(rc, out, "boom"),
+    ) as mock_gh:
+        got = await git_ops.merge_commit_sha(
+            7, repo="/ws/proj", gh_repo="mrPDA/calc-kids"
+        )
+
+    assert got == expected
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--repo") + 1] == "mrPDA/calc-kids"
+    assert "mergeCommit" in args, "the SHA must be asked of the pull request itself"
+
+
 async def test_get_ci_failure_logs_targets_project_repo(git_ops: GitOpsIntegration):
     # AC-2 (#420): failure-log lookup also uses the project repo.
     with patch(

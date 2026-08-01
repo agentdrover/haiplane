@@ -108,6 +108,25 @@ class NoopGitOps:
     async def current_branch(self, repo: str | None = None) -> str:
         return ""
 
+    async def head_sha(self, repo: str, base: str) -> str:
+        return ""
+
+    async def merge_commit_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> str:
+        return ""
+
+    async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
+        """No git here — the drift check must read this as "cannot check",
+        never as "clean" (#534)."""
+        return (False, "git integration is not configured")
+
+    async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
+        return None
+
     async def branch_contains_unmerged_commits_of(
         self,
         branch: str,

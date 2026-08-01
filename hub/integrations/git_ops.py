@@ -804,6 +804,34 @@ class GitOpsIntegration:
         )
         return True
 
+    async def head_sha(self, repo: str, base: str) -> str:
+        """Current tip of origin/<base>, or "" when it cannot be read (#534)."""
+        rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
+        return out.strip() if rc == 0 else ""
+
+    async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
+        """Refresh one base branch from origin. Read-only, never writes (#534)."""
+        rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)
+        return (rc == 0, err or "")
+
+    async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
+        """Commits on the base's own line, newest first, or None on failure.
+
+        --first-parent stays on the base line so work merged from a branch is
+        represented by its merge commit rather than by every commit inside it.
+        The unit separator keeps subjects with spaces intact (#534).
+        """
+        rc, out, _ = await _git(
+            "log",
+            f"origin/{base}",
+            "--first-parent",
+            f"-{int(limit)}",
+            "--format=%H\x1f%s\x1f%an",
+            repo=repo,
+            check=False,
+        )
+        return out if rc == 0 else None
+
     def worktree_path(self, task_id: int, repo: str | None = None) -> str:
         """Deterministic worktree path for a task (#459); where its branch lives."""
         return _worktree_path(task_id, repo or _repo_root())
@@ -1441,6 +1469,44 @@ class GitOpsIntegration:
         return CIProbeResult(
             CIProbeOutcome.unavailable, "unknown_state", details=",".join(states)
         )
+
+    async def merge_commit_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> str:
+        """The SHA of the commit THIS pull request produced, or "" (#534).
+
+        Not the tip of the base branch. The tip is whatever landed last, and
+        between the merge and the read a direct push can land — which would
+        write the intruder into the whitelist and mark the real merge as
+        drift. The pull request knows its own merge commit, so ask it.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "mergeCommit",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            log.warning(
+                "could not read the merge commit of PR #%d: %s",
+                pr_number,
+                (err or "").strip(),
+            )
+            return ""
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            log.warning("PR #%d returned no readable merge commit", pr_number)
+            return ""
+        return str((data.get("mergeCommit") or {}).get("oid") or "").strip()
 
     async def merge_pr(
         self,
