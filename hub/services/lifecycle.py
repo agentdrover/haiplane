@@ -85,6 +85,7 @@ from hub.services.orchestration import (
 )
 from hub.services.refinement import (
     TaskNotFoundError,
+    _guard_ac_locator,
     get_readiness,
     get_write_lock,
     list_acceptance_criteria,
@@ -698,6 +699,18 @@ async def create_subtasks_bulk(
     auto_review = body.auto_review
     if body.task_type == TaskType.subtask:
         auto_review = False
+
+    # Check every item's locators BEFORE opening the write lock: the batch
+    # promises all-or-nothing, and refusing after the first rows are written
+    # would rely on the rollback to keep that promise instead of never
+    # breaking it. This path writes ACs straight through the repository, so
+    # the service-layer guard on add/upsert/replace does not cover it — it is
+    # the fifth write path, found in review of submission #1 after I had
+    # enumerated four by reading one module instead of following the
+    # repository calls (#596).
+    for item in body.items:
+        if item.acceptance_criteria is not None:
+            _guard_ac_locator(item.acceptance_criteria)
 
     created_ids: list[int] = []
     async with get_write_lock(db):
