@@ -673,6 +673,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "UPDATE tasks SET ready_at = datetime(ready_at) "
         "WHERE ready_at IS NOT NULL AND ready_at LIKE '%T%'",
     ),
+    (
+        # Nullable on purpose: NULL is "not stated", which must stay
+        # distinguishable from the explicit choice "implementation". A NOT
+        # NULL DEFAULT '' would make the empty string a third state that is
+        # neither (#595).
+        "add_ac_expectation_source_column",
+        "ALTER TABLE acceptance_criteria ADD COLUMN expectation_source TEXT",
+    ),
 ]
 
 
@@ -862,6 +870,12 @@ def ac_to_row_kwargs(ac: Any) -> dict[str, Any]:
         "then_clause": ac.then,
         "verifiable_by": ac.verifiable_by.value,
         "test_ref": ac.test_ref,
+        # Writing and reading go through different functions, so a field added
+        # to one and forgotten in the other is stored and never surfaces —
+        # the shape that bit this project in #331. Both sides here.
+        "expectation_source": getattr(
+            getattr(ac, "expectation_source", None), "value", None
+        ),
     }
 
 
@@ -874,6 +888,9 @@ def row_to_ac_kwargs(row: Any) -> dict[str, Any]:
         "then": row["then_clause"],
         "verifiable_by": row["verifiable_by"],
         "test_ref": row["test_ref"],
+        "expectation_source": (
+            row["expectation_source"] if "expectation_source" in row.keys() else None
+        ),
     }
 
 

@@ -56,6 +56,10 @@ def _ac(idx: int = 1) -> AcceptanceCriterion:
         when="they click the export button",
         then="a CSV download starts within 2 seconds",
         verifiable_by=ACVerifiableBy.test,
+        # A complete criterion now says where its expectation came from
+        # (#595). Without it these "nothing to suggest" cases would carry the
+        # unstated-source warning, which is the point of the warning.
+        expectation_source="requirement",
     )
 
 

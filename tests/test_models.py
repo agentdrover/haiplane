@@ -67,7 +67,13 @@ def test_acceptance_criterion_serializes_round_trip():
         "test_ref": "tests/test_x.py::test_y",
     }
     ac = AcceptanceCriterion.model_validate(payload)
-    assert ac.model_dump() == {**payload, "verifiable_by": ACVerifiableBy.test}
+    # expectation_source (#595) defaults to None — "not stated", which the
+    # payload above deliberately omits.
+    assert ac.model_dump() == {
+        **payload,
+        "verifiable_by": ACVerifiableBy.test,
+        "expectation_source": None,
+    }
 
 
 # --- TaskRisk ---
