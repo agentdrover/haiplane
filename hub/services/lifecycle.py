@@ -1260,6 +1260,39 @@ async def submit_for_review(
             f"current status: {task['status']}",
         )
 
+    # #533: the task records a canonical branch; the client reports the one it
+    # worked in. A mismatch means the hub, CI and the reviewer are looking at
+    # a branch nobody wrote in.
+    #
+    # This compares a REPORT, not an observation. The hub has no working copy
+    # of the project to inspect — on production the workspace holds a single
+    # .placeholder file — so a client that names the right branch while
+    # sitting in another passes. It catches forgetting to switch, which is
+    # the failure that actually happens; it is not a guarantee, and the
+    # policy document says so in the same words.
+    #
+    # Pair path only: a headless task's branch belongs to the dispatch job,
+    # and the client never reports one.
+    reported = (body.branch or "").strip()
+    canonical = (task.get("branch") or "").strip()
+    if reported and canonical and reported != canonical:
+        raise HTTPException(
+            409,
+            {
+                "error": "branch_mismatch",
+                "task_id": task_id,
+                "expected": canonical,
+                "reported": reported,
+                "hint": (
+                    f"work in the branch this task owns: git switch {canonical} "
+                    f"(create it from the base branch if it does not exist), or "
+                    f"move the commits over. If {reported!r} is genuinely the "
+                    "right branch, update the task's branch field first so the "
+                    "hub, CI and the reviewer all point at the same place."
+                ),
+            },
+        )
+
     # #550: before the transition, not after — a refusal has to happen while
     # there is still something to refuse.
     surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
