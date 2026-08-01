@@ -373,6 +373,11 @@ class TaskSubmitReview(BaseModel):
 
     agent: str = Field("", max_length=100)
     summary: str = Field("", max_length=10000)
+    # The branch the client actually worked in (#533). Reported, not observed:
+    # the hub has no copy of the project to inspect, so this catches a client
+    # that forgot to switch, never one that misreports. Optional so existing
+    # callers keep working; omitting it skips the comparison.
+    branch: str = Field("", max_length=200)
 
 
 class ReviewFinding(BaseModel):
