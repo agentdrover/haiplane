@@ -125,6 +125,7 @@ def row_to_ac(row: aiosqlite.Row) -> AcceptanceCriterion:
     ``then_clause`` columns are unpacked back to the model's ``id``/
     ``when``/``then`` field names.
     """
+    keys = row.keys() if hasattr(row, "keys") else []
     return AcceptanceCriterion(
         id=row["ac_id"],
         given=row["given"],
@@ -132,6 +133,12 @@ def row_to_ac(row: aiosqlite.Row) -> AcceptanceCriterion:
         then=row["then_clause"],
         verifiable_by=row["verifiable_by"],
         test_ref=row["test_ref"],
+        # Guarded by key presence so a row read before the migration — or in
+        # a test fixture built from an older schema — loads as "not stated"
+        # rather than raising (#595).
+        expectation_source=(
+            row["expectation_source"] if "expectation_source" in keys else None
+        ),
     )
 
 

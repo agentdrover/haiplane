@@ -34,6 +34,8 @@ def _ac_payload(idx: int = 1, **overrides) -> dict:
         "then": f"the system returns outcome {idx}",
         "verifiable_by": "test",
         "test_ref": f"tests/test_ac.py::test_{idx}",
+        # #595: a complete criterion states where its expectation came from.
+        "expectation_source": "requirement",
     }
     base.update(overrides)
     return base

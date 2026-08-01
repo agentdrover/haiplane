@@ -1227,7 +1227,8 @@ async def add_acceptance_criterion(
     cur = await db.execute(
         "INSERT INTO acceptance_criteria "
         "(task_id, ac_id, given, when_clause, then_clause, verifiable_by, "
-        "test_ref, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "test_ref, expectation_source, position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             kwargs["ac_id"],
@@ -1236,6 +1237,7 @@ async def add_acceptance_criterion(
             kwargs["then_clause"],
             kwargs["verifiable_by"],
             kwargs["test_ref"],
+            kwargs["expectation_source"],
             position,
         ),
     )
@@ -1272,11 +1274,13 @@ async def upsert_acceptance_criterion(
     await db.execute(
         "INSERT INTO acceptance_criteria "
         "(task_id, ac_id, given, when_clause, then_clause, verifiable_by, "
-        "test_ref, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "test_ref, expectation_source, position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(task_id, ac_id) DO UPDATE SET "
         "given=excluded.given, when_clause=excluded.when_clause, "
         "then_clause=excluded.then_clause, verifiable_by=excluded.verifiable_by, "
-        "test_ref=excluded.test_ref",
+        "test_ref=excluded.test_ref, "
+        "expectation_source=excluded.expectation_source",
         (
             task_id,
             kwargs["ac_id"],
@@ -1285,6 +1289,7 @@ async def upsert_acceptance_criterion(
             kwargs["then_clause"],
             kwargs["verifiable_by"],
             kwargs["test_ref"],
+            kwargs["expectation_source"],
             next_pos,
         ),
     )
@@ -1313,8 +1318,8 @@ async def replace_acceptance_criteria(
         await db.execute(
             "INSERT INTO acceptance_criteria "
             "(task_id, ac_id, given, when_clause, then_clause, "
-            "verifiable_by, test_ref, position) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "verifiable_by, test_ref, expectation_source, position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 kwargs["ac_id"],
@@ -1323,6 +1328,7 @@ async def replace_acceptance_criteria(
                 kwargs["then_clause"],
                 kwargs["verifiable_by"],
                 kwargs["test_ref"],
+                kwargs["expectation_source"],
                 position,
             ),
         )
