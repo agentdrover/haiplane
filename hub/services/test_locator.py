@@ -56,9 +56,14 @@ def _ac_id(ac: Any) -> str:
 def validate_test_locators(acs: Any, *, enforce: bool) -> None:
     """Reject verifiable_by=test AC without a valid locator when ``enforce`` (#505).
 
-    Applied only to refine INPUT, never to DB reads. When ``enforce`` is False
-    this is a no-op, so the default-off policy preserves existing behavior.
-    Non-test AC (manual/log_check/ui_check) never require a locator (AC-2).
+    Applied to every AC WRITE path, never to DB reads. It used to guard only
+    the bulk-refine payload, so the single add/upsert/replace calls let an
+    unresolvable locator through with the policy set to require — 425 of the
+    695 stored locators were unresolvable by the time that was noticed (#596).
+
+    Never on reads: those 425 rows must keep loading. When ``enforce`` is
+    False this is a no-op, so off/warn behaviour is unchanged. Non-test AC
+    (manual/log_check/ui_check) never require a locator (AC-2).
     """
     if not enforce or not acs:
         return
@@ -69,12 +74,28 @@ def validate_test_locators(acs: Any, *, enforce: bool) -> None:
         and not is_valid_test_locator(getattr(ac, "test_ref", None))
     ]
     if bad:
+        # A comma-separated list is the most common near-miss, and the plain
+        # "no valid locator" wording reads as if the value were missing rather
+        # than plural. Naming it stops the author guessing (#596).
+        listish = [
+            _ac_id(ac)
+            for ac in acs
+            if _ac_id(ac) in bad and "," in (getattr(ac, "test_ref", None) or "")
+        ]
+        extra = ""
+        if listish:
+            extra = (
+                f" Criteria {', '.join(listish)} name several tests separated by "
+                "commas: test_ref holds exactly ONE nodeid. Point it at the test "
+                "that proves the criterion and mention the others in the 'then' "
+                "text."
+            )
         raise HTTPException(
             422,
             f"acceptance criteria {', '.join(bad)} have verifiable_by=test but "
             "no valid pytest test locator in test_ref. Provide a pytest nodeid, "
-            f"e.g. '{_EXAMPLE}'. The whole request was rejected: no fields were "
-            "written, not even the ones that validated, and in a bulk refine no "
-            "task in the batch was touched — resend the whole request once the "
-            "locators are in place.",
+            f"e.g. '{_EXAMPLE}'.{extra} The whole request was rejected: no "
+            "fields were written, not even the ones that validated, and in a "
+            "bulk refine no task in the batch was touched — resend the whole "
+            "request once the locators are in place.",
         )
