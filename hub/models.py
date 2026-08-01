@@ -583,6 +583,24 @@ class TaskUnarchive(BaseModel):
 # --- Structured task form: ACs, risks, refine, readiness (Epic #32) ---
 
 
+class ExpectationSource(str, Enum):
+    """Where the expected behaviour in an acceptance criterion came from (#595).
+
+    A criterion says what must be observably true; this says who decided it.
+    When the answer is the implementation, the test can only confirm the
+    status quo — including a defect — which is how an assertion ends up
+    unable to fail. ``implementation`` is allowed rather than forbidden:
+    sometimes it is the only source there is, and saying so plainly beats
+    leaving it blank.
+    """
+
+    requirement = "requirement"
+    contract = "contract"
+    incident = "incident"
+    bug_report = "bug_report"
+    implementation = "implementation"
+
+
 class AcceptanceCriterion(BaseModel):
     """A single Given/When/Then scenario verifiable by a concrete method."""
 
@@ -592,6 +610,9 @@ class AcceptanceCriterion(BaseModel):
     then: str = Field(..., min_length=1, max_length=500)
     verifiable_by: ACVerifiableBy
     test_ref: str | None = Field(default=None, max_length=500)
+    # None means "not stated", which is NOT the same as "taken from the
+    # implementation" — the column is nullable so the two cannot be confused.
+    expectation_source: ExpectationSource | None = None
 
 
 class TaskRisk(BaseModel):

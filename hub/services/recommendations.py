@@ -235,6 +235,66 @@ def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
     ]
 
 
+def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+    """Flag criteria whose expected behaviour has no stated source (#595).
+
+    Strictly non-blocking: severity="low", expected_score_delta=0, no effect
+    on dor_passed — the same contract as the AC-quality warnings above. A
+    charge here would drop every task in the backlog on the day this ships,
+    since no criterion written before today can carry the field.
+
+    ``implementation`` is warned about but not forbidden. Sometimes the code
+    is the only source there is; saying so lets a reviewer weigh the
+    assertion instead of assuming it came from a requirement. Silence is what
+    hides the difference.
+    """
+    unstated: list[str] = []
+    from_code: list[str] = []
+    for row in ac_rows:
+        keys = row.keys() if hasattr(row, "keys") else []
+        source = row["expectation_source"] if "expectation_source" in keys else None
+        if source == "implementation":
+            from_code.append(row["ac_id"])
+        elif not source:
+            unstated.append(row["ac_id"])
+
+    out: list[Recommendation] = []
+    if from_code:
+        out.append(
+            Recommendation(
+                field="expectation_source",
+                severity="low",
+                message=(
+                    f"Acceptance criteria {', '.join(from_code)} take their "
+                    "expected behaviour from the implementation. That is "
+                    "allowed and honestly stated, but a test written from it "
+                    "can only confirm what the code already does — including "
+                    "a defect. Where a requirement, contract or incident "
+                    "exists, derive the expectation from that instead."
+                ),
+                expected_score_delta=0,
+                estimated_minutes=3,
+            )
+        )
+    if unstated:
+        out.append(
+            Recommendation(
+                field="expectation_source",
+                severity="low",
+                message=(
+                    f"Acceptance criteria {', '.join(unstated)} do not say "
+                    "where their expected behaviour comes from. Name the "
+                    "source (requirement / contract / incident / bug_report / "
+                    "implementation) so a reviewer can tell a checked "
+                    "requirement from a restatement of the code."
+                ),
+                expected_score_delta=0,
+                estimated_minutes=2,
+            )
+        )
+    return out
+
+
 def _recommendation_for(
     check: DoRCheckItem,
     *,
@@ -329,6 +389,7 @@ async def calculate_readiness_with_recommendations(
     # Non-blocking AC-quality nudge (#6): does not affect score/dor_passed.
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
     recs.extend(build_ac_quality_warnings(ac_rows))
+    recs.extend(build_expectation_source_warnings(ac_rows))
     recs.sort(key=lambda r: SEVERITY_ORDER[r.severity])
 
     return ReadinessReport(
@@ -346,6 +407,7 @@ __all__ = [
     "CHECK_RECOMMENDATIONS",
     "SEVERITY_ORDER",
     "build_ac_quality_warnings",
+    "build_expectation_source_warnings",
     "build_for_task",
     "build_recommendations",
     "calculate_readiness_with_recommendations",

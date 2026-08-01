@@ -190,7 +190,8 @@
                         <div><span class="u-text-muted">Given</span> {{ ac.given }}</div>
                         <div><span class="u-text-muted">When</span> {{ ac.when }}</div>
                         <div><span class="u-text-muted">Then</span> {{ ac.then }}</div>
-                        <div><span class="badge badge--xs badge-{{ ac.verifiable_by.value }}">{{ ac.verifiable_by.value }}</span>{% if ac.test_ref %} <code class="code-sm">{{ ac.test_ref }}</code>{% endif %}</div>
+                        <div><span class="badge badge--xs badge-{{ ac.verifiable_by.value }}">{{ ac.verifiable_by.value }}</span>{% if ac.test_ref %} <code class="code-sm">{{ ac.test_ref }}</code>{% endif %}
+                            {%- if ac.expectation_source %} <span class="muted">источник ожидания: {{ ac.expectation_source.value }}{% if ac.expectation_source.value == 'implementation' %} — проверка может лишь подтверждать текущее поведение{% endif %}</span>{% else %} <span class="muted">источник ожидания не указан</span>{% endif %}</div>
                     </article>
                     {% endfor %}
                 </div>
