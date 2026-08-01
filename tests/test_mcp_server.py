@@ -2841,3 +2841,71 @@ async def test_machine_review_receipt_quotes_the_stored_raw_count(
     text = out.content[0].text if hasattr(out, "content") else str(out)
     assert "2 raw" in text
     assert "0 raw" not in text, "the receipt must not repeat the un-normalised input"
+
+
+async def test_pair_start_states_the_branch_as_an_obligation(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#533 AC-1: the canonical branch is an instruction, not a footnote.
+
+    It already appeared inside the summary line, which reads as "here is what
+    we recorded". The policy used to allow the local name to differ, and while
+    it does, CI and the reviewer read a branch nobody wrote in.
+    """
+    mock_api_post.return_value = {
+        "status": "running",
+        "branch": "task-77/some-slug",
+        "assigned_agent": "dev",
+        "job_id": None,
+        "workspace_mode": "legacy",
+    }
+    mock_api_get.side_effect = [
+        {"id": 77, "status": "open"},
+        {
+            "id": 77,
+            "status": "running",
+            "branch": "task-77/some-slug",
+            "assigned_agent": "dev",
+        },
+    ]
+
+    payload = json.loads(await hub_pair_start(77))
+
+    text = payload["message"]
+    assert "Canonical branch: task-77/some-slug" in text
+    assert "exactly this" in text, "the wording has to bind, not inform"
+
+
+async def test_pair_start_stays_quiet_about_branches_for_headless_tasks(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#533 AC-3: a dispatched task's branch belongs to its job."""
+    mock_api_post.return_value = {
+        "status": "running",
+        "branch": "task-78/slug",
+        "assigned_agent": "dev",
+        "job_id": "job-9",
+        "workspace_mode": "legacy",
+    }
+    mock_api_get.side_effect = [
+        {"id": 78, "status": "open"},
+        # The branch IS present here on purpose. Without it the assertion
+        # below passes because there is no name to print, not because the
+        # headless guard suppressed it — the first version of this test was
+        # green for that wrong reason and a mutation removing the guard
+        # survived it (#533).
+        {
+            "id": 78,
+            "status": "running",
+            "branch": "task-78/slug",
+            "job_id": "job-9",
+        },
+    ]
+
+    payload = json.loads(await hub_pair_start(78))
+
+    assert "task-78/slug" in payload["message"], (
+        "the summary line still names the branch; only the obligation wording "
+        "is withheld"
+    )
+    assert "Canonical branch:" not in payload["message"]

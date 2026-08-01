@@ -1118,6 +1118,17 @@ async def hub_pair_start(
             f"\nWorkspace mode: worktree — your isolated working tree is at "
             f"{worktree_path}. Work THERE; the main clone stays on the base branch."
         )
+    # The branch name is an obligation, not a note (#533). It used to appear
+    # only inside the summary line above, which reads as "here is what we
+    # recorded" — and the policy document said the local name MAY differ. When
+    # it does, the task points at one branch while the work happens in
+    # another, so CI and the reviewer look at code nobody wrote.
+    if branch and branch != "-" and not job_id:
+        message += (
+            f"\nCanonical branch: {branch}. Create or switch to exactly this "
+            "name locally — submit_for_review compares what you report against "
+            "it and refuses a mismatch."
+        )
     return await _task_mutation_response(
         task_id,
         message,
@@ -1132,6 +1143,7 @@ async def hub_submit_for_review(
     task_id: int,
     agent: str = "",
     summary: str = "",
+    branch: str = "",
 ) -> str:
     """Submit the current work of a pair task for client-driven review (#307).
 
@@ -1145,6 +1157,11 @@ async def hub_submit_for_review(
         task_id: The running pair task ID
         agent: Name of the submitting agent (empty uses task's assigned agent)
         summary: Short note on what is being submitted
+        branch: The branch you actually worked in. Compared against the
+            canonical name pair-start gave you; a mismatch is refused with
+            both names and a way to fix it. Omitting it skips the check —
+            the hub cannot see your working copy, so this is your report,
+            not its observation (#533).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1153,6 +1170,8 @@ async def hub_submit_for_review(
         body["agent"] = agent
     if summary:
         body["summary"] = summary
+    if branch:
+        body["branch"] = branch
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
