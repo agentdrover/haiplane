@@ -681,6 +681,54 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_ac_expectation_source_column",
         "ALTER TABLE acceptance_criteria ADD COLUMN expectation_source TEXT",
     ),
+    (
+        # One row per drift commit already reported. The UNIQUE key is what
+        # makes a repeated check silent instead of noisy (#534 AC-5), and
+        # what keeps a case a human has accepted from reopening.
+        # Merges the hub performed itself. Without this the only evidence a
+        # commit came through the pipeline is a "(#N)" in its subject, which
+        # anyone can type — a direct push named "hotfix (#42)" would pass as
+        # legitimate. Found in review of submission #1 (#534).
+        "create_pipeline_merges",
+        """CREATE TABLE IF NOT EXISTS pipeline_merges (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER,
+            pr_number   INTEGER NOT NULL,
+            task_id     INTEGER,
+            merged_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (project_id, pr_number)
+        )""",
+    ),
+    (
+        # Where each project's base stood when the guard first looked. History
+        # written before the hub started recording its own merges cannot be
+        # judged — treating it as drift would bury the operator in alerts
+        # about work that went through the pipeline correctly (#534).
+        "add_projects_drift_baseline",
+        "ALTER TABLE projects ADD COLUMN drift_baseline_sha TEXT",
+    ),
+    (
+        # The commit the merge produced. A pull-request number lives in the
+        # subject, which anyone can type: a direct push titled
+        # "hotfix (#42)" passed as legitimate even after the number had to be
+        # one the hub really merged, because the number is still just text.
+        # A SHA is not text the pusher controls (#534, review of #2).
+        "add_pipeline_merges_sha",
+        "ALTER TABLE pipeline_merges ADD COLUMN merge_sha TEXT",
+    ),
+    (
+        "create_base_branch_drift",
+        """CREATE TABLE IF NOT EXISTS base_branch_drift (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            sha         TEXT    NOT NULL,
+            branch      TEXT    NOT NULL,
+            subject     TEXT    NOT NULL DEFAULT '',
+            author      TEXT    NOT NULL DEFAULT '',
+            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (project_id, sha)
+        )""",
+    ),
 ]
 
 

@@ -348,6 +348,39 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                                     gh_repo=mgh_repo,
                                 )
                                 if merged:
+                                    # Record the commit the merge produced, not
+                                    # the PR number: the number lives in the
+                                    # subject the pusher writes, the SHA does
+                                    # not. Project resolved through the task's
+                                    # epic rather than its own column, so a
+                                    # task without one cannot record a merge
+                                    # that counts for every project (#534).
+                                    merge_sha = ""
+                                    try:
+                                        merge_sha = (
+                                            await plugins.git_ops.merge_commit_sha(
+                                                pr_num,
+                                                repo=mworkspace,
+                                                gh_repo=mgh_repo,
+                                            )
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            "could not read the merge commit "
+                                            "for task #%s; the drift guard "
+                                            "will flag it once",
+                                            task["id"],
+                                        )
+                                    proj = await repo.resolve_project_for_task(
+                                        db, task["id"]
+                                    )
+                                    await repo.record_pipeline_merge(
+                                        db,
+                                        pr_number=pr_num,
+                                        merge_sha=merge_sha,
+                                        project_id=(dict(proj)["id"] if proj else None),
+                                        task_id=task["id"],
+                                    )
                                     mbase = mctx.get("base_branch")
                                     # Post-merge tidying, not delivery: the work
                                     # is already merged, so a workspace we
@@ -973,9 +1006,47 @@ async def _session_reaper(app: FastAPI) -> None:
             log.exception("Session reaper error")
 
 
+DRIFT_CHECK_INTERVAL = 900  # 15 minutes
+
+
+async def _drift_watch(app: FastAPI) -> None:
+    """Run the base-branch drift check on a schedule (#534).
+
+    Submission #1 shipped the checker with no caller at all — code and table
+    in place, nothing ever running them. A guard nobody invokes is not a
+    guard, and review caught it. This is the trigger.
+
+    Its own interval rather than the 30s poll tick: each run fetches from the
+    remote, and drift is not an emergency — noticing within the quarter hour
+    is the point, not noticing instantly.
+    """
+    from hub.services import drift_guard
+
+    while True:
+        await asyncio.sleep(DRIFT_CHECK_INTERVAL)
+        try:
+            reports = await drift_guard.check_all_projects(app.state.db)
+            for report in reports:
+                if report.status == "unknown":
+                    # Never silent: "could not check" is a state an operator
+                    # has to be able to see, not an absence of news.
+                    log.warning(
+                        "drift check skipped for %s: %s",
+                        report.project_slug,
+                        report.reason,
+                    )
+        except Exception:
+            log.exception("Drift watch error")
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
     """Create and return the background poller task."""
     task = asyncio.create_task(_poll_running_tasks(app))
     asyncio.create_task(_session_reaper(app))
-    log.info("Background poller started (every %ds)", POLL_INTERVAL)
+    asyncio.create_task(_drift_watch(app))
+    log.info(
+        "Background poller started (every %ds; drift check every %ds)",
+        POLL_INTERVAL,
+        DRIFT_CHECK_INTERVAL,
+    )
     return task
