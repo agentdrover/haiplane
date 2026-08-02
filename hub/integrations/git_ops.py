@@ -809,6 +809,21 @@ class GitOpsIntegration:
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
         return out.strip() if rc == 0 else ""
 
+    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
+        """``git diff -U0 base...branch``, or None when it cannot be read (#601).
+
+        None rather than "" on failure: an empty diff and an unreadable one are
+        different answers, and the section must be able to say which.
+        """
+        rc, out, _ = await _git(
+            "diff",
+            "-U0",
+            f"{base}...{branch}",
+            repo=repo,
+            check=False,
+        )
+        return out if rc == 0 else None
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """Refresh one base branch from origin. Read-only, never writes (#534)."""
         rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)

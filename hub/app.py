@@ -32,6 +32,8 @@ from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     ACLocatorResolution,
+    CallSiteEntry,
+    CallSiteSection,
     ACTestResultView,
     BulkChildTasksCreate,
     BulkRefine,
@@ -107,6 +109,7 @@ from hub.services.diagnostics import (
 from hub.services.ac_tests import current_ac_test_results, run_ac_tests
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
+from hub.services import call_sites
 from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -1135,6 +1138,61 @@ async def api_run_validation(task_id: int, request: Request):
     return await run_validation_commands(db, task_id)
 
 
+async def _build_call_sites_section(db, task_id: int, task_view) -> CallSiteSection:
+    """The call-site enumeration for a task's branch (#601).
+
+    Best effort by contract: every failure answers ``unknown`` with a reason
+    rather than an empty section. An empty section would say "no other call
+    sites exist", which is exactly the false reassurance this was written to
+    remove.
+    """
+    branch = (task_view.branch or "").strip()
+    if not branch:
+        return CallSiteSection(status=call_sites.UNKNOWN, reason="task has no branch")
+
+    try:
+        ctx = await services.project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+        if not workspace:
+            return CallSiteSection(
+                status=call_sites.UNKNOWN, reason="project has no workspace"
+            )
+        diff = await plugins.git_ops.branch_diff(workspace, base, branch)
+        if diff is None:
+            return CallSiteSection(
+                status=call_sites.UNKNOWN,
+                reason=f"could not read the diff of {branch} against {base}",
+            )
+        report = await asyncio.to_thread(call_sites.analyse, workspace, diff)
+    except Exception as exc:  # noqa: BLE001 - advisory section, never fatal
+        log.warning("call-site section failed for task #%s: %s", task_id, exc)
+        return CallSiteSection(status=call_sites.UNKNOWN, reason=f"failed: {exc}")
+
+    return CallSiteSection(
+        status=report.status,
+        reason=report.reason,
+        summary=report.summary(),
+        note=report.note,
+        unparsed=report.unparsed,
+        entries=[
+            CallSiteEntry(
+                symbol=s.symbol,
+                defined_in=s.defined_in,
+                state=s.state,
+                statement=s.statement(),
+                total_sites=len(s.sites),
+                untouched=[
+                    f"{site.file}:{site.line} ({site.caller})"
+                    for site in s.sites
+                    if not site.touched
+                ],
+            )
+            for s in report.symbols
+        ],
+    )
+
+
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
 async def api_review_brief(
     task_id: int,
@@ -1229,6 +1287,14 @@ async def api_review_brief(
             ACLocatorResolution(**r) for r in resolve_ac_locators(ac_models, collected)
         ]
 
+    # #601: where else is each changed symbol called, and does this diff touch
+    # those places. Same shape as #506 above and for the same reason: the
+    # analysis needs the checkout, so it runs against the project workspace and
+    # answers `unknown` with a reason when that is not available. Silence here
+    # would read as "no other call sites", which is the very mistake the
+    # section exists to catch.
+    call_sites_section = await _build_call_sites_section(db, task_id, task_view)
+
     # #507: recorded pass/fail of each test-AC for the current generation.
     ac_result_rows = await repo.list_ac_test_results(db, task_id)
     ac_test_results = [
@@ -1264,6 +1330,7 @@ async def api_review_brief(
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,
+        call_sites=call_sites_section,
         review_cycle=task_view.review_cycle,
         submission_generation=task_view.submission_generation,
         latest_submission_summary=latest_submission_summary,
