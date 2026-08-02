@@ -467,6 +467,36 @@ class ACTestResultView(BaseModel):
     is_current: bool = False
 
 
+class CallSiteEntry(BaseModel):
+    """One changed symbol and where else it is called (#601)."""
+
+    symbol: str
+    defined_in: str
+    state: str
+    statement: str
+    # Only the untouched sites are listed — the touched ones are noise. But
+    # without the total, "one site left alone" cannot be told apart from "one
+    # of one", and the completeness of the walk is unjudgeable (#601 review).
+    total_sites: int = 0
+    untouched: list[str] = Field(default_factory=list)
+
+
+class CallSiteSection(BaseModel):
+    """Call sites of everything the diff changes (#601).
+
+    ``status`` is ``analysed`` or ``unknown``; ``unknown`` carries the reason,
+    because "could not look" and "nothing to report" are different answers and
+    a reviewer must be able to tell them apart.
+    """
+
+    status: str = "unknown"
+    reason: str = ""
+    summary: str = ""
+    note: str = ""
+    entries: list[CallSiteEntry] = Field(default_factory=list)
+    unparsed: list[str] = Field(default_factory=list)
+
+
 class ACLocatorResolution(BaseModel):
     """Whether a verifiable_by=test AC's locator resolves to a real test (#506).
 
@@ -498,6 +528,7 @@ class ReviewBrief(BaseModel):
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     # #506: per verifiable_by=test AC, whether its locator resolves to a real test.
     locator_resolution: list[ACLocatorResolution] = Field(default_factory=list)
+    call_sites: CallSiteSection = Field(default_factory=CallSiteSection)
     # #507: recorded pass/fail of each test-AC's bound test for this generation.
     ac_test_results: list[ACTestResultView] = Field(default_factory=list)
     scope_in: list[str] = Field(default_factory=list)

@@ -94,7 +94,8 @@ test: cover pending report force complete api
 - Push в `main` не является обычным рабочим процессом; предпочтительный путь - PR из рабочей ветки.
 - PR должен использовать `.github/pull_request_template.md`, указывать задачу/intent, LLM work log, validation commands и риски.
 - Перед merge проверить GitHub CI и review checklist ниже.
-- Локальная защита push хранится в `.githooks/pre-push`; для новой копии репозитория установить ее командой `cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push`.
+- Локальная защита push хранится в `.githooks/pre-push`. **Вооружается шагом установки:** `make setup` ставит окружение и активирует хук вместе. Вручную: `git config core.hooksPath .githooks`. Проверить: `make doctor` — ненулевой код, если push не будет проверен.
+- Копирование хука в `.git/hooks` (как советовала прежняя редакция) тоже работает, но копия перестаёт соответствовать политике при первом же её изменении, и никто об этом не узнаёт. `doctor` такой клон распознаёт и предлагает перейти на `core.hooksPath`.
 - Emergency push в `main` допускается только владельцем и только явно: `ALLOW_MAIN_PUSH=1 git push origin main`.
 
 ## Что хранить в git

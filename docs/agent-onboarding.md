@@ -198,6 +198,15 @@ curl -sS \
 
 ## 6. Git-политика (pair mode) — главные грабли
 
+- **Вооружи pre-push хук ДО первого push — в каждом клоне:** это делает
+  `make setup`, тот же шаг, что ставит окружение; проверка — `make doctor`.
+  Вручную: `git config core.hooksPath .githooks`.
+  Это не рекомендация: без этой настройки git не вызывает `.githooks/pre-push`,
+  и вся веточная политика ниже не принуждается ничем. Проверено 01.08.2026 —
+  в рабочем клоне оператора и в обоих серверных воркспейсах ключ был пуст.
+  Предел честно: `git push --no-verify` обходит хук целиком, так что это
+  быстрая обратная связь, а не гарантия; гарантию даёт только серверная
+  детекция дрейфа (#534).
 - **Чистый worktree перед `hub_pair_start`.** При грязном worktree pair-start
   вернёт 422, а git ops при создании ветки может выполнить `git clean -fd` —
   несохранённая работа потеряется. Сначала commit или stash.
@@ -445,12 +454,13 @@ CI на PR гоняет также `pip-audit`, `bandit` и secret-scan — сл
 
 ## 14. Чеклист первого запуска
 
-1. Понять, на каком инстансе работаешь (локальный vs agenthai).
-2. Проверить доступ к MCP (`initialize` → `serverInfo: openclaw-hub`).
-3. `hub_my_context(task_id)` или `hub_project_status` для контекста.
-4. Убедиться, что задача готова (`hub_get_readiness`), иначе — refine.
-5. Зафиксировать план (`hub_task_update kind="status"`).
-6. Чистый worktree → `hub_pair_start` (path B) или `hub_start_task` (path A).
-7. Работа в ветке `task-<id>/<slug>`, PR в `develop`.
-8. `hub_report_done` с реальной валидацией; проверить фактический статус.
-9. Не печатать секреты; не мержить в `main` без проверки.
+1. `make setup` в свежем клоне (ставит окружение И вооружает pre-push хук); проверить — `make doctor`.
+2. Понять, на каком инстансе работаешь (локальный vs agenthai).
+3. Проверить доступ к MCP (`initialize` → `serverInfo: openclaw-hub`).
+4. `hub_my_context(task_id)` или `hub_project_status` для контекста.
+5. Убедиться, что задача готова (`hub_get_readiness`), иначе — refine.
+6. Зафиксировать план (`hub_task_update kind="status"`).
+7. Чистый worktree → `hub_pair_start` (path B) или `hub_start_task` (path A).
+8. Работа в ветке `task-<id>/<slug>`, PR в `develop`.
+9. `hub_report_done` с реальной валидацией; проверить фактический статус.
+10. Не печатать секреты; не мержить в `main` без проверки.

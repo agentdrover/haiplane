@@ -922,6 +922,26 @@ async def test_review_brief_works_without_branch_or_pr(client: AsyncClient):
     assert brief["latest_submission_summary"] == ""
 
 
+async def test_the_brief_carries_the_call_site_section(client: AsyncClient):
+    """The section has to reach the reviewer, not merely exist as a service.
+
+    Five findings in one session were mechanisms that worked and were never
+    wired; a unit test of the analyser alone would repeat that mistake here.
+    This asks the endpoint the reviewer actually calls.
+    """
+    resp = await client.post("/api/tasks", json={"title": "Wired?"})
+    task_id = resp.json()["id"]
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    assert "call_sites" in brief, "the reviewer never sees a section the brief omits"
+    section = brief["call_sites"]
+    # Without a branch there is nothing to diff, and the section must SAY that
+    # rather than return an empty list that reads as "no other call sites".
+    assert section["status"] == "unknown"
+    assert section["reason"], "an unknown with no reason is a shrug"
+
+
 async def test_review_brief_404(client: AsyncClient):
     resp = await client.get("/api/tasks/99999/review-brief")
     assert resp.status_code == 404

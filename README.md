@@ -27,8 +27,8 @@ passwords, see [docs/admin-section-design.md](docs/admin-section-design.md).
 git clone https://github.com/mrPDA/openclaw-hub.git
 cd openclaw-hub
 
-# Install
-uv venv && uv pip install -e .
+# Install (also arms the pre-push hook that enforces branch policy)
+make setup
 
 # Run
 openclaw-hub
@@ -287,7 +287,7 @@ git submodule add git@github.com:mrPDA/openclaw-hub.git hub
 git submodule update --init --recursive
 
 # Install
-cd hub && uv venv && uv pip install -e .
+cd hub && make setup
 ```
 
 ## Architecture

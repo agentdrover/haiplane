@@ -21,6 +21,7 @@ dependencies = [
 openclaw-hub = "hub.app:main"
 oc-hub = "hub.cli:main"
 openclaw-hub-mcp = "hub.mcp_server:main"
+oc-git-policy = "hub.git_policy:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hub"]

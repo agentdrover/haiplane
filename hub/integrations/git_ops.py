@@ -17,6 +17,7 @@ from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.mcp_envelope import enrich_error_payload
 
+from hub import git_policy
 from hub.commit_scope import parse_porcelain_paths
 from hub.process_kill import kill_process_group
 
@@ -808,6 +809,21 @@ class GitOpsIntegration:
         """Current tip of origin/<base>, or "" when it cannot be read (#534)."""
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
         return out.strip() if rc == 0 else ""
+
+    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
+        """``git diff -U0 base...branch``, or None when it cannot be read (#601).
+
+        None rather than "" on failure: an empty diff and an unreadable one are
+        different answers, and the section must be able to say which.
+        """
+        rc, out, _ = await _git(
+            "diff",
+            "-U0",
+            f"{base}...{branch}",
+            repo=repo,
+            check=False,
+        )
+        return out if rc == 0 else None
 
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """Refresh one base branch from origin. Read-only, never writes (#534)."""
@@ -1622,6 +1638,10 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 return False, f"fetch failed: {err[:300]}"
+            # Every workspace on production already exists, so this is the
+            # only path that actually runs there: arming solely after a fresh
+            # clone would have changed nothing at all (#532 review).
+            git_policy.activate_quietly(workspace_path)
             log.info("clone_repo: verified existing clone at %s", workspace_path)
             return True, "existing clone verified, origin fetched"
 
@@ -1667,6 +1687,12 @@ class GitOpsIntegration:
         )
         if rc != 0:
             return False, f"clone failed ({url}): {err[:300]}"
+        # Arm the hook while the hub has the clone in its hands. A setup step
+        # a person must remember is the same failure as the hook nobody
+        # activated — this is the one moment where nobody has to remember
+        # (#532). Best effort: a hook that cannot be armed never fails a clone.
+        git_policy.activate_quietly(workspace_path)
+
         transport = "https" if url.startswith("https") else "ssh"
         log.info(
             "clone_repo: cloned %s → %s (%s, %s)",
