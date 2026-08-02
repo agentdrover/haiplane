@@ -1287,6 +1287,31 @@ async def api_review_brief(
             ACLocatorResolution(**r) for r in resolve_ac_locators(ac_models, collected)
         ]
 
+    # #572: does the branch still stand where the submission pinned it? Three
+    # states, never collapsed — the reviewer must see "could not look" as
+    # itself, not as "nothing moved". Costs one fetch, and only when there is
+    # a pinned submission to compare against.
+    submission_sha = (task_view.submission_sha or "").strip()
+    current_tip = ""
+    sha_check = "unknown"
+    sha_check_reason = "branch tip was not pinned at submission"
+    if submission_sha and task_view.branch:
+        current_tip, tip_reason = await services.resolve_branch_tip(
+            db, task_id, task_view.branch
+        )
+        if not current_tip:
+            sha_check_reason = tip_reason
+        elif current_tip == submission_sha:
+            sha_check = "match"
+            sha_check_reason = ""
+        else:
+            sha_check = "diverged"
+            sha_check_reason = (
+                f"submitted at {submission_sha[:12]}, branch now at "
+                f"{current_tip[:12]} — the diff under review is not the code "
+                "in the branch"
+            )
+
     # #601: where else is each changed symbol called, and does this diff touch
     # those places. Same shape as #506 above and for the same reason: the
     # analysis needs the checkout, so it runs against the project workspace and
@@ -1330,6 +1355,10 @@ async def api_review_brief(
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,
+        submission_sha=submission_sha,
+        current_branch_tip=current_tip,
+        sha_check=sha_check,
+        sha_check_reason=sha_check_reason,
         call_sites=call_sites_section,
         review_cycle=task_view.review_cycle,
         submission_generation=task_view.submission_generation,

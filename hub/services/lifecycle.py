@@ -468,6 +468,7 @@ def row_to_task(
         auto_review=bool(d.get("auto_review", 1)),
         review_job_id=d.get("review_job_id"),
         submission_generation=d.get("submission_generation", 0) or 0,
+        submission_sha=d.get("submission_sha") or "",
         review_verdict=d.get("review_verdict"),
         review_verdict_generation=d.get("review_verdict_generation"),
         review_approved_current=review_approved_for_current_submission(d),
@@ -1228,6 +1229,40 @@ async def _surface_check(
     return "ok", [], ""
 
 
+async def resolve_branch_tip(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> tuple[str, str]:
+    """The tip of ``origin/<branch>`` as the hub itself observes it (#572).
+
+    Returns ``(sha, reason)`` where an empty sha means "could not look" and
+    the reason says why. The hub resolves this — never the client: a value
+    supplied by the same agent whose work is under review is a declaration,
+    and this whole mechanism exists because declarations are not
+    observations. Best effort by contract: a verdict must not become hostage
+    to the network, so failures degrade to "unchecked", never to an error.
+    """
+    from hub.services.orchestration import project_git_context
+
+    branch = (branch or "").strip()
+    if not branch:
+        return "", "task has no branch"
+    try:
+        ctx = await project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        if not workspace:
+            return "", "project has no workspace to observe the branch from"
+        ok, detail = await plugins.git_ops.fetch_base(workspace, branch)
+        if not ok:
+            return "", f"could not fetch {branch}: {detail or 'fetch failed'}"
+        sha = await plugins.git_ops.head_sha(workspace, branch)
+        if not sha:
+            return "", f"origin/{branch} did not resolve to a commit"
+        return sha, ""
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not resolve tip of %s for #%s: %s", branch, task_id, exc)
+        return "", f"tip resolution failed: {exc}"
+
+
 async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1320,6 +1355,14 @@ async def submit_for_review(
                 "Это не значит, что расхождений нет."
             )
 
+    # #572: pin the code the reviewer will actually be judging. Resolved by
+    # the hub BEFORE the write lock — this walks to the network. An empty
+    # result is recorded as empty and the submission proceeds: the pin is
+    # protection for the verdict, not a new gate on submitting.
+    submission_sha, sha_reason = await resolve_branch_tip(
+        db, task_id, task.get("branch") or ""
+    )
+
     async with get_write_lock(db):
         if not await repo.transition_status_if(
             db, task_id, expected_from="running", new_status="review"
@@ -1330,6 +1373,7 @@ async def submit_for_review(
                 "its current status",
             )
         generation = await repo.bump_submission_generation(db, task_id)
+        await repo.update_task(db, task_id, submission_sha=submission_sha)
         # Client-driven review: no dispatch job. A stale review_job_id from a
         # previous headless cycle would make the poller treat this task as its
         # own, so clear it explicitly.
@@ -1337,6 +1381,12 @@ async def submit_for_review(
         agent = (body.agent or "").strip() or task.get("assigned_agent", "")
         summary = (body.summary or "").strip()
         content = f"Submitted for review (submission #{generation})."
+        if submission_sha:
+            content += f" Branch tip at submission: {submission_sha[:12]}."
+        else:
+            # Unchecked is a state the reviewer must see, not an absence of
+            # news — the same rule the drift guard follows (#534, #572).
+            content += f" Branch tip NOT pinned: {sha_reason}."
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)
@@ -1567,6 +1617,35 @@ async def record_review_verdict(
         if ac_gap:
             raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
 
+    # #572: does the branch still stand where it stood at submission? Only
+    # APPROVED is checked — it is the verdict that creates the false safety of
+    # review_approved_current, while changes_requested returns the task to
+    # work anyway. Three outcomes, never collapsed: diverged / match /
+    # could-not-check with the reason. Resolved before the write lock (it
+    # walks to the network), and a resolution failure degrades to a visible
+    # "unchecked" — a verdict must not be hostage to the remote.
+    pinned_sha = (task.get("submission_sha") or "").strip()
+    diverged_tip = ""
+    sha_note = ""
+    if body.verdict.value == "approved":
+        if not pinned_sha:
+            sha_note = (
+                "Сверка кода с моментом сдачи НЕ проводилась: вершина ветки "
+                "не была записана при сдаче. Вердикт относится к номеру "
+                "сдачи, не к коммиту."
+            )
+        else:
+            current_tip, tip_reason = await resolve_branch_tip(
+                db, task_id, task.get("branch") or ""
+            )
+            if not current_tip:
+                sha_note = (
+                    f"Сверка кода с моментом сдачи НЕ проводилась: {tip_reason}. "
+                    f"Сдавался коммит {pinned_sha[:12]}."
+                )
+            elif current_tip != pinned_sha:
+                diverged_tip = current_tip
+
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
     # it must run outside the verdict's write-lock critical section).
@@ -1588,6 +1667,16 @@ async def record_review_verdict(
         )
         agent = (body.agent or "").strip() or "reviewer"
         content = f"Review verdict: {body.verdict.value.upper()}"
+        if diverged_tip:
+            content += (
+                f"\nКОД УШЁЛ ИЗ-ПОД ОДОБРЕНИЯ: сдавался {pinned_sha[:12]}, "
+                f"вершина ветки теперь {diverged_tip[:12]}. Вердикт записан "
+                f"для {pinned_sha[:12]} и НЕ распространяется на новые "
+                "коммиты; задача возвращена в running — пересдайте, чтобы "
+                "ревью увидело текущий код."
+            )
+        elif sha_note:
+            content += f"\n{sha_note}"
         if self_approved:
             content += " [self-approved: solo mode, OPENCLAW_REVIEW_SELF_APPROVE=allow]"
             log.warning(
@@ -1660,6 +1749,17 @@ async def record_review_verdict(
             await repo.transition_status_if(
                 db, task_id, expected_from="review", new_status="running"
             )
+            if diverged_tip:
+                # The verdict stays recorded for the audit trail, but it must
+                # not read as covering code the reviewer never saw. Bumping
+                # the generation stales it by the SAME mechanism a
+                # resubmission uses — review_approved_current goes false —
+                # and the task is already back in running, so there is a
+                # legal way forward: resubmit and let review see the real
+                # tip (#572). A hard refusal would leave the task locked in
+                # review with no exit — the dead end #547 hit.
+                await repo.bump_submission_generation(db, task_id)
+                await repo.update_task(db, task_id, submission_sha="")
             if body.verdict.value == "changes_requested":
                 await repo.update_task(
                     db, task_id, review_cycle=(task.get("review_cycle") or 0) + 1
@@ -1689,7 +1789,17 @@ async def record_review_verdict(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    if diverged_tip:
+        view.lifecycle_hint = (
+            f"Код ушёл из-под одобрения: сдавался {pinned_sha[:12]}, вершина "
+            f"ветки теперь {diverged_tip[:12]}. Вердикт не распространяется "
+            "на новые коммиты; задача в running — пересдайте через "
+            "hub_submit_for_review."
+        )
+    elif sha_note:
+        view.lifecycle_hint = sha_note
+    return view
 
 
 async def claim_task(
