@@ -198,8 +198,10 @@ def _decorator_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
             dec = dec.func
         try:
             names.append(ast.unparse(dec))
-        except Exception:  # noqa: BLE001 - display only, never fatal
-            continue
+        except ValueError:
+            # ast.unparse can refuse exotic nodes; a decorator we cannot
+            # render is still a decorator worth counting.
+            names.append("<unreadable decorator>")
     return names
 
 
