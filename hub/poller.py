@@ -1039,11 +1039,49 @@ async def _drift_watch(app: FastAPI) -> None:
             log.exception("Drift watch error")
 
 
+async def arm_workspace_hooks(db) -> list[tuple[str, str]]:
+    """Point every existing workspace at its pre-push hook (#532).
+
+    Arming inside clone_repo covered only the moment a workspace is created or
+    re-provisioned by hand. Every workspace on this server already exists and
+    nobody presses Provision in a normal week, so that path never ran and the
+    release would have changed nothing — the same finding as the early return,
+    one level up. Startup is the moment that does happen.
+
+    Cheap and offline: reads git config, writes at most one key. A workspace
+    whose repository carries no hook is left alone and said so.
+    """
+    from hub import git_policy
+
+    outcomes: list[tuple[str, str]] = []
+    try:
+        rows = await repo.list_projects(db)
+    except Exception:  # noqa: BLE001 - never block startup
+        log.exception("could not list projects to arm their pre-push hooks")
+        return outcomes
+
+    for row in rows:
+        project = dict(row)
+        workspace = (project.get("workspace_path") or "").strip()
+        if not workspace or project.get("archived"):
+            continue
+        status = git_policy.activate_quietly(workspace)
+        outcomes.append((project.get("slug") or "?", status.state))
+        log.info(
+            "pre-push hook in workspace of %s: %s (%s)",
+            project.get("slug"),
+            status.state,
+            status.reason,
+        )
+    return outcomes
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
     """Create and return the background poller task."""
     task = asyncio.create_task(_poll_running_tasks(app))
     asyncio.create_task(_session_reaper(app))
     asyncio.create_task(_drift_watch(app))
+    asyncio.create_task(arm_workspace_hooks(app.state.db))
     log.info(
         "Background poller started (every %ds; drift check every %ds)",
         POLL_INTERVAL,
