@@ -3361,10 +3361,20 @@ async def test_pair_start_uses_project_workspace_and_base(
     assert kwargs["base_branch"] == "trunk"
 
 
-async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
-    # AC-2 (#337): the default project passes no overrides — env behavior.
+async def test_default_project_passes_its_seeded_values(db: aiosqlite.Connection):
+    """Deliberately updated for #604 — this used to assert the OPPOSITE.
+
+    #337's AC-2 pinned the plumbing: the default project passed no overrides,
+    and an unconditional special case emptied its context so git_ops re-read
+    the same values from env. Once the owner configured REAL fields (#602),
+    that special case silently threw them away and three brief mechanisms
+    stayed blind next to a live clone. The context now carries whatever the
+    row holds; for a fresh seed those values mirror env, so the effective
+    behavior of this scenario is unchanged — only the plumbing is honest.
+    """
     from unittest.mock import AsyncMock
 
+    from hub import config as cfg
     from hub.db import seed_default_project
     from hub.integrations.registry import plugins
 
@@ -3377,7 +3387,10 @@ async def test_default_project_keeps_env_fallback(db: aiosqlite.Connection):
     plugins.git_ops.pair_prepare_branch = prep
     await services.pair_start_task(db, tv.id, caller="dev")
     kwargs = prep.await_args.kwargs
-    assert "repo" not in kwargs and "base_branch" not in kwargs
+    assert kwargs.get("repo") == str(cfg.WORKSPACE_REPO_LINK), (
+        "the seeded workspace must reach git_ops explicitly, not by env luck"
+    )
+    assert kwargs.get("base_branch") == cfg.PAIR_BASE_BRANCH
 
 
 # --- pair workspace restore (#451) ---

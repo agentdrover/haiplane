@@ -729,6 +729,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (project_id, sha)
         )""",
     ),
+    (
+        # The verdict binds to the submission NUMBER; this binds it to the
+        # CODE. Between submission and verdict the branch can move, and the
+        # number alone lets an APPROVED silently cover commits the reviewer
+        # never saw — reproduced on #547, then twice more on #601 and #532
+        # (#572). Empty means "recorded before this existed, or the tip could
+        # not be resolved": both degrade to today's behaviour, never to a
+        # refusal.
+        "add_tasks_submission_sha",
+        "ALTER TABLE tasks ADD COLUMN submission_sha TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

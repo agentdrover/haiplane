@@ -552,6 +552,14 @@ class ReviewBrief(BaseModel):
     diff_command: str = ""
     review_cycle: int = 0
     submission_generation: int = 0
+    # #572: what code the submission pinned, where the branch stands now, and
+    # whether they agree. sha_check is "match" | "diverged" | "unknown" —
+    # three states, never collapsed: "could not look" must not read as
+    # "nothing moved". The reviewer sees this before spending an hour.
+    submission_sha: str = ""
+    current_branch_tip: str = ""
+    sha_check: str = "unknown"
+    sha_check_reason: str = ""
     latest_submission_summary: str = ""
     latest_review: LatestReview | None = None
     # #381: latest machine-review report; forward ref — MachineReviewView is
@@ -922,6 +930,11 @@ class TaskView(BaseModel):
     # A verdict only counts while review_verdict_generation matches
     # submission_generation.
     submission_generation: int = 0
+    # #572: the branch tip the hub observed at submission. The generation
+    # binds the verdict to a NUMBER; this binds it to the CODE. Empty means
+    # the tip could not be pinned (no branch, no workspace, network) — that
+    # degrades to the pre-#572 behaviour, never to a refusal.
+    submission_sha: str = ""
     review_verdict: ReviewVerdict | None = None
     review_verdict_generation: int | None = None
     review_approved_current: bool = False
