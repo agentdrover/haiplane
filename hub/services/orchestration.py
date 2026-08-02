@@ -41,10 +41,15 @@ async def project_git_context(
         ctx["gh_repo"] = d["repo"].strip()
     if (d.get("default_branch") or "").strip():
         ctx["base_branch"] = d["default_branch"].strip()
-    # The default project mirrors env values; dropping them keeps call
-    # sites byte-identical to legacy behavior for it.
-    if d.get("slug") == "default":
-        return {}
+    # No special case for the default project (#604). One existed here —
+    # an unconditional empty context, written when default had no real
+    # fields and "behave like the pre-project hub" was the only correct
+    # answer. Once the owner configured a real repo and workspace (#602),
+    # that compatibility silently threw the configuration away, and every
+    # consumer of ctx["repo"] — locator resolution, the call-sites section,
+    # submission-SHA pinning — stayed blind next to a live clone. The
+    # field-wise omission above IS the legacy behaviour: an unconfigured
+    # project contributes no keys and git_ops falls back to env.
     return ctx
 
 
