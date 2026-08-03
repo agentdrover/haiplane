@@ -1441,6 +1441,104 @@ class GitOpsIntegration:
 
         return result
 
+    async def _workflow_runs_probe(
+        self, pr_number: int, repo: str | None, gh_repo: str | None
+    ) -> CIProbeResult:
+        """CI verdict from Actions workflow runs, by the PR's head SHA (#606).
+
+        The primary probe (``gh pr checks``) needs ``checks:read`` — a
+        permission GitHub removed from the fine-grained token picker while
+        the API still demands it (verified 2026-08-03: the picker's search
+        for "check" answers "No items available", the API answers 403). This
+        path uses only permissions a token can actually be granted: Pull
+        requests (headRefOid) and Actions (workflow runs).
+
+        The mapping is conservative — unknown is never ok: an unrecognised
+        conclusion reads as unavailable, not as passed. A workflow's
+        conclusion is GitHub's own aggregate over its jobs, so skipped jobs
+        (Deploy on a PR) are already accounted for.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "headRefOid",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return CIProbeResult(
+                CIProbeOutcome.unavailable,
+                "workflow_runs_unavailable",
+                details=f"could not read headRefOid: {(err or '').strip()}",
+            )
+        try:
+            head_sha = str(json.loads(out).get("headRefOid") or "").strip()
+        except json.JSONDecodeError:
+            head_sha = ""
+        if not head_sha:
+            return CIProbeResult(
+                CIProbeOutcome.unavailable,
+                "workflow_runs_unavailable",
+                details="PR carries no readable headRefOid",
+            )
+
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/runs?head_sha={head_sha}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return CIProbeResult(
+                CIProbeOutcome.unavailable,
+                "workflow_runs_unavailable",
+                details=(err or "").strip(),
+            )
+        try:
+            runs = json.loads(out).get("workflow_runs") or []
+        except (json.JSONDecodeError, AttributeError):
+            return CIProbeResult(
+                CIProbeOutcome.unavailable, "workflow_runs_invalid_json"
+            )
+
+        # No runs for this SHA is a definite answer, not a wait: the
+        # repository has no CI for it (#419's absent semantics).
+        if not runs:
+            return CIProbeResult(CIProbeOutcome.absent, "no_workflow_runs")
+
+        statuses = [str(r.get("status") or "").lower() for r in runs]
+        conclusions = [str(r.get("conclusion") or "").lower() for r in runs]
+        if any(
+            s in ("queued", "in_progress", "waiting", "requested", "pending")
+            for s in statuses
+        ):
+            return CIProbeResult(CIProbeOutcome.pending, "workflow_runs_running")
+        if any(
+            c
+            in (
+                "failure",
+                "cancelled",
+                "timed_out",
+                "startup_failure",
+                "action_required",
+            )
+            for c in conclusions
+        ):
+            return CIProbeResult(CIProbeOutcome.failed, "workflow_runs_failed")
+        if all(s == "completed" for s in statuses) and all(
+            c in ("success", "neutral", "skipped") for c in conclusions
+        ):
+            return CIProbeResult(CIProbeOutcome.passed, "workflow_runs_passed")
+        return CIProbeResult(
+            CIProbeOutcome.unavailable,
+            "workflow_runs_unknown_state",
+            details=",".join(sorted(set(conclusions) | set(statuses))),
+        )
+
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult:
@@ -1455,11 +1553,21 @@ class GitOpsIntegration:
             repo=repo,
             check=False,
         )
-        # rc error / empty output — the probe itself could not run. Not pending:
-        # nothing is known to be in flight (#419).
+        # rc error / empty output — the probe itself could not run. Before
+        # answering "unavailable", try the workflow-runs fallback (#606): the
+        # primary path needs checks:read, which GitHub's token picker no
+        # longer offers while the API still demands it. A WORKING primary
+        # path never reaches this line, so its behaviour is untouched.
         if rc != 0 or not out or not out.strip():
+            fallback = await self._workflow_runs_probe(pr_number, repo, gh_repo)
+            if fallback.outcome != CIProbeOutcome.unavailable:
+                return fallback
+            # Both paths failed: name the primary error — it is the one an
+            # operator can act on (#419: not pending, nothing known in flight).
             return CIProbeResult(
-                CIProbeOutcome.unavailable, "gh_error", details=(err or "").strip()
+                CIProbeOutcome.unavailable,
+                "gh_error",
+                details=(err or "").strip() or fallback.details,
             )
         try:
             checks = json.loads(out)
