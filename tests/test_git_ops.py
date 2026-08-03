@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from hub import config
+from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.git_ops import (
     GitOpsIntegration,
     PairBranchConflictError,
@@ -1688,3 +1689,123 @@ async def test_branch_diff_paths_reads_non_ascii_and_reports_unknown(
     # A branch that does not exist is unknown, never an empty diff: silence
     # would read as "the branch changes nothing".
     assert await git_ops.branch_diff_paths("no-such-branch", repo=str(repo)) is None
+
+
+# ---- CI probe fallback (#606): the eye GitHub's token picker put out ----
+
+
+def _gh_router(*, checks, view=None, runs=None):
+    """A _gh double that answers by the gh subcommand it was asked."""
+
+    async def route(*args, **kwargs):
+        if args[0] == "pr" and args[1] == "checks":
+            return checks
+        if args[0] == "pr" and args[1] == "view":
+            return view if view is not None else (1, "", "no view stub")
+        if args[0] == "api" and "actions/runs" in args[1]:
+            return runs if runs is not None else (1, "", "no runs stub")
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    return route
+
+
+def _runs_json(*runs: tuple[str, str]) -> str:
+    import json as _json
+
+    return _json.dumps(
+        {
+            "workflow_runs": [
+                {"name": "CI", "status": s, "conclusion": c} for s, c in runs
+            ]
+        }
+    )
+
+
+async def test_ci_probe_falls_back_to_workflow_runs(git_ops: GitOpsIntegration):
+    """The exact production failure of 2026-08-03: gh pr checks answers 403
+    because the Checks permission no longer exists in the token picker, while
+    the workflow runs for the same head SHA are green. The probe must answer
+    passed — and say which path answered."""
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(1, "", "GraphQL: Resource not accessible by personal access token"),
+            view=(0, '{"headRefOid": "pr-head-oid-stand-in"}', ""),
+            runs=(0, _runs_json(("completed", "success")), ""),
+        ),
+    ):
+        result = await git_ops.check_pr_ci(240, gh_repo="mrPDA/openclaw-hub-standalone")
+
+    assert result.outcome == CIProbeOutcome.passed
+    assert "workflow_runs" in result.reason, (
+        "the degraded path must be visible, not pass itself off as the primary"
+    )
+
+
+async def test_workflow_fallback_maps_every_outcome(git_ops: GitOpsIntegration):
+    """Conservative mapping — unknown is never ok."""
+    cases = [
+        (_runs_json(("completed", "failure")), CIProbeOutcome.failed),
+        (_runs_json(("completed", "cancelled")), CIProbeOutcome.failed),
+        (_runs_json(("completed", "timed_out")), CIProbeOutcome.failed),
+        (_runs_json(("in_progress", "")), CIProbeOutcome.pending),
+        (_runs_json(("queued", "")), CIProbeOutcome.pending),
+        ('{"workflow_runs": []}', CIProbeOutcome.absent),
+        (_runs_json(("completed", "mystery_state")), CIProbeOutcome.unavailable),
+        (
+            _runs_json(("completed", "success"), ("completed", "skipped")),
+            CIProbeOutcome.passed,
+        ),
+    ]
+    for runs_payload, expected in cases:
+        with patch(
+            "hub.integrations.git_ops._gh",
+            side_effect=_gh_router(
+                checks=(1, "", "denied"),
+                view=(0, '{"headRefOid": "abc"}', ""),
+                runs=(0, runs_payload, ""),
+            ),
+        ):
+            result = await git_ops.check_pr_ci(7)
+        assert result.outcome == expected, (
+            f"{runs_payload} must map to {expected}, got {result.outcome} "
+            f"({result.reason})"
+        )
+
+
+async def test_double_failure_stays_unavailable(git_ops: GitOpsIntegration):
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(1, "", "primary down"),
+            view=(1, "", "fallback down too"),
+        ),
+    ):
+        result = await git_ops.check_pr_ci(7)
+
+    assert result.outcome == CIProbeOutcome.unavailable
+    assert result.reason == "gh_error", (
+        "the primary error is the one an operator can act on"
+    )
+    assert "primary down" in (result.details or "")
+
+
+async def test_fallback_is_not_consulted_when_checks_work(
+    git_ops: GitOpsIntegration,
+):
+    """AC-4: a working primary path stays byte-identical — the fallback must
+    not even be asked. The router raises on any unexpected call, so a single
+    pr-view or actions/runs request fails this test."""
+    calls: list[tuple] = []
+
+    async def only_checks(*args, **kwargs):
+        calls.append(args[:2])
+        assert args[0] == "pr" and args[1] == "checks", f"fallback consulted: {args}"
+        return (0, '[{"name": "CI", "state": "SUCCESS"}]', "")
+
+    with patch("hub.integrations.git_ops._gh", side_effect=only_checks):
+        result = await git_ops.check_pr_ci(7)
+
+    assert result.outcome == CIProbeOutcome.passed
+    assert result.reason == "checks_passed"
+    assert calls == [("pr", "checks")]
