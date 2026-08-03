@@ -16,6 +16,7 @@ from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
+from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
@@ -656,6 +657,93 @@ def completion_requires_review(task: dict[str, Any]) -> bool:
     )
 
 
+async def merge_before_completion(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[bool, str]:
+    """Deliver the task's PR before letting it complete (#605).
+
+    Mirrors the headless conveyor's gate (#363): only a green CI merges, a
+    refused merge never completes, and the merge commit is asked of the PR
+    itself (#534) so the drift guard can tell this delivery from an intruder.
+    Returns ``(ok, reason)``; every failure is a reason, never an exception —
+    a done report must not 500 because GitHub blinked (AC-5).
+
+    Until this existed the pair flow had NO merge trigger at all: APPROVED
+    returned the task to running, report_done completed it, and the PR hung
+    unmerged — the state #363 ruled out for headless. Every merge of the
+    past week was manual out of necessity, and every one of them now rings
+    the drift guard. Found by the first live run of #603.
+    """
+    task_id = task["id"]
+    pr_num = task.get("pr_number")
+    try:
+        # Already delivered — by the headless conveyor, or by an earlier done
+        # report that failed after the merge. Merging twice is not extra
+        # safety: GitHub refuses the second merge and the refusal would flip
+        # a DELIVERED task into needs_decision (#363's exactly-once guard
+        # caught precisely this).
+        if await repo.pipeline_merge_recorded(db, task_id, pr_num):
+            return True, "already delivered"
+
+        ctx = await project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        gh_repo = ctx.get("gh_repo")
+
+        ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
+        if ci.outcome != CIProbeOutcome.passed:
+            return False, f"ci_{ci.outcome.value}: {ci.reason}"
+
+        merged = await plugins.git_ops.merge_pr(
+            pr_num,
+            task_id,
+            task.get("title") or "",
+            repo=workspace,
+            gh_repo=gh_repo,
+        )
+        if not merged:
+            return False, "merge_failed: GitHub refused the merge"
+
+        # The commit THIS pull request produced — never the branch tip,
+        # which is whatever landed last (#534, review round 3).
+        merge_sha = ""
+        try:
+            merge_sha = await plugins.git_ops.merge_commit_sha(
+                pr_num, repo=workspace, gh_repo=gh_repo
+            )
+        except Exception:  # noqa: BLE001 - the drift guard flags it once
+            log.exception(
+                "could not read the merge commit for task #%s; "
+                "the drift guard will flag it once",
+                task_id,
+            )
+        proj = await repo.resolve_project_for_task(db, task_id)
+        await repo.record_pipeline_merge(
+            db,
+            pr_number=pr_num,
+            merge_sha=merge_sha,
+            project_id=(dict(proj)["id"] if proj else None),
+            task_id=task_id,
+        )
+
+        # Post-merge tidying, not delivery (#552): the work is merged, so a
+        # workspace that cannot be returned to base is logged, never fatal.
+        try:
+            await plugins.git_ops.pull_main(
+                repo=workspace, base_branch=ctx.get("base_branch")
+            )
+            branch = (task.get("branch") or "").strip()
+            if branch:
+                await plugins.git_ops.delete_branch(
+                    branch, repo=workspace, base_branch=ctx.get("base_branch")
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("post-merge tidy failed for task #%s", task_id)
+        return True, merge_sha
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.exception("merge gate failed for task #%s", task_id)
+        return False, f"merge_gate_error: {exc}"
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -669,6 +757,38 @@ async def transition_after_agent_done(
     branch = task.get("branch")
 
     if has_done and not completion_requires_review(task):
+        # Delivery gate (#605): a task that owns a PR completes only once
+        # that PR is merged — "completed" must mean delivered, the invariant
+        # #363 established for headless and the pair flow never had. Tasks
+        # without a PR (config work, docs) are untouched. force_complete and
+        # decide-accept are human overrides and bypass this by design.
+        if task.get("pr_number") and not task.get("job_id"):
+            ok, detail = await merge_before_completion(db, task)
+            if not ok:
+                await repo.update_task(db, task_id, status="needs_decision")
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "alert",
+                    f"Done report NOT completed: PR #{task['pr_number']} is not "
+                    f"delivered — {detail}. Fix the cause and report done "
+                    "again, or decide the task by hand.",
+                )
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task_id,
+                    actor=task.get("assigned_agent") or "agent",
+                    payload={"reason": "merge_gate", "detail": detail},
+                )
+                log.info(
+                    "Task #%d → needs_decision: merge gate refused (%s)",
+                    task_id,
+                    detail,
+                )
+                return "needs_decision"
+
         # Review gate satisfied: either an explicit auto_review opt-out or
         # the current submission already has an APPROVED verdict. Complete
         # WITHOUT bumping the generation — no new work is being submitted,
