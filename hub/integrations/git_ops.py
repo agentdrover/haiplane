@@ -1486,6 +1486,21 @@ class GitOpsIntegration:
             CIProbeOutcome.unavailable, "unknown_state", details=",".join(states)
         )
 
+    async def pr_for_branch(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        """The open PR whose head is ``branch``, or None (#605).
+
+        The pair flow never records pr_number — only the headless create_pr
+        paths do — so the delivery gate would have keyed on a field nobody
+        sets. Discovery at submission time closes that: the hub looks the PR
+        up itself instead of asking anyone to remember a number.
+        """
+        return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
+
     async def merge_commit_sha(
         self,
         pr_number: int,

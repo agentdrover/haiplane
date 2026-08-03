@@ -111,6 +111,14 @@ class NoopGitOps:
     async def head_sha(self, repo: str, base: str) -> str:
         return ""
 
+    async def pr_for_branch(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        return None
+
     async def merge_commit_sha(
         self,
         pr_number: int,

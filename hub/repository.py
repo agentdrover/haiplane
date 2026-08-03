@@ -360,6 +360,24 @@ async def record_pipeline_merge(
     await db.commit()
 
 
+async def pipeline_merge_recorded(
+    db: aiosqlite.Connection, task_id: int, pr_number: int
+) -> bool:
+    """Was this task's PR already delivered by the pipeline (#605)?
+
+    The completion gate must not merge twice: the headless conveyor merges
+    inside the poller and then walks the same shared transition, and a second
+    merge_pr on an already-merged PR reads as a refusal — which would flip a
+    delivered task into needs_decision. Caught by #363's merges-exactly-once
+    guard the first time the gate ran.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM pipeline_merges WHERE task_id = ? AND pr_number = ? LIMIT 1",
+        (task_id, int(pr_number)),
+    )
+    return bool(rows)
+
+
 async def known_pipeline_shas(db: aiosqlite.Connection, project_id: int) -> set[str]:
     """Merge commits this project's pipeline produced.
 

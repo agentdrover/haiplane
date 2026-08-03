@@ -1363,6 +1363,24 @@ async def submit_for_review(
         db, task_id, task.get("branch") or ""
     )
 
+    # #605: record which PR carries this work. The pair flow never sets
+    # pr_number — only headless create_pr does — so the delivery gate would
+    # have keyed on a field nobody fills. The hub looks it up itself; a
+    # discovery failure records nothing and the submission proceeds, because
+    # a task that genuinely has no PR (config work) must submit exactly as
+    # before — the gate then completes it untouched.
+    discovered_pr: int | None = None
+    if not task.get("pr_number") and canonical:
+        from hub.services.orchestration import project_git_context
+
+        try:
+            ctx = await project_git_context(db, task_id)
+            discovered_pr = await plugins.git_ops.pr_for_branch(
+                canonical, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            )
+        except Exception as exc:  # noqa: BLE001 - best effort by contract
+            log.warning("PR discovery failed for #%s (%s): %s", task_id, canonical, exc)
+
     async with get_write_lock(db):
         if not await repo.transition_status_if(
             db, task_id, expected_from="running", new_status="review"
@@ -1374,6 +1392,8 @@ async def submit_for_review(
             )
         generation = await repo.bump_submission_generation(db, task_id)
         await repo.update_task(db, task_id, submission_sha=submission_sha)
+        if discovered_pr:
+            await repo.update_task(db, task_id, pr_number=discovered_pr)
         # Client-driven review: no dispatch job. A stale review_job_id from a
         # previous headless cycle would make the poller treat this task as its
         # own, so clear it explicitly.
@@ -1381,6 +1401,8 @@ async def submit_for_review(
         agent = (body.agent or "").strip() or task.get("assigned_agent", "")
         summary = (body.summary or "").strip()
         content = f"Submitted for review (submission #{generation})."
+        if discovered_pr:
+            content += f" PR #{discovered_pr} recorded for delivery."
         if submission_sha:
             content += f" Branch tip at submission: {submission_sha[:12]}."
         else:
