@@ -242,8 +242,54 @@ async def _default_workspace_error() -> str | None:
     )
 
 
+# Transliteration for slugs (#607). A fully Cyrillic title used to slug to
+# the empty string: pair-start then built "task-601/" (fatal: invalid branch
+# name) and the delivery gate's very first squash subject came out as
+# "feat(task):  (#569)". One table here fixes every consumer at once — six
+# call sites funnel through _slugify, and both incidents were the same hole.
+# Deterministic by construction: the canonical-branch gate (#533) compares
+# names strictly, so one title must always yield one slug.
+_CYRILLIC_TO_LATIN = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "i",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "sch",
+    "ъ": "",
+    "ы": "y",
+    "ь": "",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
+}
+
+
 def _slugify(title: str, max_len: int = 40) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
+    lowered = title.lower()
+    transliterated = "".join(_CYRILLIC_TO_LATIN.get(ch, ch) for ch in lowered)
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", transliterated).strip("-").lower()
     return slug[:max_len].rstrip("-")
 
 

@@ -1809,3 +1809,56 @@ async def test_fallback_is_not_consulted_when_checks_work(
     assert result.outcome == CIProbeOutcome.passed
     assert result.reason == "checks_passed"
     assert calls == [("pr", "checks")]
+
+
+# ---- Cyrillic titles slug to something, not to nothing (#607) ----
+
+
+async def test_merge_subject_is_not_empty_for_cyrillic_titles(
+    git_ops: GitOpsIntegration,
+):
+    """The delivery gate's very first squash subject was "feat(task):  (#569)"
+    — a fully Cyrillic title slugged to the empty string exactly when commit
+    subjects started being written by the hub rather than a human."""
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        await git_ops.merge_pr(240, 569, "Критерий живости эпика")
+
+    args = list(mock_gh.await_args.args)
+    subject = args[args.index("--subject") + 1]
+    assert subject == "feat(task): kriterii-zhivosti-epika (#569)", subject
+    between = subject.split(": ", 1)[1].rsplit(" (#", 1)[0]
+    assert between.strip(), "the middle of the subject must carry meaning"
+
+
+async def test_ascii_slugs_are_unchanged(git_ops: GitOpsIntegration):
+    """AC-3: the transliteration table must be invisible to ASCII titles —
+    byte for byte, including the type prefix and the length cap."""
+    from hub.integrations.git_ops import _slugify
+
+    assert _slugify("Fix the CI probe fallback") == "fix-the-ci-probe-fallback"
+    assert _slugify("A" * 100) == "a" * 40, "the length cap is untouched"
+    assert _slugify("Weird  spacing -- and_punct!!") == "weird-spacing-and-punct"
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        await git_ops.merge_pr(7, 3, "Fix the poller retry")
+
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--subject") + 1] == "fix(task): fix-the-poller-retry (#3)"
+
+
+def test_the_slug_is_deterministic():
+    """#533 compares the canonical branch name strictly: one title must
+    always yield one slug, or resubmission would mismatch its own branch."""
+    from hub.integrations.git_ops import _slugify
+
+    title = "Кириллический заголовок задачи даёт пустой слаг"
+    assert _slugify(title) == _slugify(title)
+    assert _slugify(title), "and it must not be empty"
