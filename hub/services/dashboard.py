@@ -49,7 +49,11 @@ async def get_dashboard_data(db: aiosqlite.Connection) -> DashboardData:
         limit=20,
     )
     stale_rows = await repo.list_stale_running(db, config.STALE_THRESHOLD_MINUTES)
-    epic_rows = await repo.list_active_epics(db, limit=20)
+    # #569: one liveness criterion for every consumer of "which epics are
+    # alive" — this call and get_epics_enriched below. A project card that
+    # grows an epic list later must call the same function, or the three
+    # places the task feared will drift apart.
+    epic_rows = await repo.list_live_epics(db)
     activity_rows = await repo.list_activity(db, limit=15)
 
     commits = await commits_t
@@ -166,7 +170,7 @@ async def get_inbox_data(
 
 async def get_epics_enriched(db: aiosqlite.Connection) -> list[TaskView]:
     """Get active epics with children and progress."""
-    rows = await repo.list_active_epics(db, limit=20)
+    rows = await repo.list_live_epics(db)
     epics: list[TaskView] = []
     for r in rows:
         tv = row_to_task(r)

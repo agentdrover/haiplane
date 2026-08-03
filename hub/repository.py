@@ -780,16 +780,48 @@ async def list_stale_tasks(
     )
 
 
-async def list_active_epics(
-    db: aiosqlite.Connection,
-    *,
-    limit: int = 20,
-) -> list[aiosqlite.Row]:
+async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Epics where work is actually happening (#569).
+
+    Liveness is judged by DESCENDANTS, not by the epic's own status: a
+    completed epic with an open task underneath is live work someone would
+    otherwise lose (#501 and #449 are real examples), and an open epic whose
+    children are all final is finished noise. An epic with no children at
+    all stays live until itself final — a freshly approved epic must not
+    vanish before its first task exists.
+
+    "Final" is the model's own set — completed, failed, rejected — not the
+    completed/rejected pair the task prose named: failed is terminal
+    everywhere else in the lifecycle, and a criterion that disagrees with
+    FINAL_STATUSES would fork the model (spec review, finding 1).
+
+    No LIMIT: silently dropping a live epic is exactly the failure this
+    replaces (#569 AC-4). The list is bounded by reality — an epic leaves it
+    by finishing, not by being the 21st row.
+    """
     return await db.execute_fetchall(
-        "SELECT * FROM tasks WHERE archived=0 AND task_type='epic' "
-        "AND status NOT IN ('completed','failed','rejected') "
-        "ORDER BY position ASC, id DESC LIMIT ?",
-        (limit,),
+        """
+        WITH RECURSIVE sub(root, id) AS (
+            SELECT id, id FROM tasks WHERE task_type='epic' AND archived=0
+            UNION ALL
+            SELECT sub.root, t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+        )
+        SELECT * FROM tasks e
+        WHERE e.task_type='epic' AND e.archived=0
+          AND (
+            EXISTS (
+                SELECT 1 FROM sub JOIN tasks c ON c.id = sub.id
+                WHERE sub.root = e.id AND sub.id != sub.root
+                  AND c.archived = 0
+                  AND c.status NOT IN ('completed','failed','rejected')
+            )
+            OR (
+                NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_id = e.id)
+                AND e.status NOT IN ('completed','failed','rejected')
+            )
+          )
+        ORDER BY e.position ASC, e.id DESC
+        """,
     )
 
 

@@ -4912,3 +4912,92 @@ async def test_successful_update_still_commits(db: aiosqlite.Connection):
 
     updates = await repo.get_task_updates(db, tv.id)
     assert any(u["content"] == "just a note" for u in updates)
+
+
+# ---- epic liveness (#569): judged by descendants, not by the epic itself ----
+
+
+async def _epic_with_child(db, *, epic_status: str, child_status: str | None) -> int:
+    tv = await services.create_task(
+        db, TaskCreate(title=f"Epic {epic_status}/{child_status}", task_type="epic")
+    )
+    await repo.update_task(db, tv.id, status=epic_status)
+    if child_status is not None:
+        child = await services.create_task(
+            db,
+            TaskCreate(title="child", task_type="feature", parent_id=tv.id),
+        )
+        await repo.update_task(db, child.id, status=child_status)
+    await db.commit()
+    return tv.id
+
+
+async def test_completed_epic_with_open_child_is_still_live(db: aiosqlite.Connection):
+    """#501 and #449 in miniature: the epic closed, a tail of work did not.
+    The old criterion judged the epic by its own status and silently dropped
+    exactly these."""
+    epic_id = await _epic_with_child(db, epic_status="completed", child_status="open")
+
+    live = {r["id"] for r in await repo.list_live_epics(db)}
+
+    assert epic_id in live
+
+
+async def test_open_epic_without_live_children_is_done(db: aiosqlite.Connection):
+    """All children final — including FAILED, which the task prose forgot but
+    the lifecycle model counts as terminal (spec review, finding 1)."""
+    done_id = await _epic_with_child(db, epic_status="open", child_status="completed")
+    failed_id = await _epic_with_child(db, epic_status="open", child_status="failed")
+
+    live = {r["id"] for r in await repo.list_live_epics(db)}
+
+    assert done_id not in live, "an open shell over finished work is noise"
+    assert failed_id not in live, (
+        "failed is final everywhere else in the model; liveness must agree"
+    )
+
+
+async def test_childless_epic_is_visible_until_it_is_closed(
+    db: aiosqlite.Connection,
+):
+    fresh_id = await _epic_with_child(db, epic_status="open", child_status=None)
+    closed_id = await _epic_with_child(db, epic_status="completed", child_status=None)
+
+    live = {r["id"] for r in await repo.list_live_epics(db)}
+
+    assert fresh_id in live, "a just-approved epic must not vanish"
+    assert closed_id not in live
+
+
+async def test_live_epics_are_not_silently_truncated(db: aiosqlite.Connection):
+    """The old query carried LIMIT 20; the 21st live epic disappeared with no
+    trace. The list is bounded by reality, not by a constant."""
+    ids = set()
+    for i in range(25):
+        ids.add(await _epic_with_child(db, epic_status="open", child_status="open"))
+
+    live = {r["id"] for r in await repo.list_live_epics(db)}
+
+    assert ids <= live, f"lost: {sorted(ids - live)}"
+
+
+async def test_liveness_sees_deep_descendants(db: aiosqlite.Connection):
+    """An open task under a completed FEATURE under a completed epic: only a
+    recursive walk sees it — direct children alone would call this epic done."""
+    epic = await services.create_task(
+        db, TaskCreate(title="Deep epic", task_type="epic")
+    )
+    feature = await services.create_task(
+        db, TaskCreate(title="f", task_type="feature", parent_id=epic.id)
+    )
+    task = await services.create_task(
+        db, TaskCreate(title="t", task_type="task", parent_id=feature.id)
+    )
+    await repo.update_task(db, epic.id, status="completed")
+    await repo.update_task(db, feature.id, status="completed")
+    await repo.update_task(db, task.id, status="open")
+    await db.commit()
+
+    live = {r["id"] for r in await repo.list_live_epics(db)}
+
+    assert epic.id in live, "depth matters: the tail is two levels down"
