@@ -113,6 +113,30 @@ async def default_validation_runner(
     return rc, "\n".join(logs)[-_LOG_TAIL:]
 
 
+async def record_validation_result(
+    db: Any,
+    task_id: int,
+    *,
+    generation: int,
+    status: str,
+    log_tail: str = "",
+) -> dict:
+    """Write the validation outcome for ``generation``. Does NOT commit (#546).
+
+    The one write path for validation results, shared by the local runner
+    (#509) and the CI report intake (#546). Callers own the transaction so the
+    submission path can land these fields inside its own write lock.
+    """
+    await repo.update_task(
+        db,
+        task_id,
+        validation_generation=generation,
+        validation_status=status,
+        validation_log=log_tail,
+    )
+    return {"status": status, "generation": generation}
+
+
 async def run_validation_commands(
     db: Any,
     task_id: int,
@@ -142,15 +166,11 @@ async def run_validation_commands(
     else:
         rc, log_tail = result
         status = PASS if rc == 0 else FAIL
-    await repo.update_task(
-        db,
-        task_id,
-        validation_generation=generation,
-        validation_status=status,
-        validation_log=log_tail,
+    out = await record_validation_result(
+        db, task_id, generation=generation, status=status, log_tail=log_tail
     )
     await db.commit()
-    return {"status": status, "generation": generation}
+    return out
 
 
 def validation_gap(task: dict) -> str | None:

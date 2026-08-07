@@ -511,6 +511,21 @@ class ACLocatorResolution(BaseModel):
     reason: str = ""
 
 
+class CIRunReportState(BaseModel):
+    """Does run evidence exist for the commit under review (#546).
+
+    ``state`` is ``current`` (CI reported this exact commit) or ``unknown``
+    (nobody reported it, it was reported for a different commit, or no commit is
+    pinned). There is no ``fail`` state on purpose: this field answers whether
+    evidence exists, and missing evidence is not a failed run. ``reason`` is
+    always filled for ``unknown`` so the reader gets a cause, not a blank.
+    """
+
+    state: str = "unknown"
+    reason: str = "отчёт CI о прогоне не запрашивался"
+    head_sha: str = ""
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -531,6 +546,10 @@ class ReviewBrief(BaseModel):
     call_sites: CallSiteSection = Field(default_factory=CallSiteSection)
     # #507: recorded pass/fail of each test-AC's bound test for this generation.
     ac_test_results: list[ACTestResultView] = Field(default_factory=list)
+    # #546: whether run evidence exists for the COMMIT under review. Two states
+    # only — current, or unknown with a reason. Absence of a report is not a
+    # failing run, and must never be shown as one.
+    ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
@@ -1180,6 +1199,39 @@ class MachineUnresolvedFinding(BaseModel):
                 "'reason' — 'reason' belongs to findings_rejected"
             )
         return data
+
+
+class CIRunReportSubmit(BaseModel):
+    """What a CI run reports back to the hub (#546).
+
+    ``head_sha`` is required and load-bearing: the hub decides whether the report
+    counts by comparing it with the commit it pinned at submission (#572), so a
+    report cannot claim to cover code it did not run. ``submission_generation``
+    is optional and advisory — when the reporter states one and it no longer
+    matches, the report is refused as stale instead of silently applied to newer
+    work. ``reason`` carries why a value is unknown, which is the difference
+    between "did not run" and "ran and failed".
+    """
+
+    head_sha: str = Field(..., min_length=7, max_length=64)
+    submission_generation: int | None = Field(default=None, ge=0)
+    ac_results: dict[str, str] = Field(default_factory=dict)
+    validation_status: str = Field("", max_length=20)
+    validation_log: str = Field("", max_length=4000)
+    reason: str = Field("", max_length=500)
+    reported_by: str = Field("", max_length=100)
+
+
+class CIRunReportResult(BaseModel):
+    """Outcome of accepting a CI run report (#546)."""
+
+    applied: bool
+    reason: str
+    head_sha: str
+    submission_generation: int | None = None
+    ac_recorded: list[dict[str, Any]] = Field(default_factory=list)
+    ac_ignored: list[str] = Field(default_factory=list)
+    validation_status: str = ""
 
 
 class MachineReviewSubmit(BaseModel):

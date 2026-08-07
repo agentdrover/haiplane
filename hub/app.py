@@ -35,6 +35,9 @@ from hub.models import (
     CallSiteEntry,
     CallSiteSection,
     ACTestResultView,
+    CIRunReportResult,
+    CIRunReportState,
+    CIRunReportSubmit,
     BulkChildTasksCreate,
     BulkRefine,
     BulkRefineResult,
@@ -107,6 +110,7 @@ from hub.services.diagnostics import (
     build_whoami,
 )
 from hub.services.ac_tests import current_ac_test_results, run_ac_tests
+from hub.services.ci_report import accept_ci_run_report, ci_report_state
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
 from hub.services import call_sites
@@ -1138,6 +1142,57 @@ async def api_run_validation(task_id: int, request: Request):
     return await run_validation_commands(db, task_id)
 
 
+@app.post("/api/tasks/{task_id}/ci-run-report", response_model=CIRunReportResult)
+async def api_ci_run_report(
+    task_id: int,
+    body: CIRunReportSubmit,
+    request: Request,
+    identity=Depends(require_permission("tasks.ci_report")),
+):
+    """Accept the run evidence CI produced for one commit (#546).
+
+    Execution lives in CI; the hub checks and keeps the result. The report counts
+    only for the commit the hub pinned at submission (#572) — a report for any
+    other commit is stored as evidence for that commit and explicitly not
+    applied, so it can never open a gate for code nobody ran. A stale generation
+    stated by the reporter is refused outright.
+
+    The permission is deliberately narrow (``tasks.ci_report``, held only by the
+    ci_runner role): this token lives in a CI secret and must not be able to move
+    a task or write a verdict.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise HTTPException(404, "task not found")
+    current_generation = dict(row).get("submission_generation") or 0
+    if (
+        body.submission_generation is not None
+        and body.submission_generation != current_generation
+    ):
+        raise HTTPException(
+            409,
+            f"stale report: sent for submission #{body.submission_generation}, "
+            f"current is #{current_generation}",
+        )
+    try:
+        result = await accept_ci_run_report(
+            db,
+            task_id,
+            head_sha=body.head_sha,
+            ac_results=body.ac_results,
+            validation_status=body.validation_status,
+            validation_log=body.validation_log,
+            reason=body.reason,
+            reported_by=body.reported_by or identity.username,
+        )
+    except LookupError:
+        raise HTTPException(404, "task not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return CIRunReportResult(**result)
+
+
 async def _build_call_sites_section(db, task_id: int, task_view) -> CallSiteSection:
     """The call-site enumeration for a task's branch (#601).
 
@@ -1329,6 +1384,22 @@ async def api_review_brief(
         )
     ]
 
+    # #546: is there run evidence for the COMMIT under review? Two states only,
+    # and the unknown one always carries its cause — a reviewer must be able to
+    # tell "nobody ran it" from "it ran and failed".
+    ci_state, ci_reason = await ci_report_state(
+        db,
+        {
+            "id": task_id,
+            "submission_sha": task_view.submission_sha,
+        },
+    )
+    ci_run_report = CIRunReportState(
+        state=ci_state,
+        reason=ci_reason,
+        head_sha=task_view.submission_sha or "",
+    )
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1338,6 +1409,7 @@ async def api_review_brief(
         acceptance_criteria=ac_models,
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
+        ci_run_report=ci_run_report,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
         out_of_scope_for_review=task_view.out_of_scope_for_review,

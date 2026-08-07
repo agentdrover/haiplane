@@ -3214,3 +3214,186 @@ async def test_review_verdict_update_records_the_reviewer_principal(
     assert verdicts, "the verdict must appear in the feed"
     assert verdicts[-1]["principal_id"] == 8
     assert verdicts[-1]["author_kind"] == "principal"
+
+
+# ---- CI reports the run, the hub checks and keeps it (#546) ----
+#
+# Execution belongs to CI: the production hub has no test runner by decision of
+# 31.07.2026, so it must never be the thing that runs task-supplied commands.
+# What it owes in exchange is judgement — a report counts only for the commit it
+# pinned at submission (#572), and silence is never read as success.
+
+
+def _ci_headers(monkeypatch) -> dict:
+    """An identity that holds tasks.ci_report.
+
+    Production grants it through a DB principal with the ci_runner role; among env
+    tokens only ``admin`` carries every permission. Human and agent tokens must be
+    refused — asserted in test_ci_report_rejects_bad_token_and_stale_generation.
+    """
+    from hub import config
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        config.parse_tokens(
+            "denis:human-token:human,cursor:agent-token:agent,ci:ci-token:admin"
+        ),
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return {"Authorization": "Bearer ci-token"}
+
+
+async def _ci_reporting_task(client: AsyncClient, monkeypatch, tip: str) -> int:
+    """A submitted pair task whose pinned tip is ``tip``, with one test-AC."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Git(NoopGitOps):
+        async def fetch_base(self, repo: str, base: str):
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return tip
+
+    monkeypatch.setattr(plugins, "git_ops", _Git())
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    resp = await client.post("/api/tasks", json={"title": "Report me"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                    "test_ref": "tests/test_x.py::test_a",
+                }
+            ],
+            "validation_commands": ["uv run pytest -q"],
+        },
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: do it"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_ci_reports_ac_test_results(client: AsyncClient, monkeypatch):
+    # AC-1 (#546): a run reported by CI for the pinned commit lands as the AC
+    # result for the current generation — nobody calls run-ac-tests by hand.
+    task_id = await _ci_reporting_task(client, monkeypatch, "sha-report-one")
+
+    ci = _ci_headers(monkeypatch)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-report-one", "ac_results": {"AC-1": "pass"}},
+        headers=ci,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True, body["reason"]
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief", headers=ci)).json()
+    assert brief["ac_test_results"] == [
+        {"ac_id": "AC-1", "status": "pass", "is_current": True}
+    ], "the reported result must be the current generation's AC evidence"
+    assert brief["ci_run_report"]["state"] == "current"
+
+
+async def test_ci_reports_validation_result(client: AsyncClient, db, monkeypatch):
+    # AC-2 (#546): the validation outcome is recorded against the current
+    # generation, so validation_gap (#510) stops seeing a gap — without anyone
+    # calling run-validation, and without the hub executing the commands.
+    from hub.services.validation_run import validation_gap
+
+    task_id = await _ci_reporting_task(client, monkeypatch, "sha-report-two")
+
+    ci = _ci_headers(monkeypatch)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={
+            "head_sha": "sha-report-two",
+            "validation_status": "pass",
+            "validation_log": "$ uv run pytest -q\n1358 passed",
+        },
+        headers=ci,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+
+    # Read the stored row, not TaskView: these columns are the gate's input and
+    # are deliberately not part of the public task payload.
+    from hub import repository as _repo
+
+    task = dict(await _repo.get_task(db, task_id))
+    assert task["validation_status"] == "pass"
+    assert task["validation_generation"] == task["submission_generation"]
+    assert validation_gap(task) is None, "a green reported run must close the gap"
+
+
+async def test_ci_report_rejects_bad_token_and_stale_generation(
+    client: AsyncClient, monkeypatch
+):
+    # AC-4 (#546): the intake is a write path, so it is guarded three ways —
+    # by permission, by generation, and by commit. An agent token is the
+    # interesting negative case: it is a legitimate hub identity that must
+    # still not be able to write run evidence, because this token lives in a
+    # CI secret and its blast radius has to stay at "report a run".
+    task_id = await _ci_reporting_task(client, monkeypatch, "sha-refusal-case")
+    ci = _ci_headers(monkeypatch)
+
+    forbidden = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-refusal-case", "ac_results": {"AC-1": "pass"}},
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    assert forbidden.status_code == 403, forbidden.text
+
+    unauthenticated = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-refusal-case", "ac_results": {"AC-1": "pass"}},
+    )
+    assert unauthenticated.status_code == 401, unauthenticated.text
+
+    stale = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={
+            "head_sha": "sha-refusal-case",
+            "submission_generation": 99,
+            "ac_results": {"AC-1": "pass"},
+        },
+        headers=ci,
+    )
+    assert stale.status_code == 409, stale.text
+    assert "stale report" in stale.json()["detail"]
+
+    other_commit = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-other-commit", "ac_results": {"AC-1": "pass"}},
+        headers=ci,
+    )
+    assert other_commit.status_code == 200, other_commit.text
+    assert other_commit.json()["applied"] is False
+    assert "закреплён" in other_commit.json()["reason"]
+
+    # None of the three refusals may have written evidence for this submission.
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief", headers=ci)).json()
+    assert brief["ac_test_results"] == []
+    assert brief["ci_run_report"]["state"] == "unknown"

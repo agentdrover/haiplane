@@ -82,6 +82,45 @@ async def default_test_runner(
     return results
 
 
+async def test_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
+    """{ac_id: nodeid} for every verifiable_by=test AC with a valid locator.
+
+    The single answer to "what would a run of this task cover" — shared by the
+    local runner and by the CI report intake (#546), so the two can never
+    disagree about which AC a run was allowed to speak for.
+    """
+    ac_models = [row_to_ac(r) for r in await repo.list_acceptance_criteria(db, task_id)]
+    out: dict[str, str] = {}
+    for ac in ac_models:
+        if ac.verifiable_by.value != "test":
+            continue
+        parsed = parse_test_locator(ac.test_ref)
+        if parsed is not None:
+            out[ac.id] = parsed[1]
+    return out
+
+
+async def record_ac_test_results(
+    db: Any,
+    task_id: int,
+    statuses: dict[str, str],
+    generation: int,
+) -> list[dict]:
+    """Write per-AC outcomes for ``generation``. Does NOT commit (#546).
+
+    The one write path for AC results: the local runner (#507) and the CI
+    report intake (#546) both come through here, so a result written by a
+    runner and a result written by a report are the same fact, stored the same
+    way. Callers own the transaction — the submission path needs these rows to
+    land inside its own write lock.
+    """
+    recorded: list[dict] = []
+    for ac_id, status in statuses.items():
+        await repo.upsert_ac_test_result(db, task_id, ac_id, generation, status)
+        recorded.append({"ac_id": ac_id, "status": status, "generation": generation})
+    return recorded
+
+
 async def run_ac_tests(
     db: Any,
     task_id: int,
@@ -96,14 +135,7 @@ async def run_ac_tests(
     recorded results. Non-test AC and AC without a valid locator are skipped.
     """
     runner = runner or default_test_runner
-    ac_models = [row_to_ac(r) for r in await repo.list_acceptance_criteria(db, task_id)]
-    nodeid_by_ac: dict[str, str] = {}
-    for ac in ac_models:
-        if ac.verifiable_by.value != "test":
-            continue
-        parsed = parse_test_locator(ac.test_ref)
-        if parsed is not None:
-            nodeid_by_ac[ac.id] = parsed[1]
+    nodeid_by_ac = await test_ac_nodeids(db, task_id)
     if not nodeid_by_ac:
         return []
 
@@ -112,14 +144,13 @@ async def run_ac_tests(
     ctx = await project_git_context(db, task_id)
     ran = await runner(list(nodeid_by_ac.values()), ctx.get("repo"))
 
-    recorded: list[dict] = []
+    statuses: dict[str, str] = {}
     for ac_id, nodeid in nodeid_by_ac.items():
         if ran is None or nodeid not in ran:
-            status = NOT_FOUND
+            statuses[ac_id] = NOT_FOUND
         else:
-            status = PASS if ran[nodeid] else FAIL
-        await repo.upsert_ac_test_result(db, task_id, ac_id, generation, status)
-        recorded.append({"ac_id": ac_id, "status": status, "generation": generation})
+            statuses[ac_id] = PASS if ran[nodeid] else FAIL
+    recorded = await record_ac_test_results(db, task_id, statuses, generation)
     await db.commit()
     return recorded
 

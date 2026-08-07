@@ -691,6 +691,74 @@ async def list_ac_test_results(
     )
 
 
+# --- CI run reports (#546) -------------------------------------------------
+
+
+async def upsert_ci_run_report(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    head_sha: str,
+    ac_results: str,
+    validation_status: str,
+    validation_log: str,
+    reason: str,
+    reported_by: str,
+) -> None:
+    """Store what a CI run reported for one commit (idempotent per commit).
+
+    Re-running CI on the same commit updates the row rather than adding a
+    second opinion — the same rule the merge ledger follows (#605).
+    """
+    await db.execute(
+        "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
+        "validation_status, validation_log, reason, reported_by, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
+        "ac_results=excluded.ac_results, "
+        "validation_status=excluded.validation_status, "
+        "validation_log=excluded.validation_log, "
+        "reason=excluded.reason, reported_by=excluded.reported_by, "
+        "reported_at=excluded.reported_at",
+        (
+            task_id,
+            head_sha,
+            ac_results,
+            validation_status,
+            validation_log,
+            reason,
+            reported_by,
+        ),
+    )
+
+
+async def get_ci_run_report(
+    db: aiosqlite.Connection, task_id: int, head_sha: str
+) -> aiosqlite.Row | None:
+    """The report for one commit, or None when that commit was never reported."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM ci_run_reports WHERE task_id=? AND head_sha=?",
+        (task_id, head_sha),
+    )
+    return rows[0] if rows else None
+
+
+async def latest_ci_run_report(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """The most recently reported run for a task, whatever commit it covered.
+
+    Used only to explain a mismatch ("a run was reported, but for another
+    commit") — never to satisfy a gate, which always keys on the pinned SHA.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT * FROM ci_run_reports WHERE task_id=? "
+        "ORDER BY reported_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    )
+    return rows[0] if rows else None
+
+
 # --- events feed (#349) ----------------------------------------------------
 
 

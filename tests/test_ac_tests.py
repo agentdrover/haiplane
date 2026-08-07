@@ -140,3 +140,52 @@ async def test_runner_reports_plain_pass_and_fail(monkeypatch):
         monkeypatch, ["tests/t.py::test_ok", "tests/t.py::test_bad"], out
     )
     assert res == {"tests/t.py::test_ok": True, "tests/t.py::test_bad": False}
+
+
+# ---- silence from CI is unknown, never a failure (#546) ----
+
+
+async def test_missing_ci_report_is_unknown_not_fail(db):
+    # AC-3 (#546): when no run was reported for the code under review, the brief
+    # says so WITH A CAUSE. It must not say the run failed: a false fail blocks a
+    # verdict for a reason that has nothing to do with the work — the same
+    # mistake #506 made when it read an unavailable environment as "no problem".
+    from hub.services.ci_report import STATE_UNKNOWN, ci_report_state
+
+    task_id = await _task_with_test_acs(db)
+
+    # 1. Nothing pinned yet: there is no commit to compare a report against.
+    state, reason = await ci_report_state(db, {"id": task_id, "submission_sha": ""})
+    assert state == STATE_UNKNOWN
+    assert "не закреплён" in reason and reason.strip(), "unknown must carry a cause"
+
+    # 2. A commit is pinned and nobody reported it — still unknown, and the
+    #    reason names the commit so the reader can go look for the run.
+    state, reason = await ci_report_state(
+        db, {"id": task_id, "submission_sha": "sha-under-review"}
+    )
+    assert state == STATE_UNKNOWN
+    assert "sha-under-review"[:12] in reason
+
+    # 3. CI reported ANOTHER commit. Still unknown, and the reason distinguishes
+    #    "no evidence" from "evidence about different code".
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha="sha-some-other-run",
+        ac_results="{}",
+        validation_status="fail",
+        validation_log="",
+        reason="",
+        reported_by="github-actions",
+    )
+    await db.commit()
+    state, reason = await ci_report_state(
+        db, {"id": task_id, "submission_sha": "sha-under-review"}
+    )
+    assert state == STATE_UNKNOWN
+    assert "sha-some-other-run"[:12] in reason and "sha-under-review"[:12] in reason
+
+    # And in none of the three cases was a fail recorded for the AC.
+    rows = [dict(r) for r in await repo.list_ac_test_results(db, task_id)]
+    assert rows == [], "absence of a report must never be stored as a result"
