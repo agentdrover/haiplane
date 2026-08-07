@@ -28,6 +28,7 @@ from hub.hub_instance import mutation_activity_detail
 from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.mcp_envelope import enrich_error_payload
+from hub.services.ci_report import adopt_ci_run_report
 from hub.services.task_idempotency import (
     IdempotencyRecord,
     hash_task_create_payload,
@@ -1392,6 +1393,12 @@ async def submit_for_review(
             )
         generation = await repo.bump_submission_generation(db, task_id)
         await repo.update_task(db, task_id, submission_sha=submission_sha)
+        # #546: CI normally runs when the PR opens — before this submission
+        # existed, when the generation was still 0 — so its evidence is stored
+        # per commit and adopted here, the moment that commit becomes the one
+        # under review. Without this the report would sit in the table while the
+        # gate reported "never ran". Inside the lock, so it shares this commit.
+        adopted = await adopt_ci_run_report(db, task_id, submission_sha, generation)
         if discovered_pr:
             await repo.update_task(db, task_id, pr_number=discovered_pr)
         # Client-driven review: no dispatch job. A stale review_job_id from a
@@ -1405,6 +1412,13 @@ async def submit_for_review(
             content += f" PR #{discovered_pr} recorded for delivery."
         if submission_sha:
             content += f" Branch tip at submission: {submission_sha[:12]}."
+        if adopted:
+            ac_count = len(adopted.get("ac_recorded") or [])
+            v_status = adopted.get("validation_status") or "—"
+            content += (
+                f" CI run report adopted for this commit: {ac_count} AC result(s), "
+                f"validation {v_status}."
+            )
         else:
             # Unchecked is a state the reviewer must see, not an absence of
             # news — the same rule the drift guard follows (#534, #572).

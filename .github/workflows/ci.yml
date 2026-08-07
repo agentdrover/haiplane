@@ -44,6 +44,27 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+      # #546: the hub has no test runner by design, so the evidence for its two
+      # SDD gates is produced here and reported back. Placed AFTER the main test
+      # step and marked continue-on-error on purpose: the delivery gate
+      # (#605/#606) decides whether a PR may merge by reading this job's
+      # outcome, so a reporting hiccup must never turn into a merge block for
+      # every task. Without the secrets the script reports nothing and says so —
+      # the hub reads silence as unknown, never as success.
+      - name: Report AC tests and validation to Hub
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          OPENCLAW_HUB_URL: ${{ secrets.OPENCLAW_HUB_URL }}
+          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          # The commit the report is evidence about must be the BRANCH HEAD. On
+          # pull_request events GITHUB_SHA is a throwaway merge of head into
+          # base, which exists in no branch and can never equal the tip the hub
+          # pinned at submission (#572) — so pass the head explicitly and let
+          # GITHUB_SHA cover push runs, where it is the tip.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: uv run python scripts/ci_report_to_hub.py
+
       - name: Dependency vulnerability audit
         run: uv run pip-audit --progress-spinner off
 

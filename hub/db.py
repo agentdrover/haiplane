@@ -740,6 +740,29 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_submission_sha",
         "ALTER TABLE tasks ADD COLUMN submission_sha TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # #546: the run evidence CI reports back. Keyed by COMMIT, not by
+        # submission generation, because the two orders both happen in real
+        # life: CI usually runs when the PR opens (before any submission, when
+        # the generation is still 0), and again after a resubmission. A commit
+        # is the one identifier that exists in both moments and that the
+        # reporter does not get to choose — the hub decides whether that commit
+        # is the one it pinned. UNIQUE(task_id, head_sha) makes a re-reported
+        # run an update rather than a second opinion.
+        "create_ci_run_reports",
+        """CREATE TABLE IF NOT EXISTS ci_run_reports (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            head_sha          TEXT    NOT NULL,
+            ac_results        TEXT    NOT NULL DEFAULT '{}',
+            validation_status TEXT    NOT NULL DEFAULT '',
+            validation_log    TEXT    NOT NULL DEFAULT '',
+            reason            TEXT    NOT NULL DEFAULT '',
+            reported_by       TEXT    NOT NULL DEFAULT '',
+            reported_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, head_sha)
+        )""",
+    ),
 ]
 
 
@@ -1252,6 +1275,11 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     "tasks.decision",
     "tasks.archive",
     "tasks.delete",
+    # #546: report the outcome of a run, and nothing else. Deliberately absent
+    # from the agent and human defaults in config.py: a token that lives in a
+    # CI secret must not be able to move a task or write a verdict, so it can
+    # only be granted through a DB-backed principal holding the ci_runner role.
+    "tasks.ci_report",
     "integrations.vast.manage",
     "system.settings.write",
 )
@@ -1348,6 +1376,16 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Security Admin",
         "Audit and security settings only",
         ("admin.read", "admin.audit.read"),
+    ),
+    (
+        # #546: the identity a CI runner authenticates as. Read a task's plan,
+        # report what the run produced — that is the whole job. No update, no
+        # agent_report, no human gate: this token lives in a GitHub secret, so
+        # its blast radius is the one thing it needs to do.
+        "ci_runner",
+        "CI Runner",
+        "Read tasks and report run results; cannot change task state",
+        ("tasks.read", "tasks.ci_report"),
     ),
 )
 

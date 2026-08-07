@@ -5001,3 +5001,28 @@ async def test_liveness_sees_deep_descendants(db: aiosqlite.Connection):
     live = {r["id"] for r in await repo.list_live_epics(db)}
 
     assert epic.id in live, "depth matters: the tail is two levels down"
+
+
+async def test_pair_start_survives_a_cyrillic_title(db: aiosqlite.Connection):
+    """#607 AC-1: a fully Cyrillic title used to slug to the empty string,
+    and pair-start died with "fatal: 'task-601/' is not a valid branch name".
+    Every Russian-titled task needed a manual branch_slug since."""
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    plugins.git_ops = NoopGitOps()
+    tv = await services.create_task(
+        db, TaskCreate(title="Критерий живости эпика и разделение выборки")
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: старт")
+    await db.commit()
+
+    view = await services.pair_start_task(db, tv.id, caller="dev")
+
+    branch = view.branch or ""
+    assert branch.startswith(f"task-{tv.id}/"), branch
+    slug = branch.split("/", 1)[1]
+    assert slug, "the slug after the slash must not be empty — that was the crash"
+    import re as _re
+
+    assert _re.fullmatch(r"[a-z0-9-]+", slug), f"branch-safe slug required: {slug!r}"
