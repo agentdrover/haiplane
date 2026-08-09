@@ -2909,3 +2909,85 @@ async def test_pair_start_stays_quiet_about_branches_for_headless_tasks(
         "is withheld"
     )
     assert "Canonical branch:" not in payload["message"]
+
+
+# ---- refine writes what it documents (#609) ----
+#
+# The docstring described seven fields — outcome_metric, outcome_indicator,
+# outcome_deadline, outcome_revisit_condition, redesign_decision,
+# redesign_rationale, agent_fit — that the signature did not have. Values passed
+# for them were dropped in silence: no error, and fields_set simply did not
+# mention them, so an agent learned of the loss only by comparing the response
+# with what it had sent. Three DoR checks (has_outcome_hypothesis,
+# has_redesign_decision, has_agent_fit) were therefore unreachable through the
+# one tool whose documentation promised them, while REST, the bulk tool and
+# hub_prepare_developer_task all accepted the same fields.
+
+_DISCOVERY_FIELDS = (
+    "outcome_metric",
+    "outcome_indicator",
+    "outcome_deadline",
+    "outcome_revisit_condition",
+    "redesign_decision",
+    "redesign_rationale",
+    "agent_fit",
+)
+
+
+async def test_refine_sends_outcome_redesign_and_agent_fit(
+    mock_api_post: AsyncMock,
+) -> None:
+    # AC-1 (#609): the values reach the server instead of evaporating.
+    mock_api_post.return_value = {"id": 7, "readiness_score": 90, "dor_passed": True}
+
+    await hub_refine_task(
+        task_id=7,
+        outcome_metric="median lead time, 3d -> 1d",
+        outcome_indicator="share of tasks with a filled hypothesis",
+        outcome_deadline="4 weeks after release",
+        outcome_revisit_condition="if the number does not move",
+        redesign_decision="adapt",
+        redesign_rationale="the process is right, only this path was missing",
+        agent_fit="deterministic",
+    )
+
+    _path, body = mock_api_post.await_args.args
+    for field in _DISCOVERY_FIELDS:
+        assert field in body, f"{field} must reach the server, not be dropped"
+    assert body["redesign_decision"] == "adapt"
+    assert body["agent_fit"] == "deterministic"
+
+
+async def test_refine_sends_only_what_was_passed(mock_api_post: AsyncMock) -> None:
+    # AC-3 (#609): adding parameters must not make the tool send them unasked —
+    # a PATCH that quietly carries empty values would overwrite good data.
+    mock_api_post.return_value = {"id": 7}
+
+    await hub_refine_task(task_id=7, problem_statement="only this")
+
+    _path, body = mock_api_post.await_args.args
+    assert body == {"problem_statement": "only this"}
+
+
+def test_refine_docstring_and_signature_agree() -> None:
+    # AC-2 (#609): this is the point of the task. Fixing seven fields while
+    # leaving the docstring free to describe an eighth would buy one incident of
+    # silence and keep the class open. Every name documented in Args must be a
+    # real parameter — and the failure names the offenders, so whoever hits it
+    # knows what to fix.
+    import inspect
+    import re
+
+    doc = inspect.getdoc(hub_refine_task) or ""
+    args_block = doc.split("Args:", 1)
+    assert len(args_block) == 2, "the docstring must keep documenting its Args"
+    documented = set(re.findall(r"^\s{4,}(\w+):", args_block[1], flags=re.MULTILINE))
+    assert documented, "parsing found no documented fields — the test would pass on air"
+
+    parameters = set(inspect.signature(hub_refine_task).parameters)
+    undeliverable = documented - parameters
+    assert not undeliverable, (
+        f"documented but not accepted, so silently dropped: {sorted(undeliverable)}"
+    )
+    # And the seven from the incident are specifically among the parameters.
+    assert set(_DISCOVERY_FIELDS) <= parameters

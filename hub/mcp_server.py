@@ -2782,6 +2782,17 @@ async def hub_refine_task(
     user_story: str | None = None,
     problem_statement: str | None = None,
     business_value: str | None = None,
+    # #609: these seven were documented in the docstring below but absent from
+    # the signature, so every value an agent passed was dropped without a word.
+    # Ordered and named exactly as in hub_prepare_developer_task, which already
+    # accepted them — two tools describing one PATCH should not look different.
+    outcome_metric: str | None = None,
+    outcome_indicator: str | None = None,
+    outcome_deadline: str | None = None,
+    outcome_revisit_condition: str | None = None,
+    redesign_decision: str | None = None,
+    redesign_rationale: str | None = None,
+    agent_fit: str | None = None,
     technical_hints: str | None = None,
     scope_in: list[str] | None = None,
     scope_out: list[str] | None = None,
@@ -2864,6 +2875,13 @@ async def hub_refine_task(
         ("review_checklist", review_checklist),
         ("human_owner", human_owner),
         ("human_reviewer", human_reviewer),
+        ("outcome_metric", outcome_metric),
+        ("outcome_indicator", outcome_indicator),
+        ("outcome_deadline", outcome_deadline),
+        ("outcome_revisit_condition", outcome_revisit_condition),
+        ("redesign_decision", redesign_decision),
+        ("redesign_rationale", redesign_rationale),
+        ("agent_fit", agent_fit),
     ):
         if val is not None:
             body[key] = val
