@@ -265,3 +265,131 @@ async def test_the_gate_merge_is_not_drift(db):
     assert drifted == [], (
         "a delivery the gate performed must never ring the drift guard"
     )
+
+
+# ---- The approved commit is re-checked before delivery (#612) ----
+#
+# #572 bound the verdict to a commit and closed the order "push, then approve":
+# a branch that moved before the verdict stales it. The opposite order stayed
+# open — approve, THEN push, then report_done — because the completion path
+# never looked at the pin. The verdict still counts as current (its generation
+# never changed), and the gate merges the branch tip, so code the reviewer never
+# saw lands in develop under their approval.
+#
+# Reproduced on a live task on 07.08.2026: #546 was approved at febb12b, then a
+# fix and a develop merge moved the branch to c20bc40 while the verdict stayed
+# generation 1 = generation 1. It was not exploited — the task was resubmitted —
+# and this is the mechanism that makes discipline unnecessary, exactly as #572
+# argued when three agent notes (#547, #601, #532) proved not to be enough.
+
+
+def _git_seeing(monkeypatch, tip: str, *, reachable: bool = True, **kw):
+    """A git double whose observed branch tip is scripted.
+
+    The project must also have a workspace: without one resolve_branch_tip
+    answers "nowhere to look" before it ever asks git, and every scripted tip
+    here would be silently ignored — the first version of these tests did
+    exactly that and tested nothing.
+    """
+    from hub.services import orchestration
+
+    g = _git(**kw)
+    g.fetch_base = AsyncMock(
+        return_value=(True, "") if reachable else (False, "remote unreachable")
+    )
+    g.head_sha = AsyncMock(return_value=tip)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    return g
+
+
+async def test_a_commit_pushed_after_approval_is_not_delivered(db, monkeypatch):
+    # AC-1 (#612): approved at one commit, branch now at another → no merge, and
+    # the refusal names BOTH commits so the reader can see what diverged.
+    g = _git_seeing(monkeypatch, "approved0commit")
+    task_id = await _approved_pair_task(db)
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == (
+        "approved0commit"
+    ), "precondition: the hub pinned the commit that was approved"
+
+    g.head_sha = AsyncMock(return_value="pushed0after0approval")
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "delivering here would put unreviewed code in develop under an approval"
+    )
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    refusal = " ".join(u.get("content") or "" for u in updates)
+    assert "stale_approval" in refusal
+    assert "approved0com" in refusal and "pushed0after" in refusal, (
+        "both commits must appear, or the reason explains nothing"
+    )
+
+
+async def test_an_unchanged_branch_still_delivers(db, monkeypatch):
+    # AC-2 (#612): the normal path is untouched. A check that also blocks honest
+    # deliveries would simply be traded away the first time it got in the way.
+    g = _git_seeing(monkeypatch, "steady0commit")
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT pr_number FROM pipeline_merges")
+    ]
+    assert rows and rows[0]["pr_number"] == 77
+
+
+async def test_an_unresolvable_tip_delivers_with_a_visible_note(db, monkeypatch):
+    # AC-3 (#612): the network is not allowed to stop the conveyor. An
+    # unreachable remote means "not checked" — said out loud — never a refusal.
+    # The same shape as #572 on the verdict path, and the same lesson the
+    # dependency advisory taught today: a check that can go red on its own
+    # blocks every task, not just the one it was about.
+    g = _git_seeing(monkeypatch, "pinned0commit")
+    task_id = await _approved_pair_task(db)
+
+    g.fetch_base = AsyncMock(return_value=(False, "remote unreachable"))
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "a blinking remote must not block delivery"
+    assert g.merge_pr.await_count == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    note = " ".join(u.get("content") or "" for u in updates)
+    assert "Сверка кода с одобрением НЕ проводилась" in note, (
+        "unchecked is a state the reader must see, not an absence of news; "
+        "the wording matches the verdict path (#572) on purpose"
+    )
+    assert "remote unreachable" in note, "and it must carry the cause"
+    assert "pinned0commi" in note, "and say which commit was approved"
+
+
+async def test_a_task_without_a_pin_delivers_as_before(db, monkeypatch):
+    # AC-4 (#612): tasks submitted before #572, or ones whose pin could not be
+    # taken, must keep working. A new check that retroactively blocks old work
+    # is a new outage, not a new guarantee.
+    g = _git_seeing(monkeypatch, "")  # head_sha returns nothing → nothing was pinned
+    task_id = await _approved_pair_task(db)
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == ""
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    note = " ".join(u.get("content") or "" for u in updates)
+    assert "Сверка кода с одобрением НЕ проводилась" in note, (
+        "say that nothing was compared"
+    )
+    assert "не был закреплён" in note, "and why"

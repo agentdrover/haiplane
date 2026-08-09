@@ -657,6 +657,52 @@ def completion_requires_review(task: dict[str, Any]) -> bool:
     )
 
 
+async def _approved_code_check(
+    db: aiosqlite.Connection, task: dict[str, Any], pr_num: Any
+) -> tuple[str, str]:
+    """Is the branch still the code that was approved? (#612)
+
+    Returns ``(refusal, note)``: a non-empty refusal blocks delivery, a
+    non-empty note records that the comparison could NOT be made and why.
+    Three outcomes, never collapsed into two — the same shape #572 used on the
+    verdict path, because "diverged" and "not checked" call for opposite
+    responses and merging them would either block on a blinking network or
+    stay silent about unreviewed code.
+    """
+    # Local import: lifecycle imports this module for project_git_context, so a
+    # module-level import here closes the cycle. The comparison lives there and
+    # is not copied — one implementation for all three paths that need it.
+    from hub.services.lifecycle import resolve_branch_tip
+
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        # Submitted before #572, or the tip could not be read at submission.
+        # Delivering is right — a task that predates the mechanism must not be
+        # retroactively blocked by it — but silence would read as "verified".
+        return "", (
+            "Сверка кода с одобрением НЕ проводилась: коммит сдачи не был "
+            "закреплён. Доставлено по номеру сдачи, не по коммиту."
+        )
+
+    current_tip, tip_reason = await resolve_branch_tip(
+        db, task["id"], task.get("branch") or ""
+    )
+    if not current_tip:
+        # The remote blinked. Blocking here would stop the conveyor for every
+        # task over a network fault that says nothing about the work.
+        return "", (
+            f"Сверка кода с одобрением НЕ проводилась: {tip_reason}. "
+            f"Одобрен коммит {pinned[:12]}."
+        )
+    if current_tip != pinned:
+        return (
+            f"stale_approval: одобрен {pinned[:12]}, ветка на "
+            f"{current_tip[:12]} — пересдайте, чтобы ревью увидело текущий код "
+            f"(PR #{pr_num})"
+        ), ""
+    return "", ""
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -684,6 +730,23 @@ async def merge_before_completion(
         # caught precisely this).
         if await repo.pipeline_merge_recorded(db, task_id, pr_num):
             return True, "already delivered"
+
+        # #612: does the branch still stand where the reviewer approved it?
+        # #572 bound the verdict to a commit and closed the order "push, then
+        # approve". The opposite order — approve, THEN push — reached here
+        # untouched: the verdict stays current because its generation never
+        # changed, and this gate merges whatever the tip is now. Checked BEFORE
+        # the CI probe: there is no point asking about code that will not be
+        # delivered, and a refusal then costs one network call instead of two.
+        diverged, sha_note = await _approved_code_check(db, task, pr_num)
+        if diverged:
+            return False, diverged
+        if sha_note:
+            # Delivered WITHOUT the comparison — the reader must be able to
+            # tell that apart from "compared and matched". Written here rather
+            # than returned: the gate's (ok, reason) contract feeds a refusal
+            # message, and a success has no channel of its own (#605 AC-5).
+            await repo.add_task_update(db, task_id, "hub", "alert", sha_note)
 
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
