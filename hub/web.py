@@ -1474,17 +1474,15 @@ async def web_admin_users(request: Request):
 
 @router.get("/admin/agents", response_class=HTMLResponse)
 async def web_admin_agents(request: Request):
-    _require_admin_web(request)
-    from hub.services import admin as admin_svc
+    """The machine-identities page — one renderer shared with every POST (#613).
 
-    db = _db(request)
-    principals = await admin_svc.list_principals(db, kind="agent")
-    nav = await _admin_nav_counts(db)
-    return TEMPLATES.TemplateResponse(
-        request,
-        "admin/agents.html",
-        {"principals": principals, "active": "admin", **nav},
-    )
+    This used to assemble the context itself, a copy of ``_render_agents_page``.
+    Two renderers meant a change had to be made twice or the page disagreed with
+    itself: the first fix here left service identities visible after an edit and
+    invisible on load.
+    """
+    _require_admin_web(request)
+    return await _render_agents_page(request)
 
 
 @router.get("/admin/roles", response_class=HTMLResponse)
@@ -1627,12 +1625,24 @@ async def _render_agents_page(
     from hub.services import admin as admin_svc
 
     db = _db(request)
-    principals = await admin_svc.list_principals(db, kind="agent")
+    # Machine identities of BOTH kinds (#613). Filtering kind='agent' made every
+    # `service` principal invisible outside the keys page — and `service` is what
+    # a CI reporter is (#546), so an identity could be created through the API
+    # and then never administered again. Two calls rather than a new query: the
+    # service layer filters by a single kind and nothing here needs more.
+    principals = sorted(
+        [
+            *await admin_svc.list_principals(db, kind="agent"),
+            *await admin_svc.list_principals(db, kind="service"),
+        ],
+        key=lambda p: p["id"],
+    )
+    roles = await admin_svc.list_roles(db)
     nav = await _admin_nav_counts(db)
     resp = TEMPLATES.TemplateResponse(
         request,
         "admin/agents.html",
-        {"principals": principals, "active": "admin", **nav},
+        {"principals": principals, "roles": roles, "active": "admin", **nav},
     )
     if flash_msg:
         resp.headers.update(_flash_headers(flash_msg, flash_level))
@@ -1867,6 +1877,8 @@ async def web_admin_create_agent(
     username: str = Form(...),
     display_name: str = Form(""),
     notes: str = Form(""),
+    role: str = Form("agent"),
+    kind: str = Form("agent"),
 ):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
@@ -1874,13 +1886,18 @@ async def web_admin_create_agent(
     db = _db(request)
     actor_id = _admin_actor_id(request)
     try:
+        # #613: the role comes from the form, defaulting to `agent` so an admin
+        # who chooses nothing gets exactly the previous behaviour. Hardcoding it
+        # meant every identity created here was an `agent` — the one role that
+        # deliberately lacks tasks.ci_report (#546), so the narrow role existed
+        # and could not be granted.
         principal = await admin_svc.create_principal(
             db,
-            kind="agent",
+            kind=kind.strip() or "agent",
             username=username.strip(),
             display_name=display_name.strip(),
             notes=notes.strip(),
-            role_slug="agent",
+            role_slug=role.strip() or "agent",
             created_by=actor_id,
         )
         await admin_svc.write_audit(
@@ -1895,6 +1912,57 @@ async def web_admin_create_agent(
             request, flash_msg=f"Agent '{username}' created successfully"
         )
     except Exception as exc:
+        return await _render_agents_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
+
+
+@router.post("/admin/agents/{principal_id}/edit-roles", response_class=HTMLResponse)
+async def web_admin_edit_agent_roles(principal_id: int, request: Request):
+    """Change a machine identity's roles from the page where it is visible (#613).
+
+    Deliberately a separate handler from the users one rather than a shared
+    route: htmx swaps by ``hx-select``, so a response carrying the users table
+    would silently replace the agents table with a list of humans. The
+    assignment itself stays in ``admin_svc.set_principal_roles`` — a second copy
+    of that logic would be a second place for the last-admin guard to be
+    forgotten.
+    """
+    _require_admin_web(request)
+    from hub.services import admin as admin_svc
+
+    db = _db(request)
+    actor_id = _admin_actor_id(request)
+    form = await request.form()
+    selected_roles = form.getlist("roles")
+    if not selected_roles:
+        return await _render_agents_page(
+            request, flash_msg="At least one role must be selected", flash_level="error"
+        )
+    try:
+        new_slugs = await admin_svc.set_principal_roles(
+            db, principal_id, list(selected_roles), granted_by=actor_id
+        )
+        p = await admin_svc.get_principal(db, principal_id)
+        uname = p["username"] if p else f"#{principal_id}"
+        await admin_svc.write_audit(
+            db,
+            actor_id=actor_id,
+            action="set_roles",
+            target_type="principal",
+            target_id=str(principal_id),
+            summary=f"Set roles for {uname!r}: {', '.join(new_slugs)}",
+        )
+        return await _render_agents_page(
+            request, flash_msg=f"Roles updated for '{uname}'"
+        )
+    except admin_svc.LastAdminError:
+        return await _render_agents_page(
+            request,
+            flash_msg="Cannot remove admin role from the last active admin",
+            flash_level="error",
+        )
+    except ValueError as exc:
         return await _render_agents_page(
             request, flash_msg=str(exc), flash_level="error"
         )

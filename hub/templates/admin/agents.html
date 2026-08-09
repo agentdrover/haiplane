@@ -2,10 +2,10 @@
 {% set admin_page = "agents" %}
 {% block title %}Agents — Admin — OpenClaw Hub{% endblock %}
 {% block admin_content %}
-<h1>AI Agents</h1>
+<h1>Machine Identities</h1>
 
 <details class="admin-form-wrap">
-    <summary>Create Agent</summary>
+    <summary>Create Machine Identity</summary>
     <form class="admin-form"
           hx-post="/admin/agents/create"
           hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML">
@@ -21,6 +21,21 @@
             <label for="ca-notes">Notes</label>
             <input id="ca-notes" name="notes" type="text" placeholder="Optional notes">
         </div>
+        <div>
+            <label for="ca-kind">Kind</label>
+            <select id="ca-kind" name="kind">
+                <option value="agent" selected>agent</option>
+                <option value="service">service</option>
+            </select>
+        </div>
+        <div>
+            <label for="ca-role">Role</label>
+            <select id="ca-role" name="role">
+                {% for r in roles %}
+                <option value="{{ r.slug }}" {% if r.slug == 'agent' %}selected{% endif %}>{{ r.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
         <div class="admin-form-actions">
             <button type="submit" class="admin-btn admin-btn-primary">Create Agent</button>
         </div>
@@ -30,12 +45,13 @@
 <div id="agent-key-reveal"></div>
 
 <table class="admin-table" id="agents-table">
-    <thead><tr><th>ID</th><th>Username</th><th>Display Name</th><th>Roles</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
+    <thead><tr><th>ID</th><th>Username</th><th>Kind</th><th>Display Name</th><th>Roles</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
     <tbody>
     {% for p in principals %}
     <tr id="agent-row-{{ p.id }}">
         <td>{{ p.id }}</td>
         <td>{{ p.username }}</td>
+        <td>{{ p.kind }}</td>
         <td>{{ p.display_name }}</td>
         <td>{{ p.roles|join(', ') }}</td>
         <td><span class="badge badge-{{ p.status }}">{{ p.status }}</span></td>
@@ -55,12 +71,32 @@
                     hx-post="/admin/agents/{{ p.id }}/enable"
                     hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML">Enable</button>
             {% endif %}
+            <button class="admin-btn" onclick="document.getElementById('agent-roles-form-{{ p.id }}').toggleAttribute('open')">Edit Roles</button>
+        </td>
+    </tr>
+    <tr id="agent-roles-row-{{ p.id }}">
+        <td colspan="8">
+            <details id="agent-roles-form-{{ p.id }}">
+                <summary class="sr-only">Edit roles</summary>
+                <form class="admin-roles-inline"
+                      hx-post="/admin/agents/{{ p.id }}/edit-roles"
+                      hx-target="#agents-table" hx-select="#agents-table" hx-swap="outerHTML">
+                    {% for r in roles %}
+                    <label class="admin-checkbox">
+                        <input type="checkbox" name="roles" value="{{ r.slug }}"
+                               {% if r.slug in p.roles %}checked{% endif %}>
+                        {{ r.name }}
+                    </label>
+                    {% endfor %}
+                    <button type="submit" class="admin-btn admin-btn-primary">Save Roles</button>
+                </form>
+            </details>
         </td>
     </tr>
     {% endfor %}
     </tbody>
 </table>
 {% if not principals %}
-<p>No agents found.</p>
+<p>No machine identities found.</p>
 {% endif %}
 {% endblock %}
