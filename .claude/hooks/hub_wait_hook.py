@@ -12,6 +12,9 @@
     отличаются, печатает событие и выходит с кодом 2 → Claude Code будит агента;
   * по таймауту MAX_WAIT_SEC выходит тихо (exit 0), файл ожиданий остаётся —
     следующий Stop или сообщение пользователя перезапустит ожидание.
+- Доставка «хотя бы раз»: сработавшее ожидание остаётся в файле с пометкой
+  fired_at/refire_count — потерянное пробуждение переоткроется следующим Stop
+  (до 3 повторов). Проснувшийся агент снимает ожидание сам: удаляет файл.
 - Лок-файл защищает от параллельных поллеров при повторных Stop.
 
 Токен и URL берутся из ~/.claude.json (mcpServers.openclaw-hub) — как у MCP.
@@ -194,8 +197,26 @@ def main() -> int:
                 else:
                     remaining.append(wait)
             if fired:
-                if remaining:
-                    state["waits"] = remaining
+                # Доставка «хотя бы раз», не «ровно раз»: сработавшее ожидание
+                # НЕ удаляем, а помечаем fired_at/refire_count и оставляем в
+                # файле. Пробуждение (exit 2 + asyncRewake) может потеряться —
+                # слушатель конкретного Stop живёт в приложении, и если его
+                # уже нет (перезапуск, осиротевший поллер), событие раньше
+                # стиралось вместе с файлом навсегда (инцидент #607, 11:41Z
+                # 03.08.2026). Теперь следующий Stop переоткроет ожидание и
+                # разбудит повторно; проснувшийся агент обязан снять ожидание
+                # сам (удалить файл или переписать waits). Кап refire_count
+                # страхует от вечного цикла, если агент забыл прибраться.
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                give_up = []
+                for wait, obj, diff in fired:
+                    wait.setdefault("fired_at", stamp)
+                    wait["refire_count"] = int(wait.get("refire_count") or 0) + 1
+                    if wait["refire_count"] > 3:
+                        give_up.append(wait)
+                kept = [w for w in waits if w not in give_up]
+                if kept:
+                    state["waits"] = kept
                     STATE_FILE.write_text(
                         json.dumps(state, ensure_ascii=False, indent=2)
                     )
@@ -212,10 +233,20 @@ def main() -> int:
                         )
                     else:
                         subject = f"задача #{wait['task_id']} «{obj.get('title', '')}»"
+                    retries = int(wait.get("refire_count") or 1)
+                    note = (
+                        ""
+                        if retries <= 1
+                        else f" (повтор {retries}: прошлое пробуждение могло не дойти)"
+                    )
                     lines.append(
                         f"- {subject}: {parts}. "
-                        f"Ожидание было: {wait.get('reason', '—')}."
+                        f"Ожидание было: {wait.get('reason', '—')}.{note}"
                     )
+                lines.append(
+                    "Обработав событие, сними ожидание: удали .claude/hub-wait.json "
+                    "(или перепиши waits) — иначе следующий Stop разбудит повторно."
+                )
                 msg = "\n".join(lines)
                 print(msg)
                 print(msg, file=sys.stderr)
