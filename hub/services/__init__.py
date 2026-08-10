@@ -2,6 +2,7 @@
 
 from hub.services.dashboard import (
     get_dashboard_data,
+    get_epic_board,
     get_epics_enriched,
     get_inbox_data,
     list_activity,
@@ -159,6 +160,7 @@ __all__ = [
     "force_complete_task",
     "get_breadcrumb_str",
     "get_dashboard_data",
+    "get_epic_board",
     "get_epics_enriched",
     "get_inbox_data",
     "list_activity",

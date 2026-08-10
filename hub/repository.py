@@ -34,17 +34,11 @@ _FINAL_PLACEHOLDERS = ",".join("?" * len(FINAL_STATUS_VALUES))
 # NOT part of this: callers control that through include_archived.
 ORPHAN_CONDITION = "parent_id IS NULL AND task_type != 'epic'"
 
-# Built once, from the placeholders above: the only thing interpolated is a run
-# of "?" — the status values themselves travel as parameters.
-_LIVE_EPICS_SQL = """
-    WITH RECURSIVE sub(root, id) AS (
-        SELECT id, id FROM tasks WHERE task_type='epic' AND archived=0
-        UNION ALL
-        SELECT sub.root, t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-    )
-    SELECT * FROM tasks e
-    WHERE e.task_type='epic' AND e.archived=0
-      AND (
+# Whether an epic is alive. Written once and used by BOTH the live list and the
+# done list, so the two are exact complements: spell the condition twice and an
+# epic can fall out of both at once, which is the silent loss #569 refused when
+# it dropped its LIMIT.
+_EPIC_IS_LIVE = """
         EXISTS (
             SELECT 1 FROM sub JOIN tasks c ON c.id = sub.id
             WHERE sub.root = e.id AND sub.id != sub.root
@@ -55,8 +49,57 @@ _LIVE_EPICS_SQL = """
             NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_id = e.id)
             AND e.status NOT IN ({finals})
         )
-      )
-    ORDER BY e.position ASC, e.id DESC
+"""
+
+_SUBTREE_CTE = """
+    WITH RECURSIVE sub(root, id) AS (
+        SELECT id, id FROM tasks WHERE task_type='epic' AND archived=0
+        UNION ALL
+        SELECT sub.root, t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+    )"""
+
+# When work last HAPPENED in this epic's subtree — from the feed, not from
+# ``updated_at`` (#570).
+#
+# ``updated_at`` is bumped by any write at all (#616 spelled that out), so it
+# answers "when was this row last touched". Checked against production: ordering
+# by it floated #182, #192, #209, #371 and #394 to the top — the five epics whose
+# PROJECT had just been reassigned. An administrative touch would have looked
+# exactly like work.
+#
+# Falling back to ``updated_at`` was the first design and a TEST KILLED IT: with
+# a per-row COALESCE the epic's own touch entered the maximum, so a rename
+# outranked a week of real work — the exact noise this key exists to avoid. An
+# epic with no feed entry anywhere in its subtree has no activity, full stop; it
+# sorts last (SQLite ranks NULL below every value, so DESC puts it at the end)
+# and stays in the list, which is the honest answer rather than a borrowed date.
+_EPIC_ACTIVITY = """
+        SELECT MAX(u.created_at)
+        FROM sub JOIN task_updates u ON u.task_id = sub.id
+        WHERE sub.root = e.id
+"""
+
+# Built once, from the placeholders above: the only thing interpolated is a run
+# of "?" — the status values themselves travel as parameters.
+_LIVE_EPICS_SQL = f"""
+    {_SUBTREE_CTE}
+    SELECT e.*, ({_EPIC_ACTIVITY}) AS last_activity_at
+    FROM tasks e
+    WHERE e.task_type='epic' AND e.archived=0
+      AND ({_EPIC_IS_LIVE})
+    ORDER BY last_activity_at DESC, e.id DESC
+""".format(finals=_FINAL_PLACEHOLDERS)  # nosec B608 - placeholders only, values are params
+
+# The complement, from the same condition: an epic is here exactly when it is not
+# in the live list. Done epics were not collapsed before this — they were gone
+# (#569 excluded them), so the count is what returns access to them.
+_DONE_EPICS_SQL = f"""
+    {_SUBTREE_CTE}
+    SELECT e.*, ({_EPIC_ACTIVITY}) AS last_activity_at
+    FROM tasks e
+    WHERE e.task_type='epic' AND e.archived=0
+      AND NOT ({_EPIC_IS_LIVE})
+    ORDER BY last_activity_at DESC, e.id DESC
 """.format(finals=_FINAL_PLACEHOLDERS)  # nosec B608 - placeholders only, values are params
 
 _LIVE_ORPHANS_COUNT_SQL = (
@@ -918,8 +961,28 @@ async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     No LIMIT: silently dropping a live epic is exactly the failure this
     replaces (#569 AC-4). The list is bounded by reality — an epic leaves it
     by finishing, not by being the 21st row.
+
+    Ordered by when work last happened in the subtree (#570), newest first —
+    not by ``position``, which is 0 on every epic, and not by id, which ranks
+    by age of creation and put a June-dead epic above yesterday's work.
     """
     return await db.execute_fetchall(_LIVE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
+
+
+async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Epics whose work is finished — the exact complement of the live list (#570).
+
+    Not merely "not shown": before this they were unreachable from the epic
+    views, because #569 filtered them out and nothing counted them. A collapsed
+    block with a number gives the access back without putting 14 finished epics
+    back into the working list.
+
+    Complement by construction, sharing ``_EPIC_IS_LIVE`` with
+    ``list_live_epics``: two hand-written conditions would eventually disagree,
+    and an epic matching neither would vanish from both lists — the silent loss
+    #569 refused when it dropped its LIMIT.
+    """
+    return await db.execute_fetchall(_DONE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
 
 
 async def count_live_orphan_tasks(db: aiosqlite.Connection) -> int:

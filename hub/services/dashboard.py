@@ -18,6 +18,7 @@ from hub.models import (
     DashboardData,
     TaskChildSummary,
     TaskProgress,
+    TaskProjectRef,
     TaskView,
 )
 from hub.services.lifecycle import row_to_task
@@ -168,12 +169,27 @@ async def get_inbox_data(
     }
 
 
-async def get_epics_enriched(db: aiosqlite.Connection) -> list[TaskView]:
-    """Get active epics with children and progress."""
-    rows = await repo.list_live_epics(db)
+async def _enrich_epics(
+    db: aiosqlite.Connection,
+    rows: list[Any],
+    project_slugs: dict[int, str] | None = None,
+) -> list[TaskView]:
+    """Attach children, progress and the project ref to epic rows, in order.
+
+    ``row_to_task`` does NOT fill ``project`` — only three call sites do, by
+    hand (app.py and lifecycle.py). Grouping by ``tv.project`` without setting
+    it here would have put every epic into "no project" while looking like it
+    worked: the mechanism-right-path-not-wired trap, caught by checking the
+    value instead of assuming it (#570).
+    """
     epics: list[TaskView] = []
     for r in rows:
         tv = row_to_task(r)
+        project_id = dict(r).get("project_id")
+        if project_id is not None and project_slugs:
+            slug = project_slugs.get(int(project_id))
+            if slug:
+                tv.project = TaskProjectRef(id=int(project_id), slug=slug)
         children = await db_module.get_children(db, tv.id)
         if children:
             tv.children = [
@@ -190,6 +206,64 @@ async def get_epics_enriched(db: aiosqlite.Connection) -> list[TaskView]:
             tv.progress = TaskProgress(**progress_data)
         epics.append(tv)
     return epics
+
+
+async def get_epics_enriched(db: aiosqlite.Connection) -> list[TaskView]:
+    """Get active epics with children and progress."""
+    return await _enrich_epics(db, await repo.list_live_epics(db))
+
+
+# A project with no slug of its own: an epic may carry project_id = NULL (the
+# column has no NOT NULL constraint), and such an epic must land in a NAMED
+# group rather than drop out of a grouped view (#570 AC-1).
+UNASSIGNED_PROJECT = "без проекта"
+
+
+async def get_epic_board(
+    db: aiosqlite.Connection, allowed: set[int] | None = None
+) -> dict[str, Any]:
+    """Live epics grouped by project, plus the finished ones as a count (#570).
+
+    ``allowed`` is the project scope the dashboard already applies to its other
+    lists. It is a parameter rather than an afterthought because the first
+    version of this function ignored it, and an epic from another project leaked
+    onto a project-filtered page — caught by an existing test, not by me.
+
+    Grouped HERE and not in the template: two views render this list — the
+    dashboard and the projects page — and a grouping written in Jinja would be
+    rewritten differently by the second one. That is the "same rule, two
+    copies" defect this hub keeps paying for (#609, #614, #616, #571).
+
+    Order inside a group is the order the query returned: last activity in the
+    subtree, newest first. Groups themselves are ordered by their freshest
+    epic, so the product where something is happening is on top.
+    """
+    slugs = {int(p["id"]): p["slug"] for p in await repo.list_projects(db)}
+    live_rows = await repo.list_live_epics(db)
+    done_rows = await repo.list_done_epics(db)
+    if allowed is not None:
+        live_rows = [r for r in live_rows if r["id"] in allowed]
+        done_rows = [r for r in done_rows if r["id"] in allowed]
+    live = await _enrich_epics(db, live_rows, slugs)
+
+    groups: dict[str, list[TaskView]] = {}
+    for tv in live:
+        ref = tv.project
+        groups.setdefault(ref.slug if ref else UNASSIGNED_PROJECT, []).append(tv)
+
+    return {
+        # dict preserves insertion order, and the epics arrive freshest-first,
+        # so a group's place is decided by its freshest epic — the product where
+        # something is happening ends up on top without a second sort.
+        "groups": [{"project": slug, "epics": items} for slug, items in groups.items()],
+        "live_total": len(live),
+        # The finished ones are counted, not hidden: a collapsed block that lies
+        # about its size is worse than no block. #571 shipped exactly that
+        # mismatch this morning — 18 promised, 51 behind the link — so the count
+        # and the contents come from one query here.
+        "done": await _enrich_epics(db, done_rows, slugs),
+        "done_total": len(done_rows),
+    }
 
 
 async def list_tasks(

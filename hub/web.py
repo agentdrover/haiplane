@@ -444,8 +444,12 @@ async def web_partial_epics(request: Request):
         "partials/epic_list.html",
         # #571: the count travels WITH the epic list, because a task outside
         # every epic is invisible in exactly this view.
+        # #570: and the list arrives grouped by project with the finished epics
+        # as a counted block — computed server-side, so this fragment and the
+        # dashboard cannot disagree about either.
         {
             "epics": epics,
+            "board": await services.get_epic_board(_db(request)),
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
         },
     )
@@ -591,6 +595,9 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         ):
             inbox[key] = _filter_by_ids(inbox[key], allowed)
     epics = await services.get_epics_enriched(db)
+    # The same project scope the other dashboard lists get — passed in, because
+    # a board computed around the filter shows another project's epics (#570).
+    board = await services.get_epic_board(db, allowed)
     if allowed is not None:
         epics = [
             e
@@ -611,6 +618,7 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         "data": data,
         "epics_enriched": epics,
         "epics": epics,
+        "board": board,
         "inbox_total": inbox_total,
         "dispatch_available": _dispatch_available(),
         "projects_list": projects_list,

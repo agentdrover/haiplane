@@ -1,17 +1,4 @@
-{% if orphan_live %}
-<article class="epic-card">
-    <div class="epic-header">
-        {# #571: named "живых", because that is exactly what is counted — a
-           label that promised "all" while counting live ones would be the
-           same lie as a docstring listing fields the code has not got. #}
-        <a href="/tasks?no_epic=1" class="epic-title">Без эпика: {{ orphan_live }} живых</a>
-        <span class="badge">вне иерархии</span>
-    </div>
-    <p class="muted small">Эти задачи не принадлежат ни одному эпику, а значит и ни одному проекту — проект живёт на эпике.</p>
-</article>
-{% endif %}
-{% if epics %}
-{% for e in epics %}
+{% macro epic_card(e) %}
 <article class="epic-card">
     <div class="epic-header">
         <a href="/tasks/{{ e.id }}" class="epic-title">#{{ e.id }} {{ e.title }}</a>
@@ -43,10 +30,40 @@
     <div class="epic-empty">No children yet</div>
     {% endif %}
 </article>
+{% endmacro %}
+{% if orphan_live %}
+<article class="epic-card">
+    <div class="epic-header">
+        {# #571: named "живых", because that is exactly what is counted — a
+           label promising "all" while counting live ones would be the same lie
+           as a docstring listing fields the code has not got. #}
+        <a href="/tasks?no_epic=1" class="epic-title">Без эпика: {{ orphan_live }} живых</a>
+        <span class="badge">вне иерархии</span>
+    </div>
+    <p class="muted small">Эти задачи не принадлежат ни одному эпику, а значит и ни одному проекту — проект живёт на эпике.</p>
+</article>
+{% endif %}
+{% if board and board.groups %}
+{# #570: the groups arrive already ordered — freshest subtree activity first,
+   inside a group and between groups. Sorting here too would be a second rule
+   for one thing, and the copies would drift apart. #}
+{% for group in board.groups %}
+<h3 class="epic-group-title">{{ group.project }} <span class="muted small">({{ group.epics|length }})</span></h3>
+{% for e in group.epics %}{{ epic_card(e) }}{% endfor %}
 {% endfor %}
 {% else %}
 <div class="empty empty-sm">
     <div class="empty-text">No active epics</div>
     <div class="empty-hint">Create one with the form below</div>
 </div>
+{% endif %}
+{% if board and board.done_total %}
+<details class="epic-done">
+    {# Collapsed, NOT hidden: until now finished epics were filtered out
+       entirely (#569), so nothing led back to them. The number comes from the
+       same query that fills the block — this morning #571 shipped a counter
+       that disagreed with its own link, and that is not worth repeating. #}
+    <summary>Доделанные эпики: {{ board.done_total }}</summary>
+    {% for e in board.done %}{{ epic_card(e) }}{% endfor %}
+</details>
 {% endif %}
