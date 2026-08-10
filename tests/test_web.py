@@ -2144,3 +2144,104 @@ async def test_the_roles_page_marks_permissions_that_gate_nothing(
             f"{real} does gate something — marking it would be a new lie"
         )
     assert "не проверяются кодом" in page.text, "explain the mark, not just show it"
+
+
+# ---------------------------------------------------------------------------
+# Tasks outside every epic are named, not just findable (#571)
+# ---------------------------------------------------------------------------
+
+
+async def _orphan(client: AsyncClient, title: str, status: str | None = None) -> int:
+    """A task with no parent — which is what POST /api/tasks makes by default."""
+    task_id = (await client.post("/api/tasks", json={"title": title})).json()["id"]
+    if status:
+        await client.post(f"/api/tasks/{task_id}/status", json={"status": status})
+    return task_id
+
+
+async def test_tasks_outside_any_epic_are_shown_as_their_own_group(client: AsyncClient):
+    # AC-1 (#571): the epic-shaped views are built on list_live_epics, so a task
+    # with no parent appears in none of them. It IS reachable in the flat list —
+    # the original statement claiming "invisible everywhere" was wrong — but
+    # nothing said HOW MANY there were. On production that was 51 rows.
+    await _orphan(client, "Orphan one")
+    await _orphan(client, "Orphan two")
+
+    for path in ("/partials/epics", "/projects"):
+        page = await client.get(path)
+        assert page.status_code == 200, page.text
+        assert "Без эпика" in page.text, f"{path} must name the group"
+        assert "no_epic=1" in page.text, f"{path} must link to the filtered list"
+
+    # And the number must be the count, not a placeholder.
+    assert "2 живых" in (await client.get("/partials/epics")).text
+
+
+async def test_orphan_group_counts_live_tasks_only(client: AsyncClient, db):
+    # AC-2 (#571): archived and terminal rows are not live work. `failed` is
+    # terminal in FINAL_STATUSES, and #569 shipped a criterion that forgot it —
+    # spec review caught that one, so it is asserted here rather than trusted.
+    live = await _orphan(client, "Still open")
+    done = await _orphan(client, "Finished")
+    failed = await _orphan(client, "Broken")
+    archived = await _orphan(client, "Put away")
+    await db.execute("UPDATE tasks SET status='completed' WHERE id=?", (done,))
+    await db.execute("UPDATE tasks SET status='failed' WHERE id=?", (failed,))
+    await db.execute("UPDATE tasks SET archived=1 WHERE id=?", (archived,))
+    await db.commit()
+
+    from hub import repository as repo
+
+    assert await repo.count_live_orphan_tasks(db) == 1, (
+        "only the open task counts: completed, failed and archived are not live"
+    )
+    assert "1 живых" in (await client.get("/partials/epics")).text
+
+    # An epic with no parent is not an orphan TASK — it is the top of a tree.
+    epic = (
+        await client.post("/api/tasks", json={"title": "An epic", "task_type": "epic"})
+    ).json()["id"]
+    assert epic
+    assert await repo.count_live_orphan_tasks(db) == 1, "epics are not orphans"
+    assert live
+
+
+async def test_orphan_filter_is_a_separate_parameter(client: AsyncClient, db):
+    # AC-3 (#571): the link needed a filter that did not exist. Overloading
+    # parent_id was the tempting route and it would have broken
+    # test_tasks_list_filters_ignore_blank_parent_id, which pins that a blank
+    # parent_id means "no filter" — and with it every link that passes an empty
+    # box. So the mode arrives as its own flag.
+    epic = (
+        await client.post(
+            "/api/tasks", json={"title": "Parent epic", "task_type": "epic"}
+        )
+    ).json()["id"]
+    child = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "Child of epic", "task_type": "feature", "parent_id": epic},
+        )
+    ).json()["id"]
+    orphan = await _orphan(client, "No parent at all")
+
+    filtered = await client.get("/tasks/list", params={"no_epic": "1"})
+    assert filtered.status_code == 200, filtered.text
+    assert f"/tasks/{orphan}" in filtered.text
+    assert f"/tasks/{child}" not in filtered.text, (
+        "a task under an epic is not an orphan"
+    )
+    assert f"/tasks/{epic}" not in filtered.text, "the epic itself is not an orphan"
+
+    # The old contract is untouched: blank parent_id still disables filtering,
+    # so both rows come back.
+    unfiltered = await client.get("/tasks/list", params={"parent_id": ""})
+    assert f"/tasks/{orphan}" in unfiltered.text
+    assert f"/tasks/{child}" in unfiltered.text
+
+    # And the full page accepts the same flag, not just the HTMX fragment —
+    # the link in the group points at /tasks, so a flag wired into only one of
+    # the two routes would give a link that quietly ignores it.
+    page = await client.get("/tasks", params={"no_epic": "1"})
+    assert page.status_code == 200
+    assert f"/tasks/{child}" not in page.text

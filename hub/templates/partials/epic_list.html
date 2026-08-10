@@ -1,3 +1,15 @@
+{% if orphan_live %}
+<article class="epic-card">
+    <div class="epic-header">
+        {# #571: named "живых", because that is exactly what is counted — a
+           label that promised "all" while counting live ones would be the
+           same lie as a docstring listing fields the code has not got. #}
+        <a href="/tasks?no_epic=1" class="epic-title">Без эпика: {{ orphan_live }} живых</a>
+        <span class="badge">вне иерархии</span>
+    </div>
+    <p class="muted small">Эти задачи не принадлежат ни одному эпику, а значит и ни одному проекту — проект живёт на эпике.</p>
+</article>
+{% endif %}
 {% if epics %}
 {% for e in epics %}
 <article class="epic-card">
