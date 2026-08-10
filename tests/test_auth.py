@@ -637,3 +637,125 @@ def test_password_complexity_accepts_valid():
         password=VALID_ADMIN_PASSWORD,
     )
     assert b.password == VALID_ADMIN_PASSWORD
+
+
+# ---- a permission list that tells the truth about what it gates (#614) ----
+#
+# Handing a permission out in a role, showing it in the admin UI, and checking it
+# in code are three different things, and only the first two were visible. Nine
+# of eighteen permissions were consulted by nothing — so a role looked narrow
+# while its narrowness was decorative. Human gates were never open (they are held
+# by require_human_or_admin, _reject_agent_authored_source and the review gate),
+# but the list promised granularity that did not exist: in #613 the ci_runner
+# role was described to the owner as unable to do anything but report, and the CI
+# token could in fact file drafts, because tasks.create is asked by nobody.
+#
+# The classification lives in hub/db.py; these tests derive the real answer FROM
+# THE CODE, so the two cannot drift apart quietly.
+
+_SOURCE_FILES = ("hub/app.py", "hub/web.py", "hub/mcp_server.py", "hub/cli.py")
+# Permissions consulted without require_permission: config.py reads these two
+# directly to answer is_admin / is_human, and require_human_or_admin is built on
+# is_human. Listed explicitly because a regex over require_permission would
+# otherwise file tasks.human_gate as decorative — which would be wrong.
+_INDIRECT_SOURCES = {"hub/config.py": ("admin.read", "tasks.human_gate")}
+
+
+def _permissions_enforced_in_code() -> set[str]:
+    """Every permission the code actually consults, read from the source.
+
+    Parsed as text rather than introspected: the gates live in decorators and in
+    Depends(...) defaults, where inspect cannot see them.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    found: set[str] = set()
+    for name in _SOURCE_FILES:
+        text = (root / name).read_text()
+        found |= set(re.findall(r'require_permission\(\s*"([a-z._]+)"', text))
+    for name, perms in _INDIRECT_SOURCES.items():
+        text = (root / name).read_text()
+        for perm in perms:
+            if f'"{perm}"' in text:
+                found.add(perm)
+    return found
+
+
+def test_every_permission_is_classified_as_enforced_or_decorative():
+    # AC-1 (#614): the split covers the whole list, without overlap, and matches
+    # what the code does. Derived from source on purpose — two hand-written lists
+    # agreeing with each other and both wrong is exactly the defect being fixed.
+    from hub.db import (
+        ALL_PERMISSIONS,
+        DECLARED_ONLY_PERMISSIONS,
+        ENFORCED_PERMISSIONS,
+    )
+
+    declared = set(ALL_PERMISSIONS)
+    enforced = set(ENFORCED_PERMISSIONS)
+    decorative = set(DECLARED_ONLY_PERMISSIONS)
+
+    assert enforced | decorative == declared, (
+        "every declared permission must be classified: "
+        f"unclassified={sorted(declared - enforced - decorative)}, "
+        f"invented={sorted((enforced | decorative) - declared)}"
+    )
+    assert not (enforced & decorative), sorted(enforced & decorative)
+
+    in_code = _permissions_enforced_in_code()
+    assert in_code, "the parser found nothing — it would then agree with anything"
+    assert in_code == enforced, (
+        "the classification disagrees with the code: "
+        f"gating but called decorative={sorted(in_code - enforced)}, "
+        f"listed as enforced but gating nothing={sorted(enforced - in_code)}"
+    )
+
+
+def test_a_new_permission_must_be_classified():
+    # AC-2 (#614): a permission added to the list and to neither bucket has to
+    # fail loudly. Otherwise the classification rots the moment someone adds the
+    # nineteenth permission — which is how the original defect arrived.
+    from hub.db import DECLARED_ONLY_PERMISSIONS, ENFORCED_PERMISSIONS
+
+    declared = set(ALL_PERMISSIONS_WITH("tasks.brand_new"))
+    classified = set(ENFORCED_PERMISSIONS) | set(DECLARED_ONLY_PERMISSIONS)
+    assert declared - classified == {"tasks.brand_new"}, (
+        "the check must notice an unclassified permission, and name it"
+    )
+
+
+def ALL_PERMISSIONS_WITH(extra: str) -> tuple[str, ...]:
+    """The declared list plus one hypothetical permission (test helper)."""
+    from hub.db import ALL_PERMISSIONS
+
+    return (*ALL_PERMISSIONS, extra)
+
+
+def test_a_decorative_permission_that_starts_gating_fails_the_test():
+    # AC-3 (#614): the other direction, and the one that rots silently. If a
+    # permission listed as decorative appears in a gate, the label is stale — the
+    # same way #610's comment claimed for months that the score looked at
+    # mitigation while the code never did.
+    from hub.db import DECLARED_ONLY_PERMISSIONS
+
+    in_code = _permissions_enforced_in_code()
+    now_gating = in_code & set(DECLARED_ONLY_PERMISSIONS)
+    assert not now_gating, (
+        "these are marked as gating nothing but appear in a permission check — "
+        f"move them to ENFORCED_PERMISSIONS: {sorted(now_gating)}"
+    )
+
+
+def test_the_classification_names_the_permissions_from_the_incident():
+    # The two facts that made this task: tasks.create gates nothing (so the CI
+    # token could file drafts, contrary to what #613's report claimed), and
+    # tasks.ci_report does gate (the intake added in #546 is real).
+    from hub.db import DECLARED_ONLY_PERMISSIONS, ENFORCED_PERMISSIONS
+
+    assert "tasks.create" in DECLARED_ONLY_PERMISSIONS
+    assert "tasks.ci_report" in ENFORCED_PERMISSIONS
+    assert "tasks.human_gate" in ENFORCED_PERMISSIONS, (
+        "it gates through is_human, one hop away — decorative would be wrong"
+    )

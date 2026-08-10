@@ -1187,6 +1187,12 @@ async def pair_start_task(
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     # Tell the agent where its isolated worktree is and the active mode (#530).
     tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
+    # #615: the statement may be older than the work that invalidated it. Told
+    # HERE, on the server, so CLI and REST callers see it too — computing it in
+    # the MCP tool would leave every other client blind.
+    from hub.services.statement_freshness import statement_freshness
+
+    tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     return tv
 
 

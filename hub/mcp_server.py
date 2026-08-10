@@ -1111,6 +1111,15 @@ async def hub_pair_start(
     # Worktree isolation (#530): the mode/path live on the pair-start response
     # (not the DB re-read), so read them from `result` and tell the agent where
     # its isolated tree is — otherwise it would keep working in the shared clone.
+    # #615: print what the server computed about the statement's age. Rendering
+    # only — the computation is server-side so CLI and REST see it too.
+    freshness = (result or {}).get("statement_freshness")
+    if freshness:
+        from hub.services.statement_freshness import render_freshness
+
+        block = render_freshness(freshness)
+        if block:
+            message += f"\n{block}"
     workspace_mode = (result or {}).get("workspace_mode") or "legacy"
     worktree_path = (result or {}).get("worktree_path") or ""
     if workspace_mode == "worktree" and worktree_path:

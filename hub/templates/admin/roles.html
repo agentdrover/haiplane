@@ -16,7 +16,13 @@
         <td>{{ r.description }}</td>
         <td class="admin-perms-badges">
             {% for perm in r.permissions %}
-            {% if perm.startswith('admin.') %}
+            {% set decorative = perm in declared_only_permissions %}
+            {# #614: a permission nothing checks must not look like a limit.
+               Reading a role's narrowness off this list is how a false claim
+               about the CI token reached the owner in #613. #}
+            {% if decorative %}
+            <span class="perm-badge perm-none" title="ничего не гатит: это право нигде не проверяется">{{ perm }} ⚠</span>
+            {% elif perm.startswith('admin.') %}
             <span class="perm-badge perm-admin">{{ perm }}</span>
             {% elif perm.startswith('integrations.') %}
             <span class="perm-badge perm-integrations">{{ perm }}</span>
@@ -32,6 +38,12 @@
     {% endfor %}
     </tbody>
 </table>
+<p class="u-text-muted">
+    Права с меткой ⚠ сегодня не проверяются кодом (#614): выдать их можно, но
+    ничего не ограничивают. Человеческие гейты держатся отдельными проверками
+    роли и личности, а не этими строками — не выводите из состава роли, что
+    токен чего-то не может.
+</p>
 
 <h2>Permission Matrix</h2>
 <div class="admin-matrix-wrap">

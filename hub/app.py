@@ -1400,6 +1400,12 @@ async def api_review_brief(
         head_sha=task_view.submission_sha or "",
     )
 
+    # #615: the statement the reviewer is judging may predate the work that
+    # invalidated it. Same computation as pair-start, one source.
+    from hub.services.statement_freshness import statement_freshness as _freshness
+
+    freshness = await _freshness(db, dict(await repo.get_task(db, task_id)))
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1410,6 +1416,7 @@ async def api_review_brief(
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
         ci_run_report=ci_run_report,
+        statement_freshness=freshness,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
         out_of_scope_for_review=task_view.out_of_scope_for_review,
