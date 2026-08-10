@@ -2564,3 +2564,104 @@ async def test_project_card_with_no_live_work_says_so(client: AsyncClient, db):
     assert page.status_code == 200
     assert "Quiet Project" in page.text
     assert "Живой работы нет" in page.text
+
+
+# ---------------------------------------------------------------------------
+# Admin fields live with their project, and the second list is gone (#568)
+# ---------------------------------------------------------------------------
+
+
+async def test_projects_page_keeps_every_admin_action_available(
+    client: AsyncClient, db
+):
+    # AC-1 (#568). The statement said "all five actions available"; spec review
+    # showed that reading it literally would STRIP the guards, because the
+    # template hides provision without a repo, activate outside pending, and
+    # archive for `default`. So the criterion is "each action available under its
+    # OWN current conditions" — and the proof is that six existing tests pass
+    # untouched. This test pins the guards themselves.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    with_repo = await repo_module.create_project(
+        db, slug="has-repo", name="Has Repo", repo_name="owner/repo"
+    )
+    no_repo = await repo_module.create_project(db, slug="no-repo", name="No Repo")
+    await db.execute("UPDATE projects SET status='pending' WHERE id=?", (no_repo,))
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+
+    assert f"/projects/{with_repo}/web-provision" in page, (
+        "repo present → provision offered"
+    )
+    assert f"/projects/{no_repo}/web-provision" not in page, (
+        "no repo → provision must stay hidden (test_web_provision_hidden_without_repo)"
+    )
+    assert f"/projects/{no_repo}/web-activate" in page, "pending → activate offered"
+    assert f"/projects/{with_repo}/web-activate" not in page, "active → no activate"
+    assert f"/projects/{no_repo}/web-archive" in page
+    assert "/projects/web-create" in page, "creating a project is not per-project"
+    assert f"/projects/{with_repo}/web-edit" in page
+
+    # `default` must never offer archive: the routing fallback cannot be removed.
+    default_id = (await repo_module.get_project_by_slug(db, "default"))["id"]
+    assert f"/projects/{default_id}/web-archive" not in page
+
+
+async def test_project_card_surfaces_pending_and_provision_error(
+    client: AsyncClient, db
+):
+    # AC-2 (#568): a broken workspace is news, not administration. Behind the
+    # disclosure it would be one unopened click away from invisible — the same
+    # reasoning as #615: silence must not pass for "fine".
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    broken = await repo_module.create_project(
+        db, slug="broken-ws", name="Broken WS", repo_name="owner/x"
+    )
+    await db.execute(
+        "UPDATE projects SET provision_status='error', provision_detail='clone failed' "
+        "WHERE id=?",
+        (broken,),
+    )
+    pending = await repo_module.create_project(db, slug="waiting", name="Waiting")
+    await db.execute("UPDATE projects SET status='pending' WHERE id=?", (pending,))
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    header_of_broken = page.split("Broken WS", 1)[1].split("</div>", 1)[0]
+    assert "ws" in header_of_broken and "error" in header_of_broken, (
+        "the failure must sit in the card header, above the collapsed block"
+    )
+    header_of_pending = page.split("Waiting", 1)[1].split("</div>", 1)[0]
+    assert "pending" in header_of_pending
+
+
+async def test_projects_page_lists_each_project_once(client: AsyncClient, db):
+    # AC-3 (#568): the actual defect. Until now /projects showed every project
+    # TWICE — cards on top, the routing table below — which is why the page read
+    # like a draft with the old version left in. Removing the table must not lose
+    # a project, and an archived one is the case that would go first.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    kept = await repo_module.create_project(db, slug="kept", name="Kept Project")
+    gone = await repo_module.create_project(db, slug="retired", name="Retired Project")
+    await db.execute("UPDATE projects SET archived=1 WHERE id=?", (gone,))
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    # Match the ARTICLE, not the prefix: 'class="project-card' also hits
+    # project-cards, project-card-numbers and project-card-waiting — my first
+    # version of this assertion counted 10 for three projects.
+    assert page.count('<article class="project-card') == 3, (
+        "one card per project (default, kept, retired) and no second listing"
+    )
+    assert "<table" not in page, "the duplicate routing table is gone"
+    assert "Retired Project" in page, "an archived project must still be reachable"
+    assert kept and gone
