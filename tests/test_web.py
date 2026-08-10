@@ -2245,3 +2245,175 @@ async def test_orphan_filter_is_a_separate_parameter(client: AsyncClient, db):
     page = await client.get("/tasks", params={"no_epic": "1"})
     assert page.status_code == 200
     assert f"/tasks/{child}" not in page.text
+
+
+# ---------------------------------------------------------------------------
+# Epics grouped by project, ordered by real activity, finished ones collapsed (#570)
+# ---------------------------------------------------------------------------
+
+
+async def _epic(client: AsyncClient, title: str, project: str | None = None) -> int:
+    body: dict = {"title": title, "task_type": "epic"}
+    if project:
+        body["project"] = project
+    resp = await client.post("/api/tasks", json=body)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"]
+
+
+async def test_epic_list_groups_by_project_and_keeps_unassigned(
+    client: AsyncClient, db
+):
+    # AC-1 (#570): grouping only became worth building today — until the epics
+    # were split across products, 30 of 31 sat in "default" and a group-by would
+    # have divided by a constant. An epic with project_id NULL must land in a
+    # NAMED group: the column has no NOT NULL constraint, so "it cannot happen"
+    # is not an argument.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import UNASSIGNED_PROJECT, get_epic_board
+
+    await seed_default_project(db)
+    await db.execute(
+        "INSERT INTO projects (slug, name, status) VALUES ('proj-a', 'A', 'active')"
+    )
+    await db.commit()
+    grouped = await _epic(client, "Epic in A", project="proj-a")
+    homeless = await _epic(client, "Epic with no project")
+    await db.execute("UPDATE tasks SET project_id=NULL WHERE id=?", (homeless,))
+    await db.commit()
+
+    board = await get_epic_board(db)
+    by_project = {g["project"]: [e.id for e in g["epics"]] for g in board["groups"]}
+
+    assert grouped in by_project.get("proj-a", []), (
+        "the epic must sit under its project"
+    )
+    assert homeless in by_project.get(UNASSIGNED_PROJECT, []), (
+        "an epic without a project must be named, not dropped from the view"
+    )
+    assert board["live_total"] == sum(len(v) for v in by_project.values()), (
+        "every live epic belongs to exactly one group"
+    )
+
+
+async def test_epics_are_ordered_by_last_subtree_activity(client: AsyncClient, db):
+    # AC-2 (#570): before this the order was position ASC, id DESC — and since
+    # position is 0 on every epic, effectively "newest id first", which put a
+    # June-dead epic above yesterday's work.
+    from hub.services.dashboard import get_epic_board
+
+    older = await _epic(client, "Older id, fresh work")
+    newer = await _epic(client, "Newer id, stale work")
+    for task_id, when in (
+        (older, "2026-08-09 12:00:00"),
+        (newer, "2026-07-01 12:00:00"),
+    ):
+        child = (
+            await client.post(
+                "/api/tasks",
+                json={
+                    "title": f"child of {task_id}",
+                    "task_type": "feature",
+                    "parent_id": task_id,
+                },
+            )
+        ).json()["id"]
+        await client.post(
+            f"/api/tasks/{child}/updates",
+            json={"agent": "dev", "kind": "status", "content": "worked"},
+        )
+        await db.execute(
+            "UPDATE task_updates SET created_at=? WHERE task_id=?", (when, child)
+        )
+        await db.execute("UPDATE tasks SET updated_at=? WHERE id=?", (when, child))
+    await db.commit()
+
+    order = [e.id for g in (await get_epic_board(db))["groups"] for e in g["epics"]]
+    assert order.index(older) < order.index(newer), (
+        f"fresh work must outrank a bigger id: got {order}"
+    )
+
+
+async def test_an_administrative_touch_is_not_activity(client: AsyncClient, db):
+    # AC-4 (#570). The obvious sort key was MAX(updated_at), and it was a trap:
+    # updated_at is bumped by ANY write (#616). On production, ordering by it
+    # floated #182, #192, #209, #371 and #394 to the top — the five epics whose
+    # project had just been reassigned twenty minutes earlier. A rename must not
+    # look like work.
+    from hub.services.dashboard import get_epic_board
+
+    worked_on = await _epic(client, "Someone reported progress here")
+    just_renamed = await _epic(client, "Only a field was edited here")
+
+    child = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "c", "task_type": "feature", "parent_id": worked_on},
+        )
+    ).json()["id"]
+    await client.post(
+        f"/api/tasks/{child}/updates",
+        json={"agent": "dev", "kind": "status", "content": "real work"},
+    )
+    await db.execute(
+        "UPDATE task_updates SET created_at='2026-08-05 10:00:00' WHERE task_id=?",
+        (child,),
+    )
+    await db.execute(
+        "UPDATE tasks SET updated_at='2026-08-05 10:00:00' WHERE id IN (?,?)",
+        (child, worked_on),
+    )
+    # The administrative touch is LATER in wall-clock time, which is exactly what
+    # makes this test meaningful: only the feed distinguishes them.
+    await db.execute(
+        "UPDATE tasks SET updated_at='2026-08-10 18:00:00' WHERE id=?", (just_renamed,)
+    )
+    await db.commit()
+
+    order = [e.id for g in (await get_epic_board(db))["groups"] for e in g["epics"]]
+    assert order.index(worked_on) < order.index(just_renamed), (
+        f"a touched-but-idle epic must not outrank one with real work: {order}"
+    )
+
+    # An epic with no feed entry anywhere has no activity to report, so it sorts
+    # LAST — and is still in the list. The first design borrowed updated_at for
+    # these rows; this assertion is what killed it, because the borrowed date is
+    # precisely the administrative touch above.
+    assert just_renamed in order, "no activity must not mean no place in the list"
+    assert order[-1] == just_renamed
+
+
+async def test_done_epics_are_collapsed_not_hidden(client: AsyncClient, db):
+    # AC-3 (#570): #569 filtered finished epics out entirely, so there was no way
+    # back to them. The count and the contents come from ONE query — this morning
+    # #571 shipped a counter that disagreed with its own link, and the whole point
+    # of a number is that it can be trusted.
+    from hub.services.dashboard import get_epic_board
+
+    live = await _epic(client, "Still working")
+    done = await _epic(client, "All finished")
+    await db.execute("UPDATE tasks SET status='completed' WHERE id=?", (done,))
+    await db.commit()
+
+    board = await get_epic_board(db)
+    live_ids = [e.id for g in board["groups"] for e in g["epics"]]
+    done_ids = [e.id for e in board["done"]]
+
+    assert live in live_ids and done not in live_ids
+    assert done in done_ids, "a finished epic must remain reachable"
+    assert board["done_total"] == len(done_ids), (
+        "the number must be the length of what the block contains"
+    )
+    # Exact complement: no epic may fall out of both lists.
+    all_rows = await db.execute_fetchall(
+        "SELECT id FROM tasks WHERE task_type='epic' AND archived=0"
+    )
+    assert {r["id"] for r in all_rows} == set(live_ids) | set(done_ids), (
+        "an epic matching neither condition would vanish from the UI entirely"
+    )
+
+    page = await client.get("/partials/epics")
+    assert "Доделанные эпики: 1" in page.text
+    assert f'href="/tasks/{done}"' in page.text.replace("'", '"'), (
+        "collapsed means present in the markup, not omitted"
+    )
