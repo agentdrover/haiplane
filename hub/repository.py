@@ -18,6 +18,52 @@ from hub.db import (
     ac_to_row_kwargs,
     structured_fields_to_db,
 )
+from hub.models import FINAL_STATUSES
+
+# One spelling of "this row is finished", derived from the model instead of
+# retyped in SQL (#571). list_live_epics had the three values written out by
+# hand, and #569 shipped that list WRONG — it omitted `failed` until spec review
+# caught it. A second hand-typed copy for orphan tasks would make three places
+# to keep in step, which is the same defect as the permission list in #614.
+FINAL_STATUS_VALUES = tuple(sorted(s.value for s in FINAL_STATUSES))
+_FINAL_PLACEHOLDERS = ",".join("?" * len(FINAL_STATUS_VALUES))
+
+# A task no epic-shaped view can reach: no parent, and not an epic itself. The
+# project sits on the epic and descendants inherit it, so these rows belong to
+# no project either — by construction, not by mistake. Archival is deliberately
+# NOT part of this: callers control that through include_archived.
+ORPHAN_CONDITION = "parent_id IS NULL AND task_type != 'epic'"
+
+# Built once, from the placeholders above: the only thing interpolated is a run
+# of "?" — the status values themselves travel as parameters.
+_LIVE_EPICS_SQL = """
+    WITH RECURSIVE sub(root, id) AS (
+        SELECT id, id FROM tasks WHERE task_type='epic' AND archived=0
+        UNION ALL
+        SELECT sub.root, t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+    )
+    SELECT * FROM tasks e
+    WHERE e.task_type='epic' AND e.archived=0
+      AND (
+        EXISTS (
+            SELECT 1 FROM sub JOIN tasks c ON c.id = sub.id
+            WHERE sub.root = e.id AND sub.id != sub.root
+              AND c.archived = 0
+              AND c.status NOT IN ({finals})
+        )
+        OR (
+            NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_id = e.id)
+            AND e.status NOT IN ({finals})
+        )
+      )
+    ORDER BY e.position ASC, e.id DESC
+""".format(finals=_FINAL_PLACEHOLDERS)  # nosec B608 - placeholders only, values are params
+
+_LIVE_ORPHANS_COUNT_SQL = (
+    f"SELECT COUNT(*) AS n FROM tasks "  # nosec B608 - placeholders only
+    f"WHERE {ORPHAN_CONDITION} AND archived=0 "
+    f"AND status NOT IN ({_FINAL_PLACEHOLDERS})"
+)
 
 # Draft queue ranking (#253): deterministic, no weights — DoR-ready first,
 # then higher readiness, then older drafts (age = FIFO fairness).
@@ -95,6 +141,7 @@ async def list_tasks_filtered(
     priority: str | None = None,
     source: str | None = None,
     parent_id: int | None = None,
+    no_epic: bool = False,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     claimed_by: str | None = None,
@@ -144,6 +191,11 @@ async def list_tasks_filtered(
     if parent_id is not None:
         conditions.append("parent_id=?")
         params.append(parent_id)
+    if no_epic:
+        # A SEPARATE flag, never a special value of parent_id: a blank parent_id
+        # means "no filter" and a test pins that (#571 AC-3). Overloading it
+        # would silently change every existing link that passes an empty box.
+        conditions.append(ORPHAN_CONDITION)
     if human_reviewer:
         conditions.append("human_reviewer=?")
         params.append(human_reviewer)
@@ -867,30 +919,24 @@ async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     replaces (#569 AC-4). The list is bounded by reality — an epic leaves it
     by finishing, not by being the 21st row.
     """
-    return await db.execute_fetchall(
-        """
-        WITH RECURSIVE sub(root, id) AS (
-            SELECT id, id FROM tasks WHERE task_type='epic' AND archived=0
-            UNION ALL
-            SELECT sub.root, t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-        )
-        SELECT * FROM tasks e
-        WHERE e.task_type='epic' AND e.archived=0
-          AND (
-            EXISTS (
-                SELECT 1 FROM sub JOIN tasks c ON c.id = sub.id
-                WHERE sub.root = e.id AND sub.id != sub.root
-                  AND c.archived = 0
-                  AND c.status NOT IN ('completed','failed','rejected')
-            )
-            OR (
-                NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_id = e.id)
-                AND e.status NOT IN ('completed','failed','rejected')
-            )
-          )
-        ORDER BY e.position ASC, e.id DESC
-        """,
-    )
+    return await db.execute_fetchall(_LIVE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
+
+
+async def count_live_orphan_tasks(db: aiosqlite.Connection) -> int:
+    """How many live tasks belong to no epic (#571).
+
+    The epic-shaped views — the dashboard and the epic list — are built on
+    ``list_live_epics``, so a task with no parent appears in none of them. It is
+    findable in the flat ``/tasks`` list, which is why the claim "invisible
+    everywhere" was wrong; what was missing is anything that SAYS how many there
+    are. On 10.08.2026 that was 51 rows, 13 of them live.
+
+    Counted here, next to the epic criterion, because two consumers ask
+    (the epic list and the projects page) and two copies of the condition
+    would drift — the class of defect fixed in #609, #614 and #616.
+    """
+    rows = await db.execute_fetchall(_LIVE_ORPHANS_COUNT_SQL, FINAL_STATUS_VALUES)
+    return int(dict(rows[0])["n"]) if rows else 0
 
 
 async def list_agent_tasks(

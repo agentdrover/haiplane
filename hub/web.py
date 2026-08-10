@@ -440,7 +440,14 @@ async def web_partial_inbox(
 async def web_partial_epics(request: Request):
     epics = await services.get_epics_enriched(_db(request))
     return TEMPLATES.TemplateResponse(
-        request, "partials/epic_list.html", {"epics": epics}
+        request,
+        "partials/epic_list.html",
+        # #571: the count travels WITH the epic list, because a task outside
+        # every epic is invisible in exactly this view.
+        {
+            "epics": epics,
+            "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
+        },
     )
 
 
@@ -491,6 +498,10 @@ async def web_tasks_list_partial(
     human_reviewer: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    # #571: a SEPARATE flag rather than a magic parent_id value — a blank
+    # parent_id must keep meaning "no filter" (pinned by
+    # test_tasks_list_filters_ignore_blank_parent_id).
+    no_epic: bool = Query(default=False),
     analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
@@ -503,6 +514,7 @@ async def web_tasks_list_partial(
         priority=priority,
         source=source,
         parent_id=parsed_parent_id,
+        no_epic=no_epic,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         claimed_by=claimed_by,
@@ -627,7 +639,13 @@ async def web_projects(request: Request, project_error: str = Query("")):
     return TEMPLATES.TemplateResponse(
         request,
         "projects.html",
-        {"projects": [dict(r) for r in rows], "project_error": project_error},
+        {
+            "projects": [dict(r) for r in rows],
+            "project_error": project_error,
+            # Same number in the second consumer, from the same function: a
+            # project holds epics, so orphan tasks belong to no project either.
+            "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
+        },
     )
 
 
@@ -891,6 +909,10 @@ async def web_tasks(
     parent_id: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    # #571: a SEPARATE flag rather than a magic parent_id value — a blank
+    # parent_id must keep meaning "no filter" (pinned by
+    # test_tasks_list_filters_ignore_blank_parent_id).
+    no_epic: bool = Query(default=False),
     analyst_ready: bool = Query(default=False),
     project: str | None = Query(default=None),
 ):
@@ -904,6 +926,7 @@ async def web_tasks(
         priority=priority,
         source=source,
         parent_id=parsed_parent_id,
+        no_epic=no_epic,
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,
