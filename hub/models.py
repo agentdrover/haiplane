@@ -550,6 +550,9 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    # #615: the reviewer judges a statement too — and it may be older than the
+    # work that invalidated it.
+    statement_freshness: dict[str, Any] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
@@ -1014,6 +1017,11 @@ class TaskView(BaseModel):
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None
+    # #615: what was delivered in these areas since the statement was written.
+    # Computed, never stored: the answer changes as work lands, and a stored copy
+    # would be one more thing to go stale — which is the very defect this
+    # addresses. Absent means "not computed on this path", not "fresh".
+    statement_freshness: dict[str, Any] | None = None
     readiness_score: int | None = None
     dor_passed: bool | None = None
     ready_at: str | None = None
