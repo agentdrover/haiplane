@@ -2665,3 +2665,110 @@ async def test_projects_page_lists_each_project_once(client: AsyncClient, db):
     assert "<table" not in page, "the duplicate routing table is gone"
     assert "Retired Project" in page, "an archived project must still be reachable"
     assert kept and gone
+
+
+# ---------------------------------------------------------------------------
+# A counter and the list behind its link tell the same story (#617)
+# ---------------------------------------------------------------------------
+
+
+async def _orphan_with_status(client: AsyncClient, db, title: str, status: str) -> int:
+    task_id = (await client.post("/api/tasks", json={"title": title})).json()["id"]
+    await db.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+    await db.commit()
+    return task_id
+
+
+async def test_orphan_counter_and_its_link_agree(client: AsyncClient, db):
+    # AC-1 (#617). Found by looking at production, not by a failing test: the
+    # line said "Без эпика: 19 живых" and its link opened 51 rows, because the
+    # list filter took a single status while "live" is the negation of a set.
+    live = [
+        await _orphan_with_status(client, db, "still open", "open"),
+        await _orphan_with_status(client, db, "in review", "review"),
+    ]
+    done = [
+        await _orphan_with_status(client, db, "finished", "completed"),
+        await _orphan_with_status(client, db, "broken", "failed"),
+        await _orphan_with_status(client, db, "dropped", "rejected"),
+    ]
+
+    from hub import repository as repo
+
+    counted = await repo.count_live_orphan_tasks(db)
+    assert counted == len(live), "precondition: the counter counts live ones"
+
+    page = await client.get("/tasks/list", params={"no_epic": "1", "state": "live"})
+    assert page.status_code == 200, page.text
+    for task_id in live:
+        assert f"/tasks/{task_id}" in page.text
+    for task_id in done:
+        assert f"/tasks/{task_id}" not in page.text, (
+            "a finished orphan must appear neither in the number nor in the list"
+        )
+
+    # And the markup actually carries that link, so the two cannot drift apart.
+    for path in ("/projects", "/partials/epics"):
+        assert "state=live" in (await client.get(path)).text, (
+            f"{path} link must carry it"
+        )
+
+
+async def test_state_filter_works_on_both_routes_and_refuses_junk(
+    client: AsyncClient, db
+):
+    # AC-2 (#617): a parameter honoured by only one of the two routes gives a
+    # link that silently ignores it — #571 shipped exactly that shape and a
+    # mutation caught it. And an unknown value must fail loudly: a filter that
+    # quietly does nothing leaves the caller believing the list was narrowed.
+    running = await _orphan_with_status(client, db, "being worked on", "running")
+    drafted = await _orphan_with_status(client, db, "a draft", "draft")
+
+    for path in ("/tasks/list", "/tasks"):
+        inflight = await client.get(path, params={"state": "inflight"})
+        assert inflight.status_code == 200, inflight.text
+        assert f"/tasks/{running}" in inflight.text, f"{path}: running is in flight"
+        assert f"/tasks/{drafted}" not in inflight.text, f"{path}: a draft is not"
+
+        awaiting = await client.get(path, params={"state": "awaiting"})
+        assert f"/tasks/{drafted}" in awaiting.text, f"{path}: a draft awaits a human"
+        assert f"/tasks/{running}" not in awaiting.text
+
+        junk = await client.get(path, params={"state": "nonsense"})
+        assert junk.status_code == 400, (
+            f"{path}: an unknown mode must be refused, not ignored"
+        )
+        assert "nonsense" in junk.text and "live" in junk.text, (
+            "the refusal must name what was passed and what is accepted"
+        )
+
+
+async def test_state_is_independent_and_excludes_headless_review(
+    client: AsyncClient, db
+):
+    # AC-3 (#617): the new mode composes with the old filters instead of
+    # replacing them, and a headless review belongs to the poller conveyor, not
+    # to a person — the rule list_stale_by_status(require_null_review_job) and
+    # the #567 card counter already follow. Disagreeing here would recreate the
+    # counter/link mismatch this task removes.
+    human = await _orphan_with_status(client, db, "waiting for a person", "review")
+    headless = await _orphan_with_status(client, db, "conveyor review", "review")
+    await db.execute("UPDATE tasks SET review_job_id='job-1' WHERE id=?", (headless,))
+    await db.commit()
+
+    awaiting = await client.get("/tasks/list", params={"state": "awaiting"})
+    assert f"/tasks/{human}" in awaiting.text
+    assert f"/tasks/{headless}" not in awaiting.text, (
+        "a review owned by the conveyor is not a person waiting"
+    )
+
+    # The pre-existing contract is untouched: a blank parent_id still disables
+    # filtering (test_tasks_list_filters_ignore_blank_parent_id pins this), and
+    # status still works on its own.
+    blank = await client.get("/tasks/list", params={"parent_id": "", "state": "live"})
+    assert blank.status_code == 200
+    assert f"/tasks/{human}" in blank.text
+    by_status = await client.get("/tasks/list", params={"status": "review"})
+    assert f"/tasks/{headless}" in by_status.text, (
+        "state must not hijack the plain status filter"
+    )
