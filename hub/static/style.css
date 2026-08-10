@@ -3358,3 +3358,14 @@ body.htmx-request .htmx-progress {
 .project-card-numbers { margin: .35rem 0 .5rem; }
 .project-card-waiting { font-weight: 600; }
 .epic-group-title { margin: 1rem 0 .35rem; font-size: .95rem; }
+
+/* Project admin block (#568): git routing lives with its project instead of in a
+   second table repeating the same list. Collapsed by default — the page answers
+   "what is happening" first, "where to push" on demand. */
+.project-admin { margin-top: .6rem; border-top: 1px solid var(--border, #333); padding-top: .5rem; }
+.project-admin-summary { cursor: pointer; font-size: .85rem; color: var(--muted, #999); }
+.project-admin-facts { display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; margin: .5rem 0; font-size: .85rem; }
+.project-admin-facts dt { color: var(--muted, #999); }
+.project-admin-facts dd { margin: 0; word-break: break-all; }
+.project-admin-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .4rem; }
+.project-admin-edit { margin-top: .3rem; }

@@ -21,6 +21,14 @@
             <a href="/tasks?project={{ c.project.slug }}" class="epic-title">{{ c.project.name }}</a>
             {% if c.project.status == 'pending' %}<span class="badge badge-draft">pending</span>{% endif %}
             {% if c.project.archived %}<span class="badge badge-failed">archived</span>{% endif %}
+            {# #568: a broken workspace stays on the surface. Hiding it behind the
+               disclosure would put a failure one click away from being unseen,
+               and the state of the workspace is not administration — it is news. #}
+            {% if c.project.provision_status == 'ok' %}
+            <span class="badge badge-completed" title="{{ c.project.provision_detail }}">ws&nbsp;ok</span>
+            {% elif c.project.provision_status == 'error' %}
+            <span class="badge badge-failed" title="{{ c.project.provision_detail }}">ws&nbsp;error</span>
+            {% endif %}
         </div>
         <p class="project-card-numbers muted small">
             {# Exactly three numbers, and the first one NAMES ITS COMPOSITION.
@@ -48,6 +56,59 @@
            — the same rule as #615, where silence had to become an answer. #}
         <div class="epic-empty">Живой работы нет — все эпики проекта доделаны или их ещё не завели</div>
         {% endif %}
+        <details class="project-admin">
+            {# #568: git routing lives WITH its project instead of in a second
+               table listing the same five projects. Every condition below is
+               copied verbatim from that table: spec review pointed out that
+               reading "all five actions available" literally would strip the
+               guards and offer actions in states where they are invalid. #}
+            <summary class="project-admin-summary">Настройки и маршрутизация</summary>
+            <dl class="project-admin-facts">
+                <dt>slug</dt><dd>{{ c.project.slug }}</dd>
+                <dt>repo</dt><dd>{{ c.project.repo or '—' }}</dd>
+                <dt>ветка</dt><dd>{{ c.project.default_branch }}</dd>
+                <dt>workspace</dt><dd>{{ c.project.workspace_path or '—' }}</dd>
+            </dl>
+            <div class="project-admin-actions">
+                {% if c.project.repo and not c.project.archived %}
+                <form method="post" action="/projects/{{ c.project.id }}/web-provision" class="project-inline-form">
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Клонировать/проверить workspace проекта {{ c.project.slug }}?')">Provision</button>
+                </form>
+                {% endif %}
+                {% if c.project.status == 'pending' and not c.project.archived %}
+                <form method="post" action="/projects/{{ c.project.id }}/web-activate" class="project-inline-form">
+                    <button class="btn btn-success" type="submit"
+                            onclick="return confirm('Активировать проект {{ c.project.slug }}? Он попадёт в git-маршрутизацию.')">Activate</button>
+                </form>
+                {% endif %}
+                {% if c.project.slug != 'default' %}
+                <form method="post" action="/projects/{{ c.project.id }}/web-archive" class="project-inline-form">
+                    <input type="hidden" name="archived" value="{{ 'false' if c.project.archived else 'true' }}">
+                    <button class="btn btn-ghost" type="submit"
+                            onclick="return confirm('{{ 'Разархивировать' if c.project.archived else 'Архивировать' }} проект {{ c.project.slug }}?')">
+                        {{ 'Unarchive' if c.project.archived else 'Archive' }}
+                    </button>
+                </form>
+                {% endif %}
+            </div>
+            <details class="project-admin-edit">
+                <summary class="project-edit-summary">edit</summary>
+                <form method="post" action="/projects/{{ c.project.id }}/web-edit" class="task-action-stack project-form">
+                    <label class="task-action-label">Name</label>
+                    <input name="name" class="task-action-control" value="{{ c.project.name }}">
+                    <label class="task-action-label">Repo (owner/repo)</label>
+                    <input name="repo" class="task-action-control" value="{{ c.project.repo }}">
+                    <label class="task-action-label">Workspace path</label>
+                    <input name="workspace_path" class="task-action-control" value="{{ c.project.workspace_path }}">
+                    <label class="task-action-label">Default branch</label>
+                    <input name="default_branch" class="task-action-control" value="{{ c.project.default_branch }}">
+                    <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
+                    <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ c.project.default_branch_policy if c.project.default_branch_policy and c.project.default_branch_policy != '{}' else '' }}</textarea>
+                    <button class="btn btn-primary task-action-btn" type="submit">Save</button>
+                </form>
+            </details>
+        </details>
     </article>
     {% endfor %}
 </section>
@@ -78,73 +139,5 @@
     </form>
 </details>
 
-<table class="task-table">
-    <thead>
-        <tr><th>Slug</th><th>Name</th><th>Repo</th><th>Base branch</th><th>Workspace</th><th>Status</th><th></th></tr>
-    </thead>
-    <tbody>
-        {% for p in projects %}
-        <tr>
-            <td><a href="/tasks?project={{ p.slug }}">{{ p.slug }}</a></td>
-            <td>{{ p.name }}</td>
-            <td>{{ p.repo or '—' }}</td>
-            <td>{{ p.default_branch }}</td>
-            <td>{{ p.workspace_path or '—' }}</td>
-            <td>
-                {% if p.archived %}<span class="badge badge-failed">archived</span>
-                {% elif p.status == 'pending' %}<span class="badge badge-review">pending</span>
-                {% else %}<span class="badge badge-completed">active</span>{% endif %}
-                {% if p.provision_status == 'ok' %}
-                <span class="badge badge-completed" title="{{ p.provision_detail }}">ws&nbsp;ok</span>
-                {% elif p.provision_status == 'error' %}
-                <span class="badge badge-failed" title="{{ p.provision_detail }}">ws&nbsp;error</span>
-                {% endif %}
-            </td>
-            <td>
-                {% if p.repo and not p.archived %}
-                <form method="post" action="/projects/{{ p.id }}/web-provision" class="project-inline-form">
-                    <button class="btn btn-primary" type="submit"
-                            onclick="return confirm('Клонировать/проверить workspace проекта {{ p.slug }}?')">Provision</button>
-                </form>
-                {% endif %}
-                {% if p.status == 'pending' and not p.archived %}
-                <form method="post" action="/projects/{{ p.id }}/web-activate" class="project-inline-form">
-                    <button class="btn btn-success" type="submit"
-                            onclick="return confirm('Активировать проект {{ p.slug }}? Он попадёт в git-маршрутизацию.')">Activate</button>
-                </form>
-                {% endif %}
-                {% if p.slug != 'default' %}
-                <form method="post" action="/projects/{{ p.id }}/web-archive" class="project-inline-form">
-                    <input type="hidden" name="archived" value="{{ 'false' if p.archived else 'true' }}">
-                    <button class="btn btn-ghost" type="submit"
-                            onclick="return confirm('{{ 'Разархивировать' if p.archived else 'Архивировать' }} проект {{ p.slug }}?')">
-                        {{ 'Unarchive' if p.archived else 'Archive' }}
-                    </button>
-                </form>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <td colspan="7" class="project-edit-cell">
-                <details>
-                    <summary class="project-edit-summary">edit</summary>
-                    <form method="post" action="/projects/{{ p.id }}/web-edit" class="task-action-stack project-form">
-                        <label class="task-action-label">Name</label>
-                        <input name="name" class="task-action-control" value="{{ p.name }}">
-                        <label class="task-action-label">Repo (owner/repo)</label>
-                        <input name="repo" class="task-action-control" value="{{ p.repo }}">
-                        <label class="task-action-label">Workspace path</label>
-                        <input name="workspace_path" class="task-action-control" value="{{ p.workspace_path }}">
-                        <label class="task-action-label">Default branch</label>
-                        <input name="default_branch" class="task-action-control" value="{{ p.default_branch }}">
-                        <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
-                        <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ p.default_branch_policy if p.default_branch_policy and p.default_branch_policy != '{}' else '' }}</textarea>
-                        <button class="btn btn-primary task-action-btn" type="submit">Save</button>
-                    </form>
-                </details>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
+
 {% endblock %}
