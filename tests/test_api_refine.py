@@ -1068,3 +1068,128 @@ async def test_review_brief_shows_ac_test_results(client: AsyncClient, monkeypat
         for r in brief.json()["ac_test_results"]
     }
     assert res == {"AC-1": ("pass", True), "AC-2": ("fail", True)}
+
+
+# ---------------------------------------------------------------------------
+# The statement's date is written on EVERY preparation path (#616)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_two_field_sets_partition_taskrefine_exactly():
+    # A classification nobody re-checks drifts from the code — the #614 defect,
+    # where nine permissions were declared and never enforced. So the split is
+    # derived from the model itself: a field added later lands in neither set and
+    # this fails, forcing whoever adds it to decide whether it is a premise.
+    from hub.models import TaskRefine
+    from hub.services.refinement import BOOKKEEPING_FIELDS, STATEMENT_FIELDS
+
+    declared = set(TaskRefine.model_fields)
+    assert declared, "guard the guard: an empty model would agree with anything"
+    assert STATEMENT_FIELDS | BOOKKEEPING_FIELDS == declared, (
+        f"unclassified: {declared - STATEMENT_FIELDS - BOOKKEEPING_FIELDS}"
+    )
+    assert not (STATEMENT_FIELDS & BOOKKEEPING_FIELDS), "a field cannot be both"
+
+
+async def _stored_prepared_at(db, task_id: int) -> str:
+    """The value AS STORED, not as served.
+
+    ``TaskView`` runs every timestamp through an ISO validator on the way out,
+    so the API response cannot answer the question AC-7 asks: the freshness
+    check reads raw DB rows and compares them as text against ``merged_at``.
+    Asserting on the response would have tested the serializer instead.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT prepared_at FROM tasks WHERE id=?", (task_id,)
+    )
+    return dict(rows[0]).get("prepared_at") or ""
+
+
+async def test_refine_stamps_the_statement_date(client: AsyncClient, db):
+    # AC-1 (#616): the defect was that only hub_prepare_developer_task wrote it,
+    # so #610, #611, #614 and #615 — all brought to DoR through refine — had no
+    # date and the freshness check silently fell back to their creation.
+    single = await _create_task(client)
+    assert not single.get("prepared_at"), "precondition: no date yet"
+    resp = await client.post(
+        f"/api/tasks/{single['id']}/refine",
+        json={"problem_statement": "the statement itself"},
+    )
+    assert resp.status_code == 200, resp.text
+    stamped = await _stored_prepared_at(db, single["id"])
+    assert stamped, "a statement field was written — the date must exist"
+
+    # Same guarantee through the bulk path, which is a SECOND entry point: the
+    # two funnel into one helper, and this test is what proves it stays that way.
+    bulk = await _create_task(client)
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={"items": [{"task_id": bulk["id"], "scope_in": ["a"]}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _stored_prepared_at(db, bulk["id"]), "refine-bulk must stamp it too"
+
+    # The format is the one the freshness check compares against (AC-7): the
+    # same space-separated shape as created_at, never ISO with a T.
+    assert "T" not in stamped and "+" not in stamped, (
+        f"{stamped!r} would sort above same-day merged_at values"
+    )
+    assert len(stamped) == len("2026-08-10 11:36:27")
+
+
+async def test_bookkeeping_fields_do_not_reset_the_statement_date(
+    client: AsyncClient, db
+):
+    # AC-2 (#616): re-estimating a size is not re-reading the premises. If it
+    # moved the date, the freshness check would go quiet about deliveries that
+    # still matter — and the warning would look fresh while hiding more.
+    # The first date is set to a DISTANT one on purpose. Stamping twice inside
+    # the same second is indistinguishable from not re-stamping at all, so a
+    # naive version of this test passes even when bookkeeping does reset the
+    # date — verified by mutation, which is how this weakness was found.
+    task = await _create_task(client)
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"problem_statement": "premises", "prepared_at": "2026-07-01 09:00:00"},
+    )
+    before = await _stored_prepared_at(db, task["id"])
+    assert before == "2026-07-01 09:00:00"
+
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"size": "L", "wip_tag": "feature_work", "human_owner": "Denis Pukinov"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _stored_prepared_at(db, task["id"]) == before, (
+        "bookkeeping must not touch it"
+    )
+
+
+async def test_a_caller_supplied_date_wins(client: AsyncClient, db):
+    # AC-3 (#616): hub_prepare_developer_task computes its own date and passes it
+    # through refine. Overwriting it here would break the analyst path while
+    # fixing the refine one.
+    task = await _create_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"problem_statement": "p", "prepared_at": "2026-07-01 09:00:00"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _stored_prepared_at(db, task["id"]) == "2026-07-01 09:00:00"
+
+
+async def test_reshaping_the_statement_moves_the_date(client: AsyncClient, db):
+    # AC-4 (#616): this is the intended meaning of the field — "when the
+    # statement was last shaped" — and not an accident of the implementation.
+    task = await _create_task(client)
+    await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"problem_statement": "first", "prepared_at": "2026-07-01 09:00:00"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine", json={"problem_statement": "rewritten"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _stored_prepared_at(db, task["id"]) != "2026-07-01 09:00:00", (
+        "the premises changed, so the date the reader is warned about must too"
+    )
