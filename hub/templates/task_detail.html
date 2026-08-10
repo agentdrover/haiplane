@@ -210,7 +210,12 @@
                         <strong>{{ risk.kind.value }}</strong>
                         <span class="badge badge--xs badge-priority-{{ risk.severity.value }}">{{ risk.severity.value }}</span>
                         <div class="u-pre-wrap">{{ risk.description }}</div>
-                        <div><span class="u-text-muted">Mitigation</span> {{ risk.mitigation }}</div>
+                        {# #610: an empty mitigation is a statement, not a
+                           rendering glitch — say it in words, otherwise the
+                           reader sees a blank label and assumes a bug. #}
+                        <div><span class="u-text-muted">Mitigation</span>
+                            {% if risk.mitigation %}{{ risk.mitigation }}{% else %}<em class="u-text-muted">не задана — риск объявлен без готового решения</em>{% endif %}
+                        </div>
                     </article>
                     {% endfor %}
                 </div>

@@ -67,9 +67,22 @@ class ReadinessConfig:
             RiskSeverity.high: 15,
         }
     )
+    # #610: a risk that carries a mitigation costs less than the same risk
+    # left open — but never nothing, because residual risk is still risk.
+    # Written as an explicit table rather than a fraction of the one above:
+    # a rounding rule ("half, rounded down") is unreadable six weeks later,
+    # while two columns can be compared at a glance.
+    mitigated_risk_penalties: dict[RiskSeverity, int] = field(
+        default_factory=lambda: {
+            RiskSeverity.low: 1,
+            RiskSeverity.medium: 3,
+            RiskSeverity.high: 6,
+        }
+    )
 
-    def penalty_for_risk(self, severity: RiskSeverity) -> int:
-        return self.risk_penalties.get(severity, 0)
+    def penalty_for_risk(self, severity: RiskSeverity, *, mitigated: bool) -> int:
+        table = self.mitigated_risk_penalties if mitigated else self.risk_penalties
+        return table.get(severity, 0)
 
 
 DEFAULT_CONFIG = ReadinessConfig()
@@ -133,7 +146,13 @@ def calculate_score_from_data(
         )
 
     for idx, risk in enumerate(risks):
-        penalty = config.penalty_for_risk(risk.severity)
+        # A declared risk with a plan is not the same liability as one left
+        # open, and pricing them alike made disclosure itself expensive: on
+        # #546 a fifth risk — named AND mitigated — cost 15 points, so the
+        # cheapest way to raise the number was to stay quiet. That is the
+        # opposite of what the field is for (#610).
+        mitigated = bool((risk.mitigation or "").strip())
+        penalty = config.penalty_for_risk(risk.severity, mitigated=mitigated)
         if penalty <= 0:
             continue
         score -= penalty
@@ -143,7 +162,8 @@ def calculate_score_from_data(
                 delta=-penalty,
                 reason=(
                     f"risk #{idx + 1} {risk.kind.value} "
-                    f"(severity={risk.severity.value})"
+                    f"(severity={risk.severity.value}, "
+                    f"{'mitigated' if mitigated else 'unmitigated'})"
                 ),
             )
         )
@@ -196,9 +216,12 @@ async def calculate_readiness(
     # NB: ``dor_passed`` and ``score`` are independent signals.
     # ``dor_passed`` is the binary gate (all required checks satisfied);
     # ``score`` reflects DoR + risks. A task can be ``dor_passed=True``
-    # with score < 100 if it carries unmitigated risks — that's by
-    # design, since the score is a refinement signal and the DoR gate
-    # is a hard yes/no.
+    # with score < 100 if it carries risks — that's by design, since the
+    # score is a refinement signal and the DoR gate is a hard yes/no.
+    # Risks are priced by severity AND by whether a mitigation is written:
+    # an open risk costs the full rate, a mitigated one costs less but
+    # never nothing (#610). Until then this comment claimed the code
+    # looked at mitigation while the code never did.
     return ReadinessReport(
         score=score,
         dor_passed=dor.passed,

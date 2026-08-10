@@ -1777,7 +1777,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--severity", required=True, choices=["low", "medium", "high"]
     )
     p_risk_add.add_argument("--description", required=True)
-    p_risk_add.add_argument("--mitigation", required=True)
+    # Optional since #610: a risk with no remedy yet is worth recording.
+    p_risk_add.add_argument("--mitigation", default="")
     p_risk_add.set_defaults(func=cmd_risk_add)
 
     # readiness — show DoR + score + recommendations

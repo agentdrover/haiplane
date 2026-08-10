@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 
 from hub import repository as repo
@@ -18,6 +20,7 @@ from hub.models import (
 )
 from hub.services.dor import DoREvaluation, evaluate_from_data
 from hub.services.readiness import (
+    parse_risks_from_row,
     DEFAULT_CONFIG,
     ReadinessConfig,
     ScoreComponent,
@@ -133,10 +136,13 @@ def test_risks_subtract_by_severity():
         ),
     ]
     score, components = calculate_score_from_data(dor=dor, risks=risks)
+    # These three carry a mitigation, so they are priced from the mitigated
+    # table (#610). The intent of this test is unchanged — penalties still
+    # scale with severity — but which table applies is now part of the rule.
     expected = 100 - (
-        DEFAULT_CONFIG.risk_penalties[RiskSeverity.high]
-        + DEFAULT_CONFIG.risk_penalties[RiskSeverity.medium]
-        + DEFAULT_CONFIG.risk_penalties[RiskSeverity.low]
+        DEFAULT_CONFIG.mitigated_risk_penalties[RiskSeverity.high]
+        + DEFAULT_CONFIG.mitigated_risk_penalties[RiskSeverity.medium]
+        + DEFAULT_CONFIG.mitigated_risk_penalties[RiskSeverity.low]
     )
     assert score == expected
     assert len(components) == 3
@@ -220,7 +226,10 @@ def test_custom_config_overrides_defaults():
 def test_unknown_risk_severity_does_not_subtract():
     """Defensive: a missing severity in the penalty dict is treated as 0."""
     dor = _all_passed_dor()
-    cfg = ReadinessConfig(risk_penalties={RiskSeverity.high: 7})
+    cfg = ReadinessConfig(
+        risk_penalties={RiskSeverity.high: 7},
+        mitigated_risk_penalties={RiskSeverity.high: 3},
+    )
     risks = [
         TaskRisk(
             kind=RiskKind.other,
@@ -298,7 +307,9 @@ async def test_calculate_readiness_includes_persisted_risks(db: aiosqlite.Connec
     assert report.dor_passed is True
     assert len(report.risks) == 1
     assert report.risks[0].kind == RiskKind.breaking_change
-    assert report.score == 100 - DEFAULT_CONFIG.risk_penalties[RiskSeverity.high]
+    assert (
+        report.score == 100 - DEFAULT_CONFIG.mitigated_risk_penalties[RiskSeverity.high]
+    ), "the stored risk carries a mitigation, so the softer rate applies (#610)"
 
 
 async def test_calculate_readiness_drops_malformed_risks(db: aiosqlite.Connection):
@@ -326,3 +337,105 @@ async def test_calculate_readiness_dor_checks_echoed_in_report(
     keys = [c.key for c in report.dor_checks]
     assert "has_user_story" in keys
     assert all(isinstance(c, DoRCheckItem) for c in report.dor_checks)
+
+
+# ---- disclosure must not be the expensive option (#610) ----
+#
+# Risks were priced by severity alone, so naming one cost the same whether or
+# not you had a plan for it. On #546 a rewritten statement declared a fifth
+# risk — high severity, WITH a mitigation — and the score fell from 73 to 58.
+# The text got better and the number got worse, which makes silence the cheap
+# move in a field that exists to make risk visible. The module's own comment
+# had claimed all along that the penalty was for *unmitigated* risks; the code
+# never looked at mitigation, and the model would not even store a risk
+# without one, so the honest state "seen, no remedy yet" was inexpressible.
+
+
+def _risk(severity: RiskSeverity, mitigation: str) -> TaskRisk:
+    return TaskRisk(
+        kind=RiskKind.other,
+        severity=severity,
+        description="the same risk either way",
+        mitigation=mitigation,
+    )
+
+
+def test_a_mitigated_risk_costs_less_than_an_unmitigated_one():
+    # AC-1 (#610): the only difference between these two tasks is that one
+    # author wrote down what they intend to do about it.
+    dor = _all_passed_dor()
+    open_score, _ = calculate_score_from_data(
+        dor=dor, risks=[_risk(RiskSeverity.high, "")]
+    )
+    handled_score, _ = calculate_score_from_data(
+        dor=dor, risks=[_risk(RiskSeverity.high, "step after the main run")]
+    )
+    assert handled_score > open_score, (
+        "declaring a risk AND handling it must not cost as much as leaving it open"
+    )
+
+
+def test_a_mitigated_risk_still_costs_something():
+    # AC-2 (#610): a plan is not a cure. Residual risk stays visible in the
+    # number, otherwise the field becomes a free way to look ready.
+    dor = _all_passed_dor()
+    clean, _ = calculate_score_from_data(dor=dor, risks=[])
+    handled, components = calculate_score_from_data(
+        dor=dor, risks=[_risk(RiskSeverity.high, "mitigated properly")]
+    )
+    assert handled < clean, "a mitigated risk is still a risk"
+    assert components and components[0].delta < 0
+
+
+def test_explain_names_the_rate_applied_to_each_risk():
+    # AC-3 (#610): two rates mean the number stops being self-evident, so the
+    # breakdown has to say which one applied — the same reason #612 refuses to
+    # collapse "not checked" into "checked".
+    dor = _all_passed_dor()
+    _score, components = calculate_score_from_data(
+        dor=dor,
+        risks=[
+            _risk(RiskSeverity.high, ""),
+            _risk(RiskSeverity.low, "handled"),
+        ],
+    )
+    reasons = " | ".join(c.reason for c in components)
+    assert "unmitigated" in reasons
+    assert "mitigated" in reasons.replace("unmitigated", "")
+
+
+def test_a_risk_without_mitigation_is_kept_and_scored():
+    # AC-4 (#610): the worst outcome of the old model was silent deletion —
+    # parse_risks_from_row dropped anything that failed validation, and a risk
+    # with no remedy failed it. The least-handled risks were the ones that
+    # disappeared from the score entirely.
+    parsed = parse_risks_from_row(
+        json.dumps(
+            [
+                {
+                    "kind": "other",
+                    "severity": "high",
+                    "description": "seen, no remedy yet",
+                    "mitigation": "",
+                }
+            ]
+        )
+    )
+    assert len(parsed) == 1, "an honest 'no plan yet' must survive validation"
+
+    dor = _all_passed_dor()
+    score, components = calculate_score_from_data(dor=dor, risks=parsed)
+    assert score == 100 - DEFAULT_CONFIG.risk_penalties[RiskSeverity.high]
+    assert "unmitigated" in components[0].reason
+
+
+def test_risk_penalties_do_not_touch_the_dor_gate():
+    # AC-5 (#610): score and gate are independent signals, and this change must
+    # not quietly turn the score into a second gate.
+    dor = _all_passed_dor()
+    score, _ = calculate_score_from_data(
+        dor=dor,
+        risks=[_risk(RiskSeverity.high, ""), _risk(RiskSeverity.high, "")],
+    )
+    assert score < 100
+    assert dor.passed is True, "declared risks never decide the DoR gate"

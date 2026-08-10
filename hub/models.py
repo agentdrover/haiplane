@@ -679,12 +679,21 @@ class AcceptanceCriterion(BaseModel):
 
 
 class TaskRisk(BaseModel):
-    """A concrete risk with severity and mitigation plan."""
+    """A concrete risk, with a mitigation when one is known (#610).
+
+    ``mitigation`` is deliberately optional. Requiring it left an author who
+    could see a risk but not yet its remedy with two bad moves: invent filler
+    text to satisfy validation, or say nothing. Worse, a risk that failed
+    validation was dropped by parse_risks_from_row — so the least-handled
+    risks were the ones that vanished from the score entirely. An empty
+    mitigation is now a statement in its own right ("seen, not yet solved")
+    and costs more in the readiness score than a mitigated one.
+    """
 
     kind: RiskKind
     severity: RiskSeverity
     description: str = Field(..., min_length=1, max_length=1000)
-    mitigation: str = Field(..., min_length=1, max_length=1000)
+    mitigation: str = Field("", max_length=1000)
 
 
 class TaskRefine(BaseModel):

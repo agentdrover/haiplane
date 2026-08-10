@@ -3106,7 +3106,7 @@ async def hub_add_risk(
     kind: str,
     severity: str,
     description: str,
-    mitigation: str,
+    mitigation: str = "",
 ) -> str:
     """Append a risk to a task through the atomic dedicated endpoint.
 
@@ -3117,7 +3117,11 @@ async def hub_add_risk(
             unknown_unknowns
         severity: low | medium | high
         description: One-line risk description.
-        mitigation: How we plan to handle / reduce it.
+        mitigation: How we plan to handle / reduce it. Optional (#610):
+            leave it empty to record an honest "seen, no remedy yet" — that
+            costs more in the readiness score than a mitigated risk, which is
+            the point. Inventing filler to satisfy a required field made the
+            score say less, not more.
     """
     result = await _api_post(
         f"/api/tasks/{task_id}/risks",
