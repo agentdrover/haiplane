@@ -1490,11 +1490,23 @@ async def web_admin_roles(request: Request):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
 
+    # #614: which of these permissions actually gate anything. Taken from the
+    # single source in hub/db.py rather than spelled out in the template: a
+    # second copy of the list is a second thing to forget.
+    from hub.db import DECLARED_ONLY_PERMISSIONS
+
     db = _db(request)
     roles = await admin_svc.list_roles(db)
     nav = await _admin_nav_counts(db)
     return TEMPLATES.TemplateResponse(
-        request, "admin/roles.html", {"roles": roles, "active": "admin", **nav}
+        request,
+        "admin/roles.html",
+        {
+            "roles": roles,
+            "declared_only_permissions": sorted(DECLARED_ONLY_PERMISSIONS),
+            "active": "admin",
+            **nav,
+        },
     )
 
 

@@ -1284,6 +1284,55 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     "system.settings.write",
 )
 
+# #614: which of the permissions above actually decide anything.
+#
+# Handing a permission out in a role, showing it in the admin UI, and checking
+# it in code are three different things, and until now only the first two were
+# visible. Nine of the eighteen were consulted by nothing at all — so a role
+# looked narrow while its narrowness was decorative. That is not an open door
+# (human gates are held by require_human_or_admin, _reject_agent_authored_source
+# and the review gate, not by these strings), but it is a promise the system
+# does not keep: in #613 the ci_runner role was described to the owner as unable
+# to do anything but report, and the CI token could in fact file drafts, because
+# tasks.create is asked by nobody.
+#
+# Kept rather than deleted: the vocabulary is worth having when a gate is
+# actually wanted. Enforcing any of these is a separate decision with its own
+# blast radius — enforcing tasks.create today would break #611, whose audit
+# reporter files drafts with exactly the ci_runner role.
+#
+# tests/test_auth.py derives the real answer FROM THE CODE and compares it with
+# these two tuples, failing in both directions: a permission missing from both,
+# and a "declared only" permission that has started to gate something. Two
+# hand-written lists agreeing with each other and both wrong is the defect this
+# task exists to remove.
+ENFORCED_PERMISSIONS: tuple[str, ...] = (
+    "admin.read",
+    "admin.users.write",
+    "admin.roles.write",
+    "admin.credentials.write",
+    "admin.audit.read",
+    "tasks.archive",
+    "tasks.delete",
+    "tasks.ci_report",
+    # Consulted indirectly: config.py reads it to answer is_human, and
+    # require_human_or_admin is built on that — so it does gate, via one hop.
+    "tasks.human_gate",
+)
+
+DECLARED_ONLY_PERMISSIONS: tuple[str, ...] = (
+    "admin.agents.write",
+    "tasks.read",
+    "tasks.create",
+    "tasks.refine",
+    "tasks.update",
+    "tasks.agent_report",
+    "tasks.decision",
+    "integrations.vast.manage",
+    "system.settings.write",
+)
+
+
 SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
         "super_admin",

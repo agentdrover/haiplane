@@ -2118,3 +2118,29 @@ async def test_role_editing_requires_an_admin_identity(
     )
     assert edit.status_code == 403, edit.text
     assert await _roles_of(db, "untouchable") == ["agent"]
+
+
+async def test_the_roles_page_marks_permissions_that_gate_nothing(
+    client: AsyncClient, monkeypatch
+):
+    # AC-4 (#614): an admin reading the roles page must be able to tell a real
+    # limit from a decorative one. Reading narrowness off this list is exactly
+    # how a false claim about the CI token reached the owner in #613.
+    from hub.db import DECLARED_ONLY_PERMISSIONS, ENFORCED_PERMISSIONS
+
+    admin = _admin_headers(monkeypatch)
+    page = await client.get("/admin/roles", headers=admin)
+    assert page.status_code == 200, page.text
+
+    # super_admin carries every permission, so both kinds are on the page.
+    for decorative in ("tasks.create", "tasks.update"):
+        assert decorative in DECLARED_ONLY_PERMISSIONS  # guards the premise
+        assert f"{decorative} ⚠" in page.text, (
+            f"{decorative} gates nothing and must be marked as such"
+        )
+    for real in ("tasks.delete", "tasks.ci_report"):
+        assert real in ENFORCED_PERMISSIONS
+        assert f"{real} ⚠" not in page.text, (
+            f"{real} does gate something — marking it would be a new lie"
+        )
+    assert "не проверяются кодом" in page.text, "explain the mark, not just show it"
