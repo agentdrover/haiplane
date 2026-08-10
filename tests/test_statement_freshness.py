@@ -233,3 +233,49 @@ async def test_pair_start_and_the_brief_both_carry_it(client, db):
     assert brief["statement_freshness"]["state"] == STATE_DELIVERIES, (
         "the reviewer judges the statement too and needs the same warning"
     )
+
+
+async def test_an_iso_stamped_date_still_finds_same_day_deliveries(db):
+    # AC-7 (#616). Found on production the hour #615 shipped: prepare_developer_task
+    # writes prepared_at as "2026-08-09T19:04:39+00:00" while merged_at is
+    # "2026-08-10 11:36:27", and the comparison is TEXT. 'T' is 0x54, space is
+    # 0x20, so an ISO date sorted above every same-day timestamp and the check
+    # answered "nothing landed" when something had — the silent-success failure
+    # this module exists to prevent, inside the module itself. Eight rows on
+    # production carry that form, so reading has to normalise, not just writing.
+    task_id = await _task(db, areas=["hub/app.py"], prepared_at=None)
+    await repo.update_task(db, task_id, prepared_at="2026-08-09T08:00:00+00:00")
+    await db.commit()
+    same_day = await _delivered(
+        db,
+        title="landed hours later",
+        areas=["hub/app.py"],
+        merged_at="2026-08-09 19:30:00",
+    )
+
+    out = await statement_freshness(db, dict(await repo.get_task(db, task_id)))
+
+    assert out["state"] == STATE_DELIVERIES, "a same-day delivery must be visible"
+    assert [d["task_id"] for d in out["deliveries"]] == [same_day]
+    assert "T" not in out["written_at"], "the reported date must be the comparable one"
+
+
+async def test_a_refined_task_reports_the_statement_date_not_creation(client, db):
+    # AC-5 (#616): the end-to-end case that started this task. A task refined
+    # into shape must be compared against WHEN IT WAS SHAPED; comparing against
+    # its creation counts deliveries that predate the text as "since" — noise,
+    # which is how a warning stops being read.
+    task_id = (await client.post("/api/tasks", json={"title": "Refined only"})).json()[
+        "id"
+    ]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"problem_statement": "written now", "affected_areas": ["hub/app.py"]},
+    )
+
+    out = await statement_freshness(db, dict(await repo.get_task(db, task_id)))
+
+    assert out["date_meaning"] == "постановка подготовлена", (
+        "refine wrote the statement, so the date is the statement's, not the row's"
+    )
+    assert out["written_at"], "and it must actually carry a value"

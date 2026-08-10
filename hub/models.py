@@ -735,6 +735,12 @@ class TaskRefine(BaseModel):
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
+    # When the statement was last SHAPED, not who shaped it. Refine stamps this
+    # server-side whenever it writes a statement field and the caller left it
+    # unset (#616) — and it deliberately does NOT touch prepared_by, since a
+    # refine caller is not necessarily an analyst. A date without an author is
+    # therefore expected. Format matters: the same space-separated form as
+    # created_at, because the freshness check (#615) compares these as text.
     prepared_at: str | None = Field(default=None, max_length=100)
     human_owner: str | None = Field(default=None, max_length=100)
     human_reviewer: str | None = Field(default=None, max_length=100)

@@ -43,6 +43,90 @@ from hub.services.test_locator import validate_test_locators
 _DOR_RELEVANT_STATUSES = frozenset({"draft", "open", "needs_info"})
 
 
+# Fields whose content IS the statement: what a developer re-reads as premises
+# before starting. Writing any of them means the statement was shaped, so
+# ``prepared_at`` moves (#616). Everything else is bookkeeping — a size estimate
+# or an owner change must not claim the premises were revisited.
+#
+# The two sets are asserted to partition TaskRefine exactly
+# (tests/test_api_refine.py), so a field added later cannot slip in unclassified.
+# That is the #614 lesson: a list nobody re-checks drifts from the code silently.
+STATEMENT_FIELDS = frozenset(
+    {
+        "title",
+        "user_story",
+        "problem_statement",
+        "business_value",
+        "outcome_metric",
+        "outcome_indicator",
+        "outcome_deadline",
+        "outcome_revisit_condition",
+        "redesign_decision",
+        "redesign_rationale",
+        "scope_in",
+        "scope_out",
+        "affected_areas",
+        "technical_hints",
+        "constraints",
+        "assumptions",
+        "validation_commands",
+        "out_of_scope_for_review",
+        "review_checklist",
+        "risks",
+        "acceptance_criteria",
+    }
+)
+BOOKKEEPING_FIELDS = frozenset(
+    {
+        "project",
+        "work_type",
+        "class_of_service",
+        "size",
+        "wip_tag",
+        "due_date",
+        "agent_fit",
+        "human_owner",
+        "human_reviewer",
+        "prepared_by",
+        "prepared_at",
+    }
+)
+
+
+def _statement_stamp() -> str:
+    """Now, in the format the rest of the table already uses.
+
+    NOT ``datetime.isoformat()``. ``created_at`` and ``pipeline_merges.merged_at``
+    come from SQLite's ``datetime('now')`` — ``2026-08-10 11:36:27`` — and the
+    freshness check (#615) compares them as TEXT. An ISO stamp with ``T`` and an
+    offset sorts ABOVE any same-day space-separated timestamp (``T`` is 0x54,
+    space is 0x20), so a delivery made hours after the statement would silently
+    fall outside the comparison. Eight rows written by
+    ``hub_prepare_developer_task`` carry that ISO form already, which is why
+    ``statement_freshness`` normalises what it reads as well.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def stamp_statement_date(payload: TaskRefine) -> TaskRefine:
+    """Record WHEN this statement was shaped, unless the caller said so (#616).
+
+    Server-side on purpose: ``hub_refine_task``/``hub_refine_tasks`` never sent
+    a date, so tasks brought to DoR through refine — #610, #611, #614, #615 —
+    had none, and the freshness check fell back to their creation date. Fixing
+    the two MCP tools instead would have left REST and CLI callers just as
+    blind: the "mechanism right, path not wired" class this hub keeps hitting.
+
+    A caller-supplied value always wins, which keeps
+    ``hub_prepare_developer_task`` (it computes its own) working unchanged.
+    """
+    if payload.prepared_at is not None:
+        return payload
+    if not (payload.model_fields_set & STATEMENT_FIELDS):
+        return payload
+    return payload.model_copy(update={"prepared_at": _statement_stamp()})
+
+
 class TaskNotFoundError(LookupError):
     """Raised when an operation targets a non-existent task."""
 
@@ -239,6 +323,11 @@ async def _apply_refine_writes(
             payload.acceptance_criteria,
             enforce=config.SDD_AC_LOCATOR == "require",
         )
+
+    # #616: both the single and the bulk flow funnel through here, so the
+    # statement date is stamped in ONE place — verified by enumerating every
+    # caller rather than by assuming this is the only one.
+    payload = stamp_statement_date(payload)
 
     updated_columns = await repo.update_task_structured(db, task_id, payload)
 

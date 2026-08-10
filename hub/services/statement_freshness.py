@@ -58,18 +58,49 @@ GATE_HISTORY_NOTE = (
 )
 
 
+def comparable_timestamp(raw: str) -> str:
+    """Normalise a timestamp to the form this table compares in TEXT (#616).
+
+    ``created_at`` and ``pipeline_merges.merged_at`` come from SQLite's
+    ``datetime('now')`` — ``2026-08-10 11:36:27`` — but
+    ``hub_prepare_developer_task`` writes ``prepared_at`` as
+    ``2026-08-10T11:36:27+00:00``. The comparison is a string comparison, and
+    ``T`` (0x54) sorts above a space (0x20), so an ISO date silently pushed
+    every same-day delivery outside the window: the check answered "nothing
+    landed" when something had. Found on production the hour #615 shipped, on
+    eight rows that already carry the ISO form.
+
+    Both forms are UTC, so only the text differs — drop the ``T`` and any
+    offset or fractional part and the two become comparable again.
+    """
+    ts = (raw or "").strip()
+    if not ts:
+        return ""
+    ts = ts.replace("T", " ")
+    for cut in ("+", "Z"):
+        head = ts.split(cut, 1)[0]
+        if head != ts:
+            ts = head
+    return ts.split(".", 1)[0].strip()
+
+
 def statement_written_at(task: dict[str, Any]) -> tuple[str, str]:
     """(timestamp, what it means) for the statement's date.
 
-    ``prepared_at`` is when an analyst last shaped the statement. Tasks that
-    never went through preparation still have a date worth comparing — their
-    creation — and falling back keeps them inside the check instead of dropping
-    them out of it silently.
+    ``prepared_at`` is when the statement was last SHAPED — by an analyst
+    through ``hub_prepare_developer_task``, or by any refine that wrote a
+    statement field (#616). It is not "who prepared it": ``prepared_by`` stays
+    untouched by refine, because a refine caller is not necessarily an analyst,
+    so a date without an author is expected here rather than a defect.
+
+    Tasks that never went through preparation still have a date worth comparing
+    — their creation — and falling back keeps them inside the check instead of
+    dropping them out of it silently.
     """
-    prepared = (task.get("prepared_at") or "").strip()
+    prepared = comparable_timestamp(task.get("prepared_at") or "")
     if prepared:
         return prepared, "постановка подготовлена"
-    created = (task.get("created_at") or "").strip()
+    created = comparable_timestamp(task.get("created_at") or "")
     return created, "задача создана (аналитика не проводилась)"
 
 
