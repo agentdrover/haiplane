@@ -79,14 +79,19 @@ def test_acceptance_criterion_serializes_round_trip():
 # --- TaskRisk ---
 
 
-def test_task_risk_requires_mitigation():
-    with pytest.raises(ValidationError):
-        TaskRisk(
-            kind=RiskKind.security,
-            severity=RiskSeverity.high,
-            description="injection",
-            mitigation="",
-        )
+def test_task_risk_accepts_an_honest_absence_of_mitigation():
+    # #610 inverted this deliberately, so the test is rewritten rather than
+    # deleted: requiring a mitigation left an author who saw a risk without a
+    # remedy only two moves — invent filler, or say nothing — and a risk that
+    # failed validation was DROPPED before scoring, so the least-handled risks
+    # vanished. An empty mitigation is now a statement: seen, not yet solved.
+    risk = TaskRisk(
+        kind=RiskKind.security,
+        severity=RiskSeverity.high,
+        description="injection",
+        mitigation="",
+    )
+    assert risk.mitigation == ""
 
 
 def test_task_risk_valid():

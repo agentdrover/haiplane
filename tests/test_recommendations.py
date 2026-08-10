@@ -321,7 +321,9 @@ async def test_calculate_readiness_with_recommendations_includes_risks(
     report = await calculate_readiness_with_recommendations(db, task_id)
     assert len(report.risks) == 1
     # Risk lowers score but does not generate a recommendation.
-    assert report.score == 100 - DEFAULT_CONFIG.risk_penalties[RiskSeverity.high]
+    assert (
+        report.score == 100 - DEFAULT_CONFIG.mitigated_risk_penalties[RiskSeverity.high]
+    ), "the risk carries a mitigation, so the softer rate applies (#610)"
     assert report.recommendations == []
 
 
