@@ -266,6 +266,51 @@ async def get_epic_board(
     }
 
 
+async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """One card per project: live epics, three numbers, freshest first (#567).
+
+    Live epics come from ``get_epic_board`` rather than a new query, because the
+    liveness criterion must stay single (#569 put it in one place, #570 made the
+    done list its exact complement). The numbers come from one aggregate query
+    for all projects (#567's own risk note about N+1).
+
+    Cards are ordered by when work last happened in the project, for the same
+    reason #570 reordered the epic list: an order by id answers "which was
+    created last", not "where is the work".
+    """
+    board = await get_epic_board(db)
+    epics_by_project = {g["project"]: g["epics"] for g in board["groups"]}
+    summary = await repo.project_work_summary(db)
+
+    cards: list[dict[str, Any]] = []
+    for project in await repo.list_projects(db, include_archived=True):
+        p = dict(project)
+        counts = summary.get(
+            int(p["id"]),
+            {
+                "awaiting_human": 0,
+                "drafts": 0,
+                "in_flight": 0,
+                "last_activity_at": None,
+            },
+        )
+        cards.append(
+            {
+                "project": p,
+                "live_epics": epics_by_project.get(p["slug"], []),
+                **counts,
+            }
+        )
+
+    # Newest activity first; a project that has never seen a feed entry has no
+    # activity to report and goes last — the same honest answer #570 settled on
+    # instead of borrowing updated_at.
+    cards.sort(
+        key=lambda c: (c["last_activity_at"] or "", c["project"]["id"]), reverse=True
+    )
+    return cards
+
+
 async def list_tasks(
     db: aiosqlite.Connection,
     *,

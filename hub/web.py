@@ -644,11 +644,15 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
 async def web_projects(request: Request, project_error: str = Query("")):
     """Project list with create/edit/archive forms (#339, #344)."""
     rows = await repo.list_projects(_db(request), include_archived=True)
+    # #567: the page stops being a routing table — each project carries its live
+    # epics and three numbers, computed server-side.
+    cards = await services.get_project_cards(_db(request))
     return TEMPLATES.TemplateResponse(
         request,
         "projects.html",
         {
             "projects": [dict(r) for r in rows],
+            "cards": cards,
             "project_error": project_error,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
