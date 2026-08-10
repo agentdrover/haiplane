@@ -111,6 +111,23 @@ def _page_query(request: Request) -> int:
     return max(page, 1)
 
 
+def _state_query(value: str | None) -> str | None:
+    """Validate the named status-set mode, refusing anything unknown (#617).
+
+    Deliberately NOT lenient: a ``state`` the server does not recognise must
+    fail loudly, because a filter that silently does nothing leaves the caller
+    believing a list was narrowed when it was not — which is the class of defect
+    this task exists to remove.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        repo.task_state_condition(value)
+    except repo.UnknownTaskStateError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return value
+
+
 def _optional_int_query(value: str | int | None, field: str) -> int | None:
     """Treat empty HTMX form values as omitted optional integer query params."""
     if value is None or value == "":
@@ -506,6 +523,10 @@ async def web_tasks_list_partial(
     # parent_id must keep meaning "no filter" (pinned by
     # test_tasks_list_filters_ignore_blank_parent_id).
     no_epic: bool = Query(default=False),
+    # #617: named status-set mode (live | awaiting | inflight). Wired into BOTH
+    # routes on purpose — a parameter that only the fragment honours gives a link
+    # that silently ignores it, and the counter's link points at the page.
+    state: str | None = Query(default=None),
     analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
@@ -519,6 +540,7 @@ async def web_tasks_list_partial(
         source=source,
         parent_id=parsed_parent_id,
         no_epic=no_epic,
+        state=_state_query(state),
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         claimed_by=claimed_by,
@@ -925,6 +947,10 @@ async def web_tasks(
     # parent_id must keep meaning "no filter" (pinned by
     # test_tasks_list_filters_ignore_blank_parent_id).
     no_epic: bool = Query(default=False),
+    # #617: named status-set mode (live | awaiting | inflight). Wired into BOTH
+    # routes on purpose — a parameter that only the fragment honours gives a link
+    # that silently ignores it, and the counter's link points at the page.
+    state: str | None = Query(default=None),
     analyst_ready: bool = Query(default=False),
     project: str | None = Query(default=None),
 ):
@@ -939,6 +965,7 @@ async def web_tasks(
         source=source,
         parent_id=parsed_parent_id,
         no_epic=no_epic,
+        state=_state_query(state),
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,

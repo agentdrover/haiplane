@@ -5,7 +5,7 @@
 {% if orphan_live %}
 <p class="muted">
     {# Same figure as the epic list, same function behind it (#571). #}
-    <a href="/tasks?no_epic=1">Без эпика: {{ orphan_live }} живых задач</a>
+    <a href="/tasks?no_epic=1&amp;state=live">Без эпика: {{ orphan_live }} живых задач</a>
     — вне всех проектов, потому что проект наследуется от эпика.
 </p>
 {% endif %}

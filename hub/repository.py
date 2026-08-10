@@ -39,6 +39,50 @@ IN_FLIGHT_STATUS_VALUES = tuple(sorted(s.value for s in IN_FLIGHT_STATUSES))
 _AWAITING_PLACEHOLDERS = ",".join("?" * len(AWAITING_HUMAN_STATUS_VALUES))
 _IN_FLIGHT_PLACEHOLDERS = ",".join("?" * len(IN_FLIGHT_STATUS_VALUES))
 
+
+class UnknownTaskStateError(ValueError):
+    """Raised for a ``state`` filter value that is not one of the named modes.
+
+    An unrecognised value must NOT silently mean "no filter": a parameter that
+    quietly does nothing is worse than one that does not exist, because the
+    caller believes it was applied. The API layer turns this into a 400.
+    """
+
+
+# The named status-set modes (#617). A counter and the list behind its link have
+# to agree, and "live" is the NEGATION of a set — impossible to express through
+# the single-valued ``status`` filter, which is exactly why "Без эпика: 19 живых"
+# opened a list of 51.
+#
+# Named values only, taken from the model's own sets. Accepting arbitrary status
+# lists in a query string would turn this into a small query language nobody
+# validates; a fourth NAMED mode is the way to grow, per the task's revisit
+# condition.
+#
+# ``awaiting`` excludes a headless review — a review with ``review_job_id`` set
+# belongs to the poller conveyor, not to a person. Same rule as
+# ``list_stale_by_status(require_null_review_job=True)`` and the card counter in
+# #567; disagreeing with it here would recreate the very mismatch this fixes.
+TASK_STATE_FILTERS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "live": (f"status NOT IN ({_FINAL_PLACEHOLDERS})", FINAL_STATUS_VALUES),
+    "awaiting": (
+        f"status IN ({_AWAITING_PLACEHOLDERS}) "
+        "AND NOT (status='review' AND review_job_id IS NOT NULL)",
+        AWAITING_HUMAN_STATUS_VALUES,
+    ),
+    "inflight": (f"status IN ({_IN_FLIGHT_PLACEHOLDERS})", IN_FLIGHT_STATUS_VALUES),
+}
+
+
+def task_state_condition(state: str) -> tuple[str, tuple[str, ...]]:
+    """(sql, params) for one named state mode, or raise for anything else."""
+    try:
+        return TASK_STATE_FILTERS[state]
+    except KeyError as exc:
+        known = ", ".join(sorted(TASK_STATE_FILTERS))
+        raise UnknownTaskStateError(f"unknown state {state!r}; known: {known}") from exc
+
+
 # A task no epic-shaped view can reach: no parent, and not an epic itself. The
 # project sits on the epic and descendants inherit it, so these rows belong to
 # no project either — by construction, not by mistake. Archival is deliberately
@@ -196,6 +240,7 @@ async def list_tasks_filtered(
     source: str | None = None,
     parent_id: int | None = None,
     no_epic: bool = False,
+    state: str | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
     claimed_by: str | None = None,
@@ -250,6 +295,13 @@ async def list_tasks_filtered(
         # means "no filter" and a test pins that (#571 AC-3). Overloading it
         # would silently change every existing link that passes an empty box.
         conditions.append(ORPHAN_CONDITION)
+    if state:
+        # #617: a third independent parameter. It composes with status and
+        # no_epic rather than replacing either — the counter needs "live", the
+        # hierarchy flag needs "no parent", and they are different questions.
+        sql, values = task_state_condition(state)
+        conditions.append(sql)
+        params.extend(values)
     if human_reviewer:
         conditions.append("human_reviewer=?")
         params.append(human_reviewer)
