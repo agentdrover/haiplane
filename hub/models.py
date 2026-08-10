@@ -233,6 +233,34 @@ FINAL_STATUSES = frozenset(
     }
 )
 
+# Statuses whose next move belongs to a HUMAN (#567).
+#
+# ``draft`` is in here and that is the whole point: draft→open is a human-only
+# gate (hub_approve_task), and on production it holds 39 tasks while the three
+# statuses the task originally named hold 2 between them. It is also the only
+# status that belongs to neither ACTIVE_STATUSES nor FINAL_STATUSES — the
+# forgotten one, which is exactly how it got left out of the first formula.
+#
+# ``review`` is included with a caveat the queries must honour: a review with
+# ``review_job_id`` set is a headless review owned by the poller, not a person
+# (the same rule ``list_stale_by_status(require_null_review_job=...)`` already
+# follows). Membership here is by status; the exclusion lives in the count.
+AWAITING_HUMAN_STATUSES = frozenset(
+    {
+        TaskStatus.draft,
+        TaskStatus.needs_info,
+        TaskStatus.needs_decision,
+        TaskStatus.review,
+    }
+)
+
+# Work in flight — DERIVED, never retyped. Spelling this set out by hand would
+# be the third copy of a status list in this codebase; the first two had to be
+# unified in #571 (terminal statuses) and #570 (epic liveness), and one of them
+# shipped wrong. A status added to TaskStatus later lands in none of the three
+# sets and the test in tests/test_web.py fails, which is the point.
+IN_FLIGHT_STATUSES = ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES
+
 
 # --- Request models ---
 

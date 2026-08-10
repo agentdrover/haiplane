@@ -18,7 +18,11 @@ from hub.db import (
     ac_to_row_kwargs,
     structured_fields_to_db,
 )
-from hub.models import FINAL_STATUSES
+from hub.models import (
+    AWAITING_HUMAN_STATUSES,
+    FINAL_STATUSES,
+    IN_FLIGHT_STATUSES,
+)
 
 # One spelling of "this row is finished", derived from the model instead of
 # retyped in SQL (#571). list_live_epics had the three values written out by
@@ -27,6 +31,13 @@ from hub.models import FINAL_STATUSES
 # to keep in step, which is the same defect as the permission list in #614.
 FINAL_STATUS_VALUES = tuple(sorted(s.value for s in FINAL_STATUSES))
 _FINAL_PLACEHOLDERS = ",".join("?" * len(FINAL_STATUS_VALUES))
+
+# Same treatment for the two sets #567 needs: values come from the model, and
+# the only thing interpolated into SQL is a run of "?".
+AWAITING_HUMAN_STATUS_VALUES = tuple(sorted(s.value for s in AWAITING_HUMAN_STATUSES))
+IN_FLIGHT_STATUS_VALUES = tuple(sorted(s.value for s in IN_FLIGHT_STATUSES))
+_AWAITING_PLACEHOLDERS = ",".join("?" * len(AWAITING_HUMAN_STATUS_VALUES))
+_IN_FLIGHT_PLACEHOLDERS = ",".join("?" * len(IN_FLIGHT_STATUS_VALUES))
 
 # A task no epic-shaped view can reach: no parent, and not an epic itself. The
 # project sits on the epic and descendants inherit it, so these rows belong to
@@ -983,6 +994,83 @@ async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     #569 refused when it dropped its LIMIT.
     """
     return await db.execute_fetchall(_DONE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
+
+
+async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, Any]]:
+    """Per project: what waits for a human, what is in flight, when work last happened.
+
+    ONE aggregate query for every project rather than a loop of per-project
+    queries — the N+1 risk named in #567's own statement.
+
+    Two rules are honoured here rather than restated:
+
+    * the project sits on the EPIC and descendants inherit it (the same subtree
+      walk as ``list_task_ids_for_project``), so a task outside every epic
+      belongs to no project — it is counted by ``count_live_orphan_tasks``
+      instead (#571), and dropping it here is by construction, not by accident;
+    * a ``review`` with ``review_job_id`` set is a headless review owned by the
+      poller, not something a person is holding — the same exclusion
+      ``list_stale_by_status(require_null_review_job=True)`` makes.
+
+    Activity is a SEPARATE query on purpose: joining ``task_updates`` into the
+    counting query would multiply every row by its number of feed entries and
+    silently inflate all three numbers.
+
+    Epics count as awaiting a human but NOT as work in flight, and the asymmetry
+    is deliberate: a draft epic really is waiting for the same approval gate as a
+    draft task, while an epic sits in ``open`` for its entire life as a
+    container — counting it would add a permanent "+1 in flight" to every
+    project, including projects where nothing at all is happening. Caught by a
+    test that expected 2 and got 3.
+    """
+    counts_sql = f"""
+        WITH RECURSIVE tree(project_id, id) AS (
+            SELECT project_id, id FROM tasks
+            WHERE task_type='epic' AND project_id IS NOT NULL AND archived=0
+            UNION ALL
+            SELECT tree.project_id, t.id FROM tasks t JOIN tree ON t.parent_id = tree.id
+        )
+        SELECT tree.project_id AS pid,
+               SUM(CASE WHEN t.status IN ({_AWAITING_PLACEHOLDERS})
+                         AND NOT (t.status='review' AND t.review_job_id IS NOT NULL)
+                        THEN 1 ELSE 0 END) AS awaiting,
+               SUM(CASE WHEN t.status='draft' THEN 1 ELSE 0 END) AS drafts,
+               SUM(CASE WHEN t.status IN ({_IN_FLIGHT_PLACEHOLDERS})
+                         AND t.task_type != 'epic'
+                        THEN 1 ELSE 0 END) AS in_flight
+        FROM tree JOIN tasks t ON t.id = tree.id
+        WHERE t.archived=0
+        GROUP BY tree.project_id
+    """  # nosec B608 - placeholders only, values are params
+    activity_sql = """
+        WITH RECURSIVE tree(project_id, id) AS (
+            SELECT project_id, id FROM tasks
+            WHERE task_type='epic' AND project_id IS NOT NULL AND archived=0
+            UNION ALL
+            SELECT tree.project_id, t.id FROM tasks t JOIN tree ON t.parent_id = tree.id
+        )
+        SELECT tree.project_id AS pid, MAX(u.created_at) AS last_activity_at
+        FROM tree JOIN task_updates u ON u.task_id = tree.id
+        GROUP BY tree.project_id
+    """
+
+    summary: dict[int, dict[str, Any]] = {}
+    for row in await db.execute_fetchall(
+        counts_sql, AWAITING_HUMAN_STATUS_VALUES + IN_FLIGHT_STATUS_VALUES
+    ):
+        d = dict(row)
+        summary[int(d["pid"])] = {
+            "awaiting_human": int(d["awaiting"] or 0),
+            "drafts": int(d["drafts"] or 0),
+            "in_flight": int(d["in_flight"] or 0),
+            "last_activity_at": None,
+        }
+    for row in await db.execute_fetchall(activity_sql):
+        d = dict(row)
+        pid = int(d["pid"])
+        if pid in summary:
+            summary[pid]["last_activity_at"] = d["last_activity_at"]
+    return summary
 
 
 async def count_live_orphan_tasks(db: aiosqlite.Connection) -> int:

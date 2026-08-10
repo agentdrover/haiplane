@@ -3348,3 +3348,13 @@ body.htmx-request .htmx-progress {
 .project-inline-form { display: inline; }
 .project-edit-cell { padding: 0 8px 8px; }
 .project-edit-summary { cursor: pointer; font-size: 0.85em; opacity: 0.7; }
+
+/* Project cards (#567): the page answers "where is the work", so the cards come
+   before the routing table. Deliberately plain — the card must not grow into a
+   second dashboard, which is what the task's own scope forbids. */
+.project-cards { display: grid; gap: .75rem; margin-bottom: 1.25rem; }
+.project-card { border: 1px solid var(--border, #333); border-radius: 6px; padding: .75rem .9rem; }
+.project-card--archived { opacity: .55; }
+.project-card-numbers { margin: .35rem 0 .5rem; }
+.project-card-waiting { font-weight: 600; }
+.epic-group-title { margin: 1rem 0 .35rem; font-size: .95rem; }

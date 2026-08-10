@@ -2417,3 +2417,150 @@ async def test_done_epics_are_collapsed_not_hidden(client: AsyncClient, db):
     assert f'href="/tasks/{done}"' in page.text.replace("'", '"'), (
         "collapsed means present in the markup, not omitted"
     )
+
+
+# ---------------------------------------------------------------------------
+# /projects answers "what is happening", not "where to push" (#567)
+# ---------------------------------------------------------------------------
+
+
+async def test_status_sets_are_derived_not_retyped():
+    # AC-5 (#567): this codebase has already unified two hand-copied status
+    # lists — terminal statuses in #571 and epic liveness in #570 — and one of
+    # them shipped WRONG (it forgot `failed`). So "in flight" is subtraction, and
+    # a status added to the enum later must land in some set or fail here.
+    from hub.models import (
+        ACTIVE_STATUSES,
+        AWAITING_HUMAN_STATUSES,
+        FINAL_STATUSES,
+        IN_FLIGHT_STATUSES,
+        TaskStatus,
+    )
+
+    assert IN_FLIGHT_STATUSES == ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES
+    assert not (IN_FLIGHT_STATUSES & AWAITING_HUMAN_STATUSES)
+    assert not (AWAITING_HUMAN_STATUSES & FINAL_STATUSES)
+    unclassified = (
+        set(TaskStatus) - AWAITING_HUMAN_STATUSES - IN_FLIGHT_STATUSES - FINAL_STATUSES
+    )
+    assert not unclassified, f"a status belonging to no set: {unclassified}"
+    # draft is the one that was outside both pre-existing sets, and the one the
+    # original statement forgot. Pin it so it cannot quietly leave again.
+    assert TaskStatus.draft in AWAITING_HUMAN_STATUSES
+
+
+async def _project(db, slug: str, name: str, status: str = "active") -> int:
+    cur = await db.execute(
+        "INSERT INTO projects (slug, name, status) VALUES (?,?,?)", (slug, name, status)
+    )
+    await db.commit()
+    return cur.lastrowid
+
+
+async def test_projects_page_lists_only_live_epics_per_project(client: AsyncClient, db):
+    # AC-1 (#567): the card shows work, so a finished epic has no place on it —
+    # it is reachable through the collapsed block delivered by #570.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+
+    await seed_default_project(db)
+    pid = await _project(db, "proj-live", "Live Project")
+    live = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "Live epic", "task_type": "epic", "project": "proj-live"},
+        )
+    ).json()["id"]
+    done = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "Done epic", "task_type": "epic", "project": "proj-live"},
+        )
+    ).json()["id"]
+    await db.execute("UPDATE tasks SET status='completed' WHERE id=?", (done,))
+    await db.commit()
+
+    card = next(c for c in await get_project_cards(db) if c["project"]["id"] == pid)
+    ids = [e.id for e in card["live_epics"]]
+    assert ids == [live], f"only live epics belong on the card, got {ids}"
+
+    page = await client.get("/projects")
+    assert page.status_code == 200
+    assert "Live Project" in page.text
+
+
+async def test_project_card_counts_only_what_waits_for_a_human(client: AsyncClient, db):
+    # AC-2 (#567). Two corrections live in this test, both found by fact:
+    # (1) draft belongs in the count — draft→open is human-only, and production
+    #     holds 39 drafts against 2 in the three statuses first named;
+    # (2) a review with review_job_id set is a HEADLESS review owned by the
+    #     poller, not a person waiting — the exclusion
+    #     list_stale_by_status(require_null_review_job=True) already makes.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+
+    await seed_default_project(db)
+    pid = await _project(db, "proj-count", "Counting")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "proj-count"},
+        )
+    ).json()["id"]
+
+    async def _child(
+        title: str, status: str, *, job: str | None = None, archived: int = 0
+    ) -> int:
+        tid = (
+            await client.post(
+                "/api/tasks",
+                json={"title": title, "task_type": "feature", "parent_id": epic},
+            )
+        ).json()["id"]
+        await db.execute(
+            "UPDATE tasks SET status=?, review_job_id=?, archived=? WHERE id=?",
+            (status, job, archived, tid),
+        )
+        return tid
+
+    await _child("a draft", "draft")
+    await _child("a question", "needs_info")
+    await _child("a decision", "needs_decision")
+    await _child("a human review", "review")
+    await _child("a headless review", "review", job="job-abc")
+    await _child("archived draft", "draft", archived=1)
+    await _child("running", "running")
+    await _child("in ci", "ci_check")
+    await db.commit()
+
+    card = next(c for c in await get_project_cards(db) if c["project"]["id"] == pid)
+    assert card["awaiting_human"] == 4, (
+        "draft + needs_info + needs_decision + human review; NOT the headless "
+        "one and NOT the archived one"
+    )
+    assert card["drafts"] == 1, "the label needs the draft share to be honest"
+    assert card["in_flight"] == 2, (
+        "running + ci_check only. The EPIC is `open` too, and counting it would "
+        "add a permanent +1 to every project — an epic is a container, not work "
+        "in flight. This assertion is what forced that rule out into the open."
+    )
+
+    page = await client.get("/projects")
+    assert "ждёт вас: 4" in page.text
+    assert "черновиков: 1" in page.text, (
+        "a bare number reads as urgency; the label must name its composition"
+    )
+
+
+async def test_project_card_with_no_live_work_says_so(client: AsyncClient, db):
+    # AC-3 (#567): an empty card reads as "broken", not as "nothing to do" —
+    # the same rule #615 settled: silence is not an answer.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project(db, "proj-quiet", "Quiet Project")
+
+    page = await client.get("/projects")
+    assert page.status_code == 200
+    assert "Quiet Project" in page.text
+    assert "Живой работы нет" in page.text

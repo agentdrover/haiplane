@@ -13,6 +13,46 @@
     <h1 class="page-title">Projects</h1>
 </header>
 
+{% if cards %}
+<section class="project-cards">
+    {% for c in cards %}
+    <article class="project-card{% if c.project.archived %} project-card--archived{% endif %}">
+        <div class="epic-header">
+            <a href="/tasks?project={{ c.project.slug }}" class="epic-title">{{ c.project.name }}</a>
+            {% if c.project.status == 'pending' %}<span class="badge badge-draft">pending</span>{% endif %}
+            {% if c.project.archived %}<span class="badge badge-failed">archived</span>{% endif %}
+        </div>
+        <p class="project-card-numbers muted small">
+            {# Exactly three numbers, and the first one NAMES ITS COMPOSITION.
+               "ждёт вас: 41" alone reads as forty-one urgent things, when 39 of
+               them are backlog drafts. A number whose label overstates it is the
+               defect #571 shipped this morning (18 promised, 51 behind the
+               link), and the label is the cheap half of the fix. #}
+            <span class="project-card-waiting">ждёт вас: {{ c.awaiting_human }}{% if c.drafts %} (черновиков: {{ c.drafts }}){% endif %}</span>
+            · в работе: {{ c.in_flight }}
+            · активность: {{ c.last_activity_at[:10] if c.last_activity_at else "не было" }}
+        </p>
+        {% if c.live_epics %}
+        <div class="epic-children">
+            {% for e in c.live_epics %}
+            <a href="/tasks/{{ e.id }}" class="epic-child-link">
+                <span class="epic-child-title">#{{ e.id }} {{ e.title[:52] }}{% if e.title|length > 52 %}…{% endif %}</span>
+                {% if e.progress and e.progress.total > 0 %}
+                <span class="badge badge--xs">{{ e.progress.completed }}/{{ e.progress.total }}</span>
+                {% endif %}
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        {# Said out loud: an empty card reads as "broken", not as "nothing to do"
+           — the same rule as #615, where silence had to become an answer. #}
+        <div class="epic-empty">Живой работы нет — все эпики проекта доделаны или их ещё не завели</div>
+        {% endif %}
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
 {% if project_error %}
 <div class="task-action-note task-action-note--warning project-error-note">
     {{ project_error }}
