@@ -22,7 +22,11 @@
             <td>
                 <a href="/tasks/{{ t.id }}">{{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
                 {% if analyst_ready_by_id is defined and analyst_ready_by_id.get(t.id) %}
-                <span class="badge badge--xs badge-completed task-table-badge">Analyst Ready</span>
+                {# #624: badge--xs asked for 9px while task-table-badge asked for
+                   10.5px on the same element — two sizes at once, and the table's
+                   own rule won. The table rule is the intended one here (its three
+                   sibling badges use it alone), so the contradiction goes, not it. #}
+                <span class="badge badge-completed task-table-badge">Analyst Ready</span>
                 {% endif %}
             </td>
             <td><span class="badge badge-{{ t.status.value }} task-table-badge task-table-badge--status">{{ t.status.value }}</span></td>
