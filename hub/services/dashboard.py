@@ -348,11 +348,28 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
             }
         )
 
-    # Newest activity first; a project that has never seen a feed entry has no
-    # activity to report and goes last — the same honest answer #570 settled on
-    # instead of borrowing updated_at.
+    # What waits for a human comes first, and only then the freshest activity
+    # (#623). Ordering by activity alone answered "where did something move
+    # last" — a question the feed already answers — while this list is read to
+    # decide where to GO. A project holding a decision outranks a project where
+    # an agent merged something an hour ago, because the human is the scarce one.
+    #
+    # The first key is deliberately a BOOLEAN, not the count: 28 waiting items
+    # against 4 does not make the first project more urgent, it makes both
+    # waiting. Sorting by the number would put the biggest backlog permanently on
+    # top, which is the same defect as ordering by id — a stable answer to a
+    # question nobody asked.
+    #
+    # Activity still breaks ties inside each group, and a project that has never
+    # seen a feed entry still goes last within its group — the honest answer #570
+    # settled on instead of borrowing updated_at.
     cards.sort(
-        key=lambda c: (c["last_activity_at"] or "", c["project"]["id"]), reverse=True
+        key=lambda c: (
+            bool(c["awaiting_human"]),
+            c["last_activity_at"] or "",
+            c["project"]["id"],
+        ),
+        reverse=True,
     )
     return cards
 

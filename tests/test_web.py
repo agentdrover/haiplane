@@ -1287,7 +1287,11 @@ async def test_web_activate_pending_project(client: AsyncClient, db):
     await db.commit()
 
     page = await client.get("/projects")
-    assert "pending" in page.text and "web-activate" in page.text
+    # The badge says "ждёт активации" since #623: the section speaks Russian, and
+    # this state stayed English only because no project on prod is ever pending,
+    # so nobody could see it. What is pinned is that the state is VISIBLE and its
+    # action is offered — not which language the label happens to be in.
+    assert "ждёт активации" in page.text and "web-activate" in page.text
 
     resp = await client.post(f"/projects/{pid}/web-activate", follow_redirects=False)
     assert resp.status_code == 303
@@ -2667,7 +2671,10 @@ async def test_project_card_surfaces_pending_and_provision_error(
     # attribute a phone never shows.
     assert "clone failed" in page, "the reason must be readable without hovering"
     header_of_pending = page.split("Waiting", 1)[1].split("</div>", 1)[0]
-    assert "pending" in header_of_pending
+    assert "ждёт активации" in header_of_pending, (
+        "the pending state belongs in the header too; the label is Russian since "
+        "#623, which is when this state was first rendered and read"
+    )
 
 
 async def test_projects_page_lists_each_project_once(client: AsyncClient, db):
@@ -3324,4 +3331,207 @@ async def test_small_badge_size_actually_applies():
     )
     assert 'class="btn btn-xs' in markup or "btn-xs" in markup, (
         "precondition: .btn-xs is the one templates actually use"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The card order answers "where am I needed", not "where did something move"
+# (#623)
+# ---------------------------------------------------------------------------
+
+
+async def _project_with_epic(db, *, slug: str, name: str, child_status: str):
+    """A project whose epic carries one child in the given status."""
+    from hub import repository as repo_module
+
+    project_id = await repo_module.create_project(db, slug=slug, name=name)
+    epic_id = await repo_module.create_task(
+        db,
+        title=f"Эпик проекта {name}",
+        description="",
+        task_type="epic",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=True,
+        parent_id=None,
+        priority="medium",
+    )
+    child_id = await repo_module.create_task(
+        db,
+        title=f"Задача проекта {name}",
+        description="",
+        task_type="task",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status=child_status,
+        auto_review=True,
+        parent_id=epic_id,
+        priority="medium",
+    )
+    await db.execute(
+        "UPDATE tasks SET project_id = ? WHERE id IN (?, ?)",
+        (project_id, epic_id, child_id),
+    )
+    await db.commit()
+    return project_id, child_id
+
+
+async def test_cards_put_what_waits_for_a_human_first(db):
+    # AC-2 (#623). The order used to answer "where did something move last",
+    # which is the question the feed already answers. The card list is read to
+    # decide where to GO, and a project holding a decision outranks a project
+    # where an agent merged something an hour ago — the human is the scarce one.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+    from hub import repository as repo_module
+
+    await seed_default_project(db)
+
+    # Waits for a human (a draft needs approval) and has NO feed activity at all.
+    waiting, _ = await _project_with_epic(
+        db, slug="zhdet", name="Ждёт решения", child_status="draft"
+    )
+    # Nothing waits, but work moved just now — the loudest thing under the old key.
+    fresh, fresh_child = await _project_with_epic(
+        db, slug="svezhiy", name="Свежая активность", child_status="completed"
+    )
+    await repo_module.add_task_update(
+        db, fresh_child, "hub", "status", "работа шла только что"
+    )
+    await db.commit()
+
+    order = [c["project"]["id"] for c in await get_project_cards(db)]
+    assert waiting in order and fresh in order, "precondition: both cards are built"
+    assert order.index(waiting) < order.index(fresh), (
+        "a project holding a human decision must come before a project that "
+        f"merely saw recent activity; got order {order} "
+        f"(waiting={waiting}, fresh={fresh})"
+    )
+
+
+async def test_activity_still_breaks_ties_within_the_same_group(db):
+    # The new key must not throw the old one away: among projects that equally
+    # do or do not wait for a human, "where did work happen last" is still the
+    # right tiebreak — otherwise the list degenerates into an order by id, which
+    # answers "which was created last" and nothing more.
+    #
+    # The fresher project is created FIRST on purpose, so its id is the SMALLER
+    # one: with the ids agreeing with the activity, dropping the activity key
+    # entirely would still pass and the test would prove nothing. A mutation
+    # that removed it did exactly that until this fixture was rebuilt.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+    from hub import repository as repo_module
+
+    await seed_default_project(db)
+    newer, newer_child = await _project_with_epic(
+        db, slug="novyy", name="Новая активность", child_status="completed"
+    )
+    older, older_child = await _project_with_epic(
+        db, slug="staryy", name="Старая активность", child_status="completed"
+    )
+    await repo_module.add_task_update(db, older_child, "hub", "status", "давно")
+    await db.execute(
+        "UPDATE task_updates SET created_at = '2020-01-01 00:00:00' WHERE task_id = ?",
+        (older_child,),
+    )
+    await repo_module.add_task_update(db, newer_child, "hub", "status", "недавно")
+    await db.commit()
+
+    order = [c["project"]["id"] for c in await get_project_cards(db)]
+    assert order.index(newer) < order.index(older), (
+        f"neither project waits for a human, so the fresher one leads; got {order}"
+    )
+
+
+async def test_a_bigger_backlog_does_not_outrank_fresher_work(db):
+    # The first sort key is a BOOLEAN, and this pins why. Both projects wait for
+    # a human, so the question is which to open first — and "the one where five
+    # things are stuck" is not a better answer than "the one that moved today".
+    # Sorting by the COUNT would nail the largest backlog to the top forever,
+    # which is the same defect as ordering by id: a stable answer to a question
+    # nobody asked. A mutation replacing bool(...) with the raw number survived
+    # until this test existed.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+    from hub import repository as repo_module
+
+    await seed_default_project(db)
+    big, big_child = await _project_with_epic(
+        db, slug="bolshoy", name="Большой бэклог", child_status="draft"
+    )
+    for i in range(4):
+        extra = await repo_module.create_task(
+            db,
+            title=f"Ещё черновик {i}",
+            description="",
+            task_type="task",
+            runtime="auto",
+            source="agent",
+            assigned_agent="",
+            rationale="",
+            status="draft",
+            auto_review=True,
+            parent_id=None,
+            priority="medium",
+        )
+        await db.execute(
+            "UPDATE tasks SET parent_id = (SELECT parent_id FROM tasks WHERE id = ?), "
+            "project_id = ? WHERE id = ?",
+            (big_child, big, extra),
+        )
+    await repo_module.add_task_update(db, big_child, "hub", "status", "давно")
+    await db.execute(
+        "UPDATE task_updates SET created_at = '2020-01-01 00:00:00' WHERE task_id = ?",
+        (big_child,),
+    )
+    small, small_child = await _project_with_epic(
+        db, slug="malenkiy", name="Одно решение", child_status="draft"
+    )
+    await repo_module.add_task_update(db, small_child, "hub", "status", "сегодня")
+    await db.commit()
+
+    cards = await get_project_cards(db)
+    counts = {c["project"]["id"]: c["awaiting_human"] for c in cards}
+    assert counts[big] > counts[small], (
+        f"precondition: the big backlog really is bigger, got {counts}"
+    )
+    order = [c["project"]["id"] for c in cards]
+    assert order.index(small) < order.index(big), (
+        "both wait for a human, so the fresher one leads regardless of backlog "
+        f"size; got {order} (small={small}, big={big})"
+    )
+
+
+async def test_the_keyboard_reaches_the_content_before_the_menu(
+    client: AsyncClient, db
+):
+    # AC-4 (#623). Measured before this task: the first focus stop on EVERY page
+    # was "Dashboard", and six sidebar links stood between the keyboard and the
+    # content. The fix is a link that is invisible until focused — it costs a
+    # mouse user nothing and saves everyone else six tab presses per page.
+    import re
+
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    page = (await client.get("/projects")).text
+
+    focusable = re.findall(r"<(?:a\s[^>]*href|button|summary|input)[^>]*>", page)
+    assert focusable, "precondition: the page has focusable elements at all"
+    assert "skip-link" in focusable[0], (
+        f"the skip link must be the FIRST focus stop, not somewhere after the "
+        f"menu; first was {focusable[0][:80]}"
+    )
+
+    target = re.search(r'class="skip-link" href="#([\w-]+)"', page)
+    assert target, "the skip link must point somewhere"
+    assert f'id="{target.group(1)}"' in page, (
+        f"#{target.group(1)} does not exist on the page — a skip link that lands "
+        "nowhere is worse than none, because the keyboard user loses their place"
     )
