@@ -566,14 +566,31 @@ async def web_tasks_list_partial(
 # ---------------------------------------------------------------------------
 
 
+async def _project_selector_ctx(
+    db: aiosqlite.Connection, project: str | None
+) -> tuple[list[dict[str, Any]], str]:
+    """(projects for the selector, current slug) — no subtree walk (#621).
+
+    What a page needs to DRAW the selector is separate from what it needs to
+    narrow a list. A page that scopes its query by project — the only correct
+    way when the query is limited — wants this and nothing more.
+    """
+    rows = await repo.list_projects(db, only_active=True)
+    return [dict(r) for r in rows], (project or "").strip()
+
+
 async def _project_filter_ctx(
     db: aiosqlite.Connection, project: str | None
 ) -> tuple[set[int] | None, list[dict[str, Any]], str]:
-    """(allowed task ids | None, projects for the selector, current slug) (#339)."""
-    rows = await repo.list_projects(db, only_active=True)
-    projects = [dict(r) for r in rows]
+    """(allowed task ids | None, projects for the selector, current slug) (#339).
+
+    Post-filtering by this set is only safe where the lists are NOT limited
+    before it runs. Where they are, it silently drops rows — see #621 and the
+    comment in ``repo.list_tasks_filtered`` about applying the project BEFORE
+    the LIMIT.
+    """
+    projects, current = await _project_selector_ctx(db, project)
     allowed: set[int] | None = None
-    current = (project or "").strip()
     if current:
         prow = await repo.get_project_by_slug(db, current)
         allowed = (
@@ -955,8 +972,13 @@ async def web_tasks(
     project: str | None = Query(default=None),
 ):
     db = _db(request)
-    allowed, projects_list, current_project = await _project_filter_ctx(db, project)
+    projects_list, current_project = await _project_selector_ctx(db, project)
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
+    # The project goes INTO the query, not into a pass over its result (#621).
+    # This list is limited, and post-filtering a limited list spends the limit on
+    # other projects' rows: audit-evidence promised 17 queued and opened zero,
+    # which reads as "this project has no work". ``repo.list_tasks_filtered``
+    # applies project_id BEFORE the LIMIT and carries #370's comment saying why.
     tasks = await services.list_tasks(
         db,
         status=status,
@@ -969,9 +991,8 @@ async def web_tasks(
         human_owner=human_owner,
         human_reviewer=human_reviewer,
         limit=100,
+        project=current_project or None,
     )
-    if allowed is not None:
-        tasks = _filter_by_ids(tasks, allowed)
     tasks, ready_by_id = await _apply_analyst_ready_filter(
         db, tasks, analyst_ready=analyst_ready
     )

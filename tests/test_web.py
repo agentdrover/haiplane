@@ -3535,3 +3535,126 @@ async def test_the_keyboard_reaches_the_content_before_the_menu(
         f"#{target.group(1)} does not exist on the page — a skip link that lands "
         "nowhere is worse than none, because the keyboard user loses their place"
     )
+
+
+# ---------------------------------------------------------------------------
+# The number on a card and the list behind its link, part three (#621)
+# ---------------------------------------------------------------------------
+
+
+async def _bulk_noise_tasks(db, count: int) -> None:
+    """`count` tasks in `open` belonging to no project — pure limit pressure.
+
+    Inserted through SQL rather than the API on purpose: this fixture exists to
+    push the interesting rows PAST the page limit, and a hundred round trips
+    through the create pipeline would buy nothing but seconds.
+    """
+    await db.executemany(
+        "INSERT INTO tasks (title, task_type, status) VALUES (?, 'task', 'open')",
+        [(f"noise {i}",) for i in range(count)],
+    )
+    await db.commit()
+
+
+async def test_project_filter_survives_the_page_limit(client: AsyncClient, db):
+    # AC-1 (#621). Live, 12.08: audit-evidence promised 17 queued and its link
+    # opened ZERO rows, because /tasks took the newest 100 tasks GLOBALLY and
+    # only then dropped the ones belonging to other projects. An empty page is
+    # indistinguishable from "this project has no work" — the quiet kind of lie.
+    #
+    # The fixture puts the project's rows BEHIND a hundred newer ones on
+    # purpose. A test whose rows all fit inside the limit passes on the broken
+    # code too, which is exactly how this defect survived #339 and #370.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "old-work", "Old Work")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "old-work"},
+        )
+    ).json()["id"]
+    buried = (
+        await client.post(
+            "/api/tasks",
+            json={
+                "title": "buried by newer work",
+                "task_type": "feature",
+                "parent_id": epic,
+            },
+        )
+    ).json()["id"]
+    await db.execute("UPDATE tasks SET status='open' WHERE id=?", (buried,))
+    await db.commit()
+
+    await _bulk_noise_tasks(db, 150)
+
+    unscoped = await client.get("/tasks")
+    assert f"/tasks/{buried}" not in unscoped.text, (
+        "precondition: the noise really does push the project past the limit"
+    )
+
+    for params in ({"project": "old-work"}, {"project": "old-work", "state": "queued"}):
+        page = await client.get("/tasks", params=params)
+        assert page.status_code == 200, page.text
+        assert f"/tasks/{buried}" in page.text, (
+            f"{params}: the project filter has to reach the query and run BEFORE "
+            "the limit — filtering afterwards spends the whole limit on other "
+            "projects' rows and returns an empty page"
+        )
+
+
+async def test_the_queue_counts_epics_the_same_way_its_link_does(
+    client: AsyncClient, db
+):
+    # AC-2 (#621). Live, 12.08: notesforllm promised 4 queued and opened 5,
+    # calc-kids promised 1 and opened 2. The counter excludes epics
+    # (project_work_summary), the state filter did not — so a project's own epic
+    # sitting in `open` appeared in the list but not in the number.
+    #
+    # Resolved in favour of excluding, the same asymmetry #567 settled for "in
+    # flight": an epic lives its whole life in `open` as a container, so it is
+    # not "approved and nobody started it".
+    import re
+
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+
+    await seed_default_project(db)
+    pid = await _project_with(client, db, "one-epic", "One Epic")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={
+                "title": "a container, not a queue item",
+                "task_type": "epic",
+                "project": "one-epic",
+            },
+        )
+    ).json()["id"]
+    queued = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "really queued", "task_type": "feature", "parent_id": epic},
+        )
+    ).json()["id"]
+    await db.execute("UPDATE tasks SET status='open' WHERE id IN (?,?)", (epic, queued))
+    await db.commit()
+
+    card = next(c for c in await get_project_cards(db) if c["project"]["id"] == pid)
+    assert card["queued"] == 1, "precondition: the counter does not count the epic"
+
+    for path in ("/tasks", "/tasks/list"):
+        page = await client.get(path, params={"project": "one-epic", "state": "queued"})
+        assert page.status_code == 200, page.text
+        # Anchored on the ROW marker, not on a bare "/tasks/{id}": a child row
+        # links to its own parent, so the loose form finds the epic in the very
+        # row that proves it was excluded. Same marker the production walk
+        # counted rows by.
+        rows = re.findall(r'id="task-row-(\d+)"', page.text)
+        assert rows == [str(queued)], (
+            f"{path}: the list must hold exactly what the number promised — the "
+            f"epic is a container in the count, so it cannot be a queue item in "
+            f"the list; got rows {rows}"
+        )
