@@ -77,7 +77,17 @@ TASK_STATE_FILTERS: dict[str, tuple[str, tuple[str, ...]]] = {
     # A fourth NAMED mode, added exactly the way #617's revisit condition said to
     # grow this: approved and untouched is a queue, and it deserves its own link
     # rather than an arbitrary status list in the query string (#619).
-    "queued": (f"status IN ({_QUEUED_PLACEHOLDERS})", QUEUED_STATUS_VALUES),
+    #
+    # Epics are excluded, and the reason is the one ``project_work_summary``
+    # already gives for the same exclusion: an epic sits in ``open`` for its
+    # entire life as a container, so it is not "approved and nobody started it".
+    # #619 put that rule in the counter and forgot it here, which is how
+    # notesforllm came to promise 4 and open 5 (#621). The membership rule now
+    # lives on BOTH sides of the same door.
+    "queued": (
+        f"status IN ({_QUEUED_PLACEHOLDERS}) AND task_type != 'epic'",
+        QUEUED_STATUS_VALUES,
+    ),
 }
 
 
