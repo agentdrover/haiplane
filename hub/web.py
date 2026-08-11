@@ -431,24 +431,16 @@ async def web_partial_inbox(
     project: str | None = Query(None),
 ):
     db = _db(request)
+    # #627: the project goes into the queries, not over their results. These
+    # lists are capped at 20 apiece, so the old pass afterwards silently dropped
+    # every row of a project whose work was not among the newest.
     inbox = await services.get_inbox_data(
         db,
         human_owner=human_owner,
         claimed_by=claimed_by,
         mine=mine,
+        project=project,
     )
-    allowed, _, _ = await _project_filter_ctx(db, project)
-    if allowed is not None:
-        for key in (
-            "drafts",
-            "questions",
-            "decisions",
-            "pending_reports",
-            "ci_check_tasks",
-            "fix_requested_tasks",
-            "stale_tasks",
-        ):
-            inbox[key] = _filter_by_ids(inbox[key], allowed)
     inbox["dispatch_available"] = _dispatch_available()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
@@ -475,18 +467,10 @@ async def web_partial_epics(request: Request):
 @router.get("/partials/kanban", response_class=HTMLResponse)
 async def web_partial_kanban(request: Request, project: str | None = Query(None)):
     db = _db(request)
-    data = await services.get_dashboard_data(db)
-    allowed, _, _ = await _project_filter_ctx(db, project)
-    if allowed is not None:
-        for field in (
-            "active_tasks",
-            "draft_tasks",
-            "review_tasks",
-            "needs_decision_tasks",
-            "needs_info_tasks",
-        ):
-            if hasattr(data, field):
-                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
+    # #627: narrowed in the query. This fragment refreshes every 30 seconds, so
+    # the old post-filter did not merely hide a project's board once — it kept
+    # re-hiding it.
+    data = await services.get_dashboard_data(db, project=project)
     tasks_for_badges = [
         *data.active_tasks,
         *data.draft_tasks,
@@ -592,10 +576,11 @@ async def _project_filter_ctx(
 ) -> tuple[set[int] | None, list[dict[str, Any]], str]:
     """(allowed task ids | None, projects for the selector, current slug) (#339).
 
-    Post-filtering by this set is only safe where the lists are NOT limited
-    before it runs. Where they are, it silently drops rows — see #621 and the
-    comment in ``repo.list_tasks_filtered`` about applying the project BEFORE
-    the LIMIT.
+    The remaining caller is the epic board, and only because ``list_live_epics``
+    carries no LIMIT — narrowing an uncut list in Python cannot lose a row.
+    Everywhere a list IS limited the project must reach the query instead; that
+    mistake has now been made and fixed three times (#370, #621, #627), so the
+    generic post-filter helper is gone rather than left within reach.
     """
     projects, current = await _project_selector_ctx(db, project)
     allowed: set[int] | None = None
@@ -609,38 +594,15 @@ async def _project_filter_ctx(
     return allowed, projects, current
 
 
-def _filter_by_ids(items: list[Any], allowed: set[int] | None) -> list[Any]:
-    if allowed is None:
-        return items
-    return [t for t in items if (t.id if hasattr(t, "id") else t.get("id")) in allowed]
-
-
 @router.get("/", response_class=HTMLResponse)
 async def web_dashboard(request: Request, project: str | None = Query(None)):
     db = _db(request)
     allowed, projects_list, current_project = await _project_filter_ctx(db, project)
-    data = await services.get_dashboard_data(db)
-    inbox = await services.get_inbox_data(db)
-    if allowed is not None:
-        for field in (
-            "active_tasks",
-            "draft_tasks",
-            "review_tasks",
-            "needs_decision_tasks",
-            "needs_info_tasks",
-        ):
-            if hasattr(data, field):
-                setattr(data, field, _filter_by_ids(getattr(data, field), allowed))
-        for key in (
-            "drafts",
-            "questions",
-            "decisions",
-            "pending_reports",
-            "ci_check_tasks",
-            "fix_requested_tasks",
-            "stale_tasks",
-        ):
-            inbox[key] = _filter_by_ids(inbox[key], allowed)
+    # #627: both aggregates narrow inside their own queries now. Every list they
+    # build is capped at 20, and a cap applied before the project filter is what
+    # made a project's whole board disappear.
+    data = await services.get_dashboard_data(db, project=project)
+    inbox = await services.get_inbox_data(db, project=project)
     epics = await services.get_epics_enriched(db)
     # The same project scope the other dashboard lists get — passed in, because
     # a board computed around the filter shows another project's epics (#570).
