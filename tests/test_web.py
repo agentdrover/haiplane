@@ -3542,16 +3542,22 @@ async def test_the_keyboard_reaches_the_content_before_the_menu(
 # ---------------------------------------------------------------------------
 
 
-async def _bulk_noise_tasks(db, count: int) -> None:
-    """`count` tasks in `open` belonging to no project — pure limit pressure.
+async def _bulk_noise_tasks(db, count: int, status: str = "open") -> None:
+    """`count` tasks belonging to no project — pure limit pressure.
 
     Inserted through SQL rather than the API on purpose: this fixture exists to
     push the interesting rows PAST the page limit, and a hundred round trips
     through the create pipeline would buy nothing but seconds.
+
+    ``status`` is a parameter because noise only presses where the filter under
+    test lets it through: 150 `open` rows are invisible to a test of the
+    `awaiting` mode, and a test whose noise gets filtered out for it passes on
+    the broken code. That mistake was made once here and caught by a test that
+    went green before its fix existed.
     """
     await db.executemany(
-        "INSERT INTO tasks (title, task_type, status) VALUES (?, 'task', 'open')",
-        [(f"noise {i}",) for i in range(count)],
+        f"INSERT INTO tasks (title, task_type, status) VALUES (?, 'task', '{status}')",  # noqa: E501, S608
+        [(f"noise {status} {i}",) for i in range(count)],
     )
     await db.commit()
 
@@ -3658,3 +3664,179 @@ async def test_the_queue_counts_epics_the_same_way_its_link_does(
             f"epic is a container in the count, so it cannot be a queue item in "
             f"the list; got rows {rows}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The scope survives the first click on a filter (#626)
+# ---------------------------------------------------------------------------
+
+
+async def _scoped_project_fixture(client: AsyncClient, db) -> tuple[int, int]:
+    """A project holding one draft and one running task, buried under newer rows.
+
+    Returns (draft id, running id). The burial matters: #621 fixed the page by
+    moving the project INTO the query, and a fixture whose rows fit inside the
+    limit cannot tell a scoped fragment from an unscoped one.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "scoped", "Scoped")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "scoped"},
+        )
+    ).json()["id"]
+
+    async def _child(title: str, status: str) -> int:
+        tid = (
+            await client.post(
+                "/api/tasks",
+                json={"title": title, "task_type": "feature", "parent_id": epic},
+            )
+        ).json()["id"]
+        await db.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        return tid
+
+    drafted = await _child("scoped draft", "draft")
+    running = await _child("scoped running", "running")
+    await db.commit()
+    # Noise in BOTH statuses under test: `open` rows are invisible to the
+    # `awaiting` mode, so open-only noise would leave that test proving nothing.
+    await _bulk_noise_tasks(db, 150, status="open")
+    await _bulk_noise_tasks(db, 150, status="draft")
+    return drafted, running
+
+
+async def test_filter_change_keeps_the_project_and_state_it_arrived_with(
+    client: AsyncClient, db
+):
+    # AC-1 (#626). Live, 12.08: /tasks?project=default&state=awaiting showed 28
+    # rows — exactly what the card promised. Changing ANY filter sent htmx to
+    # /tasks/list, which knew nothing of either parameter, and the table became
+    # 100 rows across every project while the selector still said "Default".
+    # Widening a list looks exactly like filtering it, which is what makes this
+    # quiet.
+    import re
+
+    drafted, running = await _scoped_project_fixture(client, db)
+
+    # What the page shows when you arrive from a card.
+    arrived = await client.get(
+        "/tasks", params={"project": "scoped", "state": "awaiting"}
+    )
+    assert re.findall(r'id="task-row-(\d+)"', arrived.text) == [str(drafted)]
+
+    # What htmx asks for when a filter changes — now carrying the same scope.
+    after_click = await client.get(
+        "/tasks/list",
+        params={"project": "scoped", "state": "awaiting", "priority": "medium"},
+    )
+    assert after_click.status_code == 200, after_click.text
+    rows = re.findall(r'id="task-row-(\d+)"', after_click.text)
+    assert rows == [str(drafted)], (
+        "changing a filter must NARROW what was on screen, not silently replace "
+        f"it with every project's rows; got {len(rows)} rows"
+    )
+    assert str(running) not in rows, "the state mode has to survive the click too"
+
+
+async def test_fragment_and_page_agree_on_the_project_scope(client: AsyncClient, db):
+    # AC-2 (#626). Compared as SETS, not sizes: two lists of equal length can
+    # hold different rows, and that mistake would let this pass on broken code.
+    import re
+
+    drafted, running = await _scoped_project_fixture(client, db)
+
+    for params in ({"project": "scoped"}, {"project": "scoped", "state": "live"}):
+        page = await client.get("/tasks", params=params)
+        fragment = await client.get("/tasks/list", params=params)
+        assert fragment.status_code == 200, fragment.text
+        page_rows = set(re.findall(r'id="task-row-(\d+)"', page.text))
+        frag_rows = set(re.findall(r'id="task-row-(\d+)"', fragment.text))
+        assert page_rows == frag_rows, (
+            f"{params}: the fragment and the page must answer the same question — "
+            f"page had {len(page_rows)} rows, fragment {len(frag_rows)}"
+        )
+        assert {str(drafted), str(running)} <= page_rows, (
+            "precondition: the project's own rows are in the scoped answer"
+        )
+
+
+async def test_the_filter_bar_carries_the_scope_it_was_opened_with(
+    client: AsyncClient, db
+):
+    # AC-3 (#626). The server side alone is not a fix: hx-include collects
+    # ".filter-bar [name]", and the project selector lives in the header, OUTSIDE
+    # that container. Measured on production before this task, the bar sent
+    # exactly eight fields and none of them was project, state or no_epic — so a
+    # fixed handler would still never be told.
+    import re
+
+    await _scoped_project_fixture(client, db)
+    page = await client.get(
+        "/tasks", params={"project": "scoped", "state": "awaiting", "no_epic": "1"}
+    )
+    bar = page.text[
+        page.text.index('class="filter-bar"') : page.text.index('id="task-table-wrap"')
+    ]
+    sent = set(re.findall(r'name="([^"]+)"', bar))
+    assert {"project", "state", "no_epic"} <= sent, (
+        f"the bar must send the scope it was opened with; it sends {sorted(sent)}"
+    )
+    assert 'value="scoped"' in bar and 'value="awaiting"' in bar, (
+        "the hidden fields must carry the CURRENT values, not empty placeholders"
+    )
+
+
+async def test_project_selector_keeps_the_other_filters(client: AsyncClient, db):
+    # AC-4 (#626). The selector is a GET form; submitting it replaces the whole
+    # query string. Its own template said so: "keeps other query params out of
+    # scope for V1". Narrowing by project should not clear the status you were
+    # looking at.
+    import re
+
+    await _scoped_project_fixture(client, db)
+    page = await client.get(
+        "/tasks", params={"project": "scoped", "status": "draft", "priority": "high"}
+    )
+    form = re.search(r'<form[^>]*class="project-selector".*?</form>', page.text, re.S)
+    assert form, "the selector form must be on the page"
+    carried = dict(re.findall(r'name="(\w+)"\s+value="([^"]*)"', form.group(0)))
+    assert carried.get("status") == "draft" and carried.get("priority") == "high", (
+        f"switching project must keep the other filters; the form carries {carried}"
+    )
+
+    # ...and the dashboard, which SHARES this template, must not grow task-page
+    # filter fields in its own URL.
+    dash = await client.get("/", params={"project": "scoped"})
+    dash_form = re.search(
+        r'<form[^>]*class="project-selector".*?</form>', dash.text, re.S
+    )
+    assert dash_form, "the dashboard has the selector too"
+    assert 'name="status"' not in dash_form.group(0), (
+        "the dashboard has no task filters to preserve — carrying them there "
+        "would put meaningless parameters in its URL"
+    )
+
+
+async def test_the_applied_state_mode_is_visible_and_removable(client: AsyncClient, db):
+    # AC-5 (#626). A filter with no on-screen representation cannot be read or
+    # undone: today the only way out of state=awaiting is Reset, which drops the
+    # project as well. So the mode gets a control, and clearing it keeps the
+    # project.
+    import re
+
+    await _scoped_project_fixture(client, db)
+    page = (
+        await client.get("/tasks", params={"project": "scoped", "state": "awaiting"})
+    ).text
+    assert "state-chip" in page, "an applied mode must be visible on the page"
+    clear = re.search(r'class="[^"]*state-chip-clear[^"]*"\s+href="([^"]+)"', page)
+    assert clear, "the mode must be removable without hunting for Reset"
+    target = clear.group(1).replace("&amp;", "&")
+    assert "project=scoped" in target, (
+        f"clearing the mode must keep the project; it goes to {target}"
+    )
+    assert "state=" not in target, "…and must actually drop the mode"

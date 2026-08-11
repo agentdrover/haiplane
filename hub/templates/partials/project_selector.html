@@ -1,6 +1,26 @@
-{# Project selector (#339): GET form keeps other query params out of scope for V1. #}
+{# Project selector (#339). Since #626 it NARROWS instead of starting over:
+   switching project used to submit a GET form holding nothing but `project`,
+   so every other filter was silently cleared. The template said as much —
+   "keeps other query params out of scope for V1" — and that V1 outlived the
+   page it was written for.
+
+   The carried filters are opt-in per page, keyed off `selector_action`: the
+   dashboard shares this template and has no task filters, so handing it these
+   fields would put parameters in its URL that nothing there reads. #}
 {% if projects_list is defined and projects_list %}
 <form method="get" action="{{ selector_action | default('/') }}" class="project-selector">
+    {% if selector_action == '/tasks' %}
+    {% for name, value in [
+        ('status', filter_status), ('type', filter_type),
+        ('priority', filter_priority), ('source', filter_source),
+        ('human_owner', filter_human_owner), ('human_reviewer', filter_human_reviewer),
+        ('state', filter_state),
+    ] %}{% if value %}<input type="hidden" name="{{ name }}" value="{{ value }}">
+    {% endif %}{% endfor %}
+    {% if filter_parent_id %}<input type="hidden" name="parent_id" value="{{ filter_parent_id }}">{% endif %}
+    {% if filter_analyst_ready %}<input type="hidden" name="analyst_ready" value="1">{% endif %}
+    {% if filter_no_epic %}<input type="hidden" name="no_epic" value="1">{% endif %}
+    {% endif %}
     <label class="filter-label" for="project-select">Project</label>
     <select id="project-select" name="project" class="filter-control" onchange="this.form.submit()">
         <option value="">All projects</option>
