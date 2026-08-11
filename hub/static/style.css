@@ -3369,3 +3369,9 @@ body.htmx-request .htmx-progress {
 .project-admin-facts dd { margin: 0; word-break: break-all; }
 .project-admin-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .4rem; }
 .project-admin-edit { margin-top: .3rem; }
+
+/* #619: the three indicators are links, and the first one carries the weight. */
+.project-card-waiting { font-weight: 600; }
+.project-card-epics-note { margin: .3rem 0 .1rem; }
+.project-card-actions { margin: .45rem 0 .1rem; }
+.btn--xs { padding: .15rem .5rem; font-size: .8rem; }

@@ -254,12 +254,26 @@ AWAITING_HUMAN_STATUSES = frozenset(
     }
 )
 
+# Approved, and nobody has started it: a QUEUE, not work (#619).
+#
+# `open` was inside "in flight" until a live page showed it-grade-dashboard with
+# "в работе: 46" beside "активность: 20.07" — a month of silence. Those 46 were
+# approved and untouched, which made the most abandoned project look like the
+# busiest one in the hub. A queue is worth counting; it is just not the same
+# question as "who is moving something right now".
+#
+# Its own named set rather than a hole: the test that asserts the sets partition
+# TaskStatus exactly would otherwise pass with `open` belonging to nothing, and a
+# status quietly outside every set is precisely the defect that test exists to
+# catch (draft was that status until #567).
+QUEUED_STATUSES = frozenset({TaskStatus.open})
+
 # Work in flight — DERIVED, never retyped. Spelling this set out by hand would
 # be the third copy of a status list in this codebase; the first two had to be
 # unified in #571 (terminal statuses) and #570 (epic liveness), and one of them
-# shipped wrong. A status added to TaskStatus later lands in none of the three
+# shipped wrong. A status added to TaskStatus later lands in none of the four
 # sets and the test in tests/test_web.py fails, which is the point.
-IN_FLIGHT_STATUSES = ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES
+IN_FLIGHT_STATUSES = ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES - QUEUED_STATUSES
 
 
 # --- Request models ---
