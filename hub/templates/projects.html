@@ -17,14 +17,17 @@
     </p>
 </header>
 
-{% if cards %}
-<section class="project-cards">
-    {% for c in cards %}
+{% macro project_card(c) %}
     <article class="project-card{% if c.project.archived %} project-card--archived{% endif %}">
         <div class="epic-header">
             <a href="/tasks?project={{ c.project.slug }}" class="epic-title">{{ c.project.name }}</a>
-            {% if c.project.status == 'pending' %}<span class="badge badge-draft">pending</span>{% endif %}
-            {% if c.project.archived %}<span class="badge badge-failed">archived</span>{% endif %}
+            {# #623: these two badges stayed English when #622 translated the
+               section, and the reason they survived is worth naming — no project
+               on prod is pending or archived, so neither badge could be SEEN.
+               Three of five states existed only on paper until this task
+               rendered them locally. #}
+            {% if c.project.status == 'pending' %}<span class="badge badge-draft">ждёт активации</span>{% endif %}
+            {% if c.project.archived %}<span class="badge badge-failed">в архиве</span>{% endif %}
             {# #568: a broken workspace stays on the surface. Hiding it behind the
                disclosure would put a failure one click away from being unseen,
                and the state of the workspace is not administration — it is news. #}
@@ -80,8 +83,10 @@
                 <span class="epic-child-title">#{{ e.id }} {{ e.title[:52] }}{% if e.title|length > 52 %}…{% endif %}</span>
                 {% if e.progress and e.progress.total > 0 %}
                 {# Labelled: "1/2" alone at the far right does not say what it is
-                   a share OF (#619). #}
-                <span class="badge badge--xs" title="задач готово из всех в эпике">готово {{ e.progress.completed }} из {{ e.progress.total }}</span>
+                   a share OF (#619). The decoding used to live in a title
+                   attribute — invisible on a phone, unread by a screen reader on
+                   touch — so it is text now, hidden from the eye only (#623). #}
+                <span class="badge badge--xs">готово {{ e.progress.completed }} из {{ e.progress.total }}<span class="u-sr-only"> задач в эпике</span></span>
                 {% endif %}
             </a>
             {% endfor %}
@@ -156,8 +161,28 @@
             </details>
         </details>
     </article>
-    {% endfor %}
+{% endmacro %}
+
+{% set live_cards = cards | rejectattr('project.archived') | list %}
+{% set archived_cards = cards | selectattr('project.archived') | list %}
+{% if live_cards %}
+<section class="project-cards">
+    {% for c in live_cards %}{{ project_card(c) }}{% endfor %}
 </section>
+{% endif %}
+{% if archived_cards %}
+{# #623: archived projects are not news, but they are not gone either. A
+   collapsed group keeps them one keystroke away and OUT of the comparison the
+   list exists for. Dimming them in place with opacity: .55 was the old answer
+   and it was measurably wrong: opacity MULTIPLIES contrast, dropping
+   --text-secondary from 7.08:1 to 3.13:1 — below the readable floor. A group
+   says "set aside" without making the text harder to read. #}
+<details class="project-archive">
+    <summary class="project-archive-summary">Архив ({{ archived_cards|length }})</summary>
+    <section class="project-cards">
+        {% for c in archived_cards %}{{ project_card(c) }}{% endfor %}
+    </section>
+</details>
 {% endif %}
 
 {% if project_error %}

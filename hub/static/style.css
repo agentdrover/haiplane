@@ -3407,7 +3407,42 @@ body.htmx-request .htmx-progress {
    106px) dictated the whole column — measured 524.758px inside a 343px
    container, which pushed the card 150px off a 375px screen. The text was
    always willing to clip; the track was not willing to let it (#620). */
-.project-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; margin-bottom: 1.25rem; }
+/* #623: one column was a phone fix from #620 that never came back for the
+   desktop, so on 1280px a card was 978px wide and five projects could only be
+   compared by scrolling. auto-fill with a floor lets the row hold as many as
+   fit and collapses to one when they do not — the phone stays fixed without
+   nailing the desktop to a single column. The floor is 380px, measured rather
+   than guessed: at 420px the row still held only two cards inside the 978px
+   content box, while 380px fits two with room to spare and does not shorten the
+   epic titles, which are cut at 52 characters by the template anyway. */
+.project-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: .75rem;
+    margin-bottom: 1.25rem;
+}
+
+/* The phone guarantee from #620, restated explicitly: a 380px floor would
+   overflow a 375px screen, and grid tracks never shrink below their floor. */
+@media (max-width: 768px) {
+    .project-cards { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* #623: the archive is a collapsed group now, and the summary is a real tap
+   target — 19px was below every floor in WCAG 2.5.8. */
+.project-archive { margin-bottom: 1.25rem; }
+
+.project-archive-summary {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding: var(--sp-2) 0;
+    font-size: .95rem;
+    color: var(--text-secondary);
+}
+
+.project-archive-summary:hover { color: var(--text); }
 .project-card {
     /* Was transparent while .epic-card and .card both use --surface, so the
        boundary of a group was barely visible. Radius and padding come from
@@ -3420,7 +3455,12 @@ body.htmx-request .htmx-progress {
     transition: border-color .15s ease;
 }
 .project-card:hover { border-color: var(--accent); }
-.project-card--archived { opacity: .55; }
+/* #623: opacity: .55 lived here and it was measurably wrong — opacity MULTIPLIES
+   contrast, so --text-secondary fell from 7.08:1 to 3.13:1, under the 4.5 floor
+   for small text. The card is set aside by its GROUP now; here it only loses the
+   surface fill, which says "not part of the comparison" without touching how
+   readable the words are. */
+.project-card--archived { background: transparent; }
 .project-card-numbers { margin: .35rem 0 .5rem; }
 .project-card-waiting { font-weight: 600; }
 .epic-group-title { margin: 1rem 0 .35rem; font-size: .95rem; }
@@ -3429,7 +3469,16 @@ body.htmx-request .htmx-progress {
    second table repeating the same list. Collapsed by default — the page answers
    "what is happening" first, "where to push" on demand. */
 .project-admin { margin-top: .6rem; border-top: 1px solid var(--border); padding-top: .5rem; }
-.project-admin-summary { cursor: pointer; font-size: .85rem; color: var(--text-secondary); }
+/* 19px measured — under every floor WCAG 2.5.8 names. A disclosure is a control,
+   and a control has to be hittable with a thumb (#623). */
+.project-admin-summary {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    font-size: .85rem;
+    color: var(--text-secondary);
+}
 .project-admin-facts { display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; margin: .5rem 0; font-size: .85rem; }
 .project-admin-facts dt { color: var(--text-secondary); }
 .project-admin-facts dd { margin: 0; word-break: break-all; }
@@ -3450,6 +3499,37 @@ body.htmx-request .htmx-progress {
 .project-card .epic-header,
 .project-card .project-card-numbers { min-width: 0; }
 .project-card .epic-child-title { min-width: 0; text-overflow: ellipsis; }
+
+/* #623: 27px measured, and a finger is not a mouse pointer. Only on narrow
+   screens — WCAG 2.5.8 exists for touch, and on a desktop the extra 9px per row
+   would push the fifth epic off the card for nothing. The chip goes to 32px in
+   the same breath: it already cleared the 24px minimum at 31px, so this is
+   rounding, not a rescue. */
+.project-card .topbar-stat { min-height: 32px; }
+
+@media (max-width: 768px) {
+    .project-card .epic-child-link { min-height: 36px; }
+}
+
+/* #623: invisible until focused. Placed last so nothing later in the cascade can
+   quietly bury it. */
+.skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    z-index: 100;
+    padding: var(--sp-2) var(--sp-4);
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    color: var(--text);
+    text-decoration: none;
+}
+
+.skip-link:focus {
+    left: var(--sp-3);
+    top: var(--sp-3);
+}
 
 /* The bottom bar is fixed, so the last rows of every page would sit under it. */
 @media (max-width: 768px) {

@@ -12,6 +12,11 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body>
+{# #623: six sidebar links stood between the keyboard and the content of
+   EVERY page — measured, the first focus stop was "Dashboard". The link
+   is invisible until focused, which is the point: it costs a sighted
+   mouse user nothing and saves everyone else six tab presses per page. #}
+<a class="skip-link" href="#main">Перейти к содержимому</a>
 <div class="layout">
     <aside class="sidebar">
         <div class="logo">
@@ -56,7 +61,7 @@
             {% endif %}
         </div>
     </aside>
-    <main class="main">
+    <main class="main" id="main" tabindex="-1">
         {% block content %}{% endblock %}
     </main>
 </div>
