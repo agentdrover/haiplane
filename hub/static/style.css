@@ -2451,7 +2451,7 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
     transform: translateY(-1px);
 }
 
-.topbar-stat-label {
+.topbar-stat-label { /* --text-secondary: 7.08:1; --text-muted было 3.53:1 (#622) */
     font-size: 10px;
     font-weight: 600;
     text-transform: uppercase;
@@ -3355,6 +3355,28 @@ body.htmx-request .htmx-progress {
 .project-edit-cell { padding: 0 8px 8px; }
 .project-edit-summary { cursor: pointer; font-size: 0.85em; opacity: 0.7; }
 
+/* Utility classes that 28 places in six templates already used — while no rule
+   defined them (#622). Undefined means "inherit", so every caption meant to be
+   quiet rendered at body colour and size: the least important text on the page
+   was louder than the most important. --text-secondary, not --text-muted: the
+   latter is 3.53:1 on a card surface, below the 4.5 a caption needs. */
+.muted { color: var(--text-secondary); }
+.small { font-size: 12px; line-height: 1.5; }
+
+/* Visible to a screen reader, not to the eye. The meaning of "0/4" currently
+   lives in a title attribute, which touch devices never read. */
+.u-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
 /* Project cards (#567): the page answers "where is the work", so the cards come
    before the routing table. Deliberately plain — the card must not grow into a
    second dashboard, which is what the task's own scope forbids. */
@@ -3364,7 +3386,18 @@ body.htmx-request .htmx-progress {
    container, which pushed the card 150px off a 375px screen. The text was
    always willing to clip; the track was not willing to let it (#620). */
 .project-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; margin-bottom: 1.25rem; }
-.project-card { border: 1px solid var(--border, #333); border-radius: 6px; padding: .75rem .9rem; }
+.project-card {
+    /* Was transparent while .epic-card and .card both use --surface, so the
+       boundary of a group was barely visible. Radius and padding come from
+       tokens instead of magic numbers, and the border no longer carries a dead
+       fallback: --border exists (#622). */
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-4);
+    transition: border-color .15s ease;
+}
+.project-card:hover { border-color: var(--accent); }
 .project-card--archived { opacity: .55; }
 .project-card-numbers { margin: .35rem 0 .5rem; }
 .project-card-waiting { font-weight: 600; }
@@ -3373,16 +3406,15 @@ body.htmx-request .htmx-progress {
 /* Project admin block (#568): git routing lives with its project instead of in a
    second table repeating the same list. Collapsed by default — the page answers
    "what is happening" first, "where to push" on demand. */
-.project-admin { margin-top: .6rem; border-top: 1px solid var(--border, #333); padding-top: .5rem; }
-.project-admin-summary { cursor: pointer; font-size: .85rem; color: var(--muted, #999); }
+.project-admin { margin-top: .6rem; border-top: 1px solid var(--border); padding-top: .5rem; }
+.project-admin-summary { cursor: pointer; font-size: .85rem; color: var(--text-secondary); }
 .project-admin-facts { display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; margin: .5rem 0; font-size: .85rem; }
-.project-admin-facts dt { color: var(--muted, #999); }
+.project-admin-facts dt { color: var(--text-secondary); }
 .project-admin-facts dd { margin: 0; word-break: break-all; }
 .project-admin-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .4rem; }
 .project-admin-edit { margin-top: .3rem; }
 
 /* #619: the three indicators are links, and the first one carries the weight. */
-.project-card-waiting { font-weight: 600; }
 .project-card-epics-note { margin: .3rem 0 .1rem; }
 .project-card-actions { margin: .45rem 0 .1rem; }
 .btn--xs { padding: .15rem .5rem; font-size: .8rem; }

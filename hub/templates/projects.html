@@ -1,16 +1,20 @@
 {% extends "base.html" %}
 {% set active = "projects" %}
-{% block title %}Projects — OpenClaw Hub{% endblock %}
+{% block title %}Проекты — OpenClaw Hub{% endblock %}
 {% block content %}
-{% if orphan_live %}
-<p class="muted">
-    {# Same figure as the epic list, same function behind it (#571). #}
-    <a href="/tasks?no_epic=1&amp;state=live">Без эпика: {{ orphan_live }} живых задач</a>
-    — вне всех проектов, потому что проект наследуется от эпика.
-</p>
-{% endif %}
 <header class="page-header">
-    <h1 class="page-title">Projects</h1>
+    <h1 class="page-title">Проекты{% if cards %} <span class="badge">{{ cards|length }}</span>{% endif %}</h1>
+    {# The footnote used to sit ABOVE the h1 and was the page's first tab stop —
+       it answered a question the arriving reader does not have yet (#622). And
+       the sorting rule is a property of the SECTION: it was printed once per
+       card, five times over. #}
+    <p class="muted small page-subtitle">
+        Эпики внутри проекта — свежие сверху, по последней работе.
+        {% if orphan_live %}
+        <a href="/tasks?no_epic=1&amp;state=live">Без эпика: {{ orphan_live }}</a>
+        — эти задачи вне проектов, потому что проект наследуется от эпика.
+        {% endif %}
+    </p>
 </header>
 
 {% if cards %}
@@ -24,38 +28,50 @@
             {# #568: a broken workspace stays on the surface. Hiding it behind the
                disclosure would put a failure one click away from being unseen,
                and the state of the workspace is not administration — it is news. #}
-            {% if c.project.provision_status == 'ok' %}
-            <span class="badge badge-completed" title="{{ c.project.provision_detail }}">ws&nbsp;ok</span>
-            {% elif c.project.provision_status == 'error' %}
-            <span class="badge badge-failed" title="{{ c.project.provision_detail }}">ws&nbsp;error</span>
+            {# Green "ws ok" is not news and left the header; the failure stays,
+               now WITH its cause as visible text below — it used to live only in
+               a title attribute, which a phone never shows (#622). #}
+            {% if c.project.provision_status == 'error' %}
+            <span class="badge badge-failed">workspace: ошибка</span>
             {% endif %}
         </div>
-        <p class="project-card-numbers muted small">
-            {# Three LABELLED indicators; a decomposition inside one of them is
-               still one indicator (#567 AC-4, reformulated in #619 — "ждёт вас:
-               41 (черновиков: 39)" was already breaking the literal reading, and
-               honesty had to win over the count).
+        {% if c.project.provision_status == 'error' %}
+        <p class="task-action-note task-action-note--warning">{{ c.project.provision_detail or 'причина не записана' }}</p>
+        {% endif %}
+        <div class="topbar-stats project-card-numbers">
+            {# The dashboard's own chip pattern, not a new one for the same
+               meaning: outline pill, caps label, bold value, .is-zero dims a
+               nothing. Replaces 3–5 same-weight links joined by "·" with nested
+               brackets, where "(в очереди: 53)" broke onto its own line at 375px
+               and read as a caption for the activity date (#622).
 
-               Every number is a LINK now. A page built as an entry point whose
-               main number is a dead end sends the reader off to assemble a filter
-               by hand; the state modes from #617 exist precisely so the number and
-               the list behind it cannot disagree. #}
-            <a class="project-card-waiting"
-               href="/tasks?project={{ c.project.slug }}&amp;state=awaiting">
-                {%- if c.awaiting_human and c.awaiting_human == c.drafts %}
-                ждёт вас: {{ c.awaiting_human }} — все черновики
-                {%- elif c.drafts %}
-                ждёт вас: {{ c.awaiting_human }} (черновиков: {{ c.drafts }})
-                {%- else %}
-                ждёт вас: {{ c.awaiting_human }}
-                {%- endif %}
+               Every chip carries an aria-label: in a screen reader's link list,
+               five projects previously produced five identical "в работе: 0"
+               with no context. #}
+            <a class="topbar-stat topbar-stat--draft{% if not c.awaiting_human %} is-zero{% endif %}"
+               href="/tasks?project={{ c.project.slug }}&amp;state=awaiting"
+               aria-label="Ждёт вашего решения: {{ c.awaiting_human }} — проект {{ c.project.name }}">
+                <span class="topbar-stat-label">Ждёт вас</span>
+                <span class="topbar-stat-value">{{ c.awaiting_human }}</span>
             </a>
-            ·
-            <a href="/tasks?project={{ c.project.slug }}&amp;state=inflight">в работе: {{ c.in_flight }}</a>
-            {%- if c.queued %}
-            <a href="/tasks?project={{ c.project.slug }}&amp;state=queued" title="одобрено, но никто не начал">(в очереди: {{ c.queued }})</a>
-            {%- endif %}
-            · <span title="{{ c.last_activity_at or 'записей в фиде нет' }}">активность: {{ c.activity_human }}</span>
+            <a class="topbar-stat{% if not c.in_flight %} is-zero{% endif %}"
+               href="/tasks?project={{ c.project.slug }}&amp;state=inflight"
+               aria-label="В работе: {{ c.in_flight }} — проект {{ c.project.name }}">
+                <span class="topbar-stat-label">В работе</span>
+                <span class="topbar-stat-value">{{ c.in_flight }}</span>
+            </a>
+            <a class="topbar-stat{% if not c.queued %} is-zero{% endif %}"
+               href="/tasks?project={{ c.project.slug }}&amp;state=queued"
+               aria-label="В очереди: {{ c.queued }} — одобрено, но никто не начал; проект {{ c.project.name }}">
+                <span class="topbar-stat-label">В очереди</span>
+                <span class="topbar-stat-value">{{ c.queued }}</span>
+            </a>
+        </div>
+        <p class="muted small">
+            {% if c.drafts and c.awaiting_human == c.drafts %}Всё ожидание — черновики.
+            {% elif c.drafts %}Из ожидающих черновиков: {{ c.drafts }}.
+            {% endif %}
+            Обновлялся: {{ c.activity_human }}<span class="u-sr-only">{% if c.last_activity_at %} ({{ c.last_activity_at }}){% endif %}</span>
         </p>
         {% if c.live_epics %}
         <div class="epic-children">
@@ -74,7 +90,6 @@
             {# The order was never stated, so it looked arbitrary; and a hidden
                remainder must be NAMED, because a silent cut reads as "that is
                all" (#611, #615). #}
-            Свежие сверху — по последней работе в эпике.
             {%- if c.epics_hidden %}
             <a href="/tasks?project={{ c.project.slug }}&amp;type=epic&amp;state=live">И ещё {{ c.epics_hidden }} →</a>
             {%- endif %}
@@ -104,27 +119,27 @@
                 {% if c.project.repo and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-provision" class="project-inline-form">
                     <button class="btn btn-primary" type="submit"
-                            onclick="return confirm('Клонировать/проверить workspace проекта {{ c.project.slug }}?')">Provision</button>
+                            onclick="return confirm('Клонировать/проверить workspace проекта {{ c.project.slug }}?')">Проверить workspace</button>
                 </form>
                 {% endif %}
                 {% if c.project.status == 'pending' and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-activate" class="project-inline-form">
                     <button class="btn btn-success" type="submit"
-                            onclick="return confirm('Активировать проект {{ c.project.slug }}? Он попадёт в git-маршрутизацию.')">Activate</button>
+                            onclick="return confirm('Активировать проект {{ c.project.slug }}? Он попадёт в git-маршрутизацию.')">Активировать</button>
                 </form>
                 {% endif %}
                 {% if c.project.slug != 'default' %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-archive" class="project-inline-form">
                     <input type="hidden" name="archived" value="{{ 'false' if c.project.archived else 'true' }}">
                     <button class="btn btn-ghost" type="submit"
-                            onclick="return confirm('{{ 'Разархивировать' if c.project.archived else 'Архивировать' }} проект {{ c.project.slug }}?')">
-                        {{ 'Unarchive' if c.project.archived else 'Archive' }}
+                            onclick="return confirm('{{ 'Вернуть из архива' if c.project.archived else 'Архивировать' }} проект {{ c.project.slug }}?')">
+                        {{ 'Вернуть из архива' if c.project.archived else 'В архив' }}
                     </button>
                 </form>
                 {% endif %}
             </div>
             <details class="project-admin-edit">
-                <summary class="project-edit-summary">edit</summary>
+                <summary class="project-edit-summary">Изменить</summary>
                 <form method="post" action="/projects/{{ c.project.id }}/web-edit" class="task-action-stack project-form">
                     <label class="task-action-label">Name</label>
                     <input name="name" class="task-action-control" value="{{ c.project.name }}">
@@ -136,7 +151,7 @@
                     <input name="default_branch" class="task-action-control" value="{{ c.project.default_branch }}">
                     <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
                     <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ c.project.default_branch_policy if c.project.default_branch_policy and c.project.default_branch_policy != '{}' else '' }}</textarea>
-                    <button class="btn btn-primary task-action-btn" type="submit">Save</button>
+                    <button class="btn btn-primary task-action-btn" type="submit">Сохранить</button>
                 </form>
             </details>
         </details>
@@ -152,7 +167,7 @@
 {% endif %}
 
 <details class="task-action-stack project-create">
-    <summary class="btn btn-primary">+ New Project</summary>
+    <summary class="btn btn-primary">+ Новый проект</summary>
     <form method="post" action="/projects/web-create" class="task-action-stack project-form">
         <label class="task-action-label" for="np-slug">Slug (a-z, 0-9, dashes)</label>
         <input id="np-slug" name="slug" class="task-action-control" required pattern="[a-z0-9][a-z0-9-]*" placeholder="calc-kids">
