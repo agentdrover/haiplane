@@ -100,6 +100,25 @@ def task_state_condition(state: str) -> tuple[str, tuple[str, ...]]:
         raise UnknownTaskStateError(f"unknown state {state!r}; known: {known}") from exc
 
 
+# Membership in a project, written ONCE (#627).
+#
+# The project sits on the epic and descendants inherit it, so membership is a
+# subtree walk. Every list that narrows by project must apply this INSIDE its
+# query, before its LIMIT: applied afterwards in Python it discards rows the
+# query already spent, and the caller gets an empty list that is
+# indistinguishable from "this project has no work". That defect has now been
+# fixed three times — #370 in the API, #621 on the tasks page, #627 across the
+# dashboard and inbox — which is why the rule is a constant instead of a habit.
+PROJECT_SUBTREE_CONDITION = """id IN (
+    WITH RECURSIVE subtree(id) AS (
+        SELECT id FROM tasks WHERE project_id = ?
+        UNION ALL
+        SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
+    )
+    SELECT id FROM subtree
+)"""
+
+
 # A task no epic-shaped view can reach: no parent, and not an epic itself. The
 # project sits on the epic and descendants inherit it, so these rows belong to
 # no project either — by construction, not by mistake. Archival is deliberately
@@ -271,22 +290,7 @@ async def list_tasks_filtered(
     params: list[Any] = []
 
     if project_id is not None:
-        # The project filter has to run BEFORE the LIMIT. Applied afterwards in
-        # Python it discarded rows the page had already spent, so a page whose
-        # top limit+1 rows belonged to other projects came back empty with
-        # next_cursor=null — indistinguishable from "this project has no
-        # tasks" (#370). Same subtree rule as list_task_ids_for_project: the
-        # project sits on the epic and descendants inherit it.
-        conditions.append(
-            """id IN (
-                WITH RECURSIVE subtree(id) AS (
-                    SELECT id FROM tasks WHERE project_id = ?
-                    UNION ALL
-                    SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
-                )
-                SELECT id FROM subtree
-            )"""
-        )
+        conditions.append(PROJECT_SUBTREE_CONDITION)
         params.append(project_id)
 
     if not include_archived:
@@ -354,13 +358,18 @@ async def list_tasks_by_statuses(
     *,
     limit: int = 20,
     include_archived: bool = False,
+    project_id: int | None = None,
 ) -> list[aiosqlite.Row]:
     placeholders = ",".join("?" for _ in statuses)
     archived_sql = "" if include_archived else " AND archived=0"
+    # #627: optional, and INSIDE the query — see PROJECT_SUBTREE_CONDITION for
+    # why narrowing a limited list afterwards is the defect, not the fix.
+    project_sql = f" AND {PROJECT_SUBTREE_CONDITION}" if project_id is not None else ""
+    project_params = () if project_id is None else (project_id,)
     return await db.execute_fetchall(
-        f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql} "  # nosec B608
-        "ORDER BY id DESC LIMIT ?",
-        (*statuses, limit),
+        f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql}"  # nosec B608
+        f"{project_sql} ORDER BY id DESC LIMIT ?",
+        (*statuses, *project_params, limit),
     )
 
 
@@ -374,6 +383,7 @@ async def list_tasks_by_status(
     human_owner: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    project_id: int | None = None,
 ) -> list[aiosqlite.Row]:
     if order_by not in ALLOWED_TASKS_ORDER_BY:
         raise ValueError(f"Unsupported order_by clause: {order_by!r}")
@@ -381,6 +391,11 @@ async def list_tasks_by_status(
     params: list[Any] = [status]
     if not include_archived:
         conditions.append("archived=0")
+    if project_id is not None:
+        # #627: inside the query, before the LIMIT — see
+        # PROJECT_SUBTREE_CONDITION.
+        conditions.append(PROJECT_SUBTREE_CONDITION)
+        params.append(project_id)
     _append_person_filters(
         conditions,
         params,

@@ -3840,3 +3840,119 @@ async def test_the_applied_state_mode_is_visible_and_removable(client: AsyncClie
         f"clearing the mode must keep the project; it goes to {target}"
     )
     assert "state=" not in target, "…and must actually drop the mode"
+
+
+# ---------------------------------------------------------------------------
+# The dashboard and the inbox stop filtering by project after their limit (#627)
+# ---------------------------------------------------------------------------
+
+
+async def _dashboard_project_fixture(client: AsyncClient, db) -> dict[str, int]:
+    """A project with one task per interesting status, buried under newer rows.
+
+    40 noise rows PER STATUS, because these lists are capped at 20 — a fixture
+    that fits inside the cap proves nothing, and this is the third task in a row
+    where that trap was the real risk (#621, #626).
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "dash", "Dash")
+    epic = (
+        await client.post(
+            "/api/tasks", json={"title": "E", "task_type": "epic", "project": "dash"}
+        )
+    ).json()["id"]
+
+    ids: dict[str, int] = {}
+    for status in ("draft", "review", "running", "needs_decision"):
+        tid = (
+            await client.post(
+                "/api/tasks",
+                json={
+                    "title": f"dash {status}",
+                    "task_type": "feature",
+                    "parent_id": epic,
+                },
+            )
+        ).json()["id"]
+        await db.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        ids[status] = tid
+    await db.commit()
+    for status in ("draft", "review", "running", "needs_decision"):
+        await _bulk_noise_tasks(db, 40, status=status)
+    return ids
+
+
+async def test_dashboard_keeps_the_project_rows_past_its_limit(client: AsyncClient, db):
+    # AC-1 (#627). Measured before the fix: with 40 newer rows per status, the
+    # project's own tasks were absent from data.active_tasks, draft_tasks,
+    # review_tasks, needs_decision_tasks AND inbox['decisions'] — every list is
+    # capped at 20 in the service layer, and the project filter ran afterwards.
+    # Choosing an empty board over a wrong one is not a choice a reader can see.
+    from hub import services
+
+    ids = await _dashboard_project_fixture(client, db)
+
+    # Asserted at the SERVICE layer, where the cap lives. The first version of
+    # this test read the whole dashboard page and passed on the broken code —
+    # the epic list renders links to its own children, so the ids were on the
+    # page for a reason that had nothing to do with the board.
+    data = await services.get_dashboard_data(db, project="dash")
+    inbox = await services.get_inbox_data(db, project="dash")
+
+    def _ids(items):
+        return {t.id if hasattr(t, "id") else t.get("id") for t in items}
+
+    assert ids["running"] in _ids(data.active_tasks), "board lost the running task"
+    assert ids["draft"] in _ids(data.draft_tasks), "board lost the draft"
+    assert ids["review"] in _ids(data.review_tasks), "board lost the review"
+    assert ids["needs_decision"] in _ids(data.needs_decision_tasks), (
+        "board lost the decision"
+    )
+    assert ids["draft"] in _ids(inbox["drafts"]), "inbox lost the draft"
+    assert ids["needs_decision"] in _ids(inbox["decisions"]), (
+        "inbox lost the decision — this is the list that was measured empty"
+    )
+
+    # Nothing from outside the project rode along.
+    assert not any(t.title.startswith("noise") for t in data.draft_tasks), (
+        "a scoped board must not carry other projects' rows"
+    )
+
+
+async def test_no_consumer_filters_by_project_after_its_limit(client: AsyncClient, db):
+    # AC-2 (#627). All four consumers, not three of four: the same defect left
+    # in one place is the same defect. #370 fixed the API, #621 the tasks page,
+    # and this is the third appearance — so the technique goes, not one more
+    # caller.
+    import re
+    from pathlib import Path
+
+    ids = await _dashboard_project_fixture(client, db)
+
+    # Named per fragment, and deliberately NOT "at least one row survived": the
+    # draft queue is ordered created_at ASC, so the project's oldest draft rides
+    # at the front whether or not scoping works. A mutation that removed the
+    # scoping passed against the loose version of this assertion. Each id below
+    # is one the id-DESC ordering genuinely buries.
+    expected = {
+        "/partials/inbox": [ids["needs_decision"]],
+        "/partials/kanban": [ids["running"], ids["review"], ids["needs_decision"]],
+    }
+    for path, must_appear in expected.items():
+        frag = await client.get(path, params={"project": "dash"})
+        assert frag.status_code == 200, frag.text
+        found = set(re.findall(r"/tasks/(\d+)", frag.text))
+        missing = [i for i in must_appear if str(i) not in found]
+        assert not missing, (
+            f"{path}: the project's rows {missing} did not survive — the "
+            "fragment is capped at 20 before the project could be applied"
+        )
+
+    # And the technique itself is gone, so a fifth caller cannot reintroduce it.
+    web = (Path(__file__).resolve().parent.parent / "hub" / "web.py").read_text()
+    assert "_filter_by_ids" not in web, (
+        "post-filtering a limited list by project is the defect itself; leaving "
+        "the helper in place invites the next caller to repeat it"
+    )

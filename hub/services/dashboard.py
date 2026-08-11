@@ -27,8 +27,31 @@ from hub.services.lifecycle import row_to_task
 log = logging.getLogger("hub")
 
 
-async def get_dashboard_data(db: aiosqlite.Connection) -> DashboardData:
-    """Aggregate all data for the main dashboard."""
+async def _project_id_for(db: aiosqlite.Connection, project: str | None) -> int | None:
+    """Resolve a project slug to its id, or None for "every project" (#627).
+
+    An unknown slug resolves to a project id nothing matches rather than to
+    None: silently widening back to every project is the failure this whole
+    line of tasks is about.
+    """
+    slug = (project or "").strip()
+    if not slug:
+        return None
+    row = await repo.get_project_by_slug(db, slug)
+    return int(row["id"]) if row is not None else -1
+
+
+async def get_dashboard_data(
+    db: aiosqlite.Connection, *, project: str | None = None
+) -> DashboardData:
+    """Aggregate all data for the main dashboard.
+
+    ``project`` narrows every limited list INSIDE its query (#627). It used to
+    be applied by the caller afterwards, over lists already capped at 20, so a
+    project whose rows were not among the newest 20 of a status disappeared
+    from the board entirely.
+    """
+    project_id = await _project_id_for(db, project)
     commits_t = asyncio.create_task(plugins.github.recent_commits(8))
     prs_t = asyncio.create_task(plugins.github.open_prs())
     decisions_t = asyncio.create_task(plugins.notes.recent_decisions(limit=8))
@@ -37,20 +60,34 @@ async def get_dashboard_data(db: aiosqlite.Connection) -> DashboardData:
         db,
         ["open", "running", "fix_requested", "ci_check"],
         limit=20,
+        project_id=project_id,
     )
-    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=20)
-    needs_info_rows = await repo.list_tasks_by_status(db, "needs_info", limit=20)
-    review_rows = await repo.list_tasks_by_status(db, "review", limit=20)
+    draft_rows = await repo.list_tasks_by_status(
+        db, "draft", limit=20, project_id=project_id
+    )
+    needs_info_rows = await repo.list_tasks_by_status(
+        db, "needs_info", limit=20, project_id=project_id
+    )
+    review_rows = await repo.list_tasks_by_status(
+        db, "review", limit=20, project_id=project_id
+    )
     needs_decision_rows = await repo.list_tasks_by_status(
-        db, "needs_decision", limit=20
+        db, "needs_decision", limit=20, project_id=project_id
     )
     pending_report_rows = await repo.list_tasks_by_status(
         db,
         "pending_report",
         order_by="updated_at ASC",
         limit=20,
+        project_id=project_id,
     )
+    # list_stale_running carries NO limit, so narrowing it in Python cannot
+    # drop a row. Kept as a post-filter deliberately, and said out loud rather
+    # than left to look like an oversight (#627 AC-3).
     stale_rows = await repo.list_stale_running(db, config.STALE_THRESHOLD_MINUTES)
+    if project_id is not None:
+        allowed = await repo.list_task_ids_for_project(db, project_id)
+        stale_rows = [r for r in stale_rows if r["id"] in allowed]
     # #569: one liveness criterion for every consumer of "which epics are
     # alive" — this call and get_epics_enriched below. A project card that
     # grows an epic list later must call the same function, or the three
@@ -96,52 +133,65 @@ async def get_inbox_data(
     human_owner: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    project: str | None = None,
 ) -> dict[str, Any]:
-    """Gather inbox items: drafts, questions, decisions, pending reports, stale."""
+    """Gather inbox items: drafts, questions, decisions, pending reports, stale.
+
+    ``project`` narrows the limited lists inside their queries (#627), for the
+    same reason as get_dashboard_data.
+    """
+    project_id = await _project_id_for(db, project)
     person = {
         "human_owner": human_owner,
         "claimed_by": claimed_by,
         "mine": mine,
     }
+    scoped = {**person, "project_id": project_id}
     draft_rows = await repo.list_tasks_by_status(
         db,
         "draft",
         order_by=repo.DRAFT_QUEUE_ORDER_BY,
         limit=20,
-        **person,
+        **scoped,
     )
     needs_info_rows = await repo.list_tasks_by_status(
-        db, "needs_info", limit=20, **person
+        db, "needs_info", limit=20, **scoped
     )
     needs_decision_rows = await repo.list_tasks_by_status(
-        db, "needs_decision", limit=20, **person
+        db, "needs_decision", limit=20, **scoped
     )
     pending_report_rows = await repo.list_tasks_by_status(
         db,
         "pending_report",
         order_by="updated_at ASC",
         limit=20,
-        **person,
+        **scoped,
     )
     ci_check_rows = await repo.list_tasks_by_status(
         db,
         "ci_check",
         order_by="updated_at ASC",
         limit=20,
-        **person,
+        **scoped,
     )
     fix_requested_rows = await repo.list_tasks_by_status(
         db,
         "fix_requested",
         order_by="updated_at ASC",
         limit=20,
-        **person,
+        **scoped,
     )
+    # No LIMIT on this one, so narrowing it in Python cannot drop a row. The
+    # exception is deliberate and named rather than left looking accidental
+    # (#627 AC-3): post-filtering is only safe where nothing was cut first.
     stale_rows = await repo.list_stale_running(
         db,
         config.STALE_THRESHOLD_MINUTES,
         **person,
     )
+    if project_id is not None:
+        allowed = await repo.list_task_ids_for_project(db, project_id)
+        stale_rows = [r for r in stale_rows if r["id"] in allowed]
 
     questions: list[dict[str, Any]] = []
     for r in needs_info_rows:
