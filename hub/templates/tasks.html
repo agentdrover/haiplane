@@ -20,9 +20,35 @@
 </nav>
 {% endif %}
 
+{# #626: the mode a card link applied is now visible and removable. A filter
+   with no on-screen representation cannot be read or undone — the only exit
+   from state=awaiting used to be Reset, which drops the project too, so
+   "narrow by one thing" cost you everything else. Clearing keeps the project
+   because the project is where the reader came FROM. #}
+{% if filter_state %}
+<div class="state-chip-row">
+    <span class="state-chip">
+        {{ {'live': 'живые', 'awaiting': 'ждут человека',
+            'inflight': 'в работе', 'queued': 'в очереди'}.get(filter_state, filter_state) }}
+        <a class="state-chip-clear"
+           href="/tasks{% if current_project %}?project={{ current_project }}{% endif %}"
+           aria-label="Снять фильтр по режиму, оставшись в проекте">&times;</a>
+    </span>
+</div>
+{% endif %}
+
 <!-- Filter bar -->
 <div class="filter-bar">
     <input type="hidden" name="source" value="{{ filter_source }}">
+    {# #626: the scope the page was opened with travels WITH every filter
+       change. hx-include collects ".filter-bar [name]", and the project
+       selector sits in the header, outside this container — so without these
+       three the fragment is never told, and the table silently widens from one
+       project to all of them. Measured on production: the bar sent eight
+       fields and none of them was one of these. #}
+    <input type="hidden" name="project" value="{{ current_project }}">
+    <input type="hidden" name="state" value="{{ filter_state }}">
+    {% if filter_no_epic %}<input type="hidden" name="no_epic" value="1">{% endif %}
     <div class="filter-group">
         <label>Analyst</label>
         <label class="filter-checkbox">

@@ -527,6 +527,11 @@ async def web_tasks_list_partial(
     # routes on purpose — a parameter that only the fragment honours gives a link
     # that silently ignores it, and the counter's link points at the page.
     state: str | None = Query(default=None),
+    # #626: the same rule, applied to the parameter that slipped past it. The
+    # page honoured ``project`` and this fragment did not, so the first change to
+    # any filter swapped one project's rows for every project's — while the
+    # selector went on naming the project the reader thought they were in.
+    project: str | None = Query(default=None),
     analyst_ready: bool = Query(default=False),
     limit: int = Query(default=100, le=200),
 ):
@@ -546,6 +551,9 @@ async def web_tasks_list_partial(
         claimed_by=claimed_by,
         mine=mine,
         limit=limit,
+        # Same path the page takes since #621 — into the query, before the
+        # LIMIT. Two routes answering one question must not answer it twice.
+        project=(project or "").strip() or None,
     )
     tasks, ready_by_id = await _apply_analyst_ready_filter(
         _db(request), tasks, analyst_ready=analyst_ready
@@ -1019,6 +1027,10 @@ async def web_tasks(
             "filter_human_owner": human_owner or "",
             "filter_human_reviewer": human_reviewer or "",
             "filter_analyst_ready": analyst_ready,
+            # #626: the scope has to reach the template, or the filter bar
+            # cannot hand it back on the next request.
+            "filter_state": state or "",
+            "filter_no_epic": no_epic,
             "projects_list": projects_list,
             "current_project": current_project,
             "parent_breadcrumb": parent_breadcrumb,
