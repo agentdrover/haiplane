@@ -135,12 +135,6 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
 .form-group--grow-2 { flex: 2; }
 .filter-group--end { align-self: flex-end; }
 
-/* Compact badge variant (for inside cards / inside other badges) */
-.badge--xs {
-    font-size: 9px;
-    padding: 1px 5px;
-    letter-spacing: 0.2px;
-}
 
 /* Vast status */
 .vast-badge .status-online { color: var(--green); font-weight: 600; }
@@ -1388,6 +1382,16 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
     white-space: nowrap;
 }
 
+/* Compact badge variant (inside cards / inside other badges). MUST stay below
+   .badge: equal specificity means the later rule wins, and for as long as this
+   sat 1200 lines above it, all 18 uses rendered at 11px while the file said
+   9px (#624). */
+.badge--xs {
+    font-size: 9px;
+    padding: 1px 5px;
+    letter-spacing: 0.2px;
+}
+
 .badge-draft { background: var(--orange-dim); color: var(--orange); }
 .badge-open { background: var(--accent-dim); color: var(--accent-light); }
 .badge-pending { background: var(--orange-dim); color: var(--orange); }
@@ -1873,7 +1877,7 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
     align-items: end;
     background: linear-gradient(135deg, var(--surface), var(--bg-elevated));
     border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
+    border-radius: var(--radius-lg);
     padding: var(--sp-6);
     margin-bottom: var(--sp-5);
     box-shadow: var(--shadow-sm);
@@ -3028,28 +3032,42 @@ body.htmx-request .htmx-progress {
     .activity-timeline .activity-time { min-width: auto; }
 }
 
-/* ---- Admin section ---- */
-.nav-divider { border: none; border-top: 1px solid var(--clr-border); margin: var(--sp-3) var(--sp-4); }
+/* ---- Admin section ----
+   #624: this whole block used to reference --clr-* tokens that were never
+   declared. A var() with no fallback that resolves to nothing makes the WHOLE
+   declaration invalid, so these borders, backgrounds and label colours were not
+   "slightly off" — they were absent, and the admin pages rendered unstyled.
+   Replacements are chosen per block: --clr-bg-accent sat on :hover and on an
+   empty value, so it is --surface-hover rather than the accent, and --clr-muted
+   coloured small labels, so it is --text-secondary (7.08:1) rather than
+   --text-muted (3.53:1, too little for 11px). */
+.nav-divider { border: none; border-top: 1px solid var(--border); margin: var(--sp-3) var(--sp-4); }
 .admin-layout { display: flex; flex-direction: column; gap: var(--sp-4); }
-.admin-nav { display: flex; gap: var(--sp-2); flex-wrap: wrap; border-bottom: 1px solid var(--clr-border); padding-bottom: var(--sp-2); }
-.admin-nav a { padding: var(--sp-2) var(--sp-3); border-radius: var(--radius); font-size: 13px; color: var(--clr-muted); text-decoration: none; }
-.admin-nav a:hover { background: var(--clr-bg-accent); color: var(--clr-text); }
-.admin-nav a.active { background: var(--clr-accent); color: #fff; }
+.admin-nav { display: flex; gap: var(--sp-2); flex-wrap: wrap; border-bottom: 1px solid var(--border); padding-bottom: var(--sp-2); }
+.admin-nav a { padding: var(--sp-2) var(--sp-3); border-radius: var(--radius); font-size: 13px; color: var(--text-secondary); text-decoration: none; }
+.admin-nav a:hover { background: var(--surface-hover); color: var(--text); }
+.admin-nav a.active { background: var(--accent); color: #fff; }
 .admin-content { }
 .admin-stats { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
-.stat-card { background: var(--clr-bg-surface); border: 1px solid var(--clr-border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); min-width: 120px; }
-.stat-value { font-size: 1.5rem; font-weight: 700; color: var(--clr-text); }
-.stat-label { font-size: 12px; color: var(--clr-muted); }
-.admin-warning { background: #fef3cd; border: 1px solid #ffc107; color: #856404; padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
-.admin-notice { background: #d1ecf1; border: 1px solid #17a2b8; color: #0c5460; padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); min-width: 120px; }
+.stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text); }
+.stat-label { font-size: 12px; color: var(--text-secondary); }
+/* The warning and notice panels were light-theme surfaces (#fef3cd at 0.90
+   relative luminance, #d1ecf1 at 0.80) inside a dark interface — nearly white
+   panels that read as a rendering failure rather than as attention. The system
+   already carries the pairs for this: a saturated colour for the edge and text,
+   its 10%-alpha twin for the fill. */
+.admin-warning { background: var(--orange-dim); border: 1px solid var(--orange); color: var(--text); padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
+.admin-notice { background: var(--blue-dim); border: 1px solid var(--blue); color: var(--text); padding: var(--sp-3); border-radius: var(--radius); margin-bottom: var(--sp-3); }
 .admin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.admin-table th, .admin-table td { padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--clr-border); text-align: left; }
-.admin-table th { font-weight: 600; color: var(--clr-muted); font-size: 11px; text-transform: uppercase; }
-.admin-perms { font-size: 11px; color: var(--clr-muted); max-width: 300px; word-break: break-all; }
+.admin-table th, .admin-table td { padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); text-align: left; }
+.admin-table th { font-weight: 600; color: var(--text-secondary); font-size: 11px; text-transform: uppercase; }
+.admin-perms { font-size: 11px; color: var(--text-secondary); max-width: 300px; word-break: break-all; }
 .row-revoked { opacity: 0.5; }
-.badge-active { background: #d4edda; color: #155724; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
-.badge-disabled { background: #f8d7da; color: #721c24; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
-.badge-locked { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+/* Same light-theme copy-paste, on the API key states. .badge-locked is gone
+   rather than recoloured: no template has ever used it. */
+.badge-active { background: var(--green-dim); border: 1px solid var(--green); color: var(--green); padding: 2px 6px; border-radius: var(--radius-sm); font-size: 11px; }
+.badge-disabled { background: var(--red-dim); border: 1px solid var(--red); color: var(--red); padding: 2px 6px; border-radius: var(--radius-sm); font-size: 11px; }
 /* ---- Admin interactive UI ---- */
 
 /* Flash / toast notifications */
@@ -3263,7 +3281,7 @@ body.htmx-request .htmx-progress {
 .perm-admin { background: rgba(231,76,60,0.15); color: #c0392b; }
 .perm-tasks { background: rgba(52,152,219,0.15); color: #2980b9; }
 .perm-integrations { background: rgba(39,174,96,0.15); color: #27ae60; }
-.perm-none { background: var(--clr-bg-accent); color: var(--clr-muted); font-style: italic; }
+.perm-none { background: var(--surface-hover); color: var(--text-secondary); font-style: italic; }
 
 /* Permission matrix */
 .admin-matrix-wrap { overflow-x: auto; margin-top: var(--sp-3); }
@@ -3287,11 +3305,11 @@ body.htmx-request .htmx-progress {
     flex-wrap: wrap;
 }
 .admin-filter-form select {
-    background: var(--clr-bg-surface);
-    border: 1px solid var(--clr-border);
+    background: var(--surface);
+    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--sp-1) var(--sp-3);
-    color: var(--clr-text);
+    color: var(--text);
     font-size: 12px;
     font-family: var(--font);
 }
@@ -3303,9 +3321,9 @@ body.htmx-request .htmx-progress {
     align-items: center;
     margin-top: var(--sp-3);
     padding-top: var(--sp-3);
-    border-top: 1px solid var(--clr-border);
+    border-top: 1px solid var(--border);
 }
-.admin-page-info { font-size: 12px; color: var(--clr-muted); }
+.admin-page-info { font-size: 12px; color: var(--text-secondary); }
 
 /* Inline roles editor */
 .admin-roles-inline {
@@ -3325,13 +3343,17 @@ body.htmx-request .htmx-progress {
 }
 .admin-checkbox input[type="checkbox"] { margin: 0; cursor: pointer; }
 
-/* Warning stat card */
+/* Warning stat card — was the loudest of the five light-theme patches: a
+   #fef3cd panel (0.90 relative luminance) with #856404 text, i.e. dark-on-light
+   inside a dark interface. The warning now speaks with the system's own voice:
+   an orange edge, its dim twin as fill, and the value in orange because THAT is
+   the number the panel exists to point at. */
 .stat-card-warn {
-    border-color: #ffc107;
-    background: #fef3cd;
+    border-color: var(--orange);
+    background: var(--orange-dim);
 }
-.stat-card-warn .stat-value { color: #856404; }
-.stat-card-warn .stat-label { color: #856404; }
+.stat-card-warn .stat-value { color: var(--orange); }
+.stat-card-warn .stat-label { color: var(--text-secondary); }
 
 /* Screen reader only */
 .sr-only {
@@ -3417,7 +3439,9 @@ body.htmx-request .htmx-progress {
 /* #619: the three indicators are links, and the first one carries the weight. */
 .project-card-epics-note { margin: .3rem 0 .1rem; }
 .project-card-actions { margin: .45rem 0 .1rem; }
-.btn--xs { padding: .15rem .5rem; font-size: .8rem; }
+/* #624: .btn--xs lived here — my own second answer to a question .btn-xs had
+   already answered 27 times, in rem where the system speaks in tokens. Its one
+   caller now uses .btn-xs, so the rule is gone rather than reconciled. */
 
 /* Same floor, one level down: a flex item will not shrink below min-content
    unless told to, so the ellipsis on the epic title never got a chance (#620). */
