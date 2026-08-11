@@ -2434,14 +2434,30 @@ async def test_status_sets_are_derived_not_retyped():
         AWAITING_HUMAN_STATUSES,
         FINAL_STATUSES,
         IN_FLIGHT_STATUSES,
+        QUEUED_STATUSES,
         TaskStatus,
     )
 
-    assert IN_FLIGHT_STATUSES == ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES
+    # #619 took `open` out of "in flight" — approved-but-untouched is a queue, not
+    # work. This assertion FAILED when that happened, which is the whole reason it
+    # exists: `open` had to be given its own named set instead of falling into the
+    # gap that hid `draft` until #567. Updated deliberately, not relaxed.
+    assert IN_FLIGHT_STATUSES == (
+        ACTIVE_STATUSES - AWAITING_HUMAN_STATUSES - QUEUED_STATUSES
+    )
+    assert TaskStatus.open in QUEUED_STATUSES
+    assert TaskStatus.open not in IN_FLIGHT_STATUSES, (
+        "an approved task nobody started is not work in progress"
+    )
     assert not (IN_FLIGHT_STATUSES & AWAITING_HUMAN_STATUSES)
+    assert not (IN_FLIGHT_STATUSES & QUEUED_STATUSES)
     assert not (AWAITING_HUMAN_STATUSES & FINAL_STATUSES)
     unclassified = (
-        set(TaskStatus) - AWAITING_HUMAN_STATUSES - IN_FLIGHT_STATUSES - FINAL_STATUSES
+        set(TaskStatus)
+        - AWAITING_HUMAN_STATUSES
+        - IN_FLIGHT_STATUSES
+        - QUEUED_STATUSES
+        - FINAL_STATUSES
     )
     assert not unclassified, f"a status belonging to no set: {unclassified}"
     # draft is the one that was outside both pre-existing sets, and the one the
@@ -2771,4 +2787,218 @@ async def test_state_is_independent_and_excludes_headless_review(
     by_status = await client.get("/tasks/list", params={"status": "review"})
     assert f"/tasks/{headless}" in by_status.text, (
         "state must not hijack the plain status filter"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The card's numbers lead into the work, and "in flight" stops lying (#619)
+# ---------------------------------------------------------------------------
+
+
+async def _project_with(client: AsyncClient, db, slug: str, name: str) -> int:
+    from hub import repository as repo_module
+
+    pid = await repo_module.create_project(db, slug=slug, name=name)
+    await db.commit()
+    return pid
+
+
+async def test_open_is_a_queue_not_work_in_flight(client: AsyncClient, db):
+    # AC-2 (#619). Live page, 10.08: it-grade-dashboard showed "в работе: 46"
+    # beside "активность: 20.07" — a month of silence. All 46 were `open`:
+    # approved and untouched. The most abandoned project looked like the busiest.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import get_project_cards
+
+    await seed_default_project(db)
+    pid = await _project_with(client, db, "queue-heavy", "Queue Heavy")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "queue-heavy"},
+        )
+    ).json()["id"]
+
+    async def _child(title: str, status: str) -> int:
+        tid = (
+            await client.post(
+                "/api/tasks",
+                json={"title": title, "task_type": "feature", "parent_id": epic},
+            )
+        ).json()["id"]
+        await db.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        return tid
+
+    for i in range(3):
+        await _child(f"approved, untouched {i}", "open")
+    await _child("someone is on it", "running")
+    await db.commit()
+
+    card = next(c for c in await get_project_cards(db) if c["project"]["id"] == pid)
+    assert card["in_flight"] == 1, "only what someone is moving counts as work"
+    assert card["queued"] == 3, "the queue is counted, not folded into work"
+
+    page = (await client.get("/projects")).text
+    assert "в работе: 1" in page
+    assert "в очереди: 3" in page, "hiding the queue would trade one lie for another"
+
+
+async def test_card_numbers_open_the_matching_list(client: AsyncClient, db):
+    # AC-1 (#619): the page is an entry point, so its numbers must be doors. The
+    # state modes from #617 make the number and the list agree by construction —
+    # a link with a different rule behind it is the #571 defect (18 vs 51).
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "clickable", "Clickable")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "clickable"},
+        )
+    ).json()["id"]
+    waiting = (
+        await client.post(
+            "/api/tasks",
+            json={
+                "title": "needs a decision",
+                "task_type": "feature",
+                "parent_id": epic,
+            },
+        )
+    ).json()["id"]
+    await db.execute("UPDATE tasks SET status='needs_decision' WHERE id=?", (waiting,))
+    moving = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "being done", "task_type": "feature", "parent_id": epic},
+        )
+    ).json()["id"]
+    await db.execute("UPDATE tasks SET status='running' WHERE id=?", (moving,))
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    assert (
+        "project=clickable&amp;state=awaiting" in page
+        or "project=clickable&state=awaiting" in page
+    )
+    assert (
+        "project=clickable&amp;state=inflight" in page
+        or "project=clickable&state=inflight" in page
+    )
+    assert "Вся доска проекта" in page, (
+        "the board needs an explicit door, not a hidden title link"
+    )
+
+    # Follow the links: the list must contain exactly what the number promised.
+    awaiting_page = await client.get(
+        "/tasks", params={"project": "clickable", "state": "awaiting"}
+    )
+    assert f"/tasks/{waiting}" in awaiting_page.text
+    assert f"/tasks/{moving}" not in awaiting_page.text
+    inflight_page = await client.get(
+        "/tasks", params={"project": "clickable", "state": "inflight"}
+    )
+    assert f"/tasks/{moving}" in inflight_page.text
+    assert f"/tasks/{waiting}" not in inflight_page.text
+
+
+async def test_card_names_what_it_hides_and_adapts_its_label(client: AsyncClient, db):
+    # AC-3 (#619): "ждёт вас: 30 (черновиков: 30)" is absurd when the numbers are
+    # equal, and a card that shows 5 of 11 epics without saying so reads as "that
+    # is all" — the silent-cap rule from #611 and #615.
+    from hub.db import seed_default_project
+    from hub.services.dashboard import PROJECT_CARD_EPIC_LIMIT
+
+    await seed_default_project(db)
+    await _project_with(client, db, "many-epics", "Many Epics")
+    for i in range(PROJECT_CARD_EPIC_LIMIT + 2):
+        eid = (
+            await client.post(
+                "/api/tasks",
+                json={
+                    "title": f"epic {i}",
+                    "task_type": "epic",
+                    "project": "many-epics",
+                },
+            )
+        ).json()["id"]
+        child = (
+            await client.post(
+                "/api/tasks",
+                json={"title": f"child {i}", "task_type": "feature", "parent_id": eid},
+            )
+        ).json()["id"]
+        await db.execute("UPDATE tasks SET status='draft' WHERE id=?", (child,))
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    assert "И ещё 2" in page, "the hidden remainder must be named, not dropped"
+    assert "Свежие сверху" in page, "the order must be stated, or it looks arbitrary"
+    assert "все черновики" in page, (
+        "when every waiting item is a draft, say so instead of '(черновиков: N)'"
+    )
+    assert "готово" in page, "a bare 1/2 does not say what it is a share of"
+
+
+async def test_activity_is_relative_and_computed_once(client: AsyncClient, db):
+    # AC-4 (#619): a raw date makes the reader do arithmetic, and the card's
+    # question is "where is work happening". Computed on the server so the next
+    # view needing the same phrase cannot word it differently.
+    from hub.services.dashboard import humanize_since
+
+    assert humanize_since("2026-08-10 09:00:00", now="2026-08-10 21:00:00") == "сегодня"
+    assert humanize_since("2026-08-09 09:00:00", now="2026-08-10 21:00:00") == "вчера"
+    assert (
+        humanize_since("2026-07-20 09:00:00", now="2026-08-10 21:00:00")
+        == "3 нед. назад"
+    )
+    assert (
+        humanize_since("2026-06-24 09:00:00", now="2026-08-10 21:00:00")
+        == "месяц назад"
+    )
+    assert humanize_since(None) == "не было", "silence is an answer, not an empty cell"
+    # An ISO stamp with a T must not fall through as a raw string: prepared_at
+    # taught that lesson in #616.
+    assert (
+        humanize_since("2026-08-09T09:00:00+00:00", now="2026-08-10 21:00:00")
+        == "вчера"
+    )
+
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    # A project with REAL feed activity. The first version of this assertion
+    # seeded an empty project, where the card says "не было" — so a mutation that
+    # printed the raw date survived, because there was no date to print. Found by
+    # mutation, not by re-reading.
+    await _project_with(client, db, "has-activity", "Has Activity")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "has-activity"},
+        )
+    ).json()["id"]
+    child = (
+        await client.post(
+            "/api/tasks", json={"title": "c", "task_type": "feature", "parent_id": epic}
+        )
+    ).json()["id"]
+    await client.post(
+        f"/api/tasks/{child}/updates",
+        json={"agent": "dev", "kind": "status", "content": "worked"},
+    )
+    await db.execute(
+        "UPDATE task_updates SET created_at='2026-07-20 09:00:00' WHERE task_id=?",
+        (child,),
+    )
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    shown = page.split("активность:", 1)[1][:60]
+    assert "2026-07-20" not in shown, (
+        "the visible value must be relative; the exact date belongs in the tooltip"
+    )
+    assert "назад" in shown or "сегодня" in shown or "вчера" in shown, (
+        f"expected a relative phrase, got: {shown.strip()[:40]!r}"
     )

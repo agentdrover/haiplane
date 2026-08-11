@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -266,6 +267,47 @@ async def get_epic_board(
     }
 
 
+# How many epics fit on a card before it stops being a card. The remainder is
+# NAMED rather than dropped: a silent cut reads as "this is everything", the rule
+# #611 and #615 both landed on.
+PROJECT_CARD_EPIC_LIMIT = 5
+
+
+def humanize_since(stamp: str | None, *, now: str | None = None) -> str:
+    """ "3 недели назад" instead of "2026-07-20" (#619).
+
+    A raw date makes the reader do the arithmetic, and the question the card
+    answers is "where is work happening" — a relative answer IS the answer.
+
+    Computed on the server, in one place, because a Jinja filter would be
+    rewritten differently by the next view that needs the same phrase. Today the
+    project card is the only consumer; the epic list (#570) sorts by this same
+    activity and is the obvious second.
+    """
+    if not stamp:
+        return "не было"
+    text = stamp.replace("T", " ").split("+", 1)[0].split(".", 1)[0].strip()
+    try:
+        then = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    current = (
+        datetime.fromisoformat(now) if now else datetime.now(UTC).replace(tzinfo=None)
+    )
+    days = (current - then).days
+    if days <= 0:
+        return "сегодня"
+    if days == 1:
+        return "вчера"
+    if days < 7:
+        return f"{days} дн. назад"
+    if days < 31:
+        weeks = days // 7
+        return f"{weeks} нед. назад"
+    months = days // 30
+    return "месяц назад" if months == 1 else f"{months} мес. назад"
+
+
 async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     """One card per project: live epics, three numbers, freshest first (#567).
 
@@ -291,13 +333,17 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
                 "awaiting_human": 0,
                 "drafts": 0,
                 "in_flight": 0,
+                "queued": 0,
                 "last_activity_at": None,
             },
         )
+        epics = epics_by_project.get(p["slug"], [])
         cards.append(
             {
                 "project": p,
-                "live_epics": epics_by_project.get(p["slug"], []),
+                "live_epics": epics[:PROJECT_CARD_EPIC_LIMIT],
+                "epics_hidden": max(0, len(epics) - PROJECT_CARD_EPIC_LIMIT),
+                "activity_human": humanize_since(counts.get("last_activity_at")),
                 **counts,
             }
         )

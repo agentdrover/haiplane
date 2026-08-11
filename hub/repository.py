@@ -22,6 +22,7 @@ from hub.models import (
     AWAITING_HUMAN_STATUSES,
     FINAL_STATUSES,
     IN_FLIGHT_STATUSES,
+    QUEUED_STATUSES,
 )
 
 # One spelling of "this row is finished", derived from the model instead of
@@ -36,7 +37,9 @@ _FINAL_PLACEHOLDERS = ",".join("?" * len(FINAL_STATUS_VALUES))
 # the only thing interpolated into SQL is a run of "?".
 AWAITING_HUMAN_STATUS_VALUES = tuple(sorted(s.value for s in AWAITING_HUMAN_STATUSES))
 IN_FLIGHT_STATUS_VALUES = tuple(sorted(s.value for s in IN_FLIGHT_STATUSES))
+QUEUED_STATUS_VALUES = tuple(sorted(s.value for s in QUEUED_STATUSES))
 _AWAITING_PLACEHOLDERS = ",".join("?" * len(AWAITING_HUMAN_STATUS_VALUES))
+_QUEUED_PLACEHOLDERS = ",".join("?" * len(QUEUED_STATUS_VALUES))
 _IN_FLIGHT_PLACEHOLDERS = ",".join("?" * len(IN_FLIGHT_STATUS_VALUES))
 
 
@@ -71,6 +74,10 @@ TASK_STATE_FILTERS: dict[str, tuple[str, tuple[str, ...]]] = {
         AWAITING_HUMAN_STATUS_VALUES,
     ),
     "inflight": (f"status IN ({_IN_FLIGHT_PLACEHOLDERS})", IN_FLIGHT_STATUS_VALUES),
+    # A fourth NAMED mode, added exactly the way #617's revisit condition said to
+    # grow this: approved and untouched is a queue, and it deserves its own link
+    # rather than an arbitrary status list in the query string (#619).
+    "queued": (f"status IN ({_QUEUED_PLACEHOLDERS})", QUEUED_STATUS_VALUES),
 }
 
 
@@ -1089,7 +1096,10 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
                SUM(CASE WHEN t.status='draft' THEN 1 ELSE 0 END) AS drafts,
                SUM(CASE WHEN t.status IN ({_IN_FLIGHT_PLACEHOLDERS})
                          AND t.task_type != 'epic'
-                        THEN 1 ELSE 0 END) AS in_flight
+                        THEN 1 ELSE 0 END) AS in_flight,
+               SUM(CASE WHEN t.status IN ({_QUEUED_PLACEHOLDERS})
+                         AND t.task_type != 'epic'
+                        THEN 1 ELSE 0 END) AS queued
         FROM tree JOIN tasks t ON t.id = tree.id
         WHERE t.archived=0
         GROUP BY tree.project_id
@@ -1108,13 +1118,17 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
 
     summary: dict[int, dict[str, Any]] = {}
     for row in await db.execute_fetchall(
-        counts_sql, AWAITING_HUMAN_STATUS_VALUES + IN_FLIGHT_STATUS_VALUES
+        counts_sql,
+        AWAITING_HUMAN_STATUS_VALUES + IN_FLIGHT_STATUS_VALUES + QUEUED_STATUS_VALUES,
     ):
         d = dict(row)
         summary[int(d["pid"])] = {
             "awaiting_human": int(d["awaiting"] or 0),
             "drafts": int(d["drafts"] or 0),
             "in_flight": int(d["in_flight"] or 0),
+            # Kept beside "in flight" rather than folded into it: the queue is
+            # worth seeing, it is just a different question (#619).
+            "queued": int(d["queued"] or 0),
             "last_activity_at": None,
         }
     for row in await db.execute_fetchall(activity_sql):
