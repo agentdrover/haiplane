@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from httpx import AsyncClient
 
@@ -1728,7 +1729,9 @@ async def test_web_provision_button_and_status(client: AsyncClient, db):
     assert resp.status_code == 303
     assert resp.headers["location"] == "/projects"
     page = await client.get("/projects")
-    assert "ws&nbsp;ok" in page.text
+    # #622 removed the green "ws ok" from the header: "everything is fine" is not
+    # news. The provision BUTTON below is what this test is really about.
+    assert "ws&nbsp;ok" not in page.text
 
     plugins.git_ops.clone_repo = AsyncMock(
         return_value=(False, "remote not accessible: no key")
@@ -1739,7 +1742,12 @@ async def test_web_provision_button_and_status(client: AsyncClient, db):
     page = await client.get(resp.headers["location"])
     assert "remote not accessible" in page.text
     page = await client.get("/projects")
-    assert "ws&nbsp;error" in page.text
+    # #622: the badge is Russian now and the CAUSE is visible text — it used to
+    # live only in a title attribute, which a phone never shows.
+    assert "workspace: ошибка" in page.text
+    assert "remote not accessible" in page.text, (
+        "the reason must be readable on the card, not only on the redirect page"
+    )
 
 
 async def test_web_provision_hidden_without_repo(client: AsyncClient, db):
@@ -2562,7 +2570,9 @@ async def test_project_card_counts_only_what_waits_for_a_human(client: AsyncClie
     )
 
     page = await client.get("/projects")
-    assert "ждёт вас: 4" in page.text
+    # #622 turned the numbers into the dashboard's chip pattern: label and value
+    # are separate elements. The COUNT itself is asserted on the card above.
+    assert ">Ждёт вас<" in page.text and ">4<" in page.text
     assert "черновиков: 1" in page.text, (
         "a bare number reads as urgency; the label must name its composition"
     )
@@ -2650,9 +2660,12 @@ async def test_project_card_surfaces_pending_and_provision_error(
 
     page = (await client.get("/projects")).text
     header_of_broken = page.split("Broken WS", 1)[1].split("</div>", 1)[0]
-    assert "ws" in header_of_broken and "error" in header_of_broken, (
+    assert "workspace: ошибка" in header_of_broken, (
         "the failure must sit in the card header, above the collapsed block"
     )
+    # #622 goes further than #568: the CAUSE is visible text now, not a title
+    # attribute a phone never shows.
+    assert "clone failed" in page, "the reason must be readable without hovering"
     header_of_pending = page.split("Waiting", 1)[1].split("</div>", 1)[0]
     assert "pending" in header_of_pending
 
@@ -2839,8 +2852,11 @@ async def test_open_is_a_queue_not_work_in_flight(client: AsyncClient, db):
     assert card["queued"] == 3, "the queue is counted, not folded into work"
 
     page = (await client.get("/projects")).text
-    assert "в работе: 1" in page
-    assert "в очереди: 3" in page, "hiding the queue would trade one lie for another"
+    # Chips after #622; the numbers themselves are asserted on the card above.
+    assert ">В работе<" in page and ">В очереди<" in page
+    assert ">1<" in page and ">3<" in page, (
+        "hiding the queue would trade one lie for another"
+    )
 
 
 async def test_card_numbers_open_the_matching_list(client: AsyncClient, db):
@@ -2934,8 +2950,11 @@ async def test_card_names_what_it_hides_and_adapts_its_label(client: AsyncClient
 
     page = (await client.get("/projects")).text
     assert "И ещё 2" in page, "the hidden remainder must be named, not dropped"
-    assert "Свежие сверху" in page, "the order must be stated, or it looks arbitrary"
-    assert "все черновики" in page, (
+    # #622: said ONCE in the section subtitle instead of once per card.
+    assert page.count("свежие сверху") == 1, (
+        "the order must be stated once for the section, not repeated per card"
+    )
+    assert "Всё ожидание — черновики" in page, (
         "when every waiting item is a draft, say so instead of '(черновиков: N)'"
     )
     assert "готово" in page, "a bare 1/2 does not say what it is a share of"
@@ -2995,10 +3014,170 @@ async def test_activity_is_relative_and_computed_once(client: AsyncClient, db):
     await db.commit()
 
     page = (await client.get("/projects")).text
-    shown = page.split("активность:", 1)[1][:60]
+    # #622 renamed the label to «Обновлялся:» — a verb says what the date means.
+    assert "Обновлялся:" in page
+    # The exact date now lives in a .u-sr-only span (a title attribute is unusable
+    # on touch). So strip what the eye cannot see before judging what it sees —
+    # the first version of this assertion looked at a 60-character window and
+    # would have failed an honest implementation.
+    visible = re.sub(r'<span class="u-sr-only">.*?</span>', "", page, flags=re.S)
+    shown = visible.split("Обновлялся:", 1)[1][:60]
     assert "2026-07-20" not in shown, (
-        "the visible value must be relative; the exact date belongs in the tooltip"
+        "the visible value must be relative; the exact date belongs to assistive text"
     )
+    assert "2026-07-20" in page, "and the exact date must still be available somewhere"
     assert "назад" in shown or "сегодня" in shown or "вчера" in shown, (
         f"expected a relative phrase, got: {shown.strip()[:40]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The stylesheet cannot reference what does not exist (#622)
+# ---------------------------------------------------------------------------
+
+# Tokens that are referenced but never declared, and are owned by #624 — it
+# fixes the whole --clr-* family plus --radius-xl on /admin and /metrics. They
+# are listed BY NAME rather than tolerated silently: a nameless exception is how
+# this defect survived in the first place.
+#
+# The list is self-cleaning: the test below asserts each entry is STILL
+# undeclared, so the moment #624 lands, this fails and forces the entry out.
+# A debt list nobody is forced to revisit rots exactly like the statements that
+# needed #615.
+_TOKENS_OWNED_BY_624 = {
+    "--clr-accent",
+    "--clr-bg-accent",
+    "--clr-bg-surface",
+    "--clr-border",
+    "--clr-muted",
+    "--clr-text",
+    "--radius-xl",
+}
+
+
+def _stylesheet() -> str:
+    from pathlib import Path
+
+    return (
+        Path(__file__).resolve().parent.parent / "hub" / "static" / "style.css"
+    ).read_text()
+
+
+async def test_every_css_token_and_utility_class_exists():
+    # AC-1 (#622). This is the check whose ABSENCE let the defect exist: .muted
+    # and .small were used 28 times across six templates while no rule defined
+    # them, so every "quiet" caption rendered at body colour and size — the least
+    # important text on the screen louder than the most important. And I myself
+    # wrote var(--muted, #999), inventing a token that was never declared.
+    import re
+    from pathlib import Path
+
+    css = _stylesheet()
+    used = set(re.findall(r"var\(\s*(--[a-zA-Z0-9-]+)", css))
+    declared = set(re.findall(r"^\s*(--[a-zA-Z0-9-]+)\s*:", css, re.M))
+    assert used and declared, "guard the guard: an empty parse agrees with anything"
+
+    undeclared = used - declared
+    assert undeclared <= _TOKENS_OWNED_BY_624, (
+        f"CSS references tokens that do not exist: {sorted(undeclared - _TOKENS_OWNED_BY_624)}"
+    )
+    # Self-cleaning: a fixed token must leave the list, or this fails.
+    assert _TOKENS_OWNED_BY_624 <= undeclared, (
+        "these are declared now — remove them from _TOKENS_OWNED_BY_624: "
+        f"{sorted(_TOKENS_OWNED_BY_624 - undeclared)}"
+    )
+
+    # Utility classes used in templates must have a rule. Only the ones this task
+    # is about; a general class linter is a different job.
+    templates = Path(__file__).resolve().parent.parent / "hub" / "templates"
+    for utility in ("muted", "small"):
+        used_in = [
+            p.name
+            for p in templates.rglob("*.html")
+            if re.search(rf'class="[^"]*\b{utility}\b', p.read_text())
+        ]
+        assert used_in, f"precondition: .{utility} is used somewhere"
+        assert re.search(rf"^\s*\.{utility}\b[^{{]*{{", css, re.M), (
+            f".{utility} is used in {used_in} but no CSS rule defines it"
+        )
+
+
+async def test_workspace_error_shows_its_reason_visibly(client: AsyncClient, db):
+    # AC-3 (#622). #568 kept the failure in the header, which was right; what it
+    # missed is that the CAUSE lived only in a title attribute — invisible on a
+    # phone, unread by screen readers on touch. And the green "ws ok" left: a
+    # state that needs no action is not news.
+    from hub import repository as repo_module
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    broken = await repo_module.create_project(
+        db, slug="broken", name="Broken", repo_name="owner/x"
+    )
+    healthy = await repo_module.create_project(
+        db, slug="healthy", name="Healthy", repo_name="owner/y"
+    )
+    await db.execute(
+        "UPDATE projects SET provision_status='error', provision_detail='клон не удался: нет ключа' WHERE id=?",
+        (broken,),
+    )
+    await db.execute(
+        "UPDATE projects SET provision_status='ok', provision_detail='всё на месте' WHERE id=?",
+        (healthy,),
+    )
+    await db.commit()
+
+    page = (await client.get("/projects")).text
+    assert "workspace: ошибка" in page
+    assert "клон не удался: нет ключа" in page, (
+        "the cause must be visible text, not a title attribute"
+    )
+    assert "ws&nbsp;ok" not in page and "ws ok" not in page, (
+        "'everything is fine' is not news and does not belong in the header"
+    )
+    assert "всё на месте" not in page, "a healthy workspace needs no explanation"
+
+
+async def test_projects_page_speaks_one_language(client: AsyncClient, db):
+    # AC-4 (#622): a Russian body with English chrome makes the reader translate
+    # while scanning. And the footnote used to sit ABOVE the h1 — the first tab
+    # stop answered a question the arriving reader does not have yet.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    page = (await client.get("/projects")).text
+
+    assert '<h1 class="page-title">Проекты' in page
+    for english in (
+        "Provision<",
+        "Activate<",
+        ">Archive<",
+        ">edit<",
+        ">Save<",
+        "New Project<",
+    ):
+        assert english not in page, f"English chrome left on a Russian page: {english}"
+
+    body = page.split("<main", 1)[1]
+    h1_at = body.index("page-title")
+    note_at = body.index("Без эпика") if "Без эпика" in body else h1_at + 1
+    assert h1_at < note_at, "the section title must come before its footnote"
+
+
+async def test_card_uses_the_dashboard_chip_pattern(client: AsyncClient, db):
+    # AC-2 (#622): the same visual language the owner already reads on the
+    # dashboard, not a second one invented for the same meaning. And zero is
+    # dimmed rather than shouted.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    page = (await client.get("/projects")).text
+
+    assert "topbar-stat-label" in page and "topbar-stat-value" in page
+    assert "is-zero" in page, "a nothing must be dimmed, not equal to a number"
+    assert "·" not in page.split("topbar-stats", 1)[1][:600], (
+        "separators and nested brackets are what made the line unreadable"
+    )
+    # Screen readers list links out of context: five identical "в работе: 0" told
+    # the user nothing about which project they belonged to.
+    assert 'aria-label="Ждёт вашего решения:' in page
