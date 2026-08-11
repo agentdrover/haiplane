@@ -2924,6 +2924,12 @@ body.htmx-request .htmx-progress {
 
     .sidebar {
         position: fixed;
+        /* #620: top MUST be reset here. The base rule sets top: 0 for the
+           sticky desktop sidebar, and a fixed box with both top and bottom at 0
+           is stretched between them — `height: auto` below then changes nothing.
+           Measured before the fix: .sidebar 812px tall on an 812px viewport, so
+           a phone showed the menu and no content at all. */
+        top: auto;
         bottom: 0;
         left: 0;
         right: 0;
@@ -3352,7 +3358,12 @@ body.htmx-request .htmx-progress {
 /* Project cards (#567): the page answers "where is the work", so the cards come
    before the routing table. Deliberately plain — the card must not grow into a
    second dashboard, which is what the task's own scope forbids. */
-.project-cards { display: grid; gap: .75rem; margin-bottom: 1.25rem; }
+/* minmax(0, 1fr), not the default auto track: a grid track's minimum is
+   min-content, so one nowrap child (an epic title at 383px plus its badge at
+   106px) dictated the whole column — measured 524.758px inside a 343px
+   container, which pushed the card 150px off a 375px screen. The text was
+   always willing to clip; the track was not willing to let it (#620). */
+.project-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; margin-bottom: 1.25rem; }
 .project-card { border: 1px solid var(--border, #333); border-radius: 6px; padding: .75rem .9rem; }
 .project-card--archived { opacity: .55; }
 .project-card-numbers { margin: .35rem 0 .5rem; }
@@ -3375,3 +3386,16 @@ body.htmx-request .htmx-progress {
 .project-card-epics-note { margin: .3rem 0 .1rem; }
 .project-card-actions { margin: .45rem 0 .1rem; }
 .btn--xs { padding: .15rem .5rem; font-size: .8rem; }
+
+/* Same floor, one level down: a flex item will not shrink below min-content
+   unless told to, so the ellipsis on the epic title never got a chance (#620). */
+.project-card .epic-children,
+.project-card .epic-child-link,
+.project-card .epic-header,
+.project-card .project-card-numbers { min-width: 0; }
+.project-card .epic-child-title { min-width: 0; text-overflow: ellipsis; }
+
+/* The bottom bar is fixed, so the last rows of every page would sit under it. */
+@media (max-width: 768px) {
+    main { padding-bottom: 4.5rem; }
+}
