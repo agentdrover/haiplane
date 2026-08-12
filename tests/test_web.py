@@ -49,7 +49,9 @@ async def test_tasks_table_actions_have_consistent_button_markup(client: AsyncCl
         "/api/tasks",
         json={"title": "Draft action", "source": "agent", "agent": "bot"},
     )
-    resp = await client.get("/tasks")
+    # #630 moved the bare /tasks to the queue; this test is about TABLE markup,
+    # so it asks for a mode that renders one. The subject is unchanged.
+    resp = await client.get("/tasks", params={"state": "live"})
     assert resp.status_code == 200
     assert "task-table-actions" in resp.text
     assert "task-table-action" in resp.text
@@ -57,7 +59,9 @@ async def test_tasks_table_actions_have_consistent_button_markup(client: AsyncCl
 
 async def test_tasks_table_badges_have_consistent_markup(client: AsyncClient):
     await client.post("/api/tasks", json={"title": "Badge row"})
-    resp = await client.get("/tasks")
+    # #630 moved the bare /tasks to the queue; this test is about TABLE markup,
+    # so it asks for a mode that renders one. The subject is unchanged.
+    resp = await client.get("/tasks", params={"state": "live"})
     assert resp.status_code == 200
     assert "task-table-badge--type" in resp.text
     assert "task-table-badge--status" in resp.text
@@ -379,7 +383,10 @@ async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient
         ],
     )
     detail = await client.get(f"/tasks/{task_id}")
-    table = await client.get("/tasks")
+    # #630: this task is `open`, so it lives in a table mode now, not in the
+    # queue that a bare /tasks opens. The claim under test — the badge shows up
+    # in the list — is unchanged.
+    table = await client.get("/tasks", params={"state": "live"})
     kanban = await client.get("/partials/kanban")
 
     assert "Analyst Ready" in detail.text
@@ -3733,7 +3740,10 @@ async def test_filter_change_keeps_the_project_and_state_it_arrived_with(
     arrived = await client.get(
         "/tasks", params={"project": "scoped", "state": "awaiting"}
     )
-    assert re.findall(r'id="task-row-(\d+)"', arrived.text) == [str(drafted)]
+    # #630 renders the awaiting mode as the queue, so the row marker moved from
+    # task-row- to queue-item-. What this test is about — the scope surviving a
+    # filter change — did not.
+    assert re.findall(r'id="queue-item-(\d+)"', arrived.text) == [str(drafted)]
 
     # What htmx asks for when a filter changes — now carrying the same scope.
     after_click = await client.get(
@@ -3741,7 +3751,10 @@ async def test_filter_change_keeps_the_project_and_state_it_arrived_with(
         params={"project": "scoped", "state": "awaiting", "priority": "medium"},
     )
     assert after_click.status_code == 200, after_click.text
-    rows = re.findall(r'id="task-row-(\d+)"', after_click.text)
+    # The fragment answers in the SAME shape the page did — a queue for a queue
+    # (#630). Serving a table into the same div would rearrange the screen under
+    # a reader who only touched a priority.
+    rows = re.findall(r'id="queue-item-(\d+)"', after_click.text)
     assert rows == [str(drafted)], (
         "changing a filter must NARROW what was on screen, not silently replace "
         f"it with every project's rows; got {len(rows)} rows"
@@ -4239,3 +4252,169 @@ async def test_readiness_badge_keeps_its_meaning(client: AsyncClient, db):
     assert f'id="task-row-{modern}"' in page.text
     assert f'id="task-row-{legacy}"' in page.text
     assert f'id="task-row-{bare}"' not in page.text
+
+
+# ---------------------------------------------------------------------------
+# The tasks section opens on what awaits a human (#630, direction A)
+# ---------------------------------------------------------------------------
+
+
+async def _queue_fixture(client: AsyncClient, db) -> dict[str, int]:
+    """One task per kind of waiting, plus noise that must not be on the queue."""
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "queue-proj", "Queue Proj")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "queue-proj"},
+        )
+    ).json()["id"]
+
+    async def _child(title: str, status: str, **cols) -> int:
+        tid = (
+            await client.post(
+                "/api/tasks",
+                json={"title": title, "task_type": "feature", "parent_id": epic},
+            )
+        ).json()["id"]
+        await db.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        for col, val in cols.items():
+            await db.execute(f"UPDATE tasks SET {col}=? WHERE id=?", (val, tid))  # noqa: S608
+        return tid
+
+    ids = {
+        "draft": await _child("needs approval", "draft"),
+        "question": await _child("asked something", "needs_info"),
+        "decision": await _child("needs a call", "needs_decision"),
+        "review": await _child("submitted for review", "review"),
+        # A review the poller owns, not a person — must NOT be on the queue.
+        "headless": await _child("machine review", "review", review_job_id="job-1"),
+        "running": await _child("in flight", "running"),
+        "queued": await _child("approved, untouched", "open"),
+        "done": await _child("finished long ago", "completed"),
+    }
+    await db.commit()
+    return ids
+
+
+async def test_tasks_page_opens_on_what_awaits_a_human(client: AsyncClient, db):
+    # AC-1 (#630). Measured before: the first screen held 100 rows of which 61
+    # were completed and 18 were drafts waiting for this reader's approval,
+    # mixed together — the section answered "what exists", never "what is
+    # needed from me".
+    import re
+
+    ids = await _queue_fixture(client, db)
+
+    page = await client.get("/tasks")
+    assert page.status_code == 200, page.text
+    shown = set(re.findall(r'id="(?:task-row|queue-item)-(\d+)"', page.text))
+
+    for key in ("draft", "question", "decision", "review"):
+        assert str(ids[key]) in shown, f"{key} waits for a human and must be here"
+    for key in ("done", "running", "queued", "headless"):
+        assert str(ids[key]) not in shown, (
+            f"{key} does not wait for a human — the default screen is the queue, "
+            "not the archive"
+        )
+
+
+async def test_mode_chip_and_its_list_agree_for_all_four(client: AsyncClient, db):
+    # AC-2 (#630). The counter-vs-list divergence has shipped three times in
+    # this codebase (#571, #619, #621). Here four counters sit next to their own
+    # links, so the same defect has four new places to appear.
+    import re
+
+    await _queue_fixture(client, db)
+
+    page = (await client.get("/tasks")).text
+    chips = dict(
+        (m.group(1), int(m.group(2)))
+        for m in re.finditer(r'data-mode="(\w+)"[^>]*data-count="(\d+)"', page)
+    )
+    assert set(chips) == {"awaiting", "inflight", "queued", "live"}, (
+        f"all four modes must be switchable, got {sorted(chips)}"
+    )
+
+    for mode, promised in chips.items():
+        listing = await client.get("/tasks", params={"state": mode})
+        rows = re.findall(r'id="(?:task-row|queue-item)-(\d+)"', listing.text)
+        assert len(rows) == promised, (
+            f"mode {mode}: the chip promises {promised}, the list holds "
+            f"{len(rows)} — counter and list must come from one definition"
+        )
+
+
+async def test_queue_groups_by_required_action(client: AsyncClient, db):
+    # AC-3 (#630). "Ждёт вас: 37" is a pile; what a reader can act on is
+    # "approve 35, answer 1, decide 0, accept 1". The headless-review exclusion
+    # is not invented here — it is the rule TASK_STATE_FILTERS['awaiting'] and
+    # project_work_summary already follow: a review with review_job_id belongs
+    # to the poller.
+    ids = await _queue_fixture(client, db)
+    page = (await client.get("/tasks")).text
+
+    for group in (
+        "queue-group-draft",
+        "queue-group-needs_info",
+        "queue-group-needs_decision",
+        "queue-group-review",
+    ):
+        assert group in page, f"group {group} must exist, even when empty"
+
+    assert f'id="queue-item-{ids["headless"]}"' not in page, (
+        "a review owned by the poller is not a person's queue item"
+    )
+    assert f'id="queue-item-{ids["review"]}"' in page
+
+    # An EMPTY group still renders, and that is the point: "Принять решение 0"
+    # is an answer, while a group that disappears when it empties leaves the
+    # reader wondering whether it ever existed. The fixture above fills all four
+    # groups, so emptying them takes a filter — without this the rule is
+    # unpinned, and a mutation that dropped empty groups stayed green.
+    narrowed = (
+        await client.get("/tasks", params={"state": "awaiting", "priority": "critical"})
+    ).text
+    assert 'id="queue-item-' not in narrowed, "precondition: nothing is critical here"
+    for group in (
+        "queue-group-draft",
+        "queue-group-needs_info",
+        "queue-group-needs_decision",
+        "queue-group-review",
+    ):
+        assert group in narrowed, (
+            f"{group} vanished when it emptied — zero has to be said out loud"
+        )
+
+
+async def test_queue_view_keeps_the_project_scope(client: AsyncClient, db):
+    # AC-4 (#630). #626 taught the filter bar to carry the scope; the mode chips
+    # are a new set of links, so they get the same rule or the defect returns in
+    # a new place.
+    import re
+
+    await _queue_fixture(client, db)
+    page = (await client.get("/tasks", params={"project": "queue-proj"})).text
+    links = re.findall(r'data-mode="\w+"[^>]*href="([^"]+)"', page) or re.findall(
+        r'href="([^"]*state=\w+[^"]*)"', page
+    )
+    assert links, "the mode chips must be links"
+    for href in links:
+        assert "project=queue-proj" in href.replace("&amp;", "&"), (
+            f"switching mode must keep the project; this one drops it: {href}"
+        )
+
+
+async def test_queue_reuses_the_selection_approval(client: AsyncClient, db):
+    # AC-5 (#630). #628 built selection-based approval; a second mechanism here
+    # would be the fourth time this codebase grew two surfaces for one meaning.
+    ids = await _queue_fixture(client, db)
+    page = (await client.get("/tasks")).text
+
+    assert 'name="task_ids"' in page, "drafts must be selectable in the queue"
+    assert f'value="{ids["draft"]}"' in page
+    assert "/tasks/web-batch-approve-selected" in page, (
+        "the queue must post to the endpoint #628 already built, not a new one"
+    )
