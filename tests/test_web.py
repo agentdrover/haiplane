@@ -4104,3 +4104,138 @@ async def test_skipped_tasks_are_named_with_their_reason(client: AsyncClient, db
         "…and named WITH its reason, not merely listed"
     )
     assert str(good) in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Reading the list is a read: no recompute per row, no writes on GET (#629)
+# ---------------------------------------------------------------------------
+
+
+async def _ready_row(
+    db,
+    client: AsyncClient,
+    title: str,
+    *,
+    dor: bool,
+    prepared_by: str = "",
+    legacy_marker: bool = False,
+) -> int:
+    """A task whose readiness signal is set up through the DB, not the pipeline.
+
+    The signal has TWO shapes and both must survive: the modern one is the
+    ``prepared_by`` column, the legacy one is an update carrying
+    ANALYST_PREPARED_MARKER for tasks refined before that column existed.
+    """
+    from hub.web import ANALYST_PREPARED_MARKER
+
+    task_id = (await client.post("/api/tasks", json={"title": title})).json()["id"]
+    await db.execute(
+        "UPDATE tasks SET dor_passed=?, prepared_by=? WHERE id=?",
+        (1 if dor else 0, prepared_by, task_id),
+    )
+    if legacy_marker:
+        await db.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (?, 'bot', 'status', ?)",
+            (task_id, f"{ANALYST_PREPARED_MARKER}: readiness score=99"),
+        )
+    await db.commit()
+    return task_id
+
+
+async def test_task_list_does_not_recompute_readiness_per_row(
+    client: AsyncClient, db, monkeypatch
+):
+    # AC-1 (#629). Measured before the fix: _analyst_ready_map looped over the
+    # rows and called get_readiness for each one — up to 100 recomputes to draw
+    # one binary badge, while dor_passed and prepared_by sit in the row already.
+    from hub import services
+
+    for i in range(30):
+        await _ready_row(
+            db,
+            client,
+            f"row {i}",
+            dor=i % 2 == 0,
+            prepared_by="bot" if i % 4 == 0 else "",
+        )
+
+    calls = {"n": 0}
+    real = services.get_readiness
+
+    async def counting(*args, **kwargs):
+        calls["n"] += 1
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(services, "get_readiness", counting)
+
+    resp = await client.get("/tasks")
+    assert resp.status_code == 200, resp.text
+    assert calls["n"] == 0, (
+        f"rendering the list recomputed readiness {calls['n']} times; the badge "
+        "must be built from fields already read with the row, so the query count "
+        "cannot depend on how long the list is"
+    )
+
+
+async def test_get_on_the_task_list_writes_nothing(client: AsyncClient, db):
+    # AC-2 (#629). get_readiness repairs stale persisted values as a side effect
+    # (refinement.py, "lazy repair" from #250) — under a write lock, on a GET.
+    # A read that writes is a read that can block.
+    for i in range(12):
+        await _ready_row(db, client, f"stale {i}", dor=True, legacy_marker=True)
+    await db.execute("UPDATE tasks SET readiness_score=1 WHERE readiness_score IS NULL")
+    await db.commit()
+
+    before = db.total_changes
+    resp = await client.get("/tasks")
+    assert resp.status_code == 200, resp.text
+    assert db.total_changes == before, (
+        f"GET /tasks changed {db.total_changes - before} rows; reading a list "
+        "must not write"
+    )
+
+
+async def test_readiness_badge_keeps_its_meaning(client: AsyncClient, db):
+    # AC-3 (#629). The signal is NOT dor_passed: it is dor_passed AND evidence
+    # that an analyst prepared the task — the prepared_by column, or, for rows
+    # older than that column, an update carrying the marker. Replacing it with
+    # the bare column would leave the same badge meaning something else, which
+    # is the quiet kind of change this task exists to avoid.
+    #
+    # WHAT DOES CHANGE, AND IT IS NOT NOTHING: dor_passed is now read from the
+    # column instead of being recomputed on every render. The two can disagree
+    # for rows refined before persistence existed — that is why "lazy repair"
+    # was written in the first place (#250). The repair still runs where a
+    # single task is opened and at refine; it stops running a hundred times to
+    # draw a list. This test pins the column as the source, deliberately.
+    modern = await _ready_row(
+        db, client, "prepared, modern", dor=True, prepared_by="analyst-bot"
+    )
+    legacy = await _ready_row(
+        db, client, "prepared, legacy", dor=True, legacy_marker=True
+    )
+    bare = await _ready_row(db, client, "ready but unprepared", dor=True)
+    unready = await _ready_row(
+        db, client, "prepared but not ready", dor=False, prepared_by="analyst-bot"
+    )
+
+    from hub.web import _analyst_ready_map
+    from hub import services
+
+    tasks = await services.list_tasks(db, limit=50)
+    ready = await _analyst_ready_map(db, tasks)
+
+    assert ready[modern] is True, "prepared_by is the modern form of the signal"
+    assert ready[legacy] is True, (
+        "an update carrying the marker is the legacy form — dropping it would "
+        "silently un-ready every task refined before the column existed"
+    )
+    assert ready[bare] is False, "DoR alone was never this badge's meaning"
+    assert ready[unready] is False, "preparation without DoR is not readiness"
+
+    # And the filter agrees with the badge — they are the same signal.
+    page = await client.get("/tasks", params={"analyst_ready": "1"})
+    assert f'id="task-row-{modern}"' in page.text
+    assert f'id="task-row-{legacy}"' in page.text
+    assert f'id="task-row-{bare}"' not in page.text
