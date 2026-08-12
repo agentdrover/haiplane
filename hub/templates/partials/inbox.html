@@ -38,18 +38,43 @@
         Proposals <span class="inbox-count">{{ drafts|length }}</span>
     </summary>
     <div class="inbox-proposals-body">
-    <div class="inbox-item-actions inbox-batch-actions">
-        <button class="btn btn-success btn-xs"
-                hx-post="/tasks/web-batch-approve-ready"
-                hx-target="#inbox-proposals"
-                hx-swap="outerHTML"
-                hx-confirm="Approve all DoR-ready drafts without high risks?">
-            Approve ready ({{ drafts|selectattr('dor_passed')|list|length }})
-        </button>
+    {# #628: the group path acts on what was TICKED. The button that used to
+       live here approved a set the server computed — reading "(1)" while
+       approving two, the second from a project not on screen. A reader cannot
+       audit a radius they cannot see, so the radius became the selection. #}
+    {% if batch_result %}
+    <div class="task-action-note inbox-batch-result">
+        {% if batch_result.approved %}Одобрено: {{ batch_result.approved|length }} — {% for i in batch_result.approved %}#{{ i }}{% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}
+        {% if batch_result.skipped %}
+        {# Named WITH the reason: ticking five and getting three, with nothing
+           said about the other two, is its own lie. The reasons already existed
+           in BatchApproveResult; the old handler threw the result away. #}
+        <div class="inbox-batch-skipped">Пропущено: {{ batch_result.skipped|length }}.
+            {% for s in batch_result.skipped %}<span class="badge badge-failed">#{{ s.task_id }}: {{ s.reason }}</span> {% endfor %}
+        </div>
+        {% endif %}
     </div>
+    {% endif %}
+    <form class="inbox-batch-form" id="inbox-batch-form">
+        <input type="hidden" name="project" value="{{ filter_project or '' }}">
+        <div class="inbox-item-actions inbox-batch-actions">
+            <button type="button" class="btn btn-success btn-xs" id="inbox-batch-approve"
+                    hx-post="/tasks/web-batch-approve-selected"
+                    hx-include="#inbox-batch-form"
+                    hx-target="#inbox-proposals"
+                    hx-swap="outerHTML"
+                    disabled>
+                Одобрить отмеченные (<span id="inbox-batch-count">0</span>)
+            </button>
+            <span class="inbox-item-meta">отметьте задачи, которые одобряете</span>
+        </div>
     {% for t in drafts %}
     <article class="inbox-item" id="inbox-task-{{ t.id }}">
         <div class="inbox-item-header">
+            <label class="inbox-pick">
+                <input type="checkbox" name="task_ids" value="{{ t.id }}" class="inbox-pick-box"
+                       aria-label="Отметить #{{ t.id }} {{ t.title[:40] }} для группового одобрения">
+            </label>
             <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title[:60] }}{% if t.title|length > 60 %}…{% endif %}</a>
             {% if t.task_type.value != 'task' %}
             <span class="badge badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
@@ -73,20 +98,23 @@
         {% if t.description %}
         <div class="inbox-item-desc">{{ t.description[:120] }}{% if t.description|length > 120 %}…{% endif %}</div>
         {% endif %}
+        {# type="button" is load-bearing now that these sit inside the batch
+           form: a bare <button> defaults to submit and would navigate away,
+           taking the single-task path down with the group one. #}
         <div class="inbox-item-actions">
             {% if dispatch_available %}
-            <button class="btn btn-success btn-xs"
+            <button type="button" class="btn btn-success btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-approve"
                     hx-vals='{"run": "true"}'
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
                     hx-confirm="Approve and run #{{ t.id }}?">Approve &amp; Run</button>
             {% endif %}
-            <button class="btn btn-primary btn-xs"
+            <button type="button" class="btn btn-primary btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-approve"
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML">Approve</button>
-            <button class="btn btn-danger btn-xs"
+            <button type="button" class="btn btn-danger btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-reject"
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
@@ -94,6 +122,7 @@
         </div>
     </article>
     {% endfor %}
+    </form>
     </div>
 </details>
 {% endif %}
@@ -267,5 +296,31 @@
     if (el) {
         el.setAttribute("hx-get", "/partials/inbox{{ inbox_query|safe }}");
     }
+})();
+</script>
+
+<script>
+// #628: the button says how many are ticked, and cannot fire on zero. The
+// count is the same number the server will act on — the whole point of the
+// group path is that the radius is visible BEFORE the click, not inferred
+// after it.
+(function () {
+    var form = document.getElementById("inbox-batch-form");
+    var btn = document.getElementById("inbox-batch-approve");
+    var out = document.getElementById("inbox-batch-count");
+    if (!form || !btn || !out) return;
+    function sync() {
+        var n = form.querySelectorAll("input[name='task_ids']:checked").length;
+        out.textContent = n;
+        btn.disabled = n === 0;
+        btn.setAttribute(
+            "hx-confirm",
+            "Одобрить отмеченные задачи (" + n + ")? Гейты DoR и high-риск остаются."
+        );
+    }
+    form.addEventListener("change", function (e) {
+        if (e.target && e.target.name === "task_ids") sync();
+    });
+    sync();
 })();
 </script>

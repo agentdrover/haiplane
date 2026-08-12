@@ -238,7 +238,16 @@ def inbox_query_string(
     human_owner: str | None = None,
     claimed_by: str | None = None,
     mine: str | None = None,
+    project: str | None = None,
 ) -> str:
+    """The URL the inbox fragment re-fetches ITSELF with, every 30 seconds.
+
+    ``project`` belongs here for the same reason the person filters do: the
+    fragment overwrites its container's hx-get with this string, so anything
+    missing is dropped on the first self-refresh. Measured on production
+    (#628): a scoped inbox kept ``mine`` and lost ``project``, silently widening
+    back to every project half a minute after it was narrowed.
+    """
     params: dict[str, str] = {}
     if mine:
         params["mine"] = mine
@@ -246,6 +255,8 @@ def inbox_query_string(
         params["human_owner"] = human_owner
     if claimed_by:
         params["claimed_by"] = claimed_by
+    if project:
+        params["project"] = project
     if not params:
         return ""
     return f"?{urlencode(params)}"
