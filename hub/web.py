@@ -7,7 +7,7 @@ import html
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 
 import aiosqlite
@@ -1263,26 +1263,47 @@ async def web_decide_task(
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 
-@router.post("/tasks/web-batch-approve-ready")
-async def web_batch_approve_ready(request: Request):
-    """Inbox bulk action (#252): approve every DoR-ready draft without
-    high risks in one click. Same guards as the API — force never."""
+@router.post("/tasks/web-batch-approve-selected")
+async def web_batch_approve_selected(
+    request: Request,
+    task_ids: Annotated[list[int], Form()] = [],  # noqa: B006 - FastAPI Form default
+    project: Annotated[str, Form()] = "",
+):
+    """Approve the drafts the reader TICKED — the group path of #628.
+
+    It replaces "approve every ready draft", whose set the server computed:
+    with a computed set the reader cannot see what the click will do, and the
+    label proved it — viewing a project with one ready draft, the button read
+    "(1)" and approved two, the second from a project not on screen. Both left
+    the human DoR gate without being looked at.
+
+    An empty selection approves NOTHING. Reading it as "then everything" would
+    rebuild the same defect in new clothes, and a test pins that.
+
+    Per-task guards and force-never live in ``batch_approve_tasks`` (#252) and
+    are unchanged; what changed is who chooses the set. Its result is rendered
+    instead of discarded, because silently dropping a task the reader
+    explicitly ticked is its own lie.
+    """
     db = _db(request)
     identity = current_identity(request)
     if identity.is_agent:
         raise HTTPException(403, detail=human_only_gate_detail())
-    draft_rows = await repo.list_tasks_by_status(db, "draft", limit=100)
-    task_ids = [dict(r)["id"] for r in draft_rows]
+    result = None
     if task_ids:
-        await services.batch_approve_tasks(
+        result = await services.batch_approve_tasks(
             db,
-            BatchApprove(task_ids=task_ids, comment="Batch-approved from inbox"),
+            BatchApprove(task_ids=task_ids, comment="Approved from inbox selection"),
         )
     if _is_htmx(request):
-        inbox = await services.get_inbox_data(db)
+        # Re-rendered INSIDE the project the reader was looking at: refreshing
+        # unscoped would widen the list under them right after they acted.
+        inbox = await services.get_inbox_data(db, project=project or None)
         inbox["dispatch_available"] = _dispatch_available()
+        inbox["batch_result"] = result
         return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
-    return RedirectResponse("/", status_code=303)
+    query = f"?project={quote(project)}" if project else ""
+    return RedirectResponse(f"/{query}", status_code=303)
 
 
 def _parse_findings_form(text: str) -> list[ReviewFinding]:

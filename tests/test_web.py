@@ -1001,7 +1001,14 @@ async def test_inbox_ranks_ready_drafts_first_with_badges(client: AsyncClient):
     assert html.index(f"inbox-task-{ready_id}") < html.index(f"inbox-task-{bare_id}")
     assert "ready · score" in html
     assert "not refined" in html
-    assert "Approve ready (1)" in html
+    # #628 removed the "Approve ready (N)" button this line used to pin: its
+    # set was computed by the server, so the number it showed and the rows it
+    # touched could differ — measured, "(1)" approved two. The group path is
+    # now a selection, and the count starts at zero because nothing is ticked
+    # yet. The ranking this test is actually about is asserted above and
+    # unchanged.
+    assert 'id="inbox-batch-count"' in html
+    assert "Одобрить отмеченные" in html
 
 
 # ---- Project selector and filtering in Web UI (#339) ----
@@ -3956,3 +3963,144 @@ async def test_no_consumer_filters_by_project_after_its_limit(client: AsyncClien
         "post-filtering a limited list by project is the defect itself; leaving "
         "the helper in place invites the next caller to repeat it"
     )
+
+
+# ---------------------------------------------------------------------------
+# Approving from the inbox acts on what was SELECTED (#628)
+# ---------------------------------------------------------------------------
+
+
+async def _ready_draft(
+    client: AsyncClient, db, title: str, *, project_epic=None
+) -> int:
+    """A DoR-ready draft, optionally hung under an epic so it has a project."""
+    task_id = await _draft_with_readiness(client, title, ready=True)
+    if project_epic is not None:
+        await db.execute(
+            "UPDATE tasks SET parent_id=?, task_type='feature' WHERE id=?",
+            (project_epic, task_id),
+        )
+        await db.commit()
+    return task_id
+
+
+async def _status_of(db, task_id: int) -> str:
+    rows = await db.execute_fetchall("SELECT status FROM tasks WHERE id=?", (task_id,))
+    return rows[0]["status"]
+
+
+async def test_group_approve_touches_only_what_was_selected(client: AsyncClient, db):
+    # AC-1 (#628). Measured on the old button: viewing a project whose inbox
+    # held ONE ready draft, the click approved two — the second belonged to a
+    # project the reader could not see. Both went draft → open. A label reading
+    # "(1)" that moves two rows is not an off-by-one, it is an action whose
+    # radius is invisible until afterwards.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await _project_with(client, db, "picked", "Picked")
+    epic = (
+        await client.post(
+            "/api/tasks",
+            json={"title": "E", "task_type": "epic", "project": "picked"},
+        )
+    ).json()["id"]
+    chosen_a = await _ready_draft(client, db, "chosen a", project_epic=epic)
+    chosen_b = await _ready_draft(client, db, "chosen b", project_epic=epic)
+    shown_not_chosen = await _ready_draft(
+        client, db, "shown, not ticked", project_epic=epic
+    )
+    outside = await _ready_draft(client, db, "another project entirely")
+
+    # The selection has to be reachable from the page, not only from a curl:
+    # a server that honours task_ids while the inbox renders no checkboxes is
+    # a fix nobody can use, and a mutation that removed them stayed green
+    # until this assertion existed.
+    page = (await client.get("/partials/inbox")).text
+    for task_id in (chosen_a, shown_not_chosen):
+        assert f'name="task_ids" value="{task_id}"' in page, (
+            f"#{task_id} has no checkbox — the reader cannot tick it"
+        )
+
+    resp = await client.post(
+        "/tasks/web-batch-approve-selected",
+        data={"task_ids": [str(chosen_a), str(chosen_b)]},
+    )
+    assert resp.status_code in (200, 303), resp.text
+
+    assert await _status_of(db, chosen_a) == "open"
+    assert await _status_of(db, chosen_b) == "open"
+    assert await _status_of(db, shown_not_chosen) == "draft", (
+        "a task that was on screen but NOT ticked must not be approved"
+    )
+    assert await _status_of(db, outside) == "draft", (
+        "a task the reader never saw must not be approved — this is the "
+        "measured defect: the old button approved it too"
+    )
+
+
+async def test_empty_selection_approves_nothing(client: AsyncClient, db):
+    # AC-2 (#628). The trap worth naming: an empty list read as "then approve
+    # everything" would rebuild the same defect in new clothes. Nothing is the
+    # only honest reading of nothing.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    ready = await _ready_draft(client, db, "ready and untouched")
+
+    resp = await client.post("/tasks/web-batch-approve-selected", data={})
+    assert resp.status_code in (200, 303, 400), resp.text
+    assert await _status_of(db, ready) == "draft", (
+        "an empty selection means nothing, never everything"
+    )
+
+
+async def test_single_approve_survives_the_group_path(client: AsyncClient, db):
+    # AC-3 (#628). Two approaches, and the single one is not swallowed by the
+    # group: one task, one decision, same gates.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    one = await _ready_draft(client, db, "approved on its own")
+    other = await _ready_draft(client, db, "left alone")
+
+    resp = await client.post(f"/tasks/{one}/web-approve")
+    assert resp.status_code in (200, 303), resp.text
+    assert await _status_of(db, one) == "open"
+    assert await _status_of(db, other) == "draft"
+
+
+async def test_skipped_tasks_are_named_with_their_reason(client: AsyncClient, db):
+    # AC-4 (#628). Ticking five and getting three, with no word about the other
+    # two, is its own lie — and the reasons already exist in BatchApproveResult;
+    # the old handler simply threw the result away.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    good = await _ready_draft(client, db, "passes the gate")
+    unrefined = await _draft_with_readiness(client, "never refined", ready=False)
+
+    resp = await client.post(
+        "/tasks/web-batch-approve-selected",
+        data={"task_ids": [str(good), str(unrefined)]},
+        headers={"HX-Request": "true"},
+    )
+    import re
+
+    assert resp.status_code == 200, resp.text
+    assert await _status_of(db, good) == "open"
+    assert await _status_of(db, unrefined) == "draft"
+
+    # Anchored INSIDE the result block, not anywhere on the page. The loose
+    # version passed with the result thrown away, because a skipped draft stays
+    # in the inbox and its id is on the page for an unrelated reason — the same
+    # mistake as reading the whole dashboard to test the board.
+    block = re.search(r'class="inbox-batch-skipped".*?</div>', resp.text, re.S)
+    assert block, "skipped tasks must be reported, not silently dropped"
+    assert str(unrefined) in block.group(0), (
+        "a task the reader explicitly ticked and did not get must be named"
+    )
+    assert re.search(r"#\d+:\s*\w", block.group(0)), (
+        "…and named WITH its reason, not merely listed"
+    )
+    assert str(good) in resp.text

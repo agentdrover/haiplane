@@ -212,10 +212,12 @@ async def get_inbox_data(
         "filter_human_owner": human_owner or "",
         "filter_claimed_by": claimed_by or "",
         "filter_mine": mine or "",
+        "filter_project": (project or "").strip(),
         "inbox_query": repo.inbox_query_string(
             human_owner=human_owner,
             claimed_by=claimed_by,
             mine=mine,
+            project=project,
         ),
     }
 
