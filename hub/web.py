@@ -346,10 +346,37 @@ async def _analyst_ready_map(
     db: aiosqlite.Connection,
     tasks: list[Any],
 ) -> dict[int, bool]:
+    """The badge for a whole list, in at most ONE extra query (#629).
+
+    What it used to do: for every row, recompute readiness (which reads all of
+    that task's updates and, on a mismatch, WRITES the repaired values under a
+    write lock — refinement.py, "lazy repair" from #250) and then, for rows
+    without ``prepared_by``, read the updates AGAIN looking for the legacy
+    marker. On production that was up to 100 recomputes plus ~80 update scans
+    to draw one binary badge — measured: only 41 of 200 tasks carry both
+    dor_passed and prepared_by, so four rows in five took the slow path.
+
+    The signal itself is unchanged: DoR passed AND evidence that an analyst
+    prepared the task — ``prepared_by`` for modern rows, an update carrying
+    ANALYST_PREPARED_MARKER for rows older than that column. Only the source of
+    dor_passed moves, from a recompute to the persisted column; the repair
+    still runs when a single task is opened and at refine.
+    """
     result: dict[int, bool] = {}
+    legacy_candidates: list[int] = []
     for task in tasks:
-        info = await _analyst_ready_info(db, task.id, task=task)
-        result[task.id] = bool(info["ready"])
+        if not getattr(task, "dor_passed", False):
+            result[task.id] = False
+        elif (getattr(task, "prepared_by", "") or "").strip():
+            result[task.id] = True
+        else:
+            legacy_candidates.append(task.id)
+    if legacy_candidates:
+        marked = await repo.task_ids_with_update_marker(
+            db, legacy_candidates, ANALYST_PREPARED_MARKER
+        )
+        for task_id in legacy_candidates:
+            result[task_id] = task_id in marked
     return result
 
 

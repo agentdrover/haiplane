@@ -233,6 +233,26 @@ def _append_person_filters(
         params.append(claimed_by)
 
 
+async def task_ids_with_update_marker(
+    db: aiosqlite.Connection, task_ids: list[int], marker: str
+) -> set[int]:
+    """Which of these tasks carry an update containing ``marker`` — ONE query.
+
+    Written for #629: the caller used to ask this per task, inside a loop over
+    a rendered list, so drawing one badge on 100 rows cost 100 scans of
+    task_updates. The question is the same; asking it once is the whole change.
+    """
+    if not task_ids:
+        return set()
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = await db.execute_fetchall(
+        f"SELECT DISTINCT task_id FROM task_updates "  # nosec B608 - placeholders only
+        f"WHERE task_id IN ({placeholders}) AND instr(content, ?) > 0",
+        (*task_ids, marker),
+    )
+    return {int(dict(r)["task_id"]) for r in rows}
+
+
 def inbox_query_string(
     *,
     human_owner: str | None = None,
