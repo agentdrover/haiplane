@@ -233,6 +233,39 @@ def _append_person_filters(
         params.append(claimed_by)
 
 
+async def count_tasks_by_state(
+    db: aiosqlite.Connection, project_id: int | None = None
+) -> dict[str, int]:
+    """How many live tasks sit in each named mode — ONE query, ONE definition.
+
+    Built by folding TASK_STATE_FILTERS into a single SELECT of SUM(CASE ...),
+    so a counter cannot drift from the list its link opens: both read the same
+    condition string. Spelling the counts out with "similar" WHERE clauses is
+    exactly how #571, #619 and #621 each shipped a number that disagreed with
+    the page behind it — three times is enough to make the shared definition
+    structural rather than a habit (#630).
+    """
+    parts: list[str] = []
+    params: list[Any] = []
+    for name in ("live", "awaiting", "inflight", "queued"):
+        sql, values = task_state_condition(name)
+        parts.append(f"SUM(CASE WHEN {sql} THEN 1 ELSE 0 END) AS {name}")
+        params.extend(values)
+    where = ["archived=0"]
+    if project_id is not None:
+        where.append(PROJECT_SUBTREE_CONDITION)
+        params.append(project_id)
+    rows = await db.execute_fetchall(
+        f"SELECT {', '.join(parts)} FROM tasks WHERE {' AND '.join(where)}",  # nosec B608
+        tuple(params),
+    )
+    row = dict(rows[0]) if rows else {}
+    return {
+        name: int(row.get(name) or 0)
+        for name in ("live", "awaiting", "inflight", "queued")
+    }
+
+
 async def task_ids_with_update_marker(
     db: aiosqlite.Connection, task_ids: list[int], marker: str
 ) -> set[int]:

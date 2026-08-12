@@ -1,0 +1,114 @@
+{# #630: the awaiting mode rendered as WORK, not as rows.
+   A pile of 37 says how much; "approve 35 · answer 1 · decide 0 · accept 1"
+   says what to do, and the reader can start without sorting anything first.
+
+   Built from the inbox's own vocabulary (.inbox-item, .inbox-group-title,
+   .inbox-pick) rather than a second one for the same meaning, and the group
+   approval posts to the endpoint #628 already built. #}
+<form class="queue-form" id="queue-form">
+    <input type="hidden" name="project" value="{{ current_project or '' }}">
+    {% for group in queue_groups %}
+    <section class="inbox-group queue-group" id="queue-group-{{ group.key }}">
+        <h3 class="inbox-group-title">
+            {{ group.label }}
+            <span class="inbox-count{% if group['items'] %} inbox-count-warn{% endif %}">{{ group['items']|length }}</span>
+        </h3>
+        {% if group['items'] %}
+        <p class="muted small queue-group-why">{{ group.why }}</p>
+        {% for t in group['items'] %}
+        <article class="inbox-item" id="queue-item-{{ t.id }}">
+            <div class="inbox-item-header">
+                {% if group.key == 'draft' %}
+                <label class="inbox-pick">
+                    <input type="checkbox" name="task_ids" value="{{ t.id }}" class="inbox-pick-box"
+                           aria-label="Отметить #{{ t.id }} {{ t.title[:40] }} для группового одобрения">
+                </label>
+                {% endif %}
+                {# No truncation. The title is the only field that actually
+                   distinguishes one row from another — measured, 216 of 552 are
+                   longer than the table's 60-character cut — and the queue is a
+                   two-line layout with room for it. Cutting here would recreate
+                   the defect one row down. #}
+                <a href="/tasks/{{ t.id }}" class="inbox-item-link">#{{ t.id }} {{ t.title }}</a>
+                {% if t.task_type.value != 'task' %}
+                <span class="badge badge-type-{{ t.task_type.value }}">{{ t.task_type.value }}</span>
+                {% endif %}
+            </div>
+            <div class="inbox-item-meta">
+                {# Readiness read from the row, never recomputed — #629. #}
+                {% if t.dor_passed %}
+                <span class="badge badge-completed">готова · {{ t.readiness_score }}</span>
+                {% elif t.readiness_score is not none %}
+                <span class="badge badge-draft">score {{ t.readiness_score }}</span>
+                {% endif %}
+                {# "Analyst Ready" is a different claim from "DoR passed": it also
+                   says a human-facing analyst prepared this. The queue is where
+                   approving happens, so dropping the signal HERE — of all
+                   places — would quietly remove the thing the decision leans
+                   on. #}
+                {% if analyst_ready_by_id is defined and analyst_ready_by_id.get(t.id) %}
+                <span class="badge badge-completed">Analyst Ready</span>
+                {% endif %}
+                {% if t.human_owner %}<span>{{ t.human_owner }}</span>{% endif %}
+                <span>{{ t.created_at[:10] }}</span>
+            </div>
+            <div class="inbox-item-actions">
+                {% if group.key == 'draft' %}
+                <button type="button" class="btn btn-success btn-xs"
+                        hx-post="/tasks/{{ t.id }}/web-approve"
+                        hx-target="#queue-item-{{ t.id }}"
+                        hx-swap="outerHTML">Одобрить</button>
+                <button type="button" class="btn btn-danger btn-xs"
+                        hx-post="/tasks/{{ t.id }}/web-reject"
+                        hx-target="#queue-item-{{ t.id }}"
+                        hx-swap="outerHTML"
+                        hx-confirm="Отклонить #{{ t.id }}?">Отклонить</button>
+                {% else %}
+                <a class="btn btn-primary btn-xs" href="/tasks/{{ t.id }}">Открыть</a>
+                {% endif %}
+            </div>
+        </article>
+        {% endfor %}
+        {% if group.key == 'draft' %}
+        {# Selection-based approval, reused from #628: the radius of the action
+           is what the reader ticked, and an empty selection approves nothing.
+           A different id than the inbox form's, or the htmx swap lands
+           nowhere. #}
+        <div class="inbox-item-actions inbox-batch-actions">
+            <button type="button" class="btn btn-success btn-xs" id="queue-batch-approve"
+                    hx-post="/tasks/web-batch-approve-selected"
+                    hx-include="#queue-form"
+                    hx-target="#task-table-wrap"
+                    hx-swap="innerHTML"
+                    disabled>
+                Одобрить отмеченные (<span id="queue-batch-count">0</span>)
+            </button>
+            <span class="inbox-item-meta">отметьте те, что одобряете</span>
+        </div>
+        {% endif %}
+        {% else %}
+        <p class="muted small queue-group-empty">Ничего — это ответ, а не пустота.</p>
+        {% endif %}
+    </section>
+    {% endfor %}
+</form>
+
+<script>
+(function () {
+    var form = document.getElementById("queue-form");
+    var btn = document.getElementById("queue-batch-approve");
+    var out = document.getElementById("queue-batch-count");
+    if (!form || !btn || !out) return;
+    function sync() {
+        var n = form.querySelectorAll("input[name='task_ids']:checked").length;
+        out.textContent = n;
+        btn.disabled = n === 0;
+        btn.setAttribute("hx-confirm",
+            "Одобрить отмеченные задачи (" + n + ")? Гейты DoR и high-риск остаются.");
+    }
+    form.addEventListener("change", function (e) {
+        if (e.target && e.target.name === "task_ids") sync();
+    });
+    sync();
+})();
+</script>

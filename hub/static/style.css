@@ -3573,3 +3573,76 @@ body.htmx-request .htmx-progress {
 @media (max-width: 768px) {
     main { padding-bottom: 4.5rem; }
 }
+
+/* ─── Задачи: очередь как умолчание раздела (#630) ─────────────────────────
+   Собрано из существующих токенов — новых не заводится: тест
+   test_every_css_token_and_utility_class_exists фиксирует их число. */
+
+/* Переключатель режимов. Выбранный отмечен так же, как активный пункт меню,
+   чтобы «где я» читалось одним приёмом на всех экранах. */
+.mode-switch { margin-bottom: var(--sp-4); flex-wrap: wrap; }
+.mode-switch .topbar-stat.is-current {
+    background: var(--accent-dim);
+    border-color: var(--accent-glow);
+}
+.mode-switch .topbar-stat.is-current .topbar-stat-value,
+.mode-switch .topbar-stat.is-current .topbar-stat-label { color: var(--accent-light); }
+
+.queue-form { display: flex; flex-direction: column; gap: var(--sp-4); }
+.queue-group { display: flex; flex-direction: column; gap: var(--sp-2); }
+.queue-group-why { margin: 0 0 var(--sp-1); }
+/* Ноль — это ответ, а не пустое место: группа остаётся и говорит словами. */
+.queue-group-empty { margin: 0; color: var(--text-muted); }
+
+/* #628 ввёл эти классы в инбоксе и не дал им правил — имена классов гейтом не
+   проверяются, поэтому цель касания, задуманная в 44px, до прода не доехала.
+   Сама галочка 18px, кликабельная область растянута паддингом и втянута
+   обратно отрицательным margin, чтобы не разъезжалась строка. */
+.inbox-pick {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 13px;
+    margin: -11px -9px -13px -13px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+.inbox-pick:hover { background: var(--surface-active); }
+.inbox-pick-box { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.inbox-batch-actions {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: var(--sp-3);
+    flex-wrap: wrap;
+    gap: var(--sp-3);
+}
+
+@media (max-width: 768px) {
+    /* Тот же пол цели касания, что уже применён к разделу проектов. */
+    .queue-group .btn { min-height: 44px; }
+    .mode-switch .topbar-stat { min-height: 44px; }
+}
+
+/* Панель фильтров свёрнута по умолчанию (#630): развёрнутая она занимала на
+   375px около четырёх экранов до первой задачи. Раскрыта, когда фильтр
+   применён — спрятанный применённый фильтр это вторая беда, не лучше первой. */
+.filter-disclosure { margin-bottom: var(--sp-4); }
+.filter-disclosure > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: 44px;
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+.filter-disclosure > summary::-webkit-details-marker { display: none; }
+.filter-disclosure > summary::before { content: "\25B6"; font-size: 9px; color: var(--text-muted); }
+.filter-disclosure[open] > summary::before { content: "\25BC"; }
+.filter-disclosure > summary:hover { background: var(--surface-hover); color: var(--text); }
+.filter-disclosure[open] > summary { margin-bottom: var(--sp-2); }

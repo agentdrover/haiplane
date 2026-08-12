@@ -342,6 +342,48 @@ async def _analyst_ready_info(
     }
 
 
+# #630: the mode a bare /tasks opens in. Named once so the handler, the chip
+# markup and the tests cannot drift apart on which one is the default.
+QUEUE_STATE = "awaiting"
+
+# What a person has to DO, in the order idleness costs most. Membership is by
+# status only — the headless-review exclusion is NOT repeated here, because
+# TASK_STATE_FILTERS['awaiting'] has already applied it upstream: a review with
+# review_job_id belongs to the poller's conveyor, not to a reader (#567, #617).
+QUEUE_GROUPS: tuple[tuple[str, str, str], ...] = (
+    (
+        "draft",
+        "Одобрить постановку",
+        "ждут гейта DoR — пока не одобрите, никто не начнёт",
+    ),
+    ("needs_info", "Ответить на вопрос", "агент остановился и ждёт ответа"),
+    (
+        "needs_decision",
+        "Принять решение",
+        "развилка, которую агент не вправе закрыть сам",
+    ),
+    ("review", "Согласовать сдачу", "работа сдана и ждёт вердикта"),
+)
+
+
+def _queue_groups(tasks: list[Any]) -> list[dict[str, Any]]:
+    """Split an already-filtered awaiting list into the actions it asks for.
+
+    Empty groups are KEPT: "Принять решение 0" is an answer, and a group that
+    vanishes when it empties makes the reader wonder whether it was there at
+    all — the same rule #615 settled for silence elsewhere.
+    """
+    by_status: dict[str, list[Any]] = {key: [] for key, _, _ in QUEUE_GROUPS}
+    for task in tasks:
+        status = getattr(task.status, "value", task.status)
+        if status in by_status:
+            by_status[status].append(task)
+    return [
+        {"key": key, "label": label, "why": why, "items": by_status[key]}
+        for key, label, why in QUEUE_GROUPS
+    ]
+
+
 async def _analyst_ready_map(
     db: aiosqlite.Connection,
     tasks: list[Any],
@@ -569,6 +611,20 @@ async def web_tasks_list_partial(
     tasks, ready_by_id = await _apply_analyst_ready_filter(
         _db(request), tasks, analyst_ready=analyst_ready
     )
+    # #630: the fragment renders the SAME shape the page does. Serving a table
+    # here while the page shows the queue would rearrange the screen under a
+    # reader who only changed a priority — the swap target is the same div.
+    if state == QUEUE_STATE:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "partials/task_queue.html",
+            {
+                "queue_groups": _queue_groups(tasks),
+                "current_project": (project or "").strip(),
+                "dispatch_available": _dispatch_available(),
+                "analyst_ready_by_id": ready_by_id,
+            },
+        )
     return TEMPLATES.TemplateResponse(
         request,
         "partials/task_table.html",
@@ -970,6 +1026,18 @@ async def web_tasks(
 ):
     db = _db(request)
     projects_list, current_project = await _project_selector_ctx(db, project)
+    # #630: a bare /tasks answers "what is needed from me", not "what exists".
+    # Measured before: the first screen held 100 rows, 61 of them completed,
+    # with the 18 drafts waiting for this reader's approval mixed in between.
+    #
+    # The default applies ONLY to a request with no query at all. Any parameter
+    # — project included — means the caller asked for something specific, and
+    # honouring it is what keeps "Вся доска проекта" from turning into "the
+    # queue of that project" behind the same words (#621 fixed that link; this
+    # must not un-fix it).
+    defaulted_to_queue = not request.query_params
+    if defaulted_to_queue:
+        state = QUEUE_STATE
     parsed_parent_id = _optional_int_query(parent_id, "parent_id")
     # The project goes INTO the query, not into a pass over its result (#621).
     # This list is limited, and post-filtering a limited list spends the limit on
@@ -1003,11 +1071,26 @@ async def web_tasks(
     all_types = [t.value for t in TaskType]
     all_priorities = ["critical", "high", "medium", "low"]
 
+    # #630: the four counters come from ONE query built out of the same
+    # TASK_STATE_FILTERS conditions the lists use, so a chip cannot promise a
+    # number the page behind it does not hold.
+    project_row = (
+        await repo.get_project_by_slug(db, current_project) if current_project else None
+    )
+    mode_counts = await repo.count_tasks_by_state(
+        db, project_row["id"] if project_row is not None else None
+    )
+    queue_groups = _queue_groups(tasks) if state == QUEUE_STATE else None
+
     return TEMPLATES.TemplateResponse(
         request,
         "tasks.html",
         {
             "tasks": tasks,
+            "mode_counts": mode_counts,
+            "queue_groups": queue_groups,
+            "queue_state": QUEUE_STATE,
+            "defaulted_to_queue": defaulted_to_queue,
             "filter_status": status or "",
             "filter_type": task_type or "",
             "filter_priority": priority or "",

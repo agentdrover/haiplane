@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "hub-local",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "hub.app:app", "--port", "8099"],
+      "port": 8099
+    }
+  ]
+}

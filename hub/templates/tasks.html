@@ -20,12 +20,33 @@
 </nav>
 {% endif %}
 
-{# #626: the mode a card link applied is now visible and removable. A filter
-   with no on-screen representation cannot be read or undone — the only exit
-   from state=awaiting used to be Reset, which drops the project too, so
-   "narrow by one thing" cost you everything else. Clearing keeps the project
-   because the project is where the reader came FROM. #}
-{% if filter_state %}
+{# #630: the four modes as a control, not just as a URL a card link can carry.
+   Each chip keeps the project it was clicked in — the mode chips are new links,
+   and #626's rule (the scope travels) applies to them the same way.
+
+   The numbers come from ONE query built from the same TASK_STATE_FILTERS the
+   lists use. Every other way of counting has shipped a chip that disagreed with
+   its own page: three times, #571, #619, #621. #}
+{% set _mode_qs = '?project=' ~ current_project ~ '&' if current_project else '?' %}
+<nav class="topbar-stats mode-switch" aria-label="Режим показа">
+    {% for key, label in [('awaiting', 'Ждёт вас'), ('inflight', 'В работе'),
+                          ('queued', 'В очереди'), ('live', 'Всё живое')] %}
+    <a class="topbar-stat{% if filter_state == key %} is-current{% endif %}{% if not mode_counts[key] %} is-zero{% endif %}"
+       data-mode="{{ key }}" data-count="{{ mode_counts[key] }}"
+       href="/tasks{{ _mode_qs }}state={{ key }}"
+       {% if filter_state == key %}aria-current="page"{% endif %}
+       aria-label="{{ label }}: {{ mode_counts[key] }}{% if current_project %} — проект {{ current_project }}{% endif %}">
+        <span class="topbar-stat-label">{{ label }}</span>
+        <span class="topbar-stat-value">{{ mode_counts[key] }}</span>
+    </a>
+    {% endfor %}
+</nav>
+
+{# The removable chip stays for modes the reader did NOT choose here — arriving
+   from a project card still needs a way out that keeps the project (#626). When
+   the queue is simply the default, the chips above ARE the control, so a
+   "clear" that lands back on the default would be a button that does nothing. #}
+{% if filter_state and not defaulted_to_queue %}
 <div class="state-chip-row">
     <span class="state-chip">
         {{ {'live': 'живые', 'awaiting': 'ждут человека',
@@ -38,6 +59,22 @@
 {% endif %}
 
 <!-- Filter bar -->
+{# #630: folded away by default, and this is not cosmetics. Looked at on a
+   375px screen, the eight expanded controls filled roughly four screens before
+   the first task — so a section that now opens on "what is needed from you"
+   still opened on a wall of filters. It stays open whenever a filter is
+   actually set, because hiding an applied filter is the other failure.
+
+   The controls stay in the DOM either way, so hx-include keeps collecting them
+   and the scope still travels (#626). Taken from #631's scope deliberately and
+   said out loud rather than smuggled: leaving it would have shipped the letter
+   of this task without its point. #}
+{% set _filters_on = filter_status or filter_type or filter_priority or filter_parent_id
+                     or filter_human_owner or filter_human_reviewer or filter_analyst_ready %}
+<details class="filter-disclosure"{% if _filters_on %} open{% endif %}>
+    <summary class="filter-disclosure-summary">
+        Уточнить{% if _filters_on %} <span class="badge badge--xs">фильтры применены</span>{% endif %}
+    </summary>
 <div class="filter-bar">
     <input type="hidden" name="source" value="{{ filter_source }}">
     {# #626: the scope the page was opened with travels WITH every filter
@@ -119,10 +156,15 @@
         <a href="/tasks" class="btn btn-ghost btn-sm filter-reset-btn">Reset</a>
     </div>
 </div>
+</details>
 
 <!-- Task table -->
 <div id="task-table-wrap">
+    {% if queue_groups is not none %}
+    {% include "partials/task_queue.html" %}
+    {% else %}
     {% include "partials/task_table.html" %}
+    {% endif %}
 </div>
 
 <nav class="nav-bar">
