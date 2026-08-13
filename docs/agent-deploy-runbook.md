@@ -111,6 +111,30 @@ uv run ruff check hub tests
 авто-деплоем; при желании после `rsync` в staging можно запустить именно её:
 `ssh user1@194.113.34.33 'bash -s' < deploy/remote-deploy.sh`.
 
+> **Правка `deploy/remote-deploy.sh` требует ручного шага на сервере.** SSH-ключ
+> CI (`openclaw-hub-ci-deploy`) с 14.08.2026 ограничен форсированной командой
+> `/usr/local/sbin/openclaw-ci-deploy-guard`: она пропускает только `rsync` на
+> приём в `~/openclaw-hub-src-staging/` и `bash -s`, причём выполняет не
+> присланный скрипт, а закреплённую копию `/usr/local/sbin/openclaw-remote-deploy.sh`
+> — и только если sha256 совпал. Смысл в том, что утечка секрета `DEPLOY_SSH_KEY`
+> больше не даёт произвольную команду на сервере: до этого ключ был обычным
+> шеллом под `user1`, у которого `NOPASSWD:ALL`.
+>
+> Поэтому изменение `deploy/remote-deploy.sh` в репозитории **уронит деплой**,
+> пока копию на сервере не обновит человек:
+>
+> ```bash
+> ssh user1@194.113.34.33 'sudo tee /usr/local/sbin/openclaw-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh
+> ssh user1@194.113.34.33 'sudo chmod 0755 /usr/local/sbin/openclaw-remote-deploy.sh'
+> ```
+>
+> Падение будет громким, а не тихим: job упадёт красным, а в логе будут оба
+> sha256 и эта же команда. Отказы guard пишет в syslog тегом `openclaw-ci-guard`
+> (`journalctl -t openclaw-ci-guard`).
+>
+> Ручной деплой ниже ограничения не касается: он идёт под личным ключом
+> администратора, а форсированная команда висит только на ключе CI.
+
 Запускать из корня локального репозитория:
 
 ```bash
@@ -172,6 +196,8 @@ ssh user1@194.113.34.33 '
 ```text
 /opt/openclaw-hub/src/                 код приложения
 /opt/openclaw-hub/venv/                Python venv
+/usr/local/sbin/openclaw-ci-deploy-guard      форсированная команда для ключа CI (см. раздел 4)
+/usr/local/sbin/openclaw-remote-deploy.sh     закреплённая копия deploy/remote-deploy.sh
 /etc/openclaw-hub/openclaw-hub.env     несекретная и частично чувствительная конфигурация
 /etc/openclaw-hub/secrets.env          секреты интеграций, если есть
 /var/lib/openclaw-hub/hub.db           SQLite база
