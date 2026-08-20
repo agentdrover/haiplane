@@ -162,6 +162,21 @@
                     <input name="default_branch" class="task-action-control" value="{{ c.project.default_branch }}">
                     <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
                     <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ c.project.default_branch_policy if c.project.default_branch_policy and c.project.default_branch_policy != '{}' else '' }}</textarea>
+                    {% if c.project.slug == 'default' %}
+                    <label class="task-action-label">Автопилот гейтов</label>
+                    <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743)">заперт: всегда human</span>
+                    {% else %}
+                    <label class="task-action-label">DoR-гейт (автоодобрение R0–R1 драфтов)</label>
+                    <select name="gate_policy_dor" class="task-action-control">
+                        <option value="human" {% if c.project.gate_policy.get('dor') != 'auto' %}selected{% endif %}>human — одобряет владелец</option>
+                        <option value="auto" {% if c.project.gate_policy.get('dor') == 'auto' %}selected{% endif %}>auto — одобряет политика</option>
+                    </select>
+                    <label class="task-action-label">Вердикт ревью (по чистому machine-review + CI)</label>
+                    <select name="gate_policy_verdict" class="task-action-control">
+                        <option value="human" {% if c.project.gate_policy.get('verdict') != 'auto' %}selected{% endif %}>human — вердикт выносит владелец</option>
+                        <option value="auto" {% if c.project.gate_policy.get('verdict') == 'auto' %}selected{% endif %}>auto — вердикт выносит политика</option>
+                    </select>
+                    {% endif %}
                     <button class="btn btn-primary task-action-btn" type="submit">Сохранить</button>
                 </form>
             </details>

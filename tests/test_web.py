@@ -4452,3 +4452,72 @@ async def test_task_detail_shows_unset_risk_class_distinct_from_r0(
     assert resp.status_code == 200
     assert "badge-risk-unset" in resp.text
     assert "badge-risk-r0" not in resp.text
+
+
+async def test_project_form_sets_gate_policy(client: AsyncClient):
+    # AC-1 (#753): the select writes the policy through the same PATCH path,
+    # the badge appears, and the form comes back prefilled.
+    resp = await client.post(
+        "/api/projects", json={"slug": "spike-form", "name": "Spike Form"}
+    )
+    pid = resp.json()["id"]
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_dor": "auto", "gate_policy_verdict": "human"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"] == {"dor": "auto", "verdict": "human"}
+
+    page = (await client.get("/projects")).text
+    assert "dor: auto" in page, "the autopilot badge must appear on the card"
+    assert 'name="gate_policy_dor"' in page
+
+
+async def test_project_form_default_locked(client: AsyncClient):
+    # AC-2 (#753): the default card shows the lock instead of selects, and a
+    # forged submit is refused by the SHARED server-side check, landing in
+    # the form as an error — never as a silent success.
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}
+    )
+    pid = resp.json()["id"]
+
+    page = (await client.get("/projects")).text
+    assert "заперт: всегда human" in page
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_dor": "auto", "gate_policy_verdict": "human"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" in resp.headers.get("location", "")
+
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"] == {}, "the forged submit must change nothing"
+
+
+async def test_project_form_reverts_policy_to_human(client: AsyncClient):
+    # AC-3 (#753): rolling the autopilot back is the same single click.
+    resp = await client.post(
+        "/api/projects", json={"slug": "spike-revert", "name": "Spike Revert"}
+    )
+    pid = resp.json()["id"]
+    await client.patch(f"/api/projects/{pid}", json={"gate_policy": {"dor": "auto"}})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_dor": "human", "gate_policy_verdict": "human"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"] == {"dor": "human", "verdict": "human"}
