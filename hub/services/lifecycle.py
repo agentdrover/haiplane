@@ -1585,6 +1585,16 @@ async def submit_for_review(
         await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
         await db.commit()
 
+    # #757: the hub — not the implementer — calls the cross-model reviewer.
+    # Best-effort by contract: a failed dispatch alerts inside and must
+    # never break the submission itself.
+    try:
+        from hub.services.review_dispatch import maybe_dispatch_review
+
+        await maybe_dispatch_review(db, task_id)
+    except Exception:  # noqa: BLE001 - dispatch must never break a submit
+        log.exception("cross-model review dispatch failed for task #%s", task_id)
+
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     view = row_to_task(row, updates=updates)  # type: ignore[arg-type]

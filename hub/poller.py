@@ -873,6 +873,16 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             except Exception:  # noqa: BLE001 - oversight must not stop polling
                 log.exception("autopilot digest generation failed")
 
+            # Cross-model review dispatches (#757): settle finished cloud
+            # reviewer runs — reports get their usage cross-check, silent
+            # finishes fail loudly.
+            try:
+                from hub.services.review_dispatch import sweep_review_dispatches
+
+                await sweep_review_dispatches(db)
+            except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+                log.exception("review dispatch sweep failed")
+
             # Claim lease expiry (#417): a claim held past the lease without a
             # pair start is auto-released back to open so the task returns to
             # the queue instead of sitting owned by a dead session forever.

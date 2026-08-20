@@ -1532,6 +1532,47 @@ async def clear_job_missing(
 
 
 # ---------------------------------------------------------------------------
+# Cross-model review dispatches (#757)
+# ---------------------------------------------------------------------------
+
+
+async def create_review_dispatch(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    submission_generation: int,
+    agent_id: str,
+    run_id: str,
+    model: str,
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, run_id, model) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, submission_generation, agent_id, run_id, model),
+    )
+    return cur.lastrowid
+
+
+async def list_active_review_dispatches(
+    db: aiosqlite.Connection,
+) -> list[aiosqlite.Row]:
+    return list(
+        await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
+        )
+    )
+
+
+async def set_review_dispatch_status(
+    db: aiosqlite.Connection, dispatch_id: int, status: str
+) -> None:
+    await db.execute(
+        "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Autopilot digests (#739)
 # ---------------------------------------------------------------------------
 
