@@ -198,8 +198,11 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     from hub.models import RiskClass
     from hub.services.risk_class import derive_risk_class
 
+    from hub.services.project_policy import risk_map_for_task
+
     diff_class, _reasons = derive_risk_class(
-        [p for p in diff_paths if p not in ROUTINE_PATHS]
+        [p for p in diff_paths if p not in ROUTINE_PATHS],
+        await risk_map_for_task(db, task_id),
     )
     stored_raw = (task.get("risk_class") or "").strip()
     if diff_class is not None:

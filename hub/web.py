@@ -838,12 +838,32 @@ async def web_edit_project(project_id: int, request: Request):
     # Gate policy selects (#753). Present only for non-default projects in
     # the template; the shared PATCH path below re-checks the default lock
     # anyway — the presentation layer is not trusted.
-    if "gate_policy_dor" in form or "gate_policy_verdict" in form:
-        fields["gate_policy"] = {
+    if any(
+        key in form
+        for key in (
+            "gate_policy_dor",
+            "gate_policy_verdict",
+            "gate_policy_dor_max_class",
+            "gate_policy_risk_map",
+        )
+    ):
+        gate_policy: dict[str, Any] = {
             "dor": str(form.get("gate_policy_dor") or "human").strip() or "human",
             "verdict": str(form.get("gate_policy_verdict") or "human").strip()
             or "human",
         }
+        # #760: the form carries the WHOLE policy, so an emptied field means
+        # "remove this knob", not "leave it alone" — the same semantics the
+        # selects already have, and the only ones a form can honestly offer.
+        ceiling = str(form.get("gate_policy_dor_max_class") or "").strip()
+        if ceiling:
+            gate_policy["dor_max_class"] = ceiling
+        risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
+        if err:
+            return _projects_error_redirect(err.replace("policy:", "risk_map:"))
+        if risk_map is not None:
+            gate_policy["risk_map"] = risk_map
+        fields["gate_policy"] = gate_policy
     if not fields:
         return RedirectResponse("/projects", status_code=303)
     try:

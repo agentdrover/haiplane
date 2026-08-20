@@ -176,6 +176,14 @@
                         <option value="human" {% if c.project.gate_policy.get('verdict') != 'auto' %}selected{% endif %}>human — вердикт выносит владелец</option>
                         <option value="auto" {% if c.project.gate_policy.get('verdict') == 'auto' %}selected{% endif %}>auto — вердикт выносит политика</option>
                     </select>
+                    <label class="task-action-label">Потолок DoR-автопилота (глобальный env остаётся верхней границей)</label>
+                    <select name="gate_policy_dor_max_class" class="task-action-control">
+                        <option value="" {% if not c.project.gate_policy.get('dor_max_class') %}selected{% endif %}>не задан — действует только глобальный потолок</option>
+                        <option value="r0" {% if c.project.gate_policy.get('dor_max_class') == 'r0' %}selected{% endif %}>r0 — только документация и тексты</option>
+                        <option value="r1" {% if c.project.gate_policy.get('dor_max_class') == 'r1' %}selected{% endif %}>r1 — плюс тесты, шаблоны, статика (R2 откроет #585)</option>
+                    </select>
+                    <label class="task-action-label">Карта путей (JSON {"src/**": "code"}; пусто = нет карты, всё незнакомое стоит R2)</label>
+                    <textarea name="gate_policy_risk_map" class="task-action-control task-action-textarea">{{ c.project.gate_policy.get('risk_map') | tojson if c.project.gate_policy.get('risk_map') else '' }}</textarea>
                     {% endif %}
                     <button class="btn btn-primary task-action-btn" type="submit">Сохранить</button>
                 </form>

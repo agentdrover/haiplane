@@ -27,6 +27,7 @@ from hub import repository as repo
 from hub.hub_instance import mutation_activity_detail
 from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
+from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass
 from hub.mcp_envelope import enrich_error_payload
@@ -641,7 +642,9 @@ async def create_task(
         # Shadow risk class (#582): derived from the declared areas, never
         # from anything the author says about risk. No declared areas → the
         # class honestly stays "not computed" (NULL from the migration).
-        risk, risk_reasons = derive_risk_class(normalized.affected_areas)
+        risk, risk_reasons = derive_risk_class(
+            normalized.affected_areas, await risk_map_for_task(db, task_id)
+        )
         if risk is not None:
             await repo.update_task(
                 db,
@@ -1288,7 +1291,10 @@ def _surface_check(
 
 
 def _risk_recompute_on_submit(
-    task: dict[str, Any], diff_paths: list[str] | None, diff_reason: str
+    task: dict[str, Any],
+    diff_paths: list[str] | None,
+    diff_reason: str,
+    project_map: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     """Recompute the risk class from the ACTUAL diff at submission (#583).
 
@@ -1309,7 +1315,7 @@ def _risk_recompute_on_submit(
         return {}, "", f" Класс риска по диффу НЕ пересчитан: {diff_reason}."
 
     candidates = [p for p in diff_paths if p not in commit_scope.ROUTINE_PATHS]
-    new_class, reasons = derive_risk_class(candidates)
+    new_class, reasons = derive_risk_class(candidates, project_map)
     if new_class is None:
         return {}, "", " Класс риска по диффу НЕ пересчитан: дифф пуст."
 
@@ -1447,7 +1453,7 @@ async def submit_for_review(
     # recompute. Resolved BEFORE the write lock — this walks to the network.
     diff_paths, diff_reason = await _resolve_branch_diff(db, task)
     risk_fields, risk_alert, risk_note = _risk_recompute_on_submit(
-        task, diff_paths, diff_reason
+        task, diff_paths, diff_reason, await risk_map_for_task(db, task_id)
     )
 
     # #550: before the transition, not after — a refusal has to happen while
