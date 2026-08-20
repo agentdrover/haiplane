@@ -35,6 +35,7 @@ from hub.models import (
 from hub.db import deserialize_str_list, serialize_str_list
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
+from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.services.test_locator import validate_test_locators
 
@@ -367,7 +368,9 @@ async def _apply_refine_writes(
         effective_areas = deserialize_str_list(old_row["affected_areas"])
     else:
         effective_areas = []
-    risk, reasons = derive_risk_class(effective_areas)
+    risk, reasons = derive_risk_class(
+        effective_areas, await risk_map_for_task(db, task_id)
+    )
     await repo.update_task(
         db,
         task_id,

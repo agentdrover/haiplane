@@ -311,3 +311,101 @@ async def test_unbound_task_refuses_toward_human(
     assert body["risk_class"] == "R0"
     assert body["dor_passed"] is True
     assert body["status"] == "draft"
+
+
+async def test_project_ceiling_only_tightens_the_global_one(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#760 AC-3: a project may be stricter than the switch, never looser.
+
+    The env is the kill-switch and the upper bound. A project asking for more
+    than it allows gets the env's answer — otherwise "who opened this gate"
+    would have two possible answers and no way to tell them apart.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    strict_pid = await _project(
+        db, "spike-strict", {"dor": "auto", "dor_max_class": "r0"}
+    )
+    task_id = await _draft_in_project(client, db, strict_pid)
+    body = await _refine_to_dor(client, task_id, ["tests/test_probe.py"])
+
+    assert body["risk_class"] == "R1"
+    assert body["status"] == "draft", (
+        "R1 is inside the global band but above the project's own ceiling"
+    )
+
+    open_pid = await _project(db, "spike-open", {"dor": "auto", "dor_max_class": "r1"})
+    other = await _draft_in_project(client, db, open_pid)
+    other_body = await _refine_to_dor(client, other, ["tests/test_probe.py"])
+    assert other_body["status"] == "open", (
+        "the same class passes where the project allows it"
+    )
+
+
+async def test_auto_approval_names_both_ceilings(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#760 AC-5: the feed line says which lever decided."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "spike-both", {"dor": "auto", "dor_max_class": "r1"})
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+
+    auto = [
+        c for c in (u["content"] for u in body["updates"] or []) if "Автоодобрено" in c
+    ]
+    assert auto, "an auto-approval without a recorded reason is unanswerable"
+    assert "проектный R1" in auto[0], "the project ceiling must be named"
+    assert "глобальный R1" in auto[0], "and the global one beside it"
+    assert "OPENCLAW_AUTO_APPROVE_MAX_CLASS=r1" in auto[0]
+
+
+async def test_project_risk_map_lets_a_satellite_draft_pass(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#760 AC-1 end to end: described paths stop costing R2 by default.
+
+    The task that started this (#759) declared ``.env.example`` beside its
+    docs and tests. Nothing in that list is risky, yet the dotfile is unknown
+    to the built-in map and drags the whole draft to R2 — so the draft waits
+    for a human it did not need. One rule describing it is the whole fix.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    unmapped_pid = await _project(db, "spike-unmapped", {"dor": "auto"})
+    baseline = await _draft_in_project(client, db, unmapped_pid)
+    baseline_body = await _refine_to_dor(
+        client, baseline, [".env.example", "specs/quickstart.md", "tests/unit"]
+    )
+    assert baseline_body["risk_class"] == "R2", "today: one dotfile makes it R2"
+    assert baseline_body["status"] == "draft"
+
+    pid = await _project(
+        db, "spike-mapped", {"dor": "auto", "risk_map": {".env*": "docs"}}
+    )
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(
+        client, task_id, [".env.example", "specs/quickstart.md", "tests/unit"]
+    )
+
+    assert body["risk_class"] == "R1", "docs + tests, nothing unknown left"
+    assert body["status"] == "open"
+    reasons = " ".join(body["risk_class_reasons"] or [])
+    assert "вне известной карты" not in reasons
+    assert "картой проекта" in reasons, "the owner's rule must be visible in the reason"
+
+
+async def test_unmapped_path_still_costs_r2(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#760 AC-1 boundary: the map describes, it does not excuse."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(
+        db, "spike-partial", {"dor": "auto", "risk_map": {"specs/**": "docs"}}
+    )
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(
+        client, task_id, ["specs/quickstart.md", "deploy/run.sh"]
+    )
+
+    assert body["risk_class"] == "R2"
+    assert body["status"] == "draft", "an undescribed path keeps the human gate"

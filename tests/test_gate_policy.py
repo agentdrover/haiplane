@@ -152,3 +152,65 @@ async def test_policy_is_inert_in_this_task(client: AsyncClient, monkeypatch):
     assert body["dor_passed"] is True
     assert body["risk_class"] == "R0"
     assert body["status"] == "draft", "the policy must decide nothing until #744"
+
+
+async def test_risk_map_and_ceiling_are_human_only(client: AsyncClient, monkeypatch):
+    """#760 AC-4: the new knobs ride the same human-only PATCH as the gates.
+
+    They decide how far the DoR autopilot reaches, so an agent able to write
+    them could widen its own gate — the conflict #743 removed for dor/verdict.
+    """
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"headers": {"Authorization": "Bearer human-token"}}
+    agent = {"headers": {"Authorization": "Bearer agent-token"}}
+
+    pid = await _create_project(client, "spike-knobs", **human)
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"dor": "auto", "risk_map": {"src/**": "code"}}},
+        **agent,
+    )
+    assert resp.status_code == 403
+    listed = (await client.get("/api/projects", **human)).json()
+    assert next(p for p in listed if p["id"] == pid)["gate_policy"] == {}
+
+    ok = await client.patch(
+        f"/api/projects/{pid}",
+        json={
+            "gate_policy": {
+                "dor": "auto",
+                "dor_max_class": "r1",
+                "risk_map": {"src/**": "code"},
+            }
+        },
+        **human,
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["gate_policy"]["risk_map"] == {"src/**": "code"}
+
+
+async def test_risk_map_and_ceiling_refuse_nonsense(client: AsyncClient):
+    """#760: a malformed knob is refused loudly, never stored half-understood."""
+    pid = await _create_project(client, "spike-shapes")
+    for payload in (
+        {"risk_map": {"src/**": "whatever"}},
+        {"risk_map": {"": "code"}},
+        {"risk_map": ["src/**"]},
+        {"dor_max_class": "r3"},
+        {"dor_max_class": "R1 "},
+    ):
+        resp = await client.patch(f"/api/projects/{pid}", json={"gate_policy": payload})
+        assert resp.status_code == 422, f"{payload} must be refused: {resp.text}"
+
+    listed = (await client.get("/api/projects")).json()
+    assert next(p for p in listed if p["id"] == pid)["gate_policy"] == {}, (
+        "a refused write must leave nothing behind"
+    )

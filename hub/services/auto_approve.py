@@ -23,7 +23,6 @@ simplify its own rules (see ``LADDER_SURFACES``).
 
 from __future__ import annotations
 
-import json
 import logging
 
 import aiosqlite
@@ -32,6 +31,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import RiskClass
+from hub.services.project_policy import gate_policy_of
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +53,11 @@ LADDER_SURFACES: tuple[str, ...] = (
     ".github/",
 )
 
+# The classes the switch can name. R2 stays OUT: opening it is #585, and that
+# task is conditioned on a measured agreement between the agent reviewer and
+# the owner (#522/#527) — a condition set on 31.07.2026 and not yet met. The
+# per-project ceiling below can therefore only tighten this band, never widen
+# it, which is the only safe direction while the number is missing.
 _AUTO_BAND: dict[str, RiskClass] = {"r0": RiskClass.r0, "r1": RiskClass.r1}
 
 
@@ -74,8 +79,8 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     today.
     """
     mode = (config.AUTO_APPROVE_MAX_CLASS or "off").strip().lower()
-    ceiling = _AUTO_BAND.get(mode)
-    if ceiling is None:
+    global_ceiling = _AUTO_BAND.get(mode)
+    if global_ceiling is None:
         # 'off' — and also any unknown value: a mistyped switch must fail
         # toward the human gate, never toward silent delegation.
         return False
@@ -94,8 +99,6 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
         return False
 
     order = list(RiskClass)
-    if order.index(risk) > order.index(ceiling):
-        return False
 
     areas = deserialize_str_list(row["affected_areas"])
     ladder = _touches_ladder(areas)
@@ -114,13 +117,24 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
         return False
-    try:
-        policy = json.loads(project["gate_policy"] or "{}")
-    except (ValueError, KeyError):
-        return False
-    if not isinstance(policy, dict) or policy.get("dor") != "auto":
+    policy = gate_policy_of(project)
+    if policy.get("dor") != "auto":
         return False
     project_slug = project["slug"]
+
+    # #760: the project may lower its own ceiling, never raise it. The global
+    # switch stays the upper bound and the kill-switch — a project that asks
+    # for more than the env allows simply gets the env's answer, and the feed
+    # line below says so, because "why did this not auto-approve" must be
+    # answerable without reading two configs and a deployment.
+    project_ceiling = _AUTO_BAND.get(str(policy.get("dor_max_class") or "").lower())
+    ceiling = global_ceiling
+    if project_ceiling is not None and order.index(project_ceiling) < order.index(
+        ceiling
+    ):
+        ceiling = project_ceiling
+    if order.index(risk) > order.index(ceiling):
+        return False
 
     transitioned = await repo.transition_status_if(
         db, task_id, expected_from="draft", new_status="open"
@@ -136,8 +150,10 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
         "status",
         (
             f"Автоодобрено политикой проекта {project_slug} (dor=auto): класс "
-            f"{risk.value} не выше порога {ceiling.value} (потолок "
-            f"OPENCLAW_AUTO_APPROVE_MAX_CLASS={mode}). "
+            f"{risk.value} не выше действующего потолка {ceiling.value}. "
+            f"Потолки: проектный "
+            f"{project_ceiling.value if project_ceiling else '—'}, глобальный "
+            f"{global_ceiling.value} (OPENCLAW_AUTO_APPROVE_MAX_CLASS={mode}). "
             f"Признаки: {'; '.join(reasons) or '—'}."
         ),
         author_kind="hub",
@@ -155,6 +171,8 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
             "auto": True,
             "risk_class": risk.value,
             "ceiling": ceiling.value,
+            "project_ceiling": project_ceiling.value if project_ceiling else None,
+            "global_ceiling": global_ceiling.value,
             "project": project_slug,
         },
     )

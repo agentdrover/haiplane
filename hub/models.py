@@ -215,6 +215,63 @@ class RiskClass(str, Enum):
     r5 = "R5"
 
 
+# #760: a project may describe its OWN paths so the derivation stops calling
+# them "outside the known map". The buckets are exactly the features the
+# built-in map derives (hub/services/risk_class.py) — a project can say WHICH
+# bucket a path belongs to, never invent a new one and never invent a class.
+RISK_MAP_BUCKETS: tuple[str, ...] = (
+    "docs",
+    "tests",
+    "presentation",
+    "code",
+    "contract",
+    "auth",
+    "migration",
+)
+# The classes a DoR autopilot ceiling may name — the same band the autopilot
+# itself supports (hub/services/auto_approve.py). R2 is absent on purpose:
+# opening it is #585, conditioned on a measured reviewer agreement, and a
+# policy that could store an inert "r2" would read as permission that does
+# nothing. R3+ is not delegable at all.
+AUTO_APPROVE_CLASSES: tuple[str, ...] = ("r0", "r1")
+GATE_POLICY_KEYS: tuple[str, ...] = ("dor", "verdict", "risk_map", "dor_max_class")
+# Bounds, so a policy stays something a human reads and argues with rather
+# than a place to hide a thousand rules.
+_RISK_MAP_MAX_RULES = 100
+_RISK_MAP_MAX_PATTERN = 200
+
+
+def _validated_risk_map(value: Any) -> dict[str, str]:
+    """Normalize {path pattern: bucket}, refusing anything else (#760).
+
+    Refusals are loud on purpose: this map feeds the DoR autopilot's ceiling,
+    and a silently dropped rule would read as "the owner described this path"
+    when nothing described it.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("gate_policy risk_map must be an object {pattern: bucket}")
+    if len(value) > _RISK_MAP_MAX_RULES:
+        raise ValueError(
+            f"gate_policy risk_map holds at most {_RISK_MAP_MAX_RULES} rules, "
+            f"got {len(value)}"
+        )
+    cleaned: dict[str, str] = {}
+    for pattern, bucket in value.items():
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError("gate_policy risk_map patterns must be non-empty strings")
+        if len(pattern) > _RISK_MAP_MAX_PATTERN:
+            raise ValueError(
+                f"gate_policy risk_map pattern is too long: {pattern[:40]!r}…"
+            )
+        if bucket not in RISK_MAP_BUCKETS:
+            raise ValueError(
+                f"gate_policy risk_map bucket must be one of "
+                f"{', '.join(RISK_MAP_BUCKETS)}, got: {bucket!r} for {pattern!r}"
+            )
+        cleaned[pattern.strip()] = bucket
+    return cleaned
+
+
 # Allowed parent task_type -> child task_type mapping
 HIERARCHY_RULES: dict[TaskType, TaskType | None] = {
     TaskType.epic: None,
@@ -1216,8 +1273,8 @@ class ProjectPatch(BaseModel):
     default_branch: str | None = Field(default=None, max_length=100)
     default_branch_policy: dict[str, Any] | None = None
     # Gate policy (#743): which gates this project delegates to the
-    # autopilot. Only the two automatable gates exist as keys; anything
-    # else in the payload is a mistake worth refusing, not ignoring.
+    # autopilot, plus the two knobs that say how far it may reach (#760).
+    # Anything else in the payload is a mistake worth refusing, not ignoring.
     gate_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
@@ -1227,16 +1284,31 @@ class ProjectPatch(BaseModel):
     def _gate_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         if v is None:
             return v
-        unknown = set(v) - {"dor", "verdict"}
+        unknown = set(v) - set(GATE_POLICY_KEYS)
         if unknown:
             raise ValueError(
-                f"unknown gate_policy keys: {sorted(unknown)}; allowed: dor, verdict"
+                f"unknown gate_policy keys: {sorted(unknown)}; "
+                f"allowed: {', '.join(GATE_POLICY_KEYS)}"
             )
-        bad = {k: val for k, val in v.items() if val not in {"human", "auto"}}
+        bad = {
+            k: val
+            for k, val in v.items()
+            if k in ("dor", "verdict") and val not in {"human", "auto"}
+        }
         if bad:
             raise ValueError(
                 f"gate_policy values must be 'human' or 'auto', got: {bad}"
             )
+        if "dor_max_class" in v:
+            ceiling = v["dor_max_class"]
+            if ceiling not in AUTO_APPROVE_CLASSES:
+                raise ValueError(
+                    "gate_policy dor_max_class must be one of "
+                    f"{', '.join(AUTO_APPROVE_CLASSES)}, got: {ceiling!r}; "
+                    "R2 is not delegable until #585 opens it, R3+ never"
+                )
+        if "risk_map" in v:
+            v["risk_map"] = _validated_risk_map(v["risk_map"])
         return v
 
     @model_validator(mode="before")

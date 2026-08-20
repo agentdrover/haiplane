@@ -423,8 +423,11 @@ async def api_patch_project(
         # project (the hub's own repo) refuses any 'auto' at any gate, from
         # any token. The rule lives here rather than in the model because it
         # needs to know WHICH project is being patched.
+        # #760 keeps the check on the two GATE keys by name: the policy now
+        # also carries a path map and a ceiling, and "any value equals auto"
+        # would quietly start meaning something else as keys are added.
         if before["slug"] == "default" and any(
-            v == "auto" for v in fields["gate_policy"].values()
+            fields["gate_policy"].get(gate) == "auto" for gate in ("dor", "verdict")
         ):
             raise HTTPException(
                 422,

@@ -278,3 +278,62 @@ async def test_unresolvable_diff_degrades_instead_of_failing(
     assert any("НЕ пересчитан" in s for s in statuses), (
         "a skipped recompute must be visible, not an absence of news"
     )
+
+
+def test_project_map_classifies_satellite_paths() -> None:
+    """#760 AC-1: described paths get their bucket, not the unknown penalty."""
+    areas = [".env.example", "src/memo/ai/prompts.py", "tests/unit"]
+    plain_class, plain_reasons = derive_risk_class(areas)
+    assert plain_class is RiskClass.r2
+    assert any("вне известной карты" in r for r in plain_reasons)
+
+    mapped_class, mapped_reasons = derive_risk_class(
+        areas, {"src/**": "code", ".env*": "docs"}
+    )
+    assert mapped_class is RiskClass.r2, "application code is R2 by its bucket too"
+    joined = " ".join(mapped_reasons)
+    assert "вне известной карты" not in joined, (
+        "a path the owner described is no longer unknown"
+    )
+    assert "src/memo/ai/prompts.py → code" in joined, "the rule must be readable"
+    assert ".env.example → docs" in joined
+
+
+def test_absent_project_map_keeps_todays_behaviour() -> None:
+    """#760 AC-2: no map, no change — the derivation is the one from #582."""
+    for areas in (
+        ["hub/db.py"],
+        ["hub/auth.py", "tests/test_auth.py"],
+        ["hub/app.py"],
+        ["hub/templates/x.html"],
+        ["docs/notes.md"],
+        ["deploy/run.sh"],
+        [],
+    ):
+        assert derive_risk_class(areas) == derive_risk_class(areas, None)
+        assert derive_risk_class(areas) == derive_risk_class(areas, {})
+
+
+def test_project_map_never_lowers_a_built_in_class() -> None:
+    """#760: the map adds features, it cannot take one away.
+
+    Without this the map would be a way to declare risk away — exactly what
+    #581 removed when it took the class field out of the create/refine models.
+    """
+    risky, reasons = derive_risk_class(["hub/db.py", "hub/auth.py"], {"hub/**": "docs"})
+    assert risky is RiskClass.r3
+    joined = " ".join(reasons)
+    assert "миграция" in joined, "the migration reason must survive the map"
+    assert "аутентификация" in joined
+
+
+def test_project_map_matching_forms() -> None:
+    """#760: exact path, directory prefix and glob — the three documented forms."""
+    exact, _ = derive_risk_class(["Makefile"], {"Makefile": "docs"})
+    assert exact is RiskClass.r0
+    prefix, _ = derive_risk_class(
+        ["alembic/versions/001.py"], {"alembic/": "migration"}
+    )
+    assert prefix is RiskClass.r3
+    glob, _ = derive_risk_class(["ui/components/Card.tsx"], {"ui/**": "presentation"})
+    assert glob is RiskClass.r1
