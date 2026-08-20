@@ -197,6 +197,24 @@ class AgentFit(str, Enum):
     agentic = "agentic"
 
 
+class RiskClass(str, Enum):
+    """Blast-radius class of a task, R0 (harmless) to R5 (irreversible) (#581).
+
+    The class is DERIVED from observable facts (#582) — paths touched,
+    migrations, contracts, irreversible operations — never declared by the
+    task author, which is why no create/refine model carries this field.
+    A task without a class is "not computed": that state lives as NULL/None
+    and must never be read as R0 (see add_risk_class_column in hub/db.py).
+    """
+
+    r0 = "R0"
+    r1 = "R1"
+    r2 = "R2"
+    r3 = "R3"
+    r4 = "R4"
+    r5 = "R5"
+
+
 # Allowed parent task_type -> child task_type mapping
 HIERARCHY_RULES: dict[TaskType, TaskType | None] = {
     TaskType.epic: None,
@@ -1053,6 +1071,9 @@ class TaskView(BaseModel):
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
+    # Shadow-mode risk class (#581): read-only surface, None = "not
+    # computed" and is NOT the same thing as RiskClass.r0.
+    risk_class: RiskClass | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)
