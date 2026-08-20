@@ -37,6 +37,8 @@ from hub.models import (
     ACTestResultView,
     CIRunReportResult,
     CIRunReportState,
+    DiffBaseState,
+    EvidenceCoverage,
     CIRunReportSubmit,
     BulkChildTasksCreate,
     BulkRefine,
@@ -114,7 +116,7 @@ from hub.services.ac_tests import current_ac_test_results, run_ac_tests
 from hub.services.ci_report import accept_ci_run_report, ci_report_state
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
-from hub.services import call_sites
+from hub.services import call_sites, review_evidence
 from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -1304,22 +1306,39 @@ async def api_ci_run_report(
     return CIRunReportResult(**result)
 
 
-async def _build_call_sites_section(db, task_id: int, task_view) -> CallSiteSection:
+async def _build_call_sites_section(
+    db, task_id: int, task_view, diff_base: dict | None = None
+) -> CallSiteSection:
     """The call-site enumeration for a task's branch (#601).
 
     Best effort by contract: every failure answers ``unknown`` with a reason
     rather than an empty section. An empty section would say "no other call
     sites exist", which is exactly the false reassurance this was written to
     remove.
+
+    #725: when the diff base itself did not resolve, the reason says so in
+    those words. This section used to report "the diff named no changed lines"
+    over a branch with 67 changed files, because the base it was diffed against
+    did not exist — an unknown that reads as an independent finding when it is
+    a consequence of one failure stated elsewhere.
     """
     branch = (task_view.branch or "").strip()
     if not branch:
         return CallSiteSection(status=call_sites.UNKNOWN, reason="task has no branch")
 
+    diff_base = diff_base or {}
+    if diff_base.get("state") == review_evidence.BASE_UNRESOLVED:
+        return CallSiteSection(
+            status=call_sites.UNKNOWN,
+            reason=review_evidence.DISABLED_BY_BASE + str(diff_base.get("reason", "")),
+        )
+
     try:
         ctx = await services.project_git_context(db, task_id)
         workspace = ctx.get("repo")
-        base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+        base = (
+            diff_base.get("base") or ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+        )
         if not workspace:
             return CallSiteSection(
                 status=call_sites.UNKNOWN, reason="project has no workspace"
@@ -1408,9 +1427,15 @@ async def api_review_brief(
         if latest_submission_summary:
             break
 
-    diff_command = ""
-    if task_view.branch:
-        diff_command = f"git diff develop...{task_view.branch}"
+    # #725: the base comes from the project (or the PR), and is resolved in the
+    # project workspace before the command is printed. A hardcoded "develop"
+    # produced an uncomputable diff on every project whose base is named
+    # differently, and the blocks that read the diff then reported bare
+    # unknowns as if each had looked and found nothing.
+    diff_base = await review_evidence.resolve_diff_base(
+        db, task_id, task_view.branch or ""
+    )
+    diff_command = review_evidence.diff_command_for(diff_base, task_view.branch or "")
 
     machine_review = None
     mr_row = await repo.get_latest_machine_review(db, task_id)
@@ -1469,7 +1494,12 @@ async def api_review_brief(
             sha_check_reason = tip_reason
         elif current_tip == submission_sha:
             sha_check = "match"
-            sha_check_reason = ""
+            # #725: never a bare green word. Beside blocks that produced no
+            # signal, "match" with an empty reason was read as verification,
+            # while this check only knows where a branch pointer stands.
+            sha_check_reason = review_evidence.sha_check_statement(
+                sha_check, submission_sha, current_tip, task_view.branch or ""
+            )
         else:
             sha_check = "diverged"
             sha_check_reason = (
@@ -1484,7 +1514,9 @@ async def api_review_brief(
     # answers `unknown` with a reason when that is not available. Silence here
     # would read as "no other call sites", which is the very mistake the
     # section exists to catch.
-    call_sites_section = await _build_call_sites_section(db, task_id, task_view)
+    call_sites_section = await _build_call_sites_section(
+        db, task_id, task_view, diff_base
+    )
 
     # #507: recorded pass/fail of each test-AC for the current generation.
     ac_result_rows = await repo.list_ac_test_results(db, task_id)
@@ -1517,6 +1549,22 @@ async def api_review_brief(
 
     freshness = await _freshness(db, dict(await repo.get_task(db, task_id)))
 
+    # #725: one verdict over every evidence block, in the same place the green
+    # words are. Four blocks silent, one reassuring wrongly and one narrow-but-
+    # green read as six independent findings across a day of briefs; they were
+    # one absence, and only a combined statement says so.
+    coverage = review_evidence.evidence_coverage(
+        diff_base=diff_base,
+        branch=task_view.branch or "",
+        call_sites_status=call_sites_section.status,
+        has_test_acs=any(a.verifiable_by.value == "test" for a in ac_models),
+        locator_resolution=locator_resolution,
+        ac_test_results=ac_test_results,
+        ci_state=ci_state,
+        freshness=freshness,
+        sha_check=sha_check,
+    )
+
     return ReviewBrief(
         task_id=task_view.id,
         title=task_view.title,
@@ -1545,6 +1593,8 @@ async def api_review_brief(
         branch=task_view.branch,
         pr_number=task_view.pr_number,
         diff_command=diff_command,
+        diff_base=DiffBaseState(**diff_base),
+        evidence_coverage=EvidenceCoverage(**coverage),
         submission_sha=submission_sha,
         current_branch_tip=current_tip,
         sha_check=sha_check,

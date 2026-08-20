@@ -655,6 +655,41 @@ class CIRunReportState(BaseModel):
     head_sha: str = ""
 
 
+class DiffBaseState(BaseModel):
+    """Which base the diff is taken against, and whether it exists (#725).
+
+    ``state`` is ``resolved`` | ``unresolved`` | ``unverified``. The last two
+    are never collapsed: "we looked and it is not there" and "there was nothing
+    to look in" call for different actions, and a brief that merges them ends
+    up asserting a fact it never checked. ``source`` names where the base came
+    from, so a wrong one can be fixed at its origin.
+    """
+
+    base: str = ""
+    source: str = ""
+    state: str = "unverified"
+    reason: str = ""
+    sha: str = ""
+
+
+class EvidenceCoverage(BaseModel):
+    """How much of this brief is evidence, and how much is absence (#725).
+
+    A day of briefs produced four blocks with no signal, one reassuring
+    wrongly, and one green about a question nobody asked — read as six
+    independent findings when they were one absence. ``state`` is ``complete``
+    | ``partial`` | ``none``, and the headline says it in words, in the same
+    place the green words are. Checks that had nothing to run over are listed
+    apart from checks that could not run, so a warning never inflates.
+    """
+
+    state: str = "partial"
+    headline: str = ""
+    checks_ran: list[str] = Field(default_factory=list)
+    checks_missing: list[dict[str, str]] = Field(default_factory=list)
+    checks_not_applicable: list[dict[str, str]] = Field(default_factory=list)
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -701,6 +736,12 @@ class ReviewBrief(BaseModel):
     branch: str | None = None
     pr_number: int | None = None
     diff_command: str = ""
+    # #725: the base the diff_command names, where that name came from, and
+    # whether it resolves. An unresolved base leaves diff_command empty — a
+    # command that cannot run reads as an offer to verify.
+    diff_base: DiffBaseState = Field(default_factory=DiffBaseState)
+    # #725: one verdict over all evidence blocks below.
+    evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
