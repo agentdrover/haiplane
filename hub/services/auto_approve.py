@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 LADDER_SURFACES: tuple[str, ...] = (
     "hub/services/risk_class.py",
     "hub/services/auto_approve.py",
+    "hub/services/auto_verdict.py",
     "hub/services/lifecycle.py",
     "hub/config.py",
     "hub/auth.py",
