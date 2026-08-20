@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Дайджесты автопилота{% endblock %}
+{% block content %}
+<h1>Дайджесты автопилота</h1>
+<p class="text-muted">Один дайджест на проект за сутки (UTC) с активностью автопилота (#739).
+Задачи из выборки помечены «на проверку» — результат фиксируется human-only вызовом
+<code>POST /api/digests/&lt;id&gt;/audit</code> и попадает в метрику human_gates гейтом <code>audit</code>.</p>
+
+{% if not digests %}
+<p>Дайджестов пока нет — автопилот ещё не совершал переходов.</p>
+{% endif %}
+
+{% for d in digests %}
+<article class="project-card" id="digest-{{ d.id }}">
+    <h2>#{{ d.id }} — {{ d.project_slug }} за {{ d.digest_date }}</h2>
+    <dl>
+        <dt>автоодобрений (DoR)</dt><dd>{{ d.data.auto_approvals | length }}</dd>
+        <dt>автовердиктов</dt><dd>{{ d.data.auto_verdicts | length }}</dd>
+        <dt>эскалаций</dt><dd>{{ d.data.escalations | length }}</dd>
+        <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
+    </dl>
+
+    {% if d.data.auto_approvals %}
+    <h3>Автоодобрения</h3>
+    <ul>
+        {% for a in d.data.auto_approvals %}
+        <li><a href="/tasks/{{ a.task_id }}">#{{ a.task_id }}</a>
+            {% if a.payload.risk_class %}<span class="badge badge-risk-{{ a.payload.risk_class | lower }}">{{ a.payload.risk_class }}</span>{% endif %}
+            <span class="text-muted">{{ a.at }}</span></li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if d.data.escalations %}
+    <h3>Эскалации — ждут человека</h3>
+    <ul>
+        {% for e in d.data.escalations %}
+        <li><a href="/tasks/{{ e.task_id }}">#{{ e.task_id }}</a>
+            <span class="badge badge-needs_decision">эскалация</span>
+            {{ e.payload.reason }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <h3>Выборка на проверку (~10%)</h3>
+    <ul>
+        {% for tid in d.data.audit_sample %}
+        <li><a href="/tasks/{{ tid }}">#{{ tid }}</a>
+            {% set res = d.data.audit_results.get(tid | string) %}
+            {% if res == 'ok' %}<span class="badge badge-completed">проверено: ок</span>
+            {% elif res == 'problem' %}<span class="badge badge-failed">проверено: проблема</span>
+            {% else %}<span class="badge badge-draft">ждёт проверки</span>{% endif %}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endfor %}
+{% endblock %}

@@ -912,6 +912,23 @@ async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1
     return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
 
 
+@router.get("/digests", response_class=HTMLResponse)
+async def web_digests(request: Request):
+    """Autopilot daily digests with the audit sample (#739)."""
+    import json as _json
+
+    rows = await repo.list_digests(_db(request), limit=30)
+    digests = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["data"] = _json.loads(d.get("payload") or "{}")
+        except ValueError:
+            d["data"] = {}
+        digests.append(d)
+    return TEMPLATES.TemplateResponse(request, "digests.html", {"digests": digests})
+
+
 @router.get("/skills", response_class=HTMLResponse)
 async def web_skills(request: Request, skill_error: str = Query("")):
     """Skills library (#380): latest version per name; create form (#385)."""

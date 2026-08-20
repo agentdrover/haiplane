@@ -863,6 +863,16 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                         missing,
                     )
 
+            # Autopilot digests (#739): one per project per UTC day of
+            # autopilot activity. Idempotent via the UNIQUE key, so every
+            # poll pass may try; a failure must not kill the loop.
+            try:
+                from hub.services.digest import generate_due_digests
+
+                await generate_due_digests(db)
+            except Exception:  # noqa: BLE001 - oversight must not stop polling
+                log.exception("autopilot digest generation failed")
+
             # Claim lease expiry (#417): a claim held past the lease without a
             # pair start is auto-released back to open so the task returns to
             # the queue instead of sitting owned by a dead session forever.

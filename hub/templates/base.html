@@ -42,6 +42,9 @@
             <a href="/metrics" class="{% if active == 'metrics' %}active{% endif %}">
                 <span class="nav-icon">&#9632;</span> Metrics
             </a>
+            <a href="/digests" class="{% if active == 'digests' %}active{% endif %}">
+                <span class="nav-icon">&#9737;</span> Digests
+            </a>
             {% if request.state.identity and request.state.identity.is_admin %}
             <hr class="nav-divider">
             <a href="/admin" class="{% if active == 'admin' %}active{% endif %}">

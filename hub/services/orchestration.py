@@ -311,7 +311,7 @@ async def _human_gate_metrics(
         "LEFT JOIN tasks t ON t.id = e.task_id "
         "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
         "('task_approved', 'task_rejected', 'review_verdict_recorded', "
-        "'task_decided') ORDER BY e.created_at ASC",
+        "'task_decided', 'audit_result') ORDER BY e.created_at ASC",
         (since,),
     )
 
@@ -372,7 +372,7 @@ async def _human_gate_metrics(
         project_slug = await project_slug_for(row["task_id"])
         decided_at = _parse_hub_ts(row["created_at"])
         kind = row["kind"]
-        if kind in {"task_approved", "task_rejected", "task_decided"}:
+        if kind in {"task_approved", "task_rejected", "task_decided", "audit_result"}:
             # These carry an explicit human/non-human actor.
             if actor != "human":
                 continue
@@ -409,6 +409,25 @@ async def _human_gate_metrics(
                 if decided_at is not None and s <= decided_at
             ]
             record_wait(entry, max(candidates) if candidates else None, decided_at)
+        elif kind == "audit_result":
+            # The post-hoc side of the autopilot (#739): a spot check that
+            # found a problem is the strongest argument to pull the gate
+            # back to human — surfaced here as its own gate so the
+            # expand-or-roll-back decision reads one table.
+            try:
+                payload = _json.loads(row["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            result = (payload.get("result") or "").lower()
+            if result not in {"ok", "problem"}:
+                continue
+            entry = bucket("audit", project_slug)
+            if result == "ok":
+                entry["approvals"] += 1
+            else:
+                entry["overrides"] += 1
+            # A spot check has no queue: nothing waits on it, so no wait
+            # sample and no unaccounted bump.
         elif kind == "task_decided":
             try:
                 payload = _json.loads(row["payload"] or "{}")

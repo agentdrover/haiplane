@@ -376,6 +376,14 @@ class BulkChildTasksCreate(BaseModel):
     auto_review: bool = True
 
 
+class DigestAuditResult(BaseModel):
+    """Spot-check outcome for a task sampled by an autopilot digest (#739)."""
+
+    task_id: int
+    result: str = Field(..., pattern="^(ok|problem)$")
+    comment: str = Field("", max_length=2000)
+
+
 class TaskApprove(BaseModel):
     comment: str = ""
     run: bool = False
