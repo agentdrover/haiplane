@@ -763,6 +763,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, head_sha)
         )""",
     ),
+    (
+        # Nullable on purpose: NULL is the only honest "not computed".
+        # R0 means "computed and found harmless" — collapsing NULL into it
+        # would silently mark every uncounted task as safe the moment the
+        # class starts gating anything (#581; same defect class that
+        # author_kind closed in #559). A NOT NULL DEFAULT '' would add a
+        # third state that is neither a class nor absence (#331).
+        "add_risk_class_column",
+        "ALTER TABLE tasks ADD COLUMN risk_class TEXT",
+    ),
 ]
 
 
@@ -866,6 +876,11 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "redesign_decision",
     "redesign_rationale",
     "agent_fit",
+    # Risk class (#581) is read-path only: it is listed here so
+    # structured_fields_from_row / TaskView surface it, but it is
+    # deliberately absent from TaskCreate and TaskRefine — the class is
+    # derived from observable facts (#582), never declared by the author.
+    "risk_class",
 )
 
 

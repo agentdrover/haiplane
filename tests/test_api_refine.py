@@ -1193,3 +1193,45 @@ async def test_reshaping_the_statement_moves_the_date(client: AsyncClient, db):
     assert await _stored_prepared_at(db, task["id"]) != "2026-07-01 09:00:00", (
         "the premises changed, so the date the reader is warned about must too"
     )
+
+
+# ---------------------------------------------------------------------------
+# Risk class (#581): shadow-mode read surface
+# ---------------------------------------------------------------------------
+
+
+async def test_risk_class_absent_is_not_r0(client: AsyncClient, db):
+    # AC-1 (#581): a computed class is visible through the API, and "not
+    # computed" is None — machine-distinguishable from the explicit R0.
+    computed = await _create_task(client, title="computed risk")
+    untouched = await _create_task(client, title="no risk computed")
+
+    await db.execute(
+        "UPDATE tasks SET risk_class = 'R2' WHERE id = ?", (computed["id"],)
+    )
+    await db.commit()
+
+    resp = await client.get(f"/api/tasks/{computed['id']}")
+    assert resp.status_code == 200
+    assert resp.json()["risk_class"] == "R2"
+
+    resp = await client.get(f"/api/tasks/{untouched['id']}")
+    body = resp.json()
+    assert "risk_class" in body, (
+        "a missing key would make 'not computed' unreadable, not a state"
+    )
+    assert body["risk_class"] is None
+    assert body["risk_class"] != "R0"
+
+
+async def test_refine_cannot_declare_risk_class(client: AsyncClient):
+    # The class is derived from observable facts (#582), never declared by
+    # the author: refine has no such field, so the value stays "not
+    # computed" no matter what the payload claims.
+    task = await _create_task(client, title="refine cannot set risk")
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine", json={"risk_class": "R0"}
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.get(f"/api/tasks/{task['id']}")
+    assert resp.json()["risk_class"] is None

@@ -1457,6 +1457,17 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
 .badge-question { background: var(--yellow-dim); color: var(--yellow); }
 .badge-answer { background: var(--green-dim); color: var(--green); }
 
+/* ─── Risk class badges (#581) ─── */
+/* R3+ must jump out of a list of thirty cards; "not computed" is visually
+   distinct from every class — R0 included — so absence never reads as safe. */
+.badge-risk-r0 { background: var(--green-dim); color: var(--green); }
+.badge-risk-r1 { background: var(--green-dim); color: var(--green); }
+.badge-risk-r2 { background: var(--orange-dim); color: var(--orange); }
+.badge-risk-r3 { background: #ea580c; color: #fff; }
+.badge-risk-r4 { background: #dc2626; color: #fff; }
+.badge-risk-r5 { background: #7f1d1d; color: #fff; }
+.badge-risk-unset { background: transparent; color: var(--text-muted); border: 1px dashed var(--text-muted); }
+
 /* ─── Task type badges ─── */
 .badge-type-epic { background: var(--purple); color: #fff; }
 .badge-type-feature { background: #2563eb; color: #fff; }

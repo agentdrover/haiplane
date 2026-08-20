@@ -4418,3 +4418,37 @@ async def test_queue_reuses_the_selection_approval(client: AsyncClient, db):
     assert "/tasks/web-batch-approve-selected" in page, (
         "the queue must post to the endpoint #628 already built, not a new one"
     )
+
+
+async def test_inbox_shows_risk_class_and_unset_state(client: AsyncClient, db):
+    # AC-2 (#581): the class sits next to each inbox row; a task without a
+    # computed class renders the explicit "not computed" badge, never R0.
+    resp = await client.post(
+        "/api/tasks", json={"title": "Classified draft", "source": "agent"}
+    )
+    classified_id = resp.json()["id"]
+    await client.post(
+        "/api/tasks", json={"title": "Unclassified draft", "source": "agent"}
+    )
+    await db.execute(
+        "UPDATE tasks SET risk_class = 'R4' WHERE id = ?", (classified_id,)
+    )
+    await db.commit()
+
+    resp = await client.get("/partials/inbox")
+    assert resp.status_code == 200
+    assert "badge-risk-r4" in resp.text
+    assert ">R4<" in resp.text
+    assert "badge-risk-unset" in resp.text
+    assert "badge-risk-r0" not in resp.text
+
+
+async def test_task_detail_shows_unset_risk_class_distinct_from_r0(
+    client: AsyncClient,
+):
+    resp = await client.post("/api/tasks", json={"title": "No class card"})
+    task_id = resp.json()["id"]
+    resp = await client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    assert "badge-risk-unset" in resp.text
+    assert "badge-risk-r0" not in resp.text

@@ -41,6 +41,7 @@ STRUCTURED_TASK_COLUMNS = {
     "prepared_at",
     "human_owner",
     "human_reviewer",
+    "risk_class",
 }
 
 
@@ -608,5 +609,59 @@ async def test_hub_written_update_is_not_confused_with_history():
         assert row["author_kind"] == "hub", (
             "the hub has no principal by nature; that is not the same as legacy"
         )
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Risk class column (#581)
+# ---------------------------------------------------------------------------
+
+
+async def test_risk_class_column_nullable_without_default():
+    # NULL is the only honest "not computed": NOT NULL or a default would
+    # collapse absence into a value the moment anything trusts the class.
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "risk_class" in cols
+        assert cols["risk_class"]["notnull"] == 0
+        assert cols["risk_class"]["dflt_value"] is None
+    finally:
+        await conn.close()
+
+
+async def test_risk_class_migration_preserves_rows(monkeypatch):
+    # AC-3 (#581): rows written before the migration survive it unchanged
+    # and read back as "not computed" (NULL) — never as R0.
+    import hub.db as db_module
+
+    trimmed = [m for m in _MIGRATIONS if m[0] != "add_risk_class_column"]
+    assert len(trimmed) == len(_MIGRATIONS) - 1, (
+        "the migration under test must exist in _MIGRATIONS"
+    )
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", trimmed)
+        await _migrate(conn)
+        await conn.execute(
+            "INSERT INTO tasks (title, description) VALUES ('legacy row', 'kept')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+
+        rows = await conn.execute_fetchall(
+            "SELECT title, description, risk_class FROM tasks"
+        )
+        assert len(rows) == 1
+        assert rows[0]["title"] == "legacy row"
+        assert rows[0]["description"] == "kept"
+        assert rows[0]["risk_class"] is None
     finally:
         await conn.close()
