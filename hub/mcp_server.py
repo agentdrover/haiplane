@@ -1978,6 +1978,108 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     return structured_echo_result("\n".join(lines), metrics=data)
 
 
+# --- Agent session registry (#771) ------------------------------------------
+#
+# The session is the address other sessions will write to (feature #770). The
+# hub takes the agent name and principal from the token, so these tools cannot
+# register a session under someone else's identity, and presence is computed
+# from the last heartbeat rather than stored.
+
+
+def _format_session(s: dict) -> str:
+    age = s.get("last_seen_age_seconds")
+    seen = "возраст неизвестен" if age is None else f"признак жизни {age}s назад"
+    task = f", задача #{s['current_task_id']}" if s.get("current_task_id") else ""
+    model = f", модель {s['model']}" if s.get("model") else ""
+    return (
+        f"{s.get('session_id', '?')} [{s.get('status', '?')}] "
+        f"{s.get('agent') or 'anonymous'}{model}{task} — {seen}"
+    )
+
+
+@mcp.tool()
+async def hub_session_register(
+    session_id: str,
+    model: str = "",
+    host: str = "",
+    workspace: str = "",
+) -> CallToolResult:
+    """Register this session so other sessions can address it (#771).
+
+    Idempotent: calling it again with the same ``session_id`` refreshes what
+    you declare and your sign of life without starting a new session. The
+    agent name and principal come from your token — they cannot be passed in.
+
+    Args:
+        session_id: Your session identifier; reuse the one you pass to hub_claim_task
+        model: The model running this session — a declaration, like the one on submit
+        host: Machine this session runs on
+        workspace: Working directory or worktree this session operates in
+    """
+    try:
+        session = await _api_post(
+            "/api/sessions/register",
+            {
+                "session_id": session_id,
+                "model": model,
+                "host": host,
+                "workspace": workspace,
+            },
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return structured_echo_result(
+        f"Session registered: {_format_session(session)}", session=session
+    )
+
+
+@mcp.tool()
+async def hub_session_heartbeat(session_id: str) -> CallToolResult:
+    """Tell the hub this session is still alive (#771).
+
+    Presence is derived from this timestamp: past the TTL the registry reports
+    the session offline and names the age, instead of leaving a stale badge lit.
+
+    Args:
+        session_id: The session you registered with hub_session_register
+    """
+    try:
+        session = await _api_post(f"/api/sessions/{session_id}/heartbeat", {})
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return structured_echo_result(
+        f"Heartbeat recorded: {_format_session(session)}", session=session
+    )
+
+
+@mcp.tool()
+async def hub_sessions(agent: str = "", status: str = "") -> CallToolResult:
+    """List registered agent sessions: who is around and on what (#771).
+
+    Every row carries the age of the last sign of life next to online/offline,
+    so a stale registry cannot read as a live one.
+
+    Args:
+        agent: Filter by agent name. Empty for all.
+        status: Filter by computed presence: online | offline. Empty for all.
+    """
+    query = []
+    if agent:
+        query.append(f"agent={agent}")
+    if status:
+        query.append(f"status={status}")
+    path = "/api/sessions" + ("?" + "&".join(query) if query else "")
+    try:
+        rows = await _api_get(path)
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    if not rows:
+        return structured_echo_result("No registered sessions.", sessions=[])
+    return structured_echo_result(
+        "\n".join(_format_session(s) for s in rows), sessions=rows
+    )
+
+
 @mcp.tool()
 async def hub_list_skills() -> CallToolResult:
     """List the skills library (#380): latest version per name.

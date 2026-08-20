@@ -171,3 +171,42 @@ async def test_off_disables_the_check_entirely(
     # the SURFACE check stays silent — no refusal, no undeclared-files alert,
     # even though the diff (tests/test_api.py) sits outside the declared area.
     assert not [a for a in await _alerts(db, task_id) if "Класс риска" not in a]
+
+
+async def _submission_notes(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    updates = await repo.get_task_updates(db, task_id)
+    return [u["content"] for u in updates if "Submitted for review" in u["content"]]
+
+
+async def test_submit_distinguishes_empty_diff_from_unreadable(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#762 AC-3: the feed must say which of the two happened.
+
+    Until this task both printed "Класс риска по диффу НЕ пересчитан: дифф
+    пуст", so a workspace looking at a stale ref was indistinguishable from a
+    branch that genuinely changes nothing — and #759 and #756 both read as the
+    harmless one while being the other.
+    """
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+
+    empty_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps([])
+    await services.submit_for_review(db, empty_id)
+    empty_note = (await _submission_notes(db, empty_id))[-1]
+
+    unreadable_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps(None)
+    await services.submit_for_review(db, unreadable_id)
+    unreadable_note = (await _submission_notes(db, unreadable_id))[-1]
+
+    assert "ветка не меняет файлов" in empty_note, (
+        "an empty diff is an observation about the branch, not a failure"
+    )
+    assert "НЕ пересчитан" not in empty_note, (
+        "nothing failed here — the class was checked and had nothing to change"
+    )
+    assert "прочитать дифф не удалось" in unreadable_note, (
+        "an unreadable diff must name itself as unreadable"
+    )
+    assert empty_note != unreadable_note

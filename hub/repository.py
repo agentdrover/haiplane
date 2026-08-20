@@ -2269,3 +2269,115 @@ async def insert_task_idempotency_key(
         "(client_request_id, task_id, request_hash) VALUES (?, ?, ?)",
         (client_request_id, task_id, request_hash),
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent session registry (#771)
+# ---------------------------------------------------------------------------
+
+
+async def upsert_agent_session(
+    db: aiosqlite.Connection,
+    *,
+    session_id: str,
+    principal_id: int | None,
+    agent: str,
+    model: str = "",
+    host: str = "",
+    workspace: str = "",
+) -> None:
+    """Register a session, or refresh the one already under this id.
+
+    Re-registration keeps ``started_at`` — the session did not restart just
+    because it said hello twice — and keeps a previously declared model, host
+    or workspace when the new call omits it: a heartbeat-shaped register must
+    not quietly erase what the registry knows.
+    """
+    await db.execute(
+        "INSERT INTO agent_sessions "
+        "(session_id, principal_id, agent, model, host, workspace, "
+        " started_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "  principal_id = excluded.principal_id, "
+        "  agent        = excluded.agent, "
+        "  model        = CASE WHEN excluded.model = '' "
+        "                 THEN agent_sessions.model ELSE excluded.model END, "
+        "  host         = CASE WHEN excluded.host = '' "
+        "                 THEN agent_sessions.host ELSE excluded.host END, "
+        "  workspace    = CASE WHEN excluded.workspace = '' "
+        "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
+        "  last_seen_at = datetime('now')",
+        (session_id, principal_id, agent, model, host, workspace),
+    )
+
+
+async def touch_agent_session(db: aiosqlite.Connection, session_id: str) -> bool:
+    """Record a sign of life. False when no such session is registered."""
+    cur = await db.execute(
+        "UPDATE agent_sessions SET last_seen_at = datetime('now') WHERE session_id = ?",
+        (session_id,),
+    )
+    return bool(cur.rowcount)
+
+
+async def set_agent_session_task(
+    db: aiosqlite.Connection, session_id: str, task_id: int | None
+) -> bool:
+    """Point a session at the task it now holds (None clears it).
+
+    Deliberately silent when the session is not registered: the registry is
+    optional, and claiming a task must not start failing because an agent
+    never said hello (#771 AC-5). NO commit here — the caller writes this
+    inside the same transaction that records claim_session_id, so the two
+    can never disagree.
+    """
+    cur = await db.execute(
+        "UPDATE agent_sessions SET current_task_id = ?, "
+        "last_seen_at = datetime('now') WHERE session_id = ?",
+        (task_id, session_id),
+    )
+    return bool(cur.rowcount)
+
+
+async def get_agent_session(
+    db: aiosqlite.Connection, session_id: str
+) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM agent_sessions WHERE session_id = ? LIMIT 1",
+        (session_id,),
+    )
+    rows = list(rows)
+    return rows[0] if rows else None
+
+
+async def list_agent_sessions(
+    db: aiosqlite.Connection,
+    *,
+    agent: str = "",
+    limit: int = 200,
+) -> list[aiosqlite.Row]:
+    """Registered sessions, freshest sign of life first."""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if agent:
+        conditions.append("agent = ?")
+        params.append(agent)
+    where = f"WHERE {' AND '.join(conditions)} " if conditions else ""
+    params.append(min(limit, 500))
+    return list(
+        await db.execute_fetchall(
+            f"SELECT * FROM agent_sessions {where}"  # nosec B608
+            "ORDER BY last_seen_at DESC, id DESC LIMIT ?",
+            tuple(params),
+        )
+    )
+
+
+async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
+    """Drop sessions with no sign of life for ``keep_days``. Rows removed."""
+    cur = await db.execute(
+        "DELETE FROM agent_sessions WHERE last_seen_at < datetime('now', ?)",
+        (f"-{keep_days} days",),
+    )
+    return cur.rowcount or 0

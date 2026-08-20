@@ -1862,3 +1862,63 @@ def test_the_slug_is_deterministic():
     title = "Кириллический заголовок задачи даёт пустой слаг"
     assert _slugify(title) == _slugify(title)
     assert _slugify(title), "and it must not be empty"
+
+
+async def test_branch_diff_uses_remote_ref_after_fetch(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#762 AC-1: a stale local ref must not answer for the pushed branch.
+
+    Reproduces #759 and #756 with real git: the workspace holds a local
+    `task-N/work` left at the base while the branch under review lives on
+    origin. Before the fix git was asked about the local ref and answered
+    honestly — an empty diff, which read as "the branch changes nothing" and
+    silently disabled the surface check and the risk-class recompute.
+    """
+    upstream = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=upstream)
+    _run_git("git", "commit", "-q", "--allow-empty", "-m", "base", cwd=upstream)
+
+    workspace = tmp_path / "workspace"
+    _run_git("git", "clone", "-q", str(upstream), str(workspace), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=workspace)
+    _run_git("git", "config", "user.name", "t", cwd=workspace)
+
+    # The stale local ref: created from the base and never moved again.
+    _run_git("git", "checkout", "-q", "-b", "task-762/work", cwd=workspace)
+    _run_git("git", "checkout", "-q", config.PAIR_BASE_BRANCH, cwd=workspace)
+
+    # The real work, done elsewhere (a developer's machine) and pushed.
+    _run_git("git", "checkout", "-q", "-b", "task-762/work", cwd=upstream)
+    (upstream / "src.py").write_text("real work\n")
+    _run_git("git", "add", "-A", cwd=upstream)
+    _run_git("git", "commit", "-q", "-m", "work", cwd=upstream)
+
+    paths = await git_ops.branch_diff_paths("task-762/work", repo=str(workspace))
+
+    assert paths == ["src.py"], (
+        "the diff must describe the pushed branch, not a local ref that "
+        f"happens to sit in the workspace (got {paths!r})"
+    )
+
+
+async def test_unreadable_diff_is_none_not_empty(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#762 AC-2: "could not look" keeps its own answer.
+
+    [] means the branch changes nothing; None means nobody found out. The
+    whole defect this task fixes lived in the gap between those two.
+    """
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+
+    assert await git_ops.branch_diff_paths("no-such-branch", repo=str(repo)) is None
+    assert await git_ops.branch_diff_paths("", repo=str(repo)) is None
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    assert await git_ops.branch_diff_paths("whatever", repo=str(not_a_repo)) is None
+
+    # And a branch that genuinely changes nothing still answers [], not None.
+    _run_git("git", "checkout", "-q", "-b", "task-762/empty", cwd=repo)
+    assert await git_ops.branch_diff_paths("task-762/empty", repo=str(repo)) == []

@@ -10,6 +10,13 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.outcomes import outcome_debt
+from hub.services.sessions import (
+    heartbeat_session,
+    list_sessions,
+    note_session_task,
+    register_session,
+    session_view,
+)
 from hub.services.dor import (
     DOR_CHECK_KEYS,
     DOR_REQUIRED_BY_WORK_TYPE,
@@ -123,10 +130,15 @@ __all__ = [
     "add_update",
     "delete_acceptance_criterion",
     "get_readiness",
+    "heartbeat_session",
     "list_acceptance_criteria",
+    "list_sessions",
+    "note_session_task",
     "readiness_tree",
     "refine_task",
     "refine_tasks_bulk",
+    "register_session",
+    "session_view",
     "upsert_acceptance_criterion",
     "replace_acceptance_criteria",
     "row_to_ac",
