@@ -1552,6 +1552,17 @@ async def submit_for_review(
             content += f" PR #{discovered_pr} recorded for delivery."
         if submission_sha:
             content += f" Branch tip at submission: {submission_sha[:12]}."
+        else:
+            # Unchecked is a state the reviewer must see, not an absence of
+            # news — the same rule the drift guard follows (#534, #572).
+            # #767: this line used to hang off ``if adopted`` — the CI-report
+            # branch — while speaking about pinning. A submission with a
+            # pinned sha and no CI report to adopt therefore printed both
+            # "Branch tip at submission: 97e4707248ee" and "Branch tip NOT
+            # pinned: " with an empty reason, contradicting itself in one
+            # sentence (seen on #725 and #763). It belongs to the sha, so it
+            # is bound to the sha.
+            content += f" Branch tip NOT pinned: {sha_reason}."
         if adopted:
             ac_count = len(adopted.get("ac_recorded") or [])
             v_status = adopted.get("validation_status") or "—"
@@ -1559,10 +1570,6 @@ async def submit_for_review(
                 f" CI run report adopted for this commit: {ac_count} AC result(s), "
                 f"validation {v_status}."
             )
-        else:
-            # Unchecked is a state the reviewer must see, not an absence of
-            # news — the same rule the drift guard follows (#534, #572).
-            content += f" Branch tip NOT pinned: {sha_reason}."
         if risk_note:
             content += risk_note
         if declared_model:

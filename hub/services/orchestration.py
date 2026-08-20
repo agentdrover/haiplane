@@ -992,6 +992,48 @@ async def merge_before_completion(
         return False, f"merge_gate_error: {exc}"
 
 
+async def pr_for_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[int | None, str]:
+    """The PR that carries this task's branch, looked up at done time (#767).
+
+    Discovery used to happen once, inside ``submit_for_review``. A PR opened
+    AFTER the submission therefore never reached ``pr_number`` — and the
+    delivery gate below keys on that field, so the task completed with its
+    work still sitting in a branch. Observed on #725: APPROVED, green CI, and
+    "Task completed" over an open PR #336. Nothing in the flow forbids that
+    order; the hub simply stopped looking.
+
+    Returns ``(pr_number, reason)``. A filled number is recorded on the task
+    so the gate and the drift guard see the same PR. An empty number with an
+    empty reason means "this task has no branch to carry a PR" — today's
+    behaviour for config and docs work, and no network call is made for it.
+    A reason is filled only when the lookup itself could not answer, which is
+    a cause to report, never an exception to raise (AC-4).
+    """
+    if task.get("pr_number"):
+        return int(task["pr_number"]), ""
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return None, ""
+    try:
+        ctx = await project_git_context(db, task["id"])
+        found = await plugins.git_ops.pr_for_branch(
+            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
+        log.warning(
+            "PR lookup at done failed for #%s (%s): %s", task["id"], branch, exc
+        )
+        return None, f"поиск PR по ветке {branch} не ответил: {exc}"
+    if found is None:
+        return None, (
+            f"открытый PR для ветки {branch} не найден — доставка не проверялась"
+        )
+    await repo.update_task(db, task["id"], pr_number=found)
+    return int(found), ""
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -1010,6 +1052,22 @@ async def transition_after_agent_done(
         # #363 established for headless and the pair flow never had. Tasks
         # without a PR (config work, docs) are untouched. force_complete and
         # decide-accept are human overrides and bypass this by design.
+        #
+        # #767: an empty pr_number is no longer taken as "nothing to deliver".
+        # It has two meanings — "this work needs no PR" and "a PR exists and
+        # the hub never learned its number" — and the second one completed
+        # tasks over unmerged branches. The lookup runs here, at done time,
+        # instead of only at submission.
+        pr_note = ""
+        if not task.get("job_id"):
+            found, pr_note = await pr_for_delivery(db, task)
+            if found:
+                task = {**task, "pr_number": found}
+        if pr_note:
+            # The gate could not look. Completion still follows today's rule,
+            # but the reader is told which check did not run — an absent line
+            # here would read as "there was nothing to deliver" (AC-4).
+            await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
         if task.get("pr_number") and not task.get("job_id"):
             ok, detail = await merge_before_completion(db, task)
             if not ok:
