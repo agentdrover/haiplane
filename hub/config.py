@@ -86,6 +86,11 @@ SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
 # the human gate completely. 'r2' is deliberately NOT accepted here — that
 # band opens only with #585, after measured reviewer agreement.
 AUTO_APPROVE_MAX_CLASS = os.environ.get("OPENCLAW_AUTO_APPROVE_MAX_CLASS", "off")
+# Review-round token budget (#745): a machine-review report that spent more
+# than this escalates the verdict to the human instead of auto-approving —
+# a round that did not converge normally is itself a risk signal. Matches
+# the multi-agent-review skill's per-round bar. 0 disables the trigger.
+REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000"))
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")

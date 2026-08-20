@@ -1089,6 +1089,17 @@ async def api_submit_machine_review(
     saved = await repo.get_latest_machine_review(db, task_id)
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
+
+    # Auto-verdict (#745): a clean report in a project whose policy allows
+    # it gets its APPROVED right here. Best-effort by contract — the report
+    # intake must never fail because the autopilot stumbled.
+    try:
+        from hub.services.auto_verdict import maybe_auto_verdict
+
+        await maybe_auto_verdict(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("auto-verdict failed for task #%s", task_id)
+
     return view
 
 
