@@ -15,6 +15,11 @@
 - Доставка «хотя бы раз»: сработавшее ожидание остаётся в файле с пометкой
   fired_at/refire_count — потерянное пробуждение переоткроется следующим Stop
   (до 3 повторов). Проснувшийся агент снимает ожидание сам: удаляет файл.
+- Владелец ожидания (#772): файл общий на каталог, а сессий в нём может быть
+  несколько, поэтому запись может нести "owner": "<session_id>", и хук следит
+  только за своими. Запись БЕЗ owner считается общей и ведёт себя как раньше —
+  иначе раскатка была бы всё-или-ничего. Чужие записи хук не трогает вообще:
+  ни будит по ним, ни переписывает их.
 - Лок-файл защищает от параллельных поллеров при повторных Stop.
 
 Токен и URL берутся из ~/.claude.json (mcpServers.openclaw-hub) — как у MCP.
@@ -117,6 +122,37 @@ def changed_fields(task: dict, baseline: dict) -> dict:
     return diff
 
 
+def session_id_from(payload: str) -> str:
+    """Идентификатор ЭТОЙ сессии из payload Stop-хука (#772).
+
+    Пустая строка означает «не удалось определить», и это намеренно приводит
+    к сегодняшнему поведению — все ожидания считаются своими. Неопределённость
+    не должна выключать пробуждения: молча не проснуться на свой вердикт хуже,
+    чем проснуться на чужой.
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    sid = str(data.get("session_id") or "").strip()
+    if sid:
+        return sid
+    # Транскрипт называется <session_id>.jsonl — тот же идентификатор с другой
+    # стороны, на случай если payload когда-нибудь перестанет нести поле явно.
+    transcript = str(data.get("transcript_path") or "").strip()
+    return Path(transcript).stem if transcript else ""
+
+
+def is_own_wait(wait: dict, session: str) -> bool:
+    """Своё ли это ожидание: без owner — общее, с owner — только своё."""
+    owner = str(wait.get("owner") or "").strip()
+    if not owner or not session:
+        return True
+    return owner == session
+
+
 def acquire_lock() -> bool:
     try:
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -135,9 +171,10 @@ def acquire_lock() -> bool:
 
 def main() -> int:
     try:
-        sys.stdin.read()  # payload Stop-хука не нужен, но стрим надо дочитать
+        payload = sys.stdin.read()  # стрим надо дочитать в любом случае
     except Exception:
-        pass
+        payload = ""
+    session = session_id_from(payload)
 
     if not STATE_FILE.exists():
         return 0
@@ -145,9 +182,9 @@ def main() -> int:
         state = json.loads(STATE_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return 0
-    waits = state.get("waits") or []
+    waits = [w for w in (state.get("waits") or []) if is_own_wait(w, session)]
     if not waits:
-        return 0
+        return 0  # в файле только чужие ожидания — не наше дело
 
     if not acquire_lock():
         return 0
@@ -166,7 +203,9 @@ def main() -> int:
                 state = json.loads(STATE_FILE.read_text())
             except (json.JSONDecodeError, OSError):
                 return 0
-            waits = state.get("waits") or []
+            all_waits = state.get("waits") or []
+            waits = [w for w in all_waits if is_own_wait(w, session)]
+            foreign = [w for w in all_waits if not is_own_wait(w, session)]
             if not waits:
                 return 0
             # Просыпаемся от событий фида (#349, ~1с реакции); baseline по
@@ -214,7 +253,7 @@ def main() -> int:
                     wait["refire_count"] = int(wait.get("refire_count") or 0) + 1
                     if wait["refire_count"] > 3:
                         give_up.append(wait)
-                kept = [w for w in waits if w not in give_up]
+                kept = foreign + [w for w in waits if w not in give_up]
                 if kept:
                     state["waits"] = kept
                     STATE_FILE.write_text(
@@ -247,6 +286,15 @@ def main() -> int:
                     "Обработав событие, сними ожидание: удали .claude/hub-wait.json "
                     "(или перепиши waits) — иначе следующий Stop разбудит повторно."
                 )
+                if session:
+                    # #772: назвать разрешённый идентификатор прямо в сообщении.
+                    # Это и есть проверка совпадения: агент пишет owner тем же
+                    # значением, и если оно когда-нибудь разъедется, это видно
+                    # здесь, а не в виде тихо не наступивших пробуждений.
+                    lines.append(
+                        f"Сессия: {session} — это же значение пиши в owner "
+                        "своих ожиданий, чтобы чужие события тебя не будили."
+                    )
                 msg = "\n".join(lines)
                 print(msg)
                 print(msg, file=sys.stderr)
