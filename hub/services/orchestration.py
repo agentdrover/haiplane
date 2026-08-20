@@ -263,13 +263,162 @@ async def practice_metrics(
         for wt in sorted(set(by_type) | set(unmeasurable_by_type))
     ]
 
+    human_gates = await _human_gate_metrics(db, since)
+
     return {
         "since_days": since_days,
         "machine_reviews": totals,
         "by_harness": [dict(r) for r in harness_rows],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
+        "human_gates": human_gates,
     }
+
+
+def _parse_hub_ts(raw: str | None) -> Any:
+    """Parse the two timestamp shapes this DB carries (#594): SQLite's
+    'YYYY-MM-DD HH:MM:SS' and ISO with 'T'/offset. None on anything else."""
+    from datetime import datetime
+
+    if not raw:
+        return None
+    text = raw.strip().replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+async def _human_gate_metrics(
+    db: aiosqlite.Connection, since: str
+) -> list[dict[str, Any]]:
+    """Override-rate and queue wait per HUMAN gate and project (#737).
+
+    A gate whose override-rate sits at ~0% over the window is a candidate
+    for the autopilot (#738); a gate where the human actually changes
+    outcomes stays human. Only human decisions count: actor 'hub' (service
+    writes, #584) and 'policy' (autopilot, #738) are excluded from both
+    the numerator and the denominator. Waits that cannot be measured are
+    reported as ``wait_unaccounted`` — never as zeros (the #518 lesson).
+    """
+    import json as _json
+    import statistics
+
+    event_rows = await db.execute_fetchall(
+        "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, "
+        "COALESCE(p.slug, 'default') AS project, t.ready_at "
+        "FROM events e "
+        "LEFT JOIN tasks t ON t.id = e.task_id "
+        "LEFT JOIN projects p ON p.id = t.project_id "
+        "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
+        "('task_approved', 'task_rejected', 'review_verdict_recorded', "
+        "'task_decided') ORDER BY e.created_at ASC",
+        (since,),
+    )
+    # The submission moment is written by the hub itself in a fixed shape
+    # (submit_for_review), which makes it the one submission timestamp that
+    # exists for the whole history — there is no dedicated event yet.
+    submit_rows = await db.execute_fetchall(
+        "SELECT task_id, created_at FROM task_updates "
+        "WHERE kind = 'status' "
+        "AND content LIKE 'Submitted for review (submission #%'",
+    )
+    submits: dict[int, list[Any]] = {}
+    for row in submit_rows:
+        parsed = _parse_hub_ts(row["created_at"])
+        if parsed is not None:
+            submits.setdefault(row["task_id"], []).append(parsed)
+
+    gates: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def bucket(gate: str, project: str) -> dict[str, Any]:
+        return gates.setdefault(
+            (gate, project),
+            {
+                "gate": gate,
+                "project": project,
+                "approvals": 0,
+                "overrides": 0,
+                "waits": [],
+                "wait_unaccounted": 0,
+            },
+        )
+
+    def record_wait(entry: dict[str, Any], start: Any, end: Any) -> None:
+        if start is None or end is None or end < start:
+            entry["wait_unaccounted"] += 1
+            return
+        entry["waits"].append((end - start).total_seconds() / 3600.0)
+
+    for row in event_rows:
+        actor = (row["actor"] or "").strip()
+        decided_at = _parse_hub_ts(row["created_at"])
+        kind = row["kind"]
+        if kind in {"task_approved", "task_rejected", "task_decided"}:
+            # These carry an explicit human/non-human actor.
+            if actor != "human":
+                continue
+        elif actor in {"hub", "policy"}:
+            # Verdicts name the reviewer; today every client-driven verdict
+            # is the human gate, and the autopilot (#738) will stamp its
+            # own actor — excluded here by name.
+            continue
+
+        if kind == "task_approved":
+            entry = bucket("dor", row["project"])
+            entry["approvals"] += 1
+            record_wait(entry, _parse_hub_ts(row["ready_at"]), decided_at)
+        elif kind == "task_rejected":
+            entry = bucket("dor", row["project"])
+            entry["overrides"] += 1
+            record_wait(entry, _parse_hub_ts(row["ready_at"]), decided_at)
+        elif kind == "review_verdict_recorded":
+            try:
+                payload = _json.loads(row["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            verdict = (payload.get("verdict") or "").lower()
+            if verdict not in {"approved", "changes_requested"}:
+                continue
+            entry = bucket("verdict", row["project"])
+            if verdict == "approved":
+                entry["approvals"] += 1
+            else:
+                entry["overrides"] += 1
+            candidates = [
+                s
+                for s in submits.get(row["task_id"], [])
+                if decided_at is not None and s <= decided_at
+            ]
+            record_wait(entry, max(candidates) if candidates else None, decided_at)
+        elif kind == "task_decided":
+            try:
+                payload = _json.loads(row["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            action = (payload.get("action") or "").lower()
+            if action not in {"accept", "rework"}:
+                continue
+            entry = bucket("decision", row["project"])
+            if action == "accept":
+                entry["approvals"] += 1
+            else:
+                entry["overrides"] += 1
+            record_wait(entry, _parse_hub_ts(payload.get("entered_at")), decided_at)
+
+    result: list[dict[str, Any]] = []
+    for (_, _), entry in sorted(gates.items()):
+        decisions = entry["approvals"] + entry["overrides"]
+        waits = entry.pop("waits")
+        entry["override_rate"] = (
+            round(entry["overrides"] / decisions, 3) if decisions else None
+        )
+        entry["median_wait_hours"] = (
+            round(statistics.median(waits), 2) if waits else None
+        )
+        result.append(entry)
+    return result
 
 
 async def provision_project(
