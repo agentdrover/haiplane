@@ -108,6 +108,11 @@ STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
 # Stale watchdog (#319): silent dead-end statuses get their own, longer
 # thresholds — review and human answers move slower than execution.
 STALE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_STALE_REVIEW_MINUTES", "120"))
+# Unrefined-draft watchdog (#751): a draft older than this without a passed
+# DoR gets one feed alert naming what is missing — approval of such a draft
+# mechanically fails (422 dor_failed), and until this watchdog the author
+# learned that only when the owner hit the button.
+UNREFINED_DRAFT_MINUTES = int(os.environ.get("OPENCLAW_UNREFINED_DRAFT_MINUTES", "240"))
 STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "240"))
 STALE_NEEDS_INFO_MINUTES = int(
     os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")

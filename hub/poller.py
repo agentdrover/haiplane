@@ -813,6 +813,56 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                             threshold,
                         )
 
+            # Unrefined drafts (#751): a draft the DoR gate would refuse is a
+            # quiet dead end — approval 422s, batch approve silently skips it,
+            # and the author finds out only when the owner hits the button.
+            # One alert per draft (has_stale_alert dedup, same as above);
+            # a draft brought to DoR after the alert is left alone.
+            unrefined = await db.execute_fetchall(
+                "SELECT id, assigned_agent FROM tasks "
+                "WHERE status='draft' AND archived=0 "
+                "AND (dor_passed IS NULL OR dor_passed=0) "
+                "AND created_at <= datetime('now', ?)",
+                (f"-{config.UNREFINED_DRAFT_MINUTES} minutes",),
+            )
+            for row in unrefined:
+                with _task_isolation("unrefined draft sweep", dict(row).get("id")):
+                    task = dict(row)
+                    if await repo.has_stale_alert(db, task["id"], "draft"):
+                        continue
+                    from hub.services.recommendations import (
+                        calculate_readiness_with_recommendations,
+                    )
+
+                    readiness = await calculate_readiness_with_recommendations(
+                        db, task["id"]
+                    )
+                    missing = ", ".join(readiness.missing_required) or "—"
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "hub",
+                        "alert",
+                        f"Task stale in draft: DoR не пройден "
+                        f"{config.UNREFINED_DRAFT_MINUTES}+ минут "
+                        f"(missing: {missing}). hub_refine_task доведёт "
+                        "постановку до готовности — без этого одобрение "
+                        "владельцем невозможно (422 dor_failed).",
+                    )
+                    await db.commit()
+                    await log_activity(
+                        db,
+                        "task_stale",
+                        f"Task #{task['id']} stale in draft: DoR not passed "
+                        f"for {config.UNREFINED_DRAFT_MINUTES}+ min",
+                    )
+                    log.warning(
+                        "Poll: draft #%d unrefined for %d+ min (missing: %s)",
+                        task["id"],
+                        config.UNREFINED_DRAFT_MINUTES,
+                        missing,
+                    )
+
             # Claim lease expiry (#417): a claim held past the lease without a
             # pair start is auto-released back to open so the task returns to
             # the queue instead of sitting owned by a dead session forever.

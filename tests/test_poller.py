@@ -1530,3 +1530,76 @@ async def test_ci_fix_limit_escalates_instead_of_looping(mock_sleep, db):
     assert events[0]["payload"] and "ci_fix_cycle_limit" in str(events[0]["payload"])
     updates = await repo.get_task_updates(db, task_id)
     assert any("cycle limit reached" in u["content"] for u in updates)
+
+
+# ---- Unrefined-draft watchdog (#751) ----
+
+
+async def _make_draft(db, *, minutes=999, refined=False) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="Unrefined draft",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="proposer-bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    if refined:
+        await repo.update_task(db, task_id, dor_passed=1, readiness_score=100)
+    await db.execute(
+        "UPDATE tasks SET created_at = datetime('now', ?) WHERE id=?",
+        (f"-{minutes} minutes", task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_stale_unrefined_draft_gets_one_alert(mock_sleep, db):
+    # AC-1 (#751): one hub alert naming what is missing and how to fix it.
+    task_id = await _make_draft(db)
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    alerts = await _stale_alerts(db, task_id)
+    assert len(alerts) == 1
+    assert "DoR не пройден" in alerts[0]
+    assert "missing:" in alerts[0]
+    assert "hub_refine_task" in alerts[0]
+    assert dict(await repo.get_task(db, task_id))["status"] == "draft", (
+        "the watchdog only speaks — it never transitions"
+    )
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_unrefined_draft_alert_is_not_repeated(mock_sleep, db):
+    # AC-2 (#751): a second pass does not duplicate the alert.
+    task_id = await _make_draft(db)
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert len(await _stale_alerts(db, task_id)) == 1
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_fresh_and_refined_drafts_are_left_alone(mock_sleep, db):
+    # AC-3 (#751): younger than the threshold, or already DoR-passed —
+    # no alert for either.
+    fresh = await _make_draft(db, minutes=1)
+    refined = await _make_draft(db, refined=True)
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    assert not await _stale_alerts(db, fresh)
+    assert not await _stale_alerts(db, refined)
