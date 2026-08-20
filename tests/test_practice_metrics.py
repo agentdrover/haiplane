@@ -190,3 +190,108 @@ async def test_decision_gate_counts_accept_and_rework(db: aiosqlite.Connection):
     assert decision["override_rate"] == 0.5
     assert decision["median_wait_hours"] is not None
     assert 3.8 <= decision["median_wait_hours"] <= 4.2
+
+
+# ---------------------------------------------------------------------------
+# Project attribution walks the hierarchy (#747)
+# ---------------------------------------------------------------------------
+
+
+async def _hierarchy_child(db: aiosqlite.Connection, *, project_id: int | None) -> int:
+    """task → feature → epic, the epic optionally bound to a project."""
+    epic = await repo.create_task(
+        db,
+        title="epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    if project_id is not None:
+        await repo.update_task(db, epic, project_id=project_id)
+    feature = await repo.create_task(
+        db,
+        title="feature",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="feature",
+        parent_id=epic,
+        priority="medium",
+    )
+    return await repo.create_task(
+        db,
+        title="hierarchy child",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="draft",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature,
+        priority="medium",
+    )
+
+
+async def test_child_task_attributed_to_epic_project(db: aiosqlite.Connection):
+    # AC-1 (#747): the child has no project_id of its own — the decision
+    # must still land under the epic's project, not under default.
+    spike = await repo.create_project(db, slug="spike-attr", name="Spike Attr")
+    task_id = await _hierarchy_child(db, project_id=spike)
+    await repo.insert_event(db, kind="task_approved", task_id=task_id, actor="human")
+    await db.commit()
+
+    gates = (await practice_metrics(db))["human_gates"]
+    row = _gate(gates, "dor", "spike-attr")
+    assert row["approvals"] == 1
+    assert not [r for r in gates if r["gate"] == "dor" and r["project"] == "default"], (
+        "nothing here belongs to default"
+    )
+
+
+async def test_project_split_sums_to_gate_total(db: aiosqlite.Connection):
+    # AC-2 (#747): attribution neither loses nor duplicates decisions.
+    spike = await repo.create_project(db, slug="spike-sum", name="Spike Sum")
+    in_spike = await _hierarchy_child(db, project_id=spike)
+    outside = await _task(db, title="no hierarchy")
+    for tid in (in_spike, outside):
+        await repo.insert_event(db, kind="task_approved", task_id=tid, actor="human")
+    await repo.insert_event(db, kind="task_rejected", task_id=outside, actor="human")
+    await db.commit()
+
+    gates = (await practice_metrics(db))["human_gates"]
+    dor_rows = [r for r in gates if r["gate"] == "dor"]
+    assert sum(r["approvals"] for r in dor_rows) == 2
+    assert sum(r["overrides"] for r in dor_rows) == 1
+
+
+async def test_attribution_matches_resolver_semantics(db: aiosqlite.Connection):
+    # AC-3 (#747): outside any epic → default; under a PENDING project →
+    # default — exactly the resolve_project_for_task rules, not a copy.
+    pending = await repo.create_project(
+        db, slug="spike-pending", name="Pending", status="pending"
+    )
+    under_pending = await _hierarchy_child(db, project_id=pending)
+    loose = await _task(db, title="outside hierarchy")
+    for tid in (under_pending, loose):
+        await repo.insert_event(db, kind="task_approved", task_id=tid, actor="human")
+    await db.commit()
+
+    gates = (await practice_metrics(db))["human_gates"]
+    row = _gate(gates, "dor", "default")
+    assert row["approvals"] == 2
+    assert not [r for r in gates if r["project"] == "spike-pending"], (
+        "a pending project must not receive attribution"
+    )
