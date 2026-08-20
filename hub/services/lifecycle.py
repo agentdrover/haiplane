@@ -488,6 +488,7 @@ def row_to_task(
         review_job_id=d.get("review_job_id"),
         submission_generation=d.get("submission_generation", 0) or 0,
         submission_sha=d.get("submission_sha") or "",
+        submission_model=d.get("submission_model") or "",
         review_verdict=d.get("review_verdict"),
         review_verdict_generation=d.get("review_verdict_generation"),
         review_approved_current=review_approved_for_current_submission(d),
@@ -1512,7 +1513,16 @@ async def submit_for_review(
                 "its current status",
             )
         generation = await repo.bump_submission_generation(db, task_id)
-        await repo.update_task(db, task_id, submission_sha=submission_sha)
+        # #758: the declared implementing model rides the submission the
+        # same way the branch does — a report, not an observation, kept
+        # auditable next to the pinned sha.
+        declared_model = (body.model or "").strip()[:100]
+        await repo.update_task(
+            db,
+            task_id,
+            submission_sha=submission_sha,
+            submission_model=declared_model,
+        )
         # #546: CI normally runs when the PR opens — before this submission
         # existed, when the generation was still 0 — so its evidence is stored
         # per commit and adopted here, the moment that commit becomes the one
@@ -1549,6 +1559,8 @@ async def submit_for_review(
             content += f" Branch tip NOT pinned: {sha_reason}."
         if risk_note:
             content += risk_note
+        if declared_model:
+            content += f" Модель исполнителя (декларация): {declared_model}."
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)

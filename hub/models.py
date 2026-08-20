@@ -446,6 +446,10 @@ class TaskSubmitReview(BaseModel):
     # that forgot to switch, never one that misreports. Optional so existing
     # callers keep working; omitting it skips the comparison.
     branch: str = Field("", max_length=200)
+    # Model diversity (#758): which model wrote this submission. A
+    # declaration like the branch above — auditable, not provable. Empty
+    # means "not declared", which the auto-verdict treats as NOT diverse.
+    model: str = Field("", max_length=100)
 
 
 class ReviewFinding(BaseModel):
@@ -1040,6 +1044,9 @@ class TaskView(BaseModel):
     # the tip could not be pinned (no branch, no workspace, network) — that
     # degrades to the pre-#572 behaviour, never to a refusal.
     submission_sha: str = ""
+    # Model diversity (#758): the submitter's declared model; '' = not
+    # declared, which the auto-verdict treats as NOT diverse.
+    submission_model: str = ""
     review_verdict: ReviewVerdict | None = None
     review_verdict_generation: int | None = None
     review_approved_current: bool = False

@@ -209,6 +209,26 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         if order.index(diff_class) > order.index(RiskClass(stored_raw)):
             return False
 
+    # --- Model diversity (#758): no monoculture reviews -------------------
+    from hub.services.model_family import same_family
+
+    implementer_model = (task.get("submission_model") or "").strip()
+    reviewer_model = (review.get("model") or "").strip()
+    diversity = same_family(implementer_model, reviewer_model)
+    if diversity is None:
+        # Either declaration missing: absence of data is not diversity —
+        # the human gate stands, silently (the raw_count=0 principle).
+        return False
+    if diversity:
+        await _escalate(
+            db,
+            task_id,
+            f"монокультура ревью: код ({implementer_model}) и ревью "
+            f"({reviewer_model}) — одно семейство моделей; коррелированные "
+            "слепые пятна проходят оба фильтра синхронно",
+        )
+        return False
+
     # --- All grounds clean: the policy issues the verdict -----------------
     from hub.services.lifecycle import record_review_verdict
 
@@ -228,7 +248,9 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
             f"(verdict=auto). Основания: machine-review #{review['id']} "
             f"(gen {generation}, raw {review.get('raw_count')}, confirmed 0), "
             f"CI {VALIDATION_PASS} на {pinned_sha[:12]}, вершина ветки на "
-            "месте, дифф в заявленных областях, класс не вырос."
+            "месте, дифф в заявленных областях, класс не вырос. "
+            f"Разнородность моделей: код {implementer_model}, ревью "
+            f"{reviewer_model}."
         ),
         author_kind="hub",
     )

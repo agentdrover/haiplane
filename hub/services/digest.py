@@ -134,6 +134,16 @@ async def generate_due_digests(
                 event["kind"] == "review_verdict_recorded"
                 and event["actor"] == "policy"
             ):
+                # Model diversity (#758): the digest shows WHO wrote and WHO
+                # reviewed — the pair the monoculture rule compares.
+                task_row = await repo.get_task(db, event["task_id"])
+                mr = await repo.get_latest_machine_review(db, event["task_id"])
+                entry["models"] = {
+                    "implementer": (
+                        dict(task_row).get("submission_model", "") if task_row else ""
+                    ),
+                    "reviewer": (dict(mr).get("model", "") if mr else ""),
+                }
                 verdicts.append(entry)
             elif event["kind"] == "verdict_escalated":
                 escalations.append(entry)
