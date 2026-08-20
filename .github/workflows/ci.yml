@@ -51,19 +51,21 @@ jobs:
       # outcome, so a reporting hiccup must never turn into a merge block for
       # every task. Without the secrets the script reports nothing and says so —
       # the hub reads silence as unknown, never as success.
+      # #761: the same composite action satellite repositories use, so there is
+      # one reporter with one behaviour instead of this step and a copy of it
+      # that drifts. The commit passed below must be the BRANCH HEAD: on
+      # pull_request events GITHUB_SHA is a throwaway merge of head into base,
+      # which exists in no branch and can never equal the tip the hub pinned at
+      # submission (#572).
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
-        env:
-          OPENCLAW_HUB_URL: ${{ secrets.OPENCLAW_HUB_URL }}
-          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
-          # The commit the report is evidence about must be the BRANCH HEAD. On
-          # pull_request events GITHUB_SHA is a throwaway merge of head into
-          # base, which exists in no branch and can never equal the tip the hub
-          # pinned at submission (#572) — so pass the head explicitly and let
-          # GITHUB_SHA cover push runs, where it is the tip.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: uv run python scripts/ci_report_to_hub.py
+        uses: ./.github/actions/hub-ci-report
+        with:
+          hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
+          hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          ac-runner: uv run pytest
 
       # #611: the audit no longer decides whether anything ships. The delivery
       # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery

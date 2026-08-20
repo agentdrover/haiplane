@@ -174,3 +174,88 @@ def test_unrun_tests_are_reported_as_not_found(script, monkeypatch):
         "manual AC are not the runner's business"
     )
     assert sent[0]["head_sha"] == "sha-github-head"
+
+
+def test_ac_runner_is_configurable(script, monkeypatch):
+    """#761 AC-1: the runner is this repository's default, not a law.
+
+    The reporter was written for a repository that runs ``uv run pytest``. A
+    satellite with different tooling would have reported not_found for every
+    AC — evidence missing for a reason that has nothing to do with the work.
+    """
+    monkeypatch.delenv("OPENCLAW_HUB_CI_PYTEST", raising=False)
+    assert script.ac_runner()[:3] == ["uv", "run", "pytest"], (
+        "without configuration the hub's own runner must stay"
+    )
+
+    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "python3 -m pytest")
+    assert script.ac_runner() == ["python3", "-m", "pytest"]
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        raise OSError("not actually running anything")
+
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    assert script.run_nodeids(["t.py::a"]) == {}
+    assert captured["cmd"][:3] == ["python3", "-m", "pytest"], (
+        "the configured runner must be the one invoked"
+    )
+    assert "t.py::a" in captured["cmd"]
+
+
+def test_missing_runner_reports_not_found(script, monkeypatch, capsys):
+    """#761 AC-2: an absent runner is missing evidence, never a failure."""
+    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "definitely-not-installed-xyz")
+    assert script.ac_runner() == []
+    assert script.run_nodeids(["t.py::a"]) == {}
+    assert "not on PATH" in capsys.readouterr().out
+
+    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "   ")
+    assert script.ac_runner() == [], "an empty runner is not a reason to guess"
+
+    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", 'pytest "unclosed')
+    assert script.ac_runner() == [], "an unparsable runner must not reach a shell"
+
+
+def test_action_manifest_uses_no_github_context():
+    """#761: the manifest must not name the github context — anywhere.
+
+    The runner evaluates every expression in an action manifest, descriptions
+    included, and the github context does not exist there: a single example
+    written literally fails the WHOLE action at load time. That failure is
+    invisible in the check list, because the calling step is
+    continue-on-error by design (a reporting hiccup must not block merges),
+    so it shows up only as evidence quietly never arriving. Caught exactly
+    that way on the first run of this task.
+    """
+    manifest = (
+        Path(__file__).resolve().parent.parent
+        / ".github"
+        / "actions"
+        / "hub-ci-report"
+        / "action.yml"
+    ).read_text()
+    offenders = [
+        line.strip()
+        for line in manifest.splitlines()
+        if "${{" in line and "inputs." not in line
+    ]
+    assert not offenders, (
+        f"only inputs.* may be interpolated in the manifest; found: {offenders}"
+    )
+
+
+def test_ci_workflow_reports_through_the_action():
+    """#761 AC-5 (static half): one reporter, and it is given the branch head."""
+    workflow = (
+        Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    ).read_text()
+    assert "uses: ./.github/actions/hub-ci-report" in workflow
+    assert "head-sha: ${{ github.event.pull_request.head.sha || github.sha }}" in (
+        workflow
+    ), "the workflow — where the github context DOES exist — passes the head"
+    assert "run: uv run python scripts/ci_report_to_hub.py" not in workflow, (
+        "the old inline path would be a second reporter to keep in step"
+    )

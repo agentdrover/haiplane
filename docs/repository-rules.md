@@ -235,6 +235,10 @@ uv run pytest -q
   `rsync` в staging → `deploy/remote-deploy.sh` (промоут в `/opt/openclaw-hub/src`,
   `pip install -e`, restart systemd, проверка `/healthz`).
 - Логика деплоя версионируется в `deploy/remote-deploy.sh`; её правят там, а не в YAML.
+- Шаг отчётности в хаб вынесен в composite action `.github/actions/hub-ci-report`
+  (#761): им же подключаются сателлитные репозитории, чтобы репортёр был один, а
+  не этот шаг плюс расходящаяся с ним копия. Подключение сателлита —
+  `docs/satellite-ci-report.md`.
 - Доступы деплоя — это GitHub Actions secrets `DEPLOY_HOST`, `DEPLOY_USER`,
   `DEPLOY_SSH_KEY` (см. `deploy/CD.md`). Секреты не хранятся в git.
 - Практический вывод для агентов: merge в `main` — это релиз в прод. Сначала
