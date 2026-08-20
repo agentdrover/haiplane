@@ -1912,6 +1912,44 @@ async def hub_submit_machine_review(
 
 
 @mcp.tool()
+async def hub_outcome_debt() -> CallToolResult:
+    """Completed tasks whose stated outcome was never answered (#766).
+
+    DoR refuses a task without an outcome_metric, and until now nothing ever
+    read one back: a task counted as successful when its gates passed, not when
+    the number moved. This is the read that makes that debt visible.
+
+    outcome_deadline is shown verbatim and never used for filtering - it is free
+    text holding event descriptions rather than dates, so nothing is hidden
+    behind a value that cannot be parsed.
+    """
+    try:
+        data = await _api_get("/api/metrics/outcome-debt")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    items = data.get("items", [])
+    if not items:
+        return structured_echo_result(
+            "No outcome debt: every completed task with a stated metric has an answer.",
+            outcome_debt=data,
+        )
+    lines = [
+        f"{data.get('total', 0)} completed tasks stated an outcome nobody answered:",
+        "",
+    ]
+    for item in items:
+        waited = item.get("days_unanswered")
+        waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
+        lines.append(f"#{item['task_id']} {item['title']} — {waited_text}")
+        lines.append(f"    metric: {item.get('outcome_metric') or '—'}")
+        if item.get("outcome_deadline"):
+            lines.append(f"    said by: {item['outcome_deadline']}")
+        if item.get("outcome_revisit_condition"):
+            lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
+    return structured_echo_result("\n".join(lines), outcome_debt=data)
+
+
+@mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
     comparison, recurring finding categories, task cycle times.
