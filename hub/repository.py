@@ -1531,6 +1531,60 @@ async def clear_job_missing(
     )
 
 
+# ---------------------------------------------------------------------------
+# Autopilot digests (#739)
+# ---------------------------------------------------------------------------
+
+
+async def create_digest(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int,
+    digest_date: str,
+    payload: str,
+) -> int | None:
+    """Insert a digest row; None when one already exists for that day."""
+    try:
+        cur = await db.execute(
+            "INSERT INTO autopilot_digests (project_id, digest_date, payload) "
+            "VALUES (?, ?, ?)",
+            (project_id, digest_date, payload),
+        )
+    except aiosqlite.IntegrityError:
+        return None
+    return cur.lastrowid
+
+
+async def get_digest(db: aiosqlite.Connection, digest_id: int) -> aiosqlite.Row | None:
+    rows = await db.execute_fetchall(
+        "SELECT d.*, p.slug AS project_slug FROM autopilot_digests d "
+        "JOIN projects p ON p.id = d.project_id WHERE d.id=?",
+        (digest_id,),
+    )
+    return rows[0] if rows else None
+
+
+async def list_digests(
+    db: aiosqlite.Connection, *, limit: int = 30
+) -> list[aiosqlite.Row]:
+    return list(
+        await db.execute_fetchall(
+            "SELECT d.*, p.slug AS project_slug FROM autopilot_digests d "
+            "JOIN projects p ON p.id = d.project_id "
+            "ORDER BY d.digest_date DESC, d.id DESC LIMIT ?",
+            (limit,),
+        )
+    )
+
+
+async def update_digest_payload(
+    db: aiosqlite.Connection, digest_id: int, payload: str
+) -> None:
+    await db.execute(
+        "UPDATE autopilot_digests SET payload=? WHERE id=?", (payload, digest_id)
+    )
+
+
 async def list_expired_claims(
     db: aiosqlite.Connection,
     threshold_minutes: int,

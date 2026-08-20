@@ -790,6 +790,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_projects_gate_policy",
         "ALTER TABLE projects ADD COLUMN gate_policy TEXT NOT NULL DEFAULT '{}'",
     ),
+    (
+        # Autopilot daily digests (#739): one row per project per UTC day
+        # that saw autopilot activity. The UNIQUE key is what makes the
+        # poller's generation idempotent — the same rule the merge ledger
+        # follows (#605). payload carries the day's facts as JSON: approvals
+        # with their grounds, escalations, deliveries, and the audit sample.
+        "create_autopilot_digests",
+        """CREATE TABLE IF NOT EXISTS autopilot_digests (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            digest_date TEXT    NOT NULL,
+            payload     TEXT    NOT NULL DEFAULT '{}',
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (project_id, digest_date)
+        )""",
+    ),
 ]
 
 

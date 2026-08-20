@@ -55,6 +55,7 @@ from hub.models import (
     TaskAnswer,
     TaskReviewVerdict,
     TaskSubmitReview,
+    DigestAuditResult,
     TaskApprove,
     TaskArchive,
     TaskClaim,
@@ -452,6 +453,49 @@ async def api_patch_project(
         await db.commit()
     row = await repo.get_project(db, project_id)
     return ProjectView(**dict(row))
+
+
+@app.get("/api/digests")
+async def api_list_digests(
+    request: Request, limit: int = Query(default=30, ge=1, le=100)
+):
+    """Autopilot digests, newest first (#739)."""
+    import json as _json
+
+    rows = await repo.list_digests(_db(request), limit=limit)
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = _json.loads(d.get("payload") or "{}")
+        except ValueError:
+            d["payload"] = {}
+        out.append(d)
+    return out
+
+
+@app.post("/api/digests/{digest_id}/audit")
+async def api_digest_audit(
+    digest_id: int,
+    body: DigestAuditResult,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Record a spot-check outcome for a sampled task (#739).
+
+    Human-only by dependency: the audit is the owner's counterpart to the
+    autopilot's approvals — an agent auditing the autopilot would close
+    the loop with itself.
+    """
+    from hub.services.digest import record_audit_result
+
+    try:
+        payload = await record_audit_result(
+            _db(request), digest_id, body.task_id, body.result, body.comment
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"digest_id": digest_id, "audit_results": payload.get("audit_results", {})}
 
 
 @app.get("/api/events")
