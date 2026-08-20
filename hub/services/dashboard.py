@@ -379,6 +379,12 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
     for project in await repo.list_projects(db, include_archived=True):
         p = dict(project)
+        # The card gets the raw row, where gate_policy is a JSON string —
+        # the template needs the dict (#743).
+        try:
+            p["gate_policy"] = json.loads(p.get("gate_policy") or "{}")
+        except ValueError:
+            p["gate_policy"] = {}
         counts = summary.get(
             int(p["id"]),
             {

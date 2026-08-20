@@ -415,6 +415,27 @@ async def api_patch_project(
         import json as _json
 
         fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
+    if "gate_policy" in fields and fields["gate_policy"] is not None:
+        import json as _json
+
+        # #743: the hub never weakens oversight over itself — the default
+        # project (the hub's own repo) refuses any 'auto' at any gate, from
+        # any token. The rule lives here rather than in the model because it
+        # needs to know WHICH project is being patched.
+        if before["slug"] == "default" and any(
+            v == "auto" for v in fields["gate_policy"].values()
+        ):
+            raise HTTPException(
+                422,
+                {
+                    "error": "default_project_gate_locked",
+                    "hint": (
+                        "проект default (сам хаб) не принимает автопилот ни на "
+                        "одном гейте; политика default всегда human"
+                    ),
+                },
+            )
+        fields["gate_policy"] = _json.dumps(fields["gate_policy"])
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
     if fields:

@@ -118,6 +118,12 @@
                 <dt>slug</dt><dd>{{ c.project.slug }}</dd>
                 <dt>repo</dt><dd>{{ c.project.repo or '—' }}</dd>
                 <dt>ветка</dt><dd>{{ c.project.default_branch }}</dd>
+                {% if c.project.gate_policy.get('dor') == 'auto' or c.project.gate_policy.get('verdict') == 'auto' %}
+                <dt>автопилот</dt><dd>
+                    {% if c.project.gate_policy.get('dor') == 'auto' %}<span class="badge badge-running" title="DoR-апрув драфтов выполняет политика (#744)">dor: auto</span>{% endif %}
+                    {% if c.project.gate_policy.get('verdict') == 'auto' %}<span class="badge badge-running" title="Вердикт по чистым сдачам выносит политика (#745)">verdict: auto</span>{% endif %}
+                </dd>
+                {% endif %}
                 <dt>workspace</dt><dd>{{ c.project.workspace_path or '—' }}</dd>
             </dl>
             <div class="project-admin-actions">
