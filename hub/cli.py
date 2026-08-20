@@ -316,6 +316,13 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_outcome_debt(args: argparse.Namespace) -> int:
+    """Completed tasks whose stated outcome was never answered (#766)."""
+    result = _api("GET", "/api/metrics/outcome-debt")
+    _print_json(result)
+    return 0
+
+
 def cmd_projects_create(args: argparse.Namespace) -> int:
     body = {
         "slug": args.slug,
@@ -1268,6 +1275,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
+
+    p_outcomes = sub.add_parser(
+        "outcome-debt",
+        help="Completed tasks whose stated outcome was never answered (#766)",
+    )
+    p_outcomes.set_defaults(func=cmd_outcome_debt)
 
     p_projects = sub.add_parser("projects", help="Manage projects (#338)")
     projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)

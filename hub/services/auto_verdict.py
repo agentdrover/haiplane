@@ -15,7 +15,12 @@ human gate:
 - zero confirmed findings, nothing unresolved, harness run complete;
 - ``raw_count >= 1`` — a report that surfaced NO candidates at all is
   "no data", not "no findings" (harness v7 shipped 60 such reviews);
-  the same principle that keeps risk_class NULL from reading as R0;
+  the same principle that keeps risk_class NULL from reading as R0.
+  Exception (#769): a raw_count=0 report still counts when the emptiness
+  is PROVEN by the provider — the hub itself dispatched the reviewer
+  (#757), the dispatch settled as done, and the provider's billed usage
+  both clears a floor and agrees with the report's own tokens_spent.
+  The first live grok run (claimed 36k, billed 1.47M) fails this check;
 - green CI recorded for the PINNED submission_sha (#546/#572);
 - the branch tip still stands where it was submitted;
 - the actual diff stays inside declared areas and does not raise the
@@ -58,6 +63,38 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
         payload={"reason": reason},
     )
     await db.commit()
+
+
+async def _proven_empty_usage(
+    db: aiosqlite.Connection, task_id: int, generation: int, review: dict
+) -> int | None:
+    """The billed usage proving an empty review worked, or None (#769).
+
+    Proof requires ALL of: the hub's own settled dispatch for this
+    generation (#757), a billed total at or above the configured floor,
+    and the report's tokens_spent agreeing with that total within the
+    same tolerance the sweep uses. Any missing piece is absence of data —
+    the #750 rule stands and the caller refuses silently.
+    """
+    floor = config.EMPTY_REVIEW_MIN_USAGE
+    if floor <= 0:
+        return None
+    dispatch = await repo.get_settled_review_dispatch(db, task_id, generation)
+    if dispatch is None:
+        return None
+    from hub.integrations import cursor_cloud
+    from hub.services.review_dispatch import _USAGE_MISMATCH_SHARE
+
+    usage = await cursor_cloud.get_usage(
+        dispatch["agent_id"], dispatch["run_id"] or None
+    )
+    total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+    if not isinstance(total, int) or total < floor:
+        return None
+    reported = review.get("tokens_spent")
+    if reported is None or abs(total - reported) / total > _USAGE_MISMATCH_SHARE:
+        return None
+    return total
 
 
 def _finding_dicts(raw: str | None) -> list[dict]:
@@ -161,9 +198,14 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # --- Clean grounds: silent refusals, the human gate stands -----------
     if confirmed or unresolved or bool(review.get("incomplete")):
         return False
-    if (review.get("raw_count") or 0) < 1:
-        # "No candidates at all" is no data, not no findings (harness v7).
-        return False
+    raw_count = review.get("raw_count") or 0
+    proven_usage: int | None = None
+    if raw_count < 1:
+        # "No candidates at all" is no data, not no findings (harness v7) —
+        # unless the provider's billing proves the reviewer worked (#769).
+        proven_usage = await _proven_empty_usage(db, task_id, generation, review)
+        if proven_usage is None:
+            return False
 
     pinned_sha = (task.get("submission_sha") or "").strip()
     if not pinned_sha:
@@ -254,6 +296,11 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
             "месте, дифф в заявленных областях, класс не вырос. "
             f"Разнородность моделей: код {implementer_model}, ревью "
             f"{reviewer_model}."
+            + (
+                f" Пустота доказана: usage={proven_usage} (#769)."
+                if proven_usage is not None
+                else ""
+            )
         ),
         author_kind="hub",
     )

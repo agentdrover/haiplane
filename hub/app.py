@@ -661,6 +661,16 @@ async def api_practice_metrics(
     return await services.practice_metrics(_db(request), since_days=since_days)
 
 
+@app.get("/api/metrics/outcome-debt")
+async def api_outcome_debt(request: Request):
+    """Completed tasks whose stated outcome was never answered (#766).
+
+    DoR refuses a task without an outcome_metric and nothing has read one back
+    since. Read-only: recording answers is a separate slice.
+    """
+    return await services.outcome_debt(_db(request))
+
+
 @app.post("/api/telemetry/deprecated-tool")
 async def api_deprecated_tool_call(request: Request, body: dict[str, Any]):
     """Stage-1 deprecation telemetry (#325, ADR-0002): count alias calls."""

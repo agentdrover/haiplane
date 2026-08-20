@@ -1102,6 +1102,29 @@ async def list_stale_tasks(
     )
 
 
+async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Completed tasks that stated an outcome nobody has come back to.
+
+    DoR refuses a task without ``outcome_metric``, and nothing has ever read it
+    since. This is the read that makes the debt visible.
+
+    Deliberately not filtered by ``outcome_deadline``: that column is free text
+    (models.py, max_length 64) and real values are event descriptions - "within
+    the first 30 captures", "on the next reviewed submission" - not dates.
+    Filtering on it would hide tasks behind a value that cannot be parsed.
+
+    Oldest first: the ones that have waited longest are the ones whose answer is
+    most likely already knowable.
+    """
+    return await db.execute_fetchall(
+        "SELECT id, title, task_type, outcome_metric, outcome_indicator, "
+        "outcome_deadline, outcome_revisit_condition, completed_at, updated_at "
+        "FROM tasks "
+        "WHERE archived=0 AND status='completed' AND TRIM(outcome_metric) != '' "
+        "ORDER BY COALESCE(completed_at, updated_at) ASC"
+    )
+
+
 async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Epics where work is actually happening (#569).
 
@@ -1562,6 +1585,25 @@ async def list_active_review_dispatches(
             "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
         )
     )
+
+
+async def get_settled_review_dispatch(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The latest DONE dispatch of this submission generation (#769).
+
+    Only 'done' counts: the sweep sets it after the report of the same
+    generation arrived — a failed or still-active dispatch proves nothing
+    about the emptiness of a review.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT * FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? AND status='done' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, generation),
+    )
+    rows = list(rows)
+    return rows[0] if rows else None
 
 
 async def set_review_dispatch_status(

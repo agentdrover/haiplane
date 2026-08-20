@@ -91,6 +91,14 @@ AUTO_APPROVE_MAX_CLASS = os.environ.get("OPENCLAW_AUTO_APPROVE_MAX_CLASS", "off"
 # a round that did not converge normally is itself a risk signal. Matches
 # the multi-agent-review skill's per-round bar. 0 disables the trigger.
 REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000"))
+# Proven-empty review (#769): raw_count=0 may still auto-approve when the
+# provider's own usage numbers prove the reviewer actually worked. This is
+# the minimum billed tokens for a hub-dispatched run to count as proof;
+# below it (or without a settled dispatch at all) the #750 rule stands and
+# the verdict stays with the human. 0 disables the proven-empty path.
+EMPTY_REVIEW_MIN_USAGE = int(
+    os.environ.get("OPENCLAW_EMPTY_REVIEW_MIN_USAGE", "200000")
+)
 # Cursor Cloud Agents API (#756): the server-side executor for cross-model
 # reviews. Empty key = the integration is off and every client method
 # degrades to None without a network call. The key comes from the Cursor

@@ -9,6 +9,7 @@ from hub.services.dashboard import (
     list_activity,
     list_tasks,
 )
+from hub.services.outcomes import outcome_debt
 from hub.services.dor import (
     DOR_CHECK_KEYS,
     DOR_REQUIRED_BY_WORK_TYPE,
@@ -175,6 +176,7 @@ __all__ = [
     "parse_review_findings",
     "prepare_pair_branch",
     "restore_pair_workspace_base",
+    "outcome_debt",
     "practice_metrics",
     "project_git_context",
     "provision_project",
