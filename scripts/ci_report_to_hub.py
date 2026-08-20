@@ -16,7 +16,10 @@ Two rules this script exists to obey:
   ``fail`` would block a verdict for something unrelated to the work.
 
 Env: OPENCLAW_HUB_URL, OPENCLAW_HUB_CI_TOKEN (both absent ⇒ report nothing and
-say so), GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA.
+say so), GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
+OPENCLAW_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
+pytest`` — this repository's own way, and exactly what a satellite repository
+with different tooling has to be able to change).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - runs the task's own declared commands, in CI
 import sys
@@ -39,6 +43,10 @@ TASK_BRANCH = re.compile(r"^task-(\d+)/")
 COMMAND_TOKEN = re.compile(r"^[A-Za-z0-9._/-]+$")
 _RUN_TIMEOUT = 900
 _LOG_TAIL = 4000
+# The default is this repository's own runner. A satellite repository sets
+# OPENCLAW_HUB_CI_PYTEST to whatever runs ITS tests; an unparsable or missing
+# runner reports not_found with a reason, never a failure about the work.
+_DEFAULT_AC_RUNNER = "uv run pytest"
 
 
 def log(msg: str) -> None:
@@ -107,14 +115,38 @@ def is_command(entry: str) -> bool:
     return shutil.which(first) is not None
 
 
+def ac_runner() -> list[str]:
+    """The argv prefix that runs the AC tests, from env or this repo's default.
+
+    Returns [] when the runner is unusable — unparsable, empty, or absent from
+    the PATH. The caller turns that into ``not_found`` with a reason: a report
+    that guessed "failed" because the runner was missing would accuse the work
+    of something the tooling did.
+    """
+    raw = (os.environ.get("OPENCLAW_HUB_CI_PYTEST") or _DEFAULT_AC_RUNNER).strip()
+    try:
+        argv = shlex.split(raw)
+    except ValueError as exc:
+        log(f"AC runner {raw!r} does not parse ({exc}) — every AC stays not_found")
+        return []
+    if not argv:
+        log("AC runner is empty — every AC stays not_found")
+        return []
+    if shutil.which(argv[0]) is None:
+        log(f"AC runner {argv[0]!r} is not on PATH — every AC stays not_found")
+        return []
+    return argv
+
+
 def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
-    """Run pytest for ``nodeids`` and return {nodeid: passed} for what ran."""
+    """Run the AC tests for ``nodeids`` and return {nodeid: passed} for what ran."""
     if not nodeids:
         return {}
+    runner = ac_runner()
+    if not runner:
+        return {}
     cmd = [
-        "uv",
-        "run",
-        "pytest",
+        *runner,
         *nodeids,
         "-v",
         "--no-header",

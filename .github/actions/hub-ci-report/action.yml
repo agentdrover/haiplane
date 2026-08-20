@@ -1,0 +1,60 @@
+name: Report AC tests and validation to OpenClaw Hub
+description: >-
+  Run a task's bound AC tests and validation commands and report the result to
+  the hub as evidence about ONE commit. Never fails the job, never reports a
+  guess: silence is read by the hub as "unknown", never as success.
+
+inputs:
+  hub-url:
+    description: Base URL of the hub (e.g. https://agenthai.ru). Absent ⇒ report nothing and say so.
+    required: false
+    default: ""
+  hub-token:
+    description: >-
+      Token of a ci_runner principal. It holds one permission (tasks.ci_report)
+      and can neither move a task nor write a verdict — keep it that way.
+    required: false
+    default: ""
+  head-sha:
+    description: >-
+      The commit this run is evidence ABOUT — the BRANCH HEAD. On pull_request
+      events GITHUB_SHA is a throwaway merge commit that exists in no branch and
+      can never match the tip the hub pinned at submission, so the caller passes
+      the head explicitly; see docs/satellite-ci-report.md for the exact
+      expression. (It is spelled out there rather than here: the runner
+      evaluates every expression in this manifest, including inside
+      descriptions, and the github context does not exist at that point — an
+      example written literally here fails the whole action at load time.)
+    required: false
+    default: ""
+  ac-runner:
+    description: >-
+      How to run this repository's tests, e.g. "uv run pytest", "poetry run
+      pytest", "pytest". Default is the hub repository's own runner.
+    required: false
+    default: "uv run pytest"
+
+runs:
+  using: composite
+  steps:
+    - name: Report to hub
+      shell: bash
+      env:
+        OPENCLAW_HUB_URL: ${{ inputs.hub-url }}
+        OPENCLAW_HUB_CI_TOKEN: ${{ inputs.hub-token }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        OPENCLAW_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
+      run: |
+        set -u
+        # A repo-hosted action ships with its whole repository, so the reporter
+        # sits three levels up from this action directory. The fallback covers
+        # the hub's own workflow, which uses the action by local path.
+        script="${GITHUB_ACTION_PATH}/../../../scripts/ci_report_to_hub.py"
+        if [ ! -f "$script" ]; then
+          script="scripts/ci_report_to_hub.py"
+        fi
+        if [ ! -f "$script" ]; then
+          echo "[hub-report] reporter not found — reporting nothing; the hub reads this as unknown"
+          exit 0
+        fi
+        python3 "$script"
