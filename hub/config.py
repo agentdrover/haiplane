@@ -97,6 +97,15 @@ REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000
 # Dashboard → API Keys and lives in a chmod-600 systemd drop-in on the VM.
 CURSOR_API_KEY = os.environ.get("CURSOR_API_KEY", "")
 CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
+# Cross-model review dispatch (#757). CURSOR_REVIEW_MODEL overrides the
+# reviewer-model choice; empty = pick from the built-in preference list, the
+# first whose family differs from the implementer's declared model (#758).
+# The hub MCP token the cloud reviewer authenticates with comes from its own
+# drop-in — a dedicated agent principal (cursor-cloud-reviewer), revocable
+# without touching the implementers' tokens.
+CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
+CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
+CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")

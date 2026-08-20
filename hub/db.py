@@ -814,6 +814,23 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_submission_model",
         "ALTER TABLE tasks ADD COLUMN submission_model TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # Hub-dispatched cross-model reviews (#757): one row per dispatched
+        # cloud reviewer run. status: active → done | failed. The poller
+        # walks 'active' rows; a run that finished without a report for the
+        # dispatched generation fails LOUDLY, never silently.
+        "create_review_dispatches",
+        """CREATE TABLE IF NOT EXISTS review_dispatches (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id               INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            submission_generation INTEGER NOT NULL,
+            agent_id              TEXT    NOT NULL,
+            run_id                TEXT    NOT NULL DEFAULT '',
+            model                 TEXT    NOT NULL DEFAULT '',
+            status                TEXT    NOT NULL DEFAULT 'active',
+            created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
 ]
 
 
