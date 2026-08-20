@@ -28,6 +28,7 @@ from hub.hub_instance import mutation_activity_detail
 from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
 from hub.services.risk_class import derive_risk_class
+from hub.models import RiskClass
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.task_idempotency import (
@@ -1209,8 +1210,33 @@ async def pair_start_task(
     return tv
 
 
-async def _surface_check(
+async def _resolve_branch_diff(
     db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[list[str] | None, str]:
+    """The branch diff as the hub itself observes it, resolved ONCE (#583).
+
+    Feeds both the surface check (#550) and the risk-class recompute: two
+    consumers, one network walk. Returns ``(paths, reason)`` where ``None``
+    means "could not look" and the reason says why — the same degradation
+    contract as ``resolve_branch_tip``.
+    """
+    from hub.services.orchestration import project_git_context
+
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return None, "у задачи нет ветки"
+
+    ctx = await project_git_context(db, task["id"])
+    paths = await plugins.git_ops.branch_diff_paths(
+        branch, base_branch=ctx.get("base_branch"), repo=ctx.get("repo")
+    )
+    if paths is None:
+        return None, f"не удалось прочитать дифф ветки {branch!r}"
+    return paths, ""
+
+
+def _surface_check(
+    task: dict[str, Any], diff_paths: list[str] | None, diff_reason: str
 ) -> tuple[str, list[str], str]:
     """Compare the branch diff with the task's declared areas (#550).
 
@@ -1223,30 +1249,78 @@ async def _surface_check(
     The comparison is with the diff, not with a prediction. On submit the hub
     has the truth, so there is no name-matching heuristic here and no false
     positive by construction — which is exactly why this check lives at
-    submission and not at DoR.
+    submission and not at DoR. The diff itself arrives precomputed (#583):
+    the risk-class recompute reads the same one.
     """
-    from hub.services.orchestration import project_git_context
-
     areas = deserialize_str_list(task.get("affected_areas"))
     if not areas:
         return "unknown", [], "у задачи не объявлены affected_areas — сверять не с чем"
 
-    branch = (task.get("branch") or "").strip()
-    if not branch:
-        return "unknown", [], "у задачи нет ветки"
+    if diff_paths is None:
+        return "unknown", [], diff_reason
 
-    ctx = await project_git_context(db, task["id"])
-    paths = await plugins.git_ops.branch_diff_paths(
-        branch, base_branch=ctx.get("base_branch"), repo=ctx.get("repo")
-    )
-    if paths is None:
-        return "unknown", [], f"не удалось прочитать дифф ветки {branch!r}"
-
-    candidates = [p for p in paths if p not in commit_scope.ROUTINE_PATHS]
+    candidates = [p for p in diff_paths if p not in commit_scope.ROUTINE_PATHS]
     undeclared = commit_scope.foreign_paths(candidates, areas)
     if undeclared:
         return "undeclared", undeclared, ""
     return "ok", [], ""
+
+
+def _risk_recompute_on_submit(
+    task: dict[str, Any], diff_paths: list[str] | None, diff_reason: str
+) -> tuple[dict[str, Any], str, str]:
+    """Recompute the risk class from the ACTUAL diff at submission (#583).
+
+    The class is a property of the change, not the card: work that started
+    as a small edit can wander into a migration or into auth — #559 did.
+    Returns ``(fields_to_write, feed_alert, content_note)``:
+
+    - upward divergence writes the new class and raises a feed alert naming
+      both classes and the triggering features — the owner decides, the
+      submission itself still lands in review (a legal path stays open, the
+      #547 lesson);
+    - downward is never automatic: doing less than promised is not grounds
+      for dropping oversight;
+    - an unresolvable diff degrades to a visible "not recomputed" note,
+      never to a failed submission.
+    """
+    if diff_paths is None:
+        return {}, "", f" Класс риска по диффу НЕ пересчитан: {diff_reason}."
+
+    candidates = [p for p in diff_paths if p not in commit_scope.ROUTINE_PATHS]
+    new_class, reasons = derive_risk_class(candidates)
+    if new_class is None:
+        return {}, "", " Класс риска по диффу НЕ пересчитан: дифф пуст."
+
+    fields = {
+        "risk_class": new_class.value,
+        "risk_class_reasons": db_module.serialize_str_list(reasons),
+    }
+    try:
+        old = RiskClass(task.get("risk_class")) if task.get("risk_class") else None
+    except ValueError:
+        old = None
+    if old is None:
+        return (
+            fields,
+            "",
+            f" Класс риска посчитан по фактическому диффу: {new_class.value}.",
+        )
+
+    order = list(RiskClass)
+    if order.index(new_class) > order.index(old):
+        alert = (
+            f"Класс риска повышен по фактическому диффу: {old.value} → "
+            f"{new_class.value}. Признаки: {'; '.join(reasons)}. "
+            "Расхождение вверх — решение владельца на ревью, не автоматический "
+            "проход."
+        )
+        return (
+            fields,
+            alert,
+            f" Класс риска повышен по диффу: {old.value} → {new_class.value}.",
+        )
+    return {}, "", ""
 
 
 async def resolve_branch_tip(
@@ -1348,12 +1422,19 @@ async def submit_for_review(
             },
         )
 
+    # #583: one diff resolution feeds the surface check and the risk-class
+    # recompute. Resolved BEFORE the write lock — this walks to the network.
+    diff_paths, diff_reason = await _resolve_branch_diff(db, task)
+    risk_fields, risk_alert, risk_note = _risk_recompute_on_submit(
+        task, diff_paths, diff_reason
+    )
+
     # #550: before the transition, not after — a refusal has to happen while
     # there is still something to refuse.
     surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
     surface_note = ""
     if surfaces_mode != "off":
-        verdict, undeclared, detail = await _surface_check(db, task)
+        verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
         if verdict == "undeclared":
             listed = ", ".join(undeclared[:10])
             if surfaces_mode == "require":
@@ -1424,6 +1505,10 @@ async def submit_for_review(
         # previous headless cycle would make the poller treat this task as its
         # own, so clear it explicitly.
         await repo.update_task(db, task_id, review_job_id=None)
+        # #583: apply the diff-based class INSIDE the transition — a refused
+        # submission must leave the task exactly where it was, class included.
+        if risk_fields:
+            await repo.update_task(db, task_id, **risk_fields)
         agent = (body.agent or "").strip() or task.get("assigned_agent", "")
         summary = (body.summary or "").strip()
         content = f"Submitted for review (submission #{generation})."
@@ -1442,11 +1527,15 @@ async def submit_for_review(
             # Unchecked is a state the reviewer must see, not an absence of
             # news — the same rule the drift guard follows (#534, #572).
             content += f" Branch tip NOT pinned: {sha_reason}."
+        if risk_note:
+            content += risk_note
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)
         if surface_note:
             await repo.add_task_update(db, task_id, "hub", "alert", surface_note)
+        if risk_alert:
+            await repo.add_task_update(db, task_id, "hub", "alert", risk_alert)
         await db.commit()
         await log_activity(
             db,

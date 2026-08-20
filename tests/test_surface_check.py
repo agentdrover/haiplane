@@ -166,5 +166,8 @@ async def test_off_disables_the_check_entirely(
     view = await services.submit_for_review(db, task_id)
 
     assert view.status.value == "review"
-    assert not git.calls, "off must not even ask for the diff"
-    assert not await _alerts(db, task_id)
+    # Since #583 the diff has a second consumer — the risk-class recompute —
+    # so "off" no longer means "never fetch the diff". What it still means:
+    # the SURFACE check stays silent — no refusal, no undeclared-files alert,
+    # even though the diff (tests/test_api.py) sits outside the declared area.
+    assert not [a for a in await _alerts(db, task_id) if "Класс риска" not in a]

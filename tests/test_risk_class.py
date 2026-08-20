@@ -8,9 +8,15 @@ arrives with the reasons that produced it.
 
 from __future__ import annotations
 
+import aiosqlite
 from httpx import AsyncClient
 
-from hub.models import RiskClass
+from hub import config
+from hub import repository as repo
+from hub import services
+from hub.integrations.noop import NoopGitOps
+from hub.integrations.registry import plugins
+from hub.models import RiskClass, TaskCreate
 from hub.services.risk_class import derive_risk_class
 
 # ---------------------------------------------------------------------------
@@ -160,3 +166,115 @@ async def test_clearing_areas_returns_class_to_not_computed(client: AsyncClient)
     body = (await client.get(f"/api/tasks/{created['id']}")).json()
     assert body["risk_class"] is None, "no facts left — the class must not linger"
     assert body["risk_class_reasons"] == []
+
+
+# ---------------------------------------------------------------------------
+# #583: recompute from the ACTUAL diff at submission, escalate upward only
+# ---------------------------------------------------------------------------
+
+
+class _DiffGitOps(NoopGitOps):
+    """Stands in for the branch diff; None means "could not be determined"."""
+
+    def __init__(self, paths: list[str] | None) -> None:
+        self._paths = paths
+
+    async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+        return self._paths
+
+
+async def _running_task(db: aiosqlite.Connection, areas: list[str]) -> int:
+    tv = await services.create_task(
+        db, TaskCreate(title="risk recompute", affected_areas=areas)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: do the work")
+    await db.commit()
+    started = await services.pair_start_task(db, tv.id, caller="dev-agent")
+    assert started.status.value == "running"
+    return tv.id
+
+
+async def _updates(db: aiosqlite.Connection, task_id: int, kind: str) -> list[str]:
+    rows = await repo.get_task_updates(db, task_id)
+    return [u["content"] for u in rows if u["kind"] == kind]
+
+
+async def test_diff_with_migration_escalates_running_task(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#583): declared as web-only work (R2), the diff wandered into
+    # hub/db.py — the class climbs to R3 and the divergence is put in front
+    # of the owner rather than waved through.
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task(db, ["hub/web.py"])
+    assert dict(await repo.get_task(db, task_id))["risk_class"] == "R2"
+    plugins.git_ops = _DiffGitOps(["hub/web.py", "hub/db.py"])
+
+    view = await services.submit_for_review(db, task_id)
+
+    assert view.status.value == "review", (
+        "escalation must leave a legal path forward, not lock the task"
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["risk_class"] == "R3"
+    alerts = [a for a in await _updates(db, task_id, "alert") if "Класс риска" in a]
+    assert alerts, "an upward divergence must be visible, not silent"
+
+
+async def test_class_does_not_auto_downgrade(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2 (#583): the diff turned out narrower than the spec — doing less
+    # than promised is not grounds for dropping oversight.
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task(db, ["hub/db.py"])
+    assert dict(await repo.get_task(db, task_id))["risk_class"] == "R3"
+    plugins.git_ops = _DiffGitOps(["docs/notes.md"])
+
+    view = await services.submit_for_review(db, task_id)
+
+    assert view.status.value == "review"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["risk_class"] == "R3", "the class must never drop automatically"
+    assert not [
+        a for a in await _updates(db, task_id, "alert") if "Класс риска" in a
+    ], "keeping the class is not an escalation and must not raise alerts"
+
+
+async def test_escalation_records_both_classes_and_reason(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3 (#583): the feed shows the original class, the recomputed one and
+    # the feature that caused the raise — «R3, потому что миграция» can be
+    # argued with, a bare «R3» cannot.
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task(db, ["hub/web.py"])
+    plugins.git_ops = _DiffGitOps(["hub/db.py"])
+
+    await services.submit_for_review(db, task_id)
+
+    alerts = [a for a in await _updates(db, task_id, "alert") if "Класс риска" in a]
+    assert len(alerts) == 1
+    assert "R2" in alerts[0] and "R3" in alerts[0]
+    assert "hub/db.py" in alerts[0]
+
+
+async def test_unresolvable_diff_degrades_instead_of_failing(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-4 (#583): nothing to resolve the diff with — the submission still
+    # goes through, the class stays put, and the "not recomputed" state is
+    # written where the reviewer will read it.
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task(db, ["hub/web.py"])
+    plugins.git_ops = _DiffGitOps(None)
+
+    view = await services.submit_for_review(db, task_id)
+
+    assert view.status.value == "review", "the submit path must not fail"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["risk_class"] == "R2", "an unreadable diff must not touch the class"
+    statuses = await _updates(db, task_id, "status")
+    assert any("НЕ пересчитан" in s for s in statuses), (
+        "a skipped recompute must be visible, not an absence of news"
+    )
