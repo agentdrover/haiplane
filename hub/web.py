@@ -835,6 +835,15 @@ async def web_edit_project(project_id: int, request: Request):
         return _projects_error_redirect(err)
     if policy is not None:
         fields["default_branch_policy"] = policy
+    # Gate policy selects (#753). Present only for non-default projects in
+    # the template; the shared PATCH path below re-checks the default lock
+    # anyway — the presentation layer is not trusted.
+    if "gate_policy_dor" in form or "gate_policy_verdict" in form:
+        fields["gate_policy"] = {
+            "dor": str(form.get("gate_policy_dor") or "human").strip() or "human",
+            "verdict": str(form.get("gate_policy_verdict") or "human").strip()
+            or "human",
+        }
     if not fields:
         return RedirectResponse("/projects", status_code=303)
     try:
@@ -843,7 +852,23 @@ async def web_edit_project(project_id: int, request: Request):
         first = exc.errors()[0]
         loc = ".".join(str(p) for p in first.get("loc", ()))
         return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
-    await _web_patch_project(request, project_id, body)
+    try:
+        await _web_patch_project(request, project_id, body)
+    except HTTPException as exc:
+        # Only VALIDATION refusals (e.g. the default-project gate lock,
+        # #743) land in the form as an error. Everything else — the 403 an
+        # agent token earns first of all — stays a raw refusal: converting
+        # it to a redirect would soften the human-only contract this route
+        # is tested on.
+        if exc.status_code != 422:
+            raise
+        detail = exc.detail
+        message = (
+            detail.get("hint") or detail.get("error")
+            if isinstance(detail, dict)
+            else str(detail)
+        )
+        return _projects_error_redirect(message or "запрос отклонён")
     return RedirectResponse("/projects", status_code=303)
 
 
