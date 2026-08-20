@@ -443,6 +443,35 @@ async def _resolve_ref(name: str, repo: str) -> str | None:
     return None
 
 
+async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
+    """Resolve a branch to a sha, preferring ``origin/<name>`` (#762).
+
+    The mirror image of ``_resolve_ref``, and the difference is the point. For
+    a comparison the hub is going to judge, the pushed branch is the subject:
+    a local ref in the workspace is whatever some earlier checkout left there,
+    and on pair tasks — where the branch is written on a developer's machine —
+    it can trail origin by every commit under review. That is how a submission
+    of real work came back as "дифф пуст" (#759, #756): git answered honestly
+    about a ref that was not the branch anyone meant.
+
+    Falls back to the local ref when ``origin/<name>`` does not exist at all,
+    which covers a workspace with no remote — there is nothing fresher to
+    prefer, and refusing would turn a local-only repository into an error.
+    """
+    for ref in (f"origin/{name}", name):
+        rc, out, _ = await _git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0 and out:
+            return out.strip()
+    return None
+
+
 def _parse_pr_number(gh_output: str) -> int | None:
     m = re.search(r"/pull/(\d+)", gh_output)
     return int(m.group(1)) if m else None
@@ -1151,27 +1180,45 @@ class GitOpsIntegration:
         base = _resolve_base(base_branch)
         if not (branch or "").strip():
             return None
-        rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
+        # #762: refresh before comparing, then compare against origin. The tip
+        # resolver has always fetched (#572) and this one never did, so on a
+        # pair task the hub pinned the right commit and diffed a stale local
+        # ref — an empty diff that read as "the branch changes nothing" and
+        # silently disabled both the surface check (#550) and the risk-class
+        # recompute (#583). The fetch is best effort: a workspace that cannot
+        # reach origin still has refs, and refusing on a network blip would
+        # trade a silent wrong answer for a loud missing one.
+        rc, _, err = await _git("fetch", "origin", base, branch, repo=repo, check=False)
         if rc != 0:
+            log.warning(
+                "branch_diff_paths: could not fetch %s/%s in %s: %s — "
+                "comparing whatever refs are already here",
+                base,
+                branch,
+                repo,
+                (err or "").strip(),
+            )
+        base_sha = await _resolve_ref_remote_first(base, repo)
+        if base_sha is None:
             log.warning("branch_diff_paths: base %r not found in %s", base, repo)
             return None
-        rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
-        if rc != 0:
+        branch_sha = await _resolve_ref_remote_first(branch, repo)
+        if branch_sha is None:
             log.warning("branch_diff_paths: branch %r not found in %s", branch, repo)
             return None
         rc, out, err = await _git(
             "diff",
             "--name-only",
             "-z",
-            f"{base}...{branch}",
+            f"{base_sha}...{branch_sha}",
             repo=repo,
             check=False,
         )
         if rc != 0:
             log.warning(
                 "branch_diff_paths: diff failed for %s...%s: %s",
-                base,
-                branch,
+                base_sha,
+                branch_sha,
                 (err or "").strip(),
             )
             return None

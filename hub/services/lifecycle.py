@@ -1312,12 +1312,29 @@ def _risk_recompute_on_submit(
       never to a failed submission.
     """
     if diff_paths is None:
-        return {}, "", f" Класс риска по диффу НЕ пересчитан: {diff_reason}."
+        # #762: name the failure as a failure. "Not recomputed" plus a reason
+        # is a different statement from "recomputed, nothing there", and the
+        # feed is where an owner decides whether to go look.
+        return (
+            {},
+            "",
+            f" Класс риска по диффу НЕ пересчитан: прочитать дифф не удалось "
+            f"({diff_reason or 'причина не названа'}).",
+        )
 
     candidates = [p for p in diff_paths if p not in commit_scope.ROUTINE_PATHS]
     new_class, reasons = derive_risk_class(candidates, project_map)
     if new_class is None:
-        return {}, "", " Класс риска по диффу НЕ пересчитан: дифф пуст."
+        # An observation, not a degradation: the branch really does change
+        # nothing the class cares about. Until #762 this printed the same way
+        # as an unreadable diff, so a stale ref in the workspace was
+        # indistinguishable from a branch with no changes in it.
+        return (
+            {},
+            "",
+            " Класс риска по диффу не менялся: ветка не меняет файлов, "
+            "влияющих на класс.",
+        )
 
     fields = {
         "risk_class": new_class.value,
