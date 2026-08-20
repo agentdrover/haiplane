@@ -134,4 +134,5 @@ def build_health() -> HealthView:
         auth_disabled=config.HUB_AUTH_DISABLED,
         env_tokens_configured=bool(config.HUB_TOKENS),
         vast_enabled=config.VAST_ENABLED,
+        cursor_cloud_configured=bool(config.CURSOR_API_KEY),
     )

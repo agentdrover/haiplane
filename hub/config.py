@@ -91,6 +91,12 @@ AUTO_APPROVE_MAX_CLASS = os.environ.get("OPENCLAW_AUTO_APPROVE_MAX_CLASS", "off"
 # a round that did not converge normally is itself a risk signal. Matches
 # the multi-agent-review skill's per-round bar. 0 disables the trigger.
 REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000"))
+# Cursor Cloud Agents API (#756): the server-side executor for cross-model
+# reviews. Empty key = the integration is off and every client method
+# degrades to None without a network call. The key comes from the Cursor
+# Dashboard → API Keys and lives in a chmod-600 systemd drop-in on the VM.
+CURSOR_API_KEY = os.environ.get("CURSOR_API_KEY", "")
+CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
