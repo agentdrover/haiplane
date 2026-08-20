@@ -471,6 +471,14 @@ async def recalc_readiness_inline(
     (it must not re-acquire the write lock)."""
     report = await calculate_readiness_with_recommendations(db, task_id)
     await _persist_readiness_fields(db, task_id, report)
+    # Auto-approval of low-risk drafts (#584): this recalc is the only place
+    # dor_passed flips to true, so hooking here covers every path a draft
+    # can take to readiness. With the switch off (the default) this is a
+    # no-op and the human gate stands exactly as before.
+    if report.dor_passed:
+        from hub.services.auto_approve import maybe_auto_approve
+
+        await maybe_auto_approve(db, task_id)
     return report
 
 

@@ -78,6 +78,14 @@ COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
 # submit the hub has the truth, so there are no name-matching heuristics and
 # no false positives by construction.
 SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
+# Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
+# for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
+# whose DERIVED risk class (#582) is at or below the named class is approved
+# by the hub itself, with the reason written into the feed. This single
+# setting is the switch the task demands: flipping it back to 'off' restores
+# the human gate completely. 'r2' is deliberately NOT accepted here — that
+# band opens only with #585, after measured reviewer agreement.
+AUTO_APPROVE_MAX_CLASS = os.environ.get("OPENCLAW_AUTO_APPROVE_MAX_CLASS", "off")
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
