@@ -831,6 +831,34 @@ _MIGRATIONS: list[tuple[str, str]] = [
             created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
         )""",
     ),
+    (
+        # Agent session registry (#771, feature #770): the session becomes an
+        # address other sessions can write to. principal_id is a plain INTEGER
+        # (no FK) for the same identity-snapshot reason as
+        # implementer_principal_id — a session record must outlive the
+        # principal row. There is deliberately NO `online` column: presence is
+        # derived from last_seen_at at read time, because an agent dies without
+        # saying goodbye and a stored online=true would be a green light over a
+        # check that never ran (#725).
+        "create_agent_sessions",
+        """CREATE TABLE IF NOT EXISTS agent_sessions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT    NOT NULL UNIQUE,
+            principal_id    INTEGER,
+            agent           TEXT    NOT NULL DEFAULT '',
+            model           TEXT    NOT NULL DEFAULT '',
+            host            TEXT    NOT NULL DEFAULT '',
+            workspace       TEXT    NOT NULL DEFAULT '',
+            current_task_id INTEGER,
+            started_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            last_seen_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_agent_sessions_last_seen",
+        "CREATE INDEX IF NOT EXISTS idx_agent_sessions_last_seen "
+        "ON agent_sessions(last_seen_at)",
+    ),
 ]
 
 

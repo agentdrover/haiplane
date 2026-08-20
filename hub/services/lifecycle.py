@@ -24,6 +24,7 @@ from hub.actionable_errors import (
     withdraw_own_draft_error_detail,
 )
 from hub import repository as repo
+from hub.services.sessions import note_session_task
 from hub.hub_instance import mutation_activity_detail
 from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
@@ -2075,6 +2076,10 @@ async def claim_task(
     if implementer_principal_id is not None:
         claim_fields["implementer_principal_id"] = implementer_principal_id
     await repo.update_task(db, task_id, **claim_fields)
+    # The registry follows the claim inside the same transaction (#771 AC-3):
+    # two places may not disagree about which task a session holds. Silent when
+    # the session is unregistered — the registry is optional.
+    await note_session_task(db, body.session_id, task_id)
     await repo.add_task_update(
         db,
         task_id,
@@ -2138,6 +2143,12 @@ async def release_task(
         # The claim is the implementer's reservation: releasing it also
         # releases the recorded implementer identity (#320).
         implementer_principal_id=None,
+    )
+    # Same transaction, mirror image of the claim (#771 AC-3). The session id
+    # comes from the request when given and from the task otherwise: the holder
+    # is whoever the task says it is.
+    await note_session_task(
+        db, body.session_id or (task.get("claim_session_id") or ""), None
     )
     await repo.add_task_update(
         db,

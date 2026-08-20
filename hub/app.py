@@ -60,6 +60,8 @@ from hub.models import (
     DigestAuditResult,
     TaskApprove,
     TaskArchive,
+    SessionRegister,
+    SessionView,
     TaskClaim,
     TaskContextView,
     TaskCreate,
@@ -1718,6 +1720,50 @@ async def api_release_task(
     if not body.agent.strip():
         body = TaskRelease(agent=identity.username, session_id=body.session_id)
     return await services.release_task(_db(request), task_id, body)
+
+
+# --- Agent session registry (#771) ---
+#
+# Identity is taken from the token on every route below: a session cannot
+# register, refresh or rename itself under another agent's name. Presence is
+# computed at read time — see hub/services/sessions.py for why there is no
+# stored `online` flag.
+
+
+@app.post("/api/sessions/register", response_model=SessionView)
+async def api_session_register(
+    body: SessionRegister,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Register the calling session, or refresh what it declares."""
+    return await services.register_session(
+        _db(request),
+        body,
+        agent=identity.username,
+        principal_id=identity.principal_id,
+    )
+
+
+@app.post("/api/sessions/{session_id}/heartbeat", response_model=SessionView)
+async def api_session_heartbeat(
+    session_id: str,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Record a sign of life for a registered session."""
+    return await services.heartbeat_session(_db(request), session_id)
+
+
+@app.get("/api/sessions", response_model=list[SessionView])
+async def api_list_sessions(
+    request: Request,
+    agent: str = "",
+    status: str = "",
+    identity=Depends(current_identity),
+):
+    """Registered sessions with presence and the age behind it."""
+    return await services.list_sessions(_db(request), agent=agent, status=status)
 
 
 # --- Q&A: Question / Answer ---

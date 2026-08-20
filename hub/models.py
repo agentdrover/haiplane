@@ -774,6 +774,46 @@ class TaskRelease(BaseModel):
     session_id: str = Field("", max_length=200)
 
 
+class SessionRegister(BaseModel):
+    """What a session declares about itself (#771).
+
+    ``agent`` is absent on purpose: the registry takes it from the token, so
+    there is nothing here a session could use to register under another name.
+    ``model`` is a declaration like ``submission_model`` — auditable, not
+    provable; the hub has no trusted source for it and does not pretend to.
+    """
+
+    session_id: str = Field(..., min_length=1, max_length=200)
+    model: str = Field("", max_length=100)
+    host: str = Field("", max_length=200)
+    workspace: str = Field("", max_length=500)
+
+
+class SessionView(BaseModel):
+    """A registry row with presence computed at read time (#771).
+
+    ``online`` is derived from ``last_seen_age_seconds`` against
+    ``ttl_minutes`` and is always returned next to it: a liveness badge without
+    the age behind it is the kind of confident indicator #725 had to strip.
+    ``last_seen_age_seconds`` is None when the timestamp cannot be read — an
+    unknown age, which counts as offline rather than as fresh.
+    """
+
+    session_id: str
+    agent: str = ""
+    model: str = ""
+    host: str = ""
+    workspace: str = ""
+    principal_id: int | None = None
+    current_task_id: int | None = None
+    started_at: str = ""
+    last_seen_at: str = ""
+    last_seen_age_seconds: int | None = None
+    online: bool = False
+    status: str = "offline"
+    ttl_minutes: int = 0
+
+
 class TaskQuestion(BaseModel):
     agent: str = Field("", max_length=100)
     question: str = Field(..., min_length=1, max_length=10000)

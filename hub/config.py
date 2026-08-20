@@ -177,6 +177,14 @@ DEADLINE_RUNNING_MINUTES = int(
 )
 DEADLINE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180"))
 
+# Agent session registry (#771): presence is a derived fact, not a stored flag.
+# A session counts as online while its last heartbeat is younger than the TTL;
+# past it the registry says offline and names the age, because an agent that
+# died without saying goodbye must not keep looking alive. Retention mirrors the
+# events feed: the registry is a directory of who is around, not an archive.
+SESSION_TTL_MINUTES = int(os.environ.get("OPENCLAW_SESSION_TTL_MINUTES", "10"))
+SESSION_RETENTION_DAYS = int(os.environ.get("OPENCLAW_SESSION_RETENTION_DAYS", "14"))
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 

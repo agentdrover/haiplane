@@ -1000,6 +1000,20 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 await db.commit()
                 log.info("Poll: pruned %d events older than 14 days", pruned)
 
+            # Session registry retention (#771): same reasoning as the feed —
+            # the registry answers "who is around now", and a session with no
+            # sign of life for weeks answers nothing.
+            pruned_sessions = await repo.prune_agent_sessions(
+                db, keep_days=config.SESSION_RETENTION_DAYS
+            )
+            if pruned_sessions:
+                await db.commit()
+                log.info(
+                    "Poll: pruned %d agent sessions with no sign of life for %d days",
+                    pruned_sessions,
+                    config.SESSION_RETENTION_DAYS,
+                )
+
         except Exception:
             log.exception("Poll error")
 
