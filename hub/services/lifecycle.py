@@ -158,8 +158,26 @@ def compute_lifecycle_hint(task: dict[str, Any]) -> str | None:
     )
 
 
+def _children_allow_rollup(children: list[Any]) -> bool:
+    """All direct children terminal, none failed, at least one completed (#742).
+
+    ``rejected`` — "the work is not needed" — does not block: a discarded
+    draft must not keep a delivered feature open forever (observed on #579,
+    where one rejected smoke draft froze the rollup after all real work
+    shipped). ``failed`` — "needed but not done" — DOES block: a failure is
+    not grounds to close the parent quietly. Anything non-terminal blocks
+    as before.
+    """
+    if not children:
+        return False
+    statuses = [c["status"] for c in children]
+    if any(s not in {"completed", "rejected"} for s in statuses):
+        return False
+    return "completed" in statuses
+
+
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
-    """Auto-complete feature/epic when all direct children are completed."""
+    """Auto-complete feature/epic when every direct child is terminal (#742)."""
     row = await repo.get_task(db, child_id)
     if not row:
         return
@@ -177,9 +195,7 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
         return
 
     children = await db_module.get_children(db, parent_id)
-    if not children:
-        return
-    if not all(c["status"] == "completed" for c in children):
+    if not _children_allow_rollup(children):
         return
 
     if not await repo.transition_status_if(
@@ -215,7 +231,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         if not parent_row:
             continue
         children = await db_module.get_children(db, parent_id)
-        if children and all(c["status"] == "completed" for c in children):
+        if _children_allow_rollup(children):
             await repo.update_task(db, parent_id, status="completed")
             repaired += 1
     if repaired:
@@ -1014,6 +1030,10 @@ async def reject_task(
 
     await repo.update_task(db, task_id, status="rejected")
     await repo.insert_event(db, kind="task_rejected", task_id=task_id, actor="human")
+    # #742: a rejection can be the LAST terminal transition among the
+    # siblings — without this call the parent stays open forever and needs
+    # a manual force-complete (observed on #579).
+    await maybe_rollup_parent(db, task_id)
     await db.commit()
     await log_activity(
         db,

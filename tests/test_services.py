@@ -5026,3 +5026,163 @@ async def test_pair_start_survives_a_cyrillic_title(db: aiosqlite.Connection):
     import re as _re
 
     assert _re.fullmatch(r"[a-z0-9-]+", slug), f"branch-safe slug required: {slug!r}"
+
+
+# ---------------------------------------------------------------------------
+# Rollup with terminal children (#742)
+# ---------------------------------------------------------------------------
+
+
+async def _rollup_node(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    task_type: str,
+    parent_id: int | None,
+    status: str,
+    source: str = "human",
+) -> int:
+    return await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source=source,
+        assigned_agent="",
+        rationale="",
+        status=status,
+        auto_review=False,
+        task_type=task_type,
+        parent_id=parent_id,
+        priority="medium",
+    )
+
+
+async def test_rejected_child_no_longer_blocks_rollup(db: aiosqlite.Connection):
+    # AC-1 (#742): the #579 case — every real task shipped, one smoke draft
+    # left; rejecting it must close the feature and cascade to the epic.
+    epic_id = await _rollup_node(
+        db, title="Epic", task_type="epic", parent_id=None, status="open"
+    )
+    feature_id = await _rollup_node(
+        db, title="Feature", task_type="feature", parent_id=epic_id, status="open"
+    )
+    for n in range(3):
+        await _rollup_node(
+            db,
+            title=f"Done {n}",
+            task_type="task",
+            parent_id=feature_id,
+            status="completed",
+        )
+    draft_id = await _rollup_node(
+        db,
+        title="Smoke draft",
+        task_type="task",
+        parent_id=feature_id,
+        status="draft",
+        source="agent",
+    )
+    await db.commit()
+
+    await services.reject_task(db, draft_id)
+
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+    assert dict(await repo.get_task(db, epic_id))["status"] == "completed"
+
+
+async def test_all_rejected_or_failed_children_do_not_complete_parent(
+    db: aiosqlite.Connection,
+):
+    # AC-2 (#742): rejected means "not needed", but a parent with NOTHING
+    # delivered has nothing to complete; and failed means "needed, not
+    # done" — neither case may close the parent quietly.
+    all_rejected = await _rollup_node(
+        db, title="All rejected", task_type="feature", parent_id=None, status="open"
+    )
+    await _rollup_node(
+        db,
+        title="Rejected earlier",
+        task_type="task",
+        parent_id=all_rejected,
+        status="rejected",
+        source="agent",
+    )
+    last_draft = await _rollup_node(
+        db,
+        title="Last draft",
+        task_type="task",
+        parent_id=all_rejected,
+        status="draft",
+        source="agent",
+    )
+
+    with_failed = await _rollup_node(
+        db, title="Has failed", task_type="feature", parent_id=None, status="open"
+    )
+    await _rollup_node(
+        db,
+        title="Done",
+        task_type="task",
+        parent_id=with_failed,
+        status="completed",
+    )
+    await _rollup_node(
+        db,
+        title="Failed",
+        task_type="task",
+        parent_id=with_failed,
+        status="failed",
+    )
+    failed_draft = await _rollup_node(
+        db,
+        title="Draft next to failure",
+        task_type="task",
+        parent_id=with_failed,
+        status="draft",
+        source="agent",
+    )
+    await db.commit()
+
+    await services.reject_task(db, last_draft)
+    await services.reject_task(db, failed_draft)
+
+    assert dict(await repo.get_task(db, all_rejected))["status"] == "open", (
+        "nothing was delivered — there is nothing to auto-complete"
+    )
+    assert dict(await repo.get_task(db, with_failed))["status"] == "open", (
+        "a failed child must keep blocking the rollup"
+    )
+
+
+async def test_repair_closes_parent_stuck_by_rejected_child(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#742): a parent ALREADY stuck open with terminal children (the
+    # state #579 was left in) is closed by the repair sweep, no human needed.
+    feature_id = await _rollup_node(
+        db, title="Stuck feature", task_type="feature", parent_id=None, status="open"
+    )
+    await _rollup_node(
+        db,
+        title="Shipped",
+        task_type="task",
+        parent_id=feature_id,
+        status="completed",
+    )
+    await _rollup_node(
+        db,
+        title="Rejected smoke",
+        task_type="task",
+        parent_id=feature_id,
+        status="rejected",
+        source="agent",
+    )
+    await db.commit()
+
+    from hub.services.lifecycle import repair_stale_parent_completions
+
+    repaired = await repair_stale_parent_completions(db)
+
+    assert repaired >= 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
