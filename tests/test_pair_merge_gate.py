@@ -393,3 +393,126 @@ async def test_a_task_without_a_pin_delivers_as_before(db, monkeypatch):
         "say that nothing was compared"
     )
     assert "не был закреплён" in note, "and why"
+
+
+# ---------------------------------------------------------------------------
+# #767: an empty pr_number meant two different things, and one of them
+# completed tasks over unmerged branches.
+# ---------------------------------------------------------------------------
+
+
+async def test_pr_opened_after_submit_is_found_at_done(db, monkeypatch):
+    # AC-1 (#767). Live case: #725 was submitted for review BEFORE its PR was
+    # opened, so discovery — which ran only inside submit_for_review — found
+    # nothing and pr_number stayed empty. The gate keys on that field, so the
+    # done report completed the task while PR #336 sat open. Nothing in the
+    # flow forbids that order; the hub simply stopped looking. Now it looks
+    # again at done time.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)  # no PR yet at submit time
+    task_id = await _approved_pair_task(db, pr_number=None)
+    assert dict(await repo.get_task(db, task_id))["pr_number"] is None, (
+        "precondition: submission-time discovery found nothing"
+    )
+    g.pr_for_branch = AsyncMock(return_value=336)  # the PR is opened afterwards
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 336, "the number is recorded, not merely used"
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1, "the gate delivered instead of being skipped"
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT pr_number FROM pipeline_merges")
+    ]
+    assert rows and rows[0]["pr_number"] == 336, (
+        "and the delivery is recorded, so the drift guard can vouch for it"
+    )
+
+
+async def test_open_pr_blocks_a_silent_completion(db):
+    # AC-2 (#767): once the PR is found, an undelivered one must stop the
+    # completion the same way a known pr_number always did. "Completed" over
+    # an open PR is the state #363 and #605 both exist to rule out.
+    g = _git(CIProbeOutcome.passed, merged=False)  # GitHub refuses the merge
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.pr_for_branch = AsyncMock(return_value=336)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alert = " ".join(u.get("content") or "" for u in updates)
+    assert "PR #336" in alert, "the refusal must name the PR it could not deliver"
+    assert "merge_failed" in alert, "and the cause"
+
+
+async def test_a_task_without_a_branch_completes_as_before(db):
+    # AC-3 (#767): work that owns no branch owns no PR. It must complete
+    # exactly as today, and must not pay for a lookup that cannot answer —
+    # a check that fires where there is nothing to check is how a warning
+    # becomes noise and then gets muted (#534).
+    g = _git(CIProbeOutcome.failed, merged=False)  # would refuse if consulted
+    g.pr_for_branch = AsyncMock(return_value=None)
+    tv = await services.create_task(db, TaskCreate(title="Config only"))
+    await repo.update_task(db, tv.id, status="running", auto_review=0)
+    await db.commit()
+
+    await _report_done(db, tv.id)
+
+    task = dict(await repo.get_task(db, tv.id))
+    assert task["status"] == "completed"
+    assert task["branch"] is None
+    g.pr_for_branch.assert_not_awaited(), "no branch, no question to ask"
+    g.merge_pr.assert_not_awaited()
+
+
+async def test_pr_lookup_failure_is_a_reason_not_an_exception(db):
+    # AC-4 (#767): gh missing, network down, GitHub blinking. A done report
+    # must not 500 because the hub could not ask — but the reader has to be
+    # told which check did not run, or the completion reads as "there was
+    # nothing to deliver", which is the very inference this task removes.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.pr_for_branch = AsyncMock(side_effect=RuntimeError("gh: command not found"))
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "today's rule still decides completion"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    note = " ".join(u.get("content") or "" for u in updates)
+    assert "не ответил" in note, "the failed check says so"
+    assert "gh: command not found" in note, "and carries its cause"
+
+
+async def test_pinned_sha_message_has_no_false_not_pinned(db, monkeypatch):
+    # AC-5 (#767): the "NOT pinned" line used to hang off the CI-adoption
+    # branch while speaking about pinning, so a submission with a pinned sha
+    # and no CI report to adopt said both "Branch tip at submission: 97e4707"
+    # and "Branch tip NOT pinned: " with an empty reason — contradicting
+    # itself in one sentence (#725, #763). Small, but it is a false signal on
+    # exactly the axis the reviewer is asked to trust.
+    _git_seeing(monkeypatch, "pinned0commit")
+    tv = await services.create_task(db, TaskCreate(title="Pin me"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: build")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+
+    await services.submit_for_review(db, tv.id)
+
+    assert dict(await repo.get_task(db, tv.id))["submission_sha"] == "pinned0commit"
+    updates = [dict(u) for u in await repo.get_task_updates(db, tv.id)]
+    submission = next(
+        u["content"]
+        for u in reversed(updates)
+        if "Submitted for review" in (u["content"] or "")
+    )
+    assert "Branch tip at submission: pinned0commi" in submission
+    assert "NOT pinned" not in submission, (
+        "a pinned commit and 'NOT pinned' cannot both be true of one submission"
+    )
