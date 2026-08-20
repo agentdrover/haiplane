@@ -773,6 +773,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_risk_class_column",
         "ALTER TABLE tasks ADD COLUMN risk_class TEXT",
     ),
+    (
+        # The observable features the class was derived from (#582), JSON
+        # list of strings like the other list columns. '[]' — not NULL — is
+        # correct here: an empty list means "computed, nothing triggered",
+        # while "not computed" is already carried by risk_class IS NULL.
+        "add_risk_class_reasons_column",
+        "ALTER TABLE tasks ADD COLUMN risk_class_reasons TEXT NOT NULL DEFAULT '[]'",
+    ),
 ]
 
 
@@ -838,6 +846,7 @@ LIST_STR_COLUMNS = frozenset(
         "validation_commands",
         "out_of_scope_for_review",
         "review_checklist",
+        "risk_class_reasons",
     }
 )
 
@@ -881,6 +890,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # deliberately absent from TaskCreate and TaskRefine — the class is
     # derived from observable facts (#582), never declared by the author.
     "risk_class",
+    # The features that produced the class (#582): "R3, потому что миграция"
+    # can be argued with; a bare "R3" cannot. Read-path only, same as above.
+    "risk_class_reasons",
 )
 
 
