@@ -1,0 +1,289 @@
+"""Where the review brief's evidence came from — and where it did not (#725).
+
+Observed on the brief for #643 (project spike-bo, 19.08.2026). The brief said
+
+    diff_command: git diff develop...task-643/memo-spike-impl
+
+on a project whose default branch is ``main`` and which has no ``develop`` ref
+at all. The command could not run, and everything that needs a diff went quiet
+behind it: ``call_sites`` answered "the diff named no changed lines" over a
+branch carrying +3260 lines in 67 files, and the risk class was recomputed
+against an empty diff. Three blocks read as three independent unknowns. There
+was one cause.
+
+Beside them stood ``sha_check: match`` with an empty reason. That check is real
+— it compares the branch tip against the SHA the submission pinned — but it
+answers a question nobody was worried about, and a lone green line next to
+three unknowns reads as "verification happened".
+
+So this module answers two questions the brief could not answer before:
+
+1. WHICH base, and does it exist. The base comes from the project's own
+   ``default_branch`` rather than a constant, and is resolved in the project's
+   workspace before the command is printed. Three outcomes, never two:
+   ``resolved``, ``unresolved`` (we looked and it is not there), ``unverified``
+   (there was nothing to look in). The second and third are different answers
+   and are never collapsed.
+
+2. WHICH checks actually ran. One coverage verdict over all evidence blocks,
+   which states plainly how many produced a signal and what stopped the rest.
+   The rule it enforces: an indicator may read confident only when the check
+   behind it ran over the data it claims to cover. Partial coverage belongs in
+   the verdict, not in a footnote under it.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from hub import config
+from hub.integrations.registry import plugins
+
+log = logging.getLogger("hub")
+
+BASE_RESOLVED = "resolved"
+BASE_UNRESOLVED = "unresolved"
+BASE_UNVERIFIED = "unverified"
+
+# Prefix every block that went silent because the diff base did not resolve.
+# A downstream block saying "unknown" on its own invites the reviewer to look
+# for three separate causes; naming the one cause is the whole point.
+DISABLED_BY_BASE = "disabled by the diff base: "
+
+COVERAGE_COMPLETE = "complete"
+COVERAGE_PARTIAL = "partial"
+COVERAGE_NONE = "none"
+
+
+async def resolve_diff_base(
+    db: Any, task_id: int, branch: str, *, pr_base: str = ""
+) -> dict[str, Any]:
+    """Which base this task's diff is taken against, and whether it exists.
+
+    ``source`` says where the name came from, so a wrong base can be fixed at
+    its origin instead of being argued about in the brief. Best effort by
+    contract: any failure answers ``unverified`` with the cause — a brief must
+    not become unreadable because git was unreachable.
+    """
+    from hub.services.orchestration import project_git_context
+
+    out: dict[str, Any] = {
+        "base": "",
+        "source": "",
+        "state": BASE_UNVERIFIED,
+        "reason": "",
+        "sha": "",
+    }
+    try:
+        ctx = await project_git_context(db, task_id)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("diff base for #%s: no project context: %s", task_id, exc)
+        out["reason"] = f"project git context failed: {exc}"
+        return out
+
+    if (pr_base or "").strip():
+        out["base"], out["source"] = pr_base.strip(), "pull request base ref"
+    elif (ctx.get("base_branch") or "").strip():
+        out["base"], out["source"] = (
+            ctx["base_branch"].strip(),
+            "project default_branch",
+        )
+    else:
+        out["base"], out["source"] = (
+            config.PAIR_BASE_BRANCH,
+            "fallback default (the project declares no default_branch)",
+        )
+
+    if not (branch or "").strip():
+        out["reason"] = "task has no branch, so there is no diff to take"
+        return out
+
+    workspace = ctx.get("repo")
+    if not workspace:
+        out["reason"] = (
+            "the project has no workspace, so the base could not be verified "
+            "here — run the command in your own checkout"
+        )
+        return out
+
+    try:
+        state, detail = await plugins.git_ops.resolve_ref(out["base"], workspace)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("diff base for #%s: resolve failed: %s", task_id, exc)
+        out["reason"] = f"could not resolve {out['base']}: {exc}"
+        return out
+
+    if state == "resolved":
+        out["state"], out["sha"] = BASE_RESOLVED, detail
+        return out
+    if state == "missing":
+        out["state"] = BASE_UNRESOLVED
+        out["reason"] = (
+            f"the base ref '{out['base']}' ({out['source']}) does not exist in "
+            f"the project workspace: {detail}. The diff cannot be taken, so "
+            "every check that reads it is disabled below — this is one failure, "
+            "not several independent unknowns"
+        )
+        return out
+    out["reason"] = f"the base ref '{out['base']}' could not be verified: {detail}"
+    return out
+
+
+def diff_command_for(diff_base: dict[str, Any], branch: str) -> str:
+    """The command, or nothing when we know it would not run (#725).
+
+    An unresolved base yields no command on purpose: a command that cannot run
+    is worse than none, because it is read as an offer to verify.
+    """
+    if not (branch or "").strip():
+        return ""
+    if diff_base.get("state") == BASE_UNRESOLVED:
+        return ""
+    return f"git diff {diff_base.get('base', '')}...{branch}"
+
+
+def sha_check_statement(
+    sha_check: str, submission_sha: str, current_tip: str, branch: str
+) -> str:
+    """What the SHA comparison actually compared (#725).
+
+    ``match`` used to carry an empty reason. Read beside three blocks that
+    produced nothing, a bare green word is taken as evidence about the code —
+    while this check only knows where a branch pointer stands. Saying so is the
+    difference between an honest narrow check and a misleading broad one.
+    """
+    if sha_check != "match":
+        return ""
+    return (
+        f"branch {branch} still stands at the submitted commit "
+        f"{(current_tip or submission_sha)[:12]}. This compares WHERE the "
+        "branch points, not what the diff contains and not whether anything "
+        "was verified"
+    )
+
+
+def evidence_coverage(
+    *,
+    diff_base: dict[str, Any],
+    branch: str,
+    call_sites_status: str,
+    has_test_acs: bool,
+    locator_resolution: list[Any],
+    ac_test_results: list[Any],
+    ci_state: str,
+    freshness: dict[str, Any] | None,
+    sha_check: str,
+) -> dict[str, Any]:
+    """One verdict over every evidence block in the brief (#725).
+
+    Scored over a full day of briefs, the blocks read as five independent
+    findings when they were one absence: four produced no signal at all, one
+    reassured wrongly, and one was correct about a question nobody asked. The
+    reviewer's own summary has to say that, in the same place the green words
+    are, or the next reader repeats the inference.
+
+    Three outcomes per check, not two. "Did not run" and "had nothing to run
+    over" are different, and a task with no test-AC must not be reported as
+    having lost evidence it never had — an inflated warning is muted, and then
+    the real one is muted with it.
+
+    ``sha_check`` is deliberately not counted as coverage: it is real, but it
+    answers where a branch points. Letting it lift the verdict is exactly the
+    arithmetic that made one green line look like an analysis.
+    """
+    ran: list[str] = []
+    missing: list[dict[str, str]] = []
+    not_applicable: list[dict[str, str]] = []
+
+    def _note(name: str, ok: bool, reason: str, *, applicable: bool = True) -> None:
+        if not applicable:
+            not_applicable.append({"check": name, "reason": reason})
+        elif ok:
+            ran.append(name)
+        else:
+            missing.append({"check": name, "reason": reason})
+
+    base_state = diff_base.get("state")
+    has_branch = bool((branch or "").strip())
+    _note(
+        "diff_base",
+        base_state == BASE_RESOLVED,
+        diff_base.get("reason") or "the diff base did not resolve",
+        applicable=has_branch,
+    )
+    _note(
+        "call_sites",
+        call_sites_status == "analysed",
+        (
+            DISABLED_BY_BASE + str(diff_base.get("reason") or "")
+            if base_state == BASE_UNRESOLVED
+            else "the call-site analysis produced no signal"
+        ),
+        applicable=has_branch,
+    )
+    _note(
+        "locator_resolution",
+        bool(locator_resolution)
+        and all(getattr(r, "status", "") != "unknown" for r in locator_resolution),
+        (
+            "no AC locator was resolved against a real test"
+            if has_test_acs
+            else "no acceptance criterion is verifiable by a test"
+        ),
+        applicable=has_test_acs,
+    )
+    _note(
+        "ac_test_results",
+        bool(ac_test_results),
+        (
+            "no test result was recorded for this submission"
+            if has_test_acs
+            else "no acceptance criterion is verifiable by a test"
+        ),
+        applicable=has_test_acs,
+    )
+    _note("ci_run_report", ci_state == "current", "no run evidence for this commit")
+    freshness_state = (freshness or {}).get("state") or "not_checked"
+    _note(
+        "statement_freshness",
+        freshness_state in ("deliveries_since", "no_overlap"),
+        (freshness or {}).get("reason")
+        or "the statement was not compared against later deliveries",
+    )
+
+    if not missing:
+        state, headline = (
+            COVERAGE_COMPLETE,
+            "every applicable evidence block produced a signal",
+        )
+    elif not ran:
+        state = COVERAGE_NONE
+        headline = (
+            f"NO evidence block produced a signal ({len(missing)} of "
+            f"{len(missing)} could not run). Nothing here has been verified — "
+            "read this brief as a list of what to check yourself"
+        )
+    else:
+        state = COVERAGE_PARTIAL
+        headline = (
+            f"{len(missing)} of {len(ran) + len(missing)} evidence blocks "
+            "produced no signal. Their subjects are unverified, not clean"
+        )
+    if state != COVERAGE_COMPLETE and base_state == BASE_UNRESOLVED and has_branch:
+        headline += (
+            "; the diff base did not resolve, which disabled the checks "
+            "that read the diff"
+        )
+    if sha_check == "match":
+        headline += (
+            ". sha_check=match is not part of this count: it says the branch "
+            "has not moved since submission, nothing about the code"
+        )
+    return {
+        "state": state,
+        "headline": headline,
+        "checks_ran": ran,
+        "checks_missing": missing,
+        "checks_not_applicable": not_applicable,
+    }

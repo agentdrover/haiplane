@@ -111,6 +111,10 @@ class NoopGitOps:
     async def head_sha(self, repo: str, base: str) -> str:
         return ""
 
+    async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]:
+        """No git here — "could not look", never "the ref is missing" (#725)."""
+        return ("unavailable", "git integration is not configured")
+
     async def pr_for_branch(
         self,
         branch: str,
