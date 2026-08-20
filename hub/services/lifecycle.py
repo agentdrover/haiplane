@@ -2266,6 +2266,22 @@ async def decide_task(
             actor="human",
             payload={"via": "decide_accept"},
         )
+        # #737: the decision gate is a human gate like approve and verdict,
+        # but until this event it left no machine-readable trace of the
+        # OUTCOME — accept vs rework — so its override-rate was uncountable.
+        # entered_at is when the task hit needs_decision (status_entered_at
+        # advances only on real status changes, #416), which makes the queue
+        # wait computable.
+        await repo.insert_event(
+            db,
+            kind="task_decided",
+            task_id=task_id,
+            actor="human",
+            payload={
+                "action": "accept",
+                "entered_at": task.get("status_entered_at") or "",
+            },
+        )
         await db.commit()
         await maybe_rollup_parent(db, task_id)
         await log_activity(
@@ -2285,6 +2301,18 @@ async def decide_task(
         # submission starts clean and the stale verdict cannot count as current.
         await repo.update_task(db, task_id, review_cycle=0)
         await repo.reset_arbiter_state(db, task_id)
+        # #737: same trace as the accept branch — rework is the "override"
+        # outcome of the decision gate.
+        await repo.insert_event(
+            db,
+            kind="task_decided",
+            task_id=task_id,
+            actor="human",
+            payload={
+                "action": "rework",
+                "entered_at": task.get("status_entered_at") or "",
+            },
+        )
         await db.commit()
 
         message = plugins.dispatch.build_fix_message(
