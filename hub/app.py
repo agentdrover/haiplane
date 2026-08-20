@@ -1078,6 +1078,38 @@ async def api_submit_machine_review(
             "generation": generation,
         },
     )
+    # #750: a report that surfaced NO candidates, ran ONE agent and counted
+    # NO tokens is the shape of a harness that never actually ran — 60 such
+    # reports landed in 36 minutes on 2026-08-19 (cursor_cloud), silently
+    # gutting the filtration metrics and, later, the auto-verdict (#745
+    # already refuses raw_count=0). Warned once per generation, never
+    # refused: the report itself is still worth keeping as evidence.
+    if raw_count == 0:
+        prior_zero = await db.execute_fetchall(
+            "SELECT COUNT(*) AS n FROM machine_reviews "
+            "WHERE task_id=? AND submission_generation=? AND raw_count=0",
+            (task_id, generation),
+        )
+        if int(prior_zero[0]["n"]) == 1:
+            single_agent = (body.agent_count or 0) <= 1
+            no_tokens = body.tokens_spent is None
+            detail = (
+                "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
+                if single_agent and no_tokens
+                else "проверьте, что фазы измерений и адъюдикации исполнялись"
+            )
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                (
+                    "Machine-review с raw_count=0: ноль кандидатов — это "
+                    f"отсутствие данных, а не отсутствие находок; {detail}. "
+                    "Отчёт принят, но автовердикт по нему невозможен, а "
+                    "«чисто» не подтверждено (#750)."
+                ),
+            )
     await db.commit()
     await db_module.log_activity(
         db,
