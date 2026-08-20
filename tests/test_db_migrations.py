@@ -666,3 +666,38 @@ async def test_risk_class_migration_preserves_rows(monkeypatch):
         assert rows[0]["risk_class"] is None
     finally:
         await conn.close()
+
+
+async def test_gate_policy_migration_preserves_projects(monkeypatch):
+    # AC-5 (#743): project rows written before the migration survive it and
+    # read back with an empty policy — every gate human by default.
+    import hub.db as db_module
+
+    trimmed = [m for m in _MIGRATIONS if m[0] != "add_projects_gate_policy"]
+    assert len(trimmed) == len(_MIGRATIONS) - 1
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", trimmed)
+        await _migrate(conn)
+        await conn.execute(
+            "INSERT INTO projects (slug, name, repo, workspace_path, "
+            "default_branch, default_branch_policy, status) "
+            "VALUES ('legacy', 'Legacy', '', '', 'develop', '{}', 'active')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+
+        rows = await conn.execute_fetchall(
+            "SELECT slug, name, gate_policy FROM projects WHERE slug='legacy'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["name"] == "Legacy"
+        assert rows[0]["gate_policy"] == "{}"
+    finally:
+        await conn.close()

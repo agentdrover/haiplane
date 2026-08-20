@@ -781,6 +781,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_risk_class_reasons_column",
         "ALTER TABLE tasks ADD COLUMN risk_class_reasons TEXT NOT NULL DEFAULT '[]'",
     ),
+    (
+        # Per-project gate policy (#743, feature #738): {"dor": "human"|"auto",
+        # "verdict": "human"|"auto"}. '{}' is honest here — "no policy set"
+        # simply means the default (every gate human), there is no third
+        # state to distinguish, unlike risk_class where NULL had to stay
+        # separate from a computed value. Inert until #744 reads it.
+        "add_projects_gate_policy",
+        "ALTER TABLE projects ADD COLUMN gate_policy TEXT NOT NULL DEFAULT '{}'",
+    ),
 ]
 
 

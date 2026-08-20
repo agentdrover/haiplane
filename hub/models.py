@@ -1200,8 +1200,29 @@ class ProjectPatch(BaseModel):
     workspace_path: str | None = Field(default=None, max_length=500)
     default_branch: str | None = Field(default=None, max_length=100)
     default_branch_policy: dict[str, Any] | None = None
+    # Gate policy (#743): which gates this project delegates to the
+    # autopilot. Only the two automatable gates exist as keys; anything
+    # else in the payload is a mistake worth refusing, not ignoring.
+    gate_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
+
+    @field_validator("gate_policy")
+    @classmethod
+    def _gate_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is None:
+            return v
+        unknown = set(v) - {"dor", "verdict"}
+        if unknown:
+            raise ValueError(
+                f"unknown gate_policy keys: {sorted(unknown)}; allowed: dor, verdict"
+            )
+        bad = {k: val for k, val in v.items() if val not in {"human", "auto"}}
+        if bad:
+            raise ValueError(
+                f"gate_policy values must be 'human' or 'auto', got: {bad}"
+            )
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -1451,6 +1472,8 @@ class ProjectView(BaseModel):
     workspace_path: str = ""
     default_branch: str = "develop"
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+    # Gate policy (#743): {} means "no delegation" — every gate human.
+    gate_policy: dict[str, Any] = Field(default_factory=dict)
     archived: bool = False
     provision_status: str = "none"
     provision_detail: str = ""
@@ -1462,7 +1485,7 @@ class ProjectView(BaseModel):
     def _iso_ts(cls, v: str | None) -> str | None:
         return to_iso_utc(v)
 
-    @field_validator("default_branch_policy", mode="before")
+    @field_validator("default_branch_policy", "gate_policy", mode="before")
     @classmethod
     def _policy_json(cls, v: Any) -> Any:
         if isinstance(v, str):
