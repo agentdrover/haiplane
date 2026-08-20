@@ -23,6 +23,7 @@ simplify its own rules (see ``LADDER_SURFACES``).
 
 from __future__ import annotations
 
+import json
 import logging
 
 import aiosqlite
@@ -102,6 +103,24 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
         # wait for the owner at ANY class.
         return False
 
+    # #744: the policy says WHERE automation is allowed, the class says WHAT
+    # is safe, and the global env above stays the kill-switch and the class
+    # ceiling. Resolved the same way the git conveyor resolves it — by
+    # walking the hierarchy — and every failure mode (no project, unparsable
+    # policy, no dor=auto) refuses toward the human gate, never toward auto.
+    # The default project cannot even store 'auto' (#743), so the hub's own
+    # drafts can never take this path.
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return False
+    try:
+        policy = json.loads(project["gate_policy"] or "{}")
+    except (ValueError, KeyError):
+        return False
+    if not isinstance(policy, dict) or policy.get("dor") != "auto":
+        return False
+    project_slug = project["slug"]
+
     transitioned = await repo.transition_status_if(
         db, task_id, expected_from="draft", new_status="open"
     )
@@ -115,18 +134,33 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
         "hub",
         "status",
         (
-            f"Автоодобрено политикой: класс {risk.value} не выше порога "
-            f"{ceiling.value} (выключатель OPENCLAW_AUTO_APPROVE_MAX_CLASS="
-            f"{mode}). Признаки: {'; '.join(reasons) or '—'}."
+            f"Автоодобрено политикой проекта {project_slug} (dor=auto): класс "
+            f"{risk.value} не выше порога {ceiling.value} (потолок "
+            f"OPENCLAW_AUTO_APPROVE_MAX_CLASS={mode}). "
+            f"Признаки: {'; '.join(reasons) or '—'}."
         ),
         author_kind="hub",
     )
+    # actor=policy (#744): distinguishable from a human click AND from other
+    # hub service writes — the human_gates metric (#737) already excludes it
+    # by this name, so the autopilot shows up as its own line, not as noise
+    # in either column.
     await repo.insert_event(
         db,
         kind="task_approved",
         task_id=task_id,
-        actor="hub",
-        payload={"auto": True, "risk_class": risk.value, "ceiling": ceiling.value},
+        actor="policy",
+        payload={
+            "auto": True,
+            "risk_class": risk.value,
+            "ceiling": ceiling.value,
+            "project": project_slug,
+        },
     )
-    log.info("auto-approved draft #%s at class %s", task_id, risk.value)
+    log.info(
+        "auto-approved draft #%s at class %s (project %s)",
+        task_id,
+        risk.value,
+        project_slug,
+    )
     return True
