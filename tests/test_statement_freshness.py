@@ -23,8 +23,27 @@ from hub.services.statement_freshness import (
     STATE_DELIVERIES,
     STATE_NO_OVERLAP,
     STATE_NOT_CHECKED,
+    STATE_PARTIAL,
+    render_freshness,
     statement_freshness,
 )
+
+
+async def _watched(db: aiosqlite.Connection) -> int:
+    """The default project, with the base-branch guard actually watching (#725).
+
+    Without a baseline the guard has never looked, and the check must not claim
+    a clean sheet — so every test that wants a plain "nothing landed" verdict
+    has to say out loud that someone is watching.
+    """
+    project = await repo.get_project_by_slug(db, "default")
+    project_id = (
+        dict(project)["id"]
+        if project
+        else await repo.create_project(db, slug="default", name="Default")
+    )
+    await repo.set_drift_baseline(db, project_id, "baseline-sha")
+    return project_id
 
 
 async def _task(
@@ -118,6 +137,7 @@ async def test_no_overlap_is_said_out_loud(db):
     # absent warning would otherwise read as confirmation — the mistake #506 and
     # #546 both made about unavailable environments.
     task_id = await _task(db, areas=["hub/services/readiness.py"])
+    await _watched(db)
     await _delivered(
         db, title="elsewhere", areas=["hub/web.py"], merged_at="2026-08-05 12:00:00"
     )
@@ -152,6 +172,7 @@ async def test_an_impossible_check_says_so_with_a_reason(db):
 async def test_a_task_does_not_see_its_own_delivery(db):
     # AC-5 (#615): a resubmitted task would otherwise warn about itself.
     task_id = await _task(db, areas=["hub/app.py"])
+    await _watched(db)
     await repo.record_pipeline_merge(
         db, pr_number=777, merge_sha="sha-self", project_id=None, task_id=task_id
     )
@@ -279,3 +300,73 @@ async def test_a_refined_task_reports_the_statement_date_not_creation(client, db
         "refine wrote the statement, so the date is the statement's, not the row's"
     )
     assert out["written_at"], "and it must actually carry a value"
+
+
+async def test_unseen_deliveries_downgrade_the_verdict(db):
+    # AC-3 (#725). On 20.08.2026 this block told #759 "в этих областях ничего
+    # не доставлялось — посылки, скорее всего, ещё в силе" on the same day four
+    # PRs were merged by hand into exactly its declared areas. Nothing here was
+    # false: pipeline_merges records the gate's merges, and those four went
+    # around it. But the headline asserted validity while the caveat that made
+    # it merely technically true sat a line below — and the headline is what is
+    # read. What the check cannot see now goes into the verdict.
+    project_id = await _watched(db)
+    task_id = await _task(db, areas=["src/memo/ai/prompts.py"])
+    await repo.record_drift_commit(
+        db,
+        project_id=project_id,
+        sha="a" * 40,
+        branch="main",
+        subject="feat: merged by hand (#901)",
+        author="mrPDA",
+    )
+    await db.execute(
+        "UPDATE base_branch_drift SET detected_at=? WHERE project_id=?",
+        ("2026-08-05 12:00:00", project_id),
+    )
+    await db.commit()
+
+    out = await statement_freshness(db, dict(await repo.get_task(db, task_id)))
+
+    assert out["state"] == STATE_PARTIAL, (
+        "gate-recorded silence over an unwatched delivery is not 'no overlap'"
+    )
+    assert out["blind_spot"]["state"] == "gap"
+    assert "мимо гейта" in out["reason"]
+    assert "нельзя" in out["reason"], "the verdict itself must block the inference"
+    assert render_freshness(out).startswith("Свежесть постановки"), (
+        "one block, as before"
+    )
+    assert "Сверка НЕПОЛНАЯ" in render_freshness(out), (
+        "the limitation leads the rendered block instead of trailing it"
+    )
+
+
+async def test_an_unwatched_project_cannot_report_a_clean_sheet(db):
+    # The same rule where the hole cannot even be sized: with no drift baseline
+    # nobody has ever looked at the base branch, so "ничего не доставлялось"
+    # would state as fact the thing that was never observed (#534, #725).
+    await repo.create_project(db, slug="default", name="Default")
+    await db.commit()
+    task_id = await _task(db, areas=["hub/app.py"])
+
+    out = await statement_freshness(db, dict(await repo.get_task(db, task_id)))
+
+    assert out["state"] == STATE_PARTIAL
+    assert out["blind_spot"]["state"] == "unwatched"
+    assert "сторож базовой ветки" in out["reason"]
+
+
+async def test_a_real_delivery_still_leads_the_verdict(db):
+    # The downgrade must not swallow the stronger warning: a delivery that WAS
+    # recorded is still named first, with the blind spot appended, not instead.
+    task_id = await _task(db, areas=["hub/app.py"])
+    await _delivered(
+        db, title="same area", areas=["hub/app.py"], merged_at="2026-08-05 12:00:00"
+    )
+
+    out = await statement_freshness(db, dict(await repo.get_task(db, task_id)))
+
+    assert out["state"] == STATE_DELIVERIES
+    assert out["deliveries"], "the recorded delivery is still the headline"
+    assert "И это не весь список" in out["reason"]

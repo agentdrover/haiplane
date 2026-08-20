@@ -1276,8 +1276,25 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     if brief.get("branch"):
         pr = f" | PR #{brief['pr_number']}" if brief.get("pr_number") else ""
         parts.append(f"\nBranch: {brief['branch']}{pr}")
+        # #725: the diff base is reported where the diff command is. When the
+        # base does not resolve there is no command to print, and the failure
+        # is stated in its place — the blocks that read the diff go silent
+        # downstream, and without this line their silence reads as findings.
+        base = brief.get("diff_base") or {}
         if brief.get("diff_command"):
             parts.append(f"Diff: {brief['diff_command']}")
+            if base.get("state") != "resolved" and base.get("reason"):
+                parts.append(f"  base NOT verified: {base['reason']}")
+        elif base.get("reason"):
+            parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
+    coverage = brief.get("evidence_coverage") or {}
+    if coverage.get("headline"):
+        parts.append(
+            f"\nEvidence coverage [{coverage.get('state', '?')}]: "
+            f"{coverage['headline']}"
+        )
+        for miss in coverage.get("checks_missing") or []:
+            parts.append(f"  - {miss.get('check', '?')}: {miss.get('reason', '')}")
     if brief.get("stacking_warning"):
         parts.append(f"\n{brief['stacking_warning']}")
     if brief.get("latest_submission_summary"):

@@ -851,6 +851,24 @@ class GitOpsIntegration:
         )
         return True
 
+    async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]:
+        """Does this ref exist here? ``(state, detail)`` (#725).
+
+        Three states, never two: ``resolved`` with the sha, ``missing`` when
+        the repository was readable and the ref is genuinely not in it, and
+        ``unavailable`` when there was nothing to look in. Collapsing the last
+        two would let "we could not check" print as "that branch does not
+        exist", which is how a brief ends up asserting something it never
+        verified — the failure this was written for.
+        """
+        rc, _, err = await _git("rev-parse", "--git-dir", repo=repo, check=False)
+        if rc != 0:
+            return ("unavailable", f"{repo} is not a readable git repository")
+        sha = await _resolve_ref(name, repo)
+        if sha:
+            return ("resolved", sha)
+        return ("missing", f"neither {name} nor origin/{name} exists in {repo}")
+
     async def head_sha(self, repo: str, base: str) -> str:
         """Current tip of origin/<base>, or "" when it cannot be read (#534)."""
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)

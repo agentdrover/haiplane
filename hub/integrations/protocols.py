@@ -117,6 +117,7 @@ class DispatchPlugin(Protocol):
 @runtime_checkable
 class GitOpsPlugin(Protocol):
     async def current_branch(self, repo: str | None = None) -> str: ...
+    async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]: ...
     async def branch_contains_unmerged_commits_of(
         self,
         branch: str,

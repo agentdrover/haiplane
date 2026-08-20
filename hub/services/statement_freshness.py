@@ -37,6 +37,15 @@ log = logging.getLogger("hub")
 STATE_DELIVERIES = "deliveries_since"
 STATE_NO_OVERLAP = "no_overlap"
 STATE_NOT_CHECKED = "not_checked"
+# #725: the check ran, and it could not see everything it reports on. Merges
+# that reached a base branch outside the gate are invisible to pipeline_merges,
+# so "nothing landed in these areas" is only true of what the gate recorded.
+# On 20.08.2026 this block answered "посылки, скорее всего, ещё в силе" for
+# #759 on the same day four PRs were merged by hand into exactly its declared
+# areas. It was not lying — its fine print says gate-recorded deliveries only —
+# but the headline asserted validity while the caveat that made it merely
+# technically true sat a line below. The blind spot now goes into the verdict.
+STATE_PARTIAL = "partial_coverage"
 
 # Enough to see the pattern without burying the reader. A cap that hid the rest
 # in silence would be its own defect, so the payload says how many were dropped.
@@ -104,6 +113,61 @@ def statement_written_at(task: dict[str, Any]) -> tuple[str, str]:
     return created, "задача создана (аналитика не проводилась)"
 
 
+async def gate_blind_spot(db: Any, task_id: int, since: str) -> dict:
+    """What reached the base branch outside the gate since ``since`` (#725).
+
+    ``state`` is ``clear`` (the drift guard watches this project and saw
+    nothing), ``gap`` (it saw commits the gate did not perform) or
+    ``unwatched`` (nobody is watching, so the size of the hole is unknown).
+    The last is not "clear": #534 exists precisely because a direct push to a
+    base branch cannot be prevented on this plan, only noticed — and a check
+    that reports "nothing landed" while nobody is looking states as fact the
+    thing it never observed.
+
+    Never raises: the caller degrades, it does not fail.
+    """
+    from hub import repository as repo_mod
+
+    out: dict[str, Any] = {"state": "unwatched", "commits": [], "reason": ""}
+    try:
+        project = await repo_mod.resolve_project_for_task(db, task_id)
+        if project is None:
+            out["reason"] = "задача не привязана к проекту — сверять не с чем"
+            return out
+        p = dict(project)
+        rows = await repo_mod.list_drift_commits(db, p["id"])
+        commits = [
+            {
+                "sha": (dict(r).get("sha") or "")[:12],
+                "subject": (dict(r).get("subject") or "")[:80],
+                "branch": dict(r).get("branch") or "",
+                "detected_at": dict(r).get("detected_at") or "",
+            }
+            for r in rows
+            if comparable_timestamp(dict(r).get("detected_at") or "") > since
+        ]
+        if commits:
+            out["state"] = "gap"
+            out["commits"] = commits[:_MAX_LISTED]
+            out["reason"] = (
+                f"в базовую ветку проекта «{p.get('slug', '?')}» после даты "
+                f"постановки попало коммитов мимо гейта: {len(commits)}"
+            )
+            return out
+        if not (p.get("drift_baseline_sha") or "").strip():
+            out["reason"] = (
+                f"для проекта «{p.get('slug', '?')}» сторож базовой ветки (#534) "
+                "ещё не сделал отметку — мержи мимо гейта здесь не отслеживаются"
+            )
+            return out
+        out["state"] = "clear"
+        return out
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("blind-spot check for #%s failed: %s", task_id, exc)
+        out["reason"] = f"не удалось проверить мержи мимо гейта: {exc}"
+        return out
+
+
 async def statement_freshness(db: Any, task: dict[str, Any]) -> dict:
     """Deliveries in the same areas since this statement was written (#615).
 
@@ -126,6 +190,7 @@ async def statement_freshness(db: Any, task: dict[str, Any]) -> dict:
         "omitted": 0,
         "declared_areas_note": DECLARED_AREAS_NOTE,
         "gate_history_note": GATE_HISTORY_NOTE,
+        "blind_spot": {"state": "unwatched", "commits": [], "reason": ""},
     }
 
     if not written_at:
@@ -182,17 +247,38 @@ async def statement_freshness(db: Any, task: dict[str, Any]) -> dict:
             }
         )
 
+    # #725: what the comparison above cannot see. Reported in the verdict, not
+    # under it: an unseen delivery is exactly the case where "ничего не
+    # доставлялось" is read as "посылки в силе".
+    blind = await gate_blind_spot(db, task_id, written_at)
+    base = {**base, "blind_spot": blind}
+
     if not hits:
+        if blind["state"] == "clear":
+            return {
+                **base,
+                "state": STATE_NO_OVERLAP,
+                "reason": (
+                    "с даты постановки в этих областях ничего не доставлялось "
+                    "— ни гейтом, ни мимо него — посылки, скорее всего, ещё в силе"
+                ),
+            }
         return {
             **base,
-            "state": STATE_NO_OVERLAP,
+            "state": STATE_PARTIAL,
             "reason": (
-                "с даты постановки в этих областях ничего не доставлялось — "
-                "посылки, скорее всего, ещё в силе"
+                "по доставкам гейта в этих областях ничего не найдено, но "
+                f"проверка покрыла не всё: {blind['reason']}. Что изменили эти "
+                "коммиты, сверка не видит — считать посылки подтверждёнными нельзя"
             ),
         }
 
     listed, omitted = hits[:_MAX_LISTED], max(0, len(hits) - _MAX_LISTED)
+    tail = (
+        ""
+        if blind["state"] == "clear"
+        else f". И это не весь список: {blind['reason']}"
+    )
     return {
         **base,
         "state": STATE_DELIVERIES,
@@ -200,7 +286,7 @@ async def statement_freshness(db: Any, task: dict[str, Any]) -> dict:
         "omitted": omitted,
         "reason": (
             f"с даты постановки в тех же областях доставлено задач: {len(hits)}. "
-            "Перечитайте посылки перед работой — они могли быть отменены"
+            f"Перечитайте посылки перед работой — они могли быть отменены{tail}"
         ),
     }
 
@@ -226,6 +312,16 @@ def render_freshness(freshness: dict | None) -> str:
             f"{head} {freshness.get('reason', '')}. "
             f"Оговорка: {freshness.get('declared_areas_note', '')}."
         )
+    if state == STATE_PARTIAL:
+        # #725: the limitation IS the verdict here, so it leads the block.
+        lines = [f"{head} Сверка НЕПОЛНАЯ: {freshness.get('reason', '')}."]
+        for c in (freshness.get("blind_spot") or {}).get("commits") or []:
+            lines.append(
+                f"  - {c.get('sha', '')} «{c.get('subject', '')}» "
+                f"({c.get('branch', '')}, замечен {c.get('detected_at', '')[:10]})"
+            )
+        lines.append(f"Оговорка: {freshness.get('declared_areas_note', '')}.")
+        return "\n".join(lines)
     lines = [f"{head} {freshness.get('reason', '')}:"]
     for d in freshness.get("deliveries") or []:
         areas = ", ".join(d.get("shared_areas") or [])
