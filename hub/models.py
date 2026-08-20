@@ -1727,6 +1727,9 @@ class HealthView(BaseModel):
     auth_disabled: bool
     env_tokens_configured: bool
     vast_enabled: bool
+    # Cursor Cloud Agents API (#756): whether the cross-model review
+    # executor has a key configured.
+    cursor_cloud_configured: bool = False
 
 
 class IdentityDiagnosticsView(BaseModel):
