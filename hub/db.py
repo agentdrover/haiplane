@@ -806,6 +806,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (project_id, digest_date)
         )""",
     ),
+    (
+        # Model diversity (#758): which model wrote the submitted code,
+        # declared by the submitter. '' means "not declared" — and the
+        # auto-verdict treats missing data as NOT diverse, the same
+        # principle as raw_count=0 and risk_class NULL.
+        "add_tasks_submission_model",
+        "ALTER TABLE tasks ADD COLUMN submission_model TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

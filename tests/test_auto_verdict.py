@@ -18,7 +18,7 @@ from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import TaskRefine
+from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.ci_report import VALIDATION_PASS
 
 _TIP = "a" * 40
@@ -35,6 +35,9 @@ _CLEAN_REVIEW = {
     "unresolved": [],
     "lost_dimensions": [],
     "agent": "reviewer-bot",
+    # #758: the diversity rule needs both models declared — the clean
+    # baseline is a cross-family pair (implementer claude, reviewer grok).
+    "model": "cursor-grok-4.6",
 }
 
 
@@ -106,7 +109,9 @@ async def _submitted_task(
         f"/api/tasks/{task_id}/refine", json={"affected_areas": areas}
     )
     assert resp.status_code == 200, resp.text
-    view = await services.submit_for_review(db, task_id)
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
     assert view.status.value == "review"
     assert view.submission_sha == _TIP, "the tip must be pinned at submission"
 

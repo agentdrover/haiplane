@@ -1153,6 +1153,7 @@ async def hub_submit_for_review(
     agent: str = "",
     summary: str = "",
     branch: str = "",
+    model: str = "",
 ) -> str:
     """Submit the current work of a pair task for client-driven review (#307).
 
@@ -1171,6 +1172,10 @@ async def hub_submit_for_review(
             both names and a way to fix it. Omitting it skips the check —
             the hub cannot see your working copy, so this is your report,
             not its observation (#533).
+        model: The model that wrote this submission (#758) — a declaration
+            like ``branch``, auditable rather than provable. Required for
+            the auto-verdict's model-diversity rule: an empty declaration
+            keeps the verdict with the human.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1181,6 +1186,8 @@ async def hub_submit_for_review(
         body["summary"] = summary
     if branch:
         body["branch"] = branch
+    if model:
+        body["model"] = model
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
