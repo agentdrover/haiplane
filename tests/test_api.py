@@ -3397,3 +3397,45 @@ async def test_ci_report_rejects_bad_token_and_stale_generation(
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief", headers=ci)).json()
     assert brief["ac_test_results"] == []
     assert brief["ci_run_report"]["state"] == "unknown"
+
+
+async def test_zero_raw_machine_review_warns_but_is_accepted(client: AsyncClient):
+    # #750 AC-3: a zero-candidate report is accepted (evidence is worth
+    # keeping) but the hub says out loud that "clean" was not demonstrated —
+    # once per generation, so repeated stubs do not turn into noise.
+    task_id = await _running_pair_task(client, "Zero raw review")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={"agent": "dev"})
+
+    body = {
+        "harness_skill": "multi-agent-review",
+        "harness_version": 7,
+        "agent_count": 1,
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "incomplete": False,
+        "unresolved": [],
+        "lost_dimensions": [],
+        "agent": "cursor_cloud",
+    }
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 200, resp.text
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    alerts = [
+        u["content"]
+        for u in data["updates"] or []
+        if u["kind"] == "alert" and "raw_count=0" in u["content"]
+    ]
+    assert len(alerts) == 1, "the stub shape must be named, once"
+    assert "харнесс не запускался" in alerts[0]
+
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 200, resp.text
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    alerts = [
+        u["content"]
+        for u in data["updates"] or []
+        if u["kind"] == "alert" and "raw_count=0" in u["content"]
+    ]
+    assert len(alerts) == 1, "a repeated stub must not repeat the alert"
