@@ -306,16 +306,32 @@ async def _human_gate_metrics(
     import statistics
 
     event_rows = await db.execute_fetchall(
-        "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, "
-        "COALESCE(p.slug, 'default') AS project, t.ready_at "
+        "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
-        "LEFT JOIN projects p ON p.id = t.project_id "
         "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
         "('task_approved', 'task_rejected', 'review_verdict_recorded', "
         "'task_decided') ORDER BY e.created_at ASC",
         (since,),
     )
+
+    # Project attribution (#747): project_id lives on epics only — children
+    # inherit it by walking up. A direct tasks.project_id join dropped almost
+    # every spike task into 'default' (spike-bo showed 1 decision instead of
+    # ~70). Reuse the SAME resolver the git conveyor uses, memoized per call,
+    # so 'pending → default' and 'outside any epic → default' stay one rule.
+    project_cache: dict[int, str] = {}
+
+    async def project_slug_for(task_id: int | None) -> str:
+        if task_id is None:
+            return "default"
+        if task_id not in project_cache:
+            project_row = await repo.resolve_project_for_task(db, task_id)
+            project_cache[task_id] = (
+                project_row["slug"] if project_row is not None else "default"
+            )
+        return project_cache[task_id]
+
     # The submission moment is written by the hub itself in a fixed shape
     # (submit_for_review), which makes it the one submission timestamp that
     # exists for the whole history — there is no dedicated event yet.
@@ -353,6 +369,7 @@ async def _human_gate_metrics(
 
     for row in event_rows:
         actor = (row["actor"] or "").strip()
+        project_slug = await project_slug_for(row["task_id"])
         decided_at = _parse_hub_ts(row["created_at"])
         kind = row["kind"]
         if kind in {"task_approved", "task_rejected", "task_decided"}:
@@ -366,11 +383,11 @@ async def _human_gate_metrics(
             continue
 
         if kind == "task_approved":
-            entry = bucket("dor", row["project"])
+            entry = bucket("dor", project_slug)
             entry["approvals"] += 1
             record_wait(entry, _parse_hub_ts(row["ready_at"]), decided_at)
         elif kind == "task_rejected":
-            entry = bucket("dor", row["project"])
+            entry = bucket("dor", project_slug)
             entry["overrides"] += 1
             record_wait(entry, _parse_hub_ts(row["ready_at"]), decided_at)
         elif kind == "review_verdict_recorded":
@@ -381,7 +398,7 @@ async def _human_gate_metrics(
             verdict = (payload.get("verdict") or "").lower()
             if verdict not in {"approved", "changes_requested"}:
                 continue
-            entry = bucket("verdict", row["project"])
+            entry = bucket("verdict", project_slug)
             if verdict == "approved":
                 entry["approvals"] += 1
             else:
@@ -400,7 +417,7 @@ async def _human_gate_metrics(
             action = (payload.get("action") or "").lower()
             if action not in {"accept", "rework"}:
                 continue
-            entry = bucket("decision", row["project"])
+            entry = bucket("decision", project_slug)
             if action == "accept":
                 entry["approvals"] += 1
             else:
