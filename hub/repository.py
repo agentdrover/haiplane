@@ -1587,6 +1587,25 @@ async def list_active_review_dispatches(
     )
 
 
+async def get_settled_review_dispatch(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The latest DONE dispatch of this submission generation (#769).
+
+    Only 'done' counts: the sweep sets it after the report of the same
+    generation arrived — a failed or still-active dispatch proves nothing
+    about the emptiness of a review.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT * FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? AND status='done' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, generation),
+    )
+    rows = list(rows)
+    return rows[0] if rows else None
+
+
 async def set_review_dispatch_status(
     db: aiosqlite.Connection, dispatch_id: int, status: str
 ) -> None:

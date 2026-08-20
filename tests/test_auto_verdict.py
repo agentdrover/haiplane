@@ -272,3 +272,84 @@ async def test_policy_verdict_is_auditable_and_deliverable(
     )
     assert resp.status_code == 200, resp.text
     assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "completed"
+
+
+async def _settled_dispatch(
+    db: aiosqlite.Connection, task_id: int, *, usage_total, monkeypatch
+) -> None:
+    """A done hub dispatch for gen 1 plus a stubbed provider usage answer."""
+    from hub.integrations import cursor_cloud
+
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-proof",
+        run_id="run-proof",
+        model="grok-4.6",
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    await db.commit()
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": usage_total}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+
+async def test_proven_empty_review_is_auto_approved(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#769): raw_count=0, but the hub's own dispatch settled and the
+    # provider's billing clears the floor and agrees with the report →
+    # APPROVED by policy with the proof in the grounds line.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-proven", {"verdict": "auto"})
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    # tokens_spent agrees with billing AND stays under the budget trigger
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] == "approved"
+    feed = [u["content"] for u in body["updates"] or []]
+    grounds = [c for c in feed if "Автовердикт APPROVED" in c]
+    assert grounds and "Пустота доказана: usage=250000" in grounds[0]
+
+
+async def test_usage_mismatch_keeps_the_human_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2 (#769): the live grok case — claimed 36k, billed 1.47M. The
+    # mismatch voids the proof; the verdict stays with the human, silently.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-mismatch", {"verdict": "auto"})
+    await _settled_dispatch(db, task_id, usage_total=1_465_666, monkeypatch=monkeypatch)
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=36_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+    assert not await _events(db, "verdict_escalated", task_id), "silent, not a trigger"
+
+
+async def test_unproven_empty_review_stays_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3 (#769): no settled dispatch (or no usage data) — absence of data
+    # is not proof; the #750 rule stands exactly as today.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-unproven", {"verdict": "auto"})
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
