@@ -1074,6 +1074,9 @@ class TaskView(BaseModel):
     # Shadow-mode risk class (#581): read-only surface, None = "not
     # computed" and is NOT the same thing as RiskClass.r0.
     risk_class: RiskClass | None = None
+    # The observable features that produced the class (#582). Empty while
+    # risk_class is None; otherwise each entry names one triggered feature.
+    risk_class_reasons: list[str] = Field(default_factory=list)
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)

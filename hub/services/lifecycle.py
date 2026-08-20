@@ -27,6 +27,7 @@ from hub import repository as repo
 from hub.hub_instance import mutation_activity_detail
 from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
 from hub.integrations.registry import plugins
+from hub.services.risk_class import derive_risk_class
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.task_idempotency import (
@@ -618,6 +619,18 @@ async def create_task(
         task_id = await repo.create_task_full(db, normalized, status=initial_status)
         if project_id is not None:
             await repo.update_task(db, task_id, project_id=project_id)
+
+        # Shadow risk class (#582): derived from the declared areas, never
+        # from anything the author says about risk. No declared areas → the
+        # class honestly stays "not computed" (NULL from the migration).
+        risk, risk_reasons = derive_risk_class(normalized.affected_areas)
+        if risk is not None:
+            await repo.update_task(
+                db,
+                task_id,
+                risk_class=risk.value,
+                risk_class_reasons=db_module.serialize_str_list(risk_reasons),
+            )
 
         if idem_key and request_hash is not None:
             await repo.insert_task_idempotency_key(

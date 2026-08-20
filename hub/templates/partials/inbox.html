@@ -92,7 +92,7 @@
             <span class="badge badge-draft">not refined</span>
             {% endif %}
             {% for r in t.risks %}{% if r.severity.value == 'high' %}<span class="badge badge-failed">high risk</span>{% endif %}{% endfor %}
-            {% if t.risk_class %}<span class="badge badge-risk-{{ t.risk_class.value|lower }}" title="Класс риска — выводится из фактов">{{ t.risk_class.value }}</span>
+            {% if t.risk_class %}<span class="badge badge-risk-{{ t.risk_class.value|lower }}" title="{{ t.risk_class_reasons | join('; ') or 'Класс риска — выводится из фактов' }}">{{ t.risk_class.value }}</span>
             {% else %}<span class="badge badge-risk-unset" title="Класс риска не посчитан — это не R0">риск ?</span>{% endif %}
             {% if t.prepared_by %}<span class="inbox-item-meta">prep: {{ t.prepared_by }}</span>{% endif %}
             <span class="inbox-item-meta">{{ t.created_at[:10] }}</span>

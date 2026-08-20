@@ -42,6 +42,7 @@ STRUCTURED_TASK_COLUMNS = {
     "human_owner",
     "human_reviewer",
     "risk_class",
+    "risk_class_reasons",
 }
 
 

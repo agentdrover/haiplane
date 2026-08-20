@@ -32,8 +32,10 @@ from hub.models import (
     TaskRefineOutcome,
     TaskRisk,
 )
+from hub.db import deserialize_str_list, serialize_str_list
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
+from hub.services.risk_class import derive_risk_class
 from hub.services.test_locator import validate_test_locators
 
 
@@ -354,6 +356,24 @@ async def _apply_refine_writes(
         except ValueError as exc:
             # SAVEPOINT rolls back the structured-fields write too.
             raise DuplicateAcceptanceCriterionError(str(exc)) from exc
+
+    # Shadow risk class (#582): recomputed on EVERY refine from the effective
+    # affected_areas — the one derivation point for both the single and the
+    # bulk flow, same funnel argument as the statement stamp above. TaskRefine
+    # carries no class field, so nothing the caller sends can influence this.
+    if payload.affected_areas is not None:
+        effective_areas = payload.affected_areas
+    elif old_row is not None and "affected_areas" in old_row.keys():
+        effective_areas = deserialize_str_list(old_row["affected_areas"])
+    else:
+        effective_areas = []
+    risk, reasons = derive_risk_class(effective_areas)
+    await repo.update_task(
+        db,
+        task_id,
+        risk_class=risk.value if risk is not None else None,
+        risk_class_reasons=serialize_str_list(reasons),
+    )
 
     return updated_columns, ac_count
 

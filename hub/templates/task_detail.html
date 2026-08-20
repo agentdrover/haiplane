@@ -32,7 +32,7 @@
                 <span class="badge badge-{{ task.source.value }} task-detail-badge">{{ task.source.value }}</span>
                 <span class="badge badge-{{ task.runtime.value }} task-detail-badge">{{ task.runtime.value }}</span>
                 {% if task.risk_class %}
-                <span class="badge badge-risk-{{ task.risk_class.value|lower }} task-detail-badge" title="Класс риска — выводится из фактов, не декларируется">{{ task.risk_class.value }}</span>
+                <span class="badge badge-risk-{{ task.risk_class.value|lower }} task-detail-badge" title="{{ task.risk_class_reasons | join('; ') or 'Класс риска — выводится из фактов, не декларируется' }}">{{ task.risk_class.value }}</span>
                 {% else %}
                 <span class="badge badge-risk-unset task-detail-badge" title="Класс риска не посчитан — это не R0">риск не посчитан</span>
                 {% endif %}
