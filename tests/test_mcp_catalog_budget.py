@@ -58,13 +58,39 @@ async def test_budget_file_covers_every_budgeted_metric():
     assert set(baseline) == {entry["name"] for entry in snapshot["tools_list"]}
 
 
-async def test_model_visible_size_counts_the_instruction_once_per_tool():
-    """Two thirds of the tax epic #776 found is this repetition."""
+async def test_model_visible_size_matches_measured_client_behaviour():
+    """AC-2 (#815): count the instruction once, keep the worst case visible.
+
+    Epic #776 assumed every client repeats the server instruction per tool and
+    budgeted 158241 characters on that basis. One client was then actually
+    looked at — Claude Code shows it once — so the budgeted number follows the
+    measurement, and the assumed one stays in the snapshot under its own name
+    instead of being deleted or quietly kept as the headline.
+    """
     snapshot = _fake_catalog({"a": 10, "b": 20}, instructions="i" * 100)
+    catalog = snapshot["description_chars"] + snapshot["schema_chars"]
+
+    assert snapshot["catalog_chars"] == catalog
+    assert snapshot["model_visible_chars"] == catalog + 100
     assert snapshot["duplicated_instruction_chars"] == 200
-    assert snapshot["model_visible_chars"] == (
-        snapshot["description_chars"] + snapshot["schema_chars"] + 200
-    )
+    assert snapshot["model_visible_chars_if_instruction_per_tool"] == catalog + 200
+
+
+async def test_the_hub_itself_never_repeats_the_instruction_into_descriptions():
+    """AC-1 (#815), server side: the repetition is not something the hub does.
+
+    Whether a client repeats the instruction when composing context is the
+    client's business and differs between them. What the hub publishes is
+    checkable here, and it publishes the instruction exactly once.
+    """
+    from hub.mcp_server import mcp
+
+    instructions = mcp.instructions or ""
+    assert instructions, "the server publishes an instruction block"
+    head = instructions[:80]
+    tools = await mcp.list_tools()
+    offenders = [t.name for t in tools if head in (t.description or "")]
+    assert offenders == []
 
 
 async def test_growth_over_budget_fails_and_names_the_tools():

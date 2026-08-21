@@ -2,11 +2,32 @@
 
 Every agent turn pays for the tool catalog before it pays for anything else:
 each published tool ships a description and an input schema, and the server
-instruction is repeated by the client once per tool. Epic #776 measured that
-tax at 142160 characters and could not say when it had grown, because nothing
-was watching.
+ships one instruction block on top.
 
-Two decisions matter here:
+**How much the instruction costs depends on the client, and that was assumed
+rather than measured (#815).** Epic #776 put the catalog at 142160 characters
+and attributed 95940 of them (67.5%) to the server instruction being repeated
+once per tool. The repetition is not something the hub does: no tool
+description contains the instruction — the check for that is a test. Whether a
+client repeats it when composing the model's context is the client's business,
+and it differs:
+
+* **Claude Code presents it once**, as a single "MCP Server Instructions"
+  section, with tool descriptions carrying only their own text. Measured from
+  inside a live session (#815).
+* **Cursor presents it once too** — one ``serverUseInstructions`` at server
+  level, and ``GetMcpTools`` returning one ``serverDescription`` followed by
+  tool descriptions that start with their own text. Measured from inside a
+  live Cursor session and recorded on #815.
+
+Both target clients therefore pay descriptions + schemas + one instruction, and
+``model_visible_chars`` counts exactly that. The per-tool repetition the epic
+assumed is still reported as
+``model_visible_chars_if_instruction_per_tool``: no client has been seen doing
+it, but the field costs nothing and a third client is not obliged to behave
+like the two that were measured.
+
+Two more decisions matter here:
 
 * **The budget is measured from the real catalog, never from source.** The
   numbers come from ``tools/list`` as a client receives it, so a docstring
@@ -48,10 +69,12 @@ def _schema_chars(schema: Any) -> int:
 def snapshot_from_tools(tools: list[Any], *, instructions: str = "") -> dict[str, Any]:
     """Measure an already-fetched ``tools/list`` result.
 
-    ``model_visible_chars`` counts the server instruction once per tool on
-    purpose. That repetition is not a hub bug — it is how MCP clients present
-    a server — and it was two thirds of the tax epic #776 found, so a
-    measurement that omitted it would report the smaller, wrong number.
+    ``model_visible_chars`` counts the server instruction once, which is what
+    both measured clients actually do (#815). The per-tool repetition the epic
+    assumed is still reported, as
+    ``model_visible_chars_if_instruction_per_tool``: it is the ceiling for a
+    client nobody has measured yet, and dropping it would leave the surface
+    with no upper bound at all.
     """
     instruction_chars = len(instructions or "")
     entries: list[dict[str, Any]] = []
@@ -76,8 +99,12 @@ def snapshot_from_tools(tools: list[Any], *, instructions: str = "") -> dict[str
         "description_chars": description_chars,
         "schema_chars": schema_chars,
         "instruction_chars": instruction_chars,
+        # The client-independent part: what every client pays whatever it does
+        # with the instruction.
+        "catalog_chars": description_chars + schema_chars,
         "duplicated_instruction_chars": instruction_chars * len(entries),
-        "model_visible_chars": description_chars
+        "model_visible_chars": description_chars + schema_chars + instruction_chars,
+        "model_visible_chars_if_instruction_per_tool": description_chars
         + schema_chars
         + instruction_chars * len(entries),
         "max_tool_chars": max((entry["total_chars"] for entry in entries), default=0),
@@ -176,8 +203,10 @@ def check_budget(
                 "description_chars",
                 "schema_chars",
                 "instruction_chars",
+                "catalog_chars",
                 "duplicated_instruction_chars",
                 "model_visible_chars",
+                "model_visible_chars_if_instruction_per_tool",
                 "max_tool_chars",
             )
         },
@@ -193,8 +222,9 @@ def format_report(result: dict[str, Any], *, limit: int = 15) -> str:
         f"descriptions {snap['description_chars']}, "
         f"schemas {snap['schema_chars']}, "
         f"model-visible {snap['model_visible_chars']} chars "
-        f"(server instruction {snap['instruction_chars']} × {snap['tools']} "
-        f"= {snap['duplicated_instruction_chars']})"
+        f"(instruction {snap['instruction_chars']} counted once — measured "
+        f"client behaviour; a client repeating it per tool would pay "
+        f"{snap['model_visible_chars_if_instruction_per_tool']})"
     )
     if result["unknown_budget_keys"]:
         lines.append(
