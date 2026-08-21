@@ -208,7 +208,8 @@ async def test_migration_adds_the_table_without_touching_tasks(
     await db.execute("DROP TABLE outcome_answers")
     await db.execute(
         "DELETE FROM _migrations WHERE name IN "
-        "('create_outcome_answers_table', 'idx_outcome_answers_task')"
+        "('create_outcome_answers_table', 'idx_outcome_answers_task', "
+        "'add_outcome_answers_hypothesis_snapshot')"
     )
     await db.commit()
 

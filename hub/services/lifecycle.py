@@ -33,6 +33,7 @@ from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.ci_report import adopt_ci_run_report
+from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
     hash_task_create_payload,
@@ -551,7 +552,9 @@ async def enrich_task_view(
 
     row = await repo.get_task(db, task_view.id)
     if row:
-        task_view.lifecycle_hint = compute_lifecycle_hint(dict(row))
+        task_dict = dict(row)
+        task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
+        task_view.outcome_status = await outcome_status_for_task(db, task_dict)
 
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
