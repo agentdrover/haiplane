@@ -31,20 +31,30 @@
 {% if u.catalog %}
 <h2>Каталог: постоянный налог</h2>
 <p class="muted">Это то, что агент платит до первого вызова: описания и схемы всех
-инструментов плюс инструкция сервера, которую клиент повторяет для каждого
-инструмента. Бюджет заморожен в <code>docs/agent-context/mcp-catalog-budget.json</code>
-и проверяется в CI.</p>
+инструментов плюс инструкция сервера. Бюджет заморожен в
+<code>docs/agent-context/mcp-catalog-budget.json</code> и проверяется в CI.</p>
 <table class="task-table">
     <tbody>
         <tr><td>Инструментов</td><td>{{ u.catalog.tools }}</td></tr>
         <tr><td>Описания / схемы</td>
             <td>{{ u.catalog.description_chars }} / {{ u.catalog.schema_chars }}</td></tr>
-        <tr><td>Инструкция × инструменты</td>
-            <td>{{ u.catalog.instruction_chars }} × {{ u.catalog.tools }} =
-                {{ u.catalog.duplicated_instruction_chars }}</td></tr>
-        <tr><td>Видно модели, символов</td><td>{{ u.catalog.model_visible_chars }}</td></tr>
+        <tr><td>Каталог без инструкции</td><td>{{ u.catalog.catalog_chars }}</td></tr>
+        <tr><td>Инструкция сервера</td><td>{{ u.catalog.instruction_chars }}</td></tr>
+        <tr><td><strong>Видно модели, символов</strong></td>
+            <td><strong>{{ u.catalog.model_visible_chars }}</strong></td></tr>
+        <tr><td>Если клиент повторяет инструкцию у каждого инструмента</td>
+            <td>{{ u.catalog.model_visible_chars_if_instruction_per_tool }}
+                ({{ u.catalog.instruction_chars }} × {{ u.catalog.tools }} =
+                {{ u.catalog.duplicated_instruction_chars }})</td></tr>
     </tbody>
 </table>
+<p class="muted">Инструкция считается ОДИН раз — так её показывают оба
+измеренных клиента: Claude Code (отдельный блок «MCP Server Instructions») и
+Cursor (<code>serverUseInstructions</code> на уровне сервера). Ни одно описание
+инструмента её не содержит, это закреплено тестом. Эпик #776 исходил из
+обратного — что клиент повторяет инструкцию для каждого инструмента, — и на
+этом предположении налог выглядел почти втрое больше; строка ниже оставлена как
+потолок для клиента, которого пока никто не мерил (#815).</p>
 {% endif %}
 
 <h2>По инструментам</h2>

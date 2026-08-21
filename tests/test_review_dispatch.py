@@ -318,10 +318,12 @@ async def test_high_risk_task_gets_deep_profile(
         client,
         db,
         "spike-deep-risk",
-        risks=[{"kind": "other", "severity": "high", "description": "d"}],
+        # #827: a TECHNICAL high risk. A product one no longer buys the
+        # harness — see test_product_high_risk_does_not_buy_deep.
+        risks=[{"kind": "breaking_change", "severity": "high", "description": "d"}],
     )
     assert (await _dispatch_row(db, by_risk))["profile"] == "deep", (
-        "a declared high risk is exactly what the expensive harness is for"
+        "a declared technical high risk is what the expensive harness is for"
     )
 
 
@@ -613,3 +615,91 @@ def test_known_process_defect_diffs_would_get_deep():
         profile, reasons = pick_review_profile({"risk_class": "R2"}, diff)
         assert profile == "deep", f"{name} must buy the expensive profile"
         assert any("процессная поверхность" in r for r in reasons), name
+
+
+# --- The KIND of risk decides, not the word "high" (#827) --------------------
+#
+# From the first live dispatch (#818): a task honestly declaring "the daily
+# message turns into noise" bought a multi-agent harness that cannot judge
+# whether a message is noise. Dogfooding answers that question; a code review
+# does not. The honest statement should not be the expensive one.
+
+_PRODUCT_RISK = [
+    {
+        "kind": "other",
+        "severity": "high",
+        "description": "ежедневное сообщение превращается в шум",
+    }
+]
+
+
+async def test_product_high_risk_does_not_buy_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#827): the real #818 risk, verbatim. It stays on the class.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-pr"}, "run": {"id": "r-pr"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-product-risk", risks=_PRODUCT_RISK)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
+
+
+def test_technical_high_risk_buys_deep_with_named_kind():
+    # AC-2 (#827): technical high still buys the harness, and the reason says
+    # WHICH kind — "high" alone was never enough to argue with.
+    for kind in ("breaking_change", "data_migration", "performance"):
+        profile, reasons = pick_review_profile(
+            {
+                "risk_class": "R0",
+                "risks": json.dumps([{"kind": kind, "severity": "high"}]),
+            },
+            _HARMLESS_DIFF,
+        )
+        assert profile == "deep", kind
+        assert kind in reasons[0], f"the reason must name the kind: {reasons}"
+
+
+def test_security_kind_still_buys_deep_at_any_severity():
+    # AC-3 (#827): unchanged from #807. A security risk somebody rated 'low'
+    # is still a security risk, and rating it is not the same as judging it.
+    for severity in ("low", "medium", "high"):
+        profile, reasons = pick_review_profile(
+            {
+                "risk_class": "R0",
+                "risks": json.dumps([{"kind": "security", "severity": severity}]),
+            },
+            _HARMLESS_DIFF,
+        )
+        assert profile == "deep", severity
+        assert "security" in reasons[0]
+
+
+async def test_process_surface_wins_over_product_risk(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#827): the new rule must not punch a hole in #820. A product risk
+    # says nothing about a subprocess left running after its timeout.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-pw"}, "run": {"id": "r-pw"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client, db, "spike-product-and-process", risks=_PRODUCT_RISK, diff=_DIFF_509
+    )
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+
+
+def test_unknown_risk_kind_at_high_stays_deep():
+    # AC-5 (#827): not knowing what a risk is must never be the cheap answer
+    # (#582) — and it closes the obvious way around the rule.
+    for kind in ("", "какой-то-новый-вид"):
+        profile, reasons = pick_review_profile(
+            {
+                "risk_class": "R0",
+                "risks": json.dumps([{"kind": kind, "severity": "high"}]),
+            },
+            _HARMLESS_DIFF,
+        )
+        assert profile == "deep", repr(kind)
+        assert "нераспознанным" in reasons[0]
