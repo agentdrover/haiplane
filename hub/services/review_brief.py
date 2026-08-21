@@ -186,6 +186,10 @@ async def build_review_brief(
         machine_review.is_current = machine_review.submission_generation == (
             task_view.submission_generation or 0
         )
+        # #876: what the gate said these findings turned out to be. The same
+        # filler the card uses — the brief shows a later reviewer what was
+        # already judged, and the two readers cannot disagree.
+        await review_evidence.attach_dispositions(db, machine_review)
 
     # Advisory branch-stacking check (#438): the reviewer should know when
     # the diff includes another task's unmerged work. Best-effort — no repo

@@ -68,6 +68,7 @@ from hub.models import (
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
     ProjectPatch,
@@ -763,6 +764,37 @@ async def api_outcome_debt(request: Request):
     the habit of checking.
     """
     return await services.outcome_debt(_db(request))
+
+
+@app.post("/api/tasks/{task_id}/finding-dispositions")
+async def api_record_finding_dispositions(
+    task_id: int,
+    body: FindingDispositionsSubmit,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Say what the current report's confirmed findings turned out to be (#876).
+
+    HUMAN-ONLY, unlike the outcome answer next door. That one is a caller's
+    declaration about production, which any principal may make; this one judges
+    the reviewer's work on the caller's OWN submission, and an agent allowed to
+    mark a finding false would be the reviewed party grading its reviewer.
+
+    ``decided_by`` comes from the authenticated principal and is never read
+    from the payload — a judgement whose author is a free-text argument proves
+    nothing about who made it.
+    """
+    try:
+        return await services.record_finding_dispositions(
+            _db(request),
+            task_id,
+            body.items,
+            decided_by=identity.username,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/tasks/{task_id}/outcome-answers")

@@ -3588,3 +3588,117 @@ async def test_wait_baseline_fires_on_current_verdict(client: AsyncClient):
 
     assert _diverges(baseline, live), "the verdict on this generation must wake it"
     assert live["review_approved_current"] is True
+
+
+# --- Who may judge a finding (#876) -----------------------------------------
+
+
+async def _task_with_machine_report(client: AsyncClient) -> int:
+    """A submitted task carrying one report with two confirmed findings."""
+    resp = await client.post("/api/tasks", json={"title": "Disposition gate"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "grok-4.6",
+            "raw_count": 2,
+            "findings_confirmed": [
+                {"title": "boundary lost", "severity": "medium"},
+                {"title": "race on retry", "severity": "high"},
+            ],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_agent_cannot_set_finding_disposition(
+    client: AsyncClient, monkeypatch, db
+):
+    # AC-2 (#876): an agent marking a finding false is the reviewed party
+    # grading its reviewer. The refusal names its cause and changes nothing.
+    from hub import config
+    from hub import repository as repo_module
+
+    task_id = await _task_with_machine_report(client)
+    monkeypatch.setattr(config, "HUB_TOKENS", _review_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    body = {"items": [{"finding_index": 0, "disposition": "false_positive"}]}
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/finding-dispositions",
+        json=body,
+        headers={"Authorization": "Bearer impl-token"},
+    )
+
+    assert resp.status_code == 403
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    assert not await repo_module.list_finding_dispositions(db, review["id"])
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/finding-dispositions",
+        json=body,
+        headers={"Authorization": "Bearer human-token"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"review_id": review["id"], "confirmed_total": 2, "judged": 1}
+    rows = [
+        dict(r) for r in await repo_module.list_finding_dispositions(db, review["id"])
+    ]
+    assert rows[0]["decided_by"] == "denis", (
+        "the author comes from the token, not the body"
+    )
+
+
+async def test_disposition_outside_the_report_is_refused(client: AsyncClient, db):
+    # A judgement of finding #7 in a two-finding report is not partial success:
+    # the caller judged something else, and storing it would poison precision.
+    from hub import repository as repo_module
+
+    task_id = await _task_with_machine_report(client)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/finding-dispositions",
+        json={
+            "items": [
+                {"finding_index": 0, "disposition": "fixed"},
+                {"finding_index": 7, "disposition": "fixed"},
+            ]
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "outside" in resp.json()["detail"]
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    assert not await repo_module.list_finding_dispositions(db, review["id"]), (
+        "a rejected batch writes nothing at all, not its valid half"
+    )
+
+
+async def test_dispositions_without_a_report_are_refused(client: AsyncClient):
+    # There is nothing to judge before a report exists, and inventing an empty
+    # one would make "no review" and "review with no findings" the same fact.
+    resp = await client.post("/api/tasks", json={"title": "No report yet"})
+    task_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/finding-dispositions",
+        json={"items": [{"finding_index": 0, "disposition": "fixed"}]},
+    )
+
+    assert resp.status_code == 404
+    assert "no machine review" in resp.json()["detail"]

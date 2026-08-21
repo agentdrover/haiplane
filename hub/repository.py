@@ -934,6 +934,57 @@ async def get_latest_machine_review(
     return rows[0] if rows else None
 
 
+# --- Finding dispositions (#876) -------------------------------------------
+
+
+async def upsert_finding_disposition(
+    db: aiosqlite.Connection,
+    *,
+    review_id: int,
+    task_id: int,
+    submission_generation: int,
+    finding_index: int,
+    finding_title: str,
+    disposition: str,
+    note: str,
+    decided_by: str,
+) -> None:
+    """Record what one confirmed finding turned out to be.
+
+    Upsert on (review_id, finding_index): a gate revisiting its own judgement
+    corrects it instead of leaving two contradictory rows for the metrics to
+    average.
+    """
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_title, disposition, "
+        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "disposition=excluded.disposition, note=excluded.note, "
+        "decided_by=excluded.decided_by, decided_at=datetime('now')",
+        (
+            review_id,
+            task_id,
+            submission_generation,
+            finding_index,
+            finding_title,
+            disposition,
+            note,
+            decided_by,
+        ),
+    )
+
+
+async def list_finding_dispositions(
+    db: aiosqlite.Connection, review_id: int
+) -> list[aiosqlite.Row]:
+    return await db.execute_fetchall(
+        "SELECT * FROM finding_dispositions WHERE review_id=? "
+        "ORDER BY finding_index ASC",
+        (review_id,),
+    )
+
+
 # --- AC test results (#507) ------------------------------------------------
 
 

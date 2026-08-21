@@ -5112,3 +5112,132 @@ async def test_diff_lines_carry_their_new_side_address(
     assert 'data-file="submitted.py"' in resp.text
     assert 'data-line="1"' in resp.text
     assert "task-diff-line--anchorable" in resp.text
+
+
+# --- What the finding turned out to be (#876, feature #871) ------------------
+#
+# Review quality used to be measured by the review itself: findings_confirmed
+# against findings_rejected is one run's own adjudication. Nobody recorded what
+# happened to a finding after the gate, so precision by profile and by model
+# could not be computed at all.
+
+_TWO_FINDINGS = [
+    {"title": "boundary lost", "severity": "medium", "file": "hub/a.py"},
+    {"title": "race on retry", "severity": "high", "file": "hub/b.py"},
+]
+
+
+async def test_finding_disposition_saved_at_gate(client: AsyncClient, db):
+    # AC-1 (#876): the gate marks each confirmed finding, and the judgement is
+    # stored against the report and its generation, then read back on the card.
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert "судьба не названа" in page.text, "an unjudged finding must say so"
+    assert "размечено 0 из 2" in page.text
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-finding-dispositions",
+        data={
+            "disposition-0": "fixed",
+            "disposition-1": "false_positive",
+            "note-1": "такого пути в коде нет",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    rows = [
+        dict(r) for r in await repo_module.list_finding_dispositions(db, review["id"])
+    ]
+    assert [r["disposition"] for r in rows] == ["fixed", "false_positive"]
+    assert rows[0]["finding_title"] == "boundary lost", "the title travels with it"
+    assert rows[1]["note"] == "такого пути в коде нет"
+    assert all(
+        r["submission_generation"] == review["submission_generation"] for r in rows
+    )
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert "размечено 2 из 2" in page.text
+    assert "судьба не названа" not in page.text
+
+
+async def test_partial_judgement_stays_partial(client: AsyncClient, db):
+    # A finding left alone is NOT judged. A default here would make every
+    # report look fully reviewed the moment anyone touched the form (#549).
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+
+    await client.post(
+        f"/tasks/{task_id}/web-finding-dispositions",
+        data={"disposition-0": "wont_fix"},
+        follow_redirects=False,
+    )
+
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    rows = await repo_module.list_finding_dispositions(db, review["id"])
+    assert len(rows) == 1 and dict(rows[0])["finding_index"] == 0
+    page = await client.get(f"/tasks/{task_id}")
+    assert "размечено 1 из 2" in page.text
+    assert "судьба не названа" in page.text
+
+
+async def test_disposition_is_corrected_not_duplicated(client: AsyncClient, db):
+    # A gate that changes its mind corrects the row instead of leaving two
+    # contradictory ones for the metrics to average.
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+
+    for value in ("fixed", "wont_fix"):
+        await client.post(
+            f"/tasks/{task_id}/web-finding-dispositions",
+            data={"disposition-0": value},
+            follow_redirects=False,
+        )
+
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    rows = [
+        dict(r) for r in await repo_module.list_finding_dispositions(db, review["id"])
+    ]
+    assert len(rows) == 1 and rows[0]["disposition"] == "wont_fix"
+
+
+async def test_web_disposition_route_rejects_agent_token(
+    client: AsyncClient, monkeypatch, db
+):
+    # The card path is guarded by require_human_or_admin like every other
+    # human gate: the reviewed party must not judge its reviewer.
+    from hub import config
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+    monkeypatch.setattr(config, "HUB_TOKENS", _web_project_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-finding-dispositions",
+        data={"disposition-0": "false_positive"},
+        headers={"Authorization": "Bearer agent-token"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    assert not await repo_module.list_finding_dispositions(db, review["id"])

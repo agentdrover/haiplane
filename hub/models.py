@@ -1882,6 +1882,49 @@ class MachineReviewSubmit(BaseModel):
     agent: str = Field("", max_length=100)
 
 
+class FindingDisposition(str, Enum):
+    """What a confirmed finding turned out to be, once a human looked (#876).
+
+    The boundary between ``false_positive`` and ``wont_fix`` decides precision,
+    so it is written into the type and repeated at the buttons rather than left
+    to intuition: ``false_positive`` means the described defect is NOT in the
+    code; ``wont_fix`` means it is there and we are choosing not to fix it.
+    """
+
+    fixed = "fixed"
+    false_positive = "false_positive"
+    wont_fix = "wont_fix"
+
+
+class FindingDispositionItem(BaseModel):
+    """One judged finding, addressed by its position in findings_confirmed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_index: int = Field(..., ge=0)
+    disposition: FindingDisposition
+    note: str = Field("", max_length=1000)
+
+
+class FindingDispositionsSubmit(BaseModel):
+    """A gate's judgement of the current report's confirmed findings (#876)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[FindingDispositionItem] = Field(..., min_length=1)
+
+
+class FindingDispositionView(BaseModel):
+    """A stored disposition, as the card and the brief read it back."""
+
+    finding_index: int
+    finding_title: str = ""
+    disposition: FindingDisposition
+    note: str = ""
+    decided_by: str = ""
+    decided_at: str = ""
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -1912,6 +1955,9 @@ class MachineReviewView(BaseModel):
     provider_tokens: int | None = None
     submitted_by: str = ""
     created_at: str = ""
+    # What the gate said each confirmed finding turned out to be (#876). An
+    # empty list means nobody judged them — never that they were all fine.
+    dispositions: list[FindingDispositionView] = Field(default_factory=list)
 
     @field_validator("created_at", mode="before")
     @classmethod

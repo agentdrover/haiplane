@@ -1121,6 +1121,45 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_outcome_answers_hypothesis_snapshot",
         "ALTER TABLE outcome_answers ADD COLUMN hypothesis_snapshot TEXT",
     ),
+    (
+        # What a machine-review finding turned out to be (#876, feature #871).
+        # Until now the only measure of review quality was the review itself:
+        # findings_confirmed / findings_rejected is one run's own adjudication,
+        # and filtration_rate divides one by the other. Nobody recorded what
+        # happened to a finding AFTER the gate, so precision by profile and by
+        # model could not be computed at all, and tokens_per_confirmed priced
+        # findings that may never have been fixed.
+        #
+        # Keyed by (review_id, finding_index): a report is immutable, so the
+        # position in findings_confirmed identifies the finding. The title is
+        # snapshotted beside it — a row that survives its report must still be
+        # readable by a person, and the index alone is not.
+        #
+        # No default disposition, and NO BACKFILL for existing reports: "not
+        # stated" is an answer, and writing one in for rows nobody judged is
+        # exactly the substitution #549 exists to prevent.
+        "create_finding_dispositions",
+        """CREATE TABLE IF NOT EXISTS finding_dispositions (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id             INTEGER NOT NULL,
+            task_id               INTEGER NOT NULL,
+            submission_generation INTEGER NOT NULL,
+            finding_index         INTEGER NOT NULL,
+            finding_title         TEXT    NOT NULL DEFAULT '',
+            disposition           TEXT    NOT NULL,
+            note                  TEXT    NOT NULL DEFAULT '',
+            decided_by            TEXT    NOT NULL DEFAULT '',
+            decided_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # One disposition per finding: a second pass over the same gate
+        # corrects the first rather than stacking a contradictory row beside
+        # it. The reads are always "everything judged in this report".
+        "idx_finding_dispositions_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dispositions_unique "
+        "ON finding_dispositions(review_id, finding_index)",
+    ),
 ]
 
 
