@@ -175,6 +175,12 @@ class NoopGitOps:
         """No git here — the reader must see "could not look" (#824)."""
         return None
 
+    async def commit_diff_stat(
+        self, repo: str, base: str, sha: str
+    ) -> list[tuple[int, int, str]] | None:
+        """No git here — "could not look", never "nothing changed" (#825)."""
+        return None
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
         never as "clean" (#534)."""

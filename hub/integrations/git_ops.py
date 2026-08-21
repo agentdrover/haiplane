@@ -952,6 +952,38 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def commit_diff_stat(
+        self, repo: str, base: str, sha: str
+    ) -> list[tuple[int, int, str]] | None:
+        """``git diff --numstat base...sha``, or None when unreadable (#825).
+
+        Paths and counts only. The card needs to know WHICH files a submission
+        touched to lay criteria against them; reading every hunk for that would
+        put the cost of the full diff on every gate render, and the full diff
+        is already loaded on demand (#824).
+        """
+        rc, out, _ = await _git(
+            "diff", "--numstat", f"{base}...{sha}", repo=repo, check=False
+        )
+        if rc != 0:
+            return None
+        rows: list[tuple[int, int, str]] = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            added, removed, path = parts
+            # "-" stands for a binary file: no line counts, but the path still
+            # changed and must not vanish from the map.
+            rows.append(
+                (
+                    int(added) if added.isdigit() else 0,
+                    int(removed) if removed.isdigit() else 0,
+                    path.strip(),
+                )
+            )
+        return rows
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """Refresh one base branch from origin. Read-only, never writes (#534)."""
         rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)

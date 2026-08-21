@@ -180,6 +180,9 @@ class GitOpsPlugin(Protocol):
     async def commit_diff(
         self, repo: str, base: str, sha: str, *, context: int = 3
     ) -> str | None: ...
+    async def commit_diff_stat(
+        self, repo: str, base: str, sha: str
+    ) -> list[tuple[int, int, str]] | None: ...
     async def auto_commit(
         self,
         task_id: int,

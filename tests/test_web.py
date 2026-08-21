@@ -4844,3 +4844,172 @@ async def test_diff_requires_the_same_auth_as_the_card(
 
     assert resp.status_code == 303, resp.status_code
     assert "submitted.py" not in resp.text
+
+
+# ---- #825: criteria laid against the changes, and the changes nobody ordered ----
+
+
+def _mapped_repo(tmp_path) -> tuple[str, str]:
+    """A submission touching one file of each kind the map must separate."""
+    import subprocess
+
+    root = tmp_path / "maprepo"
+    root.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(root),
+    }
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args], cwd=root, check=True, capture_output=True, env=env
+        )
+
+    git("init", "-b", "main")
+    (root / "seed.py").write_text("x = 1\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "task-map/work")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_bound.py").write_text(
+        "def test_bound():\n    assert True\n"
+    )
+    (root / "declared.py").write_text("def declared():\n    return 'asked for'\n")
+    (root / "stray.py").write_text("def stray():\n    return 'nobody asked'\n")
+    git("add", ".")
+    git("commit", "-m", "submission")
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    return str(root), sha
+
+
+async def _mapped_task(
+    client: AsyncClient, db, monkeypatch, tmp_path, *, test_ref: str
+) -> int:
+    from hub import repository as repo_module
+
+    workspace, sha = _mapped_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "commit_diff_stat",
+        GitOpsIntegration().commit_diff_stat,
+        raising=False,
+    )
+
+    task_id = await _web_task_in_review(client)
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "affected_areas": ["declared.py"],
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "сдача с изменениями",
+                    "when": "читается панель",
+                    "then": "критерий стоит рядом со своими изменениями",
+                    "verifiable_by": "test",
+                    "test_ref": test_ref,
+                }
+            ],
+        },
+    )
+    row = await repo_module.get_task(db, task_id)
+    await repo_module.upsert_ac_test_result(
+        db,
+        task_id=task_id,
+        ac_id="AC-1",
+        generation=dict(row)["submission_generation"],
+        status="pass",
+    )
+    await repo_module.update_task(
+        db, task_id, branch="task-map/work", submission_sha=sha
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_criteria_are_bound_to_their_changes(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-1 (#825): the criterion and the change it caused, in one place. While
+    # they sat in two lists, joining them was the reader's job — the expensive
+    # half of a review, and the half that gets skipped.
+    task_id = await _mapped_task(
+        client, db, monkeypatch, tmp_path, test_ref="tests/test_bound.py::test_bound"
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "изменения критерия:" in resp.text
+    assert "tests/test_bound.py" in resp.text
+    assert "точная привязка" in resp.text
+
+
+async def test_green_criterion_without_changes_is_called_out(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-2 (#825): a tick with nothing behind it in this submission. Today it
+    # reads as done and passes the gate unnoticed.
+    task_id = await _mapped_task(
+        client,
+        db,
+        monkeypatch,
+        tmp_path,
+        test_ref="tests/test_absent.py::test_absent",
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "тест зелёный, изменений критерия нет" in resp.text
+    assert "не менялся" in resp.text
+
+
+async def test_unattributed_changes_are_listed(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-3 (#825): the reverse question. Nothing marks these today, and this is
+    # where the risk that survives review lives.
+    task_id = await _mapped_task(
+        client, db, monkeypatch, tmp_path, test_ref="tests/test_bound.py::test_bound"
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "Изменения, которых никто не просил:" in resp.text
+    assert "stray.py" in resp.text
+    assert "вне объявленных областей" in resp.text
+
+
+async def test_weak_attribution_is_marked_as_such(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-4 (#825): "declared in the task's areas" is not "verified by this
+    # criterion". A confident wrong attribution is worse than an absent one —
+    # it puts a tick where the reader would otherwise look.
+    task_id = await _mapped_task(
+        client, db, monkeypatch, tmp_path, test_ref="tests/test_bound.py::test_bound"
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "предположительно по объявленным областям" in resp.text
+    assert "declared.py" in resp.text
+    assert "к конкретному критерию не привязана" in resp.text
+    # The weak bucket must not be dressed up as the exact one.
+    weak_at = resp.text.index("предположительно по объявленным областям")
+    exact_at = resp.text.index("точная привязка")
+    assert exact_at < weak_at

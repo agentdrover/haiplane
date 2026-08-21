@@ -1251,6 +1251,31 @@ async def web_task_detail(
 
     evidence = await gate_evidence(db, dict(row))
 
+    # #825: the criteria and the changes, laid against each other. Built from
+    # the numstat of the pinned submission — paths, not hunks: the hunks load
+    # on demand (#824), and this map only needs to know which files moved.
+    change_map = None
+    if evidence is not None:
+        from hub.services import change_map as change_map_service
+        from hub.services.task_diff import READ, submission_files
+
+        listing = await submission_files(db, task_id)
+        if listing["state"] == READ:
+            findings = []
+            if machine_review is not None and machine_review.is_current:
+                findings = list(machine_review.findings_confirmed or [])
+            change_map = change_map_service.build(
+                listing["files"],
+                evidence.acceptance_criteria,
+                evidence.ac_test_results,
+                task.affected_areas or [],
+                findings,
+            )
+        else:
+            # Same rule as every other block here: no map is a stated cause,
+            # never an empty list that reads as "nothing changed" (#725).
+            change_map = {"unavailable": listing["reason"]}
+
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
     if task.status.value == "review" and not task.review_job_id:
@@ -1291,6 +1316,7 @@ async def web_task_detail(
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,
             "evidence": evidence,
+            "change_map": change_map,
             "machine_review": machine_review,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
