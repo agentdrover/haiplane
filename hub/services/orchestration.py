@@ -264,6 +264,7 @@ async def practice_metrics(
     ]
 
     human_gates = await _human_gate_metrics(db, since)
+    review_outcomes = await _review_outcome_metrics(db, since)
 
     return {
         "since_days": since_days,
@@ -272,6 +273,116 @@ async def practice_metrics(
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
         "human_gates": human_gates,
+        "review_outcomes": review_outcomes,
+    }
+
+
+async def _review_outcome_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """First-pass acceptance and changes-requested rate (#522).
+
+    Two different questions, so two different denominators, and both are
+    reported beside their rates rather than left to be reconstructed:
+
+    * ``first_pass_acceptance_rate`` is per TASK — the share of tasks that
+      were approved on their first submission. "First time" is pinned to
+      ``submission_generation == 1``: the generation is bumped only by a
+      resubmission, so a verdict on a later generation is proof that work
+      came back. A task whose first submission collected a
+      ``changes_requested`` does not become first-pass by being approved
+      afterwards on the same generation.
+    * ``changes_requested_rate`` is per VERDICT — the proportion the task
+      statement names (changes_requested against approved). Mixing the two
+      denominators into one number is what makes such a metric unreadable
+      three months later.
+
+    Verdicts whose payload carries no usable generation cannot answer the
+    first-pass question at all. Their tasks are counted in
+    ``tasks_unaccounted`` and kept OUT of the first-pass denominator
+    instead of being silently scored as reworked — the #518/#519 rule: say
+    what is not known rather than let it flatter or spoil the rate. Those
+    verdicts still count toward the changes-requested rate, which does not
+    need a generation.
+
+    Self-approved first passes are counted separately: a submission the
+    author waved through is not evidence of quality, and folding it into
+    the headline number would let the rate rise by removing the reviewer.
+    The full self-approval picture is its own metric (#523).
+    """
+    import json as _json
+
+    rows = await db.execute_fetchall(
+        "SELECT task_id, payload FROM events "
+        "WHERE kind = 'review_verdict_recorded' "
+        "AND created_at >= datetime('now', ?)",
+        (since,),
+    )
+
+    approved = 0
+    changes_requested = 0
+    per_task: dict[int, dict[str, bool]] = {}
+
+    for row in rows:
+        try:
+            payload = _json.loads(row["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        verdict = (payload.get("verdict") or "").lower()
+        if verdict not in {"approved", "changes_requested"}:
+            continue
+        if verdict == "approved":
+            approved += 1
+        else:
+            changes_requested += 1
+
+        task_id = row["task_id"]
+        if task_id is None:
+            continue
+        entry = per_task.setdefault(
+            task_id,
+            {
+                "generation_known": False,
+                "first_approved": False,
+                "first_changes": False,
+                "self_approved": False,
+            },
+        )
+        generation = payload.get("submission_generation")
+        # bool is an int in Python; a True here would mean generation 1.
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            continue
+        entry["generation_known"] = True
+        if generation != 1:
+            continue
+        if verdict == "approved":
+            entry["first_approved"] = True
+            entry["self_approved"] = entry["self_approved"] or bool(
+                payload.get("self_approved")
+            )
+        else:
+            entry["first_changes"] = True
+
+    measurable = [e for e in per_task.values() if e["generation_known"]]
+    first_pass = [
+        e for e in measurable if e["first_approved"] and not e["first_changes"]
+    ]
+    verdicts = approved + changes_requested
+
+    return {
+        "tasks": len(measurable),
+        "tasks_unaccounted": len(per_task) - len(measurable),
+        "first_pass_tasks": len(first_pass),
+        "first_pass_acceptance_rate": (
+            round(len(first_pass) / len(measurable), 3) if measurable else None
+        ),
+        "self_approved_first_pass": sum(1 for e in first_pass if e["self_approved"]),
+        "verdicts": verdicts,
+        "approved": approved,
+        "changes_requested": changes_requested,
+        "changes_requested_rate": (
+            round(changes_requested / verdicts, 3) if verdicts else None
+        ),
     }
 
 

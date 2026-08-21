@@ -42,6 +42,37 @@ latency и размер ответов — на отдельной страни�
 занижало ответ на 38 процентов. Строка покрытия выше показывает, какая доля
 выборки вошла в расчёт.</p>
 
+<h2>Review outcomes: с первого раза</h2>
+<table class="task-table">
+    <tbody>
+        <tr><td>First-pass acceptance (задачи, одобренные с первой сдачи)</td>
+            <td>{% if m.review_outcomes.first_pass_acceptance_rate is not none %}{{ (m.review_outcomes.first_pass_acceptance_rate * 100) | round(1) }}%
+                <span class="muted">({{ m.review_outcomes.first_pass_tasks }} из {{ m.review_outcomes.tasks }})</span>
+                {% else %}<span class="muted">нет вердиктов в окне</span>{% endif %}</td></tr>
+        <tr><td>Changes-requested rate (доля вердиктов с правками)</td>
+            <td>{% if m.review_outcomes.changes_requested_rate is not none %}{{ (m.review_outcomes.changes_requested_rate * 100) | round(1) }}%
+                <span class="muted">({{ m.review_outcomes.changes_requested }} из {{ m.review_outcomes.verdicts }} вердиктов)</span>
+                {% else %}<span class="muted">нет вердиктов в окне</span>{% endif %}</td></tr>
+        <tr><td>Из них одобрено самим автором</td>
+            <td>{% if m.review_outcomes.self_approved_first_pass %}{{ m.review_outcomes.self_approved_first_pass }} из {{ m.review_outcomes.first_pass_tasks }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Задач без читаемого номера сдачи (вне знаменателя first-pass)</td>
+            <td>{% if m.review_outcomes.tasks_unaccounted %}{{ m.review_outcomes.tasks_unaccounted }}{% else %}—{% endif %}</td></tr>
+    </tbody>
+</table>
+
+<p class="muted">«С первого раза» — это вердикт approved на первой сдаче
+(submission_generation = 1): номер сдачи растёт только при пересдаче, поэтому
+вердикт на второй генерации и есть доказательство, что работа возвращалась.
+Задача, у которой на первой сдаче были запрошены правки, не становится
+first-pass от того, что её одобрили следом.</p>
+
+<p class="muted">Знаменатели разные и названы рядом с числами: first-pass
+считается по задачам, доля правок — по вердиктам. Вердикт, у которого номер
+сдачи не читается, ответить на вопрос «с первого ли раза» не может: такая
+задача выходит из знаменателя и показана отдельной строкой, а не засчитывается
+как пересдача. Самоодобрение показано рядом: рейт, который растёт от того, что
+ревьюера убрали, ничего не измеряет — полная картина в отдельной метрике.</p>
+
 <h2>By harness version</h2>
 <table class="task-table">
     <thead><tr><th>Harness</th><th>Reviews</th><th>Raw</th><th>Confirmed</th><th>Tokens</th></tr></thead>
