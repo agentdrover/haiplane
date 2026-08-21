@@ -2537,6 +2537,46 @@ async def prune_agent_messages(db: aiosqlite.Connection, *, keep_days: int = 14)
     return cur.rowcount or 0
 
 
+async def list_task_messages(
+    db: aiosqlite.Connection, task_id: int, *, limit: int = 200
+) -> list[aiosqlite.Row]:
+    """The conversation about one task, oldest first (#775).
+
+    Two ways in, on purpose: a message addressed to the task channel, and a
+    message addressed to someone in particular that names this task. Both are
+    talk about this task, and an owner reading the card wants the conversation,
+    not the addressing scheme.
+    """
+    return list(
+        await db.execute_fetchall(
+            "SELECT * FROM agent_messages "
+            "WHERE (to_kind = 'task' AND to_ref = ?) OR related_task_id = ? "
+            "ORDER BY id ASC LIMIT ?",
+            (str(task_id), task_id, min(limit, 500)),
+        )
+    )
+
+
+async def list_recent_threads(
+    db: aiosqlite.Connection, *, limit: int = 10
+) -> list[aiosqlite.Row]:
+    """Last message of each thread plus its size, newest thread first (#775).
+
+    Every thread, whatever it is addressed to — a conversation between two
+    sessions with no task attached is exactly the kind the owner must not have
+    to go looking for.
+    """
+    return list(
+        await db.execute_fetchall(
+            "SELECT m.*, t.messages AS messages FROM agent_messages m "
+            "JOIN (SELECT thread_id, COUNT(*) AS messages, MAX(id) AS last_id "
+            "      FROM agent_messages GROUP BY thread_id) t ON m.id = t.last_id "
+            "ORDER BY m.id DESC LIMIT ?",
+            (min(limit, 50),),
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP usage telemetry (#780)
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.models import (
+    MessageSend,
     BatchApprove,
     ProjectCreate,
     ProjectPatch,
@@ -706,8 +707,16 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
     )
+    # Coordination panels (#775): who is around, and what the sessions are
+    # saying to each other. Deliberately unfiltered by project — a session
+    # belongs to an agent, not to a project, and a thread the owner cannot see
+    # is the one thing this feature is not allowed to have.
+    agent_sessions = await services.get_agent_sessions_panel(db)
+    message_threads = await services.get_message_threads_panel(db)
     ctx: dict[str, Any] = {
         "data": data,
+        "agent_sessions": agent_sessions,
+        "message_threads": message_threads,
         "epics_enriched": epics,
         "epics": epics,
         "board": board,
@@ -1234,11 +1243,20 @@ async def web_task_detail(
 
         machine_review_gap_text = await machine_review_gap(db, dict(row))
 
+    # The conversation about this task (#775) — a separate list from the
+    # update feed above it: updates are the lifecycle journal, messages are
+    # people and agents talking. Merged into one stream both would lose their
+    # meaning.
+    task_messages = [
+        services.message_view(row) for row in await repo.list_task_messages(db, task_id)
+    ]
+
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
+            "task_messages": task_messages,
             "machine_review": machine_review,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
@@ -1428,6 +1446,41 @@ async def web_answer_task(
     _require_human_web(request)
     body = TaskAnswer(answer=answer, resume=resume)
     await services.answer_question(_db(request), task_id, body)
+    if _is_htmx(request):
+        return await _htmx_task_done_fragment(request, task_id)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-message")
+async def web_send_message(
+    task_id: int,
+    request: Request,
+    body: str = Form(...),
+    to_kind: str = Form("task"),
+    to_ref: str = Form(""),
+    kind: str = Form("note"),
+):
+    """The owner writes into the same channel the agents use (#775).
+
+    Same endpoint, same table, same provenance rules — a separate path for
+    humans would make the UI and the API tell different stories about who said
+    what. The identity is the web session's own.
+    """
+    _require_human_web(request)
+    identity = current_identity(request)
+    payload = MessageSend(
+        to_kind=to_kind or "task",
+        to_ref=(to_ref or str(task_id)),
+        body=body,
+        kind=kind or "note",
+        related_task_id=task_id,
+    )
+    await services.send_message(
+        _db(request),
+        payload,
+        agent=identity.username,
+        principal_id=identity.principal_id,
+    )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

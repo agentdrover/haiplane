@@ -548,3 +548,42 @@ async def list_activity(
     """List recent activity items."""
     rows = await repo.list_activity(db, limit=limit)
     return _parse_activity_rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Coordination panels (#775): sessions and threads, for the owner's view
+# ---------------------------------------------------------------------------
+
+
+async def get_agent_sessions_panel(db: aiosqlite.Connection) -> list[dict]:
+    """Registered sessions with presence, freshest first.
+
+    Presence comes from the same place the API computes it (#771), so the badge
+    on the dashboard and the answer to a caller can never disagree — and the
+    age of the last sign of life travels with it, because "online" alone is a
+    claim nobody can check.
+    """
+    from hub.services.sessions import session_view
+
+    rows = await repo.list_agent_sessions(db, limit=50)
+    return [session_view(row) for row in rows]
+
+
+async def get_message_threads_panel(
+    db: aiosqlite.Connection, *, limit: int = 10
+) -> list[dict]:
+    """Latest message of each thread with its size (#775).
+
+    Every thread is here, including ones addressed straight from one session to
+    another with no task attached: the channel is allowed to exist precisely
+    because the owner sees all of it.
+    """
+    from hub.services.messaging import message_view
+
+    threads: list[dict] = []
+    for row in await repo.list_recent_threads(db, limit=limit):
+        data = dict(row)
+        view = message_view(data)
+        view["messages"] = data.get("messages") or 1
+        threads.append(view)
+    return threads
