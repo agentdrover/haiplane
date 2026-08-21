@@ -3151,3 +3151,55 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
         )
     )
     return str(dict(rows[0])["merge_sha"]) if rows else ""
+
+
+# --- Releases: what is actually running in production (#839) ----------------
+
+RELEASE_SUCCESS = "success"
+RELEASE_FAILED = "failed"
+
+
+async def record_release(
+    db: aiosqlite.Connection,
+    *,
+    deployed_sha: str,
+    project_id: int | None = None,
+    ref: str = "",
+    status: str = RELEASE_SUCCESS,
+    source: str = "",
+) -> int:
+    """Record one deploy attempt and return its id.
+
+    Failures are recorded too, on purpose: a deploy that fell over is evidence
+    about the pipeline, and dropping it would make the failure look like it
+    never happened. Readers ask for the last SUCCESSFUL release, so a failure
+    never becomes the state of production.
+    """
+    cursor = await db.execute(
+        "INSERT INTO releases (project_id, deployed_sha, ref, status, source) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (project_id, deployed_sha.strip(), ref.strip(), status.strip(), source.strip()),
+    )
+    await db.commit()
+    return int(cursor.lastrowid or 0)
+
+
+async def latest_successful_release(
+    db: aiosqlite.Connection, project_id: int | None = None
+) -> dict[str, Any] | None:
+    """The newest successful deploy for a project, or ``None`` for UNKNOWN.
+
+    ``None`` means the hub has no record — NOT that nothing is deployed. The
+    distinction is the whole point of this table: an installation that
+    predates it, or one whose CI does not report yet, must read as "we do not
+    know", never as "not in production". Collapsing the two would turn silence
+    into a denial, which is the failure this epic exists to remove (#725).
+    """
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT * FROM releases WHERE status = ? "
+            "AND (? IS NULL OR project_id = ?) ORDER BY id DESC LIMIT 1",
+            (RELEASE_SUCCESS, project_id, project_id),
+        )
+    )
+    return dict(rows[0]) if rows else None

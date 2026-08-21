@@ -1074,6 +1074,34 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_agent_messages_for_session",
         "ALTER TABLE agent_messages ADD COLUMN for_session TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # What is actually RUNNING, as opposed to what was merged (#839).
+        # The hub already records its own merges (pipeline_merges, #534), and
+        # a merge was read as delivery — on 21.08.2026 a task sat completed
+        # with its PR merged into develop while the deploy job was skipped,
+        # because deployment runs from main. "Merged" and "running" had no way
+        # to be different facts, so they were the same one, wrongly.
+        #
+        # status is kept for failed deploys too: a deploy that fell over is
+        # evidence about the pipeline, and dropping it would leave the failure
+        # looking like it never happened. Readers ask for the last SUCCESSFUL
+        # release, so a failure never becomes the state of production.
+        "create_releases",
+        """CREATE TABLE IF NOT EXISTS releases (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER,
+            deployed_sha TEXT    NOT NULL,
+            ref          TEXT    NOT NULL DEFAULT '',
+            status       TEXT    NOT NULL DEFAULT 'success',
+            source       TEXT    NOT NULL DEFAULT '',
+            deployed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # Reads are always "the newest row for this project", never a scan.
+        "idx_releases_project",
+        "CREATE INDEX IF NOT EXISTS idx_releases_project ON releases(project_id, id)",
+    ),
 ]
 
 
