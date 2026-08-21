@@ -56,11 +56,15 @@ async def project_git_context(
 
 
 def machine_review_required(task: dict[str, Any], project_policy: str = "auto") -> bool:
-    """Machine-review applicability cascade (#382).
+    """Machine-review applicability cascade (#382, #806).
 
     task override > project policy > auto rules from task metadata.
     Computed at submit/verdict time, not at creation — size and risks are
     refined along the way and the decision must see current values.
+
+    The auto rules, in order: a high or security risk always requires review;
+    docs, chore and spike are exempt by their nature; everything else — the
+    work types that change code — requires it regardless of declared size.
     """
     import json as _json
 
@@ -87,11 +91,14 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
     work_type = (task.get("work_type") or "feature").strip()
     if work_type in ("docs", "chore", "spike"):
         return False
-    if work_type == "refactor":
-        return True
-    if (task.get("size") or "").strip() in ("XS", "S"):
-        return False
-    # feature/bug/incident sized M+ (or unsized — err toward review)
+    # Size no longer excuses a change to code (#806). The exemption made sense
+    # while a human on the gate read the diff himself — a small change could be
+    # eyeballed. The owner does not read code, so "small task" now means
+    # "nobody looked at all": #522 was S, touched orchestration.py, mcp_server.py
+    # and a template, and reached the human gate with no report and no notice
+    # that one was missing. Size is also the author's own estimate, and an
+    # exemption from oversight resting on self-assessment is exactly what #582
+    # ruled out for risk class.
     return True
 
 

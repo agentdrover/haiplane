@@ -3439,3 +3439,54 @@ async def test_zero_raw_machine_review_warns_but_is_accepted(client: AsyncClient
         if u["kind"] == "alert" and "raw_count=0" in u["content"]
     ]
     assert len(alerts) == 1, "a repeated stub must not repeat the alert"
+
+
+# ---- #806: declared size stops excusing a change to code ----
+#
+# The cascade let XS/S out before it ever looked at what the work touches.
+# #522 was S, changed orchestration.py, mcp_server.py and a template, and
+# reached the human gate with no report and no notice that one was missing.
+
+
+def _mr_size_task(**overrides) -> dict:
+    task = {
+        "work_type": "feature",
+        "size": "S",
+        "risks": "[]",
+        "machine_review_override": "",
+    }
+    task.update(overrides)
+    return task
+
+
+def test_small_code_task_still_requires_machine_review():
+    from hub.services.orchestration import machine_review_required
+
+    for work_type in ("feature", "bug", "refactor", "incident"):
+        for size in ("XS", "S"):
+            task = _mr_size_task(work_type=work_type, size=size)
+            assert machine_review_required(task, "auto") is True, (
+                f"{work_type}/{size} changes code: the declared size is the "
+                "author's own estimate, not a reason to skip review"
+            )
+
+
+def test_docs_task_stays_exempt_from_machine_review():
+    from hub.services.orchestration import machine_review_required
+
+    for work_type in ("docs", "chore", "spike"):
+        task = _mr_size_task(work_type=work_type, size="S")
+        assert machine_review_required(task, "auto") is False, (
+            "the exemption that survives is the one about the nature of the "
+            "work, not about its declared size"
+        )
+
+
+def test_task_override_skip_still_wins():
+    from hub.services.orchestration import machine_review_required
+
+    task = _mr_size_task(work_type="feature", size="S", machine_review_override="skip")
+    assert machine_review_required(task, "auto") is False
+    assert machine_review_required(task, "always") is False, (
+        "an explicit override stays above both the new rule and the policy"
+    )
