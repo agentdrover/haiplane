@@ -2709,6 +2709,28 @@ async def list_agent_sessions(
     )
 
 
+async def list_unaddressable_tasks(
+    db: aiosqlite.Connection, *, limit: int = 200
+) -> list[aiosqlite.Row]:
+    """Pair tasks in flight whose claim carries no session (#852).
+
+    Work is happening and nobody can be asked about it: claimed or running,
+    no ``claim_session_id``, and no ``job_id`` — headless tasks are excluded
+    on purpose, their executor is the dispatch job, not a session.
+    """
+    return list(
+        await db.execute_fetchall(
+            "SELECT id, title, status, claimed_by, claimed_at, branch "
+            "FROM tasks WHERE status IN ('claimed', 'running') "
+            "AND (claim_session_id IS NULL OR claim_session_id = '') "
+            "AND (job_id IS NULL OR job_id = '') "
+            "AND COALESCE(archived, 0) = 0 "
+            "ORDER BY claimed_at ASC, id ASC LIMIT ?",
+            (min(limit, 500),),
+        )
+    )
+
+
 async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
     """Drop sessions with no sign of life for ``keep_days``. Rows removed."""
     cur = await db.execute(

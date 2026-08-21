@@ -849,7 +849,7 @@ async def test_web_solo_verdict_marked_and_badge_rendered(
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "bot"},
+        json={"assigned_agent": "bot", "session_id": "s-bot"},
         headers=agent,
     )
     assert resp.status_code == 200, resp.text
@@ -917,7 +917,7 @@ async def test_web_review_verdict_rejects_self_review(client: AsyncClient, monke
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "bot"},
+        json={"assigned_agent": "bot", "session_id": "s-bot"},
         headers=agent,
     )
     assert resp.status_code == 200, resp.text

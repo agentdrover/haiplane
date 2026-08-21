@@ -12,6 +12,8 @@ from __future__ import annotations
 import aiosqlite
 from httpx import AsyncClient
 
+from hub import repository as repo
+
 
 async def _walk_pair_lifecycle(client: AsyncClient, task_id: int) -> list[str]:
     """Run the canonical pair cycle and return the observed status trace."""
@@ -84,3 +86,34 @@ async def test_risk_class_does_not_change_gates(
     # The class itself survived the whole cycle untouched.
     resp = await client.get(f"/api/tasks/{classified_id}")
     assert resp.json()["risk_class"] == "R5"
+
+
+# ---- #852 AC-4: the session requirement is scoped to the pair path ----
+
+
+async def test_headless_path_does_not_require_session(db: aiosqlite.Connection):
+    """A dispatched task has no session by construction, and must not need one.
+
+    #852 makes an agent name the session that takes a task, because a name
+    does not identify an executor. Headless work is the case where that
+    reasoning does not apply: the executor is the dispatch job, recorded in
+    ``job_id``, and no session exists to name. If the new guard leaked into
+    this path, every headless task would stop starting.
+    """
+    from hub import services
+    from hub.models import TaskCreate, TaskStart
+
+    tv = await services.create_task(db, TaskCreate(title="Dispatched, not paired"))
+
+    started = await services.start_task(db, tv.id, TaskStart(plan="Plan: run headless"))
+
+    assert started.status.value == "running", "headless start still works"
+    task = dict(await repo.get_task(db, tv.id))
+    assert not task["claim_session_id"], "nothing invented a session for it"
+
+    # And it is not counted as unaddressable either: a dispatched task has an
+    # executor, it just is not a session (job_id is what names it).
+    await repo.update_task(db, tv.id, job_id="job-headless")
+    await db.commit()
+    orphans = [t.id for t in await services.unaddressable_tasks(db)]
+    assert tv.id not in orphans

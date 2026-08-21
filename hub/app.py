@@ -62,6 +62,7 @@ from hub.models import (
     MessageView,
     SessionRegister,
     SessionView,
+    UnaddressableTask,
     TaskClaim,
     TaskContextView,
     TaskCreate,
@@ -1759,6 +1760,7 @@ async def api_pair_start_task(
         body,
         caller=identity.username,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+        caller_is_agent=identity.is_agent,
     )
 
 
@@ -1777,6 +1779,7 @@ async def api_claim_task(
         task_id,
         body,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+        caller_is_agent=identity.is_agent,
     )
 
 
@@ -1922,6 +1925,21 @@ async def api_list_sessions(
 ):
     """Registered sessions with presence and the age behind it."""
     return await services.list_sessions(_db(request), agent=agent, status=status)
+
+
+@app.get("/api/sessions/unaddressable", response_model=list[UnaddressableTask])
+async def api_unaddressable_tasks(
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Tasks in flight that no session can be reached about (#852).
+
+    The registry says who is around; this says what is being worked with no
+    address attached. Both are needed to coordinate — a task nobody can be
+    asked about is invisible in the first list precisely because it has no
+    session behind it.
+    """
+    return await services.unaddressable_tasks(_db(request))
 
 
 # --- Q&A: Question / Answer ---

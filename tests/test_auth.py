@@ -475,7 +475,9 @@ async def test_agent_token_can_pair_start(client, monkeypatch):
 
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"plan": "Plan: work in Cursor"},
+        # #852: an agent declares the session that takes the task; what this
+        # test holds — an agent token may pair-start at all — is unchanged.
+        json={"plan": "Plan: work in Cursor", "session_id": "s-bot"},
         headers={"Authorization": "Bearer agent-token"},
     )
     assert resp.status_code == 200

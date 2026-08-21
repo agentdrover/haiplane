@@ -504,6 +504,11 @@ class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
     branch_slug: str = Field("", max_length=80)
+    # #852: which session takes the task, not just which agent name. The name
+    # does not identify an executor — one agent runs many sessions at once —
+    # and everything addressable (registry #771, messages #773, wake-up #774)
+    # routes by session. Required for agent callers; humans pair-start as before.
+    session_id: str = Field("", max_length=200)
 
 
 class TaskSubmitReview(BaseModel):
@@ -881,6 +886,24 @@ class SessionView(BaseModel):
     online: bool = False
     status: str = "offline"
     ttl_minutes: int = 0
+
+
+class UnaddressableTask(BaseModel):
+    """A task in flight that no session can be reached about (#852).
+
+    Work is happening — the task is claimed or running on the pair path — but
+    ``claim_session_id`` is empty, so there is no address to ask a question at
+    and nothing for a wake-up to target. Listing these is the honest half of
+    the fix: tightening the contract stops NEW tasks from entering this state
+    and says nothing about the ones already in it.
+    """
+
+    id: int
+    title: str = ""
+    status: str = ""
+    claimed_by: str = ""
+    claimed_at: str = ""
+    branch: str = ""
 
 
 class MessageSend(BaseModel):

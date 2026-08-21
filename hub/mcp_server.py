@@ -1261,6 +1261,7 @@ async def hub_pair_start(
     plan: str = "",
     assigned_agent: str = "",
     branch_slug: str = "",
+    session_id: str = "",
 ) -> str:
     """Start pair mode: move an open task to running without headless dispatch.
 
@@ -1285,6 +1286,12 @@ async def hub_pair_start(
             must equal the claim holder (hub_claim_task agent). Empty uses caller
             identity, which may not match the holder — pass it explicitly.
         branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
+        session_id: YOUR session id — required for agents (#852). The agent
+            name does not identify an executor: several sessions run under one
+            name and all of them pass a name-based holder check. Pass the same
+            id you registered with hub_session_register and used in
+            hub_claim_task; another session of the same agent is refused with
+            pair_start_session_mismatch.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1295,6 +1302,8 @@ async def hub_pair_start(
         body["assigned_agent"] = assigned_agent
     if branch_slug:
         body["branch_slug"] = branch_slug
+    if session_id:
+        body["session_id"] = session_id
     try:
         result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
     except HubApiError as exc:
@@ -1622,7 +1631,10 @@ async def hub_claim_task(
     Args:
         task_id: The open task ID
         agent: Agent name taking the claim; reuse it as assigned_agent in hub_pair_start
-        session_id: Optional Cursor session id for conflict detection
+        session_id: YOUR session id — REQUIRED for agents (#852), because the
+            agent name does not identify which session works the task. Register
+            it with hub_session_register and reuse it in hub_pair_start and
+            hub_release_task
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2510,10 +2522,38 @@ async def hub_sessions(agent: str = "", status: str = "") -> CallToolResult:
         rows = await _api_get(path)
     except HubApiError as exc:
         return _format_hub_api_error(exc)
+    # #852: the registry answers "who is around", and on its own that reads as
+    # the whole picture. A task claimed or running with no session behind it is
+    # invisible here for exactly the reason it matters — there is no address to
+    # list — so the tail is reported next to the sessions, never instead.
+    orphans: list[dict] = []
+    try:
+        orphans = await _api_get("/api/sessions/unaddressable") or []
+    except HubApiError:
+        orphans = []
+    tail = ""
+    if orphans:
+        listed = ", ".join(
+            f"#{o.get('id')} ({o.get('status', '?')}, держит "
+            f"{o.get('claimed_by') or 'никто'})"
+            for o in orphans[:10]
+        )
+        more = f" и ещё {len(orphans) - 10}" if len(orphans) > 10 else ""
+        tail = (
+            f"\n\nБез адреса ({len(orphans)}): {listed}{more}. "
+            "Это задачи в работе, у заявки которых нет сессии — спросить "
+            "исполнителя и разбудить его нельзя."
+        )
     if not rows:
-        return structured_echo_result("No registered sessions.", sessions=[])
+        return structured_echo_result(
+            "No registered sessions." + tail,
+            sessions=[],
+            unaddressable_tasks=orphans,
+        )
     return structured_echo_result(
-        "\n".join(_format_session(s) for s in rows), sessions=rows
+        "\n".join(_format_session(s) for s in rows) + tail,
+        sessions=rows,
+        unaddressable_tasks=orphans,
     )
 
 

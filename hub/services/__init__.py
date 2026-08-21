@@ -30,6 +30,7 @@ from hub.services.messaging import (
 from hub.services.sessions import (
     heartbeat_session,
     list_sessions,
+    unaddressable_tasks,
     note_session_task,
     register_session,
     session_view,
@@ -156,6 +157,7 @@ __all__ = [
     "list_acceptance_criteria",
     "list_checks",
     "list_sessions",
+    "unaddressable_tasks",
     "live_check_view",
     "record_finding_dispositions",
     "message_event_is_addressed",

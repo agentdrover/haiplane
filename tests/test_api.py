@@ -1259,7 +1259,9 @@ async def _task_in_review(
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": agent},
+        # #852: an agent names the session that takes the task; the properties
+        # under test here (self-review by name and by principal) are unchanged.
+        json={"assigned_agent": agent, "session_id": f"s-{agent}"},
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -1443,7 +1445,7 @@ async def test_review_brief_warns_implementer_by_principal_id(
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "claude-code"},
+        json={"assigned_agent": "claude-code", "session_id": "s-impl"},
         headers=impl,
     )
     assert resp.status_code == 200, resp.text
@@ -1506,7 +1508,7 @@ async def test_self_review_blocked_by_principal_despite_name_mismatch(
     # username — exactly the prod scenario that motivated #320.
     resp = await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "claude-code"},
+        json={"assigned_agent": "claude-code", "session_id": "s-impl"},
         headers=impl,
     )
     assert resp.status_code == 200, resp.text
@@ -1552,7 +1554,9 @@ async def test_claim_records_and_release_clears_implementer_principal(
     )
     task_id = resp.json()["id"]
     resp = await client.post(
-        f"/api/tasks/{task_id}/claim", json={"agent": "display-name-x"}, headers=impl
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "display-name-x", "session_id": "s-impl"},
+        headers=impl,
     )
     assert resp.status_code == 200
     d = dict(await repo_module.get_task(db, task_id))
@@ -3202,7 +3206,7 @@ async def test_review_verdict_update_records_the_reviewer_principal(
     )
     await client.post(
         f"/api/tasks/{task_id}/pair-start",
-        json={"assigned_agent": "dev"},
+        json={"assigned_agent": "dev", "session_id": "s-impl-pid"},
         headers={"Authorization": "Bearer impl-pid-token"},
     )
     await client.post(

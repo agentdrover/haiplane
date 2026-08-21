@@ -17,9 +17,11 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    claim_without_session_detail,
     done_report_error_detail,
     hierarchy_error_detail,
     pair_start_claim_mismatch_detail,
+    pair_start_session_mismatch_detail,
     self_review_forbidden_detail,
     withdraw_own_draft_error_detail,
 )
@@ -1168,6 +1170,7 @@ async def pair_start_task(
     *,
     caller: str = "",
     implementer_principal_id: int | None = None,
+    caller_is_agent: bool = False,
 ) -> TaskView:
     """Start an open task in pair mode: running without headless dispatch.
 
@@ -1175,6 +1178,11 @@ async def pair_start_task(
     principal (#320) so the self-review ban can compare identities instead
     of free-text agent names. None (env tokens, anonymous, humans) keeps
     the name-based fallback of #318.
+
+    ``caller_is_agent`` gates the session requirement of #852: an agent must
+    say WHICH of its sessions takes the task, because the holder check made of
+    names passes for every session of that agent at once. Humans pair-start
+    unchanged — there is no session to name and nothing to address.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1187,7 +1195,31 @@ async def pair_start_task(
     if not assigned_agent:
         assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
 
+    declared_session = (body.session_id or "").strip() if body else ""
+    # #852: the session requirement lives BEFORE the branch is prepared —
+    # prepare_pair_branch talks to git and creates a branch, and a task that
+    # fails the check afterwards would leave that branch behind.
+    if caller_is_agent and not declared_session:
+        raise HTTPException(
+            422,
+            detail=claim_without_session_detail(task_id=task_id, tool="hub_pair_start"),
+        )
+
     if task["status"] == "claimed":
+        holder_session = (task.get("claim_session_id") or "").strip()
+        # The name check below passes for EVERY session of the holding agent —
+        # that is the hole #852 closes. Compared only when both sides name a
+        # session: a legacy claim without one keeps the old behaviour rather
+        # than becoming unstartable.
+        if holder_session and declared_session and holder_session != declared_session:
+            raise HTTPException(
+                409,
+                detail=pair_start_session_mismatch_detail(
+                    task_id=task_id,
+                    holder_session=holder_session,
+                    caller_session=declared_session,
+                ),
+            )
         holder = (task.get("claimed_by") or "").strip()
         if holder and assigned_agent and holder != assigned_agent:
             # Principal is truth, name is presentational (#453): if the caller
@@ -1254,6 +1286,11 @@ async def pair_start_task(
         update_fields["implementer_principal_id"] = implementer_principal_id
     if branch:
         update_fields["branch"] = branch
+    # #852: pair-start from `open` skips the claim entirely, which is how a
+    # task reached running with no session at all. Whoever starts it owns it,
+    # so the address is written here too — not only on the claim path.
+    if declared_session:
+        update_fields["claim_session_id"] = declared_session
 
     # #365 K4: the status was written unconditionally, and everything between
     # the check above and this line is a window — branch preparation talks to
@@ -1271,6 +1308,10 @@ async def pair_start_task(
             "retry from its current status",
         )
     await repo.update_task(db, task_id, **update_fields)
+    # The registry follows the task the same way it follows a claim (#771
+    # AC-3): silent when the session is unregistered.
+    if declared_session:
+        await note_session_task(db, declared_session, task_id)
     await db.commit()
     await log_activity(
         db,
@@ -2107,16 +2148,31 @@ async def claim_task(
     body: TaskClaim,
     *,
     implementer_principal_id: int | None = None,
+    caller_is_agent: bool = False,
 ) -> TaskView:
     """Claim an open task for a single Cursor agent/session.
 
     ``implementer_principal_id`` records the claiming agent's authenticated
     principal (#320) for the identity-based self-review ban.
+
+    ``caller_is_agent`` says whether an authenticated AGENT is taking the task,
+    and only then is ``session_id`` required (#852). Humans and env-token
+    callers claim exactly as before: the address matters for agent sessions,
+    which is who the registry, the message channel and the wake-up serve.
     """
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+
+    # #852: a claim without a session leaves a task nobody can be reached
+    # about. Refused BEFORE the status transition — a refusal has to happen
+    # while there is still something to refuse.
+    if caller_is_agent and not body.session_id.strip():
+        raise HTTPException(
+            422,
+            detail=claim_without_session_detail(task_id=task_id, tool="hub_claim_task"),
+        )
 
     if task["status"] == "claimed":
         if (

@@ -221,6 +221,71 @@ def pair_start_claim_mismatch_detail(
     )
 
 
+def claim_without_session_detail(*, task_id: int, tool: str) -> dict[str, Any]:
+    """422 when an agent takes a task without naming its session (#852).
+
+    The claim used to accept an empty session_id, so a task could run with
+    claim_session_id NULL — held by an agent NAME, which does not identify an
+    executor: one agent runs several sessions at once and each of them passes
+    a holder check made of names. Everything addressable routes by session
+    (registry #771, messages #773, wake-up #774), so such a task cannot be
+    asked a question or woken up.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "claim_without_session",
+            "actor_hint": "agent",
+            "message": (
+                f"Task #{task_id}: session_id is required to take a task — "
+                "an agent name does not identify which session is working"
+            ),
+            "hint": (
+                f"Pass your session id: {tool}(task_id={task_id}, "
+                "session_id='<your session>'). Register it first with "
+                "hub_session_register(session_id=...) so other sessions can "
+                "reach you about this task. The same id must be used for "
+                "hub_pair_start and hub_release_task."
+            ),
+            "task_id": task_id,
+            "suggested_tool": tool,
+        }
+    )
+
+
+def pair_start_session_mismatch_detail(
+    *, task_id: int, holder_session: str, caller_session: str
+) -> dict[str, Any]:
+    """409 when another session of the SAME agent tries to pair-start (#852).
+
+    The name-based holder check passes here — both sessions run under one
+    agent name — which is exactly the hole: two sessions of the same agent
+    would both believe they hold the task.
+    """
+    caller_repr = caller_session or "(no session declared)"
+    return enrich_error_payload(
+        {
+            "reason": "pair_start_session_mismatch",
+            "actor_hint": "agent",
+            "message": (
+                f"Task #{task_id} is held by session '{holder_session}'; "
+                f"pair-start denied for session '{caller_repr}'"
+            ),
+            "hint": (
+                f"The claim belongs to session '{holder_session}', not to "
+                f"'{caller_repr}' — the agent name matches, the session does "
+                "not. Either continue in the holding session, or ask it to "
+                "call hub_release_task first (hub_send_message reaches it: "
+                f"the address is '{holder_session}'). Never pair-start a task "
+                "another live session is already working."
+            ),
+            "task_id": task_id,
+            "claim_session_id": holder_session,
+            "caller_session_id": caller_session,
+            "suggested_tool": "hub_pair_start",
+        }
+    )
+
+
 def hierarchy_error_detail(
     raw_message: str,
     *,
