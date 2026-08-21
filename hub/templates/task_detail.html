@@ -522,6 +522,86 @@
 
                 {% elif task.status.value == 'review' and not task.review_job_id %}
                 <div class="task-action-state task-action-state--danger">Review Required</div>
+
+                {# #823: доказательства выше пересказа. Всё, что ниже, уже
+                   считалось для ревью-брифа и доставалось только агенту-
+                   ревьюеру, а человек у кнопки читал сдаточный текст
+                   исполнителя. Первой строкой — сводка (#725): блок, который
+                   не смог посчитать, называет причину, потому что тишина
+                   здесь читается как «проверено, чисто». #}
+                {% if evidence %}
+                <div class="task-action-note">
+                    <strong>Проверено по этой сдаче:</strong>
+                    <span class="badge badge--xs badge-{{ 'failed' if evidence.evidence_coverage.state == 'none' else ('pending' if evidence.evidence_coverage.state == 'partial' else 'test') }}">{{ evidence.evidence_coverage.state }}</span>
+                    {{ evidence.evidence_coverage.headline }}
+
+                    {% if evidence.acceptance_criteria %}
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Критерии:</span>
+                        <ul class="task-review-findings">
+                            {% for ac in evidence.acceptance_criteria %}
+                            {% set result = (evidence.ac_test_results | selectattr('ac_id', 'equalto', ac.id) | first) %}
+                            <li>{{ ac.id }}
+                                {% if ac.verifiable_by.value != 'test' %}
+                                <span class="badge badge--xs badge-{{ ac.verifiable_by.value }}">{{ ac.verifiable_by.value }}</span>
+                                <span class="muted">проверяется не тестом — результата в хабе нет по определению</span>
+                                {% elif result %}
+                                <span class="badge badge--xs badge-{{ 'test' if result.status == 'pass' else 'failed' }}">{{ result.status }}</span>
+                                {% if not result.is_current %}<span class="badge badge-failed">stale — работа пересдана</span>{% endif %}
+                                {% else %}
+                                <span class="badge badge-pending">результат не записан</span>
+                                <span class="muted">тест к критерию привязан, но за эту сдачу не прогонялся</span>
+                                {% endif %}
+                                <span class="u-text-muted">{{ ac.then }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">CI по закреплённому коммиту:</span>
+                        <span class="badge badge--xs badge-{{ 'test' if evidence.ci_run_report.state == 'current' else 'failed' }}">{{ evidence.ci_run_report.state }}</span>
+                        {% if evidence.ci_run_report.state != 'current' %}<span class="muted">{{ evidence.ci_run_report.reason }}</span>{% endif %}
+                    </div>
+
+                    {% if evidence.statement_freshness %}
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Свежесть постановки:</span>
+                        <span class="badge badge--xs badge-{{ 'test' if evidence.statement_freshness.state == 'no_overlap' else 'pending' }}">{{ evidence.statement_freshness.state }}</span>
+                        <span class="muted">{{ evidence.statement_freshness.reason }}</span>
+                    </div>
+                    {% endif %}
+
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Вызовы изменённых символов:</span>
+                        <span class="badge badge--xs badge-{{ 'test' if evidence.call_sites.status == 'analysed' else 'pending' }}">{{ evidence.call_sites.status }}</span>
+                        {% if evidence.call_sites.status == 'analysed' %}<span class="muted">{{ evidence.call_sites.summary }}</span>
+                        {% else %}<span class="muted">{{ evidence.call_sites.reason }}</span>{% endif %}
+                    </div>
+
+                    {% if evidence.evidence_coverage.checks_missing %}
+                    <details>
+                        <summary class="project-edit-summary">не дали сигнала: {{ evidence.evidence_coverage.checks_missing | length }} — и почему</summary>
+                        <ul class="task-review-findings">
+                            {% for c in evidence.evidence_coverage.checks_missing %}
+                            <li>{{ c.check }} — {{ c.reason }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                    {% if evidence.evidence_coverage.checks_not_applicable %}
+                    <details>
+                        <summary class="project-edit-summary">нечего проверять: {{ evidence.evidence_coverage.checks_not_applicable | length }}</summary>
+                        <ul class="task-review-findings">
+                            {% for c in evidence.evidence_coverage.checks_not_applicable %}
+                            <li>{{ c.check }} — {{ c.reason }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                </div>
+                {% endif %}
                 {% if review_error %}
                 <div class="task-action-note">{{ review_error }}</div>
                 {% endif %}
@@ -646,6 +726,12 @@
                     </ul>
                     {% endif %}
                 </div>
+                {% endif %}
+                {% if evidence and evidence.latest_submission_summary %}
+                <details class="task-action-note">
+                    <summary class="project-edit-summary">что говорит исполнитель</summary>
+                    <div class="u-pre-wrap">{{ evidence.latest_submission_summary }}</div>
+                </details>
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack">
                     <label class="task-action-label" for="review-comments">Review comments</label>
