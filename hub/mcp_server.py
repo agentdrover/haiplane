@@ -2014,6 +2014,28 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"Tokens: {mr.get('tokens_total', 0)} total, "
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding",
     ]
+    outcomes = data.get("review_outcomes", {})
+    first_pass = outcomes.get("first_pass_acceptance_rate")
+    cr_rate = outcomes.get("changes_requested_rate")
+    # The counts travel with the rates (#522): a percentage over an unnamed
+    # sample is the figure nobody re-checks.
+    lines.append(
+        "First-pass acceptance: "
+        + (
+            f"{round(first_pass * 100, 1)}% "
+            f"({outcomes.get('first_pass_tasks', 0)}/{outcomes.get('tasks', 0)} tasks)"
+            if first_pass is not None
+            else "— (no verdicts in window)"
+        )
+        + ", changes requested: "
+        + (
+            f"{round(cr_rate * 100, 1)}% "
+            f"({outcomes.get('changes_requested', 0)}/"
+            f"{outcomes.get('verdicts', 0)} verdicts)"
+            if cr_rate is not None
+            else "—"
+        )
+    )
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(

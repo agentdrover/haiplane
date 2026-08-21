@@ -295,3 +295,134 @@ async def test_attribution_matches_resolver_semantics(db: aiosqlite.Connection):
     assert not [r for r in gates if r["project"] == "spike-pending"], (
         "a pending project must not receive attribution"
     )
+
+
+# --- First-pass acceptance & changes-requested rate (#522) -------------------
+#
+# Two rates over two denominators: tasks for first-pass, verdicts for the
+# changes-requested proportion. What cannot be measured is reported, not
+# scored — a verdict whose payload lost its generation says nothing about
+# whether the work came back.
+
+
+async def _verdict(
+    db: aiosqlite.Connection,
+    task_id: int,
+    verdict: str,
+    *,
+    generation: int | None = 1,
+    self_approved: bool = False,
+    days_ago: float = 0.0,
+) -> None:
+    payload: dict = {"verdict": verdict, "self_approved": self_approved}
+    if generation is not None:
+        payload["submission_generation"] = generation
+    event_id = await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="reviewer",
+        payload=payload,
+    )
+    if days_ago:
+        await db.execute(
+            "UPDATE events SET created_at = ? WHERE id = ?",
+            (_ts(days_ago * 24.0), event_id),
+        )
+
+
+async def test_first_pass_acceptance_and_changes_requested_rate(
+    db: aiosqlite.Connection,
+):
+    # AC-1 (#522): hub_practice_metrics answers both rates, and each carries
+    # the counts it was computed from.
+    clean = await _task(db, title="approved on the first submission")
+    reworked = await _task(db, title="changes requested, then approved")
+    also_clean = await _task(db, title="approved on the first submission too")
+    stale = await _task(db, title="approved before the window")
+
+    await _verdict(db, clean, "approved")
+    await _verdict(db, reworked, "changes_requested", generation=1)
+    await _verdict(db, reworked, "approved", generation=2)
+    await _verdict(db, also_clean, "approved")
+    # Outside the 90d window: neither rate may see it.
+    await _verdict(db, stale, "approved", days_ago=120)
+    await db.commit()
+
+    outcomes = (await practice_metrics(db))["review_outcomes"]
+
+    assert outcomes["tasks"] == 3
+    assert outcomes["first_pass_tasks"] == 2
+    assert outcomes["first_pass_acceptance_rate"] == round(2 / 3, 3)
+    assert outcomes["verdicts"] == 4
+    assert outcomes["approved"] == 3
+    assert outcomes["changes_requested"] == 1
+    assert outcomes["changes_requested_rate"] == 0.25
+
+
+async def test_changes_requested_on_first_submission_is_never_first_pass(
+    db: aiosqlite.Connection,
+):
+    # A second verdict on the SAME generation must not launder the first one:
+    # the work was sent back, whatever happened next.
+    task_id = await _task(db, title="changes requested, then approved as-is")
+    await _verdict(db, task_id, "changes_requested", generation=1)
+    await _verdict(db, task_id, "approved", generation=1)
+    await db.commit()
+
+    outcomes = (await practice_metrics(db))["review_outcomes"]
+
+    assert outcomes["tasks"] == 1
+    assert outcomes["first_pass_tasks"] == 0
+    assert outcomes["first_pass_acceptance_rate"] == 0.0
+
+
+async def test_verdict_without_generation_is_reported_not_scored(
+    db: aiosqlite.Connection,
+):
+    # An unreadable generation cannot answer "first time?". The task leaves
+    # the first-pass denominator and is counted as unaccounted; its verdict
+    # still counts toward the changes-requested rate, which needs no
+    # generation.
+    unknown = await _task(db, title="verdict without a generation")
+    measured = await _task(db, title="approved on the first submission")
+    await _verdict(db, unknown, "changes_requested", generation=None)
+    await _verdict(db, measured, "approved")
+    await db.commit()
+
+    outcomes = (await practice_metrics(db))["review_outcomes"]
+
+    assert outcomes["tasks"] == 1
+    assert outcomes["tasks_unaccounted"] == 1
+    assert outcomes["first_pass_acceptance_rate"] == 1.0
+    assert outcomes["verdicts"] == 2
+    assert outcomes["changes_requested_rate"] == 0.5
+
+
+async def test_self_approved_first_pass_is_counted_separately(
+    db: aiosqlite.Connection,
+):
+    # A submission its own author waved through is not evidence of quality.
+    # It stays in the rate (it IS a first-pass acceptance) but is visible
+    # beside it, so the number cannot be raised by removing the reviewer.
+    solo = await _task(db, title="approved by its own author")
+    reviewed = await _task(db, title="approved by someone else")
+    await _verdict(db, solo, "approved", self_approved=True)
+    await _verdict(db, reviewed, "approved")
+    await db.commit()
+
+    outcomes = (await practice_metrics(db))["review_outcomes"]
+
+    assert outcomes["first_pass_tasks"] == 2
+    assert outcomes["self_approved_first_pass"] == 1
+
+
+async def test_empty_window_reports_none_not_zero(db: aiosqlite.Connection):
+    # No verdicts is not a 0% acceptance rate. Zero would read as "everything
+    # came back", which is the opposite of what an empty sample says.
+    outcomes = (await practice_metrics(db))["review_outcomes"]
+
+    assert outcomes["tasks"] == 0
+    assert outcomes["verdicts"] == 0
+    assert outcomes["first_pass_acceptance_rate"] is None
+    assert outcomes["changes_requested_rate"] is None
