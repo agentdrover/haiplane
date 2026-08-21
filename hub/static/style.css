@@ -3726,3 +3726,41 @@ body.htmx-request .htmx-progress {
 @media (max-width: 900px) {
     .section--coordination { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Diff of the submission under review (#824). Only existing tokens are used
+   here — invented ones rendered as nothing at all once before (#624). */
+.task-diff-file {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 6px;
+    margin-top: 6px;
+}
+
+.task-diff-body {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    background: var(--bg-elevated);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    margin: 6px 0 0;
+    white-space: pre;
+}
+
+.task-diff-line {
+    display: block;
+}
+
+.task-diff-line--add {
+    background: var(--green-dim);
+    color: var(--green);
+}
+
+.task-diff-line--del {
+    background: var(--red-dim);
+    color: var(--red);
+}
+
+.task-diff-line--hunk {
+    color: var(--text-muted);
+}

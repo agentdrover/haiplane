@@ -1,0 +1,43 @@
+{# #824: изменения сдачи, прочитанные внутри хаба. Загружается по раскрытию —
+   чтение диффа стоит git-работы, и платить за него на каждом рендере карточки
+   незачем. #}
+{% if diff.state == 'read' %}
+<div class="task-diff">
+    <div class="task-action-note">
+        <code class="code-sm">{{ diff.base }}...{{ diff.sha[:12] }}</code>
+        — файлов: {{ diff.total_files }}, строк диффа: {{ diff.total_lines }}
+        {% if diff.truncated %}
+        {# Молчаливая обрезка читается как «это всё изменения» — то же
+           умолчание, что #725 убирал из блоков брифа. #}
+        <span class="badge badge-failed">показано не всё</span>
+        <div class="u-text-muted">
+            Показано файлов: {{ diff.files | length }} из {{ diff.total_files }},
+            строк: {{ diff.shown_lines }} из {{ diff.total_lines }} — дальше упёрлись
+            в потолок показа. Остальное читается командой:
+            <code class="code-sm">{{ diff.fallback_command }}</code>
+        </div>
+        {% endif %}
+    </div>
+    {% for file in diff.files %}
+    <details class="task-diff-file">
+        <summary class="project-edit-summary">
+            {{ file.path }}
+            <span class="badge badge--xs badge-test">+{{ file.added }}</span>
+            <span class="badge badge--xs badge-failed">&minus;{{ file.removed }}</span>
+            {% if file.cut %}<span class="badge badge-failed">файл показан не целиком</span>{% endif %}
+        </summary>
+        <pre class="task-diff-body">{% for line in file.lines %}<span class="task-diff-line{% if line.startswith('+') and not line.startswith('+++') %} task-diff-line--add{% elif line.startswith('-') and not line.startswith('---') %} task-diff-line--del{% elif line.startswith('@@') %} task-diff-line--hunk{% endif %}">{{ line }}</span>
+{% endfor %}</pre>
+    </details>
+    {% endfor %}
+</div>
+{% else %}
+<div class="task-action-note task-action-note--warning">
+    Дифф не показан: {{ diff.reason }}
+    {% if diff.fallback_command %}
+    <div class="u-text-muted">Прочитать самостоятельно:
+        <code class="code-sm">{{ diff.fallback_command }}</code>
+    </div>
+    {% endif %}
+</div>
+{% endif %}

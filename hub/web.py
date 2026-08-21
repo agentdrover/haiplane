@@ -1305,6 +1305,30 @@ async def web_task_detail(
     )
 
 
+@router.get("/tasks/{task_id}/diff", response_class=HTMLResponse)
+async def web_task_diff(task_id: int, request: Request):
+    """The changes of the PINNED submission, rendered inside the hub (#824).
+
+    No revision parameter by construction: this serves one task's submission,
+    not arbitrary history, and the diff a reader sees must be the diff the
+    verdict is cast on. Authentication is the card's own — the middleware
+    covers this path like every other page.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+
+    from hub.services.task_diff import submission_diff
+
+    diff = await submission_diff(db, task_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "partials/task_diff.html",
+        {"diff": diff, "task_id": task_id},
+    )
+
+
 @router.get("/tasks/{task_id}/log", response_class=HTMLResponse)
 async def web_task_log(task_id: int, request: Request, job: str = Query("main")):
     db = _db(request)
