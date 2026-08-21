@@ -2502,6 +2502,31 @@ async def list_thread_messages(
     )
 
 
+async def count_visible_in_thread(
+    db: aiosqlite.Connection,
+    thread_id: str,
+    *,
+    session_id: str = "",
+    agent: str = "",
+) -> int:
+    """How many messages of this thread the caller may see (#801).
+
+    The same predicate the inbox is bounded by, plus "or I wrote it": a sender
+    reading back their own thread is a participant too. Reusing the predicate is
+    the point of this helper — the bug it fixes existed because the rule lived
+    in one branch of the endpoint and the other branch never asked for it.
+    """
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT COUNT(*) AS n FROM agent_messages "  # nosec B608
+            f"WHERE thread_id = :thread AND ({_INBOX_PREDICATE} "
+            "  OR (from_agent = :agent AND :agent <> ''))",
+            {"thread": thread_id, "session": session_id, "agent": agent},
+        )
+    )
+    return int(rows[0]["n"]) if rows else 0
+
+
 async def count_recent_messages(
     db: aiosqlite.Connection,
     *,

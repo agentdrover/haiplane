@@ -464,3 +464,99 @@ async def test_verdict_still_belongs_to_its_own_tool(
     assert dict(await repo.get_task(db, task_id))["review_verdict"] == "approved", (
         "the verdict arrives only through the tool that owns it"
     )
+
+
+# ---- #801: the thread branch of the endpoint is a door too ----
+#
+# The inbox was bounded from the start (AC-1 above), and that made the hole
+# below easy to miss: the tests asked "does the inbox leak?", the endpoint
+# answered "no", and its other branch was never asked anything. These tests
+# aim at GET /api/messages itself — both ways in.
+
+
+async def _thread_between_two(client: AsyncClient, auth: dict) -> str:
+    await _register(client, auth["alpha"], "s-alpha")
+    await _register(client, auth["beta"], "s-beta")
+    await _register(client, auth["gamma"], "s-gamma")
+    sent = await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "session",
+            "to_ref": "s-beta",
+            "body": "СЕКРЕТ: ключ лежит в 1password",
+            "session_id": "s-alpha",
+        },
+        headers=auth["alpha"],
+    )
+    assert sent.status_code == 200, sent.text
+    return sent.json()["message"]["thread_id"]
+
+
+async def test_thread_read_is_refused_to_a_stranger(client: AsyncClient, monkeypatch):
+    auth = _auth(monkeypatch)
+    thread_id = await _thread_between_two(client, auth)
+
+    peek = await client.get(
+        f"/api/messages?thread_id={thread_id}", headers=auth["gamma"]
+    )
+    assert peek.status_code == 403
+    assert "foreign_thread" in peek.text
+    assert "1password" not in peek.text, "a refusal must not carry the body with it"
+
+    # And guessing is what made this cheap: thread ids are small integers.
+    for guess in range(1, 5):
+        probe = await client.get(
+            f"/api/messages?thread_id={guess}", headers=auth["gamma"]
+        )
+        assert probe.status_code == 403 or probe.json() == []
+
+
+async def test_participants_still_read_their_thread(client: AsyncClient, monkeypatch):
+    auth = _auth(monkeypatch)
+    thread_id = await _thread_between_two(client, auth)
+
+    for who, session in (("beta", "s-beta"), ("alpha", "s-alpha")):
+        mine = await client.get(
+            f"/api/messages?thread_id={thread_id}&session_id={session}",
+            headers=auth[who],
+        )
+        assert mine.status_code == 200, mine.text
+        assert "1password" in mine.text, f"{who} is a participant and must read it"
+
+    # The sender is a participant even without naming a session.
+    bare = await client.get(
+        f"/api/messages?thread_id={thread_id}", headers=auth["alpha"]
+    )
+    assert bare.status_code == 200 and "1password" in bare.text
+
+
+async def test_the_owner_still_sees_every_thread(client: AsyncClient, monkeypatch):
+    auth = _auth(monkeypatch)
+    thread_id = await _thread_between_two(client, auth)
+
+    owner = await client.get(
+        f"/api/messages?thread_id={thread_id}", headers=auth["human"]
+    )
+    assert owner.status_code == 200, owner.text
+    assert "1password" in owner.text, (
+        "the owner reading the whole channel is the condition under which "
+        "agent-to-agent messaging is allowed to exist (#775)"
+    )
+    dashboard = await client.get("/", headers=auth["human"])
+    assert "1password" in dashboard.text
+
+
+async def test_thread_branch_honours_session_ownership(
+    client: AsyncClient, monkeypatch
+):
+    auth = _auth(monkeypatch)
+    thread_id = await _thread_between_two(client, auth)
+
+    borrowed = await client.get(
+        f"/api/messages?thread_id={thread_id}&session_id=s-beta", headers=auth["gamma"]
+    )
+    assert borrowed.status_code == 403
+    assert "foreign_session" in borrowed.text, (
+        "the check standing on the inbox branch must not be walked around "
+        "by asking for a thread instead"
+    )
