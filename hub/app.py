@@ -532,14 +532,26 @@ async def api_list_events(
     ),
     kinds: str = Query(default="", description="Comma-separated kind filter"),
     limit: int = Query(default=100, ge=1, le=200),
+    identity=Depends(current_identity),
 ):
-    """Cursor-addressable events feed (#349).
+    """Cursor-addressable events feed (#349), addressee-filtered (#774).
 
     Returns transition events with id > ``since`` oldest-first plus
     ``next_cursor`` (last returned id; unchanged ``since`` when empty, so
     repeat calls are idempotent). With ``wait`` > 0 the request long-polls:
     periodic re-reads on asyncio.sleep — the shared write lock is never
     held between reads, so writers are not starved.
+
+    ``message_posted`` events are narrowed to what the caller is addressed by
+    (#774): the inbox is bounded, and a feed that announced everyone's mail
+    would be the same leak one indirection away — the shape of the bug #801
+    fixed. Transition events are unchanged: they are about tasks, which the
+    hub shows to every authenticated caller anyway.
+
+    The filter runs after the page is read, so a page can come back empty
+    while ``next_cursor`` advances. That is the honest behaviour for a cursor:
+    those events happened, they were simply not the caller's to see, and
+    re-serving them on the next call would loop forever.
     """
     import json as _json
     import time as _time
@@ -554,16 +566,26 @@ async def api_list_events(
         await asyncio.sleep(1.0)
 
     events = []
+    last_id = since
+    refs: dict | None = None
     for r in rows:
         item = dict(r)
+        last_id = item["id"]
         try:
             item["payload"] = _json.loads(item.get("payload") or "{}")
         except (TypeError, ValueError):
             item["payload"] = {}
+        if item.get("kind") == services.MESSAGE_EVENT_KIND and identity.is_agent:
+            if refs is None:
+                refs = await services.addressable_refs(
+                    db, agent=identity.username, principal_id=identity.principal_id
+                )
+            if not services.message_event_is_addressed(item["payload"], refs):
+                continue
         events.append(item)
     return {
         "events": events,
-        "next_cursor": events[-1]["id"] if events else since,
+        "next_cursor": last_id,
     }
 
 

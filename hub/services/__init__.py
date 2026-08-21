@@ -13,7 +13,10 @@ from hub.services.dashboard import (
 )
 from hub.services.outcomes import outcome_debt
 from hub.services.messaging import (
+    MESSAGE_EVENT_KIND,
+    addressable_refs,
     inbox,
+    message_event_is_addressed,
     message_view,
     send_message,
     thread,
@@ -128,6 +131,7 @@ __all__ = [
     "DoREvaluation",
     "DuplicateAcceptanceCriterionError",
     "LimitExceededError",
+    "MESSAGE_EVENT_KIND",
     "ProjectBindError",
     "ReadinessConfig",
     "SEVERITY_ORDER",
@@ -136,6 +140,7 @@ __all__ = [
     "add_acceptance_criterion",
     "add_risk",
     "add_update",
+    "addressable_refs",
     "delete_acceptance_criterion",
     "get_agent_sessions_panel",
     "get_message_threads_panel",
@@ -144,6 +149,7 @@ __all__ = [
     "inbox",
     "list_acceptance_criteria",
     "list_sessions",
+    "message_event_is_addressed",
     "message_view",
     "note_session_task",
     "readiness_tree",
