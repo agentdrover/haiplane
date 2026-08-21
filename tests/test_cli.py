@@ -1123,3 +1123,65 @@ def test_cmd_projects_create() -> None:
             "default_branch": "develop",
         },
     )
+
+
+# --- oc-hub dep (#487) --------------------------------------------------------
+#
+# The CLI holds no rules of its own: it calls the same REST endpoints the MCP
+# tools do (#486). Three implementations of one rule drift, and the one nobody
+# touches drifts first.
+
+
+def _dep_args(dep_cmd: str, task_id: int, depends_on: int, json_out: bool = False):
+    return argparse.Namespace(
+        dep_cmd=dep_cmd, task_id=task_id, depends_on=depends_on, json=json_out
+    )
+
+
+def test_dep_commands_match_the_rest_contract(capsys) -> None:
+    # AC-5 (#487): behaviour and exit codes follow REST, including the
+    # idempotent answers — "created" and "already existed" are different
+    # facts with the same outcome, and the output says which happened.
+    calls: list[tuple[str, str]] = []
+
+    def _fake_api(method, path, body=None, **kwargs):
+        calls.append((method, path))
+        if method == "POST":
+            return {"task_id": 830, "depends_on_task_id": 818, "created": True}
+        if method == "DELETE":
+            return {"task_id": 830, "depends_on_task_id": 818, "removed": False}
+        return {
+            "blocked_by": [
+                {
+                    "task_id": 818,
+                    "title": "daily digest",
+                    "status": "completed",
+                    "delivered": False,
+                    "reason": "PR #8 не смержен гейтом",
+                }
+            ],
+            "unblocks": [],
+        }
+
+    with patch.object(cli, "_api", _fake_api):
+        assert cli.cmd_dep(_dep_args("add", 830, 818)) == 0
+        assert cli.cmd_dep(_dep_args("rm", 830, 818)) == 0
+        assert cli.cmd_dep(_dep_args("list", 830, 0)) == 0
+
+    out = capsys.readouterr().out
+    assert "edge created" in out
+    assert "was not there" in out
+    # Delivery, not status: the blocker is completed and still blocks.
+    assert "NOT delivered" in out and "PR #8" in out
+    assert calls == [
+        ("POST", "/api/tasks/830/dependencies"),
+        ("DELETE", "/api/tasks/830/dependencies/818"),
+        ("GET", "/api/tasks/830/dependencies"),
+    ]
+
+
+def test_dep_list_says_so_when_there_are_no_edges(capsys) -> None:
+    with patch.object(cli, "_api", lambda *a, **k: {"blocked_by": [], "unblocks": []}):
+        assert cli.cmd_dep(_dep_args("list", 1, 0)) == 0
+
+    assert "no dependencies" in capsys.readouterr().out

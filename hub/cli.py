@@ -209,6 +209,55 @@ def _cmd_create_typed(task_type: str) -> Any:
     return handler
 
 
+def cmd_dep(args: argparse.Namespace) -> int:
+    """Dependency edges from the command line (#487).
+
+    Calls the same REST endpoints the MCP tools do (#486). No rules live here:
+    three implementations of one rule drift, and the one nobody touches drifts
+    first.
+    """
+    if args.dep_cmd == "add":
+        result = _api(
+            "POST",
+            f"/api/tasks/{args.task_id}/dependencies",
+            {"depends_on_task_id": args.depends_on},
+        )
+        verb = "created" if result.get("created") else "already existed"
+        print(f"#{args.task_id} → #{args.depends_on}: edge {verb}")
+        return 0
+    if args.dep_cmd == "rm":
+        result = _api(
+            "DELETE",
+            f"/api/tasks/{args.task_id}/dependencies/{args.depends_on}",
+        )
+        verb = "removed" if result.get("removed") else "was not there"
+        print(f"#{args.task_id} → #{args.depends_on}: edge {verb}")
+        return 0
+    edges = _api("GET", f"/api/tasks/{args.task_id}/dependencies")
+    if args.json:
+        _print_json(edges)
+        return 0
+    blocked_by = edges.get("blocked_by") or []
+    unblocks = edges.get("unblocks") or []
+    if not blocked_by and not unblocks:
+        print("no dependencies")
+        return 0
+    for dep in blocked_by:
+        # Delivery, not status, decides whether a blocker still blocks (#484).
+        mark = "delivered" if dep.get("delivered") else "NOT delivered"
+        reason = f" — {dep['reason']}" if dep.get("reason") else ""
+        print(
+            f"blocked by #{dep['task_id']} {dep.get('title', '')} "
+            f"[{dep.get('status', '?')}] {mark}{reason}"
+        )
+    for dep in unblocks:
+        print(
+            f"unblocks   #{dep['task_id']} {dep.get('title', '')} "
+            f"[{dep.get('status', '?')}]"
+        )
+    return 0
+
+
 def cmd_tree(args: argparse.Namespace) -> int:
     params: dict[str, str] = {}
     if getattr(args, "depth", None) is not None:
@@ -1213,6 +1262,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="summary applies depth=2 and max_nodes=50 by default",
     )
     p_tree.set_defaults(func=cmd_tree)
+
+    # dep — dependency edges (#487). The graph lives in the hub since #482;
+    # this is how an operator writes to it without curl.
+    p_dep = sub.add_parser("dep", help="Task dependency edges (blocked_by/unblocks)")
+    dep_sub = p_dep.add_subparsers(dest="dep_cmd", required=True)
+
+    p_dep_add = dep_sub.add_parser("add", help="TASK_ID waits for DEPENDS_ON")
+    p_dep_add.add_argument("task_id", type=int)
+    p_dep_add.add_argument("depends_on", type=int)
+    p_dep_add.set_defaults(func=cmd_dep)
+
+    p_dep_rm = dep_sub.add_parser("rm", help="Drop the edge; missing is a no-op")
+    p_dep_rm.add_argument("task_id", type=int)
+    p_dep_rm.add_argument("depends_on", type=int)
+    p_dep_rm.set_defaults(func=cmd_dep)
+
+    p_dep_list = dep_sub.add_parser("list", help="Both sides, with delivery state")
+    p_dep_list.add_argument("task_id", type=int)
+    p_dep_list.add_argument("--json", action="store_true")
+    p_dep_list.set_defaults(func=cmd_dep)
 
     # context — get agent work context
     p_context = sub.add_parser(

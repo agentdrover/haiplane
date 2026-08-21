@@ -244,6 +244,23 @@ async def _api_delete(path: str) -> None:
             ) from exc
 
 
+async def _api_delete_json(path: str) -> Any:
+    """DELETE that returns a body (#487): the dependency endpoints answer with
+    whether anything was actually removed, and dropping that would hide the
+    difference between "removed" and "was not there"."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HubApiError(
+                _parse_api_error(exc.response, exc.response.status_code)
+            ) from exc
+        return resp.json()
+
+
 async def _api_post_with_status(
     path: str, body: dict[str, Any] | None = None
 ) -> tuple[Any, int]:
@@ -610,6 +627,108 @@ def _dependency_lines(task: dict[str, Any]) -> list[str]:
                 f"  #{dep['task_id']} {dep.get('title', '')} [{dep.get('status', '?')}]"
             )
     return lines
+
+
+def _format_dependency_edges(edges: dict[str, Any]) -> str:
+    """Both sides of a task's edges as text (#487).
+
+    Delivery is printed for blockers because delivery, not status, is what
+    decides whether one still blocks (#484): a closed task whose PR is still
+    open blocks exactly as much as an unfinished one.
+    """
+    lines: list[str] = []
+    blocked_by = edges.get("blocked_by") or []
+    if blocked_by:
+        lines.append("Блокеры (ждём их):")
+        for dep in blocked_by:
+            mark = "доставлен" if dep.get("delivered") else "НЕ доставлен"
+            reason = f" — {dep['reason']}" if dep.get("reason") else ""
+            lines.append(
+                f"  #{dep['task_id']} {dep.get('title', '')} "
+                f"[{dep.get('status', '?')}] {mark}{reason}"
+            )
+    unblocks = edges.get("unblocks") or []
+    if unblocks:
+        lines.append("Разблокирует (ждут нас):")
+        for dep in unblocks:
+            lines.append(
+                f"  #{dep['task_id']} {dep.get('title', '')} [{dep.get('status', '?')}]"
+            )
+    return "\n".join(lines) if lines else "Зависимостей нет."
+
+
+@mcp.tool()
+async def hub_add_dependency(task_id: int, depends_on_task_id: int) -> CallToolResult:
+    """Record that a task waits for another one (#487, epic #478).
+
+    Readiness is judged by DELIVERY, not by status (#484): a blocker counts as
+    cleared when the gate has merged its PR, because between a done report and
+    that merge there is a window and a PR can still go back for rework. Task
+    #830 was approved, claimed and started on top of an unmerged PR — that is
+    the mistake this edge prevents.
+
+    Adding the same edge twice is not an error, it is a no-op. A cycle is
+    refused and the answer names the chain that would close it.
+
+    Args:
+        task_id: The task that has to wait.
+        depends_on_task_id: The task it waits for.
+    """
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/dependencies",
+            {"depends_on_task_id": depends_on_task_id},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    verb = "создано" if result.get("created") else "уже было"
+    return structured_echo_result(
+        f"Зависимость #{task_id} → #{depends_on_task_id}: ребро {verb}.",
+        dependency=result,
+    )
+
+
+@mcp.tool()
+async def hub_remove_dependency(
+    task_id: int, depends_on_task_id: int
+) -> CallToolResult:
+    """Drop a dependency edge (#487).
+
+    Removing an edge that is not there is a no-op: the caller wanted it gone
+    and it is gone.
+
+    Args:
+        task_id: The task that was waiting.
+        depends_on_task_id: The task it waited for.
+    """
+    try:
+        result = await _api_delete_json(
+            f"/api/tasks/{task_id}/dependencies/{depends_on_task_id}"
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    verb = "снято" if result.get("removed") else "и так отсутствовало"
+    return structured_echo_result(
+        f"Зависимость #{task_id} → #{depends_on_task_id}: ребро {verb}.",
+        dependency=result,
+    )
+
+
+@mcp.tool()
+async def hub_list_dependencies(task_id: int) -> CallToolResult:
+    """Who blocks this task and whom it unblocks (#487).
+
+    Blockers carry their delivery state, not just their status — the status
+    alone is what let #830 start on top of an open PR.
+
+    Args:
+        task_id: The task to read.
+    """
+    try:
+        edges = await _api_get(f"/api/tasks/{task_id}/dependencies")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return structured_echo_result(_format_dependency_edges(edges), dependencies=edges)
 
 
 @mcp.tool()
