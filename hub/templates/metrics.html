@@ -132,6 +132,45 @@ first-pass от того, что её одобрили следом.</p>
     </tbody>
 </table>
 
+<h2>Escaped defects: баги на уже закрытые фичи</h2>
+<p class="muted">Recurring-категории показывают пойманное — находки, остановленные
+на гейте. Здесь обратная сторона: баг, заведённый уже после закрытия своей фичи,
+то есть дефект, который ревью пропустило. Признак считается только там, где обе
+даты известны, а непосчитанное названо рядом, а не свёрнуто в итог.</p>
+<p class="muted">«Багов без фичи-предка» — родитель эпик или ничего, привязать
+не к чему. «Закрытых фич без отметки завершения» — completed_at появился с #517
+и задним числом не проставлялся, поэтому по таким фичам ответа нет. Считаются
+только фичи, под которыми есть баги в этом окне — то есть те, где ответ и правда
+требовался; общая дисциплина заполнения колонки шире и здесь не измеряется. Дата не
+достраивается из updated_at, потому что это дало бы волну выдуманных утечек —
+ровно та подмена, которую убрали из cycle time (#810). Пока непосчитанного
+больше, чем посчитанного, итоговое число говорит не о качестве ревью, а о том,
+насколько заполнены поля.</p>
+<table class="task-table">
+    <thead><tr><th>Показатель</th><th>Значение</th></tr></thead>
+    <tbody>
+        <tr><td>Утечек посчитано</td>
+            <td>{{ m.escaped_defects.escaped }}</td></tr>
+        <tr><td>Багов в окне</td>
+            <td>{{ m.escaped_defects.bugs_in_window }}</td></tr>
+        <tr><td>Багов без фичи-предка</td>
+            <td>{% if m.escaped_defects.bugs_without_feature %}{{ m.escaped_defects.bugs_without_feature }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Закрытых фич без отметки завершения</td>
+            <td>{% if m.escaped_defects.features_without_completion %}{{ m.escaped_defects.features_without_completion }}{% else %}—{% endif %}</td></tr>
+    </tbody>
+</table>
+<table class="task-table">
+    <thead><tr><th>Фича-источник</th><th>Утечек</th></tr></thead>
+    <tbody>
+        {% for f in m.escaped_defects.features %}
+        <tr><td><a href="/tasks/{{ f.feature_id }}">#{{ f.feature_id }} {{ f.title }}</a></td>
+            <td>{{ f.bugs }}</td></tr>
+        {% else %}
+        <tr><td colspan="2"><span class="muted">нет измеримых утечек в этом окне</span></td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
 <h2>Cycle time (ready → completed), median</h2>
 <p class="muted">Считается только по completed_at. У задач, завершённых до того,
 как эта колонка начала заполняться, момента завершения нет вовсе — раньше он
