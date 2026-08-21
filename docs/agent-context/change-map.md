@@ -13,6 +13,8 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 | Web dashboard behavior | `hub/web.py`, `hub/templates/` | `hub/services/dashboard.py`, `hub/static/style.css` | `tests/test_web.py` |
 | CLI commands or UX | `hub/cli.py` | `hub/app.py`, `hub/models.py`, template files | `tests/test_cli.py` |
 | MCP tool surface | `hub/mcp_server.py` | `hub/app.py`, `hub/models.py` | `tests/test_mcp_server.py`, `tests/test_api.py` |
+| MCP usage telemetry or the usage report | `hub/services/mcp_telemetry.py`, `hub/repository.py` | `hub/mcp_server.py` (call path), `hub/db.py`, `hub/app.py`, `hub/web.py` | `tests/test_mcp_telemetry.py`, `tests/test_agent_api_metrics.py`, `tests/test_db_migrations.py` |
+| MCP catalog size or its CI budget | `hub/mcp_catalog.py`, `docs/agent-context/mcp-catalog-budget.json` | `scripts/mcp_catalog_budget.py`, `hub/mcp_server.py` (tool docstrings and signatures) | `tests/test_mcp_catalog_budget.py` |
 | Persistence queries | `hub/repository.py` | `hub/db.py`, service callers | `tests/test_repository.py`, `tests/test_repository_structured.py` |
 | DB schema or migrations | `hub/db.py` | `hub/repository.py`, `hub/models.py` | `tests/test_db_migrations.py`, repository tests |
 | Plugin interfaces | `hub/integrations/protocols.py` | `hub/integrations/registry.py`, concrete plugin file, service caller | `tests/test_poller.py`, `tests/test_services.py` |
@@ -25,6 +27,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 - Changing task row fields usually means touching both migration logic in `hub/db.py` and serialization/deserialization paths.
 - Changing DoR or readiness logic can break approval behavior even if the API schema stays the same.
 - Changing plugin protocols is a cross-cutting contract change; inspect noop and real adapters together.
+- Editing a tool docstring or adding a parameter changes the published `tools/list` and can breach the catalog budget (#780). CI runs `uv run python scripts/mcp_catalog_budget.py`; re-freeze deliberately with `--update` and say why in the change.
 
 ## Safe Read Order
 

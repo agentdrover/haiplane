@@ -1,4 +1,4 @@
-"""Inbound Bearer for MCP tools calling the Hub REST API in-process."""
+"""Inbound identity for MCP: the Bearer to reuse, and who is calling."""
 
 from __future__ import annotations
 
@@ -23,3 +23,27 @@ def bearer_context_reset(handle: Any) -> None:
 
 def bearer_context_get() -> str | None:
     return _internal_bearer.get()
+
+
+# Who is calling, for telemetry only (#780). Usage records must name a
+# principal and a role — "which role uses which tool" is half of the case for
+# a core surface — and a tool function has no request to read that from. The
+# identity is a snapshot of what AuthMiddleware already resolved: the token
+# itself stays in the bearer var above and is never copied here.
+_identity: contextvars.ContextVar[tuple[int | None, str] | None] = (
+    contextvars.ContextVar("hub_mcp_identity", default=None)
+)
+
+
+def identity_context_set(principal_id: int | None, role: str) -> Any:
+    """Stash caller (principal_id, role); returns handle for the reset."""
+    return _identity.set((principal_id, role or ""))
+
+
+def identity_context_reset(handle: Any) -> None:
+    _identity.reset(handle)
+
+
+def identity_context_get() -> tuple[int | None, str]:
+    """Caller identity for the current MCP call, or (None, "") outside one."""
+    return _identity.get() or (None, "")

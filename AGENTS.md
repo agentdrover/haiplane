@@ -12,6 +12,9 @@
 - Use `uv add <package>` for dependencies.
 - If a change touches API contracts, update `hub/cli.py`, `hub/mcp_server.py`, and affected tests in the same pass.
 - If a change touches persisted task data or schema, update migrations in `hub/db.py`.
+- If a change touches MCP tool docstrings or signatures, it changes the published
+  `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too)
+  and re-freeze the budget with `--update` only as a deliberate, explained decision.
 - Prefer focused validation:
   - `uv run ruff check hub tests`
   - `uv run ruff format hub tests`
