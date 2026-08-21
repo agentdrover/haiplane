@@ -28,7 +28,12 @@ from hub.actionable_errors import (
 from hub import repository as repo
 from hub.services.sessions import note_session_task
 from hub.hub_instance import mutation_activity_detail
-from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
+from hub.db import (
+    deserialize_str_list,
+    fetchall,
+    log_activity,
+    structured_fields_from_row,
+)
 from hub.integrations.registry import plugins
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
@@ -102,6 +107,19 @@ from hub.services.refinement import (
 log = logging.getLogger("hub")
 
 _ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+def _existing_task(row: aiosqlite.Row | None, task_id: int) -> aiosqlite.Row:
+    """Строка задачи, которая обязана существовать на этом шаге.
+
+    Инвариант «мы только что её читали/меняли, значит она есть» жил в коде
+    сорока подавлениями type: ignore. Подавление молчит и когда инвариант
+    держится, и когда он порвался; здесь он проверяется и, если не сошёлся,
+    отвечает 404 вместо AttributeError на None (#847).
+    """
+    if row is None:
+        raise HTTPException(404, f"task #{task_id} not found")
+    return row
 
 
 async def _try_restore_pair_workspace(
@@ -224,10 +242,11 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
 
 async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
     """Repair feature/epic rows left open while all children are completed."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id FROM tasks WHERE archived=0 AND task_type IN ('feature','epic') "
         "AND status NOT IN ('completed','failed','rejected') "
-        "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC"
+        "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC",
     )
     repaired = 0
     for row in rows:
@@ -1596,24 +1615,43 @@ async def submit_for_review(
     # there is still something to refuse.
     surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
     surface_note = ""
+    # #890: paths the submitter accepts as the real scope. Empty unless the
+    # submission asked for it — the hub never widens affected_areas on its own.
+    accepted_paths: list[str] = []
     if surfaces_mode != "off":
         verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
         if verdict == "undeclared":
             listed = ", ".join(undeclared[:10])
-            if surfaces_mode == "require":
+            if body.accept_areas:
+                # #890: affected_areas is written at DoR as a PREDICTION, and
+                # work discovers its own scope — #854 measured 46 of 104
+                # submissions changing files outside the declared set, and
+                # showed the residue is real surfaces, not routine noise.
+                # Refusing that punishes imprecise foresight; what review,
+                # commit-scope and the risk recompute actually need is that
+                # declared and actual agree AT SUBMISSION. So the submitter
+                # may accept the truth in one step — explicitly, and on the
+                # record below.
+                accepted_paths = list(undeclared)
+            elif surfaces_mode == "require":
                 raise HTTPException(
                     422,
                     f"ветка меняет файлы вне объявленной области: {listed}. "
-                    "Допишите их в affected_areas или объясните в сдаче, "
+                    "Допишите их в affected_areas, признайте фактические "
+                    "области на сдаче (accept_areas) или объясните в сдаче, "
                     "почему они здесь. Проверка сравнивает с фактическим "
                     "диффом, а не с предсказанием.",
                 )
-            surface_note = (
-                f"Вне объявленной области изменены: {listed}. Режим проверки — "
-                "warn, сдача принята. Область стоит дописать: по ней "
-                "сверяется и commit-scope."
-            )
+            else:
+                surface_note = (
+                    f"Вне объявленной области изменены: {listed}. Режим "
+                    "проверки — warn, сдача принята. Область стоит дописать "
+                    "(или признать на сдаче через accept_areas): по ней "
+                    "сверяется и commit-scope."
+                )
         elif verdict == "unknown":
+            # Nothing to accept: a check that did not run is not a divergence,
+            # and accept_areas must never turn silence into agreement.
             surface_note = (
                 f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
                 "Это не значит, что расхождений нет."
@@ -1713,6 +1751,34 @@ async def submit_for_review(
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)
+        # #890: the accepted scope is written INSIDE the same transaction as
+        # the transition, so a task can never end up in review with the field
+        # widened but the growth unrecorded — or the other way round.
+        if accepted_paths:
+            declared = deserialize_str_list(task.get("affected_areas"))
+            merged = list(declared) + [p for p in accepted_paths if p not in declared]
+            await repo.update_task_structured(
+                db, task_id, TaskRefine(affected_areas=merged)
+            )
+            shown = ", ".join(accepted_paths[:10])
+            more = (
+                f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
+            )
+            # A separate, visible event on purpose. Without it affected_areas
+            # would simply always equal the diff, and there would be nothing
+            # left to compare: the reviewer must be able to see that half the
+            # declared scope appeared at submission, not at DoR.
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"{commit_scope.SCOPE_GROWTH_MARKER} "
+                f"+{len(accepted_paths)} путь(ей) "
+                f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
+                f"{len(declared)}, стало {len(merged)}. Это признание факта "
+                "сдающим, а не предсказание из постановки.",
+            )
         if surface_note:
             await repo.add_task_update(db, task_id, "hub", "alert", surface_note)
         if risk_alert:
@@ -1744,9 +1810,9 @@ async def submit_for_review(
     except Exception:  # noqa: BLE001 - dispatch must never break a submit
         log.exception("cross-model review dispatch failed for task #%s", task_id)
 
-    row = await repo.get_task(db, task_id)
+    row = _existing_task(await repo.get_task(db, task_id), task_id)
     updates = await repo.get_task_updates(db, task_id)
-    view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    view = row_to_task(row, updates=updates)
 
     # Machine-review policy (#382): tell the submitting agent right away
     # when the harness run is expected before the human verdict.
@@ -2197,11 +2263,11 @@ async def claim_task(
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):
-        row = await repo.get_task(db, task_id)
+        row = _existing_task(await repo.get_task(db, task_id), task_id)
         task = dict(row)
         if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
             updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            return row_to_task(row, updates=updates)
         raise HTTPException(409, f"Task #{task_id} claim conflict")
 
     session_note = f" session={body.session_id}" if body.session_id else ""
@@ -2602,6 +2668,18 @@ async def add_update(
     if body.kind == "done":
         _validate_done_report(task)
 
+    # #498: work that never started its way out, named while the report is
+    # being written rather than found weeks later. Advisory by design: the
+    # completion is not blocked, and anything unknown stays silent.
+    undelivered = ""
+    if body.kind == "done":
+        from hub.services.delivery_gate import undelivered_warning
+
+        try:
+            undelivered = await undelivered_warning(db, task)
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            log.warning("delivery check for #%s failed: %s", task_id, exc)
+
     # Serialize the whole mutation (insert + status transition + commits) on the
     # shared connection so it cannot interleave with a refinement ``_atomic``
     # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
@@ -2735,8 +2813,15 @@ async def add_update(
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
 
+    if undelivered:
+        await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
+        await db.commit()
+
     update_row = await repo.get_task_update_by_id(db, update_id)
-    return TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
+    view = TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
+    if undelivered:
+        view.warnings = [undelivered]
+    return view
 
 
 async def refresh_task(
@@ -2848,7 +2933,8 @@ async def _has_incomplete_descendants(
     db: aiosqlite.Connection,
     root_id: int,
 ) -> bool:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """
         WITH RECURSIVE sub(id) AS (
             SELECT id FROM tasks WHERE parent_id = ?

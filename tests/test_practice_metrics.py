@@ -759,3 +759,139 @@ async def test_page_says_nothing_measurable_instead_of_zero(
 
     page = (await client.get("/metrics")).text
     assert "нет измеримых утечек в этом окне" in page
+
+
+# --- What the findings turned out to be (#877, on #876's data) ---------------
+#
+# Until this, review quality was measured by the review itself. precision and
+# resolution answer a different question — whether the findings were real, and
+# whether anyone acted on them.
+
+
+async def _judged(
+    db: aiosqlite.Connection,
+    task_id: int,
+    dispositions: list[str],
+    *,
+    profile: str = "lite",
+    model: str = "grok-4.6",
+    tokens_spent: int | None = 1000,
+    provider_tokens: int | None = None,
+) -> None:
+    """A report with `len(dispositions)` confirmed findings, each judged."""
+    await _report(
+        db,
+        task_id,
+        confirmed=len(dispositions),
+        tokens_spent=tokens_spent,
+        provider_tokens=provider_tokens,
+    )
+    row = await repo.get_latest_machine_review(db, task_id)
+    await db.execute(
+        "UPDATE machine_reviews SET profile = ?, model = ? WHERE id = ?",
+        (profile, model, row["id"]),
+    )
+    for index, disposition in enumerate(dispositions):
+        await repo.upsert_finding_disposition(
+            db,
+            review_id=int(row["id"]),
+            task_id=task_id,
+            submission_generation=1,
+            finding_index=index,
+            finding_title=f"f{index}",
+            disposition=disposition,
+            note="",
+            decided_by="owner",
+        )
+
+
+async def test_precision_and_resolution_by_profile(db: aiosqlite.Connection):
+    # AC-1 (#877): both rates, split by profile AND by reviewer model, with the
+    # sample size beside each — a precision of 100% over two findings is not a
+    # verdict on a profile.
+    cheap = await _task(db, title="cheap run")
+    await _judged(
+        db, cheap, ["fixed", "false_positive"], profile="lite", model="grok-4.6"
+    )
+    deep = await _task(db, title="deep run")
+    await _judged(
+        db, deep, ["fixed", "wont_fix", "fixed"], profile="deep", model="gpt-5.3-codex"
+    )
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    disp = metrics["machine_reviews"]["dispositions"]
+
+    # A defect nobody chose to fix is still a defect the reviewer found: only
+    # false_positive counts against precision.
+    assert disp["judged"] == 5 and disp["fixed"] == 3 and disp["false_positive"] == 1
+    assert disp["precision"] == round(4 / 5, 3)
+    assert disp["resolution_rate"] == round(3 / 5, 3)
+
+    by_profile = {row["profile"]: row for row in metrics["by_profile"]}
+    assert by_profile["lite"]["precision"] == 0.5
+    assert by_profile["lite"]["judged"] == 2
+    assert by_profile["deep"]["precision"] == 1.0
+    assert by_profile["deep"]["resolution_rate"] == round(2 / 3, 3)
+
+    by_model = {row["model"]: row for row in metrics["by_reviewer_model"]}
+    assert by_model["grok-4.6"]["judged"] == 2
+    assert by_model["gpt-5.3-codex"]["resolution_rate"] == round(2 / 3, 3)
+
+
+async def test_reports_without_disposition_counted_apart(db: aiosqlite.Connection):
+    # AC-2 (#877): an unjudged report is neither a hit nor a miss. Folding it
+    # in as a zero would make an unanswered question look like a false
+    # positive, and the coverage of the loop would stop being visible (#841).
+    judged = await _task(db, title="judged run")
+    await _judged(db, judged, ["fixed"])
+    silent = await _task(db, title="nobody judged this")
+    await _report(db, silent, confirmed=4)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+    disp = mr["dispositions"]
+
+    assert disp["judged"] == 1, "only the judged finding is in the denominator"
+    assert disp["precision"] == 1.0
+    assert disp["reports_judged"] == 1 and disp["reports_unjudged"] == 1
+    assert disp["confirmed_unjudged"] == 4, "the four unanswered findings stay visible"
+
+
+async def test_tokens_per_fixed_takes_both_ends_from_the_same_rows(
+    db: aiosqlite.Connection,
+):
+    # The #516 rule, applied to the honest price: a report that reported no
+    # tokens contributes neither its tokens nor its fixed findings, and a
+    # report nobody judged contributes nothing at all.
+    priced = await _task(db, title="priced and judged")
+    await _judged(db, priced, ["fixed", "fixed"], tokens_spent=100_000)
+    unpriced = await _task(db, title="judged but unpriced")
+    await _judged(db, unpriced, ["fixed"], tokens_spent=None)
+    unjudged = await _task(db, title="priced but unjudged")
+    await _report(db, unjudged, confirmed=5, tokens_spent=900_000)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+
+    assert mr["tokens_per_fixed"] == 50_000, "100k over ITS two fixed findings"
+    assert mr["provider_tokens_per_fixed"] is None, "no bill means no billed price"
+
+
+async def test_no_dispositions_reads_as_no_data(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#877): a window nobody judged shows "нет данных", never 0% and
+    # never 100%. Both readings would be a verdict the data cannot support.
+    task_id = await _task(db, title="unjudged")
+    await _report(db, task_id, confirmed=2)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+    assert mr["dispositions"]["precision"] is None
+    assert mr["dispositions"]["resolution_rate"] is None
+    assert mr["tokens_per_fixed"] is None
+
+    page = (await client.get("/metrics")).text
+    assert "ни одна находка не размечена" in page
+    assert "сравнивать" in page, "the model table says why it is empty"

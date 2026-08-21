@@ -11,7 +11,7 @@ import aiosqlite
 
 from hub import commit_scope, config
 from hub import repository as repo
-from hub.db import deserialize_str_list, get_breadcrumb, log_activity
+from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
@@ -19,7 +19,12 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
-from hub.services.project_policy import base_branch_of
+from hub.services import workflow_seed
+from hub.services.project_policy import (
+    base_branch_of,
+    ci_runner_of,
+    release_base_of,
+)
 
 log = logging.getLogger("hub")
 
@@ -177,8 +182,9 @@ async def machine_review_gap(
 ) -> str | None:
     """None when policy is satisfied; otherwise a human-readable gap reason."""
     project = await repo.resolve_project_for_task(db, task["id"])
-    keys = project.keys() if project is not None else []
-    policy = project["machine_review"] if "machine_review" in keys else "auto"
+    policy = "auto"
+    if project is not None and "machine_review" in project.keys():
+        policy = project["machine_review"]
     if not machine_review_required(task, policy):
         return None
     generation = task.get("submission_generation") or 0
@@ -199,6 +205,134 @@ async def machine_review_gap(
             "(#750/#841). Прогоните харнесс заново или выносите вердикт сами"
         )
     return None
+
+
+# What the gate said the findings turned out to be (#877, on #876's data).
+#
+# ``precision`` is the share of judged findings that were REAL. A defect the
+# owner chose not to fix is still a defect the reviewer found, so ``wont_fix``
+# counts as a hit; only ``false_positive`` — "the described defect is not in
+# the code" — counts against it. ``resolution_rate`` is narrower and is the
+# number BugBot publishes: the share that actually got fixed.
+#
+# Both are computed ONLY over judged findings. A confirmed finding nobody
+# judged is not a miss and not a hit, it is an unanswered question, and it is
+# reported beside the rates rather than folded into either (#519, #841).
+_REAL = ("fixed", "wont_fix")
+
+
+async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Precision and resolution, overall and split by profile and model.
+
+    The window is the REPORT's ``created_at``, never the disposition's: a
+    judgement made a week after the run belongs to the run it judges. Keying it
+    by when someone clicked would let a report and its verdict fall into
+    different windows and divide unrelated things by each other.
+    """
+
+    def _rates(counts: dict[str, int]) -> dict[str, Any]:
+        judged = sum(counts.values())
+        real = sum(counts.get(k, 0) for k in _REAL)
+        return {
+            # The sample size travels with the rate. Two judged findings can
+            # produce a precision of 1.0, and a bare 1.0 invites a decision
+            # the sample cannot support.
+            "judged": judged,
+            "fixed": counts.get("fixed", 0),
+            "false_positive": counts.get("false_positive", 0),
+            "wont_fix": counts.get("wont_fix", 0),
+            "precision": round(real / judged, 3) if judged else None,
+            "resolution_rate": (
+                round(counts.get("fixed", 0) / judged, 3) if judged else None
+            ),
+        }
+
+    rows = await fetchall(
+        db,
+        "SELECT CASE WHEN mr.profile = '' THEN 'не заявлен' ELSE mr.profile END "
+        "AS profile, "  # nosec B608 - constant fragment, values stay params
+        "CASE WHEN mr.model = '' THEN 'не заявлена' ELSE mr.model END AS model, "
+        "d.disposition AS disposition, COUNT(*) AS n "
+        "FROM finding_dispositions d "
+        "JOIN machine_reviews mr ON mr.id = d.review_id "
+        "WHERE mr.created_at >= datetime('now', ?) "
+        "GROUP BY profile, model, d.disposition",
+        (since,),
+    )
+    overall: dict[str, int] = {}
+    by_profile: dict[str, dict[str, int]] = {}
+    by_model: dict[str, dict[str, int]] = {}
+    for row in rows:
+        r = dict(row)
+        n = int(r["n"])
+        overall[r["disposition"]] = overall.get(r["disposition"], 0) + n
+        p = by_profile.setdefault(r["profile"], {})
+        p[r["disposition"]] = p.get(r["disposition"], 0) + n
+        m = by_model.setdefault(r["model"], {})
+        m[r["disposition"]] = m.get(r["disposition"], 0) + n
+
+    # Coverage of the loop itself: how many reports were judged at all, and how
+    # many confirmed findings are still waiting for an answer. Without these a
+    # precision of 1.0 over two findings out of ninety reads like a verdict on
+    # the harness.
+    coverage_rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
+        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
+        "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
+        "COALESCE(SUM(judged.n), 0) AS judged "
+        "FROM machine_reviews mr LEFT JOIN ("
+        "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
+        "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
+        "WHERE mr.created_at >= datetime('now', ?)",
+        (since,),
+    )
+    cov = dict(coverage_rows[0]) if coverage_rows else {}
+    reports = int(cov.get("reports") or 0)
+    reports_judged = int(cov.get("reports_judged") or 0)
+    result = _rates(overall)
+    result["reports_judged"] = reports_judged
+    # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
+    # reader needs, and a percentage hides which one this is.
+    result["reports_unjudged"] = reports - reports_judged
+    result["confirmed_unjudged"] = max(
+        int(cov.get("confirmed") or 0) - int(cov.get("judged") or 0), 0
+    )
+    result["by_profile"] = [
+        dict(_rates(counts), profile=name)
+        for name, counts in sorted(by_profile.items())
+    ]
+    result["by_model"] = [
+        dict(_rates(counts), model=name) for name, counts in sorted(by_model.items())
+    ]
+    return result
+
+
+async def _tokens_per_fixed(
+    db: aiosqlite.Connection, since: str, column: str
+) -> int | None:
+    """Tokens per FIXED finding, or None when nothing supports the division.
+
+    Numerator and denominator come from the same rows — the #516 rule that
+    understated the cost per confirmed finding by 38% when they did not. A
+    report without a token count contributes neither its tokens nor its
+    findings, and a report nobody judged contributes nothing at all.
+    """
+    if column not in ("tokens_spent", "provider_tokens"):  # pragma: no cover
+        raise ValueError(f"unsupported token column: {column}")
+    rows = await fetchall(
+        db,
+        f"SELECT COALESCE(SUM(mr.{column}), 0) AS tokens, "  # nosec B608 - column is checked above against a literal allow-list
+        "COALESCE(SUM(fixed.n), 0) AS fixed FROM machine_reviews mr "
+        "JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
+        "WHERE disposition = 'fixed' GROUP BY review_id) AS fixed "
+        "ON fixed.review_id = mr.id "
+        f"WHERE mr.created_at >= datetime('now', ?) AND mr.{column} IS NOT NULL",
+        (since,),
+    )
+    row = dict(rows[0]) if rows else {}
+    fixed = int(row.get("fixed") or 0)
+    return round(int(row.get("tokens") or 0) / fixed) if fixed else None
 
 
 async def practice_metrics(
@@ -227,7 +361,8 @@ async def practice_metrics(
 
     since = f"-{since_days} days"
 
-    totals_rows = await db.execute_fetchall(
+    totals_rows = await fetchall(
+        db,
         # `reviews` counts the reports that show a sign of having run; the
         # stamps are counted beside them, never inside them (#841). Both are
         # reported, so `reports_total` still answers "how many rows landed"
@@ -313,7 +448,8 @@ async def practice_metrics(
     # stayed affordable. Kept beside by_harness rather than folded into it:
     # the harness answers "what ran", the profile answers "how much it was
     # allowed to spend".
-    profile_rows = await db.execute_fetchall(
+    profile_rows = await fetchall(
+        db,
         "SELECT CASE WHEN profile = '' THEN 'не заявлен' ELSE profile END "
         "AS profile, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
@@ -329,7 +465,8 @@ async def practice_metrics(
         (since,),
     )
 
-    harness_rows = await db.execute_fetchall(
+    harness_rows = await fetchall(
+        db,
         "SELECT harness_skill, harness_version, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
@@ -343,7 +480,8 @@ async def practice_metrics(
         (since,),
     )
 
-    category_rows = await db.execute_fetchall(
+    category_rows = await fetchall(
+        db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
         "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
@@ -376,7 +514,8 @@ async def practice_metrics(
     # duration. Every row that HAS a completion is filtered and measured by
     # the same `completed_at` — #518 fixed a version where numerator and
     # window used different clocks, and that fix stays.
-    cycle_rows = await db.execute_fetchall(
+    cycle_rows = await fetchall(
+        db,
         "SELECT work_type, completed_at IS NULL AS no_completion, "
         "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
         "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
@@ -439,6 +578,27 @@ async def practice_metrics(
         )
     ]
 
+    # #877: what the findings turned out to be. Attached to the profile rows
+    # as well, because "lite found three things" and "lite found three things
+    # and two of them were real" are different facts about the same run.
+    dispositions = await _disposition_metrics(db, since)
+    totals["dispositions"] = dispositions
+    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, since, "tokens_spent")
+    totals["provider_tokens_per_fixed"] = await _tokens_per_fixed(
+        db, since, "provider_tokens"
+    )
+    by_profile_rates = {row["profile"]: row for row in dispositions["by_profile"]}
+    profile_dicts = []
+    for row in profile_rows:
+        entry = dict(row)
+        # A profile nobody judged gets the empty shape, not zeros: "no data"
+        # and "nothing was real" are opposite readings of the same blank.
+        rates = by_profile_rates.get(entry["profile"])
+        entry["judged"] = rates["judged"] if rates else 0
+        entry["precision"] = rates["precision"] if rates else None
+        entry["resolution_rate"] = rates["resolution_rate"] if rates else None
+        profile_dicts.append(entry)
+
     escaped = await _escaped_defect_metrics(db, since)
 
     human_gates = await _human_gate_metrics(db, since)
@@ -448,7 +608,8 @@ async def practice_metrics(
         "since_days": since_days,
         "machine_reviews": totals,
         "by_harness": [dict(r) for r in harness_rows],
-        "by_profile": [dict(r) for r in profile_rows],
+        "by_profile": profile_dicts,
+        "by_reviewer_model": dispositions["by_model"],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
@@ -493,7 +654,8 @@ async def _escaped_defect_metrics(
     never to the feature's closure. #518 was a bug about a numerator and a
     window keeping different clocks; this one states its clock.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         # The ancestry walk stops at the first feature, so each bug contributes
         # its NEAREST feature and no other: a bug hanging under a task under a
         # feature is attributed to that feature, not to the epic above it.
@@ -513,7 +675,8 @@ async def _escaped_defect_metrics(
         "JOIN tasks f ON f.id = a.node_id AND f.task_type = 'feature'",
         (since,),
     )
-    total_rows = await db.execute_fetchall(
+    total_rows = await fetchall(
+        db,
         "SELECT COUNT(*) AS bugs FROM tasks "
         "WHERE work_type = 'bug' AND created_at >= datetime('now', ?)",
         (since,),
@@ -589,7 +752,8 @@ async def _review_outcome_metrics(
     """
     import json as _json
 
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT task_id, payload FROM events "
         "WHERE kind = 'review_verdict_recorded' "
         "AND created_at >= datetime('now', ?)",
@@ -693,7 +857,8 @@ async def _human_gate_metrics(
     import json as _json
     import statistics
 
-    event_rows = await db.execute_fetchall(
+    event_rows = await fetchall(
+        db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
@@ -723,7 +888,8 @@ async def _human_gate_metrics(
     # The submission moment is written by the hub itself in a fixed shape
     # (submit_for_review), which makes it the one submission timestamp that
     # exists for the whole history — there is no dedicated event yet.
-    submit_rows = await db.execute_fetchall(
+    submit_rows = await fetchall(
+        db,
         "SELECT task_id, created_at FROM task_updates "
         "WHERE kind = 'status' "
         "AND content LIKE 'Submitted for review (submission #%'",
@@ -806,11 +972,11 @@ async def _human_gate_metrics(
                 payload = _json.loads(row["payload"] or "{}")
             except ValueError:
                 payload = {}
-            result = (payload.get("result") or "").lower()
-            if result not in {"ok", "problem"}:
+            audit_result = (payload.get("result") or "").lower()
+            if audit_result not in {"ok", "problem"}:
                 continue
             entry = bucket("audit", project_slug)
-            if result == "ok":
+            if audit_result == "ok":
                 entry["approvals"] += 1
             else:
                 entry["overrides"] += 1
@@ -854,6 +1020,14 @@ async def provision_project(
     ``provision_status``/``provision_detail`` so the operator can read
     WHY instead of getting a 500. Missing repo/workspace are provision
     errors too, not validation errors: the button must always answer.
+
+    #476: a successful clone also gets the hub's workflow templates, because
+    a repository the hub can clone but cannot deliver from is not provisioned.
+    The delivery gate merges only on a green workflow outcome, so a project
+    with no ``.github/workflows`` answered ``ci_absent`` and parked approved,
+    green work in ``needs_decision``. Seeding is best effort by contract: it
+    appends its own sentence to the detail and never changes the status,
+    since a clone that worked is still a clone that worked.
     """
     row = await repo.get_project(db, project_id)
     if row is None:
@@ -872,6 +1046,17 @@ async def provision_project(
             # develop the moment the column was blank.
             base_branch_of(project),
         )
+        if ok:
+            seed = workflow_seed.seed_project_workflows(
+                project["workspace_path"].strip(),
+                # Same readers as everything else that asks which branches
+                # this project uses (#475) — the templates carry placeholders
+                # precisely so no branch name is written into a file here.
+                base_branch=base_branch_of(project),
+                release_branch=release_base_of(project),
+                ac_runner=ci_runner_of(project),
+            )
+            detail = f"{detail}; workflows: {seed.detail}"
     status = "ok" if ok else "error"
     await repo.update_project(
         db, project_id, provision_status=status, provision_detail=detail[:1000]
@@ -1302,6 +1487,12 @@ async def merge_before_completion(
     """
     task_id = task["id"]
     pr_num = task.get("pr_number")
+    if pr_num is None:
+        # Вызывающий пускает сюда только задачи с номером PR (#605), но внутри
+        # это нигде не было сказано, и проверка типов справедливо считала, что
+        # в GitHub может уехать None. Инвариант записан явно: отказ с причиной
+        # дешевле падения на первом же вызове с None.
+        return False, "no_pr: у задачи нет номера PR — доставлять нечего"
     try:
         # Already delivered — by the headless conveyor, or by an earlier done
         # report that failed after the merge. Merging twice is not extra
@@ -1864,8 +2055,10 @@ async def transition_after_agent_done(
         # is a submission for review, not a completion. Route to
         # client-driven review (no review_job_id) and tell the agent how to
         # obtain the verdict.
-        generation = (await repo.get_task(db, task_id)) or {}
-        generation_num = dict(generation).get("submission_generation", 0)
+        task_row = await repo.get_task(db, task_id)
+        generation_num = (
+            dict(task_row).get("submission_generation", 0) if task_row else 0
+        )
         await repo.update_task(
             db,
             task_id,

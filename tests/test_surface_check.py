@@ -13,7 +13,7 @@ import aiosqlite
 import pytest
 from fastapi import HTTPException
 
-from hub import config
+from hub import commit_scope, config
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
@@ -210,3 +210,133 @@ async def test_submit_distinguishes_empty_diff_from_unreadable(
         "an unreadable diff must name itself as unreadable"
     )
     assert empty_note != unreadable_note
+
+
+async def test_surfaces_default_mode_stays_warn(monkeypatch) -> None:
+    """#854: tightening is an installation's decision, never a new default.
+
+    The check has been in ``warn`` since #550, and the measurement behind #854
+    is why that stays: over the 30 days to 2026-08-21, 46 of 104 checkable
+    submissions (44%) would have been refused rather than alerted. A default
+    that refuses two submissions in five is not a default — it is a migration,
+    and it belongs to whoever runs the installation, switched on through the
+    environment with the number in hand.
+    """
+    import importlib
+    import os
+
+    monkeypatch.delenv("OPENCLAW_SDD_SURFACES", raising=False)
+    fresh = importlib.reload(config)
+    try:
+        assert fresh.SDD_SURFACES == "warn"
+    finally:
+        # Leave the module as the rest of the suite expects to find it.
+        if "OPENCLAW_SDD_SURFACES" in os.environ:
+            del os.environ["OPENCLAW_SDD_SURFACES"]
+        importlib.reload(config)
+
+
+# ---- #890: accepting the actual scope instead of refusing a forecast ----
+#
+# #854 measured the price of the alternative: 46 of 104 submissions over 30
+# days changed files outside their declared areas, and the residue after the
+# most generous routine-path allowances was real surfaces, not noise. The
+# field is written at DoR as a prediction; work discovers its own scope. What
+# review, commit-scope and the risk recompute need is that declared and actual
+# agree AT SUBMISSION — so the submitter may accept the truth in one step.
+
+
+async def test_accepting_actual_areas_records_the_growth(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#890 AC-1. The field becomes true, and the growth is on the record."""
+    from hub.models import TaskSubmitReview
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps(["hub/app.py", "hub/db.py", "tests/test_api.py"])
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(accept_areas=True)
+    )
+
+    assert view.status.value == "review"
+    task = dict(await repo.get_task(db, task_id))
+    from hub.db import deserialize_str_list
+
+    areas = deserialize_str_list(task["affected_areas"])
+    assert areas == ["hub/app.py", "hub/db.py", "tests/test_api.py"], (
+        "the declared field now says what the work actually touched"
+    )
+
+    alerts = await _alerts(db, task_id)
+    growth = [a for a in alerts if a.startswith(commit_scope.SCOPE_GROWTH_MARKER)]
+    assert len(growth) == 1, alerts
+    assert "+2" in growth[0], growth[0]
+    assert "hub/db.py" in growth[0] and "tests/test_api.py" in growth[0]
+    # The point of the event: the reviewer can tell a fact from a forecast.
+    assert "признание факта" in growth[0]
+    assert not any("Вне объявленной области" in a for a in alerts), (
+        "accepted scope is not also reported as an unresolved divergence"
+    )
+
+
+async def test_areas_are_never_accepted_implicitly(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#890 AC-2. Without the explicit flag nothing changes — in either mode.
+
+    A hub that widened the field on its own would leave affected_areas always
+    equal to the diff, and then there would be nothing left to compare.
+    """
+    from hub.models import TaskSubmitReview
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps(["hub/app.py", "hub/db.py"])
+
+    await services.submit_for_review(db, task_id, TaskSubmitReview())
+
+    from hub.db import deserialize_str_list
+
+    task = dict(await repo.get_task(db, task_id))
+    assert deserialize_str_list(task["affected_areas"]) == ["hub/app.py"]
+    alerts = await _alerts(db, task_id)
+    assert any("Вне объявленной области" in a for a in alerts)
+    assert not any(a.startswith(commit_scope.SCOPE_GROWTH_MARKER) for a in alerts)
+
+    # And in require the same submission is still refused, not silently fixed.
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    other_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps(["hub/app.py", "hub/db.py"])
+    with pytest.raises(HTTPException) as exc_info:
+        await services.submit_for_review(db, other_id, TaskSubmitReview())
+    assert exc_info.value.status_code == 422
+    # The refusal now names the one-step way out as well.
+    assert "accept_areas" in str(exc_info.value.detail)
+
+
+async def test_unknown_verdict_cannot_be_accepted_away(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#890 AC-3. A check that did not run is not a divergence to accept."""
+    from hub.models import TaskSubmitReview
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    task_id = await _running_task_with_areas(db, ["hub/app.py"])
+    plugins.git_ops = _DiffGitOps(None)  # diff could not be determined
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(accept_areas=True)
+    )
+
+    assert view.status.value == "review"
+    from hub.db import deserialize_str_list
+
+    task = dict(await repo.get_task(db, task_id))
+    assert deserialize_str_list(task["affected_areas"]) == ["hub/app.py"], (
+        "nothing was invented from a check that never ran"
+    )
+    alerts = await _alerts(db, task_id)
+    assert any("НЕ выполнялась" in a for a in alerts)
+    assert not any(a.startswith(commit_scope.SCOPE_GROWTH_MARKER) for a in alerts)

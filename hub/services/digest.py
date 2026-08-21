@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from hub.db import fetchall
 from hub import repository as repo
 
 log = logging.getLogger(__name__)
@@ -88,21 +89,24 @@ async def generate_due_digests(
     )
 
     created = 0
-    projects = await db.execute_fetchall(
+    projects = await fetchall(
+        db,
         "SELECT id, slug, gate_policy FROM projects "
-        "WHERE archived=0 AND status='active'"
+        "WHERE archived=0 AND status='active'",
     )
     for project in projects:
         if not _policy_delegates(project["gate_policy"]):
             continue
-        existing = await db.execute_fetchall(
+        existing = await fetchall(
+            db,
             "SELECT id FROM autopilot_digests WHERE project_id=? AND digest_date=?",
             (project["id"], day),
         )
         if existing:
             continue
 
-        events = await db.execute_fetchall(
+        events = await fetchall(
+            db,
             "SELECT id, kind, actor, task_id, payload, created_at FROM events "
             "WHERE kind IN (?, ?, ?) AND created_at >= ? AND created_at < ? "
             "ORDER BY id ASC",
@@ -151,7 +155,8 @@ async def generate_due_digests(
         if not (approvals or verdicts or escalations):
             continue
 
-        merges = await db.execute_fetchall(
+        merges = await fetchall(
+            db,
             "SELECT pr_number, task_id, merge_sha, merged_at FROM pipeline_merges "
             "WHERE project_id=? AND merged_at >= ? AND merged_at < ?",
             (project["id"], day_start, day_end),

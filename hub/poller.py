@@ -13,7 +13,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
-from hub.db import log_activity
+from hub.db import fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
@@ -823,7 +823,8 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             # and the author finds out only when the owner hits the button.
             # One alert per draft (has_stale_alert dedup, same as above);
             # a draft brought to DoR after the alert is left alone.
-            unrefined = await db.execute_fetchall(
+            unrefined = await fetchall(
+                db,
                 "SELECT id, assigned_agent FROM tasks "
                 "WHERE status='draft' AND archived=0 "
                 "AND (dor_passed IS NULL OR dor_passed=0) "
@@ -924,6 +925,12 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             # stay stuck without an owner. claimed → open is handled above.
             for policy in lifecycle_matrix.machine_deadline_policies():
                 if policy.escalation != "needs_decision":
+                    continue
+                if policy.deadline_config is None:
+                    # Матрица требует конечный дедлайн у каждой machine-политики
+                    # (см. инварианты в hub/lifecycle_matrix.py), но здесь это
+                    # держалось на честном слове: getattr(config, None) упал бы
+                    # на первом же нарушении инварианта.
                     continue
                 threshold = getattr(config, policy.deadline_config)
                 overdue = await repo.list_past_status_deadline(

@@ -26,6 +26,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -133,6 +134,144 @@ def _is_comment(code: str) -> bool:
     return not stripped or stripped.startswith(_COMMENT_PREFIXES)
 
 
+# Generated files (#874). They spend the cheap profile's ceiling exactly like
+# code does, and there is nothing in them for a reviewer to find: nobody wrote
+# those lines and nobody will fix them.
+#
+# Two uses, and only one of them is a real filter. The hub does NOT hand the
+# reviewer a diff — it reads one for itself and tells the reviewer to run
+# `git diff`. So for the reviewer this list becomes an exclusion pathspec in
+# the command it is given, plus the names of what was left out; inside the hub
+# it is a genuine filter over the diff that decides the profile, where a marker
+# in a lock file used to be able to buy the expensive harness on its own.
+#
+# Deliberately short, explicit and suffix-based. A broad mask like ``*.json``
+# would hide real code, and the failure would be silent — the worst kind here.
+_GENERATED_SUFFIXES: tuple[str, ...] = (
+    "uv.lock",
+    "poetry.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "Cargo.lock",
+    ".snap",
+    ".min.js",
+    ".min.css",
+)
+_GENERATED_DIRS: tuple[str, ...] = (
+    "__snapshots__/",
+    "node_modules/",
+)
+
+# Per-file ceiling, in diff lines. One 4000-line file must not eat a budget
+# that five 200-line files needed: the reviewer is told which file it is and
+# how big, and that the unread remainder belongs in lost_dimensions. Not a
+# truncation — the hub has no diff to truncate — but the same guarantee that
+# "did not fit" stays a stated fact instead of passing for "nothing found".
+REVIEW_FILE_LINE_CAP = 800
+
+
+def is_generated(path: str) -> bool:
+    """Is this path a generated artefact rather than written code?"""
+    if any(marker in path for marker in _GENERATED_DIRS):
+        return True
+    return any(path.endswith(suffix) for suffix in _GENERATED_SUFFIXES)
+
+
+def split_generated(diff: str) -> tuple[str, list[str]]:
+    """``(diff without generated files, names of what was dropped)``.
+
+    Splits on the ``+++`` headers the same way :func:`changed_paths` reads
+    them, so both functions agree on where a file's hunk begins. A diff that
+    starts with lines before any header keeps them: dropping text we could not
+    attribute would be the silent cut this whole task exists to prevent.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    skipping = False
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            path = raw[2:] if raw.startswith("b/") else raw
+            skipping = path != "/dev/null" and is_generated(path)
+            if skipping:
+                if path not in dropped:
+                    dropped.append(path)
+                # The header of the dropped file goes with it; the "--- a/..."
+                # line above it was already kept, which is why the reader sees
+                # the pair broken rather than the file silently absent.
+                continue
+        elif skipping and line.startswith("diff --git "):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    return "".join(kept), dropped
+
+
+def file_line_counts(diff: str) -> list[tuple[str, int]]:
+    """How many diff lines each changed file carries, biggest first."""
+    counts: dict[str, int] = {}
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            path = raw[2:] if raw.startswith("b/") else raw
+            current = "" if path == "/dev/null" else path
+            counts.setdefault(current, 0)
+            continue
+        if current and (line.startswith("+") or line.startswith("-")):
+            counts[current] += 1
+    counts.pop("", None)
+    return sorted(counts.items(), key=lambda item: -item[1])
+
+
+def diff_plan(diff: str | None, base: str, branch: str) -> tuple[str, str]:
+    """What the reviewer should read, and the note for the task update (#874).
+
+    Returns ``(block, note)``. The block carries a ready ``git diff`` command
+    with ``:(exclude)`` pathspecs, the names of the generated files left out,
+    and the files whose size will not fit a single pass. Nothing disappears
+    quietly: every exclusion is named where the reviewer reads it.
+    """
+    if diff is None:
+        return (
+            f"ПРЕДМЕТ РЕВЬЮ: дифф {base}...{branch}. Прочитать его хабу не "
+            "удалось, поэтому список исключений не составлен — читай дифф "
+            "целиком и сам реши, что в нём сгенерировано.",
+            "дифф не прочитан, исключения не составлены",
+        )
+    kept, dropped = split_generated(diff)
+    excludes = "".join(f" ':(exclude){path}'" for path in dropped)
+    lines = [
+        f"ПРЕДМЕТ РЕВЬЮ — команда диффа (выполни ЕЁ, а не свою):\n"
+        f"  git diff {base}...{branch} --{excludes}"
+    ]
+    if dropped:
+        lines.append(
+            "Исключены как сгенерированные (их никто не писал и не будет "
+            f"править): {', '.join(dropped)}."
+        )
+    oversized = [
+        (path, count)
+        for path, count in file_line_counts(kept)
+        if count > REVIEW_FILE_LINE_CAP
+    ]
+    if oversized:
+        named = ", ".join(f"{path} ({count} строк)" for path, count in oversized)
+        lines.append(
+            f"НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД (потолок {REVIEW_FILE_LINE_CAP} "
+            f"строк на файл): {named}. Прочитай сколько успеешь, остальные "
+            "файлы всё равно прочитай, а непрочитанный остаток перечисли в "
+            "lost_dimensions и сдай incomplete=true. Один большой файл не "
+            "имеет права съесть бюджет, которого ждали остальные."
+        )
+    note_bits = []
+    if dropped:
+        note_bits.append(f"исключено сгенерированных: {len(dropped)}")
+    if oversized:
+        note_bits.append(f"крупных файлов: {len(oversized)}")
+    return "\n".join(lines), "; ".join(note_bits) or "исключать нечего"
+
+
 def process_surface_reasons(diff: str) -> list[str]:
     """Which process surfaces this diff ADDS code on (#820).
 
@@ -140,7 +279,12 @@ def process_surface_reasons(diff: str) -> list[str]:
     mentions ``wait_for`` in a docstring — as this very module does — must not
     buy the expensive profile, or 'deep' quietly becomes the default and the
     saving #807 exists for is gone.
+
+    Generated files are dropped first (#874). A lock file or a snapshot could
+    otherwise buy the expensive harness by carrying one marker string in a line
+    nobody wrote — the cheapest possible way to lose the saving #807 exists for.
     """
+    diff, _ = split_generated(diff)
     reasons: list[str] = []
     for group, markers in _PROCESS_SURFACES:
         hits: list[str] = []
@@ -410,7 +554,12 @@ async def collect_review_rules(
 
 
 def _review_prompt(
-    task_id: int, branch: str, model_id: str, profile: str, rules_block: str
+    task_id: int,
+    branch: str,
+    model_id: str,
+    profile: str,
+    rules_block: str,
+    diff_block: str,
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба OpenClaw "
@@ -419,6 +568,9 @@ def _review_prompt(
         # The rules travel with BOTH profiles: the expensive harness has no
         # more knowledge of this repository's history than the cheap pass.
         f"{rules_block}\n\n"
+        # So does the diff plan (#874): the deep harness reads the same branch
+        # and has the same reason not to spend its passes on lock files.
+        f"{diff_block}\n\n"
     )
     if profile == LITE:
         budget = config.REVIEW_LITE_TOKEN_BUDGET
@@ -426,7 +578,7 @@ def _review_prompt(
             common + "Это ЛЁГКОЕ ревью: один проход, бюджет "
             f"{budget} токенов. Порядок: "
             f"1) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
-            "2) прочитай ДИФФ ветки к базовой (git diff) и только его — "
+            "2) прочитай дифф КОМАНДОЙ ИЗ ПРЕДМЕТА РЕВЬЮ выше и только его — "
             "не исследуй репозиторий целиком, контекст берётся из диффа; "
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
             "потерянные граничные случаи, несоответствие заявленным AC; "
@@ -543,12 +695,20 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
     diff = await _submission_diff(db, task_id, branch)
     profile, profile_reasons = pick_review_profile(task, diff)
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
+    # #874: which base the reviewer diffs against. Unknown base falls back to
+    # the configured one rather than to nothing — a command the reviewer cannot
+    # run would send it back to inventing its own, which is what we are fixing.
+    ctx = await _git_context(db, task_id)
+    base = ctx[1] if ctx else config.PAIR_BASE_BRANCH
+    diff_block, diff_note = diff_plan(diff, base, branch)
     hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=branch,
         model_id=model_id,
-        prompt_text=_review_prompt(task_id, branch, model_id, profile, rules_block),
+        prompt_text=_review_prompt(
+            task_id, branch, model_id, profile, rules_block, diff_block
+        ),
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
     )
@@ -593,7 +753,8 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         f"Кросс-модельное ревью вызвано хабом: модель {model_id} "
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
         f"{profile_note}, агент {agent_id}. Правила репозитория: "
-        f"{rules_note} (#873). Отчёт придёт через "
+        f"{rules_note} (#873). Предмет ревью: {diff_note} (#874). "
+        "Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
         "(#757, #807).",
     )
@@ -690,7 +851,8 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             continue  # API hiccup or run still unknown — retry next pass
         if (run.get("status") or "").upper() not in _TERMINAL_RUN_STATUSES:
             continue
-        grace_rows = await db.execute_fetchall(
+        grace_rows = await fetchall(
+            db,
             "SELECT 1 FROM review_dispatches WHERE id=? "
             "AND created_at <= datetime('now', ?)",
             (dispatch["id"], f"-{config.CURSOR_REVIEW_GRACE_MINUTES} minutes"),

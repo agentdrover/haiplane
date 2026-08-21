@@ -3692,7 +3692,13 @@ async def test_provision_project_success_and_repeat(db: aiosqlite.Connection):
     clone.assert_awaited_with("mrPDA/prov", "/srv/prov", "trunk")
     row = await repo.get_project(db, pid)
     assert row["provision_status"] == "ok"
-    assert row["provision_detail"] == "cloned"
+    # #476: the detail now carries the workflow-seeding sentence too. This
+    # workspace path does not exist, so seeding refuses and says which of its
+    # preconditions failed — the outcome an operator has to be able to read.
+    # The status is untouched by it: a clone that worked is still a clone that
+    # worked, and a repository the hub could not seed is not a failed clone.
+    assert row["provision_detail"].startswith("cloned")
+    assert "workflows: no git workspace" in row["provision_detail"]
 
     again = await services.provision_project(db, pid)
     assert again["provision_status"] == "ok"

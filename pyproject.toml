@@ -25,8 +25,12 @@ oc-git-policy = "hub.git_policy:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hub"]
-# work_type YAML templates ship as package data (read via importlib.resources)
-artifacts = ["hub/cli_templates/work_types/*.yaml"]
+# work_type YAML templates ship as package data (read via importlib.resources);
+# so do the workflow templates provisioning lays into a project repo (#476).
+artifacts = [
+    "hub/cli_templates/work_types/*.yaml",
+    "hub/workflow_templates/*.yml",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -40,9 +44,29 @@ testpaths = ["tests"]
 dev = [
     "bandit>=1.9.4",
     "detect-secrets>=1.5.0",
+    "mypy>=1.19.1",
     "pip-audit>=2.10.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.10",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["hub"]
+# Строгость подобрана снизу вверх (#847): дефолтный набор проверок плюс
+# pydantic-плагин, без --strict. Цель первой задачи — рабочий гейт на ядре,
+# а не максимальная придирчивость: правило, которое нельзя удержать зелёным,
+# отключают целиком, и проверки не остаётся вовсе.
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# Единственный список исключений — здесь, а не тегами type: ignore по коду:
+# список видно, его можно посчитать, и он ТОЛЬКО СОКРАЩАЕТСЯ. Расширять его
+# — отдельное решение, а не побочный эффект правки. Остаток: 37 ошибок в трёх
+# самых толстых модулях проекта, они снимаются задачей #848.
+[[tool.mypy.overrides]]
+module = ["hub.mcp_server", "hub.app", "hub.web"]
+ignore_errors = true

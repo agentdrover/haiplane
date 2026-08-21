@@ -247,6 +247,14 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     "review",
     "risk_map",
     "dor_max_class",
+    # Both of these have had readers in hub/services/project_policy.py since
+    # #812 and #476 (release_auto_enabled, ci_runner_of) while this set — the
+    # only place a write is checked against — still called them unknown. A key
+    # that is read but cannot be written is a feature nobody can turn on, and
+    # the drift is exactly what test_allowed_keys_stay_in_sync_with_reader
+    # now refuses to let happen again (#886).
+    "release",
+    "ci_runner",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -283,6 +291,19 @@ def _validated_risk_map(value: Any) -> dict[str, str]:
             )
         cleaned[pattern.strip()] = bucket
     return cleaned
+
+
+def _validated_branch_policy(value: Any) -> dict[str, Any]:
+    """Refuse a ``default_branch_policy`` key nothing reads (#886).
+
+    The rule itself — which keys exist — belongs next to the reader that
+    gives them meaning, so it is imported rather than restated here. The
+    import is local because ``hub.services`` reaches back into this module
+    through ``hub.repository``; at validation time everything is loaded.
+    """
+    from hub.services.project_policy import validate_default_branch_policy
+
+    return validate_default_branch_policy(value)
 
 
 # Allowed parent task_type -> child task_type mapping
@@ -525,6 +546,13 @@ class TaskSubmitReview(BaseModel):
     # declaration like the branch above — auditable, not provable. Empty
     # means "not declared", which the auto-verdict treats as NOT diverse.
     model: str = Field("", max_length=100)
+    # #890: accept the areas the work ACTUALLY touched instead of being
+    # refused for an imprecise prediction. Measured in #854: 46 of 104
+    # submissions over 30 days changed files outside their declared areas —
+    # affected_areas is written at DoR as a forecast, and work discovers its
+    # own scope. Explicit on purpose: the hub never widens the field on its
+    # own, because a field that always matches the diff is nothing to compare.
+    accept_areas: bool = False
 
 
 class ReviewFinding(BaseModel):
@@ -787,6 +815,12 @@ class ReviewBrief(BaseModel):
     statement_freshness: dict[str, Any] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
+    # #890: areas accepted AT SUBMISSION rather than declared at DoR, newest
+    # first. Empty means the declared scope held. Non-empty is not a fault —
+    # #854 measured that 44% of submissions outgrow their forecast — but the
+    # reviewer must know which half of affected_areas is a prediction and
+    # which is a fact recorded after the code was written.
+    scope_growth: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
     review_checklist: list[str] = Field(default_factory=list)
     validation_commands: list[str] = Field(default_factory=list)
@@ -1299,6 +1333,11 @@ class TaskUpdateView(BaseModel):
     # "legacy" predates the field, "hub" is the hub writing its own updates,
     # "anonymous" is a request with no authenticated identity. One NULL could
     # not have told those apart.
+    # #498: advisory notes about THIS report, filled on the done path. The
+    # feed is where the owner reads them and the response is where the agent
+    # does — a warning that reaches only one of the two reaches nobody who can
+    # act on it (the lesson of #826).
+    warnings: list[str] = Field(default_factory=list)
     principal_id: int | None = None
     author_kind: str = "legacy"
 
@@ -1623,6 +1662,11 @@ class ProjectCreate(BaseModel):
     default_branch: str = Field(config.PAIR_BASE_BRANCH, max_length=100)
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("default_branch_policy")
+    @classmethod
+    def _branch_policy_shape(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validated_branch_policy(v)
+
 
 class ProjectPatch(BaseModel):
     """PATCH semantics: omitted fields stay unchanged (#338).
@@ -1643,6 +1687,11 @@ class ProjectPatch(BaseModel):
     gate_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
+
+    @field_validator("default_branch_policy")
+    @classmethod
+    def _branch_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return v if v is None else _validated_branch_policy(v)
 
     @field_validator("gate_policy")
     @classmethod

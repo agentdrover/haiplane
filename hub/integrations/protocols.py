@@ -218,6 +218,8 @@ class GitOpsPlugin(Protocol):
         description: str,
         branch: str,
         repo: str | None = None,
+        gh_repo: str | None = None,
+        base_branch: str | None = None,
     ) -> int | None: ...
     async def get_ci_failure_logs(
         self,
@@ -230,6 +232,29 @@ class GitOpsPlugin(Protocol):
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...
+    # Читатели git и GitHub, которые вызываются из services/, но в протоколе
+    # отсутствовали: реализации (git_ops, noop) их имеют, контракт — нет. То
+    # есть подменить плагин по этому протоколу было можно только угадав, что
+    # ещё требуется сверх объявленного (#847).
+    async def head_sha(self, repo: str, base: str) -> str: ...
+    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None: ...
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None: ...
+    async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]: ...
+    async def first_parent_log(
+        self, repo: str, base: str, limit: int
+    ) -> str | None: ...
+    async def pr_for_branch(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None: ...
+    async def merge_commit_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> str: ...
     async def pr_state(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...

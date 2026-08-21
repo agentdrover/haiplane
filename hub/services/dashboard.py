@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 import aiosqlite
 
@@ -127,6 +127,26 @@ async def get_dashboard_data(
     )
 
 
+class _PersonFilters(TypedDict):
+    """Фильтры «чьё это» — те же три поля, что принимают репо-запросы.
+
+    Обычный dict здесь распаковывался в **kwargs с точными типами, и проверка
+    типов на этом слепла: словарь со смешанными значениями подходит под любую
+    сигнатуру. TypedDict делает распаковку проверяемой, ничего не меняя в
+    рантайме (#847).
+    """
+
+    human_owner: str | None
+    claimed_by: str | None
+    mine: str | None
+
+
+class _ScopedFilters(_PersonFilters):
+    """То же плюс проект — набор, который принимают списки с LIMIT (#627)."""
+
+    project_id: int | None
+
+
 async def get_inbox_data(
     db: aiosqlite.Connection,
     *,
@@ -141,12 +161,12 @@ async def get_inbox_data(
     same reason as get_dashboard_data.
     """
     project_id = await _project_id_for(db, project)
-    person = {
+    person: _PersonFilters = {
         "human_owner": human_owner,
         "claimed_by": claimed_by,
         "mine": mine,
     }
-    scoped = {**person, "project_id": project_id}
+    scoped: _ScopedFilters = {**person, "project_id": project_id}
     draft_rows = await repo.list_tasks_by_status(
         db,
         "draft",

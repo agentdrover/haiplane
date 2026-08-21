@@ -33,6 +33,25 @@ latency и размер ответов — на отдельной страни�
         <tr><td>Tokens total / per confirmed finding</td>
             <td>{{ m.machine_reviews.tokens_total }} /
                 {% if m.machine_reviews.tokens_per_confirmed is not none %}{{ m.machine_reviews.tokens_per_confirmed }}{% else %}<span class="muted">нет данных</span>{% endif %}</td></tr>
+        {# #877: попадание считается по тому, чем находка ОКАЗАЛАСЬ, а не по
+           тому, как ревьюер сам себя разобрал. Ложняк — описанного дефекта в
+           коде нет; «неважно» — дефект есть, править не будем, и он всё равно
+           засчитывается ревьюеру. #}
+        <tr><td>Precision (доля находок, оказавшихся настоящими)</td>
+            <td>{% if m.machine_reviews.dispositions.precision is not none %}{{ (m.machine_reviews.dispositions.precision * 100) | round(1) }}%
+                <span class="muted">(размечено находок: {{ m.machine_reviews.dispositions.judged }})</span>
+                {% else %}<span class="muted">нет данных: ни одна находка не размечена</span>{% endif %}</td></tr>
+        <tr><td>Resolution rate (доля находок, которые починили)</td>
+            <td>{% if m.machine_reviews.dispositions.resolution_rate is not none %}{{ (m.machine_reviews.dispositions.resolution_rate * 100) | round(1) }}%
+                <span class="muted">({{ m.machine_reviews.dispositions.fixed }} из {{ m.machine_reviews.dispositions.judged }})</span>
+                {% else %}<span class="muted">нет данных: ни одна находка не размечена</span>{% endif %}</td></tr>
+        <tr><td>Tokens per FIXED finding (честная цена)</td>
+            <td>{% if m.machine_reviews.tokens_per_fixed is not none %}{{ m.machine_reviews.tokens_per_fixed }}{% else %}<span class="muted">нет данных</span>{% endif %}
+                <span class="muted">/ по счёту провайдера:
+                {% if m.machine_reviews.provider_tokens_per_fixed is not none %}{{ m.machine_reviews.provider_tokens_per_fixed }}{% else %}нет данных провайдера{% endif %}</span></td></tr>
+        <tr><td>Покрытие петли: отчётов без разметки / находок без ответа</td>
+            <td>{{ m.machine_reviews.dispositions.reports_unjudged }} из {{ m.machine_reviews.reviews }}
+                / {{ m.machine_reviews.dispositions.confirmed_unjudged }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
         <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
         <tr><td>Покрытие: отчётов без токенов / находок в расчёте цены</td>
             <td>{{ m.machine_reviews.reports_without_tokens or 0 }} из {{ m.machine_reviews.reviews }}
@@ -100,7 +119,8 @@ first-pass от того, что её одобрили следом.</p>
 не то же самое, что дешёвый прогон.</p>
 <table class="task-table">
     <thead><tr><th>Профиль</th><th>Прогонов</th><th>Без данных</th><th>Raw</th>
-        <th>Confirmed</th><th>Tokens</th><th>Неполных</th></tr></thead>
+        <th>Confirmed</th><th>Tokens</th><th>Неполных</th>
+        <th>Precision</th><th>Resolution</th></tr></thead>
     <tbody>
         {% for pr in m.by_profile %}
         <tr>
@@ -109,7 +129,37 @@ first-pass от того, что её одобрили следом.</p>
             <td>{{ pr.raw_total }}</td>
             <td>{{ pr.confirmed_total }}</td><td>{{ pr.tokens_total }}</td>
             <td>{% if pr.incomplete_runs %}{{ pr.incomplete_runs }}{% else %}—{% endif %}</td>
+            {# Размер выборки рядом с долей: precision 100% по двум находкам
+               и по двумстам — разные основания для решения. #}
+            <td>{% if pr.precision is not none %}{{ (pr.precision * 100) | round(1) }}%
+                <span class="muted">({{ pr.judged }})</span>
+                {% else %}<span class="muted">не размечено</span>{% endif %}</td>
+            <td>{% if pr.resolution_rate is not none %}{{ (pr.resolution_rate * 100) | round(1) }}%{% else %}<span class="muted">не размечено</span>{% endif %}</td>
         </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>По модели-ревьюеру</h2>
+<p class="muted">Кросс-модельность (#758) выбирает семейство, отличное от
+исполнителя, но до сих пор нечем было сказать, какая из моделей находит
+настоящие дефекты. Эта таблица — про попадание, а не про объём: размер
+выборки стоит рядом с долей, потому что доля по трём находкам решения не
+выдерживает.</p>
+<table class="task-table">
+    <thead><tr><th>Модель</th><th>Размечено находок</th><th>Precision</th>
+        <th>Resolution</th><th>Ложняков</th></tr></thead>
+    <tbody>
+        {% for mm in m.by_reviewer_model %}
+        <tr>
+            <td>{{ mm.model }}</td><td>{{ mm.judged }}</td>
+            <td>{% if mm.precision is not none %}{{ (mm.precision * 100) | round(1) }}%{% else %}—{% endif %}</td>
+            <td>{% if mm.resolution_rate is not none %}{{ (mm.resolution_rate * 100) | round(1) }}%{% else %}—{% endif %}</td>
+            <td>{{ mm.false_positive }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">Ни одна находка не размечена — сравнивать
+            модели не по чему. Это отсутствие данных, а не равенство моделей.</td></tr>
         {% endfor %}
     </tbody>
 </table>

@@ -218,10 +218,16 @@ def check_budget(
         # mergeability, and the only thing that keeps it honest is seeing it
         # shrink (#829).
         base = (measured or {}).get(key)
-        span = ceiling - int(base) if base is not None else 0
-        used_pct = (
-            round(100 * max(0, actual - int(base)) / span, 1) if span > 0 else None
-        )
+        # Одной веткой вместо двух условных выражений: "span > 0" подразумевало
+        # наличие base, но говорило об этом только автору.
+        if base is None:
+            span = 0
+            used_pct = None
+        else:
+            span = ceiling - int(base)
+            used_pct = (
+                round(100 * max(0, actual - int(base)) / span, 1) if span > 0 else None
+            )
         headroom.append(
             {
                 "metric": key,
@@ -238,10 +244,10 @@ def check_budget(
         entry["name"]: int(entry["total_chars"])
         for entry in snapshot.get("tools_list", [])
     }
-    base = baseline or {}
+    baseline_tools = baseline or {}
     diff: list[dict[str, Any]] = []
-    for name in sorted(set(current) | set(base)):
-        before = base.get(name)
+    for name in sorted(set(current) | set(baseline_tools)):
+        before = baseline_tools.get(name)
         after = current.get(name)
         if before == after:
             continue

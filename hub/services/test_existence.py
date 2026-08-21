@@ -73,7 +73,9 @@ async def collect_test_nodeids(repo_path: str | None) -> set[str] | None:
 
 def _verifiable_by(ac: Any) -> str:
     vb = getattr(ac, "verifiable_by", None)
-    return getattr(vb, "value", vb)
+    # Обещали str, а при отсутствующем поле отдавали None: сравнение с "test"
+    # молча давало False, а .lower() у вызывающего дал бы AttributeError.
+    return str(getattr(vb, "value", vb) or "")
 
 
 def _base_nodeids(collected: set[str]) -> set[str]:

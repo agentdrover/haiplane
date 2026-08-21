@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 import aiosqlite
@@ -9,6 +10,34 @@ import aiosqlite
 from hub.config import HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
+
+
+async def fetchall(
+    db: aiosqlite.Connection, sql: str, parameters: Iterable[Any] = ()
+) -> list[aiosqlite.Row]:
+    """Выполнить запрос и вернуть строки СПИСКОМ.
+
+    aiosqlite объявляет execute_fetchall как ``Iterable[Row]``, хотя отдаёт
+    список. Код хаба повсеместно индексирует результат и возвращает его как
+    ``list[Row]``, то есть опирается на реализацию, а не на контракт
+    библиотеки. Один list здесь дешевле, чем полторы сотни мест, каждое из
+    которых держится на этом допущении молча (#847).
+    """
+    return list(await db.execute_fetchall(sql, parameters))
+
+
+def inserted_id(cursor: aiosqlite.Cursor) -> int:
+    """id строки, которую только что вставили.
+
+    sqlite3 объявляет lastrowid как Optional — у курсора не-INSERT его нет, —
+    поэтому вызывающий выбирал между враньём в аннотации и подавлением. Здесь
+    отсутствие id значит, что вставка не состоялась, и это сказано вслух, а не
+    уехало дальше нулём или None (#847).
+    """
+    if cursor.lastrowid is None:
+        raise RuntimeError("INSERT не вернул rowid")
+    return cursor.lastrowid
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1384,7 +1413,7 @@ def row_to_ac_kwargs(row: Any) -> dict[str, Any]:
 
 async def _column_exists(db: aiosqlite.Connection, table: str, column: str) -> bool:
     """Check if a column exists in a table via PRAGMA table_info."""
-    rows = await db.execute_fetchall(f"PRAGMA table_info({table})")
+    rows = await fetchall(db, f"PRAGMA table_info({table})")
     return any(row[1] == column for row in rows)
 
 
@@ -1392,9 +1421,7 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))"
     )
-    applied = {
-        row[0] for row in await db.execute_fetchall("SELECT name FROM _migrations")
-    }
+    applied = {row[0] for row in await fetchall(db, "SELECT name FROM _migrations")}
     for name, sql in _MIGRATIONS:
         if name not in applied:
             if sql.startswith("ALTER TABLE") and "ADD COLUMN" in sql:
@@ -1427,20 +1454,21 @@ async def _migrate(db: aiosqlite.Connection) -> None:
 
 
 async def _table_exists(db: aiosqlite.Connection, table: str) -> bool:
-    rows = await db.execute_fetchall(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    rows = await fetchall(
+        db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     )
     return len(rows) > 0
 
 
 async def _migrate_proposals(db: aiosqlite.Connection) -> None:
     """Migrate old proposals table into tasks with source='agent'."""
-    rows = await db.execute_fetchall("SELECT * FROM proposals")
+    rows = await fetchall(db, "SELECT * FROM proposals")
     for r in rows:
         d = dict(r)
         status_map = {"pending": "draft", "approved": "open", "rejected": "rejected"}
         new_status = status_map.get(d.get("status", ""), "draft")
-        existing = await db.execute_fetchall(
+        existing = await fetchall(
+            db,
             "SELECT id FROM tasks WHERE title=? AND source='agent' AND description=?",
             (d["title"], d.get("description", "")),
         )
@@ -1485,7 +1513,8 @@ async def get_db() -> aiosqlite.Connection:
 
 async def _fix_orphaned_parents(db: aiosqlite.Connection) -> None:
     """Nullify parent_id references that point to nonexistent tasks."""
-    orphans = await db.execute_fetchall(
+    orphans = await fetchall(
+        db,
         "SELECT t.id FROM tasks t "
         "LEFT JOIN tasks p ON t.parent_id = p.id "
         "WHERE t.parent_id IS NOT NULL AND p.id IS NULL",
@@ -1525,9 +1554,7 @@ async def validate_hierarchy(
     if parent_id is None:
         return f"{task_type} requires a parent of type {required_parent.value}"
 
-    rows = await db.execute_fetchall(
-        "SELECT task_type FROM tasks WHERE id=?", (parent_id,)
-    )
+    rows = await fetchall(db, "SELECT task_type FROM tasks WHERE id=?", (parent_id,))
     if not rows:
         return f"Parent task #{parent_id} not found"
     parent_type = rows[0][0]
@@ -1554,7 +1581,8 @@ async def get_breadcrumb(
         if current_id in seen:
             break
         seen.add(current_id)
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT id, title, task_type, parent_id FROM tasks WHERE id=?",
             (current_id,),
         )
@@ -1578,7 +1606,8 @@ async def get_children(
     task_id: int,
 ) -> list[dict[str, Any]]:
     """Get direct children of a task, ordered by position then id."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id, title, task_type, status, priority FROM tasks "
         "WHERE parent_id=? AND archived=0 ORDER BY position ASC, id ASC",
         (task_id,),
@@ -1593,8 +1622,8 @@ async def get_progress(
     """Calculate progress for a parent task based on direct children."""
     from hub.models import ACTIVE_STATUSES
 
-    rows = await db.execute_fetchall(
-        "SELECT status FROM tasks WHERE parent_id=? AND archived=0", (task_id,)
+    rows = await fetchall(
+        db, "SELECT status FROM tasks WHERE parent_id=? AND archived=0", (task_id,)
     )
     total = len(rows)
     if total == 0:
@@ -1619,7 +1648,8 @@ async def build_tree(
     task_id: int,
 ) -> dict[str, Any] | None:
     """Build a recursive tree from a task downward."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id, title, task_type, status, priority, assigned_agent FROM tasks WHERE id=?",
         (task_id,),
     )
@@ -1627,7 +1657,8 @@ async def build_tree(
         return None
 
     task = dict(rows[0])
-    children_rows = await db.execute_fetchall(
+    children_rows = await fetchall(
+        db,
         "SELECT id FROM tasks WHERE parent_id=? AND archived=0 "
         "ORDER BY position ASC, id ASC",
         (task_id,),
@@ -1861,7 +1892,7 @@ async def seed_default_project(db: aiosqlite.Connection) -> None:
     """
     from hub import config as cfg
 
-    rows = await db.execute_fetchall("SELECT id FROM projects WHERE slug='default'")
+    rows = await fetchall(db, "SELECT id FROM projects WHERE slug='default'")
     if rows:
         default_id = rows[0][0]
     else:
@@ -2006,9 +2037,7 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         ),
     )
     for name, kind, content, tags in seeds:
-        rows = await db.execute_fetchall(
-            "SELECT id FROM skills WHERE name=? LIMIT 1", (name,)
-        )
+        rows = await fetchall(db, "SELECT id FROM skills WHERE name=? LIMIT 1", (name,))
         if rows:
             continue
         await db.execute(
@@ -2025,7 +2054,7 @@ async def seed_system_roles(db: aiosqlite.Connection) -> None:
     Idempotent: skips roles that already exist, adds missing permissions.
     """
     for slug, name, description, permissions in SYSTEM_ROLES:
-        rows = await db.execute_fetchall("SELECT id FROM roles WHERE slug = ?", (slug,))
+        rows = await fetchall(db, "SELECT id FROM roles WHERE slug = ?", (slug,))
         if rows:
             role_id = rows[0][0]
         else:
@@ -2044,12 +2073,13 @@ async def seed_system_roles(db: aiosqlite.Connection) -> None:
 
 async def has_active_admin(db: aiosqlite.Connection) -> bool:
     """Check if at least one active principal with admin or super_admin role exists."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """SELECT 1 FROM principals p
            JOIN principal_roles pr ON p.id = pr.principal_id
            JOIN roles r ON pr.role_id = r.id
            WHERE p.status = 'active'
              AND r.slug IN ('super_admin', 'admin')
-           LIMIT 1"""
+           LIMIT 1""",
     )
     return len(rows) > 0

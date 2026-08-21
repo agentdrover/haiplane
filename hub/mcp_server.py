@@ -851,6 +851,7 @@ async def hub_task_update(
     status = task.get("status", "?")
     if kind == "done":
         message = _format_hub_report_done_message(task_id, result["id"], status)
+        message += _format_report_warnings(result)
     else:
         message = f"Update #{result['id']} added to task #{task_id}."
     if task.get("lifecycle_hint"):
@@ -863,6 +864,14 @@ async def hub_task_update(
             "hub_task_update kind=done", "hub_report_done", response
         )
     return response
+
+
+def _format_report_warnings(result: dict[str, Any]) -> str:
+    """Advisory notes about this report, or "" (#498)."""
+    warnings = result.get("warnings") or []
+    if not warnings:
+        return ""
+    return "\n" + "\n".join(f"Внимание: {w}" for w in warnings)
 
 
 def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
@@ -976,6 +985,7 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
         return _format_hub_api_error(exc)
     status = task.get("status", "?")
     msg = _format_hub_report_done_message(task_id, result["id"], status)
+    msg += _format_report_warnings(result)
     if task.get("lifecycle_hint"):
         msg += f"\nLifecycle: {task['lifecycle_hint']}"
     return _format_mutation_success(msg, task, transition_from=prior_status)
@@ -1364,6 +1374,7 @@ async def hub_submit_for_review(
     summary: str = "",
     branch: str = "",
     model: str = "",
+    accept_areas: bool = False,
 ) -> str:
     """Submit the current work of a pair task for client-driven review (#307).
 
@@ -1386,6 +1397,12 @@ async def hub_submit_for_review(
             like ``branch``, auditable rather than provable. Required for
             the auto-verdict's model-diversity rule: an empty declaration
             keeps the verdict with the human.
+        accept_areas: Accept the areas the work ACTUALLY touched (#890). Use
+            it when the diff went outside affected_areas: the paths are folded
+            into the field and the growth is recorded as a visible event, so
+            declared and actual agree at review time. It never hides anything
+            — the reviewer sees how much of the scope appeared at submission.
+            Nothing is widened without this flag.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1398,6 +1415,8 @@ async def hub_submit_for_review(
         body["branch"] = branch
     if model:
         body["model"] = model
+    if accept_areas:
+        body["accept_areas"] = True
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
@@ -2246,8 +2265,25 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"runs, {mr.get('raw_total', 0)} raw → {mr.get('confirmed_total', 0)} "
         f"confirmed / {mr.get('rejected_total', 0)} rejected",
         f"Tokens: {mr.get('tokens_total', 0)} total, "
-        f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding",
+        f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
+        f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    # #877: the rate travels with its sample, and an unjudged window says so
+    # rather than printing a zero that reads as "nothing was real".
+    disp = mr.get("dispositions") or {}
+    precision = disp.get("precision")
+    resolution = disp.get("resolution_rate")
+    lines.append(
+        "Findings judged: "
+        + (
+            f"{disp.get('judged', 0)} — precision "
+            f"{round(precision * 100, 1)}%, resolution "
+            f"{round(resolution * 100, 1)}%"
+            if precision is not None and resolution is not None
+            else "0 — no data (nobody said what the findings turned out to be)"
+        )
+        + f"; {disp.get('confirmed_unjudged', 0)} confirmed finding(s) unanswered"
+    )
     outcomes = data.get("review_outcomes", {})
     first_pass = outcomes.get("first_pass_acceptance_rate")
     cr_rate = outcomes.get("changes_requested_rate")

@@ -25,7 +25,7 @@ import asyncio
 import logging
 from typing import Any
 
-from hub import config
+from hub import commit_scope, config
 from hub import repository as repo
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
@@ -322,6 +322,16 @@ async def build_review_brief(
     # that feeds the task card. Two readers, one report.
     brief_review_report = await review_evidence.review_report(db, task_row, mr_row)
 
+    # #890: scope accepted at submission, newest first. Read from the feed
+    # rather than a column: the growth IS an event, and an event that only
+    # existed as a field would lose when it happened.
+    growth_updates = await repo.get_task_updates(db, task_row["id"])
+    scope_growth = [
+        str(u["content"])
+        for u in reversed(list(growth_updates))
+        if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
+    ]
+
     return ReviewBrief(
         review_report=brief_review_report,
         task_id=task_view.id,
@@ -337,6 +347,7 @@ async def build_review_brief(
         statement_freshness=freshness,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
+        scope_growth=scope_growth,
         out_of_scope_for_review=task_view.out_of_scope_for_review,
         review_checklist=task_view.review_checklist,
         validation_commands=task_view.validation_commands,

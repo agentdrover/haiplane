@@ -383,6 +383,10 @@ _GATE_MODULES = (
     "hub/services/review_evidence.py",
     "hub/integrations/protocols.py",
     "hub/integrations/noop.py",
+    # #476: the module that renders workflow templates decides which branch
+    # each provisioned repository runs CI on — exactly the question this guard
+    # is about, in exactly the kind of module "nobody re-checked".
+    "hub/services/workflow_seed.py",
 )
 
 
