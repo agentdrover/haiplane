@@ -1720,6 +1720,41 @@ class GitOpsIntegration:
         """
         return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
 
+    async def pr_state(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> str:
+        """Where this pull request stands: "open", "merged", "closed", or "".
+
+        Empty means the question could not be asked — no gh, no network, an
+        unknown number. The caller treats that as a cause to report, never as
+        an answer: "could not look" and "closed" lead to opposite decisions
+        about delivery (#802, the rule #725 wrote down).
+        """
+        rc, out, _ = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "state,merged",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not out:
+            return ""
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return ""
+        if data.get("merged"):
+            return "merged"
+        state = str(data.get("state") or "").lower()
+        return state or ""
+
     async def merge_commit_sha(
         self,
         pr_number: int,

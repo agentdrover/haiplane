@@ -123,6 +123,15 @@ class NoopGitOps:
     ) -> int | None:
         return None
 
+    async def pr_state(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> str:
+        """No git here — "could not look", not "closed" (#802)."""
+        return ""
+
     async def merge_commit_sha(
         self,
         pr_number: int,

@@ -217,6 +217,9 @@ class GitOpsPlugin(Protocol):
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...
+    async def pr_state(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> str: ...
     async def merge_pr(
         self,
         pr_number: int,
