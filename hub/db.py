@@ -1628,6 +1628,12 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     # CI secret must not be able to move a task or write a verdict, so it can
     # only be granted through a DB-backed principal holding the ci_runner role.
     "tasks.ci_report",
+    # #495: record what was deployed, and nothing else. Same reasoning as
+    # tasks.ci_report above — this token lives in a GitHub secret, so it gets
+    # the one verb it needs. Separate from ci_report because the facts are
+    # different: one is "the tests ran on this commit", the other is "this
+    # commit is what production is running".
+    "deploys.record",
     "integrations.vast.manage",
     "system.settings.write",
 )
@@ -1663,6 +1669,7 @@ ENFORCED_PERMISSIONS: tuple[str, ...] = (
     "tasks.archive",
     "tasks.delete",
     "tasks.ci_report",
+    "deploys.record",
     # Consulted indirectly: config.py reads it to answer is_human, and
     # require_human_or_admin is built on that — so it does gate, via one hop.
     "tasks.human_gate",
@@ -1782,7 +1789,7 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "ci_runner",
         "CI Runner",
         "Read tasks and report run results; cannot change task state",
-        ("tasks.read", "tasks.ci_report"),
+        ("tasks.read", "tasks.ci_report", "deploys.record"),
     ),
 )
 

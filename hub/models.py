@@ -1359,6 +1359,32 @@ class TaskDependencies(BaseModel):
     unblocks: list[TaskDependencyRef] = Field(default_factory=list)
 
 
+class DeployCallback(BaseModel):
+    """What CI reports after a deploy attempt (#495).
+
+    ``status`` is taken as reported: whether the rollout worked is known at
+    the place the deploy ran, not here. The endpoint's job is to record the
+    claim, not to second-guess it.
+    """
+
+    sha: str = Field(..., min_length=7, max_length=64)
+    ref: str = Field("", max_length=200)
+    status: str = Field("success", pattern="^(success|failed)$")
+    project: str = Field("", max_length=100)
+
+
+class DeployView(BaseModel):
+    """One recorded deploy attempt (#495)."""
+
+    id: int
+    project_id: int | None = None
+    deployed_sha: str
+    ref: str = ""
+    status: str = "success"
+    source: str = ""
+    deployed_at: str = ""
+
+
 class TaskView(BaseModel):
     id: int
     title: str

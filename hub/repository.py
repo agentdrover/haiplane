@@ -3175,10 +3175,27 @@ async def record_release(
     never happened. Readers ask for the last SUCCESSFUL release, so a failure
     never becomes the state of production.
     """
+    sha, status = deployed_sha.strip(), status.strip()
+    # #495: CI runs get re-run, and a re-run redelivers the same callback. A
+    # second row for the same (project, sha, status) would say the commit was
+    # deployed twice, turning the release history into noise — so the existing
+    # record is returned instead. Different STATUS for the same sha is a real
+    # second event (a retry that succeeded) and is stored.
+    existing = list(
+        await db.execute_fetchall(
+            "SELECT id FROM releases WHERE deployed_sha = ? AND status = ? "
+            "AND ((? IS NULL AND project_id IS NULL) OR project_id = ?) "
+            "ORDER BY id DESC LIMIT 1",
+            (sha, status, project_id, project_id),
+        )
+    )
+    if existing:
+        return int(dict(existing[0])["id"])
+
     cursor = await db.execute(
         "INSERT INTO releases (project_id, deployed_sha, ref, status, source) "
         "VALUES (?, ?, ?, ?, ?)",
-        (project_id, deployed_sha.strip(), ref.strip(), status.strip(), source.strip()),
+        (project_id, sha, ref.strip(), status, source.strip()),
     )
     await db.commit()
     return int(cursor.lastrowid or 0)
@@ -3201,5 +3218,15 @@ async def latest_successful_release(
             "AND (? IS NULL OR project_id = ?) ORDER BY id DESC LIMIT 1",
             (RELEASE_SUCCESS, project_id, project_id),
         )
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def release_by_id(
+    db: aiosqlite.Connection, release_id: int
+) -> dict[str, Any] | None:
+    """One release row by id, or None."""
+    rows = list(
+        await db.execute_fetchall("SELECT * FROM releases WHERE id = ?", (release_id,))
     )
     return dict(rows[0]) if rows else None
