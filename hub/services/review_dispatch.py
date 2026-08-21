@@ -159,6 +159,60 @@ def process_surface_reasons(diff: str) -> list[str]:
     return reasons
 
 
+# Which risks buy the expensive harness (#827). The catalogue mixes two
+# different things: some risks are about the code and its behaviour, others
+# about the statement and the product. A multi-agent code review answers the
+# first kind and cannot answer the second.
+#
+# Measured on the first live dispatch (#818, 21.08.2026): the run went deep
+# because the task honestly declared a high risk reading "the daily message
+# turns into noise and devalues the bot". Dogfooding answers that; reading
+# the diff does not. We paid for a harness that had nothing to say.
+_TECHNICAL_RISK_KINDS = frozenset(
+    {
+        "security",
+        "breaking_change",
+        "data_migration",
+        "performance",
+        "unknown_unknowns",
+    }
+)
+_PRODUCT_RISK_KINDS = frozenset({"ambiguous_requirements", "large_scope", "other"})
+
+
+def _risk_profile_reason(risks: Any) -> str | None:
+    """Why the declared risks buy deep, or None when they do not (#827).
+
+    Two rules, and the asymmetry between them is deliberate:
+
+    * ``kind=security`` buys deep at ANY severity — unchanged from #807,
+      because a security risk somebody rated 'low' is still a security risk.
+    * a ``high`` severity buys deep only for TECHNICAL kinds. A product or
+      statement risk stays with the class: it is not that such a task is
+      safe, it is that this particular instrument cannot read it.
+
+    A kind nobody recognises counts as technical at high severity. Not
+    knowing what a risk is must never be the cheap answer (#582) — and it
+    also closes the obvious way around the rule.
+    """
+    if not isinstance(risks, list):
+        return None
+    for risk in risks:
+        if not isinstance(risk, dict):
+            continue
+        kind = str(risk.get("kind") or "").strip()
+        severity = str(risk.get("severity") or "").strip()
+        if kind == "security":
+            return "заявлен риск security"
+        if severity != "high":
+            continue
+        if kind in _TECHNICAL_RISK_KINDS:
+            return f"заявлен технический риск high: {kind}"
+        if kind not in _PRODUCT_RISK_KINDS:
+            return f"заявлен риск high с нераспознанным видом: {kind or 'не указан'}"
+    return None
+
+
 def pick_review_profile(
     task: dict[str, Any], diff: str | None = None
 ) -> tuple[str, list[str]]:
@@ -196,11 +250,9 @@ def pick_review_profile(
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         risks = []
-    for risk in risks:
-        if isinstance(risk, dict) and (
-            risk.get("severity") == "high" or risk.get("kind") == "security"
-        ):
-            return DEEP, ["заявлен риск high/security"]
+    risk_reason = _risk_profile_reason(risks)
+    if risk_reason:
+        return DEEP, [risk_reason]
     raw_class = (task.get("risk_class") or "").strip()
     if not raw_class:
         return DEEP, ["класс риска не посчитан"]
