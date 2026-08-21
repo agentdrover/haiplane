@@ -317,8 +317,20 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
 
 
 def cmd_outcome_debt(args: argparse.Namespace) -> int:
-    """Completed tasks whose stated outcome was never answered (#766)."""
+    """Outcome promises and the answers to them (#766, #819)."""
     result = _api("GET", "/api/metrics/outcome-debt")
+    _print_json(result)
+    return 0
+
+
+def cmd_answer_outcome(args: argparse.Namespace) -> int:
+    """Record one check of a completed task's outcome (#819)."""
+    body = {
+        "verdict": args.verdict,
+        "measured_value": args.measured_value,
+        "note": args.note,
+    }
+    result = _api("POST", f"/api/tasks/{args.task_id}/outcome-answers", body)
     _print_json(result)
     return 0
 
@@ -1278,9 +1290,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_outcomes = sub.add_parser(
         "outcome-debt",
-        help="Completed tasks whose stated outcome was never answered (#766)",
+        help="Outcome promises and the answers to them (#766, #819)",
     )
     p_outcomes.set_defaults(func=cmd_outcome_debt)
+
+    p_answer = sub.add_parser(
+        "answer-outcome",
+        help="Record one check of a completed task's outcome (#819)",
+    )
+    p_answer.add_argument("task_id", type=int)
+    p_answer.add_argument(
+        "--verdict",
+        required=True,
+        choices=["moved", "not_moved", "unmeasurable"],
+        help="What the check found; not_moved and unmeasurable are answers too",
+    )
+    p_answer.add_argument(
+        "--measured-value",
+        dest="measured_value",
+        required=True,
+        help="What was observed - the number and where it was read",
+    )
+    p_answer.add_argument("--note", default="", help="Context or what to do next")
+    p_answer.set_defaults(func=cmd_answer_outcome)
 
     p_projects = sub.add_parser("projects", help="Manage projects (#338)")
     projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)

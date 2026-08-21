@@ -651,6 +651,30 @@ class ACLocatorResolution(BaseModel):
     reason: str = ""
 
 
+class LiveCheckState(BaseModel):
+    """Did anyone watch this behave in production, and on which build (#814).
+
+    ``state`` is ``done`` (someone ran it and said what they saw),
+    ``not_applicable`` (there is nothing to observe, with a reason) or
+    ``unknown`` — nobody looked. Unknown is the default and always carries a
+    cause: an absent block would read as "the question was not asked", and it
+    is asked of every task.
+
+    ``sha_mismatch`` names the case the card must not hide: the observation
+    exists but was taken against another build than the one delivered.
+    """
+
+    state: str = "unknown"
+    reason: str = "живая проверка не записывалась"
+    probe: str = ""
+    observation: str = ""
+    sha: str = ""
+    delivered_sha: str = ""
+    sha_mismatch: bool = False
+    recorded_agent: str = ""
+    created_at: str = ""
+
+
 class CIRunReportState(BaseModel):
     """Does run evidence exist for the commit under review (#546).
 
@@ -750,6 +774,7 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    live_check: LiveCheckState = Field(default_factory=lambda: LiveCheckState())
     # #615: the reviewer judges a statement too — and it may be older than the
     # work that invalidated it.
     statement_freshness: dict[str, Any] | None = None
@@ -1645,6 +1670,57 @@ class CIRunReportResult(BaseModel):
     ac_recorded: list[dict[str, Any]] = Field(default_factory=list)
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
+
+
+class OutcomeVerdict(str, Enum):
+    """What the check of an outcome_metric found (#819).
+
+    ``not_moved`` and ``unmeasurable`` exist so that an inconvenient answer is
+    as easy to file as a flattering one. A log that only accepts success stops
+    being read the first time the number disappoints.
+    """
+
+    moved = "moved"
+    not_moved = "not_moved"
+    unmeasurable = "unmeasurable"
+
+
+class OutcomeAnswerSubmit(BaseModel):
+    """One check of a completed task's stated outcome (#819).
+
+    ``measured_value`` is required and rejected when blank: an answer without a
+    number or an observation is an opinion, and a log of opinions closes the
+    loop only in appearance. The verdict is the caller's declaration — the hub
+    sees neither production nor dashboards — auditable like ``branch`` (#533)
+    and ``model`` (#758), not provable.
+    """
+
+    verdict: OutcomeVerdict
+    measured_value: str = Field(..., min_length=1, max_length=500)
+    note: str = Field("", max_length=2000)
+
+    @field_validator("measured_value")
+    @classmethod
+    def _measurement_must_say_something(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError(
+                "measured_value is the observation itself - name the number "
+                "and where it was read, or file the answer as unmeasurable"
+            )
+        return text
+
+
+class OutcomeAnswerView(BaseModel):
+    """A recorded answer as the debt list shows it (#819)."""
+
+    id: int
+    task_id: int
+    verdict: OutcomeVerdict
+    measured_value: str
+    note: str = ""
+    answered_by: str = ""
+    answered_at: str = ""
 
 
 class MachineReviewSubmit(BaseModel):

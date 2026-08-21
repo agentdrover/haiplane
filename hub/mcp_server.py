@@ -1958,11 +1958,13 @@ async def hub_submit_machine_review(
 
 @mcp.tool()
 async def hub_outcome_debt() -> CallToolResult:
-    """Completed tasks whose stated outcome was never answered (#766).
+    """Outcome promises and the answers to them (#766, #819).
 
-    DoR refuses a task without an outcome_metric, and until now nothing ever
-    read one back: a task counted as successful when its gates passed, not when
-    the number moved. This is the read that makes that debt visible.
+    DoR refuses a task without an outcome_metric, and for a long time nothing
+    ever read one back: a task counted as successful when its gates passed, not
+    when the number moved. This read makes both sides visible - the tasks
+    nobody has come back to, and the ones somebody has, with the last verdict
+    and what was measured. Record an answer with hub_answer_outcome.
 
     outcome_deadline is shown verbatim and never used for filtering - it is free
     text holding event descriptions rather than dates, so nothing is hidden
@@ -1973,15 +1975,24 @@ async def hub_outcome_debt() -> CallToolResult:
     except HubApiError as exc:
         return _format_hub_api_error(exc)
     items = data.get("items", [])
+    answered = data.get("answered_total", 0)
+    # Both numbers in the header: the unanswered count alone can only grow, so
+    # on its own it says more about the age of the backlog than about whether
+    # anyone checks (#819). The answered rows are printed in both branches —
+    # hiding them exactly when the debt is clean would make the evidence of
+    # checking disappear at the moment it is most worth seeing.
     if not items:
-        return structured_echo_result(
-            "No outcome debt: every completed task with a stated metric has an answer.",
-            outcome_debt=data,
-        )
-    lines = [
-        f"{data.get('total', 0)} completed tasks stated an outcome nobody answered:",
-        "",
-    ]
+        lines = [
+            "No outcome debt: every completed task with a stated metric has "
+            f"an answer ({answered} answered).",
+            "",
+        ]
+    else:
+        lines = [
+            f"{data.get('total', 0)} completed tasks stated an outcome nobody "
+            f"answered; {answered} have been answered:",
+            "",
+        ]
     for item in items:
         waited = item.get("days_unanswered")
         waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
@@ -1991,7 +2002,52 @@ async def hub_outcome_debt() -> CallToolResult:
             lines.append(f"    said by: {item['outcome_deadline']}")
         if item.get("outcome_revisit_condition"):
             lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
+    for item in data.get("answered", []):
+        latest = item.get("latest_answer") or {}
+        lines.append(
+            f"#{item['task_id']} {item['title']} — {latest.get('verdict', '?')}"
+            f" ({item.get('answers', 0)} check(s), last by "
+            f"{latest.get('answered_by') or 'unknown'})"
+        )
+        lines.append(f"    measured: {latest.get('measured_value') or '—'}")
     return structured_echo_result("\n".join(lines), outcome_debt=data)
+
+
+@mcp.tool()
+async def hub_answer_outcome(
+    task_id: int,
+    verdict: str,
+    measured_value: str,
+    note: str = "",
+) -> CallToolResult:
+    """Record one check of a completed task's stated outcome (#819).
+
+    A check is not a success: not_moved and unmeasurable are filed exactly like
+    moved. The verdict is your declaration, auditable rather than provable -
+    answered_by comes from your identity, not from an argument. Checks are
+    appended, so a task can be answered at several moments.
+
+    Args:
+        task_id: Completed task whose outcome_metric is being answered.
+        verdict: moved | not_moved | unmeasurable.
+        measured_value: What was observed - the number and where it was read.
+            Required: an answer without one is an opinion.
+        note: Optional context, caveats, or what to do next.
+    """
+    try:
+        result = await _api_post(
+            f"/api/tasks/{task_id}/outcome-answers",
+            {"verdict": verdict, "measured_value": measured_value, "note": note},
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    latest = result.get("latest_answer") or {}
+    return structured_echo_result(
+        f"Outcome of task #{task_id} answered: {latest.get('verdict', verdict)} "
+        f"— {latest.get('measured_value', measured_value)} "
+        f"(check #{result.get('answers', 1)} for this task).",
+        outcome_answer=result,
+    )
 
 
 @mcp.tool()

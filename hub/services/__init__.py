@@ -11,7 +11,7 @@ from hub.services.dashboard import (
     list_activity,
     list_tasks,
 )
-from hub.services.outcomes import outcome_debt
+from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.live_check import (
     list_checks,
     live_check_view,
@@ -216,6 +216,7 @@ __all__ = [
     "parse_review_findings",
     "prepare_pair_branch",
     "restore_pair_workspace_base",
+    "answer_outcome",
     "outcome_debt",
     "practice_metrics",
     "project_git_context",
