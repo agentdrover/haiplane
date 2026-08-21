@@ -28,6 +28,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.integrations.registry import plugins
 from hub.models import RiskClass
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -73,8 +74,99 @@ DEEP = "deep"
 _DEEP_FROM_CLASS = RiskClass.r3
 
 
-def pick_review_profile(task: dict[str, Any]) -> str:
-    """Which review profile this submission deserves (#807).
+# Process surfaces (#820). Measured, not guessed: the lite-vs-deep comparison
+# of 21.08.2026 found that the cheap profile caught 2 of 7 confirmed findings,
+# and BOTH misses were of one kind — a pytest collector that outlived its
+# timeout, and a collection run against whatever branch the shared workspace
+# happened to be on. #509 had already produced the same shape twice: an
+# orphaned validation command and its unbounded output buffer.
+#
+# These defects are invisible to reading a diff. You have to know how the
+# process behaves after the await is cancelled, and who else writes to that
+# workspace. So the surfaces where they live buy the expensive profile
+# regardless of risk class — the class says how bad a mistake would be, this
+# says how likely one is to hide from a single reader.
+#
+# The list is a filter against a KNOWN class, never a guarantee: a process
+# defect written in words nobody listed here walks straight through. It gets
+# extended every time one reaches production.
+_PROCESS_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "запуск подпроцессов",
+        (
+            "create_subprocess_exec",
+            "create_subprocess_shell",
+            "subprocess.run",
+            "subprocess.Popen",
+            "Popen(",
+            ".communicate(",
+        ),
+    ),
+    (
+        "таймауты и отмена",
+        ("wait_for(", "asyncio.timeout", "CancelledError", "TimeoutError"),
+    ),
+    (
+        "воркспейс и ветки",
+        (
+            "workspace_path",
+            "worktree",
+            "checkout",
+            "branch_diff",
+            "fetch_base",
+            "head_sha",
+        ),
+    ),
+    (
+        "конкурентный доступ",
+        ("asyncio.Lock", "asyncio.Semaphore", "threading.", "asyncio.gather"),
+    ),
+)
+
+_COMMENT_PREFIXES = ("#", '"""', "'''", "*", "//")
+
+
+def _is_comment(code: str) -> bool:
+    """A line that only comments or documents. Markers there are talk, not code."""
+    stripped = code.strip()
+    return not stripped or stripped.startswith(_COMMENT_PREFIXES)
+
+
+def process_surface_reasons(diff: str) -> list[str]:
+    """Which process surfaces this diff ADDS code on (#820).
+
+    Only added lines count, and only outside comments: a diff that merely
+    mentions ``wait_for`` in a docstring — as this very module does — must not
+    buy the expensive profile, or 'deep' quietly becomes the default and the
+    saving #807 exists for is gone.
+    """
+    reasons: list[str] = []
+    for group, markers in _PROCESS_SURFACES:
+        hits: list[str] = []
+        for raw in diff.splitlines():
+            if not raw.startswith("+") or raw.startswith("+++"):
+                continue
+            code = raw[1:]
+            if _is_comment(code):
+                continue
+            # A marker inside a trailing comment is talk too.
+            code = code.split("#", 1)[0]
+            for marker in markers:
+                if marker in code and marker not in hits:
+                    hits.append(marker)
+        if hits:
+            reasons.append(f"{group}: {', '.join(sorted(hits))}")
+    return reasons
+
+
+def pick_review_profile(
+    task: dict[str, Any], diff: str | None = None
+) -> tuple[str, list[str]]:
+    """Which review profile this submission deserves, and why (#807, #820).
+
+    Returns ``(profile, reasons)``. The reasons exist because "why was this
+    reviewed cheaply" and "why did this cost a full harness run" are both
+    questions somebody asks later, and a bare profile name answers neither.
 
     deep is the multi-agent harness; lite is a single pass over the branch
     diff under a token ceiling. The rule leans toward deep on every kind of
@@ -91,7 +183,15 @@ def pick_review_profile(task: dict[str, Any]) -> str:
     submission" unaffordable in the first place.
     """
     if (task.get("machine_review_override") or "").strip() == "require":
-        return DEEP
+        return DEEP, ["ревью запрошено человеком"]
+
+    # #820: the diff decides before the class does. A missing diff is not a
+    # harmless one — the same rule the ladder uses for "class not computed".
+    if diff is None:
+        return DEEP, ["дифф сдачи прочитать не удалось"]
+    surfaces = process_surface_reasons(diff)
+    if surfaces:
+        return DEEP, [f"процессная поверхность — {r}" for r in surfaces]
     try:
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
@@ -100,19 +200,19 @@ def pick_review_profile(task: dict[str, Any]) -> str:
         if isinstance(risk, dict) and (
             risk.get("severity") == "high" or risk.get("kind") == "security"
         ):
-            return DEEP
+            return DEEP, ["заявлен риск high/security"]
     raw_class = (task.get("risk_class") or "").strip()
     if not raw_class:
-        return DEEP
+        return DEEP, ["класс риска не посчитан"]
     try:
         risk_class = RiskClass(raw_class)
     except ValueError:
         # An unreadable class is an unknown class, and unknown means deep.
-        return DEEP
+        return DEEP, [f"класс риска нечитаем: {raw_class}"]
     order = list(RiskClass)
     if order.index(risk_class) >= order.index(_DEEP_FROM_CLASS):
-        return DEEP
-    return LITE
+        return DEEP, [f"класс риска {risk_class.value}"]
+    return LITE, [f"класс риска {risk_class.value}, процессных поверхностей нет"]
 
 
 def _review_prompt(task_id: int, branch: str, model_id: str, profile: str) -> str:
@@ -150,6 +250,29 @@ def _review_prompt(task_id: int, branch: str, model_id: str, profile: str) -> st
         f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
         "Вердикт НЕ выноси — он не твой."
     )
+
+
+async def _submission_diff(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> str | None:
+    """The submitted branch diff, or None when it cannot be read (#820).
+
+    None is a real answer, not an error to swallow: the caller turns it into
+    the expensive profile rather than into a quiet lite run over code nobody
+    looked at.
+    """
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_id)
+        workspace = ctx.get("repo")
+        base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+        if not workspace or not branch:
+            return None
+        return await plugins.git_ops.branch_diff(workspace, base, branch)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not read the diff of task #%s: %s", task_id, exc)
+        return None
 
 
 async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
@@ -196,7 +319,11 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         return False
 
     model_id = pick_review_model((task.get("submission_model") or "").strip())
-    profile = pick_review_profile(task)
+    # #820: the profile is decided against the SUBMITTED diff, not against the
+    # areas the author declared — self-assessment cannot exempt work from
+    # oversight (#582). An unreadable diff buys deep, it does not excuse it.
+    diff = await _submission_diff(db, task_id, branch)
+    profile, profile_reasons = pick_review_profile(task, diff)
     hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
@@ -236,6 +363,9 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         if profile == LITE
         else f"профиль {profile} (многоагентный харнесс)"
     )
+    # "deep" on its own is not reviewable in hindsight; the reason is (#820).
+    if profile_reasons:
+        profile_note += " — " + "; ".join(profile_reasons)
     await repo.add_task_update(
         db,
         task_id,
@@ -258,6 +388,7 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
             "run_id": run_info.get("id") or "",
             "generation": generation,
             "profile": profile,
+            "profile_reasons": profile_reasons,
         },
     )
     await db.commit()
