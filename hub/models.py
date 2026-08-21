@@ -1954,6 +1954,18 @@ class MachineReviewSubmit(BaseModel):
     agent: str = Field("", max_length=100)
 
 
+class CategoryCheckSubmit(BaseModel):
+    """The deterministic check that ends a recurring finding category (#878)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str = Field(..., min_length=1, max_length=60)
+    # Required and non-blank by the type as well as by the service: the whole
+    # point of the record is that something real now catches this class.
+    check_ref: str = Field(..., min_length=1, max_length=500)
+    note: str = Field("", max_length=1000)
+
+
 class FindingDisposition(str, Enum):
     """What a confirmed finding turned out to be, once a human looked (#876).
 

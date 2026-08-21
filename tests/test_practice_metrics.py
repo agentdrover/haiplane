@@ -22,6 +22,7 @@ from httpx import AsyncClient
 from hub import repository as repo
 from hub import services
 from hub.models import TaskDecide
+from hub.db import _MIGRATIONS, _SCHEMA, _migrate  # noqa: F401
 from hub.services.orchestration import practice_metrics
 
 
@@ -895,3 +896,131 @@ async def test_no_dispositions_reads_as_no_data(
     page = (await client.get("/metrics")).text
     assert "ни одна находка не размечена" in page
     assert "сравнивать" in page, "the model table says why it is empty"
+
+
+# --- The flywheel: a recurring class must become a check (#878) --------------
+#
+# recurring_categories has counted repeats since #384 and closed nothing. A
+# class found in three tasks is still hunted by a model, at full price, on the
+# fourth — the one cost in this economy that never has to be paid again.
+
+
+async def _categorised(db: aiosqlite.Connection, title: str, categories: list[str]):
+    """One report whose confirmed findings carry these categories."""
+    task_id = await _task(db, title=title)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        tokens_spent=1000,
+        raw_count=len(categories),
+        findings_confirmed=json.dumps(
+            [
+                {"title": f"f{i}", "severity": "medium", "category": c}
+                for i, c in enumerate(categories)
+            ]
+        ),
+        incomplete=False,
+    )
+
+
+async def test_recurring_category_becomes_debt(db: aiosqlite.Connection):
+    # AC-1 (#878): a category seen in three DISTINCT tasks lands in the debt
+    # list marked as uncovered. Below the threshold it does not — the list has
+    # to stay short enough to be read.
+    for i in range(3):
+        await _categorised(db, f"task {i}", ["timeouts"])
+    await _categorised(db, "one-off", ["style"])
+    # Ten hits inside ONE task are a fact about that task, not about the repo.
+    await _categorised(db, "sprawling", ["naming"] * 10)
+    await db.commit()
+
+    debt = (await practice_metrics(db))["category_debt"]
+
+    by_category = {row["category"]: row for row in debt}
+    assert set(by_category) == {"timeouts"}, (
+        "three tasks buy the debt; ten findings in one task do not"
+    )
+    assert by_category["timeouts"]["tasks"] == 3
+    assert by_category["timeouts"]["covered"] is False
+    assert by_category["timeouts"]["check_ref"] == ""
+
+
+async def test_covered_category_leaves_debt_with_link(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-2 (#878): closing a category needs the NAME of the check. The category
+    # stays listed as covered rather than vanishing — a list that drops what
+    # was closed cannot show that anything ever gets closed.
+    for i in range(3):
+        await _categorised(db, f"task {i}", ["timeouts"])
+    await db.commit()
+
+    resp = await client.post(
+        "/api/metrics/category-checks",
+        json={
+            "category": "timeouts",
+            "check_ref": "tests/test_review_dispatch.py::test_exhausted_lite",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = next(
+        r
+        for r in (await practice_metrics(db))["category_debt"]
+        if r["category"] == "timeouts"
+    )
+    assert row["covered"] is True
+    assert row["check_ref"].endswith("::test_exhausted_lite")
+
+    page = (await client.get("/metrics")).text
+    assert "test_exhausted_lite" in page
+    assert "проверка не заведена" not in page
+
+
+async def test_closing_a_category_without_naming_a_check_is_refused(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # A category closed by a tick is a category nobody covered: the debt list
+    # would shrink while the token bill stayed exactly where it was.
+    for i in range(3):
+        await _categorised(db, f"task {i}", ["timeouts"])
+    await db.commit()
+
+    resp = await client.post(
+        "/api/metrics/category-checks",
+        json={"category": "timeouts", "check_ref": "   "},
+    )
+
+    assert resp.status_code in (400, 422)
+    row = next(
+        r
+        for r in (await practice_metrics(db))["category_debt"]
+        if r["category"] == "timeouts"
+    )
+    assert row["covered"] is False, "an unnamed check closes nothing"
+
+
+async def test_debt_blocks_nothing_and_says_so_when_empty(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # A gate that shouts off-target stops being read, and then the real signal
+    # is the one that gets missed. The list informs; it never blocks.
+    task_id = await _task(db, title="clean")
+    before = dict(await repo.get_task(db, task_id))["status"]
+    for i in range(3):
+        await _categorised(db, f"debt task {i}", ["timeouts"])
+    await db.commit()
+
+    debt = (await practice_metrics(db))["category_debt"]
+    assert debt and debt[0]["covered"] is False, "the debt is real and open"
+    # ...and nothing about the work moved because of it.
+    assert dict(await repo.get_task(db, task_id))["status"] == before
+
+    # The empty case says why it is empty rather than rendering a blank table.
+    async with aiosqlite.connect(":memory:") as fresh:
+        fresh.row_factory = aiosqlite.Row
+        await fresh.executescript(_SCHEMA)
+        await _migrate(fresh)
+        assert (await practice_metrics(fresh))["category_debt"] == []

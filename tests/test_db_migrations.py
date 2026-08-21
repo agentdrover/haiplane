@@ -971,3 +971,29 @@ async def test_disposition_migration_backfills_nothing():
             )
     finally:
         await conn.close()
+
+
+async def test_category_check_needs_a_named_check():
+    """#878. The table exists and refuses a second answer to "is this covered?".
+
+    ``check_ref`` is NOT NULL by schema and non-blank by the service: a
+    category closed by a tick is a category nobody covered, and the debt list
+    would shrink while the token bill stayed exactly where it was.
+    """
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "category_checks")
+        assert cols, "the table must exist after migration"
+        assert cols["check_ref"]["notnull"] == 1
+
+        await conn.execute(
+            "INSERT INTO category_checks (category, check_ref) "
+            "VALUES ('timeouts', 'tests/test_x.py::test_y')"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO category_checks (category, check_ref) "
+                "VALUES ('timeouts', 'another/check')"
+            )
+    finally:
+        await conn.close()
