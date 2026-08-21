@@ -175,6 +175,12 @@ class NoopGitOps:
         """No git here — the reader must see "could not look" (#824)."""
         return None
 
+    async def is_ancestor(
+        self, repo: str, ancestor: str, descendant: str
+    ) -> bool | None:
+        """No git here — "could not look", never "not in that history" (#497)."""
+        return None
+
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None:

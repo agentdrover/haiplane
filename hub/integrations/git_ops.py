@@ -952,6 +952,30 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def is_ancestor(
+        self, repo: str, ancestor: str, descendant: str
+    ) -> bool | None:
+        """Is ``ancestor`` in the history of ``descendant``? (#497)
+
+        Three answers, never two. ``None`` means the question could not be
+        asked — an unreadable repository, or a commit this checkout does not
+        carry — and it must never collapse into ``False``: "we did not check"
+        printed as "not deployed" is the exact failure this epic removes.
+        """
+        rc, _, _ = await _git("rev-parse", "--git-dir", repo=repo, check=False)
+        if rc != 0:
+            return None
+        for sha in (ancestor, descendant):
+            rc, _, _ = await _git(
+                "cat-file", "-e", f"{sha}^{{commit}}", repo=repo, check=False
+            )
+            if rc != 0:
+                return None
+        rc, _, _ = await _git(
+            "merge-base", "--is-ancestor", ancestor, descendant, repo=repo, check=False
+        )
+        return rc == 0
+
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None:

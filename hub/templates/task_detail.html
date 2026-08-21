@@ -916,6 +916,17 @@
                     <dt>Branch</dt>
                     <dd><code class="code-sm">{{ task.branch }}</code></dd>
                     {% endif %}
+                    {# #497: смёржено и раскатано — разные факты, и до этой
+                       строки второй было негде увидеть. Три состояния, и
+                       «не смогли проверить» никогда не печатается как
+                       «не раскатано». #}
+                    {% if delivery %}
+                    <dt>Доставка</dt>
+                    <dd>
+                        <span class="badge badge--xs badge-{{ 'test' if delivery.state == 'in_prod' else ('failed' if delivery.state == 'not_in_prod' else 'pending') }}">{{ delivery.state }}</span>
+                        <span class="muted">{{ delivery.reason }}</span>
+                    </dd>
+                    {% endif %}
                     {% if task.pr_number %}
                     <dt>PR</dt>
                     <dd><a href="https://github.com/mrPDA/vkuswill_bot/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a></dd>
