@@ -24,7 +24,7 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from hub import config, services
+from hub import config, models, services
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db
@@ -871,6 +871,92 @@ async def api_get_task(task_id: int, request: Request):
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
+
+
+# --- Task dependencies (#486, epic #478) ------------------------------------
+#
+# The graph existed since #482 but only code inside the hub could write to it,
+# so it stayed empty while four statements went on saying "проверяется глазами,
+# depends_on в хабе нет". These are the endpoints that let the people who know
+# about an order record it.
+#
+# Authorisation deliberately matches refine rather than the human-only gates:
+# an edge approves nothing and lifts nothing. It states an order and turns on
+# an advisory warning at start (#484), so the cost of a wrong one is a line in
+# a response and a DELETE.
+
+
+async def _require_task(db, task_id: int) -> dict[str, Any]:
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise HTTPException(404, f"task #{task_id} not found")
+    return dict(row)
+
+
+@app.post(
+    "/api/tasks/{task_id}/dependencies", response_model=models.TaskDependencyWritten
+)
+async def api_add_task_dependency(
+    task_id: int, body: models.TaskDependencyCreate, request: Request
+):
+    """Record that this task waits for another one (#486)."""
+    db = _db(request)
+    await _require_task(db, task_id)
+    # Both ends must exist BEFORE anything is written: an edge pointing at a
+    # task nobody can finish would read as a blocker that never clears.
+    await _require_task(db, body.depends_on_task_id)
+    try:
+        created = await repo.add_task_dependency(db, task_id, body.depends_on_task_id)
+    except repo.SelfDependencyError as exc:
+        # A malformed request, not a conflicting state.
+        raise HTTPException(
+            422, {"error": "self_dependency", "hint": str(exc)}
+        ) from exc
+    except repo.DependencyCycleError as exc:
+        # The hint carries the chain itself: "a cycle was detected" cannot be
+        # acted on, "#A → #B → #C → #A" names the edge to reconsider.
+        raise HTTPException(
+            409, {"error": "dependency_cycle", "hint": str(exc)}
+        ) from exc
+    await db.commit()
+    return models.TaskDependencyWritten(
+        task_id=task_id,
+        depends_on_task_id=body.depends_on_task_id,
+        created=created,
+    )
+
+
+@app.delete(
+    "/api/tasks/{task_id}/dependencies/{depends_on_task_id}",
+    response_model=models.TaskDependencyRemoved,
+)
+async def api_remove_task_dependency(
+    task_id: int, depends_on_task_id: int, request: Request
+):
+    """Drop the edge. Removing one that is not there is a no-op, not a 404 —
+    the caller wanted it gone and it is gone (#486)."""
+    db = _db(request)
+    await _require_task(db, task_id)
+    removed = await repo.remove_task_dependency(db, task_id, depends_on_task_id)
+    await db.commit()
+    return models.TaskDependencyRemoved(
+        task_id=task_id,
+        depends_on_task_id=depends_on_task_id,
+        removed=removed,
+    )
+
+
+@app.get("/api/tasks/{task_id}/dependencies", response_model=models.TaskDependencies)
+async def api_list_task_dependencies(task_id: int, request: Request):
+    """Both sides of the task's edges, from the SAME reader the task context
+    uses (#485) — two sources for one fact drift apart (#486)."""
+    db = _db(request)
+    await _require_task(db, task_id)
+    edges = await repo.list_task_dependencies(db, task_id)
+    return models.TaskDependencies(
+        blocked_by=[models.TaskDependencyRef(**e) for e in edges["blocked_by"]],
+        unblocks=[models.TaskDependencyRef(**e) for e in edges["unblocks"]],
+    )
 
 
 @app.post("/api/tasks/{task_id}/archive", response_model=TaskView)

@@ -1305,6 +1305,37 @@ class TaskProjectRef(BaseModel):
     slug: str
 
 
+class TaskDependencyCreate(BaseModel):
+    """Ask that a task wait for another one (#486)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    depends_on_task_id: int = Field(..., ge=1)
+
+
+class TaskDependencyWritten(BaseModel):
+    """The outcome of writing an edge (#486).
+
+    ``created`` is False when the edge was already there. Not an error: the
+    caller's intent — "this must wait for that" — is satisfied either way,
+    and the repository layer (#483) already answers the same way. A contract
+    that raised where the layer under it shrugs would make callers write
+    retry logic around a no-op.
+    """
+
+    task_id: int
+    depends_on_task_id: int
+    created: bool
+
+
+class TaskDependencyRemoved(BaseModel):
+    """The outcome of dropping an edge; ``removed`` False when none was there."""
+
+    task_id: int
+    depends_on_task_id: int
+    removed: bool
+
+
 class TaskDependencyRef(BaseModel):
     """One end of a dependency edge, as a reader needs it (#485)."""
 
