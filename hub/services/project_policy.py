@@ -66,6 +66,36 @@ async def base_branch_for_task(db: aiosqlite.Connection, task_id: int) -> str:
 # already ``main`` (spike-bo) would have had a release PR opened from main
 # into main. Declared per project, falling back to the configured branch.
 RELEASE_BASE_KEY = "release_base"
+# The closed set of keys ``default_branch_policy`` may carry (#886). It lives
+# next to the reader on purpose: a set kept in the write layer drifts from the
+# reader that gives keys their meaning, and the drift is invisible — an
+# unrecognised key reads exactly like a key nobody wrote. ``release_base``
+# missing is a legitimate state ("this project declared no release branch");
+# ``releaseBase`` present is a typo that produces the same fallback while the
+# owner looks at their JSON and believes the policy is set. Refusing on write
+# is what tells those two apart, and it is the only moment where the person
+# who made the typo is still there to fix it.
+DEFAULT_BRANCH_POLICY_KEYS: tuple[str, ...] = (RELEASE_BASE_KEY,)
+
+
+def validate_default_branch_policy(policy: object) -> dict:
+    """Return the policy, or raise ``ValueError`` naming the unknown keys.
+
+    The message names both halves — what was written and what exists —
+    because it is shown to a human in the project card, not only logged:
+    "unknown key" without the allowed list sends the reader to the source.
+    """
+    if policy is None:
+        return {}
+    if not isinstance(policy, dict):
+        raise ValueError("default_branch_policy must be an object")
+    unknown = set(policy) - set(DEFAULT_BRANCH_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown default_branch_policy keys: {sorted(unknown)}; "
+            f"allowed: {', '.join(DEFAULT_BRANCH_POLICY_KEYS)}"
+        )
+    return policy
 
 
 def release_base_of(project) -> str:

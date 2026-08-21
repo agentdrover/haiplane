@@ -35,6 +35,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.integrations.registry import plugins
+from hub.services import project_policy
 from hub.models import (
     FindingDisposition,
     FindingDispositionItem,
@@ -783,6 +784,15 @@ def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return parsed, None
 
 
+# The gate-policy keys the project card actually renders (#753/#760/#805).
+# For these — and only these — an empty field means "remove this knob": the
+# form showed them, so the submitter had a say. Everything else in the stored
+# policy is carried through untouched (#886).
+_FORM_GATE_POLICY_KEYS = frozenset(
+    {"dor", "verdict", "review", "dor_max_class", "risk_map"}
+)
+
+
 def _projects_error_redirect(message: str) -> RedirectResponse:
     return RedirectResponse(
         f"/projects?project_error={quote(message)}", status_code=303
@@ -887,6 +897,18 @@ async def web_edit_project(project_id: int, request: Request):
             return _projects_error_redirect(err.replace("policy:", "risk_map:"))
         if risk_map is not None:
             gate_policy["risk_map"] = risk_map
+        # Keys the form does not offer (#886: release, ci_runner) are carried
+        # over untouched. "The form carries the whole policy" is true of the
+        # knobs it shows; a knob it never showed cannot be said to have been
+        # emptied by the person who submitted it, and dropping it here would
+        # undo an API-set value with no trace — the silent rollback this
+        # task exists to remove.
+        stored = await repo.get_project(_db(request), project_id)
+        if stored is not None:
+            kept = project_policy.gate_policy_of(stored)
+            for key, value in kept.items():
+                if key not in _FORM_GATE_POLICY_KEYS:
+                    gate_policy[key] = value
         fields["gate_policy"] = gate_policy
     if not fields:
         return RedirectResponse("/projects", status_code=303)
