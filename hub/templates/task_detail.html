@@ -102,7 +102,7 @@
                 {% endif %}
             </section>
 
-            {% set has_discovery = task.outcome_metric or task.outcome_indicator or task.outcome_deadline or task.outcome_revisit_condition or task.redesign_decision or task.agent_fit %}
+            {% set has_discovery = task.outcome_status or task.outcome_metric or task.outcome_indicator or task.outcome_deadline or task.outcome_revisit_condition or task.redesign_decision or task.agent_fit %}
             {% set has_brief = task.user_story or task.problem_statement or task.business_value or task.technical_hints or task.scope_in or task.scope_out or task.affected_areas or task.validation_commands or task.constraints or task.assumptions or task.out_of_scope_for_review %}
             {% if has_brief or has_discovery %}
             <section class="task-content-card">
@@ -121,6 +121,20 @@
                     {% if task.business_value %}
                     <dt>Value</dt>
                     <dd class="u-pre-wrap">{{ task.business_value }}</dd>
+                    {% endif %}
+                    {% if task.outcome_status %}
+                    {% set outcome_status_value = task.outcome_status.value %}
+                    {% set outcome_status_labels = {
+                        'no_hypothesis': 'Нет гипотезы',
+                        'not_due': 'Срок не наступил',
+                        'unanswered': 'Срок наступил, ответа нет',
+                        'confirmed': 'Подтверждена',
+                        'refuted': 'Опровергнута',
+                        'unmeasurable': 'Неизмерима',
+                        'revised': 'Пересмотрена',
+                    } %}
+                    <dt>Состояние гипотезы</dt>
+                    <dd data-outcome-status="{{ outcome_status_value }}">{{ outcome_status_labels.get(outcome_status_value, outcome_status_value) }}</dd>
                     {% endif %}
                     {% if task.outcome_metric %}
                     <dt>Outcome Metric</dt>

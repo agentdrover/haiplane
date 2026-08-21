@@ -743,6 +743,10 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     parts = [
         f"Task #{task['id']}: {task['title']}",
         f"Status: {task['status']}",
+    ]
+    if task.get("outcome_status"):
+        parts.append(f"Outcome hypothesis: {task['outcome_status']}")
+    parts += [
         f"Source: {task.get('source', 'human')}",
         f"Runtime: {task.get('runtime', 'auto')}",
         f"Agent: {task.get('assigned_agent', '-')}",

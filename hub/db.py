@@ -1102,6 +1102,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_releases_project",
         "CREATE INDEX IF NOT EXISTS idx_releases_project ON releases(project_id, id)",
     ),
+    (
+        # Snapshot of the hypothesis that was answered (#576). Without it,
+        # refining outcome_metric after an answer leaves "confirmed" pointing
+        # at a different promise. NULL is the legacy default: pre-#576 rows
+        # must read as answered, not as revised — the same move as author_kind
+        # in #559.
+        "add_outcome_answers_hypothesis_snapshot",
+        "ALTER TABLE outcome_answers ADD COLUMN hypothesis_snapshot TEXT",
+    ),
 ]
 
 

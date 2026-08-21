@@ -791,6 +791,8 @@ class ReviewBrief(BaseModel):
     outcome_indicator: str = ""
     outcome_deadline: str = ""
     outcome_revisit_condition: str = ""
+    # Computed (#576). None = this path did not assemble it, not "no hypothesis".
+    outcome_status: OutcomeHypothesisStatus | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -1458,6 +1460,8 @@ class TaskView(BaseModel):
     outcome_indicator: str = ""
     outcome_deadline: str = ""
     outcome_revisit_condition: str = ""
+    # Computed (#576). None = this path did not assemble it, not "no hypothesis".
+    outcome_status: OutcomeHypothesisStatus | None = None
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str = ""
     agent_fit: AgentFit | None = None
@@ -1780,6 +1784,24 @@ class OutcomeVerdict(str, Enum):
     unmeasurable = "unmeasurable"
 
 
+class OutcomeHypothesisStatus(str, Enum):
+    """Derived state of a task's outcome hypothesis (#576).
+
+    Not stored: one value here is assembled from the metric, ``outcome_answers``,
+    and the last successful release. A stored copy would have to be kept in
+    step with those facts, which is the class of defect this field exists
+    to stop — empty, null, and overdue collapsing into one silence.
+    """
+
+    no_hypothesis = "no_hypothesis"
+    not_due = "not_due"
+    unanswered = "unanswered"
+    confirmed = "confirmed"
+    refuted = "refuted"
+    unmeasurable = "unmeasurable"
+    revised = "revised"
+
+
 class OutcomeAnswerSubmit(BaseModel):
     """One check of a completed task's stated outcome (#819).
 
@@ -1816,6 +1838,8 @@ class OutcomeAnswerView(BaseModel):
     note: str = ""
     answered_by: str = ""
     answered_at: str = ""
+    # Empty/null = written before #576; those rows read as answered, not revised.
+    hypothesis_snapshot: str | None = None
 
 
 class MachineReviewSubmit(BaseModel):
@@ -2234,3 +2258,4 @@ ProposalView = TaskView
 # which is declared after ReviewBrief (#381).
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
+TaskView.model_rebuild()
