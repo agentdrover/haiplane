@@ -3764,3 +3764,22 @@ body.htmx-request .htmx-progress {
 .task-diff-line--hunk {
     color: var(--text-muted);
 }
+
+/* Anchoring a finding to a line (#826). Only lines that HAVE a new-side
+   address are clickable — a removed line has no address to point at. */
+.task-diff-num {
+    display: inline-block;
+    width: 44px;
+    padding-right: 10px;
+    text-align: right;
+    color: var(--text-muted);
+    user-select: none;
+}
+
+.task-diff-line--anchorable {
+    cursor: pointer;
+}
+
+.task-diff-line--anchorable:hover {
+    outline: 1px solid var(--border-focus);
+}

@@ -19,6 +19,11 @@
   - `uv run ruff check hub tests`
   - `uv run ruff format hub tests`
   - `uv run pytest -q`
+  - `uv run python scripts/surface_parity.py` before submitting: names the
+    contract surfaces (REST/CLI/MCP, metric and page, schema and storage) that
+    usually change together and are missing from this diff. Warning only —
+    always exits 0, so either change them too or say in the submission why they
+    do not apply (#833).
 
 ## Fast Start For Agents
 

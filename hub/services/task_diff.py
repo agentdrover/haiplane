@@ -60,26 +60,56 @@ def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
     }
 
 
+def _hunk_start(header: str) -> int | None:
+    """New-side start line of a ``@@ -a,b +c,d @@`` header, or None."""
+    plus = header.find("+")
+    if plus < 0:
+        return None
+    token = header[plus + 1 :].split()[0] if header[plus + 1 :].split() else ""
+    number = token.split(",", 1)[0]
+    return int(number) if number.isdigit() else None
+
+
 def split_files(diff: str) -> list[dict[str, Any]]:
     """Split a unified diff into per-file entries, in the order git printed them.
+
+    Each line carries the new-side line number it lands on (#826) so a reader
+    can point at it: a finding without an address sends the implementer looking
+    for the place by description. Removed lines have no new-side number and
+    carry None rather than a neighbour's — a wrong address is worse than none.
 
     Deliberately tolerant: an unparsable header keeps its lines rather than
     dropping them, because a lost hunk is a change nobody was shown.
     """
     files: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    new_line: int | None = None
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             path = line.split(" b/", 1)[-1].strip() if " b/" in line else line
             current = {"path": path, "added": 0, "removed": 0, "lines": []}
             files.append(current)
+            new_line = None
             continue
         if current is None:
             # Output before any file header (git rarely emits this) — keep it
             # under a named entry instead of discarding it.
             current = {"path": "(diff preamble)", "added": 0, "removed": 0, "lines": []}
             files.append(current)
-        current["lines"].append(line)
+            new_line = None
+
+        number: int | None = None
+        if line.startswith("@@"):
+            new_line = _hunk_start(line)
+        elif new_line is not None and not line.startswith("---"):
+            if line.startswith("+"):
+                number, new_line = new_line, new_line + 1
+            elif line.startswith("-"):
+                number = None
+            elif line.startswith(" ") or line == "":
+                number, new_line = new_line, new_line + 1
+
+        current["lines"].append({"text": line, "new_line": number})
         if line.startswith("+") and not line.startswith("+++"):
             current["added"] += 1
         elif line.startswith("-") and not line.startswith("---"):
@@ -111,11 +141,11 @@ def truncate(
         lines: list[str] = []
         weight = 0
         for line in entry["lines"]:
-            if len(lines) >= room_lines or weight + len(line) + 1 > room_bytes:
+            if len(lines) >= room_lines or weight + len(line["text"]) + 1 > room_bytes:
                 kept.append({**entry, "lines": lines, "cut": True})
                 return kept, True, shown + len(lines), total
             lines.append(line)
-            weight += len(line) + 1
+            weight += len(line["text"]) + 1
         kept.append({**entry, "cut": False})
         shown += len(lines)
         size += weight

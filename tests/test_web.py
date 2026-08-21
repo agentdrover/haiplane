@@ -5013,3 +5013,98 @@ async def test_weak_attribution_is_marked_as_such(
     weak_at = resp.text.index("предположительно по объявленным областям")
     exact_at = resp.text.index("точная привязка")
     assert exact_at < weak_at
+
+
+# ---- #826: a finding that knows where it lives ----
+
+
+async def test_verdict_finding_carries_file_and_line(client: AsyncClient):
+    # AC-1 (#826): the address the reviewer clicked survives into the record.
+    # Without it the implementer searches for the place by description.
+    task_id = await _web_task_in_review(client)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={
+            "verdict": "changes_requested",
+            "comments": "смотри строку",
+            "findings_text": "high: гонка в bump @ hub/services/lifecycle.py:412",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    finding = body["latest_review"]["findings"][0]
+    assert finding["file"] == "hub/services/lifecycle.py"
+    assert finding["line"] == 412
+    assert finding["message"] == "гонка в bump", "the address must leave the text"
+
+
+async def test_unanchored_finding_is_still_accepted(client: AsyncClient):
+    # AC-2 (#826): anchoring stays optional. Made mandatory it would be
+    # answered with a click on whatever line was under the cursor, and a
+    # made-up address is worse than an honest none.
+    task_id = await _web_task_in_review(client)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={
+            "verdict": "changes_requested",
+            "comments": "",
+            "findings_text": "low: опечатка в докстринге\nмысль без severity и без адреса",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    findings = (await client.get(f"/api/tasks/{task_id}")).json()["latest_review"][
+        "findings"
+    ]
+    assert [f["message"] for f in findings] == [
+        "опечатка в докстринге",
+        "мысль без severity и без адреса",
+    ]
+    assert all(f["file"] == "" and f["line"] is None for f in findings)
+
+
+async def test_anchored_findings_reach_the_implementer(client: AsyncClient):
+    # AC-3 (#826): the address is only worth capturing if it travels. The card
+    # is where the implementer reads the verdict back.
+    task_id = await _web_task_in_review(client)
+    await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={
+            "verdict": "changes_requested",
+            "comments": "",
+            "findings_text": "high: тут падает @ hub/web.py:77",
+        },
+        follow_redirects=False,
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    finding = body["latest_review"]["findings"][0]
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    # Structured, not merely present in the prose: before #826 the address
+    # travelled as part of the message text, which reads the same on the card
+    # and is useless to anything that wants to open the file.
+    assert (finding["file"], finding["line"]) == ("hub/web.py", 77)
+    assert "@" not in finding["message"]
+    assert '<code class="code-sm">hub/web.py:77</code>' in page
+
+
+async def test_diff_lines_carry_their_new_side_address(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # #826: the click has to have something to read. A removed line keeps no
+    # number — pointing at a neighbour's address would be a wrong address.
+    workspace, submitted, _later = _diff_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    task_id = await _task_pinned_at(client, db, submitted, "task-x/work")
+
+    resp = await client.get(f"/tasks/{task_id}/diff")
+
+    assert 'data-file="submitted.py"' in resp.text
+    assert 'data-line="1"' in resp.text
+    assert "task-diff-line--anchorable" in resp.text

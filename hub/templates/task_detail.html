@@ -783,6 +783,7 @@
                     <ul class="task-review-findings">
                         {% for f in task.latest_review.findings %}
                         <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}
+                            {%- if f.file %} <code class="code-sm">{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</code>{% endif %}
                             {% if f.scope.value == 'out_of_scope' %}
                             <span class="badge badge--xs badge-type-subtask">out of scope{% if f.linked_task_id %} &rarr; <a href="/tasks/{{ f.linked_task_id }}">#{{ f.linked_task_id }}</a>{% endif %}</span>
                             {% endif %}
@@ -802,13 +803,53 @@
                     <label class="task-action-label" for="review-comments">Review comments</label>
                     <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
                     <button class="btn btn-success task-action-btn" type="submit" name="verdict" value="approved">Approve</button>
-                    <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...)</label>
+                    <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...; клик по строке диффа добавит «@ файл:строка»)</label>
                     <textarea id="review-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: race condition in bump&#10;low: typo in docstring"></textarea>
                     <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
                 </form>
+                <script>
+                document.addEventListener('click', function (event) {
+                    var line = event.target.closest('.task-diff-line--anchorable');
+                    if (!line) return;
+                    var box = document.getElementById('review-findings');
+                    if (!box) return;
+                    var address = ' @ ' + line.dataset.file + ':' + line.dataset.line;
+                    var text = box.value.replace(/\s+$/, '');
+                    // Appending to the line being written keeps one finding one
+                    // line; a second click on the same finding replaces the
+                    // address rather than stacking two.
+                    var parts = text.split('\n');
+                    var last = parts.length ? parts[parts.length - 1] : '';
+                    if (!last.trim()) {
+                        parts[parts.length - 1] = 'medium: ' + address.trim();
+                    } else {
+                        parts[parts.length - 1] = last.replace(/\s*@\s*\S+:\d+$/, '') + address;
+                    }
+                    box.value = parts.join('\n');
+                    box.focus();
+                });
+                </script>
 
                 {% elif task.status.value in ('running', 'review', 'fix_requested', 'ci_check') %}
                 <div class="task-action-state">In Progress</div>
+                {# #826: адрес правки нужен ИСПОЛНИТЕЛЮ, а он смотрит на карточку
+                   уже после вердикта — в fix_requested, где блок вердикта не
+                   показывался вовсе. Находки без места отправляли искать по
+                   описанию. #}
+                {% if task.latest_review and task.latest_review.findings %}
+                <div class="task-action-note">
+                    Находки последнего вердикта ({{ task.latest_review.verdict.value|upper }},
+                    сдача #{{ task.latest_review.submission_generation }}{{ '' if task.latest_review.is_current else ', устарел — работа пересдана' }}):
+                    <ul class="task-review-findings">
+                        {% for f in task.latest_review.findings %}
+                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}
+                            {%- if f.file %} <code class="code-sm">{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</code>
+                            {%- else %} <span class="muted">место не указано</span>{% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
                 <button class="btn btn-primary task-action-btn"
                         hx-get="/tasks/{{ task.id }}"
                         hx-select=".main"

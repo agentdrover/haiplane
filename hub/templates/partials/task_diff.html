@@ -26,7 +26,10 @@
             <span class="badge badge--xs badge-failed">&minus;{{ file.removed }}</span>
             {% if file.cut %}<span class="badge badge-failed">файл показан не целиком</span>{% endif %}
         </summary>
-        <pre class="task-diff-body">{% for line in file.lines %}<span class="task-diff-line{% if line.startswith('+') and not line.startswith('+++') %} task-diff-line--add{% elif line.startswith('-') and not line.startswith('---') %} task-diff-line--del{% elif line.startswith('@@') %} task-diff-line--hunk{% endif %}">{{ line }}</span>
+        {# #826: у каждой строки новой стороны есть номер и адрес. Клик по ней
+           дописывает «@ файл:строка» в находку — находка приходит туда, где
+           делается правка, а не описанием места. #}
+        <pre class="task-diff-body">{% for line in file.lines %}<span class="task-diff-line{% if line.text.startswith('+') and not line.text.startswith('+++') %} task-diff-line--add{% elif line.text.startswith('-') and not line.text.startswith('---') %} task-diff-line--del{% elif line.text.startswith('@@') %} task-diff-line--hunk{% endif %}{% if line.new_line %} task-diff-line--anchorable{% endif %}"{% if line.new_line %} data-file="{{ file.path }}" data-line="{{ line.new_line }}" title="кликните, чтобы привязать находку к {{ file.path }}:{{ line.new_line }}"{% endif %}><span class="task-diff-num">{{ line.new_line or '' }}</span>{{ line.text }}</span>
 {% endfor %}</pre>
     </details>
     {% endfor %}
