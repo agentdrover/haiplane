@@ -1071,6 +1071,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # changes no addressing — every session of that agent still reads the
         # message — it only lets the sender say who it is for, which is what
         # the sender knew and had no way to write down.
+        # #837: was this observation checked against what production runs?
+        # '' for rows written before the check existed, 'in_prod' when the
+        # task's merge was verifiably deployed, 'unknown' when the hub could
+        # not tell. The third is stored rather than refused: absence of
+        # delivery facts is not a violation, and blocking on it would turn
+        # ignorance into a gate.
+        "add_live_checks_deploy_state",
+        "ALTER TABLE live_checks ADD COLUMN deploy_state TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         "add_agent_messages_for_session",
         "ALTER TABLE agent_messages ADD COLUMN for_session TEXT NOT NULL DEFAULT ''",
     ),
@@ -1110,6 +1120,45 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # in #559.
         "add_outcome_answers_hypothesis_snapshot",
         "ALTER TABLE outcome_answers ADD COLUMN hypothesis_snapshot TEXT",
+    ),
+    (
+        # What a machine-review finding turned out to be (#876, feature #871).
+        # Until now the only measure of review quality was the review itself:
+        # findings_confirmed / findings_rejected is one run's own adjudication,
+        # and filtration_rate divides one by the other. Nobody recorded what
+        # happened to a finding AFTER the gate, so precision by profile and by
+        # model could not be computed at all, and tokens_per_confirmed priced
+        # findings that may never have been fixed.
+        #
+        # Keyed by (review_id, finding_index): a report is immutable, so the
+        # position in findings_confirmed identifies the finding. The title is
+        # snapshotted beside it — a row that survives its report must still be
+        # readable by a person, and the index alone is not.
+        #
+        # No default disposition, and NO BACKFILL for existing reports: "not
+        # stated" is an answer, and writing one in for rows nobody judged is
+        # exactly the substitution #549 exists to prevent.
+        "create_finding_dispositions",
+        """CREATE TABLE IF NOT EXISTS finding_dispositions (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id             INTEGER NOT NULL,
+            task_id               INTEGER NOT NULL,
+            submission_generation INTEGER NOT NULL,
+            finding_index         INTEGER NOT NULL,
+            finding_title         TEXT    NOT NULL DEFAULT '',
+            disposition           TEXT    NOT NULL,
+            note                  TEXT    NOT NULL DEFAULT '',
+            decided_by            TEXT    NOT NULL DEFAULT '',
+            decided_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # One disposition per finding: a second pass over the same gate
+        # corrects the first rather than stacking a contradictory row beside
+        # it. The reads are always "everything judged in this report".
+        "idx_finding_dispositions_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dispositions_unique "
+        "ON finding_dispositions(review_id, finding_index)",
     ),
 ]
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import PurePosixPath
 from typing import Any
 
 import aiosqlite
@@ -267,11 +268,157 @@ def pick_review_profile(
     return LITE, [f"класс риска {risk_class.value}, процессных поверхностей нет"]
 
 
-def _review_prompt(task_id: int, branch: str, model_id: str, profile: str) -> str:
+# Repository review rules (#873). Until now the reviewer got the diff and
+# nothing about the code it came from: the prompt named no known defect class,
+# while ``_PROCESS_SURFACES`` above already listed the ones this repository
+# actually burned itself on — and spent them on routing the profile alone.
+# Both findings the cheap profile missed on 21.08.2026 were of those classes.
+#
+# The layout is Cursor's (``.cursor/BUGBOT.md``): a root file plus every file
+# met while walking up from each changed file, nearest to the change last so
+# the most specific rules are read last. Two rules are ours:
+#
+# * the rules are read from the BASE ref, never from the branch under review.
+#   Read from the branch, a submission could relax the review it is about to
+#   receive inside the very diff being reviewed.
+# * a missing file is a STATED absence. "There are no rules here" and "nothing
+#   ever broke here" are different claims, and silence says the second (#725).
+REVIEW_RULES_FILE = ".hub/REVIEW_RULES.md"
+
+# A quarter of the cheap profile's ceiling and not a token more: rules that eat
+# the budget they were written to protect are worse than no rules at all. The
+# hub cannot tokenise the reviewer's model, so the share is enforced in
+# characters at a stated approximation — an honest ratio beats a precise number
+# nobody here can compute.
+RULES_BUDGET_SHARE = 0.25
+CHARS_PER_TOKEN = 4
+
+
+def rules_char_cap() -> int:
+    """How many characters of rules the cheap profile can afford."""
+    budget = max(int(config.REVIEW_LITE_TOKEN_BUDGET), 0)
+    return int(budget * RULES_BUDGET_SHARE * CHARS_PER_TOKEN)
+
+
+def changed_paths(diff: str) -> list[str]:
+    """Repository paths the diff touches, in order of first appearance.
+
+    Taken from the ``+++`` headers, so a deleted file (``+++ /dev/null``) does
+    not contribute a directory whose rules nobody needs.
+    """
+    paths: list[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        raw = line[4:].strip()
+        if not raw or raw == "/dev/null":
+            continue
+        if raw.startswith("b/"):
+            raw = raw[2:]
+        if raw and raw not in paths:
+            paths.append(raw)
+    return paths
+
+
+def rules_candidates(paths: list[str]) -> list[str]:
+    """Rules files that apply to these changes: root first, nearest last.
+
+    The root file is always a candidate, including when the diff could not be
+    read: repository-wide rules do not stop applying because we failed to list
+    the changed files.
+    """
+    ordered: list[tuple[int, str]] = [(0, REVIEW_RULES_FILE)]
+    known = {REVIEW_RULES_FILE}
+    for path in paths:
+        parts = PurePosixPath(path).parent.parts
+        for depth in range(1, len(parts) + 1):
+            candidate = "/".join((*parts[:depth], REVIEW_RULES_FILE))
+            if candidate not in known:
+                known.add(candidate)
+                ordered.append((depth, candidate))
+    # Stable by depth: same-depth files keep the order their changes appeared
+    # in, and the deepest — the one closest to the changed code — lands last.
+    ordered.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in ordered]
+
+
+async def collect_review_rules(
+    db: aiosqlite.Connection, task_id: int, diff: str | None
+) -> tuple[str, str]:
+    """The repository's review rules for this submission, and what happened.
+
+    Returns ``(block, note)``. The block goes into the reviewer's prompt; the
+    note goes into the task update, so "the reviewer worked without rules" is
+    readable afterwards instead of being inferred from its absence.
+
+    Every outcome names itself: rules found, no rules file, rules truncated,
+    the repository could not be read. The last two are the ones that would
+    otherwise pass for the first.
+    """
+    ctx = await _git_context(db, task_id)
+    if ctx is None:
+        return (
+            "ПРАВИЛА РЕПОЗИТОРИЯ ПРОЧИТАТЬ НЕ УДАЛОСЬ (нет доступа к "
+            "воркспейсу проекта). Это не значит, что правил нет.",
+            "правила прочитать не удалось — нет воркспейса",
+        )
+    workspace, base = ctx
+    sections: list[tuple[str, str]] = []
+    for candidate in rules_candidates(changed_paths(diff or "")):
+        try:
+            text = await plugins.git_ops.file_at_ref(workspace, base, candidate)
+        except Exception as exc:  # noqa: BLE001 - degradation is the contract
+            log.warning("could not read %s for task #%s: %s", candidate, task_id, exc)
+            text = None
+        if text and text.strip():
+            sections.append((candidate, text.strip()))
+    if not sections:
+        return (
+            f"ПРАВИЛ РЕПОЗИТОРИЯ НЕТ: файла {REVIEW_RULES_FILE} на ветке "
+            f"{base} не найдено. Это отсутствие данных, а не утверждение, "
+            "что здесь ничего не ломается.",
+            f"правил нет — {REVIEW_RULES_FILE} на {base} отсутствует",
+        )
+
+    header = (
+        f"ПРАВИЛА РЕПОЗИТОРИЯ (ветка {base}). Это места, где здесь "
+        "ИСТОРИЧЕСКИ ЛОМАЛОСЬ, а не исчерпывающий чеклист: проверь их "
+        "обязательно И СМОТРИ ШИРЕ — дефект, которого нет в списке, "
+        "остаётся дефектом."
+    )
+    body: list[str] = []
+    used = len(header)
+    cap = rules_char_cap()
+    dropped: list[str] = []
+    for path, text in sections:
+        chunk = f"\n--- {path} ---\n{text}"
+        if used + len(chunk) > cap:
+            dropped.append(path)
+            continue
+        body.append(chunk)
+        used += len(chunk)
+    note = f"правила из {len(sections) - len(dropped)} файл(ов)"
+    if dropped:
+        cut = (
+            f"\n[ОБРЕЗАНО по потолку {cap} символов — не поместились: "
+            f"{', '.join(dropped)}. Непрочитанные правила это «не проверено», "
+            "а не «правил нет».]"
+        )
+        body.append(cut)
+        note += f"; обрезано, не поместились: {', '.join(dropped)}"
+    return header + "".join(body), note
+
+
+def _review_prompt(
+    task_id: int, branch: str, model_id: str, profile: str, rules_block: str
+) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба OpenClaw "
         f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
-        "не менять — только читать код и запускать проверки. "
+        "не менять — только читать код и запускать проверки.\n\n"
+        # The rules travel with BOTH profiles: the expensive harness has no
+        # more knowledge of this repository's history than the cheap pass.
+        f"{rules_block}\n\n"
     )
     if profile == LITE:
         budget = config.REVIEW_LITE_TOKEN_BUDGET
@@ -304,6 +451,28 @@ def _review_prompt(task_id: int, branch: str, model_id: str, profile: str) -> st
     )
 
 
+async def _git_context(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """``(workspace, base branch)`` of the task's project, or None (#873).
+
+    None means "we could not look", which every caller has to turn into a
+    named answer of its own rather than into a quiet default.
+    """
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_id)
+        workspace = (ctx.get("repo") or "").strip()
+        base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
+        if not workspace or not base:
+            return None
+        return workspace, base
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not read the git context of task #%s: %s", task_id, exc)
+        return None
+
+
 async def _submission_diff(
     db: aiosqlite.Connection, task_id: int, branch: str
 ) -> str | None:
@@ -313,14 +482,11 @@ async def _submission_diff(
     the expensive profile rather than into a quiet lite run over code nobody
     looked at.
     """
+    ctx = await _git_context(db, task_id)
+    if ctx is None or not branch:
+        return None
+    workspace, base = ctx
     try:
-        from hub import services
-
-        ctx = await services.project_git_context(db, task_id)
-        workspace = ctx.get("repo")
-        base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
-        if not workspace or not branch:
-            return None
         return await plugins.git_ops.branch_diff(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not read the diff of task #%s: %s", task_id, exc)
@@ -376,12 +542,13 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
     profile, profile_reasons = pick_review_profile(task, diff)
+    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=branch,
         model_id=model_id,
-        prompt_text=_review_prompt(task_id, branch, model_id, profile),
+        prompt_text=_review_prompt(task_id, branch, model_id, profile, rules_block),
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
     )
@@ -425,7 +592,8 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         "status",
         f"Кросс-модельное ревью вызвано хабом: модель {model_id} "
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
-        f"{profile_note}, агент {agent_id}. Отчёт придёт через "
+        f"{profile_note}, агент {agent_id}. Правила репозитория: "
+        f"{rules_note} (#873). Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
         "(#757, #807).",
     )

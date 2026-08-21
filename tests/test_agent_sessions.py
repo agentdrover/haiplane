@@ -242,3 +242,149 @@ async def test_registry_is_optional_for_the_existing_lifecycle(
 
     rows = list(await db.execute_fetchall("SELECT * FROM agent_sessions"))
     assert rows == [], "no session ever registered, and nothing needed one"
+
+
+# ---- #852: the claim carries a session, or it is not a claim ----
+#
+# The hole these tests close: claim_session_id was optional, so a task could
+# run held by an agent NAME. A name is not an executor — pda_claude ran four
+# sessions on the day this was found — and every address the hub grew (the
+# registry above, messages #773, wake-up #774) routes by session. #842 was
+# running, claimed_by=pda_claude, claim_session_id=NULL: nobody to ask.
+
+
+async def test_claim_without_session_id_is_refused(
+    client: AsyncClient, monkeypatch, db
+):
+    """An agent must say WHICH session takes the task (AC-1)."""
+    agent = _auth(monkeypatch)
+    task_id = (await services.create_task(db, TaskCreate(title="Needs an address"))).id
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": ""},
+        headers=agent,
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "claim_without_session"
+    # The refusal has to carry the way out, not just the verdict.
+    assert "session_id" in detail["hint"]
+    assert "hub_session_register" in detail["hint"]
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "open", "a refused claim leaves the task open"
+    assert not task["claim_session_id"]
+
+    # With a session the very same call goes through.
+    ok = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": "s-852"},
+        headers=agent,
+    )
+    assert ok.status_code == 200, ok.text
+    assert dict(await repo.get_task(db, task_id))["claim_session_id"] == "s-852"
+
+
+async def test_pair_start_refuses_other_session_of_same_agent(
+    client: AsyncClient, monkeypatch, db
+):
+    """The name check passes for both sessions; the session check does not (AC-2)."""
+    agent = _auth(monkeypatch)
+    task_id = (
+        await services.create_task(db, TaskCreate(title="One holder at a time"))
+    ).id
+    await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": "session-A"},
+        headers=agent,
+    )
+    await repo.add_task_update(db, task_id, "bot", "status", "Plan: work")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        # Same agent name — this is what used to be enough.
+        json={"assigned_agent": "bot", "session_id": "session-B"},
+        headers=agent,
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "pair_start_session_mismatch"
+    assert detail["claim_session_id"] == "session-A"
+    assert detail["caller_session_id"] == "session-B"
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "claimed", "the loser does not move the task"
+
+    ok = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "session_id": "session-A"},
+        headers=agent,
+    )
+    assert ok.status_code == 200, ok.text
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+async def test_pair_start_from_open_records_the_session(
+    client: AsyncClient, monkeypatch, db
+):
+    """Pair-start skips the claim, so it must write the address itself (AC-2)."""
+    agent = _auth(monkeypatch)
+    task_id = (
+        await services.create_task(db, TaskCreate(title="Straight to running"))
+    ).id
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "plan": "Plan: go", "session_id": "s-open"},
+        headers=agent,
+    )
+    assert resp.status_code == 200, resp.text
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running"
+    assert task["claim_session_id"] == "s-open", "running work has an address"
+
+    # And without a session an agent cannot start one at all.
+    other_id = (
+        await services.create_task(db, TaskCreate(title="No address, no start"))
+    ).id
+    refused = await client.post(
+        f"/api/tasks/{other_id}/pair-start",
+        json={"assigned_agent": "bot", "plan": "Plan: go"},
+        headers=agent,
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["reason"] == "claim_without_session"
+    assert dict(await repo.get_task(db, other_id))["status"] == "open"
+
+
+async def test_running_without_session_is_visible(client: AsyncClient, monkeypatch, db):
+    """The tail that predates the contract has to be findable (AC-3)."""
+    agent = _auth(monkeypatch)
+    addressed = await services.create_task(db, TaskCreate(title="Has a session"))
+    orphan = await services.create_task(db, TaskCreate(title="Nobody to ask"))
+    headless = await services.create_task(db, TaskCreate(title="Dispatched"))
+    await repo.update_task(
+        db,
+        addressed.id,
+        status="running",
+        claimed_by="bot",
+        claim_session_id="s-live",
+    )
+    # Exactly the shape #842 was found in: claimed by a name, no session.
+    await repo.update_task(
+        db, orphan.id, status="running", claimed_by="bot", claim_session_id=None
+    )
+    # Headless work is not unaddressable — its executor is the job, not a
+    # session — so it must NOT show up here.
+    await repo.update_task(
+        db, headless.id, status="running", claimed_by="bot", job_id="job-1"
+    )
+    await db.commit()
+
+    resp = await client.get("/api/sessions/unaddressable", headers=agent)
+    assert resp.status_code == 200, resp.text
+    ids = [row["id"] for row in resp.json()]
+    assert ids == [orphan.id], resp.json()
+    assert resp.json()[0]["claimed_by"] == "bot"

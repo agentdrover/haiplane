@@ -8,6 +8,8 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from hub import config
+
 _SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
 
@@ -502,6 +504,11 @@ class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
     branch_slug: str = Field("", max_length=80)
+    # #852: which session takes the task, not just which agent name. The name
+    # does not identify an executor — one agent runs many sessions at once —
+    # and everything addressable (registry #771, messages #773, wake-up #774)
+    # routes by session. Required for agent callers; humans pair-start as before.
+    session_id: str = Field("", max_length=200)
 
 
 class TaskSubmitReview(BaseModel):
@@ -881,6 +888,24 @@ class SessionView(BaseModel):
     ttl_minutes: int = 0
 
 
+class UnaddressableTask(BaseModel):
+    """A task in flight that no session can be reached about (#852).
+
+    Work is happening — the task is claimed or running on the pair path — but
+    ``claim_session_id`` is empty, so there is no address to ask a question at
+    and nothing for a wake-up to target. Listing these is the honest half of
+    the fix: tightening the contract stops NEW tasks from entering this state
+    and says nothing about the ones already in it.
+    """
+
+    id: int
+    title: str = ""
+    status: str = ""
+    claimed_by: str = ""
+    claimed_at: str = ""
+    branch: str = ""
+
+
 class MessageSend(BaseModel):
     """One message from a session to an address (#773).
 
@@ -964,6 +989,11 @@ class LiveCheckView(BaseModel):
     id: int
     task_id: int
     sha: str = ""
+    # #837: 'in_prod' when the task's merge was verifiably deployed at the
+    # moment of recording, 'unknown' when the hub could not tell, '' for rows
+    # older than the check. An unverified observation must not read like a
+    # verified one.
+    deploy_state: str = ""
     outcome: str = "done"
     probe: str = ""
     observation: str = ""
@@ -1590,7 +1620,7 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     repo: str = Field("", max_length=200)
     workspace_path: str = Field("", max_length=500)
-    default_branch: str = Field("develop", max_length=100)
+    default_branch: str = Field(config.PAIR_BASE_BRANCH, max_length=100)
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1875,6 +1905,49 @@ class MachineReviewSubmit(BaseModel):
     agent: str = Field("", max_length=100)
 
 
+class FindingDisposition(str, Enum):
+    """What a confirmed finding turned out to be, once a human looked (#876).
+
+    The boundary between ``false_positive`` and ``wont_fix`` decides precision,
+    so it is written into the type and repeated at the buttons rather than left
+    to intuition: ``false_positive`` means the described defect is NOT in the
+    code; ``wont_fix`` means it is there and we are choosing not to fix it.
+    """
+
+    fixed = "fixed"
+    false_positive = "false_positive"
+    wont_fix = "wont_fix"
+
+
+class FindingDispositionItem(BaseModel):
+    """One judged finding, addressed by its position in findings_confirmed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_index: int = Field(..., ge=0)
+    disposition: FindingDisposition
+    note: str = Field("", max_length=1000)
+
+
+class FindingDispositionsSubmit(BaseModel):
+    """A gate's judgement of the current report's confirmed findings (#876)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[FindingDispositionItem] = Field(..., min_length=1)
+
+
+class FindingDispositionView(BaseModel):
+    """A stored disposition, as the card and the brief read it back."""
+
+    finding_index: int
+    finding_title: str = ""
+    disposition: FindingDisposition
+    note: str = ""
+    decided_by: str = ""
+    decided_at: str = ""
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -1905,6 +1978,9 @@ class MachineReviewView(BaseModel):
     provider_tokens: int | None = None
     submitted_by: str = ""
     created_at: str = ""
+    # What the gate said each confirmed finding turned out to be (#876). An
+    # empty list means nobody judged them — never that they were all fine.
+    dispositions: list[FindingDispositionView] = Field(default_factory=list)
 
     @field_validator("created_at", mode="before")
     @classmethod
@@ -1975,7 +2051,7 @@ class ProjectView(BaseModel):
     status: str = "active"
     repo: str = ""
     workspace_path: str = ""
-    default_branch: str = "develop"
+    default_branch: str = config.PAIR_BASE_BRANCH
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
     # Gate policy (#743): {} means "no delegation" — every gate human.
     gate_policy: dict[str, Any] = Field(default_factory=dict)

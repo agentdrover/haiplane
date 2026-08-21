@@ -1189,6 +1189,7 @@ async def arm_workspace_hooks(db) -> list[tuple[str, str]]:
     whose repository carries no hook is left alone and said so.
     """
     from hub import git_policy
+    from hub.services.project_policy import base_branch_of, release_base_of
 
     outcomes: list[tuple[str, str]] = []
     try:
@@ -1202,7 +1203,15 @@ async def arm_workspace_hooks(db) -> list[tuple[str, str]]:
         workspace = (project.get("workspace_path") or "").strip()
         if not workspace or project.get("archived"):
             continue
-        status = git_policy.activate_quietly(workspace)
+        # #475: the hook protects the branches of THIS project. Startup is the
+        # only moment the hub touches every existing workspace, so it is also
+        # the only moment the recorded policy can be corrected after an owner
+        # changes a project's default_branch.
+        status = git_policy.activate_quietly(
+            workspace,
+            base_branch=base_branch_of(row),
+            release_branch=release_base_of(row),
+        )
         outcomes.append((project.get("slug") or "?", status.state))
         log.info(
             "pre-push hook in workspace of %s: %s (%s)",

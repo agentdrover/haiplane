@@ -84,6 +84,18 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
         ),
         "minutes": 5,
     },
+    "has_affected_areas": {
+        "field": "affected_areas",
+        "message": (
+            "Name the files or directories this work touches. Four "
+            "mechanisms read them: the risk class is derived from them "
+            "(#582), the review profile is chosen by that class (#807), "
+            "the statement-freshness check compares them against what has "
+            "shipped since, and the submit-time check asks whether the diff "
+            "stayed inside them. Leave them empty and all four go quiet."
+        ),
+        "minutes": 3,
+    },
     "has_acceptance_criteria": {
         "field": "acceptance_criteria",
         "message": (

@@ -13,6 +13,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hub import config
+
 HUB_URL = os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
 HUB_TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN", "")
 
@@ -353,6 +355,8 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["assigned_agent"] = args.agent
     if getattr(args, "branch_slug", None):
         body["branch_slug"] = args.branch_slug
+    if getattr(args, "session_id", None):
+        body["session_id"] = args.session_id
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
     return 0
@@ -1355,6 +1359,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Git branch slug (task-<id>/<slug>); default from task title",
     )
+    p_pair_start.add_argument(
+        "--session-id",
+        dest="session_id",
+        default="",
+        help="Session taking the task; required when the token is an agent (#852)",
+    )
     p_pair_start.set_defaults(func=cmd_pair_start)
 
     p_outcomes = sub.add_parser(
@@ -1395,7 +1405,11 @@ def build_parser() -> argparse.ArgumentParser:
     pp_create.add_argument("--name", required=True)
     pp_create.add_argument("--repo", default="")
     pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
-    pp_create.add_argument("--default-branch", dest="default_branch", default="develop")
+    pp_create.add_argument(
+        "--default-branch",
+        dest="default_branch",
+        default=config.PAIR_BASE_BRANCH,
+    )
     pp_create.set_defaults(func=cmd_projects_create)
 
     p_approve_batch = sub.add_parser(

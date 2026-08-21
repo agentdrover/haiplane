@@ -375,6 +375,26 @@ def evidence_coverage(
     }
 
 
+async def attach_dispositions(db, view) -> None:
+    """Fill a report view with what the gate said its findings turned out to be.
+
+    Lives here because BOTH builders need it — the card (``review_report``) and
+    the brief (``build_review_brief``). #808 already learned that two readers
+    assembling the same report separately drift apart; a second copy of this
+    read would be that mistake again.
+
+    An empty list means nobody judged the findings. It never means they were
+    all fine (#549).
+    """
+    from hub import repository as repo_module
+    from hub.models import FindingDispositionView
+
+    view.dispositions = [
+        FindingDispositionView(**dict(row))
+        for row in await repo_module.list_finding_dispositions(db, view.id)
+    ]
+
+
 async def review_report(
     db: Any, task_row: dict[str, Any], mr_row: Any = None
 ) -> "ReviewReport":
@@ -397,6 +417,7 @@ async def review_report(
     if mr_row is not None:
         machine_review = MachineReviewView(**dict(mr_row))
         machine_review.is_current = machine_review.submission_generation == generation
+        await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
     branch = (task_row.get("branch") or "").strip()

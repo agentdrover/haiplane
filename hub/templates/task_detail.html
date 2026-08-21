@@ -347,6 +347,15 @@
                                 {% if c.sha_mismatch %}
                                 <span class="badge badge--xs badge-alert" title="Доставлен {{ delivered_sha[:12] }}">снято не на доставленном коммите</span>
                                 {% endif %}
+                                {# #837: запись принята, но хаб не смог
+                                   подтвердить, что код раскатан. Без этой
+                                   пометки она читалась бы наравне с
+                                   проверенной — а «проверено в проде» о
+                                   нераскатанном коде выглядит сильнее всех
+                                   прочих блоков и при этом ложно. #}
+                                {% if c.deploy_state == 'unknown' %}
+                                <span class="badge badge--xs badge-pending" title="Хаб не смог сверить с фактом выката — запись принята как есть">не сверено с выкатом</span>
+                                {% endif %}
                                 <time>{{ c.created_at }}</time>
                             </div>
                             {% if c.outcome == 'not_applicable' %}
@@ -757,15 +766,50 @@
                     </details>
                     {% endif %}
                     {% if machine_review.findings_confirmed %}
+                    {# #876: находка без диспозиции — это находка, о судьбе
+                       которой никто не сказал. Пока её нет, precision и
+                       resolution rate считать не из чего, а «подтверждена»
+                       и «оказалась настоящей» — разные утверждения. #}
+                    {% set judged = {} %}
+                    {% for d in machine_review.dispositions %}
+                    {% if judged.update({d.finding_index: d}) %}{% endif %}
+                    {% endfor %}
                     <details>
-                        <summary class="project-edit-summary">confirmed findings</summary>
-                        <ul class="task-review-findings">
-                            {% for f in machine_review.findings_confirmed %}
-                            <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
-                                {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
-                                {{ f.title }}</li>
-                            {% endfor %}
-                        </ul>
+                        <summary class="project-edit-summary">confirmed findings — {#
+                            #}размечено {{ machine_review.dispositions|length }} из {{ machine_review.findings_confirmed|length }}</summary>
+                        <form method="post"
+                              action="/tasks/{{ task.id }}/web-finding-dispositions">
+                            <p class="u-text-muted">
+                                Ложняк — описанного дефекта в коде НЕТ.
+                                Неважно — дефект есть, править не будем.
+                                Оставленное «не размечено» так и остаётся
+                                неразмеченным: значения по умолчанию нет.
+                            </p>
+                            <ul class="task-review-findings">
+                                {% for f in machine_review.findings_confirmed %}
+                                <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
+                                    {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
+                                    {{ f.title }}
+                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
+                                        value="fixed"
+                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'fixed' %}checked{% endif %}>
+                                        исправлено</label>
+                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
+                                        value="false_positive"
+                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'false_positive' %}checked{% endif %}>
+                                        ложняк</label>
+                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
+                                        value="wont_fix"
+                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'wont_fix' %}checked{% endif %}>
+                                        неважно</label>
+                                    {% if not judged.get(loop.index0) %}
+                                    <span class="badge badge-self-approved">судьба не названа</span>
+                                    {% endif %}
+                                </li>
+                                {% endfor %}
+                            </ul>
+                            <button class="btn btn-ghost" type="submit">Сохранить диспозиции</button>
+                        </form>
                     </details>
                     {% endif %}
                     {# #808: отклонённые находки — половина работы ревьюера, и

@@ -19,6 +19,7 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
+from hub.services.project_policy import base_branch_of
 
 log = logging.getLogger("hub")
 
@@ -866,7 +867,10 @@ async def provision_project(
         ok, detail = await plugins.git_ops.clone_repo(
             project["repo"].strip(),
             project["workspace_path"].strip(),
-            (project.get("default_branch") or "develop").strip() or "develop",
+            # #475: one reader for the integration branch. The literal that
+            # stood here cloned calc-kids' master workspace with --branch
+            # develop the moment the column was blank.
+            base_branch_of(project),
         )
     status = "ok" if ok else "error"
     await repo.update_project(
@@ -1029,7 +1033,11 @@ def _slug_for_task(task_id: int, task: dict[str, Any], branch_slug: str) -> str:
     existing = (task.get("branch") or "").strip()
     prefix = f"task-{task_id}/"
     if existing.startswith(prefix):
-        return existing[len(prefix) :]
+        # #884: a branch already doubled by the old code carries the prefix
+        # twice; returning the tail verbatim would feed it back in and grow
+        # the name on every restart. canonical_task_branch strips repeats,
+        # and this path hands it the same shape it expects.
+        return existing[len(prefix) :].strip("/")
     return ""
 
 

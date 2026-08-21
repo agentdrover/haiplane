@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 import aiosqlite
 
+from hub import config
 from hub.db import (
     STRUCTURED_TASK_FIELDS,
     ac_to_row_kwargs,
@@ -556,7 +557,7 @@ async def create_project(
     name: str,
     repo_name: str = "",
     workspace_path: str = "",
-    default_branch: str = "develop",
+    default_branch: str = config.PAIR_BASE_BRANCH,
     default_branch_policy: str = "{}",
     status: str = "active",
 ) -> int:
@@ -931,6 +932,57 @@ async def get_latest_machine_review(
         (task_id,),
     )
     return rows[0] if rows else None
+
+
+# --- Finding dispositions (#876) -------------------------------------------
+
+
+async def upsert_finding_disposition(
+    db: aiosqlite.Connection,
+    *,
+    review_id: int,
+    task_id: int,
+    submission_generation: int,
+    finding_index: int,
+    finding_title: str,
+    disposition: str,
+    note: str,
+    decided_by: str,
+) -> None:
+    """Record what one confirmed finding turned out to be.
+
+    Upsert on (review_id, finding_index): a gate revisiting its own judgement
+    corrects it instead of leaving two contradictory rows for the metrics to
+    average.
+    """
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_title, disposition, "
+        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "disposition=excluded.disposition, note=excluded.note, "
+        "decided_by=excluded.decided_by, decided_at=datetime('now')",
+        (
+            review_id,
+            task_id,
+            submission_generation,
+            finding_index,
+            finding_title,
+            disposition,
+            note,
+            decided_by,
+        ),
+    )
+
+
+async def list_finding_dispositions(
+    db: aiosqlite.Connection, review_id: int
+) -> list[aiosqlite.Row]:
+    return await db.execute_fetchall(
+        "SELECT * FROM finding_dispositions WHERE review_id=? "
+        "ORDER BY finding_index ASC",
+        (review_id,),
+    )
 
 
 # --- AC test results (#507) ------------------------------------------------
@@ -2657,6 +2709,28 @@ async def list_agent_sessions(
     )
 
 
+async def list_unaddressable_tasks(
+    db: aiosqlite.Connection, *, limit: int = 200
+) -> list[aiosqlite.Row]:
+    """Pair tasks in flight whose claim carries no session (#852).
+
+    Work is happening and nobody can be asked about it: claimed or running,
+    no ``claim_session_id``, and no ``job_id`` — headless tasks are excluded
+    on purpose, their executor is the dispatch job, not a session.
+    """
+    return list(
+        await db.execute_fetchall(
+            "SELECT id, title, status, claimed_by, claimed_at, branch "
+            "FROM tasks WHERE status IN ('claimed', 'running') "
+            "AND (claim_session_id IS NULL OR claim_session_id = '') "
+            "AND (job_id IS NULL OR job_id = '') "
+            "AND COALESCE(archived, 0) = 0 "
+            "ORDER BY claimed_at ASC, id ASC LIMIT ?",
+            (min(limit, 500),),
+        )
+    )
+
+
 async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
     """Drop sessions with no sign of life for ``keep_days``. Rows removed."""
     cur = await db.execute(
@@ -3116,6 +3190,7 @@ async def insert_live_check(
     reason: str = "",
     recorded_by: int | None = None,
     recorded_agent: str = "",
+    deploy_state: str = "",
 ) -> int:
     """Append one live-check record. Rows accumulate — never overwrite.
 
@@ -3126,7 +3201,7 @@ async def insert_live_check(
     cur = await db.execute(
         "INSERT INTO live_checks "
         "(task_id, sha, outcome, probe, observation, reason, recorded_by, "
-        " recorded_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " recorded_agent, deploy_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             sha or "",
@@ -3136,6 +3211,7 @@ async def insert_live_check(
             reason or "",
             recorded_by,
             recorded_agent or "",
+            deploy_state or "",
         ),
     )
     await db.commit()

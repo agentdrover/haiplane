@@ -21,8 +21,11 @@ from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
+    changed_paths,
     pick_review_model,
     pick_review_profile,
+    rules_candidates,
+    rules_char_cap,
     sweep_review_dispatches,
 )
 
@@ -33,15 +36,27 @@ _HARMLESS_DIFF = "+++ b/docs/notes.md\n+одна строка текста\n"
 
 
 class _PinnedGitOps(NoopGitOps):
-    def __init__(self, tip: str, paths: list[str], diff: str | None = None) -> None:
+    def __init__(
+        self,
+        tip: str,
+        paths: list[str],
+        diff: str | None = None,
+        rules: dict[str, str] | None = None,
+    ) -> None:
         self._tip = tip
         self._paths = paths
         # #820: the profile is decided against the diff, so the double must
         # serve one. None means "could not be read", which buys deep.
         self._diff = _HARMLESS_DIFF if diff is None else diff
+        # #873: the repository's review rules, keyed by path. Absent path =
+        # no such file, exactly as `git show base:path` behaves.
+        self._rules = rules or {}
 
     async def branch_diff(self, repo, base, branch):
         return self._diff
+
+    async def file_at_ref(self, repo, ref, path):
+        return self._rules.get(path)
 
     async def fetch_base(self, repo: str, base: str):
         return True, ""
@@ -99,6 +114,7 @@ async def _submitted(
     risks: list[dict] | None = None,
     clear_risk_class: bool = False,
     diff: str | None = None,
+    rules: dict[str, str] | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -127,7 +143,7 @@ async def _submitted(
         await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
     await db.commit()
 
-    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff)
+    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules)
     started = await services.pair_start_task(db, task_id, caller="dev-agent")
     assert started.status.value == "running"
     view = await services.submit_for_review(
@@ -742,3 +758,109 @@ async def test_provider_usage_is_stored_on_the_report(
     saved = dict(await repo.get_latest_machine_review(db, task_id))
     assert saved["provider_tokens"] == 6_013_569
     assert saved["tokens_spent"] == 175_000, "the self-report is not overwritten"
+
+
+# --- Repository review rules in the prompt (#873) ---------------------------
+# The reviewer used to read the diff knowing nothing about the code it came
+# from, while _PROCESS_SURFACES already listed the classes this repository
+# burns itself on and spent them on routing alone.
+
+_RULES_DIFF = "+++ b/hub/services/notes.py\n+одна строка кода\n"
+
+
+def test_changed_paths_ignores_deletions_and_dedupes():
+    diff = (
+        "+++ b/hub/a.py\n+x\n+++ /dev/null\n+++ b/hub/a.py\n+y\n+++ b/docs/b.md\n+z\n"
+    )
+    assert changed_paths(diff) == ["hub/a.py", "docs/b.md"]
+
+
+def test_rules_candidates_root_first_nearest_last():
+    # The root file applies even to a diff nobody could read, and the file
+    # closest to the change is read last so it can override.
+    assert rules_candidates([]) == [".hub/REVIEW_RULES.md"]
+    assert rules_candidates(["hub/services/notes.py"]) == [
+        ".hub/REVIEW_RULES.md",
+        "hub/.hub/REVIEW_RULES.md",
+        "hub/services/.hub/REVIEW_RULES.md",
+    ]
+
+
+async def test_repo_rules_collected_up_the_tree(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#873): a root rules file and one in the changed file's directory
+    # both reach the prompt, with the nearest one last.
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-rules"}, "run": {"id": "r-rules"}}
+    )
+    _wire(monkeypatch, recorder)
+
+    await _submitted(
+        client,
+        db,
+        "spike-rules",
+        diff=_RULES_DIFF,
+        rules={
+            ".hub/REVIEW_RULES.md": "ПРАВИЛО-КОРНЕВОЕ",
+            "hub/services/.hub/REVIEW_RULES.md": "ПРАВИЛО-БЛИЖНЕЕ",
+        },
+    )
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "ПРАВИЛО-КОРНЕВОЕ" in prompt and "ПРАВИЛО-БЛИЖНЕЕ" in prompt
+    assert prompt.index("ПРАВИЛО-КОРНЕВОЕ") < prompt.index("ПРАВИЛО-БЛИЖНЕЕ"), (
+        "the rules nearest the changed file must be read last"
+    )
+    # The framing is part of the contract, not decoration: a list presented as
+    # exhaustive becomes the ceiling of the reviewer's attention.
+    assert "СМОТРИ ШИРЕ" in prompt
+
+
+async def test_missing_repo_rules_is_stated_not_silent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#873): no rules file is a NAMED absence — in the prompt and in the
+    # task update. Silence there reads as "nothing ever broke here".
+    recorder = _DispatchRecorder({"agent": {"id": "bc-norules"}, "run": {"id": "r-nr"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-norules", diff=_RULES_DIFF)
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "ПРАВИЛ РЕПОЗИТОРИЯ НЕТ" in prompt
+    assert "отсутствие данных" in prompt
+    updates = [dict(r) for r in await repo.get_task_updates(db, task_id)]
+    dispatched = [u for u in updates if "Кросс-модельное ревью вызвано" in u["content"]]
+    assert dispatched and "правил нет" in dispatched[-1]["content"]
+
+
+async def test_repo_rules_are_capped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#873): rules cannot eat the budget they were written to protect.
+    # What did not fit is named — an unread rule is "not checked", not "absent".
+    recorder = _DispatchRecorder({"agent": {"id": "bc-cap"}, "run": {"id": "r-cap"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 400)
+    assert rules_char_cap() == 400, "a quarter of the ceiling, counted in chars"
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-cap",
+        diff=_RULES_DIFF,
+        rules={
+            ".hub/REVIEW_RULES.md": "КОРОТКОЕ-ПРАВИЛО",
+            "hub/services/.hub/REVIEW_RULES.md": "Д" * 500,
+        },
+    )
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "КОРОТКОЕ-ПРАВИЛО" in prompt, "what fits is still delivered"
+    assert "Д" * 500 not in prompt
+    assert "ОБРЕЗАНО" in prompt
+    assert "hub/services/.hub/REVIEW_RULES.md" in prompt, "the dropped file is named"
+    updates = [dict(r) for r in await repo.get_task_updates(db, task_id)]
+    dispatched = [u for u in updates if "Кросс-модельное ревью вызвано" in u["content"]]
+    assert dispatched and "обрезано" in dispatched[-1]["content"]

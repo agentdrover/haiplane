@@ -4,6 +4,16 @@ set -eu
 remote_name="${1:-}"
 zero="0000000000000000000000000000000000000000"
 
+# #475: which branches this clone protects is a property of the PROJECT, not
+# of this file. The hub writes both keys when it arms the hook (hub/git_policy),
+# so a calc-kids workspace protects master and a spike-bo one protects main.
+# The literals below are the fallback for a clone nobody configured — the hub's
+# own, which is where these names came from in the first place.
+base_branch="$(git config --get openclaw.baseBranch 2>/dev/null || true)"
+[ -n "$base_branch" ] || base_branch="develop"
+release_branch="$(git config --get openclaw.releaseBranch 2>/dev/null || true)"
+[ -n "$release_branch" ] || release_branch="main"
+
 while read -r local_ref local_oid remote_ref remote_oid; do
   # Branch deletion (git push origin --delete <branch> / git push origin :ref):
   # git sets local_ref to the literal "(delete)" and local_oid to all-zeros.
@@ -17,33 +27,33 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     "(delete)" | "delete") is_delete=1 ;;
   esac
   if [ "$is_delete" = "1" ]; then
-    case "$remote_ref" in
-      refs/heads/main | refs/heads/develop)
-        echo "Blocked delete of protected branch '${remote_ref#refs/heads/}' on ${remote_name}." >&2
-        echo "Protected branches (main, develop) must not be deleted." >&2
-        exit 1
-        ;;
-    esac
+    if [ "$remote_ref" = "refs/heads/$release_branch" ] ||
+       [ "$remote_ref" = "refs/heads/$base_branch" ]; then
+      echo "Blocked delete of protected branch '${remote_ref#refs/heads/}' on ${remote_name}." >&2
+      echo "Protected branches ($release_branch, $base_branch) must not be deleted." >&2
+      exit 1
+    fi
     continue
   fi
 
-  case "$local_ref" in
-    refs/heads/main)
-      if [ "${ALLOW_MAIN_PUSH:-}" != "1" ]; then
-        echo "Blocked push to main. Use a PR branch, or set ALLOW_MAIN_PUSH=1 for an explicit owner-approved emergency push." >&2
-        exit 1
-      fi
-      ;;
-    refs/heads/develop)
-      ;;
-    refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*)
-      ;;
-    *)
-      echo "Blocked push from branch '${local_ref#refs/heads/}' to ${remote_name}." >&2
-      echo "Use develop, task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
+  if [ "$local_ref" = "refs/heads/$release_branch" ]; then
+    if [ "${ALLOW_MAIN_PUSH:-}" != "1" ]; then
+      echo "Blocked push to $release_branch. Use a PR branch, or set ALLOW_MAIN_PUSH=1 for an explicit owner-approved emergency push." >&2
       exit 1
-      ;;
-  esac
+    fi
+  elif [ "$local_ref" = "refs/heads/$base_branch" ]; then
+    :
+  else
+    case "$local_ref" in
+      refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*)
+        ;;
+      *)
+        echo "Blocked push from branch '${local_ref#refs/heads/}' to ${remote_name}." >&2
+        echo "Use $base_branch, task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
+        exit 1
+        ;;
+    esac
+  fi
 
   if [ -n "$(git status --porcelain)" ] && [ "${ALLOW_DIRTY_PUSH:-}" != "1" ]; then
     echo "Blocked push with a dirty working tree. Commit/stash unrelated changes, or set ALLOW_DIRTY_PUSH=1 intentionally." >&2

@@ -121,11 +121,18 @@ def _pair_branch_conflict(
     suggested_tool: str | None = "hub_pair_start",
     current_branch: str | None = None,
     task_id: int | None = None,
+    base_branch: str | None = None,
 ) -> PairBranchConflictError:
     host = _hostname()
     if hint is None and current_branch and task_id is not None:
+        # #475: the operator is told to check out the branch this project
+        # actually integrates on. A literal here sent a calc-kids operator to
+        # `git checkout develop` in a clone that has no develop — an
+        # instruction that fails is worse than none, because it reads as the
+        # fix and leaves the workspace exactly as it was.
+        base = _resolve_base(base_branch)
         hint = (
-            f"SSH to {host}, then: cd {repo} && git checkout develop "
+            f"SSH to {host}, then: cd {repo} && git checkout {base} "
             f"(or push {current_branch!r} if unpushed), then "
             f"hub_pair_start for #{task_id}."
         )
@@ -291,6 +298,40 @@ def _slugify(title: str, max_len: int = 40) -> str:
     transliterated = "".join(_CYRILLIC_TO_LATIN.get(ch, ch) for ch in lowered)
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", transliterated).strip("-").lower()
     return slug[:max_len].rstrip("-")
+
+
+def canonical_task_branch(task_id: int, branch_slug: str, title: str = "") -> str:
+    """The one place a task's branch name is assembled (#884).
+
+    Three call sites used to build ``f"task-{id}/{slug}"`` inline, and none
+    asked whether the slug already carried that prefix. A caller passing
+    "task-818/daily-digest" — which is exactly how the branch is written in a
+    work plan — got ``task-818/task-818/daily-digest``. On production that
+    cost four mechanisms in a row: the gate could not find the PR for such a
+    name, pr_number stayed empty, the merge went outside the pipeline, and
+    the dependency graph then reported delivered code as undelivered.
+
+    Same lesson as #607, which put transliteration behind one function: a
+    rule copied into three call sites drifts, starting with the copy nobody
+    touches.
+
+    The prefix is stripped only when it matches THIS task exactly, slash
+    included — a slug like "task-runner-fix" is a name, not a prefix. The
+    strip repeats, so a branch already doubled by the old code normalises on
+    its next pair-start instead of growing again.
+    """
+    slug = (branch_slug or "").strip()
+    prefix = f"task-{task_id}/"
+    # Strip BEFORE trimming slashes: "task-601/" only reads as a prefix while
+    # its trailing slash is still there. Trimming first left "task-601" and
+    # produced "task-601/task-601" — caught by the empty-slug test below.
+    while slug.startswith(prefix):
+        slug = slug[len(prefix) :]
+    slug = slug.strip("/")
+    if not slug:
+        # An empty slug once produced "task-601/" — an invalid ref (#607).
+        slug = _slugify(title)
+    return f"task-{task_id}/{slug}"
 
 
 def _conv_commit_type(title: str) -> str:
@@ -588,8 +629,7 @@ class GitOpsIntegration:
         # Project git context (#337): headless branches historically cut
         # from main; a project may define its own integration branch.
         base = _resolve_base(base_branch)
-        slug = _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, "", title)
 
         # Refuse before touching anything (#361 I2). The old shape checked out
         # base without looking at the result, then ran `checkout .` + `clean -fd`
@@ -708,10 +748,10 @@ class GitOpsIntegration:
                     reason="pair_branch_checkout_failed",
                     current_branch=current,
                     task_id=task_id,
+                    base_branch=base,
                 )
 
-        slug = (branch_slug or "").strip() or _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, branch_slug, title)
 
         rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
         if rc == 0:
@@ -918,6 +958,18 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
+        """``git show <ref>:<path>``, or None when it is not there (#873).
+
+        Callers pass the BASE ref, never the branch under review — see
+        ``collect_review_rules``. Absent and unreadable collapse into None on
+        purpose here: for a per-directory policy file both mean "no rules from
+        this path", and the caller states the distinction that matters (no
+        rules anywhere vs no repository to look in) one level up.
+        """
+        rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
+        return out if rc == 0 else None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
 
@@ -1013,6 +1065,41 @@ class GitOpsIntegration:
         rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)
         return (rc == 0, err or "")
 
+    async def fetch_commit(
+        self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
+    ) -> tuple[bool, str]:
+        """Bring one commit's objects into ``repo`` (#883). Objects ONLY.
+
+        No checkout, no reset, no HEAD movement: pair tasks and their worktrees
+        live in this same clone, and moving its working tree to answer a
+        question about history would break work in progress.
+
+        Two attempts, because servers differ: fetching a bare sha is allowed
+        only when ``uploadpack.allowReachableSHA1InWant`` is on, so a refusal
+        falls back to the ref the deploy reported. Failure is returned, never
+        raised — the caller degrades to "could not check", which must stay
+        distinguishable from "not deployed".
+        """
+        rc, _, err = await _git(
+            "fetch", "--quiet", "origin", sha, repo=repo, check=False, timeout=timeout
+        )
+        if rc == 0:
+            return (True, "")
+        if ref:
+            rc, _, err_ref = await _git(
+                "fetch",
+                "--quiet",
+                "origin",
+                ref,
+                repo=repo,
+                check=False,
+                timeout=timeout,
+            )
+            if rc == 0:
+                return (True, "")
+            return (False, (err_ref or err or "").strip())
+        return (False, (err or "").strip())
+
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         """Commits on the base's own line, newest first, or None on failure.
 
@@ -1060,8 +1147,7 @@ class GitOpsIntegration:
                 raise PairBranchConflictError(reason)
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
-        slug = (branch_slug or "").strip() or _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, branch_slug, title)
         wt_path = _worktree_path(task_id, repo)
 
         # Clear stale registrations (a worktree dir deleted out from under git)
@@ -2082,7 +2168,7 @@ class GitOpsIntegration:
             # Every workspace on production already exists, so this is the
             # only path that actually runs there: arming solely after a fresh
             # clone would have changed nothing at all (#532 review).
-            git_policy.activate_quietly(workspace_path)
+            git_policy.activate_quietly(workspace_path, base_branch=base_branch)
             log.info("clone_repo: verified existing clone at %s", workspace_path)
             return True, "existing clone verified, origin fetched"
 
@@ -2132,7 +2218,7 @@ class GitOpsIntegration:
         # a person must remember is the same failure as the hook nobody
         # activated — this is the one moment where nobody has to remember
         # (#532). Best effort: a hook that cannot be armed never fails a clone.
-        git_policy.activate_quietly(workspace_path)
+        git_policy.activate_quietly(workspace_path, base_branch=base_branch)
 
         transport = "https" if url.startswith("https") else "ssh"
         log.info(

@@ -37,7 +37,7 @@ from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
-from hub.models import SessionRegister, SessionView
+from hub.models import SessionRegister, SessionView, UnaddressableTask
 
 ONLINE = "online"
 OFFLINE = "offline"
@@ -169,3 +169,27 @@ async def note_session_task(
     if not session_id:
         return
     await repo.set_agent_session_task(db, session_id, task_id)
+
+
+async def unaddressable_tasks(
+    db: aiosqlite.Connection, *, limit: int = 200
+) -> list[UnaddressableTask]:
+    """Tasks in flight that no session can be reached about (#852).
+
+    The complement of the registry: ``list_sessions`` answers "who is around",
+    this answers "what is being done by nobody addressable". Tightening the
+    claim contract keeps NEW tasks out of that state; it cannot empty the
+    tail that is already there, and a tail nobody can see reads as absent.
+    """
+    rows = await repo.list_unaddressable_tasks(db, limit=limit)
+    return [
+        UnaddressableTask(
+            id=int(dict(row).get("id") or 0),
+            title=str(dict(row).get("title") or ""),
+            status=str(dict(row).get("status") or ""),
+            claimed_by=str(dict(row).get("claimed_by") or ""),
+            claimed_at=str(dict(row).get("claimed_at") or ""),
+            branch=str(dict(row).get("branch") or ""),
+        )
+        for row in rows
+    ]

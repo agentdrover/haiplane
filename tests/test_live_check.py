@@ -359,3 +359,131 @@ async def test_undelivered_task_is_not_scolded_for_a_missing_check(
         "demanding evidence that could not exist yet is the inflated warning "
         "this counter was written to avoid (#534)"
     )
+
+
+# ---- #837: "verified in production" needs production to have it ----
+#
+# 21.08.2026: task #823 was completed, its PR merged into develop, the deploy
+# job skipped — and nothing stopped a live check claiming the panel had been
+# observed working. The panel did not exist yet. Only ONE of the three delivery
+# answers refuses here; ignorance is recorded, never used as a gate.
+
+from tests.test_delivery_state import _use_real_git  # noqa: E402
+
+
+async def _merged_task(client: AsyncClient, auth: dict, db, merge_sha: str) -> int:
+    """A task the hub merged at ``merge_sha`` — the fact #534 records."""
+    task_id = await _task(client, auth, title="Delivered?")
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 5000 + task_id, task_id, merge_sha),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _post_check(client: AsyncClient, auth: dict, task_id: int, **body) -> object:
+    return await client.post(
+        f"/api/tasks/{task_id}/live-check", json=body, headers=auth["agent"]
+    )
+
+
+async def test_done_is_refused_before_deploy(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-1 (#837): merged, not released — the exact shape of the 21.08 defect.
+    auth = _auth(monkeypatch)
+    _use_real_git(monkeypatch, history["repo"])
+    task_id = await _merged_task(client, auth, db, history["pending"])
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+
+    resp = await _post_check(
+        client,
+        auth,
+        task_id,
+        outcome="done",
+        probe="открыл страницу на проде",
+        observation="всё работает",
+    )
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_deployed_yet"
+    assert "ждёт релиза" in detail["message"], "the refusal must name the cause"
+    assert await repo.list_live_checks(db, task_id) == [], (
+        "a refused check must leave no record — a stored one would read as evidence"
+    )
+
+
+async def test_not_applicable_is_allowed_before_deploy(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-2 (#837): "there is nothing to observe" is a claim about the task and
+    # does not depend on a release having happened.
+    auth = _auth(monkeypatch)
+    _use_real_git(monkeypatch, history["repo"])
+    task_id = await _merged_task(client, auth, db, history["pending"])
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+
+    resp = await _post_check(
+        client, auth, task_id, outcome="not_applicable", reason="меняются только тесты"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outcome"] == "not_applicable"
+
+
+async def test_done_is_allowed_after_deploy(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-3 (#837): once the merge is in what production runs, nothing changes
+    # for the caller — the check exists to stop one case, not to add friction.
+    auth = _auth(monkeypatch)
+    _use_real_git(monkeypatch, history["repo"])
+    task_id = await _merged_task(client, auth, db, history["shipped"])
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+
+    resp = await _post_check(
+        client,
+        auth,
+        task_id,
+        outcome="done",
+        probe="GET /tasks/1 на проде",
+        observation="строка доставки на месте",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deploy_state"] == "in_prod"
+
+
+async def test_unknown_deploy_state_does_not_block(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#837): an installation with no delivery facts knows nothing about
+    # production. Refusing there would turn ignorance into a gate — the record
+    # is kept and marked instead, so it never reads as verified.
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+
+    resp = await _post_check(
+        client,
+        auth,
+        task_id,
+        outcome="done",
+        probe="смотрел вручную",
+        observation="работает",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deploy_state"] == "unknown", (
+        "accepted, but visibly not checked against a deploy"
+    )
+    page = (await client.get(f"/tasks/{task_id}", headers=auth["human"])).text
+    assert "не сверено с выкатом" in page

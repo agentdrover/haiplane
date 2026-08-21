@@ -36,6 +36,8 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.models import (
+    FindingDisposition,
+    FindingDispositionItem,
     MessageSend,
     BatchApprove,
     ProjectCreate,
@@ -755,6 +757,9 @@ async def web_projects(request: Request, project_error: str = Query("")):
             "projects": [dict(r) for r in rows],
             "cards": cards,
             "project_error": project_error,
+            # #475: the create form must prefill the branch the hub would
+            # actually fall back to, not a literal that stops matching it.
+            "default_base_branch": config.PAIR_BASE_BRANCH,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -798,7 +803,9 @@ async def web_create_project(request: Request):
             name=str(form.get("name") or "").strip(),
             repo=str(form.get("repo") or "").strip(),
             workspace_path=str(form.get("workspace_path") or "").strip(),
-            default_branch=str(form.get("default_branch") or "").strip() or "develop",
+            default_branch=(
+                str(form.get("default_branch") or "").strip() or config.PAIR_BASE_BRANCH
+            ),
             default_branch_policy=policy or {},
         )
     except ValidationError as exc:
@@ -964,6 +971,50 @@ async def web_request_machine_review(task_id: int, request: Request):
         actor=identity.username,
     )
     await db.commit()
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-finding-dispositions")
+async def web_finding_dispositions(task_id: int, request: Request):
+    """The gate says what each confirmed finding turned out to be (#876).
+
+    One form for the whole report: findings left on "не размечено" are simply
+    not submitted, so a half-judged report stays half-judged instead of being
+    silently completed with a default.
+    """
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    form = await request.form()
+    items: list[FindingDispositionItem] = []
+    for key, value in form.items():
+        if not key.startswith("disposition-") or not value:
+            continue
+        try:
+            index = int(key.removeprefix("disposition-"))
+        except ValueError:
+            continue
+        try:
+            items.append(
+                FindingDispositionItem(
+                    finding_index=index,
+                    disposition=FindingDisposition(str(value)),
+                    note=str(form.get(f"note-{index}") or ""),
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    if not items:
+        # Nothing chosen is not an error and not a judgement: the gate looked
+        # and marked nothing, which must leave the report exactly as it was.
+        return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+    try:
+        await services.record_finding_dispositions(
+            db, task_id, items, decided_by=identity.username
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 

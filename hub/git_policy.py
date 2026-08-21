@@ -42,6 +42,15 @@ HOOKS_DIR = ".githooks"
 HOOK_NAME = "pre-push"
 ACTIVATE_COMMAND = f"git config core.hooksPath {HOOKS_DIR}"
 
+# #475: the hook enforces a branch policy, and WHICH branches it protects is a
+# per-project fact. It cannot ask the hub — it runs offline, inside git — so
+# the hub leaves the answer where the hook can read it: local git config in the
+# clone it just armed. Two keys, because "where work lands" and "what is in
+# production" are two different questions (the same split as PAIR_BASE_BRANCH
+# vs RELEASE_BRANCH in hub/config.py).
+BASE_BRANCH_KEY = "openclaw.baseBranch"
+RELEASE_BRANCH_KEY = "openclaw.releaseBranch"
+
 
 def activate_command(repo: str) -> str:
     """The activation command as the reader must type it from where they are.
@@ -203,6 +212,35 @@ def inspect(repo: str) -> HookStatus:
     return HookStatus(ACTIVE, f"push is checked by {target}")
 
 
+def record_branch_policy(
+    repo: str, base_branch: str = "", release_branch: str = ""
+) -> dict[str, str]:
+    """Tell the hook in ``repo`` which branches this project protects (#475).
+
+    Written as local git config so the hook — which runs offline and cannot
+    ask the hub — reads the project's own branches instead of the hub's. An
+    empty value writes nothing rather than writing an empty key: a key that
+    exists and says nothing is worse than an absent one, because the hook
+    would read it as configured and fall back to nothing.
+
+    Never raises: recording the policy must not fail a clone, and a key that
+    could not be written leaves the hook on its documented fallback.
+    """
+    written: dict[str, str] = {}
+    for key, value in (
+        (BASE_BRANCH_KEY, (base_branch or "").strip()),
+        (RELEASE_BRANCH_KEY, (release_branch or "").strip()),
+    ):
+        if not value:
+            continue
+        rc, out = _git(repo, "config", key, value)
+        if rc != 0:
+            log.warning("could not record %s in %s: %s", key, repo, out)
+            continue
+        written[key] = value
+    return written
+
+
 def activate(repo: str) -> HookStatus:
     """Point git at the hook. Idempotent; returns the resulting status.
 
@@ -221,13 +259,24 @@ def activate(repo: str) -> HookStatus:
     return inspect(repo)
 
 
-def activate_quietly(repo: str) -> HookStatus:
+def activate_quietly(
+    repo: str, base_branch: str = "", release_branch: str = ""
+) -> HookStatus:
     """Activation for paths the hub prepares itself (clones, workspaces).
 
     Never raises and never blocks the caller: failing to arm a hook must not
     fail a clone. It does log, because an activation nobody can see is the
     silent state this task exists to remove.
+
+    ``base_branch``/``release_branch`` (#475) are recorded alongside so the
+    armed hook protects THIS project's branches. Recorded even when the hook
+    is absent or could not be armed: the keys are inert without a hook, and a
+    clone that gets one later is then already configured.
     """
+    try:
+        record_branch_policy(repo, base_branch, release_branch)
+    except Exception as exc:  # noqa: BLE001 - best effort by contract
+        log.warning("could not record the branch policy in %s: %s", repo, exc)
     try:
         status = activate(repo)
     except Exception as exc:  # noqa: BLE001 - best effort by contract

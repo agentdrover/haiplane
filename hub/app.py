@@ -62,12 +62,14 @@ from hub.models import (
     MessageView,
     SessionRegister,
     SessionView,
+    UnaddressableTask,
     TaskClaim,
     TaskContextView,
     TaskCreate,
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
     ProjectPatch,
@@ -763,6 +765,37 @@ async def api_outcome_debt(request: Request):
     the habit of checking.
     """
     return await services.outcome_debt(_db(request))
+
+
+@app.post("/api/tasks/{task_id}/finding-dispositions")
+async def api_record_finding_dispositions(
+    task_id: int,
+    body: FindingDispositionsSubmit,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Say what the current report's confirmed findings turned out to be (#876).
+
+    HUMAN-ONLY, unlike the outcome answer next door. That one is a caller's
+    declaration about production, which any principal may make; this one judges
+    the reviewer's work on the caller's OWN submission, and an agent allowed to
+    mark a finding false would be the reviewed party grading its reviewer.
+
+    ``decided_by`` comes from the authenticated principal and is never read
+    from the payload — a judgement whose author is a free-text argument proves
+    nothing about who made it.
+    """
+    try:
+        return await services.record_finding_dispositions(
+            _db(request),
+            task_id,
+            body.items,
+            decided_by=identity.username,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/tasks/{task_id}/outcome-answers")
@@ -1547,6 +1580,18 @@ async def api_record_deploy(
         status=body.status,
         source=identity.username or "ci",
     )
+    # #883: bring the deployed commit into the workspace now, once per deploy,
+    # instead of on every card render. Best-effort by contract: the rollout has
+    # already happened, and failing this callback would report it as not having
+    # happened. A missed fetch degrades to "could not check" on read, which is
+    # a state the hub says out loud.
+    try:
+        from hub.services.delivery_state import ensure_commit_available
+
+        await ensure_commit_available(db, body.sha, body.ref, project_id=project_id)
+    except Exception:  # noqa: BLE001 - never break the callback over a fetch
+        log.warning("could not pre-fetch deployed commit %s", body.sha[:12])
+
     row = await repo.release_by_id(db, release_id)
     if row is None:  # pragma: no cover - the row was just written
         raise HTTPException(500, "release was written but could not be read back")
@@ -1715,6 +1760,7 @@ async def api_pair_start_task(
         body,
         caller=identity.username,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+        caller_is_agent=identity.is_agent,
     )
 
 
@@ -1733,6 +1779,7 @@ async def api_claim_task(
         task_id,
         body,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
+        caller_is_agent=identity.is_agent,
     )
 
 
@@ -1878,6 +1925,21 @@ async def api_list_sessions(
 ):
     """Registered sessions with presence and the age behind it."""
     return await services.list_sessions(_db(request), agent=agent, status=status)
+
+
+@app.get("/api/sessions/unaddressable", response_model=list[UnaddressableTask])
+async def api_unaddressable_tasks(
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Tasks in flight that no session can be reached about (#852).
+
+    The registry says who is around; this says what is being worked with no
+    address attached. Both are needed to coordinate — a task nobody can be
+    asked about is invisible in the first list precisely because it has no
+    session behind it.
+    """
+    return await services.unaddressable_tasks(_db(request))
 
 
 # --- Q&A: Question / Answer ---

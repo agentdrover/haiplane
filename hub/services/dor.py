@@ -31,6 +31,9 @@ DOR_CHECK_KEYS: tuple[str, ...] = (
     "has_validation_commands",
     "has_size",
     "has_wip_tag",
+    # #842: which code the work touches. Required only for the work types
+    # that mean a code change — see DOR_REQUIRED_BY_WORK_TYPE.
+    "has_affected_areas",
     # Discovery checks (#331). Advisory — see DOR_ADVISORY_KEYS below.
     "has_outcome_hypothesis",
     "has_redesign_decision",
@@ -84,6 +87,7 @@ DOR_ADVISORY_WORK_TYPES: frozenset[str] = frozenset({WorkType.feature.value})
 DOR_REQUIRED_BY_WORK_TYPE: dict[str, frozenset[str]] = {
     WorkType.feature.value: frozenset(
         {
+            "has_affected_areas",
             "has_user_story",
             "has_problem_statement",
             "has_business_value",
@@ -96,6 +100,7 @@ DOR_REQUIRED_BY_WORK_TYPE: dict[str, frozenset[str]] = {
     ),
     WorkType.bug.value: frozenset(
         {
+            "has_affected_areas",
             "has_problem_statement",
             "has_business_value",
             "has_scope_in",
@@ -107,6 +112,7 @@ DOR_REQUIRED_BY_WORK_TYPE: dict[str, frozenset[str]] = {
     ),
     WorkType.refactor.value: frozenset(
         {
+            "has_affected_areas",
             "has_problem_statement",
             "has_scope_in",
             "has_acceptance_criteria",
@@ -124,6 +130,7 @@ DOR_REQUIRED_BY_WORK_TYPE: dict[str, frozenset[str]] = {
     ),
     WorkType.incident.value: frozenset(
         {
+            "has_affected_areas",
             "has_problem_statement",
             "has_acceptance_criteria",
             "has_validation_commands",
@@ -185,6 +192,7 @@ def evaluate_from_data(
     size: str | None,
     wip_tag: str | None,
     ac_count: int,
+    affected_areas_count: int = 0,
     outcome_metric: str | None = None,
     redesign_decision: str | None = None,
     agent_fit: str | None = None,
@@ -223,6 +231,11 @@ def evaluate_from_data(
             key="has_scope_in",
             passed=scope_in_count > 0,
             detail=f"scope_in has {scope_in_count} item(s)",
+        ),
+        "has_affected_areas": DoRCheckItem(
+            key="has_affected_areas",
+            passed=affected_areas_count > 0,
+            detail=f"affected_areas has {affected_areas_count} item(s)",
         ),
         "has_acceptance_criteria": DoRCheckItem(
             key="has_acceptance_criteria",
@@ -307,6 +320,7 @@ async def evaluate_dor(db, task_id: int) -> DoREvaluation:
         size=row["size"],
         wip_tag=row["wip_tag"],
         ac_count=len(acs),
+        affected_areas_count=len(deserialize_str_list(row["affected_areas"])),
         outcome_metric=row["outcome_metric"],
         redesign_decision=row["redesign_decision"],
         agent_fit=row["agent_fit"],

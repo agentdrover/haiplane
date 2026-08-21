@@ -145,6 +145,7 @@ def _dor(**overrides):
         size="S",
         wip_tag="feature_work",
         ac_count=1,
+        affected_areas_count=1,
     )
     base.update(overrides)
     return evaluate_from_data(**base)
@@ -163,6 +164,7 @@ async def test_missing_discovery_does_not_block_dor(client: AsyncClient):
             "validation_commands": ["uv run pytest"],
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "acceptance_criteria": [
                 {
                     "id": "AC-1",

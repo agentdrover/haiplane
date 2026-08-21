@@ -52,6 +52,45 @@ def _answer(state: str, reason: str, **extra: Any) -> dict[str, Any]:
     }
 
 
+async def ensure_commit_available(
+    db: Any, sha: str, ref: str = "", *, project_id: int | None = None
+) -> bool:
+    """Make sure the workspace carries ``sha``, fetching once if it does not.
+
+    Called where a deploy is RECORDED (#883): deploys happen a few times a day,
+    cards are read constantly, and paying for the network on every render to
+    learn something that changes once per release is the wrong trade. Returns
+    whether the commit is available afterwards; the caller decides what an
+    unavailable one means — here it never means "not deployed".
+    """
+    sha = (sha or "").strip()
+    if not sha:
+        return False
+    # The workspace comes from the PROJECT, not from a task: a deploy callback
+    # names no task. project_git_context resolves through a task id and would
+    # answer an empty context here, which would have made this whole path a
+    # no-op — caught before the first test, and worth stating so the next
+    # reader does not reintroduce it.
+    try:
+        row = (
+            await repo.get_project(db, project_id)
+            if project_id
+            else await repo.get_project_by_slug(db, "default")
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort by contract
+        log.warning("pre-fetch of %s: no project row: %s", sha[:12], exc)
+        return False
+    workspace = (dict(row).get("workspace_path") or "").strip() if row else ""
+    if not workspace:
+        return False
+    if await plugins.git_ops.commit_exists(workspace, sha):
+        return True
+    fetched, error = await plugins.git_ops.fetch_commit(workspace, sha, ref)
+    if not fetched:
+        log.warning("pre-fetch of %s failed: %s", sha[:12], error)
+    return fetched
+
+
 async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
     """Whether this task's merge is part of what production is running."""
     from hub import services
@@ -94,6 +133,24 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             "проверить негде",
             **known,
         )
+
+    # #883: the objects have to be here before git can be asked about them.
+    # The workspace tracks the base branch, so a commit deployed from another
+    # ref is simply absent — and that absence was answering "could not check"
+    # for every task on this installation. Checked first, and only fetched
+    # when missing: a present commit must cost no network at all.
+    if await plugins.git_ops.commit_exists(workspace, deployed_sha) is False:
+        fetched, fetch_error = await plugins.git_ops.fetch_commit(
+            workspace, deployed_sha, str(release.get("ref") or "")
+        )
+        if not fetched:
+            return _answer(
+                UNKNOWN,
+                f"коммита {deployed_sha[:12]} нет в рабочей копии, и подтянуть "
+                f"его не удалось: {fetch_error or 'причина не названа'}. "
+                "Это не «не раскатано»",
+                **known,
+            )
 
     reachable = await plugins.git_ops.is_ancestor(workspace, merge_sha, deployed_sha)
     if reachable is None:

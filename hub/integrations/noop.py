@@ -165,6 +165,10 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
+        """No git here — there is no rules file to read (#873)."""
+        return None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """No git here — "could not look", never "the commit is gone" (#824)."""
         return None
@@ -187,6 +191,12 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def fetch_commit(
+        self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
+    ) -> tuple[bool, str]:
+        """No git here — nothing is fetched, and the caller must say so (#883)."""
+        return (False, "git integration is not configured")
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
         never as "clean" (#534)."""
@@ -199,7 +209,7 @@ class NoopGitOps:
         self,
         branch: str,
         other_branch: str,
-        base_branch: str = "develop",
+        base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool:
         # No repo access — the advisory stacking check is silently skipped.
@@ -361,7 +371,7 @@ class NoopGitOps:
         return False
 
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+        self, repo_url: str, workspace_path: str, base_branch: str | None = None
     ) -> tuple[bool, str]:
         # Valid provision outcome (#347): the operator sees WHY it failed.
         return False, "git ops disabled (noop integration)"

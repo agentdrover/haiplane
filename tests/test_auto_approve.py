@@ -252,10 +252,19 @@ async def test_unclassified_draft_is_never_auto_approved(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ) -> None:
     # #584 AC-4: absence of a class is not low risk.
+    #
+    # Since #842 a code-typed task cannot reach DoR without declaring areas,
+    # so the only way to be READY and still unclassified is a work type that
+    # legitimately has nothing to declare — docs. The rule under test is
+    # unchanged: no class means no auto-approval, whatever the ceiling says.
     monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
     pid = await _project(db, "spike-null", {"dor": "auto"})
     task_id = await _draft_in_project(client, db, pid)
-    body = await _refine_to_dor(client, task_id, None)
+    docs_payload = dict(_DOR_READY, work_type="docs")
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json=docs_payload)
+    assert resp.status_code == 200, resp.text
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["dor_passed"] is True, "docs work is ready without areas"
 
     assert body["risk_class"] is None
     assert body["dor_passed"] is True

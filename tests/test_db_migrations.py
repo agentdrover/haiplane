@@ -924,3 +924,50 @@ async def test_outcome_answer_snapshot_migration_preserves_legacy_rows():
         assert row["hypothesis_snapshot"] is None
     finally:
         await conn.close()
+
+
+async def test_disposition_migration_backfills_nothing():
+    """#876 AC-3. A report written before dispositions existed keeps no
+    judgement at all — silence there must not become a default verdict.
+
+    The pairing that matters: the table appears, and the reports already in the
+    database gain zero rows in it. A back-filled 'fixed' (or anything else)
+    would let every legacy report read as fully judged, which is exactly the
+    substitution #549 removed elsewhere.
+    """
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "finding_dispositions")
+        assert cols, "the table must exist after migration"
+        assert cols["disposition"]["notnull"] == 1, (
+            "a row without a verdict is not a row"
+        )
+
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, "
+            "raw_count, findings_confirmed) VALUES (1, 1, 2, ?)",
+            ('[{"title": "a"}, {"title": "b"}]',),
+        )
+        await conn.commit()
+        # Re-running migrations must not invent history for it either.
+        await _migrate(conn)
+        rows = await conn.execute_fetchall("SELECT * FROM finding_dispositions")
+        assert rows == [], "legacy reports stay unjudged, not defaulted"
+
+        # And the uniqueness that makes a correction a correction.
+        await conn.execute(
+            "INSERT INTO finding_dispositions (review_id, task_id, "
+            "submission_generation, finding_index, disposition) "
+            "VALUES (1, 1, 1, 0, 'fixed')"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO finding_dispositions (review_id, task_id, "
+                "submission_generation, finding_index, disposition) "
+                "VALUES (1, 1, 1, 0, 'false_positive')"
+            )
+    finally:
+        await conn.close()

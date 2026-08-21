@@ -417,6 +417,7 @@ async def test_readiness_full_feature_returns_100(client: AsyncClient):
             "validation_commands": ["uv run pytest"],
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "acceptance_criteria": [_ac_payload(1)],
             # Discovery (#331): a complete feature answers "why this, in what
             # form", not only "what to build".
@@ -453,6 +454,7 @@ async def _make_dor_ready(client: AsyncClient, task_id: int) -> None:
             "validation_commands": ["uv run pytest"],
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "acceptance_criteria": [_ac_payload(1)],
         },
     )
@@ -854,6 +856,7 @@ _DOR_READY_PAYLOAD = {
     "validation_commands": ["uv run pytest -q"],
     "size": "S",
     "wip_tag": "feature_work",
+    "affected_areas": ["hub/services/dor.py"],
     "acceptance_criteria": [
         {
             "id": "AC-1",
@@ -1157,7 +1160,11 @@ async def test_bookkeeping_fields_do_not_reset_the_statement_date(
 
     resp = await client.post(
         f"/api/tasks/{task['id']}/refine",
-        json={"size": "L", "wip_tag": "feature_work", "human_owner": "Denis Pukinov"},
+        json={
+            "size": "L",
+            "wip_tag": "feature_work",
+            "human_owner": "Denis Pukinov",
+        },
     )
     assert resp.status_code == 200, resp.text
     assert await _stored_prepared_at(db, task["id"]) == before, (
