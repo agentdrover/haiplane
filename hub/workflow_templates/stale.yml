@@ -1,0 +1,52 @@
+# Laid down by OpenClaw Hub provisioning (#476) — do not rename this file.
+#
+# The hub owns the name `openclaw-stale.yml`. Like the CI template it is
+# written only into a repository that carried no workflows of its own.
+#
+# Why it ships with the CI template rather than separately: the operational
+# load epic (#460) is about pull requests that accumulate, and provisioning is
+# the one moment where nobody has to remember to add this.
+name: OpenClaw stale pull requests
+
+on:
+  schedule:
+    # Off the hour: every runner in the world is busy at :00.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  # Labelling a pull request goes through the issues API, so both are needed;
+  # neither of them can touch the contents of the repository.
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: Mark and close stale pull requests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/stale@v9
+        with:
+          # Pull requests only. Issues are a different conversation with a
+          # different lifetime, and closing them on a timer is not what the
+          # operational-load epic asked for.
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+
+          days-before-pr-stale: 14
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          # An explicit human "keep this" outranks the timer. Without an
+          # exemption the only way to hold a long-running pull request open is
+          # to touch it on a schedule, which is the busywork this removes.
+          exempt-pr-labels: keep,pinned
+          exempt-draft-pr: true
+          stale-pr-message: >-
+            No activity for 14 days. Labelled `stale`; it will close in 7 more
+            days unless something happens here. Add the `keep` label to hold it
+            open.
+          close-pr-message: >-
+            Closed after 21 days without activity. Reopen it if the work is
+            still wanted — nothing was deleted, the branch still stands.

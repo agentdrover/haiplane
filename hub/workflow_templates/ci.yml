@@ -1,0 +1,75 @@
+# Laid down by OpenClaw Hub provisioning (#476) — do not rename this file.
+#
+# The hub owns the name `openclaw-ci.yml` and nothing else in this directory.
+# It is written only into a repository that carried NO workflows of its own,
+# so this file never replaced an opinion somebody else had already expressed
+# about CI here.
+#
+# What it is for: the delivery gate merges a pull request only after reading a
+# workflow's outcome. With no workflow at all the probe answers "absent" and
+# approved, green work cannot be delivered by any supported path.
+name: OpenClaw CI
+
+on:
+  # No base-branch allowlist, deliberately (#475/#476). The gate reads THIS
+  # workflow's outcome, so a base the list did not name produces no run, and
+  # the branch a project integrates on is a project setting the hub resolves
+  # from project.default_branch — not a list somebody must remember to edit
+  # here when the repository renames its integration branch.
+  pull_request:
+  # Push IS named explicitly, and the list is rendered per project rather than
+  # written here: it is what produces evidence for a pair task, which lands
+  # work without ever opening a pull request. The CI report is keyed by
+  # COMMIT, so a push of the task branch is enough.
+  push:
+    branches: @@PUSH_BRANCHES@@
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The hub pins a commit at submission (#572) and compares it against
+          # the branch head before merging; a depth-1 checkout cannot answer
+          # that comparison.
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # ADD THIS REPOSITORY'S OWN BUILD AND TEST STEPS HERE.
+      #
+      # The hub deliberately does not guess them. Inventing a build command
+      # for a repository it has never read would turn "no CI" into "failing
+      # CI", which is strictly worse: the delivery gate treats a red job as a
+      # blocker and spends fix cycles on it, while an honest silence is read
+      # as unknown and routed to a human.
+      # ---------------------------------------------------------------------
+
+      # Carries the result of this repository's acceptance tests back to the
+      # hub as evidence about ONE commit. Never fails the job and never
+      # reports a guess — see docs/satellite-ci-report.md.
+      #
+      # always() + continue-on-error: the gate reads this job's outcome, so a
+      # hiccup in the reporter must never block delivery for every task.
+      #
+      # head-sha is passed explicitly: on pull_request events GITHUB_SHA is a
+      # throwaway merge commit that exists in no branch and can never equal
+      # the tip the hub pinned at submission.
+      #
+      # Referenced by version rather than copied: a copy of the reporter in
+      # this repository would drift from the original silently.
+      - name: Report AC tests and validation to Hub
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main
+        with:
+          hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
+          hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          ac-runner: "@@AC_RUNNER@@"

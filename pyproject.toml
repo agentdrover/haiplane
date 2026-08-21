@@ -25,8 +25,12 @@ oc-git-policy = "hub.git_policy:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hub"]
-# work_type YAML templates ship as package data (read via importlib.resources)
-artifacts = ["hub/cli_templates/work_types/*.yaml"]
+# work_type YAML templates ship as package data (read via importlib.resources);
+# so do the workflow templates provisioning lays into a project repo (#476).
+artifacts = [
+    "hub/cli_templates/work_types/*.yaml",
+    "hub/workflow_templates/*.yml",
+]
 
 [build-system]
 requires = ["hatchling"]

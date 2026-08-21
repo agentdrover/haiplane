@@ -159,6 +159,22 @@ async def release_policy_for_task(db: aiosqlite.Connection, task_id: int) -> str
     return RELEASE_AUTO if release_auto_enabled(policy) else RELEASE_MANUAL
 
 
+# Recognised key of the CI test command in ``gate_policy`` (#476). The hub
+# lays a CI workflow into a provisioned repository, and that workflow reports
+# acceptance-test results back — but HOW this repository runs its tests is a
+# fact only the project knows. Undeclared means "use the documented default of
+# the shared reporting action", never "guess a build command": a wrong guess
+# turns a missing CI run into a failing one, and the delivery gate treats red
+# as a blocker while it routes silence to a human.
+CI_RUNNER_KEY = "ci_runner"
+
+
+def ci_runner_of(project) -> str:
+    """How this project's acceptance tests are run in CI; ``""`` when unsaid."""
+    policy = gate_policy_of(project)
+    return str(policy.get(CI_RUNNER_KEY) or "").strip()
+
+
 async def risk_map_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, str] | None:

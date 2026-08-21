@@ -19,7 +19,12 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
-from hub.services.project_policy import base_branch_of
+from hub.services import workflow_seed
+from hub.services.project_policy import (
+    base_branch_of,
+    ci_runner_of,
+    release_base_of,
+)
 
 log = logging.getLogger("hub")
 
@@ -854,6 +859,14 @@ async def provision_project(
     ``provision_status``/``provision_detail`` so the operator can read
     WHY instead of getting a 500. Missing repo/workspace are provision
     errors too, not validation errors: the button must always answer.
+
+    #476: a successful clone also gets the hub's workflow templates, because
+    a repository the hub can clone but cannot deliver from is not provisioned.
+    The delivery gate merges only on a green workflow outcome, so a project
+    with no ``.github/workflows`` answered ``ci_absent`` and parked approved,
+    green work in ``needs_decision``. Seeding is best effort by contract: it
+    appends its own sentence to the detail and never changes the status,
+    since a clone that worked is still a clone that worked.
     """
     row = await repo.get_project(db, project_id)
     if row is None:
@@ -872,6 +885,17 @@ async def provision_project(
             # develop the moment the column was blank.
             base_branch_of(project),
         )
+        if ok:
+            seed = workflow_seed.seed_project_workflows(
+                project["workspace_path"].strip(),
+                # Same readers as everything else that asks which branches
+                # this project uses (#475) — the templates carry placeholders
+                # precisely so no branch name is written into a file here.
+                base_branch=base_branch_of(project),
+                release_branch=release_base_of(project),
+                ac_runner=ci_runner_of(project),
+            )
+            detail = f"{detail}; workflows: {seed.detail}"
     status = "ok" if ok else "error"
     await repo.update_project(
         db, project_id, provision_status=status, provision_detail=detail[:1000]
