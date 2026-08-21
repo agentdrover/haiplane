@@ -55,7 +55,20 @@ async def test_budget_file_covers_every_budgeted_metric():
     assert set(budgets) == set(BUDGET_KEYS)
     baseline = load_baseline()
     snapshot = await catalog_snapshot()
-    assert set(baseline) == {entry["name"] for entry in snapshot["tools_list"]}
+    published = {entry["name"] for entry in snapshot["tools_list"]}
+    # #829 redefined the baseline as the last DELIBERATE freeze rather than a
+    # snapshot of every commit, and ordinary delivery is not supposed to touch
+    # the file at all. Equality contradicted that by construction: adding a
+    # tool turned this red and forced an edit to the very file #829 told
+    # everyone to leave alone (found while delivering #487).
+    #
+    # Containment keeps what the check was actually for — a tool that vanishes
+    # or gets renamed still breaks it, and that IS worth a deliberate edit —
+    # while a newly added tool spends headroom instead of demanding a freeze.
+    missing = set(baseline) - published
+    assert not missing, (
+        f"tools in the frozen baseline are gone from tools/list: {sorted(missing)}"
+    )
 
 
 async def test_model_visible_size_matches_measured_client_behaviour():

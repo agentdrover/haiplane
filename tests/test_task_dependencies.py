@@ -428,3 +428,122 @@ async def test_rest_refuses_an_edge_to_a_missing_task(client: AsyncClient):
 
     assert resp.status_code == 404, resp.text
     assert (await client.get(f"/api/tasks/{task_id}")).json()["dependencies"] is None
+
+
+# --- The tools that finally let the graph be filled (#487) -------------------
+#
+# The graph has existed since #482 and REST since #486, but an agent works
+# through MCP: until these tools existed, edges could only be written with
+# curl, which is to say they were not written at all.
+
+
+async def _mcp_text(result) -> str:
+    # Refusals come back as a plain JSON string (_format_hub_api_error);
+    # successes as a CallToolResult. Both are text to the reader.
+    if isinstance(result, str):
+        return result
+    return "\n".join(
+        block.text for block in result.content if getattr(block, "text", None)
+    )
+
+
+async def test_mcp_and_rest_return_the_same_edges(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#487): the tools call REST rather than the database, so there is
+    # no second implementation to drift from the first.
+    from hub import mcp_server
+
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "blocks"})).json()["id"]
+
+    async def _get(path, **kwargs):
+        return (await client.get(path)).json()
+
+    async def _post(path, body=None, **kwargs):
+        return (await client.post(path, json=body or {})).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+
+    added = await mcp_server.hub_add_dependency(waits, blocker)
+    listed = await mcp_server.hub_list_dependencies(waits)
+
+    assert "создано" in await _mcp_text(added)
+    rest = (await client.get(f"/api/tasks/{waits}/dependencies")).json()
+    assert listed.structuredContent["dependencies"] == rest
+    assert [d["task_id"] for d in rest["blocked_by"]] == [blocker]
+
+
+async def test_mcp_add_reports_idempotency(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#487): both calls succeed, and the wording distinguishes them.
+    # "Already there" and "just created" are different facts about the world.
+    from hub import mcp_server
+
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "blocks"})).json()["id"]
+
+    async def _post(path, body=None, **kwargs):
+        return (await client.post(path, json=body or {})).json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+
+    first = await _mcp_text(await mcp_server.hub_add_dependency(waits, blocker))
+    second = await _mcp_text(await mcp_server.hub_add_dependency(waits, blocker))
+
+    assert "создано" in first
+    assert "уже было" in second
+
+
+async def test_mcp_cycle_error_keeps_the_chain(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#487): the chain survives the translation from a structured
+    # refusal into text. Without it the reader knows something is wrong and
+    # nothing about which edge to drop.
+    from hub import mcp_server
+
+    a = (await client.post("/api/tasks", json={"title": "A"})).json()["id"]
+    b = (await client.post("/api/tasks", json={"title": "B"})).json()["id"]
+
+    async def _post(path, body=None, **kwargs):
+        resp = await client.post(path, json=body or {})
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError(resp.json()["detail"])
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+    await mcp_server.hub_add_dependency(a, b)
+
+    refused = await _mcp_text(await mcp_server.hub_add_dependency(b, a))
+
+    assert "dependency_cycle" in refused
+    assert f"#{a}" in refused and f"#{b}" in refused
+
+
+async def test_mcp_list_shows_delivery(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#487): a completed blocker with an open PR still blocks, and the
+    # tool says so — the exact shape that stopped #830.
+    from hub import mcp_server
+
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "digest"})).json()["id"]
+    await client.post(
+        f"/api/tasks/{waits}/dependencies", json={"depends_on_task_id": blocker}
+    )
+    await repo.update_task(db, blocker, status="completed", pr_number=8)
+    await db.commit()
+
+    async def _get(path, **kwargs):
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+
+    text = await _mcp_text(await mcp_server.hub_list_dependencies(waits))
+
+    assert "НЕ доставлен" in text
+    assert "PR #8 не смержен гейтом" in text
