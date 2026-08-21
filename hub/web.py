@@ -1265,6 +1265,19 @@ async def web_task_detail(
 
     evidence = await gate_evidence(db, dict(row))
 
+    # #497: merged is not running. The hub records both facts now — its own
+    # merge (#534) and the deploy CI reported (#839, #496) — and this compares
+    # them. Computed, never stored: the answer changes with every release.
+    delivery = None
+    if task.status.value in ("completed", "review", "fix_requested"):
+        from hub.services.delivery_state import delivery_state
+
+        try:
+            delivery = await delivery_state(db, task_id)
+        except Exception as exc:  # noqa: BLE001 - the card must render regardless
+            log.warning("delivery state failed for #%s: %s", task_id, exc)
+            delivery = None
+
     # #825: the criteria and the changes, laid against each other. Built from
     # the numstat of the pinned submission — paths, not hunks: the hunks load
     # on demand (#824), and this map only needs to know which files moved.
@@ -1329,6 +1342,7 @@ async def web_task_detail(
             "task_messages": task_messages,
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,
+            "delivery": delivery,
             "evidence": evidence,
             "change_map": change_map,
             "machine_review": machine_review,
