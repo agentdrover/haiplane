@@ -333,6 +333,44 @@ async def test_usage_report_answers_popularity_errors_latency_and_size(db):
     assert profiles["v1"]["tools"] == 2
 
 
+async def test_usage_report_breaks_down_calls_by_role(db):
+    """AC-1 (#816): the report answers who is calling, not only what.
+
+    Without this the "nobody called it" list cannot be read: a review tool
+    with zero calls is indistinguishable from a review tool whose caller
+    never comes through MCP at all.
+    """
+    await _seed(
+        db,
+        [
+            {"tool": "hub_task_status", "principal_role": "agent", "principal_id": 1},
+            {"tool": "hub_claim_task", "principal_role": "agent", "principal_id": 1},
+            {
+                "tool": "hub_submit_review",
+                "principal_role": "reviewer",
+                "principal_id": 2,
+                "status": "error",
+                "error_reason": "not_reviewer",
+                "response_chars": 40,
+            },
+        ],
+    )
+
+    report = await telemetry.usage_report(db, window_days=14)
+
+    roles = {row["principal_role"]: row for row in report["by_role"]}
+    assert set(roles) == {"agent", "reviewer"}
+    assert roles["agent"]["calls"] == 2
+    assert roles["agent"]["tools"] == 2
+    assert roles["agent"]["principals"] == 1
+    assert roles["agent"]["error_calls"] == 0
+    assert roles["reviewer"]["calls"] == 1
+    assert roles["reviewer"]["error_rate"] == 1.0
+    assert roles["reviewer"]["total_chars"] == 40
+    # Same window rules as every other section of the report.
+    assert sum(row["calls"] for row in report["by_role"]) == report["totals"]["calls"]
+
+
 async def test_usage_report_names_tools_nobody_called(db):
     await _seed(db, [{"tool": "hub_task_status"}])
     catalog = {

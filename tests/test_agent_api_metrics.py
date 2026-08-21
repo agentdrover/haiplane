@@ -138,6 +138,22 @@ async def test_agent_api_page_renders_usage(client, db):
     assert "1234" in body
 
 
+async def test_agent_api_page_shows_role_breakdown(client, db):
+    """AC-2 (#816): the role split is where the human reads the metrics."""
+    await _seed(db, tool="hub_task_status", principal_role="agent")
+    await _seed(db, tool="hub_submit_review", principal_role="reviewer", principal_id=2)
+
+    resp = await client.get("/metrics/agent-api?window_days=14")
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "По ролям" in body
+    assert "reviewer" in body
+    # A role that never calls anything is the finding, so the section must not
+    # collapse two roles into one line.
+    assert body.count("<td>agent</td>") >= 1
+
+
 async def test_practice_metrics_page_links_to_the_agent_api_page(client, db):
     resp = await client.get("/metrics")
     assert "/metrics/agent-api" in resp.text

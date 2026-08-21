@@ -359,6 +359,9 @@ async def usage_report(
         _with_rates(row)
         for row in await repo.mcp_usage_by_profile(db, window_days=days)
     ]
+    by_role = [
+        _with_rates(row) for row in await repo.mcp_usage_by_role(db, window_days=days)
+    ]
     top_errors = await repo.mcp_usage_errors(db, window_days=days, limit=error_limit)
 
     calls = sum(row["calls"] for row in by_tool)
@@ -388,6 +391,11 @@ async def usage_report(
         },
         "by_tool": by_tool,
         "by_profile": by_profile,
+        # Who is calling, not just what. A core allowlist chosen from calls
+        # made by one role would be a profile of that role's day, and the
+        # unused list would be measuring the absence of a caller rather than
+        # the absence of a need (#816).
+        "by_role": by_role,
         "top_errors": [dict(row) for row in top_errors],
         "unused_tools": unused,
         "published_tools": len(published),

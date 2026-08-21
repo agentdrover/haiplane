@@ -1305,6 +1305,60 @@ class TaskProjectRef(BaseModel):
     slug: str
 
 
+class TaskDependencyCreate(BaseModel):
+    """Ask that a task wait for another one (#486)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    depends_on_task_id: int = Field(..., ge=1)
+
+
+class TaskDependencyWritten(BaseModel):
+    """The outcome of writing an edge (#486).
+
+    ``created`` is False when the edge was already there. Not an error: the
+    caller's intent — "this must wait for that" — is satisfied either way,
+    and the repository layer (#483) already answers the same way. A contract
+    that raised where the layer under it shrugs would make callers write
+    retry logic around a no-op.
+    """
+
+    task_id: int
+    depends_on_task_id: int
+    created: bool
+
+
+class TaskDependencyRemoved(BaseModel):
+    """The outcome of dropping an edge; ``removed`` False when none was there."""
+
+    task_id: int
+    depends_on_task_id: int
+    removed: bool
+
+
+class TaskDependencyRef(BaseModel):
+    """One end of a dependency edge, as a reader needs it (#485)."""
+
+    task_id: int
+    title: str = ""
+    status: str = ""
+    # Delivery, not status, decides whether a blocker still blocks (#484).
+    # None on the `unblocks` side: nobody asked whether THIS task shipped.
+    delivered: bool | None = None
+    reason: str = ""
+
+
+class TaskDependencies(BaseModel):
+    """Both sides of a task's edges (#485).
+
+    Absent entirely when the task has none — an empty pair of lists in every
+    response would be noise on the overwhelming majority of tasks.
+    """
+
+    blocked_by: list[TaskDependencyRef] = Field(default_factory=list)
+    unblocks: list[TaskDependencyRef] = Field(default_factory=list)
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -1404,6 +1458,9 @@ class TaskView(BaseModel):
     # would be one more thing to go stale — which is the very defect this
     # addresses. Absent means "not computed on this path", not "fresh".
     statement_freshness: dict[str, Any] | None = None
+    # #485: who blocks this task and whom it unblocks. None means no edges at
+    # all, which is not the same as "edges, but empty".
+    dependencies: "TaskDependencies | None" = None
     readiness_score: int | None = None
     dor_passed: bool | None = None
     ready_at: str | None = None

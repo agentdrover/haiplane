@@ -1763,8 +1763,12 @@ async def list_task_dependencies(
     immediately — "blocked by #818" means nothing without knowing where #818
     stands.
     """
+    # #485: delivery travels beside the status. A closed task whose PR is not
+    # merged blocks exactly as much as an open one — that is what #830 learned
+    # the expensive way, and a reader given only the status would repeat it.
     blocked_by = await db.execute_fetchall(
-        "SELECT t.id AS task_id, t.title, t.status "
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
         "WHERE d.task_id = ? ORDER BY t.id",
         (task_id,),
@@ -1776,9 +1780,24 @@ async def list_task_dependencies(
         (task_id,),
     )
     return {
-        "blocked_by": [dict(r) for r in blocked_by],
+        "blocked_by": [_blocker_entry(dict(r)) for r in blocked_by],
         "unblocks": [dict(r) for r in unblocks],
     }
+
+
+def _blocker_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """One blocker with its delivery state (#485).
+
+    ``delivered`` answers "is the code in the base branch", which is the
+    question the reader actually has; ``reason`` says why not, because "PR
+    not merged" and "no PR declared" call for different next moves.
+    """
+    delivered = bool(row.pop("merges", 0))
+    pr_number = row.pop("pr_number", None)
+    reason = ""
+    if not delivered:
+        reason = f"PR #{pr_number} не смержен гейтом" if pr_number else "PR не заявлен"
+    return {**row, "delivered": delivered, "reason": reason}
 
 
 async def undelivered_blockers(
@@ -3008,6 +3027,31 @@ async def mcp_usage_by_profile(
         "SUM(response_chars) AS total_chars "
         "FROM mcp_call_events WHERE created_at >= datetime('now', ?) "
         "GROUP BY profile ORDER BY calls DESC",
+        (f"-{int(window_days)} days",),
+    )
+    return [dict(row) for row in rows]
+
+
+async def mcp_usage_by_role(
+    db: aiosqlite.Connection, *, window_days: int
+) -> list[dict[str, Any]]:
+    """Per-role totals for the window: who the Agent API is actually for.
+
+    The role is already on every record (#780); until it was grouped, a report
+    could say which tools were called but not whether reviewers and analysts
+    call any at all. That distinction decides what "nobody called this tool"
+    means — genuinely unused, or used from somewhere this table cannot see
+    (#816).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT principal_role, COUNT(*) AS calls, "
+        "COUNT(DISTINCT tool) AS tools, "
+        "COUNT(DISTINCT COALESCE(principal_id, -1)) AS principals, "
+        "SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_calls, "
+        "SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS error_calls, "
+        "SUM(response_chars) AS total_chars "
+        "FROM mcp_call_events WHERE created_at >= datetime('now', ?) "
+        "GROUP BY principal_role ORDER BY calls DESC",
         (f"-{int(window_days)} days",),
     )
     return [dict(row) for row in rows]

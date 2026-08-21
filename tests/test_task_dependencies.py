@@ -233,3 +233,198 @@ async def test_warning_never_blocks_the_start(
     assert any("недоставленных блокерах" in c for c in contents), (
         "the warning travels in the same response the agent already reads"
     )
+
+
+# --- The edges become readable (#485) ----------------------------------------
+#
+# They were already stored (#482, #483) and already warned at start (#484), but
+# nothing outside SQL could see them: a task looked as if it had neither
+# blockers nor dependents.
+
+
+async def test_task_view_carries_both_sides(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-1 (#485): both directions on the single-task read.
+    resp = await client.post("/api/tasks", json={"title": "middle"})
+    middle = resp.json()["id"]
+    blocker = await _task(db, "upstream")
+    dependent = await _task(db, "downstream")
+    await repo.add_task_dependency(db, middle, blocker)
+    await repo.add_task_dependency(db, dependent, middle)
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{middle}")).json()
+
+    deps = view["dependencies"]
+    assert [d["task_id"] for d in deps["blocked_by"]] == [blocker]
+    assert [d["task_id"] for d in deps["unblocks"]] == [dependent]
+    assert deps["blocked_by"][0]["status"] == "open"
+
+
+async def test_blocked_by_shows_delivery_not_just_status(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-2 (#485): the status said "completed" for #818 while its PR sat open,
+    # and that is precisely what let #830 start. Delivery travels beside it.
+    resp = await client.post("/api/tasks", json={"title": "waits"})
+    blocked = resp.json()["id"]
+    blocker = await _task(db, "closed but unmerged")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="completed", pr_number=8)
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{blocked}")).json()
+
+    entry = view["dependencies"]["blocked_by"][0]
+    assert entry["status"] == "completed"
+    assert entry["delivered"] is False
+    assert entry["reason"] == "PR #8 не смержен гейтом"
+
+
+async def test_task_without_edges_says_nothing(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#485): silence, not empty lists. Most tasks have no edges, and a
+    # section printed for all of them is noise that trains readers to skip it.
+    from hub.mcp_server import _dependency_lines
+
+    resp = await client.post("/api/tasks", json={"title": "no edges"})
+    lonely = resp.json()["id"]
+
+    view = (await client.get(f"/api/tasks/{lonely}")).json()
+
+    assert view["dependencies"] is None
+    assert _dependency_lines(view) == []
+
+
+async def test_rest_and_mcp_agree_on_dependencies(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-4 (#485): one source, two presentations. Assembled from a second
+    # query, the text would drift from the payload and nobody could tell which
+    # one had aged.
+    from hub.mcp_server import _dependency_lines
+
+    resp = await client.post("/api/tasks", json={"title": "linked"})
+    task_id = resp.json()["id"]
+    blocker = await _task(db, "upstream work")
+    await repo.add_task_dependency(db, task_id, blocker)
+    await repo.update_task(db, blocker, status="running")
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{task_id}")).json()
+    lines = "\n".join(_dependency_lines(view))
+
+    assert f"#{blocker}" in lines
+    assert "upstream work" in lines
+    assert "НЕ доставлен" in lines and "PR не заявлен" in lines
+    assert view["dependencies"]["blocked_by"][0]["delivered"] is False
+
+
+# --- REST for the graph (#486) -----------------------------------------------
+#
+# The graph existed since #482 but only hub code could write to it, so it
+# stayed empty while four statements went on saying the order is "checked by
+# eye". These endpoints hand the pen to whoever knows about the order.
+
+
+async def test_rest_add_is_idempotent(client: AsyncClient, db: aiosqlite.Connection):
+    # AC-1 (#486): the contract must not raise where the layer beneath it
+    # shrugs (#483), or callers end up writing retry logic around a no-op.
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "blocks"})).json()["id"]
+
+    first = await client.post(
+        f"/api/tasks/{waits}/dependencies", json={"depends_on_task_id": blocker}
+    )
+    second = await client.post(
+        f"/api/tasks/{waits}/dependencies", json={"depends_on_task_id": blocker}
+    )
+
+    assert first.status_code == 200 and first.json()["created"] is True
+    assert second.status_code == 200 and second.json()["created"] is False
+    edges = (await client.get(f"/api/tasks/{waits}/dependencies")).json()
+    assert len(edges["blocked_by"]) == 1
+
+
+async def test_rest_cycle_is_a_structured_conflict(client: AsyncClient):
+    # AC-2 (#486): the hint carries the chain. "A cycle was detected" cannot
+    # be acted on; the chain names the edge to reconsider.
+    a = (await client.post("/api/tasks", json={"title": "A"})).json()["id"]
+    b = (await client.post("/api/tasks", json={"title": "B"})).json()["id"]
+    c = (await client.post("/api/tasks", json={"title": "C"})).json()["id"]
+    await client.post(f"/api/tasks/{a}/dependencies", json={"depends_on_task_id": b})
+    await client.post(f"/api/tasks/{b}/dependencies", json={"depends_on_task_id": c})
+
+    resp = await client.post(
+        f"/api/tasks/{c}/dependencies", json={"depends_on_task_id": a}
+    )
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "dependency_cycle"
+    assert f"#{a}" in detail["hint"] and f"#{c}" in detail["hint"]
+    assert (await client.get(f"/api/tasks/{c}/dependencies")).json()["blocked_by"] == []
+
+
+async def test_rest_self_edge_is_unprocessable(client: AsyncClient):
+    # AC-3 (#486): a request that cannot mean anything, not a state conflict.
+    task_id = (await client.post("/api/tasks", json={"title": "lonely"})).json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/dependencies", json={"depends_on_task_id": task_id}
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "self_dependency"
+
+
+async def test_rest_delete_is_idempotent(client: AsyncClient):
+    # AC-4 (#486): the caller wanted the edge gone, and it is gone.
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "blocks"})).json()["id"]
+    await client.post(
+        f"/api/tasks/{waits}/dependencies", json={"depends_on_task_id": blocker}
+    )
+
+    first = await client.delete(f"/api/tasks/{waits}/dependencies/{blocker}")
+    second = await client.delete(f"/api/tasks/{waits}/dependencies/{blocker}")
+
+    assert first.status_code == 200 and first.json()["removed"] is True
+    assert second.status_code == 200 and second.json()["removed"] is False
+
+
+async def test_rest_get_matches_the_task_context(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-5 (#486): one reader behind both answers. Assembled separately, the
+    # endpoint and the task context would drift and nobody could say which
+    # one had aged.
+    waits = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "unmerged"})).json()["id"]
+    await client.post(
+        f"/api/tasks/{waits}/dependencies", json={"depends_on_task_id": blocker}
+    )
+    await repo.update_task(db, blocker, status="completed", pr_number=8)
+    await db.commit()
+
+    endpoint = (await client.get(f"/api/tasks/{waits}/dependencies")).json()
+    context = (await client.get(f"/api/tasks/{waits}")).json()["dependencies"]
+
+    assert endpoint == context
+    assert endpoint["blocked_by"][0]["delivered"] is False
+    assert endpoint["blocked_by"][0]["reason"] == "PR #8 не смержен гейтом"
+
+
+async def test_rest_refuses_an_edge_to_a_missing_task(client: AsyncClient):
+    # An edge pointing at a task nobody can finish would read as a blocker
+    # that never clears — refused before anything is written.
+    task_id = (await client.post("/api/tasks", json={"title": "real"})).json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/dependencies", json={"depends_on_task_id": 999_999}
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["dependencies"] is None
