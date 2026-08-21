@@ -1015,6 +1015,11 @@ async def api_list_task_dependencies(task_id: int, request: Request):
     db = _db(request)
     await _require_task(db, task_id)
     edges = await repo.list_task_dependencies(db, task_id)
+    # #885: one enrichment for every reader — this endpoint, the task context,
+    # the start gate and the MCP tools that call this endpoint.
+    from hub.services.delivery_state import with_delivery
+
+    edges["blocked_by"] = await with_delivery(db, edges["blocked_by"])
     return models.TaskDependencies(
         blocked_by=[models.TaskDependencyRef(**e) for e in edges["blocked_by"]],
         unblocks=[models.TaskDependencyRef(**e) for e in edges["unblocks"]],
