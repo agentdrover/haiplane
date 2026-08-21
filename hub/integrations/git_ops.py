@@ -926,6 +926,18 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
+        """``git show <ref>:<path>``, or None when it is not there (#873).
+
+        Callers pass the BASE ref, never the branch under review — see
+        ``collect_review_rules``. Absent and unreadable collapse into None on
+        purpose here: for a per-directory policy file both mean "no rules from
+        this path", and the caller states the distinction that matters (no
+        rules anywhere vs no repository to look in) one level up.
+        """
+        rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
+        return out if rc == 0 else None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
 

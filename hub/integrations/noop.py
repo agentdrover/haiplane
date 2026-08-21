@@ -165,6 +165,10 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
+        """No git here — there is no rules file to read (#873)."""
+        return None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """No git here — "could not look", never "the commit is gone" (#824)."""
         return None
