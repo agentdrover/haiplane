@@ -73,6 +73,7 @@ from hub.models import (
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    OutcomeAnswerSubmit,
     ProjectCreate,
     ProjectPatch,
     ProjectView,
@@ -738,12 +739,48 @@ async def api_mcp_catalog(request: Request):
 
 @app.get("/api/metrics/outcome-debt")
 async def api_outcome_debt(request: Request):
-    """Completed tasks whose stated outcome was never answered (#766).
+    """Outcome promises and the answers to them (#766, #819).
 
-    DoR refuses a task without an outcome_metric and nothing has read one back
-    since. Read-only: recording answers is a separate slice.
+    ``items`` are the tasks nobody has come back to; ``answered`` are the ones
+    somebody has, with the last verdict and what was measured. Both counts are
+    reported: a list that could only grow measured the age of the backlog, not
+    the habit of checking.
     """
     return await services.outcome_debt(_db(request))
+
+
+@app.post("/api/tasks/{task_id}/outcome-answers")
+async def api_answer_outcome(
+    task_id: int,
+    body: OutcomeAnswerSubmit,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Record one check of a completed task's stated outcome (#819).
+
+    Open to agents and humans alike: the verdict is the caller's declaration,
+    auditable rather than provable, exactly like ``branch`` (#533) and
+    ``model`` (#758) on a submission. The hub sees neither production nor
+    dashboards and cannot confirm a number itself; what it can do is keep who
+    said it, when, and what they measured.
+
+    ``answered_by`` comes from the authenticated principal and is never taken
+    from the payload — an answer whose author is a free-text argument is not
+    evidence of anything.
+    """
+    try:
+        return await services.answer_outcome(
+            _db(request),
+            task_id=task_id,
+            verdict=body.verdict.value,
+            measured_value=body.measured_value,
+            note=body.note,
+            answered_by=identity.username,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/telemetry/deprecated-tool")

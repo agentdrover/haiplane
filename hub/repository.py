@@ -1127,6 +1127,39 @@ async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     )
 
 
+async def record_outcome_answer(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    verdict: str,
+    measured_value: str,
+    note: str = "",
+    answered_by: str = "",
+) -> int:
+    """Append one answer to a task's outcome (#819).
+
+    Append-only on purpose: an outcome_deadline routinely names more than one
+    moment, and an update-in-place would erase the evidence that anyone came
+    back a second time.
+    """
+    cur = await db.execute(
+        "INSERT INTO outcome_answers "
+        "(task_id, verdict, measured_value, note, answered_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, verdict, measured_value, note, answered_by),
+    )
+    await db.commit()
+    return int(cur.lastrowid or 0)
+
+
+async def list_outcome_answers(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Every recorded answer, oldest first, for grouping by task (#819)."""
+    return await db.execute_fetchall(
+        "SELECT id, task_id, verdict, measured_value, note, answered_by, "
+        "answered_at FROM outcome_answers ORDER BY answered_at ASC, id ASC"
+    )
+
+
 async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Epics where work is actually happening (#569).
 

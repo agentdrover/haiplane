@@ -1647,6 +1647,57 @@ class CIRunReportResult(BaseModel):
     validation_status: str = ""
 
 
+class OutcomeVerdict(str, Enum):
+    """What the check of an outcome_metric found (#819).
+
+    ``not_moved`` and ``unmeasurable`` exist so that an inconvenient answer is
+    as easy to file as a flattering one. A log that only accepts success stops
+    being read the first time the number disappoints.
+    """
+
+    moved = "moved"
+    not_moved = "not_moved"
+    unmeasurable = "unmeasurable"
+
+
+class OutcomeAnswerSubmit(BaseModel):
+    """One check of a completed task's stated outcome (#819).
+
+    ``measured_value`` is required and rejected when blank: an answer without a
+    number or an observation is an opinion, and a log of opinions closes the
+    loop only in appearance. The verdict is the caller's declaration — the hub
+    sees neither production nor dashboards — auditable like ``branch`` (#533)
+    and ``model`` (#758), not provable.
+    """
+
+    verdict: OutcomeVerdict
+    measured_value: str = Field(..., min_length=1, max_length=500)
+    note: str = Field("", max_length=2000)
+
+    @field_validator("measured_value")
+    @classmethod
+    def _measurement_must_say_something(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError(
+                "measured_value is the observation itself - name the number "
+                "and where it was read, or file the answer as unmeasurable"
+            )
+        return text
+
+
+class OutcomeAnswerView(BaseModel):
+    """A recorded answer as the debt list shows it (#819)."""
+
+    id: int
+    task_id: int
+    verdict: OutcomeVerdict
+    measured_value: str
+    note: str = ""
+    answered_by: str = ""
+    answered_at: str = ""
+
+
 class MachineReviewSubmit(BaseModel):
     """Structured multi-agent review report (#381).
 

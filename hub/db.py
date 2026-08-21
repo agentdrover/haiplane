@@ -949,6 +949,39 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # ---- Outcome answers (#819): where the check of an outcome_metric
+        # lands. #766 shipped the debt list read-only to find out whether these
+        # metrics can be answered at all; #810 answered that on a live case, so
+        # this is the storage that slice deliberately left out.
+        #
+        # A log, not a column on tasks: an outcome_deadline routinely names more
+        # than one moment ("right after release, again in two weeks"), and a
+        # second check that overwrites the first destroys the only evidence that
+        # anyone came back.
+        #
+        # answered_by is a name snapshot, no FK — the record of who checked must
+        # outlive the key that made it, same reasoning as agent_sessions.
+        # measured_value is NOT NULL and refused when blank at the call site: an
+        # answer without a number or an observation is an opinion, and a log of
+        # opinions would close the loop only in appearance.
+        "create_outcome_answers_table",
+        """CREATE TABLE IF NOT EXISTS outcome_answers (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id        INTEGER NOT NULL,
+            verdict        TEXT    NOT NULL,
+            measured_value TEXT    NOT NULL,
+            note           TEXT    NOT NULL DEFAULT '',
+            answered_by    TEXT    NOT NULL DEFAULT '',
+            answered_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # The debt read joins answers per task and shows the latest first.
+        "idx_outcome_answers_task",
+        "CREATE INDEX IF NOT EXISTS idx_outcome_answers_task "
+        "ON outcome_answers(task_id, answered_at)",
+    ),
+    (
         # Live-check evidence (#813, feature #811): did anyone actually watch
         # this work behave after it shipped? Three defects on 21.08.2026
         # (#801, #802, #803) passed review and green CI and were found only by
