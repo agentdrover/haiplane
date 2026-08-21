@@ -1374,6 +1374,7 @@ async def hub_submit_for_review(
     summary: str = "",
     branch: str = "",
     model: str = "",
+    accept_areas: bool = False,
 ) -> str:
     """Submit the current work of a pair task for client-driven review (#307).
 
@@ -1396,6 +1397,12 @@ async def hub_submit_for_review(
             like ``branch``, auditable rather than provable. Required for
             the auto-verdict's model-diversity rule: an empty declaration
             keeps the verdict with the human.
+        accept_areas: Accept the areas the work ACTUALLY touched (#890). Use
+            it when the diff went outside affected_areas: the paths are folded
+            into the field and the growth is recorded as a visible event, so
+            declared and actual agree at review time. It never hides anything
+            — the reviewer sees how much of the scope appeared at submission.
+            Nothing is widened without this flag.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1408,6 +1415,8 @@ async def hub_submit_for_review(
         body["branch"] = branch
     if model:
         body["model"] = model
+    if accept_areas:
+        body["accept_areas"] = True
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:

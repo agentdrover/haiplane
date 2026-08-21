@@ -1615,24 +1615,43 @@ async def submit_for_review(
     # there is still something to refuse.
     surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
     surface_note = ""
+    # #890: paths the submitter accepts as the real scope. Empty unless the
+    # submission asked for it — the hub never widens affected_areas on its own.
+    accepted_paths: list[str] = []
     if surfaces_mode != "off":
         verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
         if verdict == "undeclared":
             listed = ", ".join(undeclared[:10])
-            if surfaces_mode == "require":
+            if body.accept_areas:
+                # #890: affected_areas is written at DoR as a PREDICTION, and
+                # work discovers its own scope — #854 measured 46 of 104
+                # submissions changing files outside the declared set, and
+                # showed the residue is real surfaces, not routine noise.
+                # Refusing that punishes imprecise foresight; what review,
+                # commit-scope and the risk recompute actually need is that
+                # declared and actual agree AT SUBMISSION. So the submitter
+                # may accept the truth in one step — explicitly, and on the
+                # record below.
+                accepted_paths = list(undeclared)
+            elif surfaces_mode == "require":
                 raise HTTPException(
                     422,
                     f"ветка меняет файлы вне объявленной области: {listed}. "
-                    "Допишите их в affected_areas или объясните в сдаче, "
+                    "Допишите их в affected_areas, признайте фактические "
+                    "области на сдаче (accept_areas) или объясните в сдаче, "
                     "почему они здесь. Проверка сравнивает с фактическим "
                     "диффом, а не с предсказанием.",
                 )
-            surface_note = (
-                f"Вне объявленной области изменены: {listed}. Режим проверки — "
-                "warn, сдача принята. Область стоит дописать: по ней "
-                "сверяется и commit-scope."
-            )
+            else:
+                surface_note = (
+                    f"Вне объявленной области изменены: {listed}. Режим "
+                    "проверки — warn, сдача принята. Область стоит дописать "
+                    "(или признать на сдаче через accept_areas): по ней "
+                    "сверяется и commit-scope."
+                )
         elif verdict == "unknown":
+            # Nothing to accept: a check that did not run is not a divergence,
+            # and accept_areas must never turn silence into agreement.
             surface_note = (
                 f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
                 "Это не значит, что расхождений нет."
@@ -1732,6 +1751,34 @@ async def submit_for_review(
         if summary:
             content += f" {summary}"
         await repo.add_task_update(db, task_id, agent, "status", content)
+        # #890: the accepted scope is written INSIDE the same transaction as
+        # the transition, so a task can never end up in review with the field
+        # widened but the growth unrecorded — or the other way round.
+        if accepted_paths:
+            declared = deserialize_str_list(task.get("affected_areas"))
+            merged = list(declared) + [p for p in accepted_paths if p not in declared]
+            await repo.update_task_structured(
+                db, task_id, TaskRefine(affected_areas=merged)
+            )
+            shown = ", ".join(accepted_paths[:10])
+            more = (
+                f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
+            )
+            # A separate, visible event on purpose. Without it affected_areas
+            # would simply always equal the diff, and there would be nothing
+            # left to compare: the reviewer must be able to see that half the
+            # declared scope appeared at submission, not at DoR.
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"{commit_scope.SCOPE_GROWTH_MARKER} "
+                f"+{len(accepted_paths)} путь(ей) "
+                f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
+                f"{len(declared)}, стало {len(merged)}. Это признание факта "
+                "сдающим, а не предсказание из постановки.",
+            )
         if surface_note:
             await repo.add_task_update(db, task_id, "hub", "alert", surface_note)
         if risk_alert:

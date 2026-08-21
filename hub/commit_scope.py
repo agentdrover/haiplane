@@ -18,7 +18,18 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["parse_porcelain_paths", "foreign_paths", "ROUTINE_PATHS"]
+__all__ = [
+    "parse_porcelain_paths",
+    "foreign_paths",
+    "ROUTINE_PATHS",
+    "SCOPE_GROWTH_MARKER",
+]
+
+# #890: the opening words of the update that records areas accepted at
+# submission. A marker rather than a new column: the growth is an event in the
+# feed, and the review brief finds it the same way has_plan_updates finds a
+# plan. Changing this string changes what the reviewer sees — it is a contract.
+SCOPE_GROWTH_MARKER = "Объём вырос по ходу работы:"
 
 # Files a task changes as a consequence of doing its work rather than as its
 # subject (#550). Declaring them would be noise, and demanding it would train

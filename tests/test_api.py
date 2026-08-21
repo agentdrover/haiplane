@@ -3706,3 +3706,53 @@ async def test_dispositions_without_a_report_are_refused(client: AsyncClient):
 
     assert resp.status_code == 404
     assert "no machine review" in resp.json()["detail"]
+
+
+async def test_review_brief_shows_scope_growth(client, db, monkeypatch):
+    """#890 AC-4: the reviewer sees which half of the scope is a fact.
+
+    affected_areas mixes two different claims once areas can be accepted at
+    submission: what was predicted at DoR and what was recorded after the code
+    existed. A brief that showed only the merged list would let the second
+    pass for the first — and #854 measured that the second is 44% of real
+    work, not an edge case.
+    """
+    from hub import commit_scope, config
+    from hub import repository as repo_module
+    from hub import services as services_module
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.models import TaskSubmitReview
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+
+    resp = await client.post("/api/tasks", json={"title": "Grew while working"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine", json={"affected_areas": ["hub/app.py"]}
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    class _Diff(NoopGitOps):
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return ["hub/app.py", "hub/services/sessions.py"]
+
+    plugins.git_ops = _Diff()
+    await services_module.submit_for_review(
+        db, task_id, TaskSubmitReview(accept_areas=True)
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    growth = brief["scope_growth"]
+    assert len(growth) == 1, growth
+    assert growth[0].startswith(commit_scope.SCOPE_GROWTH_MARKER)
+    assert "+1" in growth[0] and "hub/services/sessions.py" in growth[0]
+
+    task = dict(await repo_module.get_task(db, task_id))
+    assert "hub/services/sessions.py" in (task["affected_areas"] or "")

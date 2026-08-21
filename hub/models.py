@@ -546,6 +546,13 @@ class TaskSubmitReview(BaseModel):
     # declaration like the branch above — auditable, not provable. Empty
     # means "not declared", which the auto-verdict treats as NOT diverse.
     model: str = Field("", max_length=100)
+    # #890: accept the areas the work ACTUALLY touched instead of being
+    # refused for an imprecise prediction. Measured in #854: 46 of 104
+    # submissions over 30 days changed files outside their declared areas —
+    # affected_areas is written at DoR as a forecast, and work discovers its
+    # own scope. Explicit on purpose: the hub never widens the field on its
+    # own, because a field that always matches the diff is nothing to compare.
+    accept_areas: bool = False
 
 
 class ReviewFinding(BaseModel):
@@ -808,6 +815,12 @@ class ReviewBrief(BaseModel):
     statement_freshness: dict[str, Any] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
+    # #890: areas accepted AT SUBMISSION rather than declared at DoR, newest
+    # first. Empty means the declared scope held. Non-empty is not a fault —
+    # #854 measured that 44% of submissions outgrow their forecast — but the
+    # reviewer must know which half of affected_areas is a prediction and
+    # which is a fact recorded after the code was written.
+    scope_growth: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
     review_checklist: list[str] = Field(default_factory=list)
     validation_commands: list[str] = Field(default_factory=list)
