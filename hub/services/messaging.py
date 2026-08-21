@@ -74,6 +74,7 @@ def message_view(row: aiosqlite.Row | dict, *, matched_by: str = "") -> dict:
         "from_model": data.get("from_model") or "",
         "to_kind": data.get("to_kind") or "",
         "to_ref": data.get("to_ref") or "",
+        "for_session": data.get("for_session") or "",
         "kind": data.get("kind") or "note",
         "body": data.get("body") or "",
         "related_task_id": data.get("related_task_id"),
@@ -271,6 +272,7 @@ async def send_message(
     try:
         message_id = await repo.insert_agent_message(
             db,
+            for_session=(body.for_session or "").strip(),
             from_principal_id=principal_id,
             from_session_id=session_id,
             from_agent=agent,
@@ -297,6 +299,9 @@ async def send_message(
                 "kind": kind,
                 "from_agent": agent,
                 "from_session_id": session_id,
+                # #821: who the sender meant, when the address itself could not
+                # say it. Still no body — the event says you have mail.
+                "for_session": (body.for_session or "").strip(),
             },
         )
         await db.commit()
@@ -334,12 +339,26 @@ async def addressable_refs(
     *,
     agent: str,
     principal_id: int | None,
+    session_id: str = "",
 ) -> dict[str, Any]:
     """What counts as "addressed to me" when reading the events feed (#774).
 
     Computed once per request rather than per event: the feed is a hot path,
     and a query per row would make the honest answer the expensive one.
+
+    ``session_id`` narrows "me" from the agent to one of its sessions (#821).
+    Without it the fleet is indistinguishable — every session of an agent
+    shares its token, so the hub cannot tell which one is polling, and mail
+    naming a sibling would wake them all. The caller must own the session it
+    names; that check is the same one the inbox makes.
     """
+    session_id = (session_id or "").strip()
+    if session_id:
+        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
+        tasks = await repo.list_addressable_task_ids(
+            db, agent=agent, session_ids=[session_id]
+        )
+        return {"agent": agent, "sessions": {session_id}, "tasks": set(tasks)}
     sessions = []
     for row in await repo.list_agent_sessions(db, limit=500):
         data = dict(row)
@@ -353,22 +372,51 @@ async def addressable_refs(
     return {"agent": agent, "sessions": set(sessions), "tasks": set(tasks)}
 
 
-def message_event_is_addressed(payload: dict[str, Any], refs: dict[str, Any]) -> bool:
+def message_event_is_addressed(
+    payload: dict[str, Any],
+    refs: dict[str, Any],
+    *,
+    for_wakeup: bool = False,
+) -> bool:
     """Whether this ``message_posted`` event belongs in the caller's feed.
 
-    The feed must not become the back door the inbox closed (#773 AC-1, #801):
-    the notification carries the address and the id, and only the people that
-    address covers get to see even that much. A project channel is a broadcast
-    and stays visible to everyone; a message to one session is not.
+    Two questions, one rule, on purpose: "may this caller see the notice" and
+    "should it interrupt them" differ, and keeping them in separate functions
+    is how the copies drift apart — which is precisely how #801 happened.
+
+    Without ``for_wakeup`` the answer is visibility, unchanged since #774: the
+    feed must not become the back door the inbox closed, so only the addresses
+    covering this caller show the notice at all.
+
+    With ``for_wakeup`` the answer is narrower (#821). A fleet under one token
+    shares one agent name, so mail addressed to the AGENT reaches every session
+    of it; waking all of them for one session's answer spends everyone's turn
+    on someone else's context — observed live when an answer meant for another
+    session arrived saying "AC-1 can be considered closed". What still wakes:
+    a message to this session, a message that names it in ``for_session``, a
+    handoff (passing work is too expensive to wait for the next poll), and the
+    caller's own send — the sender is awake anyway, and dropping it would move
+    their cursor past a notice they never saw.
     """
-    if payload.get("from_session_id") in refs["sessions"]:
-        return True
-    if payload.get("from_agent") and payload.get("from_agent") == refs["agent"]:
-        return True
+    own = bool(
+        payload.get("from_session_id") in refs["sessions"]
+        or (payload.get("from_agent") and payload.get("from_agent") == refs["agent"])
+    )
     to_kind = payload.get("to_kind")
     to_ref = payload.get("to_ref")
-    if to_kind == "session":
-        return to_ref in refs["sessions"]
+    personal = to_kind == "session" and to_ref in refs["sessions"]
+    named = (
+        bool(payload.get("for_session"))
+        and payload["for_session"] in (refs["sessions"])
+    )
+
+    if for_wakeup:
+        return own or personal or named or payload.get("kind") == "handoff"
+
+    if own:
+        return True
+    if personal:
+        return True
     if to_kind == "agent":
         return bool(refs["agent"]) and to_ref == refs["agent"]
     if to_kind == "task":

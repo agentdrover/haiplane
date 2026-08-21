@@ -282,3 +282,122 @@ def test_existing_task_waits_are_untouched(tmp_path, monkeypatch, capsys):
     woke = capsys.readouterr().out
     assert "задача #42" in woke
     assert "status: 'review' → 'running'" in woke
+
+
+# ---- #821: what wakes a session, now that its name is shared ----
+
+
+async def _fleet(db) -> None:
+    """Two sessions of one agent, plus a stranger's."""
+    await repo.upsert_agent_session(
+        db, session_id="s-beta", principal_id=12, agent="beta"
+    )
+    await repo.upsert_agent_session(
+        db, session_id="s-beta-2", principal_id=12, agent="beta"
+    )
+    await repo.upsert_agent_session(
+        db, session_id="s-alpha", principal_id=11, agent="alpha"
+    )
+    await db.commit()
+
+
+async def test_only_personal_mail_wakes_a_session(client: AsyncClient, monkeypatch, db):
+    auth = _auth(monkeypatch)
+    await _fleet(db)
+
+    # Addressed to the agent — every session of beta can read it...
+    await services.send_message(
+        db,
+        MessageSend(
+            to_kind="agent",
+            to_ref="beta",
+            body="всем моим сессиям",
+            session_id="s-alpha",
+        ),
+        agent="alpha",
+        principal_id=11,
+    )
+    inbox = await client.get("/api/messages?session_id=s-beta", headers=auth["beta"])
+    assert len(inbox.json()) == 1, "agent mail stays readable in the inbox"
+
+    # ...but it does not interrupt them.
+    feed = await client.get("/api/events?kinds=message_posted", headers=auth["beta"])
+    assert feed.json()["events"] == [], (
+        "waking a whole fleet for one session's answer spends everyone's turn "
+        "on someone else's context"
+    )
+    assert feed.json()["next_cursor"] >= 1, "the cursor still moves past it"
+
+    # Addressed to the session itself — this is what a wake-up is for.
+    await services.send_message(
+        db,
+        MessageSend(
+            to_kind="session", to_ref="s-beta", body="лично тебе", session_id="s-alpha"
+        ),
+        agent="alpha",
+        principal_id=11,
+    )
+    feed = await client.get(
+        f"/api/events?kinds=message_posted&since={feed.json()['next_cursor']}",
+        headers=auth["beta"],
+    )
+    assert [e["payload"]["to_ref"] for e in feed.json()["events"]] == ["s-beta"]
+
+
+async def test_named_session_is_woken_through_agent_mail(
+    client: AsyncClient, monkeypatch, db
+):
+    """for_session is the sender saying who they meant — and that wakes them."""
+    auth = _auth(monkeypatch)
+    await _fleet(db)
+
+    await services.send_message(
+        db,
+        MessageSend(
+            to_kind="agent",
+            to_ref="beta",
+            body="это для второй сессии",
+            session_id="s-alpha",
+            for_session="s-beta-2",
+        ),
+        agent="alpha",
+        principal_id=11,
+    )
+
+    named = await client.get(
+        "/api/events?kinds=message_posted&session_id=s-beta-2", headers=auth["beta"]
+    )
+    assert len(named.json()["events"]) == 1, "the session that was meant is woken"
+
+    # And the sibling, whose name was not on it, is left alone. Without
+    # session_id the hub cannot tell them apart — they share one token — so
+    # naming the session is what makes the distinction possible at all.
+    sibling = await client.get(
+        "/api/events?kinds=message_posted&session_id=s-beta", headers=auth["beta"]
+    )
+    assert sibling.json()["events"] == [], (
+        "mail naming a sibling must not spend this session's turn"
+    )
+
+
+async def test_handoff_still_wakes_the_fleet(client: AsyncClient, monkeypatch, db):
+    auth = _auth(monkeypatch)
+    await _fleet(db)
+
+    await services.send_message(
+        db,
+        MessageSend(
+            to_kind="agent",
+            to_ref="beta",
+            body="передаю задачу, подхватите кто свободен",
+            kind="handoff",
+            session_id="s-alpha",
+        ),
+        agent="alpha",
+        principal_id=11,
+    )
+
+    feed = await client.get("/api/events?kinds=message_posted", headers=auth["beta"])
+    assert len(feed.json()["events"]) == 1, (
+        "passing work is too expensive to wait for the next poll"
+    )

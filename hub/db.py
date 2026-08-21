@@ -1063,6 +1063,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on "
         "ON task_dependencies(depends_on_task_id)",
     ),
+    (
+        # Who a message addressed to an AGENT was actually meant for (#821).
+        # A fleet under one token shares one agent name, so to_kind='agent' is
+        # a broadcast: on 21.08.2026 an answer meant for one session landed in
+        # another's inbox saying "AC-1 can be considered closed". The field
+        # changes no addressing — every session of that agent still reads the
+        # message — it only lets the sender say who it is for, which is what
+        # the sender knew and had no way to write down.
+        "add_agent_messages_for_session",
+        "ALTER TABLE agent_messages ADD COLUMN for_session TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

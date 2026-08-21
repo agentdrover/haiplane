@@ -2598,6 +2598,7 @@ async def insert_agent_message(
     body: str,
     related_task_id: int | None = None,
     thread_id: str = "",
+    for_session: str = "",
 ) -> int:
     """Append a message. Deliberately NO commit: the caller writes the
     ``message_posted`` event in the same transaction, so a rollback removes
@@ -2606,8 +2607,8 @@ async def insert_agent_message(
     cur = await db.execute(
         "INSERT INTO agent_messages "
         "(thread_id, from_principal_id, from_session_id, from_agent, from_model, "
-        " to_kind, to_ref, kind, body, related_task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " to_kind, to_ref, kind, body, related_task_id, for_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             thread_id,
             from_principal_id,
@@ -2619,6 +2620,7 @@ async def insert_agent_message(
             kind,
             body,
             related_task_id,
+            for_session or "",
         ),
     )
     message_id = cur.lastrowid
