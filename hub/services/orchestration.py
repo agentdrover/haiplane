@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import aiosqlite
@@ -1103,9 +1104,67 @@ async def merge_before_completion(
         return False, f"merge_gate_error: {exc}"
 
 
-async def pr_for_delivery(
-    db: aiosqlite.Connection, task: dict[str, Any]
+@dataclass(frozen=True)
+class DeliveryPR:
+    """Which PR carries this delivery, and whether it can carry it at all (#802).
+
+    ``unusable`` is the state that had no name before: the recorded PR is
+    closed, not merged, and no open PR replaces it. Left unnamed, the gate
+    walked on and tried to merge a corpse — approved, green work could not be
+    delivered by any supported path.
+    """
+
+    number: int | None = None
+    reason: str = ""
+    unusable: bool = False
+
+
+async def _recorded_pr_state(
+    db: aiosqlite.Connection, task: dict[str, Any], pr_number: int
+) -> tuple[str, str]:
+    """Where the recorded PR stands, and a cause when it cannot be asked (#802).
+
+    Returns ``(state, reason)``. An empty state means "could not look" — never
+    "closed": those two lead to opposite decisions, and reading silence as a
+    verdict is the mistake #725 catalogued.
+    """
+    try:
+        ctx = await project_git_context(db, task["id"])
+        state = await plugins.git_ops.pr_state(
+            pr_number, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
+        log.warning(
+            "PR state lookup failed for #%s (#%s): %s", task["id"], pr_number, exc
+        )
+        return "", f"состояние PR #{pr_number} не удалось узнать: {exc}"
+    if not state:
+        return (
+            "",
+            f"состояние PR #{pr_number} неизвестно — доставка идёт по нему как раньше",
+        )
+    return state, ""
+
+
+async def _live_pr_for_branch(
+    db: aiosqlite.Connection, task: dict[str, Any], branch: str
 ) -> tuple[int | None, str]:
+    """An open PR for this branch, or a cause. Records nothing by itself."""
+    try:
+        ctx = await project_git_context(db, task["id"])
+        found = await plugins.git_ops.pr_for_branch(
+            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
+        log.warning("PR search failed for #%s (%s): %s", task["id"], branch, exc)
+        return None, f"поиск открытого PR по ветке {branch} не ответил: {exc}"
+    if found is None:
+        return None, ""
+    await repo.update_task(db, task["id"], pr_number=int(found))
+    return int(found), ""
+
+
+async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> DeliveryPR:
     """The PR that carries this task's branch, looked up at done time (#767).
 
     Discovery used to happen once, inside ``submit_for_review``. A PR opened
@@ -1115,18 +1174,47 @@ async def pr_for_delivery(
     "Task completed" over an open PR #336. Nothing in the flow forbids that
     order; the hub simply stopped looking.
 
-    Returns ``(pr_number, reason)``. A filled number is recorded on the task
+    Returns a :class:`DeliveryPR`. A filled number is recorded on the task
     so the gate and the drift guard see the same PR. An empty number with an
     empty reason means "this task has no branch to carry a PR" — today's
     behaviour for config and docs work, and no network call is made for it.
     A reason is filled only when the lookup itself could not answer, which is
     a cause to report, never an exception to raise (AC-4).
     """
-    if task.get("pr_number"):
-        return int(task["pr_number"]), ""
     branch = (task.get("branch") or "").strip()
+    recorded = int(task["pr_number"]) if task.get("pr_number") else None
+    if recorded is not None:
+        # The recorded number is a cached observation, not a fact — the same
+        # thing #767 established for an empty field, now for a stale one. A PR
+        # can close without its author: a stacked PR dies when its base branch
+        # is merged and deleted, which is exactly what stranded #774 with a
+        # live branch, a green PR, and a closed number on the task.
+        state, note = await _recorded_pr_state(db, task, recorded)
+        if state == "closed":
+            replacement, find_note = (
+                await _live_pr_for_branch(db, task, branch) if branch else (None, "")
+            )
+            if replacement and replacement != recorded:
+                return DeliveryPR(
+                    replacement,
+                    f"записанный PR #{recorded} закрыт и не слит — "
+                    f"доставка идёт открытым PR #{replacement} той же ветки",
+                )
+            return DeliveryPR(
+                recorded,
+                find_note
+                or (
+                    f"записанный PR #{recorded} закрыт и не слит, а открытого "
+                    f"PR у ветки {branch or '(ветки нет)'} не нашлось"
+                ),
+                unusable=True,
+            )
+        # merged, open, or unknown: the number stands. "Merged" must never be
+        # replaced — a second merge is not extra safety, and #605 already had
+        # to guard that. "Unknown" keeps today's behaviour with a named cause.
+        return DeliveryPR(recorded, note)
     if not branch:
-        return None, ""
+        return DeliveryPR()
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
@@ -1136,13 +1224,13 @@ async def pr_for_delivery(
         log.warning(
             "PR lookup at done failed for #%s (%s): %s", task["id"], branch, exc
         )
-        return None, f"поиск PR по ветке {branch} не ответил: {exc}"
+        return DeliveryPR(reason=f"поиск PR по ветке {branch} не ответил: {exc}")
     if found is None:
-        return None, (
-            f"открытый PR для ветки {branch} не найден — доставка не проверялась"
+        return DeliveryPR(
+            reason=f"открытый PR для ветки {branch} не найден — доставка не проверялась"
         )
     await repo.update_task(db, task["id"], pr_number=found)
-    return int(found), ""
+    return DeliveryPR(int(found))
 
 
 async def transition_after_agent_done(
@@ -1170,17 +1258,27 @@ async def transition_after_agent_done(
         # tasks over unmerged branches. The lookup runs here, at done time,
         # instead of only at submission.
         pr_note = ""
+        # Bound before the branch: the refusal below reads it, and a name that
+        # exists only on one path is a trap for the next edit.
+        delivery_pr = DeliveryPR()
         if not task.get("job_id"):
-            found, pr_note = await pr_for_delivery(db, task)
-            if found:
-                task = {**task, "pr_number": found}
+            delivery_pr = await pr_for_delivery(db, task)
+            if delivery_pr.number:
+                task = {**task, "pr_number": delivery_pr.number}
+            pr_note = delivery_pr.reason
         if pr_note:
             # The gate could not look. Completion still follows today's rule,
             # but the reader is told which check did not run — an absent line
             # here would read as "there was nothing to deliver" (AC-4).
             await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
         if task.get("pr_number") and not task.get("job_id"):
-            ok, detail = await merge_before_completion(db, task)
+            if delivery_pr.unusable:
+                # Nothing to merge: the recorded PR is closed and nothing
+                # replaces it. Refusing here is the decision the merge gate
+                # would reach anyway, taken before touching GitHub.
+                ok, detail = False, delivery_pr.reason
+            else:
+                ok, detail = await merge_before_completion(db, task)
             if not ok:
                 await repo.update_task(db, task_id, status="needs_decision")
                 await repo.add_task_update(

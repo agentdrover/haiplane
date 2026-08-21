@@ -516,3 +516,88 @@ async def test_pinned_sha_message_has_no_false_not_pinned(db, monkeypatch):
     assert "NOT pinned" not in submission, (
         "a pinned commit and 'NOT pinned' cannot both be true of one submission"
     )
+
+
+# ---- #802: a recorded PR number is an observation, not a fact ----
+#
+# A pull request can close without its author: a stacked PR dies when its base
+# branch is merged and deleted. That stranded #774 — live branch, green PR,
+# closed number on the task — and the gate, holding the number, refused to
+# deliver approved work at all. Same rule as #767, other direction: the field
+# caches what was seen, so it has to be re-checked before it is trusted.
+
+
+def _git_with_state(state: str, *, found: int | None = None):
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_state = AsyncMock(return_value=state)
+    g.pr_for_branch = AsyncMock(return_value=found)
+    return g
+
+
+async def test_a_closed_pr_is_replaced_by_the_live_one(db):
+    g = _git_with_state("closed", found=362)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 362, "the live PR is recorded on the task"
+    assert g.merge_pr.await_args.args[0] == 362, "and it is the one delivered"
+    assert task["status"] == "completed"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#360" in feed and "#362" in feed, "both numbers are named in the feed"
+
+
+async def test_a_merged_pr_is_never_replaced(db):
+    g = _git_with_state("merged", found=999)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 360, "a merged PR keeps its number"
+    g.pr_for_branch.assert_not_awaited()
+    assert g.merge_pr.await_args.args[0] == 360, (
+        "merging twice is not extra safety — #605 had to guard exactly this"
+    )
+
+
+async def test_no_live_pr_is_a_named_refusal(db):
+    _git_with_state("closed", found=None)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed", "nothing was delivered, nothing completes"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#360" in feed and "закрыт" in feed
+
+
+async def test_pr_state_failure_is_a_reason_not_an_exception(db):
+    g = _git_with_state("open")
+    g.pr_state = AsyncMock(side_effect=RuntimeError("gh is not installed"))
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "an unanswerable question keeps today's behaviour instead of blocking"
+    )
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "gh is not installed" in feed
