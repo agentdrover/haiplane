@@ -1,0 +1,37 @@
+{# The latest message of every thread (#775).
+
+   Every thread, including ones addressed straight from one session to another
+   with no task attached — a channel between agents is allowed to exist exactly
+   because the owner sees all of it. Bodies are rendered as text: Jinja escapes
+   them, and nothing here uses |safe, because agents write this content. #}
+<section class="dash-card">
+    <div class="dash-card-header">
+        <h2>Переписка сессий</h2>
+        {% if message_threads %}<span class="section-count">{{ message_threads | length }}</span>{% endif %}
+    </div>
+    {% if message_threads %}
+    <ul class="thread-list">
+        {% for m in message_threads %}
+        <li class="thread-row">
+            <div class="thread-meta">
+                <span class="badge badge--xs">{{ m.kind }}</span>
+                <span class="thread-from">{{ m.from_agent or 'anonymous' }}</span>
+                {% if m.from_model %}<span class="thread-model">{{ m.from_model }}</span>{% endif %}
+                <span class="thread-arrow">→</span>
+                <span class="thread-to">{{ m.to_kind }}:{{ m.to_ref }}</span>
+                {% if m.related_task_id %}
+                <a class="thread-task" href="/tasks/{{ m.related_task_id }}">#{{ m.related_task_id }}</a>
+                {% endif %}
+                <span class="thread-count">{{ m.messages }} сообщ.</span>
+                <time>{{ m.created_at }}</time>
+            </div>
+            <div class="thread-body u-pre-wrap">{{ m.body }}</div>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty empty-sm">
+        <div class="empty-text">Сессии пока не переписывались</div>
+    </div>
+    {% endif %}
+</section>
