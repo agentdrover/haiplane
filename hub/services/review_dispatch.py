@@ -30,6 +30,7 @@ from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.models import RiskClass
 from hub.services.model_family import family
+from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
 log = logging.getLogger(__name__)
 
@@ -172,11 +173,11 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
         return False
-    try:
-        policy = json.loads(project["gate_policy"] or "{}")
-    except (ValueError, KeyError):
-        return False
-    if not isinstance(policy, dict) or policy.get("verdict") != "auto":
+    # #805: one reader, and it answers "call a reviewer?" — not "who signs
+    # the verdict?". Those were the same question only because they shared a
+    # key, which forced the hub's own project to choose between no review
+    # and no human.
+    if not review_dispatch_enabled(gate_policy_of(project)):
         return False
 
     gh_repo = (dict(project).get("repo") or "").strip()

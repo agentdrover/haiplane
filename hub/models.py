@@ -234,7 +234,18 @@ RISK_MAP_BUCKETS: tuple[str, ...] = (
 # policy that could store an inert "r2" would read as permission that does
 # nothing. R3+ is not delegable at all.
 AUTO_APPROVE_CLASSES: tuple[str, ...] = ("r0", "r1")
-GATE_POLICY_KEYS: tuple[str, ...] = ("dor", "verdict", "risk_map", "dor_max_class")
+# 'review' (#805) answers a different question from the two gate keys: it
+# says whether the hub CALLS a reviewer, not who signs the verdict. It is
+# therefore not covered by the default-project lock — dispatching a reviewer
+# removes no human from any gate.
+REVIEW_POLICY_VALUES: tuple[str, ...] = ("off", "dispatch")
+GATE_POLICY_KEYS: tuple[str, ...] = (
+    "dor",
+    "verdict",
+    "review",
+    "risk_map",
+    "dor_max_class",
+)
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
@@ -1441,6 +1452,11 @@ class ProjectPatch(BaseModel):
         if bad:
             raise ValueError(
                 f"gate_policy values must be 'human' or 'auto', got: {bad}"
+            )
+        if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
+            raise ValueError(
+                "gate_policy review must be one of "
+                f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
             )
         if "dor_max_class" in v:
             ceiling = v["dor_max_class"]

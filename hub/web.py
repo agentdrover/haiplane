@@ -852,6 +852,7 @@ async def web_edit_project(project_id: int, request: Request):
         for key in (
             "gate_policy_dor",
             "gate_policy_verdict",
+            "gate_policy_review",
             "gate_policy_dor_max_class",
             "gate_policy_risk_map",
         )
@@ -861,6 +862,13 @@ async def web_edit_project(project_id: int, request: Request):
             "verdict": str(form.get("gate_policy_verdict") or "human").strip()
             or "human",
         }
+        # #805: the review key is offered to EVERY project, including default
+        # — dispatching a reviewer takes no human out of any gate, so the
+        # #743 lock (which is about 'auto' on dor/verdict) does not apply.
+        # Only the recognised value is stored; anything else is dropped
+        # rather than saved as a knob nothing reads.
+        if str(form.get("gate_policy_review") or "").strip() == "dispatch":
+            gate_policy["review"] = "dispatch"
         # #760: the form carries the WHOLE policy, so an emptied field means
         # "remove this knob", not "leave it alone" — the same semantics the
         # selects already have, and the only ones a form can honestly offer.

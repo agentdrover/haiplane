@@ -214,3 +214,50 @@ async def test_risk_map_and_ceiling_refuse_nonsense(client: AsyncClient):
     assert next(p for p in listed if p["id"] == pid)["gate_policy"] == {}, (
         "a refused write must leave nothing behind"
     )
+
+
+# --- The review key (#805) ---------------------------------------------------
+
+
+async def test_review_key_is_stored_and_validated(client: AsyncClient):
+    # The key is part of the policy shape, so a typo is refused at the door
+    # rather than stored as a knob nothing reads. (The dispatcher ALSO reads
+    # an unknown value as off — a policy written straight into the DB must
+    # not spend tokens either.)
+    pid = await _create_project(client, "spike-review")
+
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"review": "dispatch"}}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gate_policy"] == {"review": "dispatch"}
+
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"review": "dispath"}}
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_default_project_may_ask_for_review(client: AsyncClient):
+    # The #743 lock is about handing the hub's own gates to the autopilot.
+    # Calling a reviewer does the opposite: the human keeps the gate and
+    # finally has something to read at it (#804). Refusing this would have
+    # meant the hub's own code is the one code nobody reviews.
+    pid = await _create_project(client, "default")
+
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={
+            "gate_policy": {"dor": "human", "verdict": "human", "review": "dispatch"}
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gate_policy"]["review"] == "dispatch"
+
+    # The lock itself is untouched.
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"verdict": "auto", "review": "dispatch"}},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "default_project_gate_locked"

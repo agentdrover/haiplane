@@ -19,6 +19,7 @@ from hub.integrations import cursor_cloud
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
+from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
     pick_review_model,
     pick_review_profile,
@@ -84,6 +85,7 @@ async def _submitted(
     slug: str,
     *,
     verdict_auto: bool = True,
+    policy: dict | None = None,
     areas: list[str] | None = None,
     risks: list[dict] | None = None,
     clear_risk_class: bool = False,
@@ -96,7 +98,9 @@ async def _submitted(
         repo_name="mrPDA/spike-repo",
         workspace_path="/tmp/ws",
     )
-    if verdict_auto:
+    if policy is not None:
+        await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+    elif verdict_auto:
         await repo.update_project(db, pid, gate_policy=json.dumps({"verdict": "auto"}))
     epic = await _node(db, title="epic", task_type="epic", parent_id=None)
     await repo.update_task(db, epic, project_id=pid)
@@ -411,3 +415,71 @@ async def test_report_without_dispatch_has_no_profile(
     saved = dict(await repo.get_latest_machine_review(db, task_id))
     assert saved["profile"] == ""
     assert saved["incomplete"] == 0, "no dispatch — no budget rule to apply"
+
+
+# --- The review key, separate from the verdict key (#805) --------------------
+#
+# "Call a reviewer" and "who signs the verdict" were one switch, which left
+# the hub's own project choosing between no review and no human. They are
+# two questions now, and only the first one spends tokens.
+
+
+async def test_dispatch_runs_without_auto_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#805): review=dispatch calls the reviewer; the verdict stays
+    # human — no auto-verdict is recorded for the submission.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-rev"}, "run": {"id": "r-rev"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client, db, "spike-review-only", policy={"review": "dispatch"}
+    )
+
+    assert len(recorder.calls) == 1, "the reviewer must be called"
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "the task waits for a human verdict"
+    assert not row["review_verdict"], "policy must not sign the verdict here"
+
+
+async def test_verdict_auto_still_dispatches(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#805): projects that already run on verdict=auto keep working
+    # without anyone editing their stored policy — the autopilot reads the
+    # report, so asking for it implies asking for the review.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-auto"}, "run": {"id": "r-auto"}})
+    _wire(monkeypatch, recorder)
+
+    await _submitted(client, db, "spike-legacy-auto", policy={"verdict": "auto"})
+
+    assert len(recorder.calls) == 1
+
+
+async def test_absent_review_policy_never_dispatches(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#805): today's behaviour for a project that asked for nothing.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-no"}, "run": {"id": "r-no"}})
+    _wire(monkeypatch, recorder)
+
+    await _submitted(client, db, "spike-silent", policy={"dor": "human"})
+
+    assert recorder.calls == []
+
+
+async def test_unknown_review_value_falls_back_to_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#805): a typo, or a value from a future version, must not spend
+    # tokens. Unreadable policy never grants anything — including budget.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-typo"}, "run": {"id": "r-typo"}})
+    _wire(monkeypatch, recorder)
+
+    await _submitted(client, db, "spike-typo", policy={"review": "dispath"})
+
+    assert recorder.calls == []
+    assert review_dispatch_enabled({"review": "dispatch"}) is True
+    assert review_dispatch_enabled({"review": "off"}) is False
+    assert review_dispatch_enabled({}) is False
+    assert review_dispatch_enabled({"verdict": "auto"}) is True
