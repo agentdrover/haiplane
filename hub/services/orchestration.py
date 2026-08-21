@@ -1370,6 +1370,17 @@ async def transition_after_agent_done(
                     detail,
                 )
                 return "needs_decision"
+            # #812: delivery succeeded, so the release range grew. Opening or
+            # refreshing the release PR is best-effort and never blocks the
+            # done report: the report answers about this task, and a release
+            # that could not be prepared is a reason in the log, not a failure
+            # of the work that is already in develop.
+            from hub.services.release import open_release_for_task
+
+            try:
+                await open_release_for_task(db, task_id)
+            except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+                log.warning("release PR not prepared for #%s: %s", task_id, exc)
 
         # Review gate satisfied: either an explicit auto_review opt-out or
         # the current submission already has an APPROVED verdict. Complete

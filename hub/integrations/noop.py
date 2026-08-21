@@ -132,6 +132,27 @@ class NoopGitOps:
         """No git here — "could not look", not "closed" (#802)."""
         return ""
 
+    async def release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]:
+        """No git here — an empty range means the release has nothing to say."""
+        return []
+
+    async def open_release_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        return None
+
     async def merge_commit_sha(
         self,
         pr_number: int,

@@ -218,6 +218,11 @@ MCP_TELEMETRY_MAX_WINDOW_DAYS = int(
 # decides where the line falls.
 MCP_PROFILE = os.environ.get("OPENCLAW_MCP_PROFILE", "v1")
 
+# Release branch (#812): where develop is carried when the project releases by
+# policy. Separate from PAIR_BASE_BRANCH so "where work lands" and "what is in
+# production" stay two different questions.
+RELEASE_BRANCH = os.environ.get("OPENCLAW_RELEASE_BRANCH", "main")
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 
