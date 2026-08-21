@@ -247,7 +247,8 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
             ),
         }
 
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT CASE WHEN mr.profile = '' THEN 'не заявлен' ELSE mr.profile END "
         "AS profile, "  # nosec B608 - constant fragment, values stay params
         "CASE WHEN mr.model = '' THEN 'не заявлена' ELSE mr.model END AS model, "
@@ -274,7 +275,8 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # many confirmed findings are still waiting for an answer. Without these a
     # precision of 1.0 over two findings out of ninety reads like a verdict on
     # the harness.
-    coverage_rows = await db.execute_fetchall(
+    coverage_rows = await fetchall(
+        db,
         "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
         "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
         "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
@@ -318,7 +320,8 @@ async def _tokens_per_fixed(
     """
     if column not in ("tokens_spent", "provider_tokens"):  # pragma: no cover
         raise ValueError(f"unsupported token column: {column}")
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         f"SELECT COALESCE(SUM(mr.{column}), 0) AS tokens, "  # nosec B608 - column is checked above against a literal allow-list
         "COALESCE(SUM(fixed.n), 0) AS fixed FROM machine_reviews mr "
         "JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
