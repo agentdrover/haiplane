@@ -1720,6 +1720,86 @@ class GitOpsIntegration:
         """
         return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
 
+    async def release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]:
+        """Commit subjects that ``head`` carries over ``base``, newest first.
+
+        The subjects are how the release learns what it is carrying: the
+        delivery gate writes «feat(task): …-(#NNN)», so the numbers can be
+        read back out. Empty means nothing to release — or that git could not
+        answer, and the caller treats those the same way it treats an empty
+        range: by doing nothing.
+        """
+        rc, out, _ = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/compare/{base}...{head}",
+            "--jq",
+            ".commits[].commit.message",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not out:
+            return []
+        subjects = [line.split("\n", 1)[0].strip() for line in out.splitlines()]
+        return [s for s in reversed(subjects) if s]
+
+    async def open_release_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        """The open release PR for this range — found, updated, or created.
+
+        Idempotent on purpose (#812 AC-5): two sessions can deliver within
+        seconds of each other, and a second pull request over the same range
+        would split one release into two stories about the same commits.
+        """
+        existing = await _find_pr_for_branch(head, repo, gh_repo=gh_repo)
+        if existing:
+            await _gh(
+                "pr",
+                "edit",
+                str(existing),
+                "--repo",
+                gh_repo or REPO_NAME,
+                "--title",
+                title,
+                "--body",
+                body,
+                repo=repo,
+                check=False,
+            )
+            return existing
+        rc, out, err = await _gh(
+            "pr",
+            "create",
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--base",
+            base,
+            "--head",
+            head,
+            "--title",
+            title,
+            "--body",
+            body,
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.warning("release PR not created: %s", (err or out or "").strip()[:200])
+            return None
+        return _parse_pr_number(out)
+
     async def pr_state(
         self,
         pr_number: int,

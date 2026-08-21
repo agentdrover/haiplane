@@ -1242,6 +1242,15 @@ async def web_task_detail(
     review_report = await _review_report(db, dict(row), mr_row)
     machine_review = review_report.machine_review
 
+    # #823: the evidence the reviewing agent has always had — per-AC test
+    # results, CI against the pinned sha, statement freshness, call sites and
+    # the coverage verdict over them — assembled by the SAME builder that
+    # answers /review-brief. Two readers, one assembly: the card and the brief
+    # cannot drift apart because there is nothing to keep in step.
+    from hub.services.review_brief import gate_evidence
+
+    evidence = await gate_evidence(db, dict(row))
+
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
     if task.status.value == "review" and not task.review_job_id:
@@ -1281,6 +1290,7 @@ async def web_task_detail(
             "task_messages": task_messages,
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,
+            "evidence": evidence,
             "machine_review": machine_review,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,

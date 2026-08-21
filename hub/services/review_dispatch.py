@@ -490,6 +490,14 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             )
             total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
             reported = review.get("tokens_spent")
+            if isinstance(total, int) and total >= 0:
+                # #828: keep the number, not just the complaint about it. The
+                # economics of the practice were being computed from the
+                # harness's own claim; the billed figure was fetched here and
+                # dropped on the floor.
+                await repo.set_machine_review_provider_tokens(
+                    db, task_id, dispatch["submission_generation"], total
+                )
             if isinstance(total, int) and total > 0:
                 mismatch = reported is None or (
                     abs(total - reported) / total > _USAGE_MISMATCH_SHARE

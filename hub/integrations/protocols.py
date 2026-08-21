@@ -220,6 +220,22 @@ class GitOpsPlugin(Protocol):
     async def pr_state(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...
+    async def release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]: ...
+    async def open_release_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None: ...
     async def merge_pr(
         self,
         pr_number: int,

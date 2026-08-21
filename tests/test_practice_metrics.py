@@ -8,9 +8,11 @@ sides of the ratio; unmeasurable waits are reported, never zeroed.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+from httpx import AsyncClient
 
 from hub import repository as repo
 from hub import services
@@ -426,3 +428,95 @@ async def test_empty_window_reports_none_not_zero(db: aiosqlite.Connection):
     assert outcomes["verdicts"] == 0
     assert outcomes["first_pass_acceptance_rate"] is None
     assert outcomes["changes_requested_rate"] is None
+
+
+# --- Cost by the provider's bill, not by self-report (#828) ------------------
+#
+# On the first live cross-model run the harness reported 175 000 tokens while
+# Cursor billed 6 013 569 — a 34x gap (#818). Until now the billed figure was
+# fetched for a mismatch alert and dropped, so the practice economics were
+# computed from what the reviewed party said about itself.
+
+
+async def _report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    confirmed: int = 1,
+    tokens_spent: int | None = 1000,
+    provider_tokens: int | None = None,
+) -> None:
+    findings = json.dumps(
+        [{"title": f"f{i}", "severity": "medium"} for i in range(confirmed)]
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        tokens_spent=tokens_spent,
+        raw_count=confirmed,
+        findings_confirmed=findings,
+        incomplete=False,
+    )
+    if provider_tokens is not None:
+        await repo.set_machine_review_provider_tokens(db, task_id, 1, provider_tokens)
+
+
+async def test_provider_cost_uses_only_reports_with_provider_data(
+    db: aiosqlite.Connection,
+):
+    # AC-2 (#828): the billed price is computed over the billed rows only,
+    # and the share of the sample is named beside it — the #516 rule.
+    billed = await _task(db, title="billed run")
+    unbilled = await _task(db, title="unbilled run")
+    await _report(db, billed, confirmed=2, tokens_spent=1000, provider_tokens=90_000)
+    await _report(db, unbilled, confirmed=8, tokens_spent=1000)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+
+    assert mr["reports_with_provider"] == 1
+    assert mr["provider_tokens_total"] == 90_000
+    # 90 000 over the TWO findings of the billed run, not over all ten.
+    assert mr["provider_tokens_per_confirmed"] == 45_000
+
+
+async def test_self_reported_tokens_never_stand_in_for_provider_data(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#828): a missing bill is not a cheap run. Substituting the
+    # self-report would repeat #516 with a far larger error.
+    task_id = await _task(db, title="self-reported only")
+    await _report(db, task_id, confirmed=1, tokens_spent=175_000)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+
+    assert mr["reports_with_provider"] == 0
+    assert mr["provider_tokens_total"] == 0
+    assert mr["provider_tokens_per_confirmed"] is None, (
+        "no bill means no billed price — not the self-reported one"
+    )
+    assert mr["tokens_per_confirmed"] == 175_000, "the self-report stays its own metric"
+
+
+async def test_both_numbers_stay_visible_when_they_disagree(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-4 (#828): the real #818 figures. Neither number corrects the other:
+    # it is not established which is wrong, and a metric that quietly picks a
+    # winner hides exactly the disagreement worth looking at.
+    task_id = await _task(db, title="the #818 shape")
+    await _report(
+        db, task_id, confirmed=1, tokens_spent=175_000, provider_tokens=6_013_569
+    )
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+    assert mr["tokens_per_confirmed"] == 175_000
+    assert mr["provider_tokens_per_confirmed"] == 6_013_569
+
+    page = (await client.get("/metrics")).text
+    assert "6013569" in page.replace(" ", "").replace("&nbsp;", "")
+    assert "175000" in page.replace(" ", "").replace("&nbsp;", "")

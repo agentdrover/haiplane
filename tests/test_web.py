@@ -4589,3 +4589,87 @@ async def test_rejected_findings_are_readable_with_reasons(client: AsyncClient):
     assert "rejected findings" in resp.text
     assert "style nit" in resp.text
     assert "не дефект" in resp.text
+
+
+# ---- #823: the evidence panel at the verdict gate ----
+
+
+async def _web_task_in_review_with_test_ac(client: AsyncClient, db) -> int:
+    """A submitted task carrying one test-AC with a recorded result."""
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "панель собрана",
+                    "when": "открыта карточка",
+                    "then": "критерий виден со своей проверкой",
+                    "verifiable_by": "test",
+                    "test_ref": "tests/test_web.py::test_evidence_panel_renders_at_the_verdict_gate",
+                }
+            ]
+        },
+    )
+    row = await repo_module.get_task(db, task_id)
+    await repo_module.upsert_ac_test_result(
+        db,
+        task_id=task_id,
+        ac_id="AC-1",
+        generation=dict(row)["submission_generation"],
+        status="pass",
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_evidence_panel_renders_at_the_verdict_gate(client: AsyncClient, db):
+    # AC-1 (#823): every block below was already computed for the review brief
+    # and reached only the agent calling it. The human deciding the verdict saw
+    # the reviewer's report and the implementer's prose — nothing about whether
+    # the ordered criteria had been checked.
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert "Проверено по этой сдаче:" in resp.text
+    assert "AC-1" in resp.text, "per-AC result must be named at the gate"
+    assert "CI по закреплённому коммиту:" in resp.text
+    assert "Свежесть постановки:" in resp.text
+
+
+async def test_missing_evidence_names_its_cause(client: AsyncClient):
+    # AC-2 (#823): a check that could not run says so with its cause. Silence
+    # in this panel would read as "checked, nothing found" — the half-truth
+    # #549 closed for "0 confirmed" and #725 for the brief's blocks.
+    task_id = await _web_task_in_review(client)
+
+    resp = await client.get(f"/tasks/{task_id}")
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    assert brief["evidence_coverage"]["state"] in ("partial", "none")
+    assert brief["evidence_coverage"]["checks_missing"], "the fixture must have gaps"
+    assert "не дали сигнала" in resp.text
+    for check in brief["evidence_coverage"]["checks_missing"]:
+        assert check["reason"], f"{check['check']} went silent without a cause"
+
+
+async def test_implementer_summary_is_secondary_to_evidence(client: AsyncClient, db):
+    # AC-4 (#823): the submission text is a statement by the party being
+    # judged. It stays available, but below the evidence — while it was read
+    # first, writing convincingly paid better than checking carefully.
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "что говорит исполнитель" in resp.text
+    evidence_at = resp.text.index("Проверено по этой сдаче:")
+    summary_at = resp.text.index("что говорит исполнитель")
+    verdict_at = resp.text.index("web-review-verdict")
+    assert evidence_at < summary_at < verdict_at, (
+        "evidence must come before the implementer's own account"
+    )

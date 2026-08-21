@@ -979,7 +979,7 @@ async def test_review_brief_includes_locator_resolution(
     async def _fake_head(repo=None):
         return "task-x/b"
 
-    monkeypatch.setattr("hub.app.collect_test_nodeids", _fake_collect)
+    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _fake_collect)
     monkeypatch.setattr("hub.app.plugins.git_ops.current_branch", _fake_head)
     task = await _create_task(client)
     # Collection is only trusted while the workspace HEAD matches the task
@@ -1018,7 +1018,7 @@ async def test_review_brief_locator_unknown_when_workspace_on_other_branch(
     async def _fake_head(repo=None):
         return "some-other-task/branch"
 
-    monkeypatch.setattr("hub.app.collect_test_nodeids", _fake_collect)
+    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _fake_collect)
     monkeypatch.setattr("hub.app.plugins.git_ops.current_branch", _fake_head)
     task = await _create_task(client)
     await repo.update_task(db, task["id"], branch="task-x/b")

@@ -75,6 +75,32 @@ def review_dispatch_enabled(policy: dict) -> bool:
     return policy.get("review") == REVIEW_DISPATCH
 
 
+# Recognised values of the `release` key (#812). Default is manual, and it is
+# the default on purpose: releasing takes what is in develop as a whole,
+# including other sessions' work, so turning it on is a decision about the
+# project rather than a convenience for whoever delivered last.
+RELEASE_MANUAL = "manual"
+RELEASE_AUTO = "auto"
+
+
+def release_auto_enabled(policy: dict) -> bool:
+    """Whether the hub carries develop into main for this project by itself.
+
+    Anything that is not exactly 'auto' — a typo, a missing key, a value from
+    a future version — reads as manual. An unreadable policy must never ship
+    code, the same way it never grants approval (#743).
+    """
+    if not isinstance(policy, dict):
+        return False
+    return policy.get("release") == RELEASE_AUTO
+
+
+async def release_policy_for_task(db: aiosqlite.Connection, task_id: int) -> str:
+    """``auto`` or ``manual`` for the project this task belongs to."""
+    policy = await gate_policy_for_task(db, task_id)
+    return RELEASE_AUTO if release_auto_enabled(policy) else RELEASE_MANUAL
+
+
 async def risk_map_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, str] | None:

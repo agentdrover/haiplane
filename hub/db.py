@@ -941,6 +941,19 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE review_dispatches ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # What the PROVIDER billed for this review run (#828). The harness
+        # reports its own token count, and on the first live cross-model run
+        # the two disagreed by 34x: 175 000 reported against 6 013 569 billed
+        # (#818). Until now the provider number was fetched only to raise a
+        # mismatch alert and then thrown away, so the practice economics kept
+        # being computed from what the reviewed party said about itself.
+        #
+        # NULL means the provider was never asked or did not answer; 0 would
+        # mean it answered zero. Different facts, never collapsed (#549).
+        "add_machine_reviews_provider_tokens",
+        "ALTER TABLE machine_reviews ADD COLUMN provider_tokens INTEGER",
+    ),
+    (
         # The profile the report was produced under, copied from the dispatch
         # of the same generation. Empty means "no dispatch behind this report"
         # — distinguishable from 'lite', because "we do not know how this was

@@ -20,6 +20,11 @@ from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
 
+# Last refusal reported per project by the release sweep (#812). Kept in memory
+# on purpose: it exists to avoid repeating the same line every cycle, and a
+# restart repeating one line is cheaper than a table nobody reads.
+_release_notices: dict[str, str] = {}
+
 POLL_INTERVAL = 30  # seconds
 
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
@@ -1013,6 +1018,26 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     pruned_sessions,
                     config.SESSION_RETENTION_DAYS,
                 )
+
+            # Release policy (#812): projects that release by policy get their
+            # open develop→main PR merged as soon as CI is green. A red or
+            # missing CI is reported ONCE per reason — the poller walks this
+            # every cycle, and a line per cycle is how a real signal gets muted
+            # (#534). Deploy stays with CI on the merge, as before.
+            try:
+                from hub.services.release import merge_ready_release
+
+                for project_row in await repo.list_projects(db):
+                    merged, reason = await merge_ready_release(db, project_row)
+                    slug = dict(project_row).get("slug") or "?"
+                    if merged:
+                        log.info("Poll: %s — %s", slug, reason)
+                        _release_notices.pop(slug, None)
+                    elif reason and _release_notices.get(slug) != reason:
+                        _release_notices[slug] = reason
+                        log.warning("Poll: %s — %s", slug, reason)
+            except Exception:
+                log.exception("Poll: release policy sweep failed")
 
             # Message retention (#773): the channel is for coordinating work in
             # flight, and the tasks themselves keep the record of what was done.

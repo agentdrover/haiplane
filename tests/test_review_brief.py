@@ -293,3 +293,34 @@ async def test_brief_report_says_when_no_review_happened(client: AsyncClient):
 
     assert brief["review_report"]["state"] == "none"
     assert brief["review_report"]["machine_review"] is None
+
+
+# ---- #823: one assembly, two readers ----
+
+
+async def test_brief_and_card_share_one_evidence_builder(client: AsyncClient):
+    """AC-3 (#823): the human's card and the agent's brief report the same
+    evidence because they are built by the same function.
+
+    Kept behavioural on purpose: two call sites producing equal text today can
+    drift apart tomorrow, so the test asserts the agreement a reader would
+    notice — the coverage verdict and the CI cause — over the same submission.
+    """
+    created = await client.post("/api/tasks", json={"title": "Shared evidence"})
+    task_id = created.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    card = (await client.get(f"/tasks/{task_id}")).text
+
+    assert brief["evidence_coverage"]["state"] in card
+    assert brief["ci_run_report"]["reason"] in card, (
+        "the cause the agent is given must be the cause the human is given"
+    )
