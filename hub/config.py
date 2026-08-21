@@ -99,6 +99,14 @@ REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000
 EMPTY_REVIEW_MIN_USAGE = int(
     os.environ.get("OPENCLAW_EMPTY_REVIEW_MIN_USAGE", "200000")
 )
+# Class ceiling for the proven-empty path (#835): usage proves the reviewer
+# WORKED, never that it was ABLE to find — and the cross-model reviewer runs
+# on the free tier of its provider. So an empty report may stand in for a
+# review only where the cost of a miss matches that reviewer: at or below
+# this class. Above it the human keeps the verdict even when the emptiness
+# is proven. An unknown value reads as the strictest band, not as "off" —
+# a typo in a drop-in must not silently disable a safeguard.
+PROVEN_EMPTY_MAX_CLASS = os.environ.get("OPENCLAW_PROVEN_EMPTY_MAX_CLASS", "r1")
 # Cursor Cloud Agents API (#756): the server-side executor for cross-model
 # reviews. Empty key = the integration is off and every client method
 # degrades to None without a network call. The key comes from the Cursor

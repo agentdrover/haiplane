@@ -353,3 +353,127 @@ async def test_unproven_empty_review_stays_human(
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["status"] == "review"
     assert body["review_verdict"] is None
+
+
+async def test_proven_empty_above_class_ceiling_stays_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#835): the emptiness is proven exactly as #769 demands, but the
+    # task is R2 and the ceiling is R1. Billed usage proves the reviewer
+    # worked, never that it could find — and above the ceiling that is not
+    # enough. Refused quietly, with the reason in the feed for the digest.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client,
+        db,
+        "spike-ceiling",
+        {"verdict": "auto"},
+        areas=["hub/services/auto_verdict.py"],
+    )
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["risk_class"] == "R2", "the probe must actually sit above the ceiling"
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+    feed = [u["content"] for u in body["updates"] or []]
+    held = [c for c in feed if "пустое ревью выше потолка класса" in c]
+    assert held, "the digest must be able to see WHY the ceiling held it back"
+    assert "R2" in held[0] and "R1" in held[0]
+    assert not await _events(db, "verdict_escalated", task_id), "silent, not a trigger"
+
+
+async def test_proven_empty_at_ceiling_still_auto_approved(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2 (#835): at the ceiling nothing changes — #769 keeps working for
+    # the classes it was meant for, or the ceiling would be a rollback.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client, db, "spike-at-ceiling", {"verdict": "auto"}, areas=["tests/test_x.py"]
+    )
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["risk_class"] == "R1", "the probe must sit exactly at the ceiling"
+    assert body["review_verdict"] == "approved"
+    feed = [u["content"] for u in body["updates"] or []]
+    assert any("Пустота доказана: usage=250000" in c for c in feed)
+
+
+async def test_ceiling_does_not_touch_non_empty_reviews(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3 (#835): raw_count >= 1 on an R3 task still auto-approves. The
+    # ceiling narrows the INFERRED proof of #769, not the ordinary ground:
+    # candidates on the table are capability shown, not inferred.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client, db, "spike-nonempty", {"verdict": "auto"}, areas=["hub/auth.py"]
+    )
+
+    await _post_review(client, task_id, raw_count=3)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["risk_class"] == "R3", "the probe must sit far above the ceiling"
+    assert body["review_verdict"] == "approved"
+    feed = [u["content"] for u in body["updates"] or []]
+    assert not any("выше потолка класса" in c for c in feed)
+
+
+async def test_proven_empty_without_class_stays_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-4 (#835): no computed class is absence of data about the blast
+    # radius, and an empty review is absence of data about the code. Two
+    # unknowns are not a ground — NULL never reads as R0.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-noclass", {"verdict": "auto"})
+    await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
+    await db.commit()
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+    feed = [u["content"] for u in body["updates"] or []]
+    held = [c for c in feed if "пустое ревью выше потолка класса" in c]
+    assert held and "не вычислен" in held[0]
+
+
+async def test_unknown_ceiling_value_is_strict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-5 (#835): a typo in the drop-in closes the path instead of opening
+    # it. An unreadable safeguard setting must never read as "no limit" —
+    # the probe here is R0, which every real ceiling would have approved.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "PROVEN_EMPTY_MAX_CLASS", "all")
+    task_id = await _submitted_task(client, db, "spike-typo", {"verdict": "auto"})
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(
+        client, task_id, raw_count=0, findings_rejected=[], tokens_spent=240_000
+    )
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["risk_class"] == "R0", "even the harmless class must be refused"
+    assert body["review_verdict"] is None
+    feed = [u["content"] for u in body["updates"] or []]
+    assert any("путь закрыт" in c for c in feed)

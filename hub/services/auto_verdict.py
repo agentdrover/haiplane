@@ -20,7 +20,13 @@ human gate:
   is PROVEN by the provider — the hub itself dispatched the reviewer
   (#757), the dispatch settled as done, and the provider's billed usage
   both clears a floor and agrees with the report's own tokens_spent.
-  The first live grok run (claimed 36k, billed 1.47M) fails this check;
+  The first live grok run (claimed 36k, billed 1.47M) fails this check.
+  That proof is bounded (#835): billed usage says the reviewer WORKED,
+  never that it was ABLE to find, and the reviewer runs on its provider's
+  free tier. So the proven-empty path applies only at or below
+  ``config.PROVEN_EMPTY_MAX_CLASS``; above it the human keeps the verdict.
+  A raw_count >= 1 report is untouched by the ceiling — candidates on the
+  table are capability shown, not inferred from a token counter;
 - green CI recorded for the PINNED submission_sha (#546/#572);
 - the branch tip still stands where it was submitted;
 - the actual diff stays inside declared areas and does not raise the
@@ -36,7 +42,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
-from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict
 from hub.services.ci_report import VALIDATION_PASS
 
 log = logging.getLogger(__name__)
@@ -63,6 +69,42 @@ async def _escalate(db: aiosqlite.Connection, task_id: int, reason: str) -> None
         payload={"reason": reason},
     )
     await db.commit()
+
+
+def _proven_empty_ceiling() -> RiskClass | None:
+    """The highest class an empty review may still auto-approve (#835).
+
+    None closes the proven-empty path entirely — which is what an
+    unrecognised value means. A typo in a systemd drop-in must not read as
+    "no limit"; the same reasoning that keeps a NULL risk_class from
+    reading as R0.
+    """
+    raw = (config.PROVEN_EMPTY_MAX_CLASS or "").strip().lower()
+    try:
+        return RiskClass[raw]
+    except KeyError:
+        return None
+
+
+def _within_proven_empty_ceiling(task: dict) -> bool:
+    """Is this task's OWN class at or below the proven-empty ceiling (#835)?
+
+    A task with no computed class fails: absence of a class is absence of
+    data about the blast radius, and an empty review is already absence of
+    data about the code. Two unknowns do not make a ground.
+    """
+    ceiling = _proven_empty_ceiling()
+    if ceiling is None:
+        return False
+    stored = (task.get("risk_class") or "").strip()
+    if not stored:
+        return False
+    try:
+        current = RiskClass(stored)
+    except ValueError:
+        return False
+    order = list(RiskClass)
+    return order.index(current) <= order.index(ceiling)
 
 
 async def _proven_empty_usage(
@@ -205,6 +247,30 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         # unless the provider's billing proves the reviewer worked (#769).
         proven_usage = await _proven_empty_usage(db, task_id, generation, review)
         if proven_usage is None:
+            return False
+        # Proven work is not proven capability (#835): an empty report may
+        # stand in for a review only where a miss costs no more than this
+        # reviewer is worth. Refused quietly — no trigger fired, the human
+        # gate simply stands — but the reason goes to the feed so the
+        # digest (#739) can show what the ceiling actually held back.
+        if not _within_proven_empty_ceiling(task):
+            ceiling = _proven_empty_ceiling()
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                (
+                    "Автовердикт НЕ вынесен: пустое ревью выше потолка "
+                    f"класса. Класс задачи: {task.get('risk_class') or 'не вычислен'}, "
+                    f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
+                    f"(OPENCLAW_PROVEN_EMPTY_MAX_CLASS={config.PROVEN_EMPTY_MAX_CLASS!r}). "
+                    f"Работа ревьюера доказана (usage={proven_usage}), способность — нет. "
+                    "Вердикт остаётся человеку."
+                ),
+                author_kind="hub",
+            )
+            await db.commit()
             return False
 
     pinned_sha = (task.get("submission_sha") or "").strip()
