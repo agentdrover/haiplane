@@ -3032,6 +3032,31 @@ async def mcp_usage_by_profile(
     return [dict(row) for row in rows]
 
 
+async def mcp_usage_by_role(
+    db: aiosqlite.Connection, *, window_days: int
+) -> list[dict[str, Any]]:
+    """Per-role totals for the window: who the Agent API is actually for.
+
+    The role is already on every record (#780); until it was grouped, a report
+    could say which tools were called but not whether reviewers and analysts
+    call any at all. That distinction decides what "nobody called this tool"
+    means — genuinely unused, or used from somewhere this table cannot see
+    (#816).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT principal_role, COUNT(*) AS calls, "
+        "COUNT(DISTINCT tool) AS tools, "
+        "COUNT(DISTINCT COALESCE(principal_id, -1)) AS principals, "
+        "SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_calls, "
+        "SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS error_calls, "
+        "SUM(response_chars) AS total_chars "
+        "FROM mcp_call_events WHERE created_at >= datetime('now', ?) "
+        "GROUP BY principal_role ORDER BY calls DESC",
+        (f"-{int(window_days)} days",),
+    )
+    return [dict(row) for row in rows]
+
+
 async def mcp_usage_errors(
     db: aiosqlite.Connection, *, window_days: int, limit: int = 20
 ) -> list[dict[str, Any]]:
