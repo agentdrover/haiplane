@@ -1033,7 +1033,11 @@ def _slug_for_task(task_id: int, task: dict[str, Any], branch_slug: str) -> str:
     existing = (task.get("branch") or "").strip()
     prefix = f"task-{task_id}/"
     if existing.startswith(prefix):
-        return existing[len(prefix) :]
+        # #884: a branch already doubled by the old code carries the prefix
+        # twice; returning the tail verbatim would feed it back in and grow
+        # the name on every restart. canonical_task_branch strips repeats,
+        # and this path hands it the same shape it expects.
+        return existing[len(prefix) :].strip("/")
     return ""
 
 

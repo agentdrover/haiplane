@@ -300,6 +300,40 @@ def _slugify(title: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
+def canonical_task_branch(task_id: int, branch_slug: str, title: str = "") -> str:
+    """The one place a task's branch name is assembled (#884).
+
+    Three call sites used to build ``f"task-{id}/{slug}"`` inline, and none
+    asked whether the slug already carried that prefix. A caller passing
+    "task-818/daily-digest" — which is exactly how the branch is written in a
+    work plan — got ``task-818/task-818/daily-digest``. On production that
+    cost four mechanisms in a row: the gate could not find the PR for such a
+    name, pr_number stayed empty, the merge went outside the pipeline, and
+    the dependency graph then reported delivered code as undelivered.
+
+    Same lesson as #607, which put transliteration behind one function: a
+    rule copied into three call sites drifts, starting with the copy nobody
+    touches.
+
+    The prefix is stripped only when it matches THIS task exactly, slash
+    included — a slug like "task-runner-fix" is a name, not a prefix. The
+    strip repeats, so a branch already doubled by the old code normalises on
+    its next pair-start instead of growing again.
+    """
+    slug = (branch_slug or "").strip()
+    prefix = f"task-{task_id}/"
+    # Strip BEFORE trimming slashes: "task-601/" only reads as a prefix while
+    # its trailing slash is still there. Trimming first left "task-601" and
+    # produced "task-601/task-601" — caught by the empty-slug test below.
+    while slug.startswith(prefix):
+        slug = slug[len(prefix) :]
+    slug = slug.strip("/")
+    if not slug:
+        # An empty slug once produced "task-601/" — an invalid ref (#607).
+        slug = _slugify(title)
+    return f"task-{task_id}/{slug}"
+
+
 def _conv_commit_type(title: str) -> str:
     t = title.lower()
     if any(k in t for k in ("fix", "bug", "исправ", "баг")):
@@ -595,8 +629,7 @@ class GitOpsIntegration:
         # Project git context (#337): headless branches historically cut
         # from main; a project may define its own integration branch.
         base = _resolve_base(base_branch)
-        slug = _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, "", title)
 
         # Refuse before touching anything (#361 I2). The old shape checked out
         # base without looking at the result, then ran `checkout .` + `clean -fd`
@@ -718,8 +751,7 @@ class GitOpsIntegration:
                     base_branch=base,
                 )
 
-        slug = (branch_slug or "").strip() or _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, branch_slug, title)
 
         rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
         if rc == 0:
@@ -1115,8 +1147,7 @@ class GitOpsIntegration:
                 raise PairBranchConflictError(reason)
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
-        slug = (branch_slug or "").strip() or _slugify(title)
-        branch = f"task-{task_id}/{slug}"
+        branch = canonical_task_branch(task_id, branch_slug, title)
         wt_path = _worktree_path(task_id, repo)
 
         # Clear stale registrations (a worktree dir deleted out from under git)

@@ -22,6 +22,7 @@ import pytest
 from fastapi import HTTPException
 
 from hub import repository as repo
+from hub.integrations.git_ops import canonical_task_branch
 from hub import services
 from hub.models import TaskCreate, TaskSubmitReview, TaskUpdateCreate
 
@@ -149,4 +150,59 @@ async def test_the_done_report_path_is_unaffected(db: aiosqlite.Connection):
     assert any(u["kind"] == "status" for u in updates)
     await services.add_update(
         db, task_id, TaskUpdateCreate(agent="dev", kind="status", content="still here")
+    )
+
+
+# --- One place assembles the name (#884) -------------------------------------
+#
+# Three call sites built f"task-{id}/{slug}" inline, none asking whether the
+# slug already carried the prefix. A caller passing "task-818/daily-digest" —
+# how the branch is written in a work plan — got task-818/task-818/daily-
+# digest, and that cost four mechanisms in a row on production: the gate did
+# not find the PR, pr_number stayed empty, the merge went outside the
+# pipeline, and the dependency graph called delivered code undelivered.
+
+
+def test_slug_with_prefix_is_not_doubled():
+    # AC-1 (#884): the exact shape observed on #818.
+    assert (
+        canonical_task_branch(818, "task-818/daily-digest", "Daily digest")
+        == "task-818/daily-digest"
+    )
+
+
+def test_both_slug_forms_give_one_branch():
+    # AC-2 (#884): the caller should not have to know which half to pass.
+    with_prefix = canonical_task_branch(818, "task-818/daily-digest", "t")
+    without_prefix = canonical_task_branch(818, "daily-digest", "t")
+    assert with_prefix == without_prefix == "task-818/daily-digest"
+
+
+def test_lookalike_slug_is_left_alone():
+    # AC-3 (#884): "task-" is a common word in a branch name. Only the exact
+    # prefix of THIS task, slash included, is a prefix.
+    assert (
+        canonical_task_branch(818, "task-runner-fix", "t") == "task-818/task-runner-fix"
+    )
+    # Another task's prefix is part of the name here, not a duplicate of ours.
+    assert (
+        canonical_task_branch(818, "task-42/other-work", "t")
+        == "task-818/task-42/other-work"
+    )
+
+
+def test_restart_does_not_grow_the_branch_name():
+    # AC-4 (#884): a branch already doubled by the old code normalises on the
+    # next pair-start instead of gaining another prefix each time.
+    doubled = "task-818/task-818/daily-digest"
+    once = canonical_task_branch(818, doubled, "t")
+    twice = canonical_task_branch(818, once, "t")
+    assert once == twice == "task-818/daily-digest"
+
+
+def test_empty_slug_still_falls_back_to_the_title():
+    # #607: an empty slug once produced "task-601/", an invalid ref. The
+    # normalisation must not reintroduce that by stripping a slug to nothing.
+    assert canonical_task_branch(601, "task-601/", "Заголовок кириллицей") == (
+        "task-601/zagolovok-kirillitsei"
     )
