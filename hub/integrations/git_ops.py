@@ -1733,6 +1733,11 @@ class GitOpsIntegration:
         an answer: "could not look" and "closed" lead to opposite decisions
         about delivery (#802, the rule #725 wrote down).
         """
+        # One field, and it is the whole answer: gh reports MERGED as a STATE,
+        # and there is no `merged` flag to ask for. Asking for one made the
+        # call fail outright ("Unknown JSON field"), so this method returned
+        # "could not look" every single time and the gate it feeds quietly
+        # fell back to the old behaviour (#803, found on the first live run).
         rc, out, _ = await _gh(
             "pr",
             "view",
@@ -1740,7 +1745,7 @@ class GitOpsIntegration:
             "--repo",
             gh_repo or REPO_NAME,
             "--json",
-            "state,merged",
+            "state",
             repo=repo,
             check=False,
         )
@@ -1750,10 +1755,7 @@ class GitOpsIntegration:
             data = json.loads(out)
         except json.JSONDecodeError:
             return ""
-        if data.get("merged"):
-            return "merged"
-        state = str(data.get("state") or "").lower()
-        return state or ""
+        return str(data.get("state") or "").lower()
 
     async def merge_commit_sha(
         self,
