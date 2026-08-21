@@ -1922,3 +1922,70 @@ async def test_unreadable_diff_is_none_not_empty(
     # And a branch that genuinely changes nothing still answers [], not None.
     _run_git("git", "checkout", "-q", "-b", "task-762/empty", cwd=repo)
     assert await git_ops.branch_diff_paths("task-762/empty", repo=str(repo)) == []
+
+
+# ---- #803: pr_state asks gh a question gh can answer ----
+#
+# The four tests that shipped with #802 mocked pr_state itself, so the boundary
+# with gh — the one place the defect lived — was never touched: the call asked
+# for a `merged` field that does not exist, gh refused the whole command, and
+# the method answered "could not look" forever. These tests stub _gh instead,
+# which is the only way to see what is actually asked and what is parsed.
+
+
+async def test_pr_state_asks_gh_only_for_fields_it_has(
+    git_ops: GitOpsIntegration,
+) -> None:
+    seen: dict[str, tuple] = {}
+
+    async def fake_gh(*args, **kw):
+        seen["args"] = args
+        return 0, '{"state":"OPEN"}', ""
+
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=fake_gh)):
+        await git_ops.pr_state(360, gh_repo="owner/repo")
+
+    args = seen["args"]
+    assert "--json" in args
+    fields = args[args.index("--json") + 1].split(",")
+    assert fields == ["state"], (
+        "gh has no `merged` field: asking for one fails the whole call, and the "
+        "caller reads that as 'could not look' rather than as an error"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('{"state":"OPEN"}', "open"),
+        ('{"state":"CLOSED"}', "closed"),
+        ('{"state":"MERGED"}', "merged"),
+    ],
+)
+async def test_pr_state_reads_the_three_states_gh_returns(
+    git_ops: GitOpsIntegration, payload: str, expected: str
+) -> None:
+    """Real gh output, verified by hand on PRs #362 (open), #360, #358."""
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new=AsyncMock(return_value=(0, payload, "")),
+    ):
+        assert await git_ops.pr_state(1, gh_repo="owner/repo") == expected
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (1, "", 'Unknown JSON field: "merged"'),
+        (0, "", ""),
+        (0, "not json", ""),
+    ],
+)
+async def test_pr_state_says_it_could_not_look(
+    git_ops: GitOpsIntegration, answer: tuple
+) -> None:
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(return_value=answer)):
+        assert await git_ops.pr_state(1, gh_repo="owner/repo") == "", (
+            "an unanswerable question stays unanswered — 'could not look' and "
+            "'closed' lead to opposite delivery decisions"
+        )
