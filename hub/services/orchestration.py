@@ -206,6 +206,131 @@ async def machine_review_gap(
     return None
 
 
+# What the gate said the findings turned out to be (#877, on #876's data).
+#
+# ``precision`` is the share of judged findings that were REAL. A defect the
+# owner chose not to fix is still a defect the reviewer found, so ``wont_fix``
+# counts as a hit; only ``false_positive`` — "the described defect is not in
+# the code" — counts against it. ``resolution_rate`` is narrower and is the
+# number BugBot publishes: the share that actually got fixed.
+#
+# Both are computed ONLY over judged findings. A confirmed finding nobody
+# judged is not a miss and not a hit, it is an unanswered question, and it is
+# reported beside the rates rather than folded into either (#519, #841).
+_REAL = ("fixed", "wont_fix")
+
+
+async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Precision and resolution, overall and split by profile and model.
+
+    The window is the REPORT's ``created_at``, never the disposition's: a
+    judgement made a week after the run belongs to the run it judges. Keying it
+    by when someone clicked would let a report and its verdict fall into
+    different windows and divide unrelated things by each other.
+    """
+
+    def _rates(counts: dict[str, int]) -> dict[str, Any]:
+        judged = sum(counts.values())
+        real = sum(counts.get(k, 0) for k in _REAL)
+        return {
+            # The sample size travels with the rate. Two judged findings can
+            # produce a precision of 1.0, and a bare 1.0 invites a decision
+            # the sample cannot support.
+            "judged": judged,
+            "fixed": counts.get("fixed", 0),
+            "false_positive": counts.get("false_positive", 0),
+            "wont_fix": counts.get("wont_fix", 0),
+            "precision": round(real / judged, 3) if judged else None,
+            "resolution_rate": (
+                round(counts.get("fixed", 0) / judged, 3) if judged else None
+            ),
+        }
+
+    rows = await db.execute_fetchall(
+        "SELECT CASE WHEN mr.profile = '' THEN 'не заявлен' ELSE mr.profile END "
+        "AS profile, "  # nosec B608 - constant fragment, values stay params
+        "CASE WHEN mr.model = '' THEN 'не заявлена' ELSE mr.model END AS model, "
+        "d.disposition AS disposition, COUNT(*) AS n "
+        "FROM finding_dispositions d "
+        "JOIN machine_reviews mr ON mr.id = d.review_id "
+        "WHERE mr.created_at >= datetime('now', ?) "
+        "GROUP BY profile, model, d.disposition",
+        (since,),
+    )
+    overall: dict[str, int] = {}
+    by_profile: dict[str, dict[str, int]] = {}
+    by_model: dict[str, dict[str, int]] = {}
+    for row in rows:
+        r = dict(row)
+        n = int(r["n"])
+        overall[r["disposition"]] = overall.get(r["disposition"], 0) + n
+        p = by_profile.setdefault(r["profile"], {})
+        p[r["disposition"]] = p.get(r["disposition"], 0) + n
+        m = by_model.setdefault(r["model"], {})
+        m[r["disposition"]] = m.get(r["disposition"], 0) + n
+
+    # Coverage of the loop itself: how many reports were judged at all, and how
+    # many confirmed findings are still waiting for an answer. Without these a
+    # precision of 1.0 over two findings out of ninety reads like a verdict on
+    # the harness.
+    coverage_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
+        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
+        "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
+        "COALESCE(SUM(judged.n), 0) AS judged "
+        "FROM machine_reviews mr LEFT JOIN ("
+        "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
+        "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
+        "WHERE mr.created_at >= datetime('now', ?)",
+        (since,),
+    )
+    cov = dict(coverage_rows[0]) if coverage_rows else {}
+    reports = int(cov.get("reports") or 0)
+    reports_judged = int(cov.get("reports_judged") or 0)
+    result = _rates(overall)
+    result["reports_judged"] = reports_judged
+    # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
+    # reader needs, and a percentage hides which one this is.
+    result["reports_unjudged"] = reports - reports_judged
+    result["confirmed_unjudged"] = max(
+        int(cov.get("confirmed") or 0) - int(cov.get("judged") or 0), 0
+    )
+    result["by_profile"] = [
+        dict(_rates(counts), profile=name)
+        for name, counts in sorted(by_profile.items())
+    ]
+    result["by_model"] = [
+        dict(_rates(counts), model=name) for name, counts in sorted(by_model.items())
+    ]
+    return result
+
+
+async def _tokens_per_fixed(
+    db: aiosqlite.Connection, since: str, column: str
+) -> int | None:
+    """Tokens per FIXED finding, or None when nothing supports the division.
+
+    Numerator and denominator come from the same rows — the #516 rule that
+    understated the cost per confirmed finding by 38% when they did not. A
+    report without a token count contributes neither its tokens nor its
+    findings, and a report nobody judged contributes nothing at all.
+    """
+    if column not in ("tokens_spent", "provider_tokens"):  # pragma: no cover
+        raise ValueError(f"unsupported token column: {column}")
+    rows = await db.execute_fetchall(
+        f"SELECT COALESCE(SUM(mr.{column}), 0) AS tokens, "  # nosec B608 - column is checked above against a literal allow-list
+        "COALESCE(SUM(fixed.n), 0) AS fixed FROM machine_reviews mr "
+        "JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
+        "WHERE disposition = 'fixed' GROUP BY review_id) AS fixed "
+        "ON fixed.review_id = mr.id "
+        f"WHERE mr.created_at >= datetime('now', ?) AND mr.{column} IS NOT NULL",
+        (since,),
+    )
+    row = dict(rows[0]) if rows else {}
+    fixed = int(row.get("fixed") or 0)
+    return round(int(row.get("tokens") or 0) / fixed) if fixed else None
+
+
 async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = 90
 ) -> dict[str, Any]:
@@ -444,6 +569,27 @@ async def practice_metrics(
         )
     ]
 
+    # #877: what the findings turned out to be. Attached to the profile rows
+    # as well, because "lite found three things" and "lite found three things
+    # and two of them were real" are different facts about the same run.
+    dispositions = await _disposition_metrics(db, since)
+    totals["dispositions"] = dispositions
+    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, since, "tokens_spent")
+    totals["provider_tokens_per_fixed"] = await _tokens_per_fixed(
+        db, since, "provider_tokens"
+    )
+    by_profile_rates = {row["profile"]: row for row in dispositions["by_profile"]}
+    profile_dicts = []
+    for row in profile_rows:
+        entry = dict(row)
+        # A profile nobody judged gets the empty shape, not zeros: "no data"
+        # and "nothing was real" are opposite readings of the same blank.
+        rates = by_profile_rates.get(entry["profile"])
+        entry["judged"] = rates["judged"] if rates else 0
+        entry["precision"] = rates["precision"] if rates else None
+        entry["resolution_rate"] = rates["resolution_rate"] if rates else None
+        profile_dicts.append(entry)
+
     escaped = await _escaped_defect_metrics(db, since)
 
     human_gates = await _human_gate_metrics(db, since)
@@ -453,7 +599,8 @@ async def practice_metrics(
         "since_days": since_days,
         "machine_reviews": totals,
         "by_harness": [dict(r) for r in harness_rows],
-        "by_profile": [dict(r) for r in profile_rows],
+        "by_profile": profile_dicts,
+        "by_reviewer_model": dispositions["by_model"],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,

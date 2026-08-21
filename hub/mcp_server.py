@@ -2256,8 +2256,25 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"runs, {mr.get('raw_total', 0)} raw → {mr.get('confirmed_total', 0)} "
         f"confirmed / {mr.get('rejected_total', 0)} rejected",
         f"Tokens: {mr.get('tokens_total', 0)} total, "
-        f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding",
+        f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
+        f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    # #877: the rate travels with its sample, and an unjudged window says so
+    # rather than printing a zero that reads as "nothing was real".
+    disp = mr.get("dispositions") or {}
+    precision = disp.get("precision")
+    resolution = disp.get("resolution_rate")
+    lines.append(
+        "Findings judged: "
+        + (
+            f"{disp.get('judged', 0)} — precision "
+            f"{round(precision * 100, 1)}%, resolution "
+            f"{round(resolution * 100, 1)}%"
+            if precision is not None and resolution is not None
+            else "0 — no data (nobody said what the findings turned out to be)"
+        )
+        + f"; {disp.get('confirmed_unjudged', 0)} confirmed finding(s) unanswered"
+    )
     outcomes = data.get("review_outcomes", {})
     first_pass = outcomes.get("first_pass_acceptance_rate")
     cr_rate = outcomes.get("changes_requested_rate")
