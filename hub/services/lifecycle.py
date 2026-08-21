@@ -1461,6 +1461,21 @@ async def resolve_branch_tip(
         return "", f"tip resolution failed: {exc}"
 
 
+def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
+    """Fields to watch for a verdict on the CURRENT submission (#836).
+
+    Deliberately NOT ``latest_review.verdict``: that field carries the
+    previous generation's verdict across a resubmission, so watching it fires
+    on work already judged. These two move only when a verdict is recorded
+    for the generation being submitted now — an APPROVED flips the first, a
+    CHANGES_REQUESTED still moves the second.
+    """
+    return {
+        "review_approved_current": bool(task.get("review_approved_current")),
+        "review_verdict_generation": task.get("review_verdict_generation"),
+    }
+
+
 async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1705,6 +1720,11 @@ async def submit_for_review(
             if view.lifecycle_hint
             else stacking["message"]
         )
+    # #836: hand back the baseline for waiting on THIS submission's verdict.
+    # A snapshot of the current values, never of the desired ones: a baseline
+    # describing the future would be the same guess it replaces.
+    view.wait_baseline = wait_baseline_for(dict(row))
+
     await _try_restore_pair_workspace(db, task_id)
     return view
 

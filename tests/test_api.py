@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -3493,3 +3496,92 @@ def test_task_override_skip_still_wins():
     assert machine_review_required(task, "always") is False, (
         "an explicit override stays above both the new rule and the policy"
     )
+
+
+# ---- #836: the hub hands back the baseline for waiting on this verdict ----
+
+
+async def _submitted_pair_task(client: AsyncClient) -> tuple[int, dict]:
+    created = await client.post("/api/tasks", json={"title": "Wait baseline"})
+    task_id = created.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    return task_id, resp.json()
+
+
+def _diverges(baseline: dict, task: dict) -> dict:
+    """Ask the REAL hook whether this baseline diverges from the live task.
+
+    Importing the shipped hook rather than reimplementing its comparison: a
+    copy of the logic would pass while the hook that actually wakes agents
+    behaves differently, which is precisely the class of defect this task
+    exists to close. Skipped, never silently reimplemented, if the hook is
+    absent from a checkout.
+    """
+    import importlib.util
+
+    hook_path = Path(__file__).resolve().parents[1] / ".claude/hooks/hub_wait_hook.py"
+    if not hook_path.exists():
+        pytest.skip(f"wait hook not present at {hook_path}")
+    spec = importlib.util.spec_from_file_location("hub_wait_hook", hook_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module.changed_fields(task, baseline)
+
+
+async def test_submit_for_review_returns_wait_baseline(client: AsyncClient):
+    # AC-1 (#836): the agent should not have to infer which fields mark "my
+    # verdict arrived" — the hub states them, with the values it just wrote.
+    _task_id, submitted = await _submitted_pair_task(client)
+
+    baseline = submitted["wait_baseline"]
+
+    assert set(baseline) == {"review_approved_current", "review_verdict_generation"}
+    assert baseline["review_approved_current"] is False
+    assert "verdict" not in baseline, (
+        "the raw verdict field carries the previous generation across a "
+        "resubmission — watching it is the defect this closes"
+    )
+
+
+async def test_wait_baseline_is_quiet_across_resubmission(client: AsyncClient):
+    # AC-2 (#836): the exact sequence that misfired on #826 — approve, then
+    # resubmit. The old approval must not read as an event.
+    task_id, _submitted = await _submitted_pair_task(client)
+    await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    resubmitted = (
+        await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    ).json()
+
+    baseline = resubmitted["wait_baseline"]
+    live = (await client.get(f"/api/tasks/{task_id}")).json()
+
+    assert live["latest_review"]["verdict"] == "approved", "the stale verdict is there"
+    assert live["review_approved_current"] is False
+    assert _diverges(baseline, live) == {}, "a resubmission must not wake the waiter"
+
+
+async def test_wait_baseline_fires_on_current_verdict(client: AsyncClient):
+    # AC-3 (#836): and it must wake on the verdict that is actually about
+    # this submission — a baseline that never fires is worse than none.
+    task_id, submitted = await _submitted_pair_task(client)
+    baseline = submitted["wait_baseline"]
+
+    await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    live = (await client.get(f"/api/tasks/{task_id}")).json()
+
+    assert _diverges(baseline, live), "the verdict on this generation must wake it"
+    assert live["review_approved_current"] is True

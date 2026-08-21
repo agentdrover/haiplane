@@ -1453,6 +1453,16 @@ class TaskView(BaseModel):
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None
+    # #836: the wait baseline for THIS submission, set only by
+    # submit_for_review. An agent waiting for its verdict has to name the
+    # fields it watches and their current values; guessing them from the
+    # schema goes wrong in one specific way — ``latest_review.verdict`` keeps
+    # the PREVIOUS generation's approval across a resubmission, so a baseline
+    # of ``{"verdict": null}`` fires immediately and reads as "my resubmission
+    # was approved" (observed on #826, 21.08.2026). These are the fields that
+    # move only when a verdict lands on the CURRENT generation, snapshotted at
+    # submission time. Absent means "not computed on this path".
+    wait_baseline: dict[str, Any] | None = None
     # #615: what was delivered in these areas since the statement was written.
     # Computed, never stored: the answer changes as work lands, and a stored copy
     # would be one more thing to go stale — which is the very defect this
