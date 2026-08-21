@@ -985,13 +985,27 @@ async def web_agent_api_metrics(
     different question — what the tool surface costs, not how the practice
     performs.
     """
-    from hub.mcp_catalog import catalog_snapshot
+    from hub.mcp_catalog import (
+        HEADROOM_WARN_PCT,
+        catalog_snapshot,
+        check_budget,
+        load_baseline,
+        load_budget,
+        load_measured,
+    )
     from hub.services.mcp_telemetry import usage_report
 
-    data = await usage_report(
-        _db(request), window_days=window_days, catalog=await catalog_snapshot()
+    snapshot = await catalog_snapshot()
+    data = await usage_report(_db(request), window_days=window_days, catalog=snapshot)
+    # The same check CI runs, rendered where a human actually looks (#832).
+    # Headroom bought the mergeability of the budget file; it stays honest
+    # only while somebody can watch it shrink.
+    budget = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
+    return TEMPLATES.TemplateResponse(
+        request,
+        "agent_api.html",
+        {"u": data, "budget": budget, "headroom_warn_pct": HEADROOM_WARN_PCT},
     )
-    return TEMPLATES.TemplateResponse(request, "agent_api.html", {"u": data})
 
 
 @router.get("/digests", response_class=HTMLResponse)
@@ -1251,6 +1265,31 @@ async def web_task_detail(
 
     evidence = await gate_evidence(db, dict(row))
 
+    # #825: the criteria and the changes, laid against each other. Built from
+    # the numstat of the pinned submission — paths, not hunks: the hunks load
+    # on demand (#824), and this map only needs to know which files moved.
+    change_map = None
+    if evidence is not None:
+        from hub.services import change_map as change_map_service
+        from hub.services.task_diff import READ, submission_files
+
+        listing = await submission_files(db, task_id)
+        if listing["state"] == READ:
+            findings = []
+            if machine_review is not None and machine_review.is_current:
+                findings = list(machine_review.findings_confirmed or [])
+            change_map = change_map_service.build(
+                listing["files"],
+                evidence.acceptance_criteria,
+                evidence.ac_test_results,
+                task.affected_areas or [],
+                findings,
+            )
+        else:
+            # Same rule as every other block here: no map is a stated cause,
+            # never an empty list that reads as "nothing changed" (#725).
+            change_map = {"unavailable": listing["reason"]}
+
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
     if task.status.value == "review" and not task.review_job_id:
@@ -1291,6 +1330,7 @@ async def web_task_detail(
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,
             "evidence": evidence,
+            "change_map": change_map,
             "machine_review": machine_review,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,

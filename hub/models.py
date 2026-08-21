@@ -892,6 +892,7 @@ class MessageSend(BaseModel):
     body: str = Field(..., min_length=1, max_length=20000)
     kind: str = Field("note", max_length=20)
     session_id: str = Field("", max_length=200)
+    for_session: str = Field("", max_length=200)
     related_task_id: int | None = None
     reply_to: int | None = None
 
@@ -913,6 +914,7 @@ class MessageView(BaseModel):
     from_model: str = ""
     to_kind: str = ""
     to_ref: str = ""
+    for_session: str = ""
     kind: str = "note"
     body: str = ""
     related_task_id: int | None = None

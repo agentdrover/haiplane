@@ -553,6 +553,24 @@
                                 <span class="muted">тест к критерию привязан, но за эту сдачу не прогонялся</span>
                                 {% endif %}
                                 <span class="u-text-muted">{{ ac.then }}</span>
+                                {# #825: критерий вместе со своими изменениями.
+                                   Зелёный тест при нуле относящихся изменений —
+                                   ровно то, что сегодня проходит гейт незамеченным. #}
+                                {% set bound = (change_map.by_ac or {}).get(ac.id) if change_map and not change_map.unavailable else None %}
+                                {% if bound %}
+                                {% if bound.files %}
+                                <div class="u-text-muted">изменения критерия:
+                                    {% for f in bound.files %}<code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }}){% if not loop.last %}, {% endif %}{% endfor %}
+                                    <span class="badge badge--xs badge-test">точная привязка</span>
+                                </div>
+                                {% elif bound.green_without_changes %}
+                                <div><span class="badge badge-failed">тест зелёный, изменений критерия нет</span>
+                                    <span class="muted">в этой сдаче файл теста {{ bound.test_file or '—' }} не менялся: критерий мог быть закрыт раньше, а мог быть не тронут вовсе</span>
+                                </div>
+                                {% else %}
+                                <div class="u-text-muted">изменений, привязанных к этому критерию, нет</div>
+                                {% endif %}
+                                {% endif %}
                             </li>
                             {% endfor %}
                         </ul>
@@ -580,6 +598,40 @@
                         {% else %}<span class="muted">{{ evidence.call_sites.reason }}</span>{% endif %}
                     </div>
 
+                    {% if change_map and change_map.unavailable %}
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Карта изменений:</span>
+                        <span class="badge badge-pending">не построена</span>
+                        <span class="muted">{{ change_map.unavailable }}</span>
+                    </div>
+                    {% elif change_map %}
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Изменения, которых никто не просил:</span>
+                        {% if change_map.nobody %}
+                        <span class="badge badge-failed">{{ change_map.nobody | length }}</span>
+                        <ul class="task-review-findings">
+                            {% for f in change_map.nobody %}
+                            <li><code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }}) — ни один критерий не называл этот файл, и он вне объявленных областей</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <span class="badge badge--xs badge-test">нет</span>
+                        <span class="muted">каждый изменённый файл либо привязан к критерию, либо объявлен в областях задачи</span>
+                        {% endif %}
+                    </div>
+                    {% if change_map.assumed %}
+                    <details>
+                        <summary class="project-edit-summary">предположительно по объявленным областям: {{ change_map.assumed | length }}</summary>
+                        <ul class="task-review-findings">
+                            {% for f in change_map.assumed %}
+                            <li><code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }})
+                                {% if f.seen_by_review %}<span class="badge badge--xs badge-pending">названо находкой ревью</span>{% endif %}
+                                <span class="muted">файл в объявленных областях задачи — работа заказана, но к конкретному критерию не привязана</span></li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                    {% endif %}
                     {% if evidence.evidence_coverage.checks_missing %}
                     <details>
                         <summary class="project-edit-summary">не дали сигнала: {{ evidence.evidence_coverage.checks_missing | length }} — и почему</summary>

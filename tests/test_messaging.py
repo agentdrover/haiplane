@@ -560,3 +560,71 @@ async def test_thread_branch_honours_session_ownership(
         "the check standing on the inbox branch must not be walked around "
         "by asking for a thread instead"
     )
+
+
+# ---- #821: one agent name, many sessions ----
+#
+# A fleet under one token shares one agent name, so to_kind='agent' is a
+# broadcast. On 21.08.2026 an answer meant for one session landed in another's
+# inbox with the words "AC-1 can be considered closed" — the addressing was
+# working as designed, and the design could not say who the sender meant.
+
+
+async def test_agent_mail_names_its_intended_session(client: AsyncClient, monkeypatch):
+    auth = _auth(monkeypatch)
+    await _register(client, auth["alpha"], "s-alpha")
+    await _register(client, auth["beta"], "s-beta")
+    # Two sessions of the SAME agent: beta's token, two session ids.
+    await _register(client, auth["beta"], "s-beta-2")
+
+    sent = await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "agent",
+            "to_ref": "beta",
+            "body": "ответ по треду #8 — AC-1 можно считать закрытым",
+            "kind": "answer",
+            "session_id": "s-alpha",
+            "for_session": "s-beta-2",
+        },
+        headers=auth["alpha"],
+    )
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["message"]["for_session"] == "s-beta-2"
+
+    for session in ("s-beta", "s-beta-2"):
+        inbox = await client.get(
+            f"/api/messages?session_id={session}", headers=auth["beta"]
+        )
+        assert inbox.status_code == 200, inbox.text
+        message = inbox.json()[0]
+        assert message["for_session"] == "s-beta-2", (
+            "both sessions of the agent still receive it — what changes is "
+            "that each can tell whose context it is"
+        )
+
+
+async def test_personal_addressing_is_unchanged(client: AsyncClient, monkeypatch):
+    """Mail addressed to a session behaves exactly as before #821."""
+    auth = _auth(monkeypatch)
+    await _register(client, auth["alpha"], "s-alpha")
+    await _register(client, auth["beta"], "s-beta")
+    await _register(client, auth["gamma"], "s-gamma")
+
+    sent = await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "session",
+            "to_ref": "s-beta",
+            "body": "лично тебе",
+            "session_id": "s-alpha",
+        },
+        headers=auth["alpha"],
+    )
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["message"]["for_session"] == "", "nothing implied, nothing set"
+
+    mine = await client.get("/api/messages?session_id=s-beta", headers=auth["beta"])
+    assert [m["body"] for m in mine.json()] == ["лично тебе"]
+    theirs = await client.get("/api/messages?session_id=s-gamma", headers=auth["gamma"])
+    assert theirs.json() == []

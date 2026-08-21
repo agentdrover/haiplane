@@ -1688,6 +1688,130 @@ async def set_review_dispatch_status(
 
 
 # ---------------------------------------------------------------------------
+# Task dependencies (#483, epic #478)
+# ---------------------------------------------------------------------------
+
+
+class DependencyCycleError(ValueError):
+    """Raised when an edge would close a cycle in the dependency graph (#483).
+
+    The message names the path that would close it. "Cycle detected" tells the
+    caller that something is wrong; naming A → B → C → A tells them which edge
+    to reconsider, and that is the difference between an error somebody acts
+    on and one they work around.
+    """
+
+
+class SelfDependencyError(ValueError):
+    """Raised for an edge from a task to itself (#483).
+
+    The schema also refuses it (#482), but an IntegrityError from SQLite says
+    "CHECK constraint failed" and leaves the reader to work out which one.
+    """
+
+
+async def add_task_dependency(
+    db: aiosqlite.Connection, task_id: int, depends_on_task_id: int
+) -> bool:
+    """Record that ``task_id`` waits for ``depends_on_task_id`` (#483).
+
+    Returns True when an edge was created, False when it already existed —
+    adding the same edge twice is not an error, it is a no-op, because the
+    caller's intent ("this must wait for that") is already satisfied.
+
+    Deliberately does NOT commit: the cycle walk and the insert belong to the
+    same transaction as the caller's other writes, so two concurrent callers
+    cannot each pass the check separately and close a cycle between them.
+    """
+    if task_id == depends_on_task_id:
+        raise SelfDependencyError(f"задача #{task_id} не может зависеть от самой себя")
+    path = await _dependency_path(db, depends_on_task_id, task_id)
+    if path is not None:
+        chain = " → ".join(f"#{t}" for t in [task_id, *path])
+        raise DependencyCycleError(
+            f"ребро #{task_id} → #{depends_on_task_id} замкнуло бы цикл: {chain}"
+        )
+    cur = await db.execute(
+        "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) "
+        "VALUES (?, ?)",
+        (task_id, depends_on_task_id),
+    )
+    return cur.rowcount > 0
+
+
+async def remove_task_dependency(
+    db: aiosqlite.Connection, task_id: int, depends_on_task_id: int
+) -> bool:
+    """Drop the edge; True when one was there. Removing a missing edge is a
+    no-op for the same reason adding a present one is (#483)."""
+    cur = await db.execute(
+        "DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?",
+        (task_id, depends_on_task_id),
+    )
+    return cur.rowcount > 0
+
+
+async def list_task_dependencies(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, list[dict[str, Any]]]:
+    """Both sides of the task's edges, with the other end's status (#483).
+
+    ``blocked_by`` is what this task waits for, ``unblocks`` is what waits for
+    it. Both are needed and neither is derivable from the other cheaply: the
+    first is read when work is about to start, the second when it finishes.
+    Statuses travel along because every consumer would otherwise ask for them
+    immediately — "blocked by #818" means nothing without knowing where #818
+    stands.
+    """
+    blocked_by = await db.execute_fetchall(
+        "SELECT t.id AS task_id, t.title, t.status "
+        "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
+        "WHERE d.task_id = ? ORDER BY t.id",
+        (task_id,),
+    )
+    unblocks = await db.execute_fetchall(
+        "SELECT t.id AS task_id, t.title, t.status "
+        "FROM task_dependencies d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.depends_on_task_id = ? ORDER BY t.id",
+        (task_id,),
+    )
+    return {
+        "blocked_by": [dict(r) for r in blocked_by],
+        "unblocks": [dict(r) for r in unblocks],
+    }
+
+
+async def _dependency_path(
+    db: aiosqlite.Connection, start: int, target: int
+) -> list[int] | None:
+    """The chain of dependencies from ``start`` to ``target``, or None (#483).
+
+    Walks "what does this wait for" breadth-first, carrying the path so the
+    error can name it. The visited set is what keeps a DIAMOND from reading as
+    a cycle: two tasks may legitimately wait for the same third one, and a
+    walk that only tracked depth would meet it twice and call that a loop.
+    """
+    if start == target:
+        return [start]
+    seen: set[int] = {start}
+    queue: list[tuple[int, list[int]]] = [(start, [start])]
+    while queue:
+        node, path = queue.pop(0)
+        rows = await db.execute_fetchall(
+            "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?",
+            (node,),
+        )
+        for row in rows:
+            nxt = row["depends_on_task_id"]
+            if nxt == target:
+                return [*path, nxt]
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append((nxt, [*path, nxt]))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Autopilot digests (#739)
 # ---------------------------------------------------------------------------
 
@@ -2474,6 +2598,7 @@ async def insert_agent_message(
     body: str,
     related_task_id: int | None = None,
     thread_id: str = "",
+    for_session: str = "",
 ) -> int:
     """Append a message. Deliberately NO commit: the caller writes the
     ``message_posted`` event in the same transaction, so a rollback removes
@@ -2482,8 +2607,8 @@ async def insert_agent_message(
     cur = await db.execute(
         "INSERT INTO agent_messages "
         "(thread_id, from_principal_id, from_session_id, from_agent, from_model, "
-        " to_kind, to_ref, kind, body, related_task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " to_kind, to_ref, kind, body, related_task_id, for_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             thread_id,
             from_principal_id,
@@ -2495,6 +2620,7 @@ async def insert_agent_message(
             kind,
             body,
             related_task_id,
+            for_session or "",
         ),
     )
     message_id = cur.lastrowid

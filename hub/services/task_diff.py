@@ -124,76 +124,148 @@ def truncate(
     return kept, False, shown, total
 
 
-async def submission_diff(db: Any, task_id: int) -> dict[str, Any]:
-    """The diff of a task's pinned submission, or a stated reason for its absence."""
+async def _resolve_target(
+    db: Any, task_id: int
+) -> tuple[dict[str, Any] | None, str, str, str, str]:
+    """Everything both readers need before git is asked anything.
+
+    Returns ``(blank, sha, base, workspace, fallback)``. When ``blank`` is not
+    None it is the finished answer — a stated reason, never an empty box.
+    """
     from hub import services
 
     row = await repo.get_task(db, task_id)
     if not row:
-        return _blank(NO_SUBMISSION, "task not found")
+        return _blank(NO_SUBMISSION, "task not found"), "", "", "", ""
     task = dict(row)
     sha = (task.get("submission_sha") or "").strip()
     branch = (task.get("branch") or "").strip()
     if not sha:
-        return _blank(
-            NO_SUBMISSION,
-            "коммит сдачи не закреплён — показывать нечего: "
-            "у ветки нет зафиксированной точки, на которую вынесен вердикт",
+        return (
+            _blank(
+                NO_SUBMISSION,
+                "коммит сдачи не закреплён — показывать нечего: "
+                "у ветки нет зафиксированной точки, на которую вынесен вердикт",
+            ),
+            "",
+            "",
+            "",
+            "",
         )
 
     diff_base = await review_evidence.resolve_diff_base(db, task_id, branch)
     base = str(diff_base.get("base") or "")
     fallback = review_evidence.diff_command_for(diff_base, sha)
 
+    def fail(state: str, reason: str) -> dict[str, Any]:
+        return _blank(state, reason, sha=sha, base=base, fallback_command=fallback)
+
     try:
         ctx = await services.project_git_context(db, task_id)
         workspace = ctx.get("repo")
     except Exception as exc:  # noqa: BLE001 - a card must render regardless
         log.warning("diff for #%s: no project context: %s", task_id, exc)
-        return _blank(
-            NO_WORKSPACE,
-            f"рабочую копию проекта определить не удалось: {exc}",
-            sha=sha,
-            base=base,
-            fallback_command=fallback,
+        return (
+            fail(NO_WORKSPACE, f"рабочую копию проекта определить не удалось: {exc}"),
+            sha,
+            base,
+            "",
+            fallback,
         )
     if not workspace:
-        return _blank(
-            NO_WORKSPACE,
-            "у проекта нет рабочей копии на этом хосте — дифф читается там, "
-            "где лежит репозиторий",
-            sha=sha,
-            base=base,
-            fallback_command=fallback,
+        return (
+            fail(
+                NO_WORKSPACE,
+                "у проекта нет рабочей копии на этом хосте — дифф читается там, "
+                "где лежит репозиторий",
+            ),
+            sha,
+            base,
+            "",
+            fallback,
         )
 
     exists = await plugins.git_ops.commit_exists(workspace, sha)
     if exists is None:
-        return _blank(
-            UNREADABLE,
-            "рабочая копия не читается как git-репозиторий — "
-            "это не значит, что коммита нет",
-            sha=sha,
-            base=base,
-            fallback_command=fallback,
+        return (
+            fail(
+                UNREADABLE,
+                "рабочая копия не читается как git-репозиторий — "
+                "это не значит, что коммита нет",
+            ),
+            sha,
+            base,
+            workspace,
+            fallback,
         )
     if not exists:
-        return _blank(
-            UNREACHABLE_SHA,
-            f"коммита {sha[:12]} нет в рабочей копии — возможно, ветка не "
-            "подтянута. Это не «изменений нет»: сравнить было не с чем",
-            sha=sha,
-            base=base,
-            fallback_command=fallback,
+        return (
+            fail(
+                UNREACHABLE_SHA,
+                f"коммита {sha[:12]} нет в рабочей копии — возможно, ветка не "
+                "подтянута. Это не «изменений нет»: сравнить было не с чем",
+            ),
+            sha,
+            base,
+            workspace,
+            fallback,
         )
     if not base:
+        return (
+            fail(
+                UNREADABLE,
+                "база для сравнения не определена — "
+                + str(diff_base.get("reason") or ""),
+            ),
+            sha,
+            base,
+            workspace,
+            fallback,
+        )
+    return None, sha, base, workspace, fallback
+
+
+async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
+    """Paths and line counts of the pinned submission (#825).
+
+    The cheap half of ``submission_diff``: the change map needs to know which
+    files a submission touched, and paying for every hunk on each gate render
+    to learn that would undo the on-demand loading #824 introduced.
+    """
+    blank, sha, base, workspace, fallback = await _resolve_target(db, task_id)
+    if blank is not None:
+        return blank
+    rows = await plugins.git_ops.commit_diff_stat(workspace, base, sha)
+    if rows is None:
         return _blank(
             UNREADABLE,
-            "база для сравнения не определена — " + str(diff_base.get("reason") or ""),
+            f"git не смог посчитать состав {base}...{sha[:12]}",
             sha=sha,
             base=base,
             fallback_command=fallback,
         )
+    files = [
+        {"path": path, "added": added, "removed": removed}
+        for added, removed, path in rows
+    ]
+    return {
+        "state": READ,
+        "reason": "",
+        "files": files,
+        "truncated": False,
+        "shown_lines": 0,
+        "total_lines": sum(f["added"] + f["removed"] for f in files),
+        "fallback_command": fallback,
+        "sha": sha,
+        "base": base,
+    }
+
+
+async def submission_diff(db: Any, task_id: int) -> dict[str, Any]:
+    """The diff of a task's pinned submission, or a stated reason for its absence."""
+    blank, sha, base, workspace, fallback = await _resolve_target(db, task_id)
+    if blank is not None:
+        return blank
 
     raw = await plugins.git_ops.commit_diff(workspace, base, sha)
     if raw is None:

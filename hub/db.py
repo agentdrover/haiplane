@@ -1023,6 +1023,57 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_live_checks_task",
         "CREATE INDEX IF NOT EXISTS idx_live_checks_task ON live_checks(task_id, id)",
     ),
+    (
+        # First-class task dependencies (#482, epic #478). Until now the order
+        # of work lived outside the hub — in a chat, in an agent's memory, in a
+        # sentence inside somebody's constraints. Four statements currently
+        # carry the words "проверяется глазами, depends_on в хабе нет" (#584,
+        # #585, #806, #830), and on 21.08.2026 that gap stopped work already
+        # under way: #830 passed DoR, was approved and pair-started before
+        # anyone noticed the code it needs sits in an unmerged PR.
+        #
+        # Columns are named task_id / depends_on_task_id rather than the
+        # from/to of the original statement: an edge has a direction, and
+        # "from" reads as either end a month later. The name is the only
+        # documentation a schema carries into every query written against it.
+        #
+        # CHECK on the self-edge is a schema invariant, not the cycle
+        # detection of #483: a cycle of length one needs no graph walk, and
+        # this way it cannot be written even by hand from a SQL prompt.
+        "create_task_dependencies",
+        """CREATE TABLE IF NOT EXISTS task_dependencies (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id            INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, depends_on_task_id),
+            CHECK (task_id != depends_on_task_id)
+        )""",
+    ),
+    (
+        # Both directions are walked: "who blocks me" when a task is about to
+        # start, "whom do I unblock" when one finishes. One index would make
+        # the second walk a table scan.
+        "idx_task_dependencies_task",
+        "CREATE INDEX IF NOT EXISTS idx_task_dependencies_task "
+        "ON task_dependencies(task_id)",
+    ),
+    (
+        "idx_task_dependencies_depends_on",
+        "CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on "
+        "ON task_dependencies(depends_on_task_id)",
+    ),
+    (
+        # Who a message addressed to an AGENT was actually meant for (#821).
+        # A fleet under one token shares one agent name, so to_kind='agent' is
+        # a broadcast: on 21.08.2026 an answer meant for one session landed in
+        # another's inbox saying "AC-1 can be considered closed". The field
+        # changes no addressing — every session of that agent still reads the
+        # message — it only lets the sender say who it is for, which is what
+        # the sender knew and had no way to write down.
+        "add_agent_messages_for_session",
+        "ALTER TABLE agent_messages ADD COLUMN for_session TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

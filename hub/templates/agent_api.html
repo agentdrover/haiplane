@@ -57,6 +57,44 @@ Cursor (<code>serverUseInstructions</code> на уровне сервера). Н
 потолок для клиента, которого пока никто не мерил (#815).</p>
 {% endif %}
 
+{% if budget and budget.headroom %}
+<h2>Запас под потолком</h2>
+<p class="muted">Потолки живут в <code>docs/agent-context/mcp-catalog-budget.json</code>
+и проверяются в CI. Обычная доставка инструмента укладывается в запас и файл не
+трогает — поэтому параллельные ветки по нему больше не конфликтуют (#829). Цена
+этого — запас, и она оплачивается тем, что его остаток видно здесь, а не только
+в логе CI: запас, за которым никто не следит, это способ тихо перестать
+проверять.</p>
+<table class="task-table">
+    <thead><tr><th>Метрика</th><th>Сейчас</th><th>Потолок</th><th>Осталось</th>
+        <th>Запас съеден</th></tr></thead>
+    <tbody>
+        {% for h in budget.headroom %}
+        <tr>
+            <td>{{ h.metric }}</td>
+            <td>{{ h.actual }}</td>
+            <td>{{ h.ceiling }}</td>
+            <td>{{ h.remaining }}</td>
+            <td>{% if h.used_pct is none %}<span class="muted">базы нет</span>
+                {% elif h.used_pct >= headroom_warn_pct %}<span class="badge badge-failed">{{ h.used_pct }}%</span>
+                {% else %}{{ h.used_pct }}%{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% if budget.breaches %}
+<p><strong>Потолок пробит:</strong>
+    {% for b in budget.breaches %}{{ b.metric }} {{ b.actual }} &gt; {{ b.budget }}
+    (+{{ b.over_by }}){% if not loop.last %}; {% endif %}{% endfor %}</p>
+{% endif %}
+<p class="muted">«Запас съеден» считается от запаса, а не от заполненности
+потолка: при запасе 10% здоровый каталог занимает 91% потолка с первого дня, и
+предупреждение, срабатывающее сразу, — это предупреждение, которое учатся не
+замечать. Отметка появляется на {{ headroom_warn_pct }}% съеденного запаса.
+«Базы нет» значит, что в файле бюджета не записано measured, — доля не
+выдумывается.</p>
+{% endif %}
+
 <h2>По инструментам</h2>
 <table class="task-table">
     <thead><tr><th>Tool</th><th>Вызовов</th><th>Вызывающих</th><th>Ошибки</th>

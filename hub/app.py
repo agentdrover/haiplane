@@ -105,6 +105,7 @@ from hub.mcp_catalog import (
     check_budget,
     load_baseline,
     load_budget,
+    load_measured,
 )
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -527,6 +528,10 @@ async def api_list_events(
     ),
     kinds: str = Query(default="", description="Comma-separated kind filter"),
     limit: int = Query(default=100, ge=1, le=200),
+    session_id: str = Query(
+        default="",
+        description="Your session id: narrows message wake-ups to this session (#821)",
+    ),
     identity=Depends(current_identity),
 ):
     """Cursor-addressable events feed (#349), addressee-filtered (#774).
@@ -540,8 +545,12 @@ async def api_list_events(
     ``message_posted`` events are narrowed to what the caller is addressed by
     (#774): the inbox is bounded, and a feed that announced everyone's mail
     would be the same leak one indirection away — the shape of the bug #801
-    fixed. Transition events are unchanged: they are about tasks, which the
-    hub shows to every authenticated caller anyway.
+    fixed. Since #821 the narrowing is tighter still: for messages this feed
+    is the wake channel, so it carries what should interrupt this session —
+    its own mail, a message naming it in ``for_session``, and handoffs. The
+    rest is read through the inbox, which is as wide as it ever was.
+    Transition events are unchanged: they are about tasks, which the hub
+    shows to every authenticated caller anyway.
 
     The filter runs after the page is read, so a page can come back empty
     while ``next_cursor`` advances. That is the honest behaviour for a cursor:
@@ -573,9 +582,18 @@ async def api_list_events(
         if item.get("kind") == services.MESSAGE_EVENT_KIND and identity.is_agent:
             if refs is None:
                 refs = await services.addressable_refs(
-                    db, agent=identity.username, principal_id=identity.principal_id
+                    db,
+                    agent=identity.username,
+                    principal_id=identity.principal_id,
+                    session_id=session_id,
                 )
-            if not services.message_event_is_addressed(item["payload"], refs):
+            # #821: for message events the feed is the WAKE channel — mail
+            # itself is read through the inbox, which stays as wide as it was.
+            # A fleet under one agent name would otherwise wake in full for
+            # one session's answer.
+            if not services.message_event_is_addressed(
+                item["payload"], refs, for_wakeup=True
+            ):
                 continue
         events.append(item)
     return {
@@ -725,7 +743,11 @@ async def api_mcp_catalog(request: Request):
     without reading a workflow log.
     """
     snapshot = await catalog_snapshot()
-    result = check_budget(snapshot, load_budget(), load_baseline())
+    # measured is what makes the answer say how much of the declared headroom
+    # is gone, not merely how much room is left (#832). Without it the API
+    # reported nulls while CI printed real percentages — the same check
+    # answering differently depending on where you looked at it.
+    result = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
     return {**result, "tools_list": snapshot["tools_list"]}
 
 

@@ -2167,23 +2167,26 @@ async def hub_send_message(
     body: str,
     kind: str = "note",
     session_id: str = "",
+    for_session: str = "",
     related_task_id: int | None = None,
     reply_to: int | None = None,
 ) -> CallToolResult:
     """Send a message to another session, an agent, or a channel (#773).
 
-    Coordination only: nothing you send here approves, completes or otherwise
-    moves a task. The response says honestly whether the addressee was reachable
-    — a session past its TTL gets "stored, not delivered now".
+    Coordination only: nothing sent here approves or completes a task. The
+    response says whether the addressee was reachable — a session past its TTL
+    gets "stored, not delivered now".
 
     Args:
         to_kind: session | agent | task | project
         to_ref: session id, agent name, task id, or project slug
-        body: What you want to say. Link the task or PR instead of pasting diffs.
+        body: What you want to say; link the task or PR, do not paste diffs.
         kind: note | question | answer | handoff | claim_request
-        session_id: YOUR session id — it carries your model and session provenance
+        session_id: YOUR session id — carries your model and provenance
+        for_session: Session you mean when writing to an agent — only that
+            one is woken (#821)
         related_task_id: Task this message is about, when there is one
-        reply_to: Message id you are answering; keeps the thread together
+        reply_to: Message id you answer; keeps the thread together
     """
     payload: dict[str, Any] = {
         "to_kind": to_kind,
@@ -2191,6 +2194,7 @@ async def hub_send_message(
         "body": body,
         "kind": kind,
         "session_id": session_id,
+        "for_session": for_session,
     }
     if related_task_id is not None:
         payload["related_task_id"] = related_task_id
