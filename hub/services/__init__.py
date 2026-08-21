@@ -12,6 +12,7 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.outcomes import answer_outcome, outcome_debt
+from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
 from hub.services.live_check import (
     list_checks,
@@ -159,6 +160,7 @@ __all__ = [
     "list_sessions",
     "unaddressable_tasks",
     "live_check_view",
+    "record_category_check",
     "record_finding_dispositions",
     "message_event_is_addressed",
     "message_view",

@@ -72,6 +72,13 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
     return isinstance(policy, dict) and "auto" in policy.values()
 
 
+# The window the category debt is read over. Wider than a digest's own day on
+# purpose: a class that recurs across three tasks does not do so within
+# twenty-four hours, and a one-day window would report an empty debt every
+# morning (#878).
+_DEBT_WINDOW = "-90 days"
+
+
 async def generate_due_digests(
     db: aiosqlite.Connection, *, now: datetime | None = None
 ) -> int:
@@ -165,9 +172,27 @@ async def generate_due_digests(
             [a["task_id"] for a in approvals] + [v["task_id"] for v in verdicts],
             day,
         )
+        # #878: the debt rides along with a digest that is being created for
+        # other reasons. It does NOT cause one: this digest is per-project and
+        # only exists on days with autopilot activity, while the debt is a
+        # property of the practice. Making it a trigger would have it arrive
+        # on some days and not others with no way to tell which.
+        from hub.services.orchestration import (
+            build_category_debt,
+            recurring_categories,
+        )
+
+        debt = [
+            d
+            for d in await build_category_debt(
+                db, await recurring_categories(db, _DEBT_WINDOW)
+            )
+            if not d["covered"]
+        ]
         payload = {
             "date": day,
             "project": project["slug"],
+            "category_debt": debt,
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,
