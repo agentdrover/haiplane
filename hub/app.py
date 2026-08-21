@@ -1170,10 +1170,44 @@ async def api_submit_machine_review(
             adjudicated,
         )
         raw_count = adjudicated
+    # #807: the profile is taken from the DISPATCH, not from the report — a
+    # run's own claim about how thoroughly it ran is exactly the evidence
+    # #750 showed to be worthless. No dispatch behind the report leaves the
+    # profile empty, which reads as "unknown", not as "cheap".
+    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    profile = (dispatch["profile"] if dispatch is not None else "") or ""
+    # A lite run that spent its whole ceiling did not finish looking, it ran
+    # out of budget. Left as incomplete=false it would read as a clean review
+    # of the whole diff — the substitution #549 exists to prevent. Forced
+    # here rather than trusted to the client, for the same reason the profile
+    # is: the report cannot be the only witness to its own completeness.
+    incomplete = body.incomplete
+    budget_exhausted = (
+        profile == "lite"
+        and body.tokens_spent is not None
+        and body.tokens_spent >= config.REVIEW_LITE_TOKEN_BUDGET
+    )
+    if budget_exhausted and not incomplete:
+        incomplete = True
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            (
+                f"Лёгкое ревью израсходовало бюджет целиком "
+                f"({body.tokens_spent} ≥ {config.REVIEW_LITE_TOKEN_BUDGET} "
+                "токенов) и сдало отчёт как полный. Прогон помечен неполным "
+                "хабом: упершийся бюджет — это «дочитать не успели», а не "
+                "«претензий нет» (#807). Для полного разбора запросите "
+                "machine-review вручную — он пойдёт по тяжёлому профилю."
+            ),
+        )
     await repo.insert_machine_review(
         db,
         task_id=task_id,
         submission_generation=generation,
+        profile=profile,
         harness_skill=body.harness_skill,
         harness_version=body.harness_version,
         agent_count=body.agent_count,
@@ -1191,7 +1225,7 @@ async def api_submit_machine_review(
             ensure_ascii=False,
         ),
         submitted_by=(body.agent or identity.username)[:100],
-        incomplete=body.incomplete,
+        incomplete=incomplete,
         unresolved=_json.dumps(
             [f.model_dump(exclude_none=True) for f in body.unresolved],
             ensure_ascii=False,

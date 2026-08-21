@@ -48,6 +48,14 @@ _REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 UNCLASSIFIED_REASON = "unclassified"
 
+# camel/Pascal → snake, cut at the two boundaries that matter: an acronym
+# followed by a word, and a lowercase run followed by a capital. A single
+# "before every capital" rule looks equivalent until an acronym arrives and
+# HTTPStatusError comes out as h_t_t_p_status_error — a stable key nobody can
+# read, which is the whole point of the reason column (#809).
+_ACRONYM_BOUNDARY = re.compile(r"(.)([A-Z][a-z]+)")
+_WORD_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 
@@ -96,9 +104,14 @@ def _exception_reason(exc: BaseException) -> str:
 
     The MCP SDK wraps every tool failure in one ``ToolError``, so the type at
     the top says only "a tool failed". The chain is followed to its root
-    instead: ``connect_error`` and ``timeout_exception`` are different
-    operational facts, and the type name carries no argument values the way
-    the message it replaces would.
+    instead: ``connect_error`` and ``timeout_error`` are different operational
+    facts, and the type name carries no argument values the way the message it
+    replaces would.
+
+    The name is then written the way a reader expects it — ``HTTPStatusError``
+    becomes ``http_status_error``, not ``h_t_t_p_status_error`` (#809). Both
+    spellings group calls equally well; only one of them can be read in a
+    report, and being read is what this column is for.
     """
     root = exc
     for _ in range(3):
@@ -106,8 +119,8 @@ def _exception_reason(exc: BaseException) -> str:
         if cause is None:
             break
         root = cause
-    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", type(root).__name__).lower()
-    return normalize_reason(snake)
+    name = _ACRONYM_BOUNDARY.sub(r"\1_\2", type(root).__name__)
+    return normalize_reason(_WORD_BOUNDARY.sub(r"\1_\2", name).lower())
 
 
 def _block_chars(block: Any) -> int:

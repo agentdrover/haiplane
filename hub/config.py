@@ -114,6 +114,14 @@ CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
 CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
 CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
 CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
+# Review profiles (#807). The lite profile reviews the branch diff in one
+# pass under a token ceiling; deep is the multi-agent harness. The ceiling is
+# what makes "review every submission" affordable: on production a deep run
+# cost 434 784 tokens per confirmed finding, and a v3 run over one stack cost
+# 1 467 701 tokens in total.
+REVIEW_LITE_TOKEN_BUDGET = int(
+    os.environ.get("OPENCLAW_REVIEW_LITE_TOKEN_BUDGET", "40000")
+)
 MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
 REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")

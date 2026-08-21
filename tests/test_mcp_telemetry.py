@@ -143,6 +143,43 @@ async def test_raised_tool_error_is_classified_by_its_root_cause(sink):
     assert events[0]["tool"] == "hub_task_status"
 
 
+def test_acronym_class_names_become_readable_slugs():
+    """AC-1 (#809): an acronym is a word, not a run of separate letters.
+
+    Both spellings group calls equally well — the slug is only ever a key.
+    Only one of them can be read in the report the column exists to fill,
+    which is why this is worth a test rather than a preference.
+    """
+
+    class HTTPStatusError(Exception):
+        pass
+
+    class JSONDecodeError(Exception):
+        pass
+
+    assert telemetry._exception_reason(HTTPStatusError()) == "http_status_error"
+    assert telemetry._exception_reason(JSONDecodeError()) == "json_decode_error"
+    assert telemetry._exception_reason(OSError()) == "os_error"
+
+
+def test_existing_reason_slugs_survive_the_fix():
+    """AC-2 (#809): the readability fix must not re-key what already worked.
+
+    A changed slug for an unchanged cause would split one reason across two
+    names in the report — trading an unreadable answer for a wrong one.
+    """
+    assert telemetry._exception_reason(TimeoutError()) == "timeout_error"
+    assert telemetry._exception_reason(ConnectionError()) == "connection_error"
+    assert telemetry._exception_reason(Exception()) == "exception"
+
+    # Slugs the hub produces itself pass through untouched: they never went
+    # near the camel-case rule, and AC-2 pins that they still do not.
+    assert telemetry.normalize_reason("already_claimed") == "already_claimed"
+    assert telemetry.normalize_reason("human_decision_required") == (
+        "human_decision_required"
+    )
+
+
 async def test_task_reference_is_taken_only_from_an_integer_argument():
     assert telemetry.task_reference({"task_id": 42}) == 42
     assert telemetry.task_reference({"task_id": "42"}) is None

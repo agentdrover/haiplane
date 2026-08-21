@@ -3776,7 +3776,9 @@ def test_machine_review_required_matrix():
         (_mr_task(work_type="docs"), "auto", False),
         (_mr_task(work_type="chore"), "auto", False),
         (_mr_task(work_type="spike"), "auto", False),
-        (_mr_task(work_type="feature", size="S"), "auto", False),
+        # Size stopped excusing code work (#806): S is the author's own
+        # estimate, and "small" had come to mean "nobody looked".
+        (_mr_task(work_type="feature", size="S"), "auto", True),
         (_mr_task(work_type="feature", size="M"), "auto", True),
         (_mr_task(work_type="bug", size="L"), "auto", True),
         (_mr_task(work_type="bug", size=None), "auto", True),  # unsized → review

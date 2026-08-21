@@ -1628,6 +1628,10 @@ class MachineReviewView(BaseModel):
     incomplete: bool | None = None
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
+    # Which profile produced this report (#807). Set by the hub from the
+    # dispatch, never by the report about itself; empty means no dispatch was
+    # behind it, which is NOT the same as a cheap run.
+    profile: str = ""
     submitted_by: str = ""
     created_at: str = ""
 

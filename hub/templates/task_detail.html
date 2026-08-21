@@ -507,6 +507,13 @@
                     {% if machine_review.agent_count %}
                     <span class="badge badge--xs">{{ machine_review.agent_count }} агентов</span>
                     {% endif %}
+                    {# #807: «0 находок на lite» и «0 находок на deep» — разные
+                       утверждения, поэтому профиль стоит рядом с числами. #}
+                    {% if machine_review.profile %}
+                    <span class="badge badge--xs">профиль {{ machine_review.profile }}</span>
+                    {% else %}
+                    <span class="badge badge-self-approved">профиль не заявлен</span>
+                    {% endif %}
                     {% if machine_review.unresolved %}
                     <span class="badge badge-failed">{{ machine_review.unresolved|length }} не проверено</span>
                     {% endif %}

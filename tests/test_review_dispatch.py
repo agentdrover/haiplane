@@ -21,6 +21,7 @@ from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.review_dispatch import (
     pick_review_model,
+    pick_review_profile,
     sweep_review_dispatches,
 )
 
@@ -83,8 +84,11 @@ async def _submitted(
     slug: str,
     *,
     verdict_auto: bool = True,
+    areas: list[str] | None = None,
+    risks: list[dict] | None = None,
+    clear_risk_class: bool = False,
 ) -> int:
-    areas = ["docs/notes.md"]
+    areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
         db,
         slug=slug,
@@ -99,7 +103,14 @@ async def _submitted(
     feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
     task_id = await _node(db, title="probe", task_type="task", parent_id=feature)
     await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
-    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=areas))
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(affected_areas=areas, risks=risks)
+    )
+    if clear_risk_class:
+        # A task whose class was never computed: the state #582 calls
+        # "not computed", which must never be read as low risk. NULL is that
+        # state in the column; the empty string is not a valid class.
+        await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
     await db.commit()
 
     plugins.git_ops = _PinnedGitOps(_TIP, areas)
@@ -242,3 +253,161 @@ async def test_dispatch_failure_degrades_visibly(
     ]
     assert len(alerts) == 1
     assert not await repo.list_active_review_dispatches(db)
+
+
+# --- Review profiles (#807) --------------------------------------------------
+#
+# The profile answers "how much was this run allowed to spend", and it is
+# decided by the hub before the run starts. Every kind of ignorance —
+# unknown class, unreadable class, a human explicitly asking — resolves
+# toward deep: cheap is the default only where the facts say it is safe.
+
+
+async def _dispatch_row(db: aiosqlite.Connection, task_id: int) -> dict:
+    rows = await repo.list_active_review_dispatches(db)
+    mine = [dict(r) for r in rows if r["task_id"] == task_id]
+    assert mine, "no dispatch recorded for the task"
+    return mine[-1]
+
+
+async def test_low_risk_task_gets_lite_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#807): ordinary low-class work is reviewed cheaply, and the
+    # profile travels with the run instead of being inferred later.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lite"}, "run": {"id": "r-lite"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 40000)
+
+    task_id = await _submitted(client, db, "spike-lite")
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "ЛЁГКОЕ ревью" in prompt
+    assert "40000" in prompt, "the ceiling must be stated to the reviewer"
+    assert "multi-agent-review" not in prompt, "lite must not call the harness"
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
+
+
+async def test_high_risk_task_gets_deep_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#807): a migration-class change and a declared high risk each
+    # buy the expensive harness on their own.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}})
+    _wire(monkeypatch, recorder)
+
+    by_class = await _submitted(client, db, "spike-deep-class", areas=["hub/db.py"])
+    assert (await _dispatch_row(db, by_class))["profile"] == "deep"
+    assert "multi-agent-review" in recorder.calls[0]["prompt_text"]
+
+    by_risk = await _submitted(
+        client,
+        db,
+        "spike-deep-risk",
+        risks=[{"kind": "other", "severity": "high", "description": "d"}],
+    )
+    assert (await _dispatch_row(db, by_risk))["profile"] == "deep", (
+        "a declared high risk is exactly what the expensive harness is for"
+    )
+
+
+async def test_unclassified_task_gets_deep_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#807): no class is not a low class. Otherwise never classifying
+    # a task would be the cheapest way to skip the harness.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-unk"}, "run": {"id": "r-unk"}})
+    _wire(monkeypatch, recorder)
+
+    # No declared areas and an empty diff: the class stays uncomputed all the
+    # way through the submit-time recalculation (#583/#762).
+    task_id = await _submitted(
+        client, db, "spike-unclassified", areas=[], clear_risk_class=True
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert not row["risk_class"], "the fixture must leave the class uncomputed"
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+    # And the same for a class the enum cannot read at all.
+    assert pick_review_profile({"risk_class": "R99"}) == "deep"
+    assert pick_review_profile({"risk_class": "R0"}) == "lite"
+    assert (
+        pick_review_profile({"risk_class": "R0", "machine_review_override": "require"})
+        == "deep"
+    ), "a human who asked for machine review asked for the real thing"
+
+
+async def test_budget_truncation_marks_run_incomplete(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#807): a lite run that spent its whole ceiling did not finish
+    # looking. Left as the client sent it, the report would read as a clean
+    # review of the whole diff — the substitution #549 exists to prevent.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-b"}, "run": {"id": "r-b"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 1000)
+
+    task_id = await _submitted(client, db, "spike-budget")
+
+    body = {
+        "harness_skill": "lite-diff-review",
+        "agent_count": 1,
+        "tokens_spent": 1000,
+        "raw_count": 1,
+        "findings_confirmed": [
+            {"title": "off-by-one", "severity": "medium", "file": "a.py"}
+        ],
+        "findings_rejected": [],
+        "incomplete": False,
+        "unresolved": [],
+        "lost_dimensions": [],
+        "agent": "cursor-cloud-reviewer",
+    }
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 200, resp.text
+
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["profile"] == "lite", "the profile comes from the dispatch"
+    assert saved["incomplete"] == 1, "an exhausted budget is not a complete run"
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    alerts = [
+        u["content"]
+        for u in data["updates"] or []
+        if u["kind"] == "alert" and "бюджет" in u["content"]
+    ]
+    assert len(alerts) == 1 and "неполным" in alerts[0]
+
+
+async def test_report_without_dispatch_has_no_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # "We do not know how this was reviewed" and "it was reviewed cheaply"
+    # are different facts, and the cheap one must never be assumed.
+    recorder = _DispatchRecorder({"agent": {"id": ""}, "run": {}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-no-dispatch", verdict_auto=False)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "multi-agent-review",
+            "harness_version": 8,
+            "agent_count": 4,
+            "tokens_spent": 999999,
+            "raw_count": 2,
+            "findings_confirmed": [],
+            "findings_rejected": [
+                {"title": "noise", "category": "style", "reason": "not a defect"}
+            ],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "dev",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["profile"] == ""
+    assert saved["incomplete"] == 0, "no dispatch — no budget rule to apply"

@@ -56,11 +56,15 @@ async def project_git_context(
 
 
 def machine_review_required(task: dict[str, Any], project_policy: str = "auto") -> bool:
-    """Machine-review applicability cascade (#382).
+    """Machine-review applicability cascade (#382, #806).
 
     task override > project policy > auto rules from task metadata.
     Computed at submit/verdict time, not at creation — size and risks are
     refined along the way and the decision must see current values.
+
+    The auto rules, in order: a high or security risk always requires review;
+    docs, chore and spike are exempt by their nature; everything else — the
+    work types that change code — requires it regardless of declared size.
     """
     import json as _json
 
@@ -87,11 +91,14 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
     work_type = (task.get("work_type") or "feature").strip()
     if work_type in ("docs", "chore", "spike"):
         return False
-    if work_type == "refactor":
-        return True
-    if (task.get("size") or "").strip() in ("XS", "S"):
-        return False
-    # feature/bug/incident sized M+ (or unsized — err toward review)
+    # Size no longer excuses a change to code (#806). The exemption made sense
+    # while a human on the gate read the diff himself — a small change could be
+    # eyeballed. The owner does not read code, so "small task" now means
+    # "nobody looked at all": #522 was S, touched orchestration.py, mcp_server.py
+    # and a template, and reached the human gate with no report and no notice
+    # that one was missing. Size is also the author's own estimate, and an
+    # exemption from oversight resting on self-assessment is exactly what #582
+    # ruled out for risk class.
     return True
 
 
@@ -175,6 +182,23 @@ async def practice_metrics(
     totals["findings_unaccounted"] = max(raw - adjudicated, 0)
     totals["filtration_rate"] = (
         round(1 - confirmed / adjudicated, 3) if adjudicated else None
+    )
+
+    # #807: the profile split is what tells whether "review every submission"
+    # stayed affordable. Kept beside by_harness rather than folded into it:
+    # the harness answers "what ran", the profile answers "how much it was
+    # allowed to spend".
+    profile_rows = await db.execute_fetchall(
+        "SELECT CASE WHEN profile = '' THEN 'не заявлен' ELSE profile END "
+        "AS profile, COUNT(*) AS reviews, "
+        "COALESCE(SUM(raw_count), 0) AS raw_total, "
+        "COALESCE(SUM(json_array_length(findings_confirmed)), 0) "
+        "AS confirmed_total, "
+        "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
+        "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        "GROUP BY profile ORDER BY reviews DESC",
+        (since,),
     )
 
     harness_rows = await db.execute_fetchall(
@@ -271,6 +295,7 @@ async def practice_metrics(
         "since_days": since_days,
         "machine_reviews": totals,
         "by_harness": [dict(r) for r in harness_rows],
+        "by_profile": [dict(r) for r in profile_rows],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
         "human_gates": human_gates,

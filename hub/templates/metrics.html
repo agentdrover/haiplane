@@ -73,6 +73,26 @@ first-pass от того, что её одобрили следом.</p>
 как пересдача. Самоодобрение показано рядом: рейт, который растёт от того, что
 ревьюера убрали, ничего не измеряет — полная картина в отдельной метрике.</p>
 
+<h2>By review profile</h2>
+<p class="muted">Профиль отвечает не на «что прогналось», а на «сколько ему
+позволили потратить»: lite — один проход по диффу под потолком токенов, deep —
+многоагентный харнесс. Профиль проставляет хаб при запуске, а не отчёт про
+самого себя; «не заявлен» значит, что за отчётом не стояло диспетчера, и это
+не то же самое, что дешёвый прогон.</p>
+<table class="task-table">
+    <thead><tr><th>Профиль</th><th>Прогонов</th><th>Raw</th><th>Confirmed</th>
+        <th>Tokens</th><th>Неполных</th></tr></thead>
+    <tbody>
+        {% for pr in m.by_profile %}
+        <tr>
+            <td>{{ pr.profile }}</td><td>{{ pr.reviews }}</td><td>{{ pr.raw_total }}</td>
+            <td>{{ pr.confirmed_total }}</td><td>{{ pr.tokens_total }}</td>
+            <td>{% if pr.incomplete_runs %}{{ pr.incomplete_runs }}{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
 <h2>By harness version</h2>
 <table class="task-table">
     <thead><tr><th>Harness</th><th>Reviews</th><th>Raw</th><th>Confirmed</th><th>Tokens</th></tr></thead>
