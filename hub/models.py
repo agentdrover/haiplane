@@ -916,6 +916,34 @@ class MessageSendResult(BaseModel):
     delivery: MessageDelivery
 
 
+class LiveCheckRecord(BaseModel):
+    """One observation of a task's behaviour in production (#813).
+
+    ``probe`` and ``observation`` are both required for outcome=done — a single
+    "checked, all good" is exactly the shape a formal stamp takes, and the
+    point of this record is to be refutable by a reader.
+    """
+
+    outcome: str = Field("done", max_length=20)
+    probe: str = Field("", max_length=2000)
+    observation: str = Field("", max_length=4000)
+    reason: str = Field("", max_length=2000)
+    sha: str = Field("", max_length=64)
+
+
+class LiveCheckView(BaseModel):
+    id: int
+    task_id: int
+    sha: str = ""
+    outcome: str = "done"
+    probe: str = ""
+    observation: str = ""
+    reason: str = ""
+    recorded_by: int | None = None
+    recorded_agent: str = ""
+    created_at: str = ""
+
+
 class TaskQuestion(BaseModel):
     agent: str = Field("", max_length=100)
     question: str = Field(..., min_length=1, max_length=10000)

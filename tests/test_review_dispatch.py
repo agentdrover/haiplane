@@ -29,10 +29,19 @@ from hub.services.review_dispatch import (
 _TIP = "c" * 40
 
 
+_HARMLESS_DIFF = "+++ b/docs/notes.md\n+одна строка текста\n"
+
+
 class _PinnedGitOps(NoopGitOps):
-    def __init__(self, tip: str, paths: list[str]) -> None:
+    def __init__(self, tip: str, paths: list[str], diff: str | None = None) -> None:
         self._tip = tip
         self._paths = paths
+        # #820: the profile is decided against the diff, so the double must
+        # serve one. None means "could not be read", which buys deep.
+        self._diff = _HARMLESS_DIFF if diff is None else diff
+
+    async def branch_diff(self, repo, base, branch):
+        return self._diff
 
     async def fetch_base(self, repo: str, base: str):
         return True, ""
@@ -89,6 +98,7 @@ async def _submitted(
     areas: list[str] | None = None,
     risks: list[dict] | None = None,
     clear_risk_class: bool = False,
+    diff: str | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -117,7 +127,7 @@ async def _submitted(
         await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
     await db.commit()
 
-    plugins.git_ops = _PinnedGitOps(_TIP, areas)
+    plugins.git_ops = _PinnedGitOps(_TIP, areas, diff)
     started = await services.pair_start_task(db, task_id, caller="dev-agent")
     assert started.status.value == "running"
     view = await services.submit_for_review(
@@ -333,10 +343,13 @@ async def test_unclassified_task_gets_deep_profile(
 
     assert (await _dispatch_row(db, task_id))["profile"] == "deep"
     # And the same for a class the enum cannot read at all.
-    assert pick_review_profile({"risk_class": "R99"}) == "deep"
-    assert pick_review_profile({"risk_class": "R0"}) == "lite"
+    # #820: the rule now answers with its reasons, and judges against a diff.
+    assert pick_review_profile({"risk_class": "R99"}, _HARMLESS_DIFF)[0] == "deep"
+    assert pick_review_profile({"risk_class": "R0"}, _HARMLESS_DIFF)[0] == "lite"
     assert (
-        pick_review_profile({"risk_class": "R0", "machine_review_override": "require"})
+        pick_review_profile(
+            {"risk_class": "R0", "machine_review_override": "require"}, _HARMLESS_DIFF
+        )[0]
         == "deep"
     ), "a human who asked for machine review asked for the real thing"
 
@@ -483,3 +496,120 @@ async def test_unknown_review_value_falls_back_to_off(
     assert review_dispatch_enabled({"review": "off"}) is False
     assert review_dispatch_enabled({}) is False
     assert review_dispatch_enabled({"verdict": "auto"}) is True
+
+
+# --- Process surfaces buy the expensive profile (#820) -----------------------
+#
+# Measured, not assumed: the lite-vs-deep comparison of 21.08.2026 found the
+# cheap profile caught 2 of 7 confirmed findings, and both misses were process
+# defects — an orphaned collector and a collection run against the wrong
+# branch. Neither is visible in the diff text; both live on surfaces that can
+# be named.
+
+# Real added lines from the branches where those defects were found. Written
+# out rather than generated, so the regression is against what actually
+# happened rather than against a shape invented to pass.
+_DIFF_506 = (
+    "+++ b/hub/services/test_existence.py\n"
+    "+        proc = await asyncio.create_subprocess_exec(\n"
+    '+            "uv",\n'
+    "+            stdout=asyncio.subprocess.PIPE,\n"
+    "+        )\n"
+    "+        out, _ = await asyncio.wait_for("
+    "proc.communicate(), timeout=_COLLECT_TIMEOUT)\n"
+)
+_DIFF_509 = (
+    "+++ b/hub/services/validation_run.py\n"
+    "+            out, dropped = await asyncio.wait_for("
+    "_collect(proc), timeout=_RUN_TIMEOUT)\n"
+    "+        except TimeoutError:\n"
+    "+            proc.kill()\n"
+)
+
+
+async def test_subprocess_surface_forces_deep_with_reason(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#820): a low-class diff that starts a subprocess still buys deep,
+    # and the feed says which surface bought it — "deep" alone cannot be
+    # argued with later.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ps"}, "run": {"id": "r-ps"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-subprocess", diff=_DIFF_506)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    notes = [
+        u["content"] for u in data["updates"] or [] if "профиль deep" in u["content"]
+    ]
+    assert notes, "the dispatch note must name the profile"
+    assert "процессная поверхность" in notes[0]
+    assert "create_subprocess_exec" in notes[0]
+
+
+async def test_workspace_surface_forces_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#820): touching the workspace or branch state is the other half
+    # of the measured blind spot — #506's collection ran against whatever the
+    # shared clone happened to be on.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ws"}, "run": {"id": "r-ws"}})
+    _wire(monkeypatch, recorder)
+
+    diff = (
+        "+++ b/hub/services/thing.py\n"
+        "+    await plugins.git_ops.checkout(workspace_path, branch)\n"
+    )
+    task_id = await _submitted(client, db, "spike-workspace", diff=diff)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+
+
+async def test_ordinary_diff_stays_lite(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#820): the saving #807 exists for must survive. Ordinary work,
+    # and the very words in a COMMENT, keep the cheap profile — otherwise
+    # 'deep' becomes the default by way of prose.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ord"}, "run": {"id": "r-ord"}})
+    _wire(monkeypatch, recorder)
+
+    talky = (
+        "+++ b/hub/services/thing.py\n"
+        "+# раньше здесь был create_subprocess_exec и wait_for(, теперь нет\n"
+        '+    """Документация упоминает worktree и checkout, но кода нет."""\n'
+        "+    return sorted(items)  # никаких подпроцессов\n"
+    )
+    task_id = await _submitted(client, db, "spike-ordinary", diff=talky)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite", (
+        "markers inside comments and docstrings are talk, not code"
+    )
+
+
+async def test_unreadable_diff_forces_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#820): a diff nobody could read is not a harmless one. Same rule
+    # the ladder uses for an uncomputed class (#582).
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nod"}, "run": {"id": "r-nod"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-nodiff", diff="")
+    # An empty string is a readable, empty diff; None is the unreadable one.
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
+
+    profile, reasons = pick_review_profile({"risk_class": "R0"}, None)
+    assert profile == "deep"
+    assert reasons == ["дифф сдачи прочитать не удалось"]
+
+
+def test_known_process_defect_diffs_would_get_deep():
+    # AC-5 (#820): the regression standard is the real thing — the two diffs
+    # whose process defects the cheap profile actually missed. If the rule
+    # stops catching these, it has stopped being worth its cost.
+    for name, diff in (("#506", _DIFF_506), ("#509", _DIFF_509)):
+        profile, reasons = pick_review_profile({"risk_class": "R2"}, diff)
+        assert profile == "deep", f"{name} must buy the expensive profile"
+        assert any("процессная поверхность" in r for r in reasons), name

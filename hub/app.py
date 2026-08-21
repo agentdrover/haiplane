@@ -60,6 +60,8 @@ from hub.models import (
     DigestAuditResult,
     TaskApprove,
     TaskArchive,
+    LiveCheckRecord,
+    LiveCheckView,
     MessageSend,
     MessageSendResult,
     MessageView,
@@ -1865,6 +1867,36 @@ async def api_session_heartbeat(
 ):
     """Record a sign of life for a registered session."""
     return await services.heartbeat_session(_db(request), session_id)
+
+
+# --- Live-check evidence (#813) ---
+#
+# The hub keeps the observation; it never performs it. Executing task-supplied
+# commands on the production box was ruled out on 31.07.2026, and a reporting
+# gap is the cheaper problem of the two.
+
+
+@app.post("/api/tasks/{task_id}/live-check", response_model=LiveCheckView)
+async def api_record_live_check(
+    task_id: int,
+    body: LiveCheckRecord,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Record what was run against production for this task, and what was seen."""
+    return await services.record_live_check(
+        _db(request),
+        task_id,
+        body,
+        agent=identity.username,
+        principal_id=identity.principal_id,
+    )
+
+
+@app.get("/api/tasks/{task_id}/live-checks", response_model=list[LiveCheckView])
+async def api_list_live_checks(task_id: int, request: Request, limit: int = 50):
+    """Evidence recorded for this task, newest first."""
+    return await services.list_checks(_db(request), task_id, limit=limit)
 
 
 # --- Messages between sessions (#773) ---

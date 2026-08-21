@@ -2811,3 +2811,74 @@ async def prune_mcp_call_events(
         (f"-{keep_days} days",),
     )
     return cur.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# Live-check evidence (#813)
+# ---------------------------------------------------------------------------
+
+
+async def insert_live_check(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    sha: str,
+    outcome: str,
+    probe: str = "",
+    observation: str = "",
+    reason: str = "",
+    recorded_by: int | None = None,
+    recorded_agent: str = "",
+) -> int:
+    """Append one live-check record. Rows accumulate — never overwrite.
+
+    A second check of the same task is a second observation, not a correction
+    of the first: they may have looked at different deployments, and the older
+    one stays true about the sha it names.
+    """
+    cur = await db.execute(
+        "INSERT INTO live_checks "
+        "(task_id, sha, outcome, probe, observation, reason, recorded_by, "
+        " recorded_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            sha or "",
+            outcome,
+            probe or "",
+            observation or "",
+            reason or "",
+            recorded_by,
+            recorded_agent or "",
+        ),
+    )
+    await db.commit()
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def list_live_checks(
+    db: aiosqlite.Connection, task_id: int, *, limit: int = 50
+) -> list[aiosqlite.Row]:
+    """Evidence for one task, newest first."""
+    return list(
+        await db.execute_fetchall(
+            "SELECT * FROM live_checks WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            (task_id, min(limit, 200)),
+        )
+    )
+
+
+async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
+    """The merge commit the delivery gate recorded for this task, or "".
+
+    Used as the default subject of a live check: what shipped is what should
+    be observed. Empty means the hub does not know — and an unknown sha is
+    recorded as unknown rather than guessed (#725).
+    """
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT merge_sha FROM pipeline_merges WHERE task_id = ? "
+            "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+    )
+    return str(dict(rows[0])["merge_sha"]) if rows else ""

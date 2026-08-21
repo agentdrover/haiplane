@@ -12,6 +12,11 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.outcomes import outcome_debt
+from hub.services.live_check import (
+    list_checks,
+    live_check_view,
+    record_live_check,
+)
 from hub.services.messaging import (
     MESSAGE_EVENT_KIND,
     addressable_refs,
@@ -148,11 +153,14 @@ __all__ = [
     "heartbeat_session",
     "inbox",
     "list_acceptance_criteria",
+    "list_checks",
     "list_sessions",
+    "live_check_view",
     "message_event_is_addressed",
     "message_view",
     "note_session_task",
     "readiness_tree",
+    "record_live_check",
     "refine_task",
     "refine_tasks_bulk",
     "register_session",
