@@ -44,6 +44,7 @@ async def _make_dor_ready(client: AsyncClient, task_id: int) -> None:
             "validation_commands": ["uv run pytest"],
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "acceptance_criteria": [
                 {
                     "id": "AC-1",

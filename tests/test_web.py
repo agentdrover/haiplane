@@ -360,6 +360,7 @@ async def test_task_detail_and_list_show_analyst_ready_badge(client: AsyncClient
             "work_type": "feature",
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "prepared_by": "analyst-agent",
             "prepared_at": "2026-04-30 00:00:00",
             "user_story": "As a reviewer I want a ready badge.",
@@ -409,6 +410,7 @@ async def test_task_detail_does_not_show_analyst_ready_without_preparation_updat
             "work_type": "feature",
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "user_story": "As a reviewer I want no false badge.",
             "problem_statement": "DoR alone is not analyst preparation.",
             "business_value": "Avoid misleading humans.",
@@ -447,6 +449,7 @@ async def test_tasks_page_filters_analyst_ready_tasks(client: AsyncClient):
             "work_type": "feature",
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "user_story": "As a reviewer I want a ready filter.",
             "problem_statement": "Prepared tasks need a list.",
             "business_value": "Humans find ready work quickly.",
@@ -980,6 +983,7 @@ async def _draft_with_readiness(client: AsyncClient, title: str, *, ready: bool)
                 "validation_commands": ["uv run pytest -q"],
                 "size": "S",
                 "wip_tag": "feature_work",
+                "affected_areas": ["hub/services/dor.py"],
                 "acceptance_criteria": [
                     {
                         "id": "AC-1",

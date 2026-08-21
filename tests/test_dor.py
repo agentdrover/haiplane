@@ -4,6 +4,8 @@ import aiosqlite
 import pytest
 
 from hub import repository as repo
+from hub.db import deserialize_str_list
+from hub.services.risk_class import derive_risk_class
 from hub.models import (
     ACVerifiableBy,
     AcceptanceCriterion,
@@ -52,6 +54,7 @@ def _empty_kwargs(**overrides):
         size=None,
         wip_tag=None,
         ac_count=0,
+        affected_areas_count=0,
     )
     base.update(overrides)
     return base
@@ -122,6 +125,7 @@ def test_feature_fully_filled_passes_dor():
             size="S",
             wip_tag="feature_work",
             ac_count=1,
+            affected_areas_count=1,
         )
     )
     assert result.passed is True
@@ -192,6 +196,7 @@ def test_incident_requires_acceptance_criteria_and_does_not_require_size():
             problem_statement="API 5xx spike",
             validation_count=1,
             ac_count=1,
+            affected_areas_count=1,
         )
     )
     assert result_ok.passed is True
@@ -211,6 +216,7 @@ def test_bug_requires_business_value_and_problem_statement():
             size="S",
             wip_tag="bugfix",
             ac_count=1,
+            affected_areas_count=1,
         )
     )
     assert result.passed is False
@@ -230,6 +236,7 @@ def test_refactor_requires_wip_tag():
             validation_count=1,
             size="S",
             ac_count=1,
+            affected_areas_count=1,
         )
     )
     assert result.passed is False
@@ -245,6 +252,7 @@ def test_refactor_requires_wip_tag():
             size="S",
             wip_tag="tech_debt",
             ac_count=1,
+            affected_areas_count=1,
         )
     )
     assert result_ok.passed is True
@@ -322,6 +330,7 @@ async def test_evaluate_dor_full_feature_passes(db: aiosqlite.Connection):
         size=TaskSize.M,
         wip_tag=WipTag.feature_work,
         class_of_service=ClassOfService.standard,
+        affected_areas=["hub/services/dor.py"],
     )
     await repo.add_acceptance_criterion(db, task_id, _ac(1))
     await db.commit()
@@ -341,3 +350,108 @@ async def test_evaluate_dor_counts_acs_from_table(db: aiosqlite.Connection):
     by_key = {c.key: c for c in result.checks}
     assert by_key["has_acceptance_criteria"].passed is True
     assert "2" in by_key["has_acceptance_criteria"].detail
+
+
+# --- Areas are part of readiness for code work (#842) ------------------------
+#
+# A statement could be complete by all eight checks and still not say what it
+# touches. Four mechanisms read that field and all four degraded quietly: the
+# risk class was never computed (#582), the review profile bought the
+# expensive harness on "unknown" (#807/#820), the statement-freshness check
+# had nothing to compare, and the submit-time area check could not tell
+# whether the work strayed. Measured 21.08.2026: 86 of 96 spike-bo tasks had
+# no class for exactly this reason.
+
+
+def test_code_work_needs_affected_areas():
+    # AC-1 (#842): complete in every other respect, and still not ready —
+    # with that one check named, not a bare "not ready".
+    result = evaluate_from_data(
+        **_empty_kwargs(
+            user_story="us",
+            problem_statement="ps",
+            business_value="bv",
+            scope_in_count=1,
+            validation_count=1,
+            size="S",
+            wip_tag="feature_work",
+            ac_count=1,
+            affected_areas_count=0,
+        )
+    )
+
+    assert result.passed is False
+    assert result.missing_required == frozenset({"has_affected_areas"})
+
+
+async def test_declared_areas_pass_and_yield_a_class(db: aiosqlite.Connection):
+    # AC-2 (#842): the point of the requirement is what it unlocks — with
+    # areas declared the task both passes and finally HAS a risk class,
+    # which is what every downstream mechanism was waiting for.
+    task_id = await _make_task(
+        db,
+        user_story="us",
+        problem_statement="ps",
+        business_value="bv",
+        scope_in=["a"],
+        validation_commands=["pytest"],
+        size=TaskSize.M,
+        wip_tag=WipTag.feature_work,
+        affected_areas=["hub/services/dor.py"],
+    )
+    await repo.add_acceptance_criterion(db, task_id, _ac(1))
+    await db.commit()
+
+    result = await evaluate_dor(db, task_id)
+
+    assert result.passed is True
+    assert result.missing_required == frozenset()
+    # And the point of the requirement: the declared areas are enough to
+    # derive a class. (The recompute itself belongs to the create/refine
+    # paths, #582 — here we check that the input it needs now exists.)
+    row = dict(await repo.get_task(db, task_id))
+    derived, reasons = derive_risk_class(deserialize_str_list(row["affected_areas"]))
+    assert derived is not None, "declared areas must yield a computed class"
+    assert reasons
+
+
+@pytest.mark.parametrize(
+    "work_type",
+    [WorkType.docs.value, WorkType.chore.value, WorkType.spike.value],
+)
+def test_non_code_work_types_stay_unchanged(work_type: str):
+    # AC-3 (#842): docs have nothing to declare, a spike does not yet know.
+    # Requiring areas there would buy nothing and cost a gate.
+    assert "has_affected_areas" not in DOR_REQUIRED_BY_WORK_TYPE[work_type]
+
+
+@pytest.mark.parametrize(
+    "work_type, wip_tag",
+    [
+        (WorkType.feature.value, "feature_work"),
+        (WorkType.bug.value, "bugfix"),
+        (WorkType.refactor.value, "tech_debt"),
+        (WorkType.incident.value, "support"),
+    ],
+)
+def test_every_code_work_type_requires_areas(work_type: str, wip_tag: str):
+    # AC-4 (#842): the rule is about changing code, not about the word
+    # "feature" — a bug fix touches the same files and hides the same risk.
+    assert "has_affected_areas" in DOR_REQUIRED_BY_WORK_TYPE[work_type]
+
+    result = evaluate_from_data(
+        **_empty_kwargs(
+            work_type=work_type,
+            user_story="us",
+            problem_statement="ps",
+            business_value="bv",
+            scope_in_count=1,
+            validation_count=1,
+            size="S",
+            wip_tag=wip_tag,
+            ac_count=1,
+            affected_areas_count=0,
+        )
+    )
+
+    assert "has_affected_areas" in result.missing_required

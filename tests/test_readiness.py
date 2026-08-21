@@ -53,6 +53,7 @@ def _all_passed_dor(work_type: WorkType = WorkType.feature) -> DoREvaluation:
         size="S",
         wip_tag="feature_work",
         ac_count=1,
+        affected_areas_count=1,
     )
 
 
@@ -256,6 +257,7 @@ async def _make_task_with_full_dor(db: aiosqlite.Connection) -> int:
         validation_commands=["pytest"],
         size=TaskSize.S,
         wip_tag=WipTag.feature_work,
+        affected_areas=["hub/services/dor.py"],
     )
     task_id = await repo.create_task_full(db, payload, status="draft")
     await repo.add_acceptance_criterion(db, task_id, _ac(1))

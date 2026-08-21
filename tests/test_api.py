@@ -31,6 +31,7 @@ async def test_create_task_persists_structured_fields(client: AsyncClient):
         "class_of_service": "expedite",
         "size": "L",
         "wip_tag": "feature_work",
+        "affected_areas": ["hub/services/dor.py"],
         "user_story": "as a user, I want X so that Y",
         "problem_statement": "the problem",
         "business_value": "the value",
@@ -1673,6 +1674,7 @@ async def _make_dor_ready_draft(client: AsyncClient, title: str) -> int:
             "validation_commands": ["uv run pytest -q"],
             "size": "S",
             "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
             "acceptance_criteria": [
                 {
                     "id": "AC-1",
@@ -2685,6 +2687,7 @@ async def _draft_ready_for_approval(client: AsyncClient, headers: dict) -> int:
             "scope_in": ["approval path"],
             "size": "S",
             "wip_tag": "bugfix",
+            "affected_areas": ["hub/services/dor.py"],
             "validation_commands": ["uv run pytest -q"],
             "acceptance_criteria": [
                 {

@@ -106,6 +106,7 @@ def test_perfect_task_yields_no_recommendations():
             size="S",
             wip_tag="feature_work",
             ac_count=1,
+            affected_areas_count=1,
             outcome_metric="median lead time, 3d -> 1d",
             redesign_decision="adapt",
             agent_fit="sdd_native",
@@ -209,6 +210,7 @@ def test_no_recommendations_for_risks_only():
             size="S",
             wip_tag="feature_work",
             ac_count=1,
+            affected_areas_count=1,
             outcome_metric="median lead time, 3d -> 1d",
             redesign_decision="adapt",
             agent_fit="sdd_native",
@@ -239,6 +241,7 @@ async def _make_full_task(db: aiosqlite.Connection) -> int:
         validation_commands=["pytest"],
         size=TaskSize.S,
         wip_tag=WipTag.feature_work,
+        affected_areas=["hub/services/dor.py"],
         # Discovery (#331) is part of a complete feature task now: without it
         # the task is not "full", it is merely fully specified.
         outcome_metric="median lead time, 3d -> 1d",
@@ -341,6 +344,7 @@ async def test_ac_quality_warning_for_thin_ac_is_non_blocking(
         validation_commands=["pytest"],
         size=TaskSize.S,
         wip_tag=WipTag.feature_work,
+        affected_areas=["hub/services/dor.py"],
     )
     task_id = await repo.create_task_full(db, payload, status="draft")
     await repo.add_acceptance_criterion(db, task_id, _thin_ac(1))
