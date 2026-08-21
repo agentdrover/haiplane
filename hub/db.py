@@ -859,6 +859,36 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_agent_sessions_last_seen "
         "ON agent_sessions(last_seen_at)",
     ),
+    (
+        # Agent messages (#773, feature #770): the coordination channel.
+        # The address is one (to_kind, to_ref) pair rather than four nullable
+        # columns — the shape itself says "exactly one addressee", and no NULL
+        # can quietly come to mean "everyone". to_ref stays TEXT with no FK for
+        # the same snapshot reason events use: a message must outlive the task,
+        # project or session it points at. The body is stored as written and
+        # never interpreted: what a message says is data for its reader, not an
+        # instruction for the hub.
+        "create_agent_messages",
+        """CREATE TABLE IF NOT EXISTS agent_messages (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id         TEXT    NOT NULL DEFAULT '',
+            from_principal_id INTEGER,
+            from_session_id   TEXT    NOT NULL DEFAULT '',
+            from_agent        TEXT    NOT NULL DEFAULT '',
+            from_model        TEXT    NOT NULL DEFAULT '',
+            to_kind           TEXT    NOT NULL,
+            to_ref            TEXT    NOT NULL,
+            kind              TEXT    NOT NULL DEFAULT 'note',
+            body              TEXT    NOT NULL,
+            related_task_id   INTEGER,
+            created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_agent_messages_address",
+        "CREATE INDEX IF NOT EXISTS idx_agent_messages_address "
+        "ON agent_messages(to_kind, to_ref, id)",
+    ),
 ]
 
 

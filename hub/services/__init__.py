@@ -10,6 +10,11 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.outcomes import outcome_debt
+from hub.services.messaging import (
+    inbox,
+    send_message,
+    thread,
+)
 from hub.services.sessions import (
     heartbeat_session,
     list_sessions,
@@ -131,6 +136,7 @@ __all__ = [
     "delete_acceptance_criterion",
     "get_readiness",
     "heartbeat_session",
+    "inbox",
     "list_acceptance_criteria",
     "list_sessions",
     "note_session_task",
@@ -138,7 +144,9 @@ __all__ = [
     "refine_task",
     "refine_tasks_bulk",
     "register_session",
+    "send_message",
     "session_view",
+    "thread",
     "upsert_acceptance_criterion",
     "replace_acceptance_criteria",
     "row_to_ac",
