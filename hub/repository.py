@@ -2381,3 +2381,157 @@ async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14)
         (f"-{keep_days} days",),
     )
     return cur.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# Agent messages (#773)
+# ---------------------------------------------------------------------------
+
+
+async def insert_agent_message(
+    db: aiosqlite.Connection,
+    *,
+    from_principal_id: int | None,
+    from_session_id: str,
+    from_agent: str,
+    from_model: str,
+    to_kind: str,
+    to_ref: str,
+    kind: str,
+    body: str,
+    related_task_id: int | None = None,
+    thread_id: str = "",
+) -> int:
+    """Append a message. Deliberately NO commit: the caller writes the
+    ``message_posted`` event in the same transaction, so a rollback removes
+    both and a notification can never outlive the message it announces
+    (the rule events have followed since #349)."""
+    cur = await db.execute(
+        "INSERT INTO agent_messages "
+        "(thread_id, from_principal_id, from_session_id, from_agent, from_model, "
+        " to_kind, to_ref, kind, body, related_task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            thread_id,
+            from_principal_id,
+            from_session_id,
+            from_agent,
+            from_model,
+            to_kind,
+            to_ref,
+            kind,
+            body,
+            related_task_id,
+        ),
+    )
+    message_id = cur.lastrowid
+    if not thread_id:
+        # A message that starts a thread is its own thread: one write, no
+        # second identifier to keep in sync.
+        await db.execute(
+            "UPDATE agent_messages SET thread_id = CAST(id AS TEXT) WHERE id = ?",
+            (message_id,),
+        )
+    return message_id  # type: ignore[return-value]
+
+
+async def get_agent_message(
+    db: aiosqlite.Connection, message_id: int
+) -> aiosqlite.Row | None:
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT * FROM agent_messages WHERE id = ? LIMIT 1", (message_id,)
+        )
+    )
+    return rows[0] if rows else None
+
+
+# The four ways a message can be addressed to the caller, as one predicate.
+# Task channels resolve through the tasks table rather than through a copy of
+# the claim kept here: the task stays the only place that knows who holds it.
+_INBOX_PREDICATE = (
+    "("
+    "  (to_kind = 'session' AND to_ref = :session AND :session <> '')"
+    "  OR (to_kind = 'agent' AND to_ref = :agent AND :agent <> '')"
+    "  OR (to_kind = 'task' AND to_ref IN ("
+    "        SELECT CAST(id AS TEXT) FROM tasks"
+    "        WHERE (claimed_by = :agent AND :agent <> '')"
+    "           OR (assigned_agent = :agent AND :agent <> '')"
+    "           OR (claim_session_id = :session AND :session <> '')))"
+    "  OR to_kind = 'project'"
+    ")"
+)
+
+
+async def list_inbox_messages(
+    db: aiosqlite.Connection,
+    *,
+    session_id: str = "",
+    agent: str = "",
+    after_id: int = 0,
+    limit: int = 100,
+) -> list[aiosqlite.Row]:
+    """Messages addressed to this caller with id > ``after_id``, oldest first.
+
+    A cursor rather than a read flag on the row: several readers (the session,
+    its agent, the owner in the UI) look at the same message, and a single
+    "read" bit would let the first of them hide it from the rest.
+    """
+    return list(
+        await db.execute_fetchall(
+            f"SELECT * FROM agent_messages WHERE id > :after AND {_INBOX_PREDICATE} "  # nosec B608
+            "ORDER BY id ASC LIMIT :limit",
+            {
+                "after": after_id,
+                "session": session_id,
+                "agent": agent,
+                "limit": min(limit, 200),
+            },
+        )
+    )
+
+
+async def list_thread_messages(
+    db: aiosqlite.Connection, thread_id: str, *, limit: int = 200
+) -> list[aiosqlite.Row]:
+    return list(
+        await db.execute_fetchall(
+            "SELECT * FROM agent_messages WHERE thread_id = ? ORDER BY id ASC LIMIT ?",
+            (thread_id, min(limit, 500)),
+        )
+    )
+
+
+async def count_recent_messages(
+    db: aiosqlite.Connection,
+    *,
+    session_id: str,
+    agent: str,
+    within_minutes: int = 1,
+) -> int:
+    """How many messages this sender wrote inside the window (rate limiting).
+
+    Keyed by session when there is one and by agent otherwise, so a sender
+    without a registered session cannot dodge the limit by staying anonymous.
+    """
+    if session_id:
+        where, param = "from_session_id = ?", session_id
+    else:
+        where, param = "from_agent = ?", agent
+    rows = list(
+        await db.execute_fetchall(
+            f"SELECT COUNT(*) AS n FROM agent_messages WHERE {where} "  # nosec B608
+            "AND created_at >= datetime('now', ?)",
+            (param, f"-{within_minutes} minutes"),
+        )
+    )
+    return int(rows[0]["n"]) if rows else 0
+
+
+async def prune_agent_messages(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
+    """Delete messages older than ``keep_days``. Returns rows removed."""
+    cur = await db.execute(
+        "DELETE FROM agent_messages WHERE created_at < datetime('now', ?)",
+        (f"-{keep_days} days",),
+    )
+    return cur.rowcount or 0

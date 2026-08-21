@@ -60,6 +60,9 @@ from hub.models import (
     DigestAuditResult,
     TaskApprove,
     TaskArchive,
+    MessageSend,
+    MessageSendResult,
+    MessageView,
     SessionRegister,
     SessionView,
     TaskClaim,
@@ -1753,6 +1756,50 @@ async def api_session_heartbeat(
 ):
     """Record a sign of life for a registered session."""
     return await services.heartbeat_session(_db(request), session_id)
+
+
+# --- Messages between sessions (#773) ---
+#
+# The sender is the token and the inbox is bounded by the caller's own
+# addressing in SQL. Nothing here touches a task's status: a message is data
+# for its reader, never a command the hub executes — see hub/services/messaging.
+
+
+@app.post("/api/messages", response_model=MessageSendResult)
+async def api_send_message(
+    body: MessageSend,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Send one message to a session, an agent, or a task/project channel."""
+    return await services.send_message(
+        _db(request),
+        body,
+        agent=identity.username,
+        principal_id=identity.principal_id,
+    )
+
+
+@app.get("/api/messages", response_model=list[MessageView])
+async def api_inbox(
+    request: Request,
+    session_id: str = "",
+    after_id: int = 0,
+    limit: int = 100,
+    thread_id: str = "",
+    identity=Depends(current_identity),
+):
+    """Your inbox after a cursor, or one whole thread when thread_id is given."""
+    if thread_id:
+        return await services.thread(_db(request), thread_id, limit=limit)
+    return await services.inbox(
+        _db(request),
+        agent=identity.username,
+        session_id=session_id,
+        principal_id=identity.principal_id,
+        after_id=after_id,
+        limit=limit,
+    )
 
 
 @app.get("/api/sessions", response_model=list[SessionView])

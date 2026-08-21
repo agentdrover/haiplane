@@ -185,6 +185,14 @@ DEADLINE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES",
 SESSION_TTL_MINUTES = int(os.environ.get("OPENCLAW_SESSION_TTL_MINUTES", "10"))
 SESSION_RETENTION_DAYS = int(os.environ.get("OPENCLAW_SESSION_RETENTION_DAYS", "14"))
 
+# Agent messages (#773): a channel without limits becomes a dump nobody reads,
+# and one that blocks work becomes a toll booth. Both defaults are generous
+# enough that ordinary coordination never meets them, and a refusal always says
+# which limit it hit rather than failing shapelessly.
+MESSAGE_MAX_CHARS = int(os.environ.get("OPENCLAW_MESSAGE_MAX_CHARS", "4000"))
+MESSAGE_RATE_PER_MINUTE = int(os.environ.get("OPENCLAW_MESSAGE_RATE_PER_MINUTE", "30"))
+MESSAGE_RETENTION_DAYS = int(os.environ.get("OPENCLAW_MESSAGE_RETENTION_DAYS", "14"))
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 

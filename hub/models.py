@@ -814,6 +814,68 @@ class SessionView(BaseModel):
     ttl_minutes: int = 0
 
 
+class MessageSend(BaseModel):
+    """One message from a session to an address (#773).
+
+    ``session_id`` names the SENDER's own session — it is how the hub picks up
+    the model and session provenance; it cannot name a session the caller does
+    not own. There is no ``agent`` field: the sender is the token.
+    """
+
+    to_kind: str = Field(..., max_length=20)
+    to_ref: str = Field(..., min_length=1, max_length=200)
+    body: str = Field(..., min_length=1, max_length=20000)
+    kind: str = Field("note", max_length=20)
+    session_id: str = Field("", max_length=200)
+    related_task_id: int | None = None
+    reply_to: int | None = None
+
+
+class MessageView(BaseModel):
+    """A stored message with the provenance a reader needs to judge it.
+
+    Who wrote it, under which principal, from which session and which model —
+    all four, because "an agent said so" is not a reason to believe anything,
+    and a reader deciding what to do with a message needs to know whose words
+    these are.
+    """
+
+    id: int
+    thread_id: str = ""
+    from_principal_id: int | None = None
+    from_session_id: str = ""
+    from_agent: str = ""
+    from_model: str = ""
+    to_kind: str = ""
+    to_ref: str = ""
+    kind: str = "note"
+    body: str = ""
+    related_task_id: int | None = None
+    created_at: str = ""
+    matched_by: str = ""
+
+
+class MessageDelivery(BaseModel):
+    """What can honestly be said about reaching the addressee (#773).
+
+    ``delivered_now`` is None for channels — nobody counted the readers, so
+    claiming delivery would be an invention — and False for a session past its
+    TTL, together with how stale it is.
+    """
+
+    addressee_kind: str
+    addressee: str
+    delivered_now: bool | None = None
+    addressee_online: bool | None = None
+    addressee_last_seen_age_seconds: int | None = None
+    note: str = ""
+
+
+class MessageSendResult(BaseModel):
+    message: MessageView
+    delivery: MessageDelivery
+
+
 class TaskQuestion(BaseModel):
     agent: str = Field("", max_length=100)
     question: str = Field(..., min_length=1, max_length=10000)
