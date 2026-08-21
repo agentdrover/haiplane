@@ -651,6 +651,30 @@ class ACLocatorResolution(BaseModel):
     reason: str = ""
 
 
+class LiveCheckState(BaseModel):
+    """Did anyone watch this behave in production, and on which build (#814).
+
+    ``state`` is ``done`` (someone ran it and said what they saw),
+    ``not_applicable`` (there is nothing to observe, with a reason) or
+    ``unknown`` — nobody looked. Unknown is the default and always carries a
+    cause: an absent block would read as "the question was not asked", and it
+    is asked of every task.
+
+    ``sha_mismatch`` names the case the card must not hide: the observation
+    exists but was taken against another build than the one delivered.
+    """
+
+    state: str = "unknown"
+    reason: str = "живая проверка не записывалась"
+    probe: str = ""
+    observation: str = ""
+    sha: str = ""
+    delivered_sha: str = ""
+    sha_mismatch: bool = False
+    recorded_agent: str = ""
+    created_at: str = ""
+
+
 class CIRunReportState(BaseModel):
     """Does run evidence exist for the commit under review (#546).
 
@@ -750,6 +774,7 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    live_check: LiveCheckState = Field(default_factory=lambda: LiveCheckState())
     # #615: the reviewer judges a statement too — and it may be older than the
     # work that invalidated it.
     statement_freshness: dict[str, Any] | None = None

@@ -216,3 +216,146 @@ async def test_unknown_sha_stays_empty_rather_than_guessed(
         "no recorded merge means the hub does not know which build was seen — "
         "and an unknown sha is recorded as unknown (#725)"
     )
+
+
+# ---- #814: the block, and the counter it has to appear in ----
+#
+# The point is not that a line of text appears. A block outside the coverage
+# counter leaves the headline lying in the reassuring direction — it would say
+# "5 of 6 blocks" while a seventh question went unasked — so these tests aim at
+# checks_ran / checks_missing / checks_not_applicable, not at wording.
+
+
+async def _delivered(db, task_id: int, sha: str = "merge-sha-live") -> str:
+    await repo.record_pipeline_merge(
+        db, project_id=1, pr_number=101, task_id=task_id, merge_sha=sha
+    )
+    await db.commit()
+    return sha
+
+
+async def test_missing_live_check_counts_as_no_signal(
+    client: AsyncClient, monkeypatch, db
+):
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+    await _delivered(db, task_id)
+
+    brief = (
+        await client.get(f"/api/tasks/{task_id}/review-brief", headers=auth["human"])
+    ).json()
+    block = brief["live_check"]
+    assert block["state"] == "unknown"
+    assert block["reason"], "an unknown state always carries its cause"
+    missing = [c["check"] for c in brief["evidence_coverage"]["checks_missing"]]
+    assert "live_check" in missing, (
+        "counted, not merely printed: a block outside the counter makes the "
+        "headline understate what was never checked"
+    )
+
+
+async def test_recorded_check_shows_what_was_seen(client: AsyncClient, monkeypatch, db):
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+    sha = await _delivered(db, task_id)
+    await client.post(
+        f"/api/tasks/{task_id}/live-check",
+        json={
+            "outcome": "done",
+            "probe": "GET /api/sessions на проде",
+            "observation": "200 и непустой список",
+            "sha": sha,
+        },
+        headers=auth["agent"],
+    )
+
+    brief = (
+        await client.get(f"/api/tasks/{task_id}/review-brief", headers=auth["human"])
+    ).json()
+    block = brief["live_check"]
+    assert block["state"] == "done"
+    assert block["probe"].startswith("GET /api/sessions")
+    assert block["observation"].startswith("200")
+    assert block["sha_mismatch"] is False
+    assert "live_check" in brief["evidence_coverage"]["checks_ran"]
+
+    page = await client.get(f"/tasks/{task_id}", headers=auth["human"])
+    assert "Живая проверка" in page.text
+    assert "GET /api/sessions на проде" in page.text
+    assert "200 и непустой список" in page.text
+
+
+async def test_nothing_to_observe_is_its_own_state(
+    client: AsyncClient, monkeypatch, db
+):
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+    await _delivered(db, task_id)
+    await client.post(
+        f"/api/tasks/{task_id}/live-check",
+        json={
+            "outcome": "not_applicable",
+            "reason": "правка только в документации",
+        },
+        headers=auth["agent"],
+    )
+
+    brief = (
+        await client.get(f"/api/tasks/{task_id}/review-brief", headers=auth["human"])
+    ).json()
+    coverage = brief["evidence_coverage"]
+    assert brief["live_check"]["state"] == "not_applicable"
+    assert "live_check" in [c["check"] for c in coverage["checks_not_applicable"]]
+    assert "live_check" not in [c["check"] for c in coverage["checks_missing"]], (
+        "'nothing to observe' and 'nobody looked' are different claims, and a "
+        "warning that inflates gets muted along with the real ones"
+    )
+
+
+async def test_evidence_from_another_sha_is_flagged(
+    client: AsyncClient, monkeypatch, db
+):
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+    await _delivered(db, task_id, "merge-sha-live")
+    await client.post(
+        f"/api/tasks/{task_id}/live-check",
+        json={
+            "outcome": "done",
+            "probe": "curl прод",
+            "observation": "200",
+            "sha": "some-older-build",
+        },
+        headers=auth["agent"],
+    )
+
+    brief = (
+        await client.get(f"/api/tasks/{task_id}/review-brief", headers=auth["human"])
+    ).json()
+    block = brief["live_check"]
+    assert block["sha_mismatch"] is True
+    assert block["reason"], "the mismatch is said out loud, not left to be noticed"
+    assert "live_check" in [
+        c["check"] for c in brief["evidence_coverage"]["checks_missing"]
+    ], "an observation of another build is not evidence about what shipped"
+
+    page = await client.get(f"/tasks/{task_id}", headers=auth["human"])
+    assert "снято не на доставленном коммите" in page.text
+
+
+async def test_undelivered_task_is_not_scolded_for_a_missing_check(
+    client: AsyncClient, monkeypatch
+):
+    """Nothing has shipped yet, so a live check is not a check that failed."""
+    auth = _auth(monkeypatch)
+    task_id = await _task(client, auth)
+
+    brief = (
+        await client.get(f"/api/tasks/{task_id}/review-brief", headers=auth["human"])
+    ).json()
+    coverage = brief["evidence_coverage"]
+    assert "live_check" in [c["check"] for c in coverage["checks_not_applicable"]]
+    assert "live_check" not in [c["check"] for c in coverage["checks_missing"]], (
+        "demanding evidence that could not exist yet is the inflated warning "
+        "this counter was written to avoid (#534)"
+    )

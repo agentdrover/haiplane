@@ -166,6 +166,65 @@ def sha_check_statement(
     )
 
 
+async def live_check_state(
+    db: Any, task_id: int, *, delivered_sha: str = ""
+) -> dict[str, Any]:
+    """Did anyone watch this task behave after it shipped (#814, feature #811).
+
+    Three states, never two. "Nobody looked" and "there was nothing to look at"
+    are different claims, and collapsing them is how a brief starts reassuring
+    about work it never examined — the failure #725 catalogued for the blocks
+    around this one.
+
+    The newest record wins, but a record taken against another build is still
+    reported: the observation happened, it simply does not speak for what was
+    delivered. Saying that out loud is the same rule sha_check applies to a
+    submission.
+    """
+    from hub import repository as repo
+
+    rows = await repo.list_live_checks(db, task_id, limit=1)
+    if not rows:
+        return {
+            "state": "unknown",
+            "reason": (
+                "живая проверка не записывалась: поведение в проде никто не наблюдал"
+            ),
+            "delivered_sha": delivered_sha or "",
+        }
+    row = dict(rows[0])
+    outcome = row.get("outcome") or "done"
+    sha = row.get("sha") or ""
+    mismatch = bool(delivered_sha and sha and sha != delivered_sha)
+    reason = row.get("reason") or ""
+    if outcome == "not_applicable":
+        return {
+            "state": "not_applicable",
+            "reason": reason or "наблюдаемой поверхности нет",
+            "sha": sha,
+            "delivered_sha": delivered_sha or "",
+            "sha_mismatch": mismatch,
+            "recorded_agent": row.get("recorded_agent") or "",
+            "created_at": row.get("created_at") or "",
+        }
+    return {
+        "state": "done",
+        "reason": (
+            f"свидетельство снято на другом коммите ({sha[:12]}), "
+            f"а доставлен {delivered_sha[:12]} — оно не говорит о раскатанном"
+            if mismatch
+            else ""
+        ),
+        "probe": row.get("probe") or "",
+        "observation": row.get("observation") or "",
+        "sha": sha,
+        "delivered_sha": delivered_sha or "",
+        "sha_mismatch": mismatch,
+        "recorded_agent": row.get("recorded_agent") or "",
+        "created_at": row.get("created_at") or "",
+    }
+
+
 def evidence_coverage(
     *,
     diff_base: dict[str, Any],
@@ -177,6 +236,7 @@ def evidence_coverage(
     ci_state: str,
     freshness: dict[str, Any] | None,
     sha_check: str,
+    live_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One verdict over every evidence block in the brief (#725).
 
@@ -247,6 +307,29 @@ def evidence_coverage(
         applicable=has_test_acs,
     )
     _note("ci_run_report", ci_state == "current", "no run evidence for this commit")
+    # #814: the most expensive class of check — did anyone watch it behave in
+    # production. Counted here rather than shown beside the count, because a
+    # block outside the counter leaves the headline lying in the reassuring
+    # direction: it would say "5 of 6 blocks" while a seventh question went
+    # unasked. A mismatched sha counts as no signal: the observation is real,
+    # but not about what shipped.
+    #
+    # Applicable only once something HAS shipped. A brief is normally read
+    # before delivery, and demanding evidence that could not exist yet is the
+    # inflated warning this function was written to avoid (#534): it would fire
+    # on every first review and be muted within a day, taking the real ones
+    # with it. Evidence recorded anyway is always counted — someone looked.
+    live = live_check or {}
+    live_state = live.get("state") or "unknown"
+    delivered = bool((live.get("delivered_sha") or "").strip())
+    _note(
+        "live_check",
+        live_state == "done" and not live.get("sha_mismatch"),
+        live.get("reason") or "поведение в проде никто не наблюдал",
+        applicable=(
+            live_state != "not_applicable" and (delivered or live_state == "done")
+        ),
+    )
     freshness_state = (freshness or {}).get("state") or "not_checked"
     _note(
         "statement_freshness",

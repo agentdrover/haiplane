@@ -1257,12 +1257,30 @@ async def web_task_detail(
         services.message_view(row) for row in await repo.list_task_messages(db, task_id)
     ]
 
+    # #814: what was observed in production, and on which build. The delivered
+    # sha is what the evidence should be about — a record taken elsewhere is
+    # shown with that said out loud rather than quietly counted as proof.
+    delivered_sha = await repo.merge_sha_for_task(db, task_id)
+    live_checks = [
+        {
+            **services.live_check_view(row),
+            "sha_mismatch": bool(
+                delivered_sha
+                and (dict(row).get("sha") or "")
+                and dict(row).get("sha") != delivered_sha
+            ),
+        }
+        for row in await repo.list_live_checks(db, task_id)
+    ]
+
     return TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
             "task": task,
             "task_messages": task_messages,
+            "live_checks": live_checks,
+            "delivered_sha": delivered_sha,
             "machine_review": machine_review,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,

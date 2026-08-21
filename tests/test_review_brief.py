@@ -229,6 +229,9 @@ async def test_a_task_without_test_acs_is_not_reported_as_lost_evidence():
     assert [c["check"] for c in coverage["checks_not_applicable"]] == [
         "locator_resolution",
         "ac_test_results",
+        # #814 joins the same list here, and for the same reason: nothing has
+        # shipped yet, so a live check is not a check that failed to run.
+        "live_check",
     ]
 
 

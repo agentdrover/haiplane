@@ -307,6 +307,51 @@
                 {% endif %}
             </section>
 
+            {# Live checks (#814): did anyone watch this behave in production.
+               Absence is stated, not implied — an empty block here reads as
+               "nobody looked", which is exactly the fact the feature exists
+               to surface. #}
+            <section class="task-content-card" id="task-live-checks">
+                <div class="task-card-header">
+                    <h2>Живая проверка</h2>
+                    {% if live_checks %}<span class="section-count">{{ live_checks | length }}</span>{% endif %}
+                </div>
+                {% if live_checks %}
+                <div class="task-timeline">
+                    {% for c in live_checks %}
+                    <article class="task-timeline-item">
+                        <div class="task-timeline-marker"></div>
+                        <div class="task-timeline-body">
+                            <div class="task-timeline-meta">
+                                <span class="badge badge--xs">{{ c.outcome }}</span>
+                                <span>{{ c.recorded_agent or 'anonymous' }}</span>
+                                {% if c.sha %}
+                                <span class="badge badge--xs" title="Коммит, на котором снято свидетельство">sha {{ c.sha[:12] }}</span>
+                                {% else %}
+                                <span class="badge badge--xs" title="Хаб не знает, какая сборка проверялась">sha неизвестен</span>
+                                {% endif %}
+                                {% if c.sha_mismatch %}
+                                <span class="badge badge--xs badge-alert" title="Доставлен {{ delivered_sha[:12] }}">снято не на доставленном коммите</span>
+                                {% endif %}
+                                <time>{{ c.created_at }}</time>
+                            </div>
+                            {% if c.outcome == 'not_applicable' %}
+                            <div class="task-timeline-content u-pre-wrap">Наблюдать нечего: {{ c.reason }}</div>
+                            {% else %}
+                            <div class="task-timeline-content u-pre-wrap">Запускали: {{ c.probe }}</div>
+                            <div class="task-timeline-content u-pre-wrap">Увидели: {{ c.observation }}</div>
+                            {% endif %}
+                        </div>
+                    </article>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div class="empty empty-sm">
+                    <div class="empty-text">Поведение в проде никто не наблюдал</div>
+                </div>
+                {% endif %}
+            </section>
+
             {# Messages about this task (#775) — its own block, next to the
                update feed above and never merged into it: updates are the
                lifecycle journal, messages are the conversation. #}

@@ -61,6 +61,7 @@ from hub.models import (
     TaskApprove,
     TaskArchive,
     LiveCheckRecord,
+    LiveCheckState,
     LiveCheckView,
     MessageSend,
     MessageSendResult,
@@ -1709,6 +1710,14 @@ async def api_review_brief(
     # words are. Four blocks silent, one reassuring wrongly and one narrow-but-
     # green read as six independent findings across a day of briefs; they were
     # one absence, and only a combined statement says so.
+    # #814: the newest live-check evidence, against the commit that shipped.
+    # The delivered sha comes from the merge the gate recorded — the same
+    # answer the evidence itself defaults to, so brief and record agree.
+    delivered_sha = await repo.merge_sha_for_task(db, task_id)
+    live_check = await review_evidence.live_check_state(
+        db, task_id, delivered_sha=delivered_sha
+    )
+
     coverage = review_evidence.evidence_coverage(
         diff_base=diff_base,
         branch=task_view.branch or "",
@@ -1719,6 +1728,7 @@ async def api_review_brief(
         ci_state=ci_state,
         freshness=freshness,
         sha_check=sha_check,
+        live_check=live_check,
     )
 
     # #808: the block the human reads at the gate, built by the same function
@@ -1738,6 +1748,7 @@ async def api_review_brief(
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
         ci_run_report=ci_run_report,
+        live_check=LiveCheckState(**live_check),
         statement_freshness=freshness,
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,
