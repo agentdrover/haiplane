@@ -21,11 +21,16 @@ from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.review_dispatch import (
+    REVIEW_FILE_LINE_CAP,
     changed_paths,
+    diff_plan,
+    file_line_counts,
+    is_generated,
     pick_review_model,
     pick_review_profile,
     rules_candidates,
     rules_char_cap,
+    split_generated,
     sweep_review_dispatches,
 )
 
@@ -864,3 +869,107 @@ async def test_repo_rules_are_capped(
     updates = [dict(r) for r in await repo.get_task_updates(db, task_id)]
     dispatched = [u for u in updates if "Кросс-модельное ревью вызвано" in u["content"]]
     assert dispatched and "обрезано" in dispatched[-1]["content"]
+
+
+# --- Diff hygiene: the budget goes on code (#874) ---------------------------
+#
+# The hub does not hand the reviewer a diff — it reads one for itself and tells
+# the reviewer to run git. So for the reviewer the exclusion list is a pathspec
+# in the command it is given plus the names of what was left out; inside the
+# hub it is a real filter over the diff that picks the profile.
+
+_LOCK_DIFF = (
+    "diff --git a/uv.lock b/uv.lock\n"
+    "--- a/uv.lock\n"
+    "+++ b/uv.lock\n"
+    "+    asyncio.gather(everything)\n"
+    "diff --git a/hub/services/notes.py b/hub/services/notes.py\n"
+    "--- a/hub/services/notes.py\n"
+    "+++ b/hub/services/notes.py\n"
+    "+одна строка кода\n"
+)
+
+
+def test_is_generated_knows_artefacts_from_code():
+    assert is_generated("uv.lock") and is_generated("web/package-lock.json")
+    assert is_generated("tests/__snapshots__/card.txt")
+    assert is_generated("static/app.min.js")
+    # The list must stay narrow: a broad mask would hide real code silently.
+    assert not is_generated("hub/services/lockfile_reader.py")
+    assert not is_generated("hub/config.json")
+
+
+def test_split_generated_drops_only_the_artefact_hunks():
+    kept, dropped = split_generated(_LOCK_DIFF)
+    assert dropped == ["uv.lock"]
+    assert "asyncio.gather(everything)" not in kept
+    assert "одна строка кода" in kept
+
+
+def test_file_line_counts_orders_by_size():
+    diff = "+++ b/a.py\n+1\n+2\n+3\n+++ b/b.py\n-1\n+++ /dev/null\n-x\n"
+    assert file_line_counts(diff) == [("a.py", 3), ("b.py", 1)]
+
+
+def test_generated_files_excluded_and_named():
+    # AC-1 (#874): the reviewer gets a command it can run as given, and every
+    # exclusion is named where it will read it. A quiet exclusion would read as
+    # "there was nothing there" (#824).
+    block, note = diff_plan(_LOCK_DIFF, "develop", "task-874/x")
+
+    assert "git diff develop...task-874/x --" in block
+    assert "':(exclude)uv.lock'" in block
+    assert "uv.lock" in block and "сгенерированны" in block
+    assert "исключено сгенерированных: 1" in note
+
+
+def test_unreadable_diff_says_so_instead_of_excluding_nothing():
+    # "We could not read it" and "there was nothing to exclude" are different
+    # answers, and the second one reads as a clean, complete subject (#725).
+    block, note = diff_plan(None, "develop", "task-874/x")
+    assert "не удалось" in block
+    assert ":(exclude)" not in block
+    assert "не прочитан" in note
+
+
+async def test_generated_file_marker_does_not_buy_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#874): a marker inside a lock file is not code anyone wrote. Before
+    # this, one such line was the cheapest possible way to buy the expensive
+    # harness — and nobody would have noticed the bill.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gen"}, "run": {"id": "r-gen"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-generated", diff=_LOCK_DIFF)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite", (
+        "asyncio.gather in uv.lock must not buy deep"
+    )
+    # And the same marker in real code still does.
+    real = _LOCK_DIFF.replace("+++ b/uv.lock", "+++ b/hub/services/pool.py")
+    other = await _submitted(client, db, "spike-real-marker", diff=real)
+    assert (await _dispatch_row(db, other))["profile"] == "deep"
+
+
+async def test_oversized_file_is_named_not_left_to_eat_budget(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#874): one huge file must not silently consume the pass the other
+    # files were waiting for. The hub has no diff to truncate, so it names the
+    # file and its size and demands the remainder in lost_dimensions.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-big"}, "run": {"id": "r-big"}})
+    _wire(monkeypatch, recorder)
+    big = "+++ b/hub/services/huge.py\n" + "+строка\n" * (REVIEW_FILE_LINE_CAP + 5)
+    small = "+++ b/hub/services/small.py\n+одна строка\n"
+
+    await _submitted(client, db, "spike-oversized", diff=big + small)
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "НЕ ПОМЕСТЯТСЯ В ОДИН ПРОХОД" in prompt
+    assert f"hub/services/huge.py ({REVIEW_FILE_LINE_CAP + 5} строк)" in prompt
+    assert "lost_dimensions" in prompt
+    assert "hub/services/small.py" not in prompt.split("НЕ ПОМЕСТЯТСЯ")[1], (
+        "the small file is not the one that did not fit"
+    )
+    assert "git diff" in prompt, "the rest of the subject is still under review"
