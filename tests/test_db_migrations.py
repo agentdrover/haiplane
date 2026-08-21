@@ -767,3 +767,24 @@ async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
     finally:
         await fresh.close()
         await upgraded.close()
+
+
+async def test_provider_tokens_migration_is_additive():
+    # AC-5 (#828): reports written before the column exists keep reading, and
+    # they read as "never billed" rather than as "cost nothing" (#549).
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        await db.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, "
+            "harness_skill, raw_count) VALUES (1, 1, 'legacy', 0)"
+        )
+        await db.commit()
+
+        rows = list(
+            await db.execute_fetchall(
+                "SELECT provider_tokens FROM machine_reviews WHERE task_id = 1"
+            )
+        )
+        assert rows and rows[0]["provider_tokens"] is None

@@ -906,6 +906,23 @@ async def insert_machine_review(
     return cur.lastrowid  # type: ignore[return-value]
 
 
+async def set_machine_review_provider_tokens(
+    db: aiosqlite.Connection, task_id: int, generation: int, tokens: int
+) -> None:
+    """Record what the provider billed for this generation's review (#828).
+
+    Written by the sweep that already fetches usage for the mismatch check.
+    Only the latest report of the generation is stamped: a resubmission gets
+    its own dispatch and its own run.
+    """
+    await db.execute(
+        "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ("
+        "SELECT id FROM machine_reviews WHERE task_id = ? "
+        "AND submission_generation = ? ORDER BY id DESC LIMIT 1)",
+        (tokens, task_id, generation),
+    )
+
+
 async def get_latest_machine_review(
     db: aiosqlite.Connection, task_id: int
 ) -> aiosqlite.Row | None:

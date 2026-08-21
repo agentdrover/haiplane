@@ -149,7 +149,15 @@ async def practice_metrics(
         # below divides by this, not by every confirmed finding in the window.
         "COALESCE(SUM(CASE WHEN tokens_spent IS NOT NULL "
         "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
-        "AS confirmed_with_tokens "
+        "AS confirmed_with_tokens, "
+        # #828: the provider's own billing, kept apart from the harness's
+        # self-report. Never mixed into the same sum — see below.
+        "COALESCE(SUM(provider_tokens), 0) AS provider_tokens_total, "
+        "SUM(CASE WHEN provider_tokens IS NOT NULL THEN 1 ELSE 0 END) "
+        "AS reports_with_provider, "
+        "COALESCE(SUM(CASE WHEN provider_tokens IS NOT NULL "
+        "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
+        "AS confirmed_with_provider "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
         (since,),
     )
@@ -182,6 +190,20 @@ async def practice_metrics(
     totals["findings_unaccounted"] = max(raw - adjudicated, 0)
     totals["filtration_rate"] = (
         round(1 - confirmed / adjudicated, 3) if adjudicated else None
+    )
+
+    # #828: the cost the PROVIDER billed, computed only over the reports that
+    # carry it. The harness's own figure is never substituted for a missing
+    # one: on the first live cross-model run the two disagreed by 34x
+    # (175 000 reported against 6 013 569 billed, #818), so standing one in
+    # for the other would repeat #516 — a plausible number nobody re-checks —
+    # with a far larger error. Both stay visible; neither is corrected into
+    # the other, because it is not yet established which one is wrong.
+    confirmed_with_provider = totals["confirmed_with_provider"] or 0
+    totals["provider_tokens_per_confirmed"] = (
+        round(totals["provider_tokens_total"] / confirmed_with_provider)
+        if confirmed_with_provider
+        else None
     )
 
     # #807: the profile split is what tells whether "review every submission"

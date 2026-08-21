@@ -1781,6 +1781,9 @@ class MachineReviewView(BaseModel):
     # dispatch, never by the report about itself; empty means no dispatch was
     # behind it, which is NOT the same as a cheap run.
     profile: str = ""
+    # What the provider billed for this run (#828). None means the provider
+    # was never asked or did not answer — not that the run was free.
+    provider_tokens: int | None = None
     submitted_by: str = ""
     created_at: str = ""
 

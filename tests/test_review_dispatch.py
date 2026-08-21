@@ -703,3 +703,42 @@ def test_unknown_risk_kind_at_high_stays_deep():
         )
         assert profile == "deep", repr(kind)
         assert "нераспознанным" in reasons[0]
+
+
+async def test_provider_usage_is_stored_on_the_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#828): the sweep already fetches the bill to compare it. Keeping
+    # it is the whole point — the economics were being computed from the
+    # harness's own claim while the billed number was thrown away.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-bill"}, "run": {"id": "r-bill"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-billed")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "multi-agent-review",
+            "harness_version": 8,
+            "raw_count": 1,
+            "findings_confirmed": [{"title": "real one", "severity": "medium"}],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+            "tokens_spent": 175_000,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _usage(agent_id, run_id=None):
+        # The real #818 numbers.
+        return {"totalUsage": {"totalTokens": 6_013_569}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    await sweep_review_dispatches(db)
+
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["provider_tokens"] == 6_013_569
+    assert saved["tokens_spent"] == 175_000, "the self-report is not overwritten"

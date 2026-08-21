@@ -20,6 +20,10 @@ latency и размер ответов — на отдельной страни�
             <td>{{ (m.machine_reviews.filtration_rate * 100) | round(1) if m.machine_reviews.filtration_rate is not none else '—' }}%</td></tr>
         <tr><td>Находок не разобрано (ни подтверждены, ни отклонены)</td>
             <td>{% if m.machine_reviews.findings_unaccounted %}{{ m.machine_reviews.findings_unaccounted }} из {{ m.machine_reviews.raw_total }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Цена по счёту провайдера: токены / за подтверждённую находку</td>
+            <td>{{ m.machine_reviews.provider_tokens_total }} /
+                {% if m.machine_reviews.provider_tokens_per_confirmed is not none %}{{ m.machine_reviews.provider_tokens_per_confirmed }}{% else %}<span class="muted">нет данных провайдера</span>{% endif %}
+                <span class="muted">(отчётов с данными провайдера: {{ m.machine_reviews.reports_with_provider or 0 }} из {{ m.machine_reviews.reviews }})</span></td></tr>
         <tr><td>Tokens total / per confirmed finding</td>
             <td>{{ m.machine_reviews.tokens_total }} /
                 {% if m.machine_reviews.tokens_per_confirmed is not none %}{{ m.machine_reviews.tokens_per_confirmed }}{% else %}<span class="muted">нет данных</span>{% endif %}</td></tr>
@@ -35,6 +39,15 @@ latency и размер ответов — на отдельной страни�
 засчитывать в отсев те находки, которые никто не разбирал: на проде это 75 из
 192, и доля отсева поднималась с 0.573 до 0.740. Строка выше показывает
 неразобранный остаток.</p>
+
+<p class="muted">Две цены стоят рядом не по недосмотру. Верхняя — то, что
+выставил провайдер; нижняя — то, что харнесс сообщил о себе. На первом живом
+кросс-модельном прогоне (#818) они разошлись в 34 раза: 175 000 против
+6 013 569. Пока не установлено, какая из них неверна — это может быть ошибка
+отчёта, а может быть разница единиц счёта (свои токены против всех
+биллинговых), — поэтому ни одна не подставляется вместо другой и ни одна не
+объявляется исправлением другой. Отчёт без данных провайдера просто не входит
+в верхний знаменатель; сколько таких — сказано в скобках.</p>
 
 <p class="muted">Цена за находку считается только по отчётам, назвавшим свою
 стоимость: делить все токены на все подтверждённые находки значит смешивать
