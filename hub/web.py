@@ -985,13 +985,27 @@ async def web_agent_api_metrics(
     different question — what the tool surface costs, not how the practice
     performs.
     """
-    from hub.mcp_catalog import catalog_snapshot
+    from hub.mcp_catalog import (
+        HEADROOM_WARN_PCT,
+        catalog_snapshot,
+        check_budget,
+        load_baseline,
+        load_budget,
+        load_measured,
+    )
     from hub.services.mcp_telemetry import usage_report
 
-    data = await usage_report(
-        _db(request), window_days=window_days, catalog=await catalog_snapshot()
+    snapshot = await catalog_snapshot()
+    data = await usage_report(_db(request), window_days=window_days, catalog=snapshot)
+    # The same check CI runs, rendered where a human actually looks (#832).
+    # Headroom bought the mergeability of the budget file; it stays honest
+    # only while somebody can watch it shrink.
+    budget = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
+    return TEMPLATES.TemplateResponse(
+        request,
+        "agent_api.html",
+        {"u": data, "budget": budget, "headroom_warn_pct": HEADROOM_WARN_PCT},
     )
-    return TEMPLATES.TemplateResponse(request, "agent_api.html", {"u": data})
 
 
 @router.get("/digests", response_class=HTMLResponse)

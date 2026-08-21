@@ -105,6 +105,7 @@ from hub.mcp_catalog import (
     check_budget,
     load_baseline,
     load_budget,
+    load_measured,
 )
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -725,7 +726,11 @@ async def api_mcp_catalog(request: Request):
     without reading a workflow log.
     """
     snapshot = await catalog_snapshot()
-    result = check_budget(snapshot, load_budget(), load_baseline())
+    # measured is what makes the answer say how much of the declared headroom
+    # is gone, not merely how much room is left (#832). Without it the API
+    # reported nulls while CI printed real percentages — the same check
+    # answering differently depending on where you looked at it.
+    result = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
     return {**result, "tools_list": snapshot["tools_list"]}
 
 
