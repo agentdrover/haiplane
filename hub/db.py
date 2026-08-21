@@ -948,6 +948,35 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_machine_reviews_profile",
         "ALTER TABLE machine_reviews ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # Live-check evidence (#813, feature #811): did anyone actually watch
+        # this work behave after it shipped? Three defects on 21.08.2026
+        # (#801, #802, #803) passed review and green CI and were found only by
+        # running against production — and there was nowhere to record that a
+        # run had happened, so "checked" and "never checked" looked identical.
+        #
+        # Keyed by task AND sha, not by task alone: evidence belongs to the
+        # deployment it was taken against, and a later deploy does not inherit
+        # an earlier observation. Several rows per task are expected — repeat
+        # checks and different shas accumulate rather than overwrite.
+        "create_live_checks",
+        """CREATE TABLE IF NOT EXISTS live_checks (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            sha            TEXT    NOT NULL DEFAULT '',
+            outcome        TEXT    NOT NULL DEFAULT 'done',
+            probe          TEXT    NOT NULL DEFAULT '',
+            observation    TEXT    NOT NULL DEFAULT '',
+            reason         TEXT    NOT NULL DEFAULT '',
+            recorded_by    INTEGER,
+            recorded_agent TEXT    NOT NULL DEFAULT '',
+            created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_live_checks_task",
+        "CREATE INDEX IF NOT EXISTS idx_live_checks_task ON live_checks(task_id, id)",
+    ),
 ]
 
 

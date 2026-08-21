@@ -9,14 +9,23 @@
     "epic #776 exists to shrink these numbers, and slack left 'for",
     "convenience' is how the catalog reached this size.",
     "baseline_tools is per-tool description+schema chars, used only to",
-    "print the diff on a breach."
+    "print the diff on a breach.",
+    "Raised once on 2026-08-21 for hub_record_live_check (#813, feature",
+    "#811): 62 -> 63 tools, +516 description and +482 schema chars, and",
+    "the model-visible total grows by those plus one more copy of the",
+    "1599-char server instruction. The trade is deliberate and belongs in",
+    "the review, not in a silent edit: three defects that day (#801,",
+    "#802, #803) passed review and green CI and were caught only by a run",
+    "against production, and the hub had nowhere to record that such a run",
+    "happened. Epic #776 still owns shrinking these numbers; this raise is",
+    "the exception it will have to absorb, not permission for the next one."
   ],
   "measured_at": "2026-08-21",
   "budgets": {
-    "tools": 62,
-    "description_chars": 32415,
-    "schema_chars": 26688,
-    "model_visible_chars": 158241,
+    "tools": 63,
+    "description_chars": 32931,
+    "schema_chars": 27170,
+    "model_visible_chars": 160838,
     "max_tool_chars": 6472
   },
   "baseline_tools": {
@@ -59,6 +68,7 @@
     "hub_propose_task": 1574,
     "hub_provision_project": 585,
     "hub_readiness_tree": 592,
+    "hub_record_live_check": 1000,
     "hub_refine_task": 6472,
     "hub_refine_tasks": 671,
     "hub_reject_proposal": 270,
@@ -79,7 +89,7 @@
     "hub_task_update": 815,
     "hub_unarchive_task": 401,
     "hub_upsert_acceptance_criterion": 1211,
-    "hub_wait_events": 820,
+    "hub_wait_events": 818,
     "hub_whoami": 292,
     "hub_withdraw_own_draft": 377
   }
