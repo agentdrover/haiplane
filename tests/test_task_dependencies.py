@@ -233,3 +233,90 @@ async def test_warning_never_blocks_the_start(
     assert any("недоставленных блокерах" in c for c in contents), (
         "the warning travels in the same response the agent already reads"
     )
+
+
+# --- The edges become readable (#485) ----------------------------------------
+#
+# They were already stored (#482, #483) and already warned at start (#484), but
+# nothing outside SQL could see them: a task looked as if it had neither
+# blockers nor dependents.
+
+
+async def test_task_view_carries_both_sides(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-1 (#485): both directions on the single-task read.
+    resp = await client.post("/api/tasks", json={"title": "middle"})
+    middle = resp.json()["id"]
+    blocker = await _task(db, "upstream")
+    dependent = await _task(db, "downstream")
+    await repo.add_task_dependency(db, middle, blocker)
+    await repo.add_task_dependency(db, dependent, middle)
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{middle}")).json()
+
+    deps = view["dependencies"]
+    assert [d["task_id"] for d in deps["blocked_by"]] == [blocker]
+    assert [d["task_id"] for d in deps["unblocks"]] == [dependent]
+    assert deps["blocked_by"][0]["status"] == "open"
+
+
+async def test_blocked_by_shows_delivery_not_just_status(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-2 (#485): the status said "completed" for #818 while its PR sat open,
+    # and that is precisely what let #830 start. Delivery travels beside it.
+    resp = await client.post("/api/tasks", json={"title": "waits"})
+    blocked = resp.json()["id"]
+    blocker = await _task(db, "closed but unmerged")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="completed", pr_number=8)
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{blocked}")).json()
+
+    entry = view["dependencies"]["blocked_by"][0]
+    assert entry["status"] == "completed"
+    assert entry["delivered"] is False
+    assert entry["reason"] == "PR #8 не смержен гейтом"
+
+
+async def test_task_without_edges_says_nothing(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#485): silence, not empty lists. Most tasks have no edges, and a
+    # section printed for all of them is noise that trains readers to skip it.
+    from hub.mcp_server import _dependency_lines
+
+    resp = await client.post("/api/tasks", json={"title": "no edges"})
+    lonely = resp.json()["id"]
+
+    view = (await client.get(f"/api/tasks/{lonely}")).json()
+
+    assert view["dependencies"] is None
+    assert _dependency_lines(view) == []
+
+
+async def test_rest_and_mcp_agree_on_dependencies(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-4 (#485): one source, two presentations. Assembled from a second
+    # query, the text would drift from the payload and nobody could tell which
+    # one had aged.
+    from hub.mcp_server import _dependency_lines
+
+    resp = await client.post("/api/tasks", json={"title": "linked"})
+    task_id = resp.json()["id"]
+    blocker = await _task(db, "upstream work")
+    await repo.add_task_dependency(db, task_id, blocker)
+    await repo.update_task(db, blocker, status="running")
+    await db.commit()
+
+    view = (await client.get(f"/api/tasks/{task_id}")).json()
+    lines = "\n".join(_dependency_lines(view))
+
+    assert f"#{blocker}" in lines
+    assert "upstream work" in lines
+    assert "НЕ доставлен" in lines and "PR не заявлен" in lines
+    assert view["dependencies"]["blocked_by"][0]["delivered"] is False

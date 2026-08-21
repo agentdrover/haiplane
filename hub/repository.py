@@ -1763,8 +1763,12 @@ async def list_task_dependencies(
     immediately — "blocked by #818" means nothing without knowing where #818
     stands.
     """
+    # #485: delivery travels beside the status. A closed task whose PR is not
+    # merged blocks exactly as much as an open one — that is what #830 learned
+    # the expensive way, and a reader given only the status would repeat it.
     blocked_by = await db.execute_fetchall(
-        "SELECT t.id AS task_id, t.title, t.status "
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
         "WHERE d.task_id = ? ORDER BY t.id",
         (task_id,),
@@ -1776,9 +1780,24 @@ async def list_task_dependencies(
         (task_id,),
     )
     return {
-        "blocked_by": [dict(r) for r in blocked_by],
+        "blocked_by": [_blocker_entry(dict(r)) for r in blocked_by],
         "unblocks": [dict(r) for r in unblocks],
     }
+
+
+def _blocker_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """One blocker with its delivery state (#485).
+
+    ``delivered`` answers "is the code in the base branch", which is the
+    question the reader actually has; ``reason`` says why not, because "PR
+    not merged" and "no PR declared" call for different next moves.
+    """
+    delivered = bool(row.pop("merges", 0))
+    pr_number = row.pop("pr_number", None)
+    reason = ""
+    if not delivered:
+        reason = f"PR #{pr_number} не смержен гейтом" if pr_number else "PR не заявлен"
+    return {**row, "delivered": delivered, "reason": reason}
 
 
 async def undelivered_blockers(

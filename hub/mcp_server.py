@@ -580,6 +580,38 @@ async def hub_list_tasks(
     return structured_echo_result("\n".join(lines), tasks=result)
 
 
+def _dependency_lines(task: dict[str, Any]) -> list[str]:
+    """Blockers and dependents as text, from the SAME field REST returns (#485).
+
+    Rendered here rather than assembled from a second query: two renderings
+    of one fact drift, and the reader has no way to tell which one aged.
+
+    Delivery is printed beside the status because the status alone was what
+    let #830 start on top of an unmerged PR. A task with no edges gets no
+    lines at all.
+    """
+    deps = task.get("dependencies") or {}
+    lines: list[str] = []
+    blocked_by = deps.get("blocked_by") or []
+    if blocked_by:
+        lines.append("\nБлокеры:")
+        for dep in blocked_by:
+            mark = "доставлен" if dep.get("delivered") else "НЕ доставлен"
+            reason = f" — {dep['reason']}" if dep.get("reason") else ""
+            lines.append(
+                f"  #{dep['task_id']} {dep.get('title', '')} "
+                f"[{dep.get('status', '?')}] {mark}{reason}"
+            )
+    unblocks = deps.get("unblocks") or []
+    if unblocks:
+        lines.append("\nРазблокирует:")
+        for dep in unblocks:
+            lines.append(
+                f"  #{dep['task_id']} {dep.get('title', '')} [{dep.get('status', '?')}]"
+            )
+    return lines
+
+
 @mcp.tool()
 async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     """Get detailed status of a specific task including updates and log tail.
@@ -600,6 +632,7 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         f"Review: {'enabled' if task.get('auto_review', True) else 'disabled'}, cycle {task.get('review_cycle', 0)}",
         f"Created: {task['created_at']}",
     ]
+    parts.extend(_dependency_lines(task))
     if task.get("description"):
         parts.append(f"\nDescription:\n{task['description']}")
     if task.get("technical_hints"):

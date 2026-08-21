@@ -519,6 +519,17 @@ async def enrich_task_view(
             for c in crumbs[:-1]
         ]
 
+    # #485: edges on the single-task read only. Lists of hundreds of tasks
+    # must not pay for links most of them do not have.
+    edges = await repo.list_task_dependencies(db, task_view.id)
+    if edges["blocked_by"] or edges["unblocks"]:
+        from hub.models import TaskDependencies, TaskDependencyRef
+
+        task_view.dependencies = TaskDependencies(
+            blocked_by=[TaskDependencyRef(**e) for e in edges["blocked_by"]],
+            unblocks=[TaskDependencyRef(**e) for e in edges["unblocks"]],
+        )
+
     children = await db_module.get_children(db, task_view.id)
     if children:
         task_view.children = [

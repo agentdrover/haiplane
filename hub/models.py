@@ -1305,6 +1305,29 @@ class TaskProjectRef(BaseModel):
     slug: str
 
 
+class TaskDependencyRef(BaseModel):
+    """One end of a dependency edge, as a reader needs it (#485)."""
+
+    task_id: int
+    title: str = ""
+    status: str = ""
+    # Delivery, not status, decides whether a blocker still blocks (#484).
+    # None on the `unblocks` side: nobody asked whether THIS task shipped.
+    delivered: bool | None = None
+    reason: str = ""
+
+
+class TaskDependencies(BaseModel):
+    """Both sides of a task's edges (#485).
+
+    Absent entirely when the task has none — an empty pair of lists in every
+    response would be noise on the overwhelming majority of tasks.
+    """
+
+    blocked_by: list[TaskDependencyRef] = Field(default_factory=list)
+    unblocks: list[TaskDependencyRef] = Field(default_factory=list)
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -1404,6 +1427,9 @@ class TaskView(BaseModel):
     # would be one more thing to go stale — which is the very defect this
     # addresses. Absent means "not computed on this path", not "fresh".
     statement_freshness: dict[str, Any] | None = None
+    # #485: who blocks this task and whom it unblocks. None means no edges at
+    # all, which is not the same as "edges, but empty".
+    dependencies: "TaskDependencies | None" = None
     readiness_score: int | None = None
     dor_passed: bool | None = None
     ready_at: str | None = None
