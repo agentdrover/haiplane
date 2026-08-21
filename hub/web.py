@@ -755,6 +755,9 @@ async def web_projects(request: Request, project_error: str = Query("")):
             "projects": [dict(r) for r in rows],
             "cards": cards,
             "project_error": project_error,
+            # #475: the create form must prefill the branch the hub would
+            # actually fall back to, not a literal that stops matching it.
+            "default_base_branch": config.PAIR_BASE_BRANCH,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -798,7 +801,9 @@ async def web_create_project(request: Request):
             name=str(form.get("name") or "").strip(),
             repo=str(form.get("repo") or "").strip(),
             workspace_path=str(form.get("workspace_path") or "").strip(),
-            default_branch=str(form.get("default_branch") or "").strip() or "develop",
+            default_branch=(
+                str(form.get("default_branch") or "").strip() or config.PAIR_BASE_BRANCH
+            ),
             default_branch_policy=policy or {},
         )
     except ValidationError as exc:

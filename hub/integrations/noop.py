@@ -199,7 +199,7 @@ class NoopGitOps:
         self,
         branch: str,
         other_branch: str,
-        base_branch: str = "develop",
+        base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool:
         # No repo access — the advisory stacking check is silently skipped.
@@ -361,7 +361,7 @@ class NoopGitOps:
         return False
 
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+        self, repo_url: str, workspace_path: str, base_branch: str | None = None
     ) -> tuple[bool, str]:
         # Valid provision outcome (#347): the operator sees WHY it failed.
         return False, "git ops disabled (noop integration)"

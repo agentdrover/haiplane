@@ -35,7 +35,12 @@ from hub import config
 from hub import repository as repo
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
-from hub.services.project_policy import release_auto_enabled, gate_policy_of
+from hub.services.project_policy import (
+    base_branch_of,
+    gate_policy_of,
+    release_auto_enabled,
+    release_base_of,
+)
 
 log = logging.getLogger("hub")
 
@@ -46,8 +51,17 @@ log = logging.getLogger("hub")
 _TASK_NUMBER = re.compile(r"\(#(\d+)\)\s*$")
 
 
-def release_body(subjects: list[str]) -> tuple[str, list[int]]:
-    """The body of the release PR, and the task ids it carries."""
+def release_body(
+    subjects: list[str],
+    head: str = "",
+    base: str = "",
+) -> tuple[str, list[int]]:
+    """The body of the release PR, and the task ids it carries.
+
+    ``head``/``base`` are named rather than assumed (#475): the record must
+    say which branches this release actually moved, and on a project that is
+    not the hub they are not develop and main.
+    """
     task_ids: list[int] = []
     lines: list[str] = []
     for subject in subjects:
@@ -55,14 +69,16 @@ def release_body(subjects: list[str]) -> tuple[str, list[int]]:
         if match:
             task_ids.append(int(match.group(1)))
         lines.append(f"- {subject}")
+    head = head or config.PAIR_BASE_BRANCH
+    base = base or config.RELEASE_BRANCH
     header = (
-        "Релиз собран политикой проекта (#812): develop → main целиком.\n\n"
+        f"Релиз собран политикой проекта (#812): {head} → {base} целиком.\n\n"
         "Всё, что уедет этим релизом:\n"
     )
     footer = (
         "\n\nПорядок задач между собой политика не понимает — до depends_on "
-        "(#478) это тупой конвейер. Деплой по-прежнему делает CI на мерже в "
-        "main.\n"
+        f"(#478) это тупой конвейер. Деплой по-прежнему делает CI на мерже в "
+        f"{base}.\n"
     )
     return header + "\n".join(lines) + footer, task_ids
 
@@ -86,8 +102,15 @@ async def open_release_for_task(db: aiosqlite.Connection, task_id: int) -> int |
         return None
 
     ctx = await _git_context(db, task_id)
-    base = config.RELEASE_BRANCH
-    head = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+    # #475: both ends of the release come from the project. head is the branch
+    # work lands on (default_branch), base is where releases land
+    # (default_branch_policy.release_base). A project whose two ends coincide —
+    # spike-bo delivers straight to main — has nothing to release, and opening
+    # a main→main PR is a failure, not a release.
+    base = release_base_of(project)
+    head = ctx.get("base_branch") or base_branch_of(project)
+    if head == base:
+        return None
     try:
         subjects = await plugins.git_ops.release_range(
             base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
@@ -98,7 +121,7 @@ async def open_release_for_task(db: aiosqlite.Connection, task_id: int) -> int |
     if not subjects:
         return None
 
-    body, task_ids = release_body(subjects)
+    body, task_ids = release_body(subjects, head, base)
     title = f"release: {len(task_ids) or len(subjects)} задач(и) из {head} в {base}"
     try:
         pr_number = await plugins.git_ops.open_release_pr(
@@ -144,8 +167,10 @@ async def merge_ready_release(
         "repo": (project.get("workspace_path") or "").strip() or None,
         "gh_repo": (project.get("repo") or "").strip() or None,
     }
-    base = config.RELEASE_BRANCH
-    head = (project.get("default_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    base = release_base_of(project_row)
+    head = base_branch_of(project_row)
+    if head == base:
+        return False, ""
     try:
         pr_number = await plugins.git_ops.pr_for_branch(
             head, repo=ctx["repo"], gh_repo=ctx["gh_repo"]

@@ -8,6 +8,8 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from hub import config
+
 _SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
 
@@ -1595,7 +1597,7 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     repo: str = Field("", max_length=200)
     workspace_path: str = Field("", max_length=500)
-    default_branch: str = Field("develop", max_length=100)
+    default_branch: str = Field(config.PAIR_BASE_BRANCH, max_length=100)
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1980,7 +1982,7 @@ class ProjectView(BaseModel):
     status: str = "active"
     repo: str = ""
     workspace_path: str = ""
-    default_branch: str = "develop"
+    default_branch: str = config.PAIR_BASE_BRANCH
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
     # Gate policy (#743): {} means "no delegation" — every gate human.
     gate_policy: dict[str, Any] = Field(default_factory=dict)

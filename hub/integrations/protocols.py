@@ -122,7 +122,7 @@ class GitOpsPlugin(Protocol):
         self,
         branch: str,
         other_branch: str,
-        base_branch: str = "develop",
+        base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool: ...
     async def create_branch(
@@ -261,7 +261,7 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
     ) -> bool: ...
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str = "develop"
+        self, repo_url: str, workspace_path: str, base_branch: str | None = None
     ) -> tuple[bool, str]: ...
 
 

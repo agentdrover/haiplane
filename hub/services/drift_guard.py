@@ -51,6 +51,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.registry import plugins
+from hub.services.project_policy import base_branch_of
 
 log = logging.getLogger("hub.drift_guard")
 
@@ -153,11 +154,12 @@ async def check_project(
     """Check one project's base branch. Never raises — a failure is ``unknown``."""
     slug = project.get("slug") or "?"
     # Never hardcoded: calc-kids lives on master while the hub lives on develop.
-    base = (project.get("default_branch") or "").strip()
+    # #475: resolved by the one reader every gate uses, so a project that
+    # declares no branch is watched on the configured default instead of being
+    # dropped from the watch entirely — silence here reads as "clean".
+    base = base_branch_of(project)
     workspace = (project.get("workspace_path") or "").strip()
 
-    if not base:
-        return DriftReport(slug, "", "unknown", "project has no default_branch")
     if not workspace:
         return DriftReport(slug, base, "unknown", "project has no workspace_path")
 

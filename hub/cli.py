@@ -13,6 +13,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hub import config
+
 HUB_URL = os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
 HUB_TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN", "")
 
@@ -1395,7 +1397,11 @@ def build_parser() -> argparse.ArgumentParser:
     pp_create.add_argument("--name", required=True)
     pp_create.add_argument("--repo", default="")
     pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
-    pp_create.add_argument("--default-branch", dest="default_branch", default="develop")
+    pp_create.add_argument(
+        "--default-branch",
+        dest="default_branch",
+        default=config.PAIR_BASE_BRANCH,
+    )
     pp_create.set_defaults(func=cmd_projects_create)
 
     p_approve_batch = sub.add_parser(

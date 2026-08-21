@@ -2023,7 +2023,7 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
         return structured_echo_result("No projects.", projects=[])
     lines = [
         f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'} "
-        f"| base={p.get('default_branch', 'develop')}"
+        f"| base={p.get('default_branch') or config.PAIR_BASE_BRANCH}"
         + (" [archived]" if p.get("archived") else "")
         for p in projects
     ]
@@ -2669,7 +2669,7 @@ async def hub_create_project(
     name: str,
     repo: str = "",
     workspace_path: str = "",
-    default_branch: str = "develop",
+    default_branch: str = config.PAIR_BASE_BRANCH,
 ) -> str:
     """Create a project (#338). HUMAN-ONLY: projects define git routing;
     agent tokens receive human_only_gate.
@@ -2679,7 +2679,7 @@ async def hub_create_project(
         name: Display name
         repo: GitHub owner/repo for PRs
         workspace_path: Server workspace clone path
-        default_branch: Integration branch (default develop)
+        default_branch: Integration branch (defaults to the configured base)
     """
     body = {
         "slug": slug,
@@ -2701,7 +2701,7 @@ async def hub_propose_project(
     name: str,
     repo: str = "",
     workspace_path: str = "",
-    default_branch: str = "develop",
+    default_branch: str = config.PAIR_BASE_BRANCH,
 ) -> str:
     """Propose a project (#345): created as PENDING until a human
     activates it — pending projects stay out of git routing.

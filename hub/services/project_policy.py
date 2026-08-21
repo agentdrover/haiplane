@@ -17,9 +17,67 @@ import logging
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 
 log = logging.getLogger(__name__)
+
+
+def base_branch_of(project) -> str:
+    """The integration branch of an already-loaded project row (#475).
+
+    One reader for the question every gate asks — "which branch does work
+    land on here?" — because the answer differs per project: the hub itself
+    lives on ``develop``, calc-kids on ``master``, spike-bo on ``main``. Each
+    gate that answered it with a literal answered it for one project only.
+
+    The fallback is ``config.PAIR_BASE_BRANCH`` and it applies in exactly one
+    case: the project declares no branch at all (missing column, NULL, empty
+    or whitespace). A project that DOES declare one is never overridden — a
+    fallback that can win over a declared value is not a fallback, it is a
+    second source of truth, which is the defect this function removes.
+
+    Takes a row or a mapping, and tolerates both being absent: gates run on
+    projects that may not be resolvable, and a lookup failure must degrade to
+    the configured default rather than raise inside a gate.
+    """
+    declared = ""
+    if project is not None:
+        try:
+            declared = str(project["default_branch"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            declared = ""
+    return declared or config.PAIR_BASE_BRANCH
+
+
+async def base_branch_for_task(db: aiosqlite.Connection, task_id: int) -> str:
+    """The integration branch of the project this task belongs to (#475)."""
+    try:
+        project = await repo.resolve_project_for_task(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not resolve project for task #%s", task_id)
+        return config.PAIR_BASE_BRANCH
+    return base_branch_of(project)
+
+
+# Recognised key of the release base in ``default_branch_policy`` (#812/#475).
+# The UI has advertised ``{"release_base": "main"}`` since the policy column
+# existed; until #475 nothing read it, so a project whose default_branch is
+# already ``main`` (spike-bo) would have had a release PR opened from main
+# into main. Declared per project, falling back to the configured branch.
+RELEASE_BASE_KEY = "release_base"
+
+
+def release_base_of(project) -> str:
+    """Where this project's releases land; ``config.RELEASE_BRANCH`` by default."""
+    try:
+        policy = json.loads(project["default_branch_policy"] or "{}")
+    except (ValueError, KeyError, IndexError, TypeError):
+        policy = {}
+    declared = ""
+    if isinstance(policy, dict):
+        declared = str(policy.get(RELEASE_BASE_KEY) or "").strip()
+    return declared or config.RELEASE_BRANCH
 
 
 async def gate_policy_for_task(db: aiosqlite.Connection, task_id: int) -> dict:

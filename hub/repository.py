@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 import aiosqlite
 
+from hub import config
 from hub.db import (
     STRUCTURED_TASK_FIELDS,
     ac_to_row_kwargs,
@@ -556,7 +557,7 @@ async def create_project(
     name: str,
     repo_name: str = "",
     workspace_path: str = "",
-    default_branch: str = "develop",
+    default_branch: str = config.PAIR_BASE_BRANCH,
     default_branch_policy: str = "{}",
     status: str = "active",
 ) -> int:

@@ -121,11 +121,18 @@ def _pair_branch_conflict(
     suggested_tool: str | None = "hub_pair_start",
     current_branch: str | None = None,
     task_id: int | None = None,
+    base_branch: str | None = None,
 ) -> PairBranchConflictError:
     host = _hostname()
     if hint is None and current_branch and task_id is not None:
+        # #475: the operator is told to check out the branch this project
+        # actually integrates on. A literal here sent a calc-kids operator to
+        # `git checkout develop` in a clone that has no develop — an
+        # instruction that fails is worse than none, because it reads as the
+        # fix and leaves the workspace exactly as it was.
+        base = _resolve_base(base_branch)
         hint = (
-            f"SSH to {host}, then: cd {repo} && git checkout develop "
+            f"SSH to {host}, then: cd {repo} && git checkout {base} "
             f"(or push {current_branch!r} if unpushed), then "
             f"hub_pair_start for #{task_id}."
         )
@@ -708,6 +715,7 @@ class GitOpsIntegration:
                     reason="pair_branch_checkout_failed",
                     current_branch=current,
                     task_id=task_id,
+                    base_branch=base,
                 )
 
         slug = (branch_slug or "").strip() or _slugify(title)
@@ -2082,7 +2090,7 @@ class GitOpsIntegration:
             # Every workspace on production already exists, so this is the
             # only path that actually runs there: arming solely after a fresh
             # clone would have changed nothing at all (#532 review).
-            git_policy.activate_quietly(workspace_path)
+            git_policy.activate_quietly(workspace_path, base_branch=base_branch)
             log.info("clone_repo: verified existing clone at %s", workspace_path)
             return True, "existing clone verified, origin fetched"
 
@@ -2132,7 +2140,7 @@ class GitOpsIntegration:
         # a person must remember is the same failure as the hook nobody
         # activated — this is the one moment where nobody has to remember
         # (#532). Best effort: a hook that cannot be armed never fails a clone.
-        git_policy.activate_quietly(workspace_path)
+        git_policy.activate_quietly(workspace_path, base_branch=base_branch)
 
         transport = "https" if url.startswith("https") else "ssh"
         log.info(

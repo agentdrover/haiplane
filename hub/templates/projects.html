@@ -241,7 +241,7 @@
         <label class="task-action-label" for="np-workspace">Workspace path</label>
         <input id="np-workspace" name="workspace_path" class="task-action-control" placeholder="/srv/workspaces/calc-kids">
         <label class="task-action-label" for="np-branch">Default branch</label>
-        <input id="np-branch" name="default_branch" class="task-action-control" value="develop">
+        <input id="np-branch" name="default_branch" class="task-action-control" value="{{ default_base_branch }}">
         <label class="task-action-label" for="np-policy">Branch policy (JSON, optional)</label>
         <textarea id="np-policy" name="default_branch_policy" class="task-action-control task-action-textarea" placeholder='{"release_base": "main"}'></textarea>
         <button class="btn btn-success task-action-btn" type="submit">Create Project</button>

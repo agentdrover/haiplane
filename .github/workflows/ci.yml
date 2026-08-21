@@ -1,10 +1,18 @@
 name: CI
 
 on:
+  # #475: no base-branch allowlist. The delivery gate (#605/#606) merges a PR
+  # only after reading THIS workflow's outcome, so a base the allowlist did not
+  # name produced no run, the probe answered "absent", and approved work could
+  # not be delivered by any supported path. The base is a project setting the
+  # hub resolves from project.default_branch — a repository that renames its
+  # integration branch, or a satellite that reuses this file with master, must
+  # not have to remember to edit a list here for its gate to keep working.
+  # Stacked PRs (task → task) now run CI too, which is the correct answer for
+  # the same reason: the gate reads their outcome as well.
   pull_request:
-    branches:
-      - main
-      - develop
+  # Push stays explicit: it is what triggers the deploy job below, and deploying
+  # is a decision about which branches are production, not about where CI runs.
   push:
     branches:
       - main
