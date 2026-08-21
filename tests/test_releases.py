@@ -93,3 +93,100 @@ async def test_no_records_reads_as_unknown(db: aiosqlite.Connection):
     # failure this epic removes.
     assert await repo.latest_successful_release(db, 1) is None
     assert await repo.latest_successful_release(db) is None
+
+
+# ---- #495: the deploy callback, the only writer of the facts above ----
+
+
+def _deploy_tokens(monkeypatch) -> dict[str, dict[str, str]]:
+    """Identities for the callback: one that may record, two that may not.
+
+    Production grants ``deploys.record`` through the DB-backed ``ci_runner``
+    role; from env tokens only ``admin`` carries every permission, so that
+    stands in for CI here — the same substitution the ci-run-report tests make.
+    """
+    from hub import config
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        config.parse_tokens("denis:human-token:human,ci:ci-token:admin"),
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return {
+        "ci": {"Authorization": "Bearer ci-token"},
+        "human": {"Authorization": "Bearer human-token"},
+        "none": {},
+    }
+
+
+async def _release_rows(db: aiosqlite.Connection) -> list[dict]:
+    return [dict(r) for r in await db.execute_fetchall("SELECT * FROM releases")]
+
+
+async def test_deploy_callback_requires_auth(client, db, monkeypatch):
+    # AC-1 (#495): checked against the TABLE, not the status code. A 401 that
+    # still wrote a row would be the worst of both — the caller told "no" while
+    # the hub believes something shipped.
+    auth = _deploy_tokens(monkeypatch)
+    body = {"sha": "shipped-one", "ref": "main", "status": "success"}
+
+    anonymous = await client.post("/api/deploys", json=body, headers=auth["none"])
+    as_human = await client.post("/api/deploys", json=body, headers=auth["human"])
+
+    assert anonymous.status_code in (401, 403), anonymous.text
+    assert as_human.status_code == 403, "a human token does not carry deploys.record"
+    assert await _release_rows(db) == [], "a refused call must write nothing"
+
+
+async def test_deploy_callback_records_release(client, db, monkeypatch):
+    # AC-2 (#495): the fact enters the hub and reads back as production state.
+    auth = _deploy_tokens(monkeypatch)
+
+    resp = await client.post(
+        "/api/deploys",
+        json={"sha": "shipped-two", "ref": "main", "status": "success"},
+        headers=auth["ci"],
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deployed_sha"] == "shipped-two"
+    latest = await repo.latest_successful_release(db)
+    assert latest is not None and latest["deployed_sha"] == "shipped-two"
+    assert latest["source"], "who reported it is part of the fact"
+
+
+async def test_deploy_callback_is_idempotent_by_sha(client, db, monkeypatch):
+    # AC-3 (#495): CI runs get re-run, and a re-run redelivers the callback.
+    # Two rows would claim the commit was deployed twice.
+    auth = _deploy_tokens(monkeypatch)
+    body = {"sha": "shipped-three", "ref": "main", "status": "success"}
+
+    first = await client.post("/api/deploys", json=body, headers=auth["ci"])
+    second = await client.post("/api/deploys", json=body, headers=auth["ci"])
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert len(await _release_rows(db)) == 1
+
+
+async def test_failed_callback_is_stored_but_not_prod_state(client, db, monkeypatch):
+    # AC-4 (#495): a failed rollout is evidence about the pipeline and is kept,
+    # but production still runs the last release that worked.
+    auth = _deploy_tokens(monkeypatch)
+    await client.post(
+        "/api/deploys",
+        json={"sha": "shipped-four", "ref": "main", "status": "success"},
+        headers=auth["ci"],
+    )
+    await client.post(
+        "/api/deploys",
+        json={"sha": "fell-over", "ref": "main", "status": "failed"},
+        headers=auth["ci"],
+    )
+
+    rows = await _release_rows(db)
+    latest = await repo.latest_successful_release(db)
+
+    assert len(rows) == 2, "the failure is recorded, not dropped"
+    assert latest is not None and latest["deployed_sha"] == "shipped-four"

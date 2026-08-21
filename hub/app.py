@@ -31,6 +31,8 @@ from hub.db import get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    DeployCallback,
+    DeployView,
     CIRunReportResult,
     CIRunReportSubmit,
     BulkChildTasksCreate,
@@ -1509,6 +1511,46 @@ async def api_run_validation(task_id: int, request: Request):
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return await run_validation_commands(db, task_id)
+
+
+@app.post("/api/deploys", response_model=DeployView)
+async def api_record_deploy(
+    body: DeployCallback,
+    request: Request,
+    identity=Depends(require_permission("deploys.record")),
+):
+    """Record what production is running, as reported by the deploy job (#495).
+
+    The hub knew when it MERGED a change and treated that as delivery. On
+    21.08.2026 that reading was wrong in a way nothing could see from here:
+    task #823 sat completed with its PR merged into develop while the deploy
+    job was skipped, because deployment runs from main. This endpoint is where
+    the second fact — what is actually running — enters the hub.
+
+    Idempotent by (project, sha, status): CI runs get re-run, and a re-run
+    redelivers the same callback. Two rows would claim two deploys.
+    """
+    db = _db(request)
+    project_id = None
+    slug = (body.project or "").strip()
+    if slug:
+        project = await repo.get_project_by_slug(db, slug)
+        if not project:
+            raise HTTPException(404, f"project '{slug}' not found")
+        project_id = int(dict(project)["id"])
+
+    release_id = await repo.record_release(
+        db,
+        deployed_sha=body.sha,
+        project_id=project_id,
+        ref=body.ref,
+        status=body.status,
+        source=identity.username or "ci",
+    )
+    row = await repo.release_by_id(db, release_id)
+    if row is None:  # pragma: no cover - the row was just written
+        raise HTTPException(500, "release was written but could not be read back")
+    return DeployView(**row)
 
 
 @app.post("/api/tasks/{task_id}/ci-run-report", response_model=CIRunReportResult)

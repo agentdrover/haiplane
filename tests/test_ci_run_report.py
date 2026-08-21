@@ -304,7 +304,13 @@ def test_the_ci_runner_role_can_report_and_nothing_else():
 
     assert "tasks.ci_report" in ALL_PERMISSIONS
     roles = {name: set(perms) for name, _label, _desc, perms in SYSTEM_ROLES}
-    assert roles["ci_runner"] == {"tasks.read", "tasks.ci_report"}
+    # #495 widened this set by exactly one verb, deliberately: the deploy job
+    # runs under the same secret and reports a second FACT — what production
+    # is running — which is a different claim from "the tests ran on this
+    # commit" and therefore a different permission. The exact-set assertion is
+    # what forced that to be a decision instead of a drift, which is why it is
+    # written this way and should stay written this way.
+    assert roles["ci_runner"] == {"tasks.read", "tasks.ci_report", "deploys.record"}
     for forbidden in (
         "tasks.update",
         "tasks.agent_report",
@@ -316,6 +322,10 @@ def test_the_ci_runner_role_can_report_and_nothing_else():
     # And no pre-existing role silently gained the new permission.
     holders = {name for name, perms in roles.items() if "tasks.ci_report" in perms}
     assert holders == {"ci_runner", "super_admin"}
+    # The same lock over the newer permission: nothing else may quietly gain
+    # the ability to declare what is deployed.
+    deployers = {name for name, perms in roles.items() if "deploys.record" in perms}
+    assert deployers == {"ci_runner", "super_admin"}
 
 
 def test_default_env_token_roles_cannot_report_a_run():
