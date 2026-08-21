@@ -1377,6 +1377,12 @@ class TaskDependencyRef(BaseModel):
     # Delivery, not status, decides whether a blocker still blocks (#484).
     # None on the `unblocks` side: nobody asked whether THIS task shipped.
     delivered: bool | None = None
+    # HOW delivery was established (#885): "gate" — the hub merged it itself;
+    # "outside_gate" — the commit is in the base branch but the merge did not
+    # come through the pipeline, which clears the block and stays visible,
+    # since manual merges are against the rules here; "unknown" — the base
+    # branch could not be asked; "none" — looked and it is not there.
+    delivery_path: str = ""
     reason: str = ""
 
 
