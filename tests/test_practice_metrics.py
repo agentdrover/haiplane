@@ -1,9 +1,14 @@
-"""Human-gate override-rate and queue wait in practice_metrics (#737).
+"""Slices of practice_metrics that must not flatter the practice.
 
-The section answers one question per gate and project: how often does the
-human click change the outcome, and how long does work queue for it. Only
-human decisions count — 'hub' and 'policy' actors are excluded on both
-sides of the ratio; unmeasurable waits are reported, never zeroed.
+Human gates (#737): how often the human click changes the outcome and how long
+work queues for it. Only human decisions count — 'hub' and 'policy' actors are
+excluded on both sides of the ratio; unmeasurable waits are reported, never
+zeroed.
+
+Review economics (#828) and escaped defects (#528) follow the same rule from
+opposite ends: what a run cost, and what the gate failed to stop. Across all
+three the invariant is the one #519 and #810 paid for — an exclusion is counted
+and named, never folded into the number it would otherwise improve.
 """
 
 from __future__ import annotations
@@ -520,3 +525,237 @@ async def test_both_numbers_stay_visible_when_they_disagree(
     page = (await client.get("/metrics")).text
     assert "6013569" in page.replace(" ", "").replace("&nbsp;", "")
     assert "175000" in page.replace(" ", "").replace("&nbsp;", "")
+
+
+# --- Escaped defects (#528) -------------------------------------------------
+#
+# The leak side of the ledger: what review did NOT stop. Every test below is
+# about the same discipline the rest of this module is about — an exclusion is
+# counted and named, never folded into the headline number.
+
+
+async def _feature(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    status: str = "completed",
+    completed: str | None = "-10 days",
+) -> int:
+    """A feature, optionally closed without a completion stamp (pre-#517)."""
+    feature_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status=status,
+        auto_review=False,
+        task_type="feature",
+        parent_id=None,
+        priority="medium",
+    )
+    if completed is None:
+        await db.execute("UPDATE tasks SET completed_at=NULL WHERE id=?", (feature_id,))
+    else:
+        await db.execute(
+            "UPDATE tasks SET completed_at=datetime('now', ?) WHERE id=?",
+            (completed, feature_id),
+        )
+    return feature_id
+
+
+async def _bug(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    parent_id: int | None,
+    created: str = "-1 days",
+) -> int:
+    bug_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=parent_id,
+        priority="medium",
+    )
+    await db.execute(
+        "UPDATE tasks SET work_type='bug', created_at=datetime('now', ?) WHERE id=?",
+        (created, bug_id),
+    )
+    return bug_id
+
+
+async def _escaped(db: aiosqlite.Connection, **kwargs) -> dict:
+    return (await practice_metrics(db, **kwargs))["escaped_defects"]
+
+
+async def test_bug_after_feature_close_is_escaped(db: aiosqlite.Connection):
+    """AC-1: filed after the close, so the gate let it through — and the
+    feature is named, because a bare total starts no post-mortem."""
+    feature_id = await _feature(db, title="the leaky one", completed="-10 days")
+    await _bug(db, title="found in prod", parent_id=feature_id, created="-2 days")
+    await _bug(db, title="found again", parent_id=feature_id, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 2
+    assert escaped["features"] == [
+        {"feature_id": feature_id, "title": "the leaky one", "bugs": 2}
+    ]
+
+
+async def test_bug_before_close_is_not_escaped(db: aiosqlite.Connection):
+    """AC-2: a bug found while the feature was still being built is work, not
+    a leak — nothing escaped a gate it never passed."""
+    feature_id = await _feature(db, title="closed later", completed="-1 days")
+    await _bug(
+        db, title="found during the work", parent_id=feature_id, created="-5 days"
+    )
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 0
+    assert escaped["features"] == []
+    assert escaped["bugs_without_feature"] == 0, "it does have a feature"
+
+
+async def test_bug_without_feature_is_counted_apart(db: aiosqlite.Connection):
+    """AC-3: no feature ancestor means no answer, and no answer gets counted.
+
+    33 of 103 production bugs hang under an epic or under nothing at all.
+    Dropping them silently would let the metric read as complete coverage.
+    """
+    await _bug(db, title="orphan bug", parent_id=None, created="-1 days")
+    feature_id = await _feature(db, title="attributed", completed="-10 days")
+    await _bug(db, title="attributed bug", parent_id=feature_id, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 1
+    assert escaped["bugs_without_feature"] == 1
+    assert escaped["bugs_in_window"] == 2
+
+
+async def test_feature_without_completion_stamp_is_counted_not_estimated(
+    db: aiosqlite.Connection,
+):
+    """AC-4: closed but unstamped — the bug is neither an escape nor a
+    non-escape, and the missing date is NOT reconstructed from updated_at.
+
+    That substitution is what #810 removed from cycle time. Here it would
+    invent escapes wholesale: on production 53 of 82 closed features have no
+    stamp, and every bug under them would be dated after a made-up close.
+    """
+    feature_id = await _feature(db, title="closed before #517", completed=None)
+    await _bug(db, title="bug under it", parent_id=feature_id, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 0
+    assert escaped["features"] == []
+    assert escaped["features_without_completion"] == 1
+    assert escaped["bugs_without_feature"] == 0, "the feature is there, its date is not"
+
+
+async def test_open_feature_is_not_a_measurement_gap(db: aiosqlite.Connection):
+    """A feature still in flight has not let anything escape yet, so it is not
+    reported as a gap — only a CLOSED feature missing its stamp is."""
+    feature_id = await _feature(db, title="still open", status="open", completed=None)
+    await _bug(db, title="bug in flight", parent_id=feature_id, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 0
+    assert escaped["features_without_completion"] == 0
+
+
+async def test_window_applies_to_the_bug_date(db: aiosqlite.Connection):
+    """AC-5: the window asks what surfaced lately, so it is measured on the
+    bug. #518 was a numerator and a window keeping different clocks."""
+    feature_id = await _feature(db, title="long closed", completed="-100 days")
+    await _bug(db, title="old leak", parent_id=feature_id, created="-60 days")
+    await _bug(db, title="fresh leak", parent_id=feature_id, created="-2 days")
+    await db.commit()
+
+    assert (await _escaped(db, since_days=30))["escaped"] == 1
+    assert (await _escaped(db, since_days=365))["escaped"] == 2
+
+
+async def test_nearest_feature_gets_the_attribution(db: aiosqlite.Connection):
+    """A bug two levels down is attributed to its feature, not lost."""
+    feature_id = await _feature(db, title="two levels up", completed="-10 days")
+    task_id = await repo.create_task(
+        db,
+        title="a task under the feature",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await _bug(db, title="subtask bug", parent_id=task_id, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert escaped["escaped"] == 1
+    assert escaped["features"][0]["feature_id"] == feature_id
+
+
+async def test_features_are_ordered_by_how_much_they_leaked(
+    db: aiosqlite.Connection,
+):
+    quiet = await _feature(db, title="one leak", completed="-10 days")
+    loud = await _feature(db, title="three leaks", completed="-10 days")
+    await _bug(db, title="q1", parent_id=quiet, created="-1 days")
+    for n in range(3):
+        await _bug(db, title=f"l{n}", parent_id=loud, created="-1 days")
+    await db.commit()
+
+    escaped = await _escaped(db)
+    assert [f["feature_id"] for f in escaped["features"]] == [loud, quiet]
+
+
+async def test_metrics_page_shows_escaped_defects(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-6: all three numbers on the page, and an empty list says so in words.
+
+    A zero in the leaks column and a zero from having nothing to measure look
+    identical to a reader — which is why the uncounted gets its own rows.
+    """
+    feature_id = await _feature(db, title="leaky feature", completed="-10 days")
+    await _bug(db, title="prod bug", parent_id=feature_id, created="-1 days")
+    await _feature(db, title="unstamped feature", completed=None)
+    await _bug(db, title="orphan", parent_id=None, created="-1 days")
+    await db.commit()
+
+    page = (await client.get("/metrics")).text
+    assert "Escaped defects" in page
+    assert "leaky feature" in page
+    assert f"/tasks/{feature_id}" in page
+    assert "Багов без фичи-предка" in page
+    assert "Закрытых фич без отметки завершения" in page
+
+
+async def test_page_says_nothing_measurable_instead_of_zero(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    await _feature(db, title="clean feature", completed="-10 days")
+    await db.commit()
+
+    page = (await client.get("/metrics")).text
+    assert "нет измеримых утечек в этом окне" in page

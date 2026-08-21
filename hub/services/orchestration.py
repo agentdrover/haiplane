@@ -124,7 +124,8 @@ async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = 90
 ) -> dict[str, Any]:
     """Practice economics (#384): machine-review costs, filtration rate,
-    harness-version comparison, recurring finding categories, cycle times.
+    harness-version comparison, recurring finding categories, cycle times,
+    escaped defects.
 
     Aggregated on the fly from machine_reviews and task timestamps. Cycle time
     is measured from ``completed_at`` (#517) and from nothing else: a row
@@ -330,6 +331,8 @@ async def practice_metrics(
         )
     ]
 
+    escaped = await _escaped_defect_metrics(db, since)
+
     human_gates = await _human_gate_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
 
@@ -340,8 +343,106 @@ async def practice_metrics(
         "by_profile": [dict(r) for r in profile_rows],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
+        "escaped_defects": escaped,
         "human_gates": human_gates,
         "review_outcomes": review_outcomes,
+    }
+
+
+async def _escaped_defect_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """Bugs filed after their feature was closed — what review let through (#528).
+
+    Recurring categories count what the gate STOPPED. This counts what it
+    missed, which is the only side of the ledger that can contradict a
+    first-pass acceptance rate of 100% at zero rejections.
+
+    A bug is an escape when the nearest ``feature`` ancestor of its parent
+    chain carries a ``completed_at`` and the bug was filed after it. Both
+    halves of that test are cheap to get wrong, so both exclusions are
+    counted and published beside the result instead of being folded into it:
+
+    * ``bugs_without_feature`` — no feature ancestor at all (parent is an epic
+      or nothing). 33 of 103 bugs on production at the time of writing.
+    * ``features_without_completion`` — the feature is closed but has no
+      completion stamp: ``completed_at`` arrived with #517 and was never
+      backfilled, so 53 of 82 closed features cannot answer the question. The
+      date is NOT reconstructed from ``updated_at`` — that substitution is the
+      defect #810 removed from cycle time, and it would land here as a silent
+      wave of fake escapes. Scoped to features that actually have bugs in the
+      window: those are the ones where an answer was owed. How many closed
+      features lack the stamp overall is a question about data hygiene, not
+      about leaks, and mixing the two would put a number on this page that
+      nothing here can move.
+
+    With 14 counted escapes against those two buckets, the uncounted currently
+    outweighs the counted. Saying so is the point: a bare "14" reads as a
+    measurement of quality when it is mostly a measurement of which fields got
+    filled in.
+
+    The window applies to the bug's ``created_at`` — when the leak surfaced —
+    never to the feature's closure. #518 was a bug about a numerator and a
+    window keeping different clocks; this one states its clock.
+    """
+    rows = await db.execute_fetchall(
+        # The ancestry walk stops at the first feature, so each bug contributes
+        # its NEAREST feature and no other: a bug hanging under a task under a
+        # feature is attributed to that feature, not to the epic above it.
+        "WITH RECURSIVE ancestry(bug_id, bug_created, node_id, depth) AS ("
+        "  SELECT id, created_at, parent_id, 1 FROM tasks"
+        "   WHERE work_type = 'bug' AND parent_id IS NOT NULL"
+        "     AND created_at >= datetime('now', ?)"
+        "  UNION ALL"
+        "  SELECT a.bug_id, a.bug_created, t.parent_id, a.depth + 1"
+        "    FROM ancestry a JOIN tasks t ON t.id = a.node_id"
+        "   WHERE t.task_type != 'feature' AND t.parent_id IS NOT NULL"
+        "     AND a.depth < 10"
+        ") "
+        "SELECT a.bug_id, a.bug_created, f.id AS feature_id, f.title AS title, "
+        "f.status AS feature_status, f.completed_at AS feature_completed "
+        "FROM ancestry a "
+        "JOIN tasks f ON f.id = a.node_id AND f.task_type = 'feature'",
+        (since,),
+    )
+    total_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS bugs FROM tasks "
+        "WHERE work_type = 'bug' AND created_at >= datetime('now', ?)",
+        (since,),
+    )
+    bugs_in_window = total_rows[0]["bugs"] or 0
+
+    per_feature: dict[int, dict[str, Any]] = {}
+    unstamped: set[int] = set()
+    bugs_with_feature: set[int] = set()
+
+    for row in rows:
+        bugs_with_feature.add(row["bug_id"])
+        if row["feature_completed"] is None:
+            # A feature closed without a stamp cannot answer the question, and
+            # a feature still open has not let anything escape yet. Only the
+            # first case is a gap in the measurement, so only it is counted.
+            if row["feature_status"] == "completed":
+                unstamped.add(row["feature_id"])
+            continue
+        if row["bug_created"] <= row["feature_completed"]:
+            continue
+        entry = per_feature.setdefault(
+            row["feature_id"],
+            {"feature_id": row["feature_id"], "title": row["title"], "bugs": 0},
+        )
+        entry["bugs"] += 1
+
+    # The list is the usable part. A total says "leaks happen"; "five bugs
+    # escaped #723" is where a post-mortem starts, so the features are named
+    # and ordered by how much they leaked.
+    features = sorted(per_feature.values(), key=lambda f: (-f["bugs"], f["feature_id"]))
+    return {
+        "escaped": sum(f["bugs"] for f in features),
+        "features": features,
+        "bugs_without_feature": bugs_in_window - len(bugs_with_feature),
+        "features_without_completion": len(unstamped),
+        "bugs_in_window": bugs_in_window,
     }
 
 
