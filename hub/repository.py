@@ -2502,6 +2502,37 @@ async def list_thread_messages(
     )
 
 
+async def list_addressable_task_ids(
+    db: aiosqlite.Connection,
+    *,
+    agent: str = "",
+    session_ids: list[str] | None = None,
+) -> list[str]:
+    """Task channels this caller may read, as strings (#774).
+
+    The same three ways the inbox counts a task as yours — you claimed it, it
+    is assigned to you, or your session holds it. Returned as text because
+    ``to_ref`` is text: an address, not a foreign key.
+    """
+    sessions = [s for s in (session_ids or []) if s]
+    placeholders = ",".join("?" for _ in sessions)
+    conditions = []
+    params: list[Any] = []
+    if agent:
+        conditions.append("(claimed_by = ? OR assigned_agent = ?)")
+        params.extend([agent, agent])
+    if sessions:
+        conditions.append(f"claim_session_id IN ({placeholders})")  # nosec B608
+        params.extend(sessions)
+    if not conditions:
+        return []
+    rows = await db.execute_fetchall(
+        f"SELECT id FROM tasks WHERE {' OR '.join(conditions)}",  # nosec B608
+        tuple(params),
+    )
+    return [str(dict(r)["id"]) for r in rows]
+
+
 async def count_visible_in_thread(
     db: aiosqlite.Connection,
     thread_id: str,

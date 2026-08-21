@@ -2352,20 +2352,28 @@ async def hub_wait_events(
     """Wait for typed hub events past a cursor (#349) — the agent half of
     the «human pressed a button → agent continues» loop.
 
-    Long-polls GET /api/events: returns immediately when events with
-    id > ``since`` exist, otherwise blocks up to ``wait`` seconds (server
-    caps at 60). An empty result is normal — repeat with the same cursor.
+    Long-polls GET /api/events: returns at once when events with id > ``since``
+    exist, else blocks up to ``wait`` seconds (capped at 60). An empty result
+    is normal — repeat with the same cursor.
 
     Args:
         since: Last seen event id (0 starts from the whole feed).
         wait: Long-poll seconds, 0 returns immediately.
-        kinds: Comma-separated filter, e.g. "review_verdict_recorded,task_approved".
+        kinds: Filter, e.g. "task_approved" or "message" (your mail; see
+            hub_inbox).
     """
     from urllib.parse import urlencode
 
     params = {"since": since, "wait": wait}
     if kinds:
-        params["kinds"] = kinds
+        # "message" is what an agent means; "message_posted" is what the feed
+        # calls it. Translating here keeps the internal name internal instead
+        # of making every caller learn it.
+        params["kinds"] = ",".join(
+            "message_posted" if k.strip() == "message" else k.strip()
+            for k in kinds.split(",")
+            if k.strip()
+        )
     result = await _api_get(
         f"/api/events?{urlencode(params)}", timeout=min(wait, 60) + 20
     )

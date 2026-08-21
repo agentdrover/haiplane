@@ -326,6 +326,58 @@ async def send_message(
     )
 
 
+MESSAGE_EVENT_KIND = "message_posted"
+
+
+async def addressable_refs(
+    db: aiosqlite.Connection,
+    *,
+    agent: str,
+    principal_id: int | None,
+) -> dict[str, Any]:
+    """What counts as "addressed to me" when reading the events feed (#774).
+
+    Computed once per request rather than per event: the feed is a hot path,
+    and a query per row would make the honest answer the expensive one.
+    """
+    sessions = []
+    for row in await repo.list_agent_sessions(db, limit=500):
+        data = dict(row)
+        owner = data.get("principal_id")
+        if principal_id is not None and owner is not None:
+            if owner == principal_id:
+                sessions.append(data["session_id"])
+        elif (data.get("agent") or "") == agent and agent:
+            sessions.append(data["session_id"])
+    tasks = await repo.list_addressable_task_ids(db, agent=agent, session_ids=sessions)
+    return {"agent": agent, "sessions": set(sessions), "tasks": set(tasks)}
+
+
+def message_event_is_addressed(payload: dict[str, Any], refs: dict[str, Any]) -> bool:
+    """Whether this ``message_posted`` event belongs in the caller's feed.
+
+    The feed must not become the back door the inbox closed (#773 AC-1, #801):
+    the notification carries the address and the id, and only the people that
+    address covers get to see even that much. A project channel is a broadcast
+    and stays visible to everyone; a message to one session is not.
+    """
+    if payload.get("from_session_id") in refs["sessions"]:
+        return True
+    if payload.get("from_agent") and payload.get("from_agent") == refs["agent"]:
+        return True
+    to_kind = payload.get("to_kind")
+    to_ref = payload.get("to_ref")
+    if to_kind == "session":
+        return to_ref in refs["sessions"]
+    if to_kind == "agent":
+        return bool(refs["agent"]) and to_ref == refs["agent"]
+    if to_kind == "task":
+        return to_ref in refs["tasks"]
+    if to_kind == "project":
+        return True
+    return False
+
+
 async def inbox(
     db: aiosqlite.Connection,
     *,
