@@ -1789,9 +1789,22 @@ async def api_inbox(
     thread_id: str = "",
     identity=Depends(current_identity),
 ):
-    """Your inbox after a cursor, or one whole thread when thread_id is given."""
+    """Your inbox after a cursor, or one whole thread when thread_id is given.
+
+    Both branches carry the caller's identity (#801). They did not: the thread
+    branch took an id and answered, which made the addressing the inbox
+    enforces a formality anyone could walk around.
+    """
     if thread_id:
-        return await services.thread(_db(request), thread_id, limit=limit)
+        return await services.thread(
+            _db(request),
+            thread_id,
+            agent=identity.username,
+            principal_id=identity.principal_id,
+            session_id=session_id,
+            is_human=not identity.is_agent,
+            limit=limit,
+        )
     return await services.inbox(
         _db(request),
         agent=identity.username,

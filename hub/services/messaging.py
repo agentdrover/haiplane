@@ -361,8 +361,43 @@ async def inbox(
 
 
 async def thread(
-    db: aiosqlite.Connection, thread_id: str, *, limit: int = 200
+    db: aiosqlite.Connection,
+    thread_id: str,
+    *,
+    agent: str = "",
+    principal_id: int | None = None,
+    session_id: str = "",
+    is_human: bool = False,
+    limit: int = 200,
 ) -> list[MessageView]:
-    """A whole conversation, for the owner's view (#775) and for context."""
+    """A whole conversation — for a participant, or for the owner (#801).
+
+    This branch used to take a thread id and hand back the bodies, full stop.
+    Since ``thread_id`` is the id of the thread's first message — a small
+    integer — that made every conversation in the hub readable to any agent
+    token willing to count. The inbox was bounded all along (#773 AC-1); the
+    rule simply never reached the second door of the same endpoint.
+
+    A human identity still reads everything: the owner seeing the whole channel
+    is the condition under which agent-to-agent messaging is allowed to exist
+    at all (#775), and narrowing it here would trade one hole for a worse one.
+    """
+    if session_id:
+        await _own_session(db, session_id, agent=agent, principal_id=principal_id)
     rows = await repo.list_thread_messages(db, thread_id, limit=limit)
+    if not is_human:
+        visible = await repo.count_visible_in_thread(
+            db, thread_id, session_id=session_id, agent=agent
+        )
+        if not visible:
+            # Refuse with a reason rather than an empty list: "this thread is
+            # not yours" and "there is no such thread" are different facts, and
+            # a caller that cannot tell them apart starts guessing.
+            raise _refuse(
+                403,
+                "foreign_thread",
+                f"thread {thread_id} has nothing addressed to you",
+                "Read your own mail with hub_inbox; a thread opens for its "
+                "participants and for a human identity.",
+            )
     return [MessageView(**message_view(row)) for row in rows]
