@@ -488,6 +488,28 @@
                     </form>
                 </div>
                 {% endif %}
+                {# #808: пустое место у кнопки вердикта читалось как «претензий
+                   нет». Отсутствие ревью — это отсутствие данных, и оно должно
+                   быть написано словами (тот же урок, что #549 закрыл для
+                   «0 подтверждённых»). #}
+                {% if review_report and review_report.state == 'none' %}
+                <div class="task-action-note task-action-note--warning">
+                    Ревью за эту сдачу не проводилось — одобрение будет вынесено
+                    без независимой проверки.
+                </div>
+                {% endif %}
+                {% if review_report and review_report.state != 'none' %}
+                <div class="task-action-note">
+                    Проверялось: ветка {{ review_report.branch or '—' }},
+                    коммит {{ review_report.submission_sha[:12] or '—' }},
+                    {% if review_report.diff_files is not none %}
+                    {{ review_report.diff_files }} файлов / {{ review_report.diff_lines }} строк
+                    {% else %}
+                    <span class="muted">{{ review_report.diff_note or 'объём диффа неизвестен' }}</span>
+                    {% endif %}
+                    {% if machine_review and machine_review.model %}, модель {{ machine_review.model }}{% endif %}
+                </div>
+                {% endif %}
                 {% if machine_review %}
                 <div class="task-action-note">
                     Machine review: {{ machine_review.raw_count }} raw &rarr;
@@ -538,6 +560,21 @@
                             <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
                                 {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
                                 {{ f.title }}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+                    {# #808: отклонённые находки — половина работы ревьюера, и
+                       раньше от неё оставался только счётчик. Человек, не
+                       читающий код, по ним и судит, насколько ревьюер разбирался
+                       в предмете, а не отмахивался. #}
+                    {% if machine_review.findings_rejected %}
+                    <details>
+                        <summary class="project-edit-summary">rejected findings — почему отклонены</summary>
+                        <ul class="task-review-findings">
+                            {% for f in machine_review.findings_rejected %}
+                            <li>{{ f.title }}{% if f.category %} [{{ f.category }}]{% endif %}
+                                {% if f.reason %} — {{ f.reason }}{% else %} — <span class="muted">причина не названа</span>{% endif %}</li>
                             {% endfor %}
                         </ul>
                     </details>

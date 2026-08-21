@@ -1682,7 +1682,14 @@ async def api_review_brief(
         sha_check=sha_check,
     )
 
+    # #808: the block the human reads at the gate, built by the same function
+    # that feeds the task card. Two readers, one report.
+    brief_review_report = await review_evidence.review_report(
+        db, dict(await repo.get_task(db, task_id)), mr_row
+    )
+
     return ReviewBrief(
+        review_report=brief_review_report,
         task_id=task_view.id,
         title=task_view.title,
         status=task_view.status,

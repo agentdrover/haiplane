@@ -230,3 +230,63 @@ async def test_a_task_without_test_acs_is_not_reported_as_lost_evidence():
         "locator_resolution",
         "ac_test_results",
     ]
+
+
+async def test_brief_carries_the_same_review_report(client: AsyncClient):
+    # AC-4 (#808): the human at the gate and the reviewing agent read one
+    # report, built by one function. Two renderings of the same facts drift.
+    resp = await client.post("/api/tasks", json={"title": "Shared report task"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "model": "grok-4.6",
+            "raw_count": 1,
+            "findings_confirmed": [{"title": "leak", "severity": "high"}],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    report = brief["review_report"]
+    assert report["state"] == "current"
+    assert report["branch"].startswith(f"task-{task_id}/")
+    assert report["machine_review"]["model"] == "grok-4.6"
+    # And the same block on the card the human reads.
+    card = (await client.get(f"/tasks/{task_id}")).text
+    assert "Проверялось:" in card and "grok-4.6" in card
+
+
+async def test_brief_report_says_when_no_review_happened(client: AsyncClient):
+    # The absence travels too: an agent reading the brief must be able to see
+    # that nothing has reviewed this submission yet.
+    resp = await client.post("/api/tasks", json={"title": "Unreviewed task"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    assert brief["review_report"]["state"] == "none"
+    assert brief["review_report"]["machine_review"] is None

@@ -4521,3 +4521,71 @@ async def test_project_form_reverts_policy_to_human(client: AsyncClient):
     listed = (await client.get("/api/projects")).json()
     row = next(p for p in listed if p["id"] == pid)
     assert row["gate_policy"] == {"dor": "human", "verdict": "human"}
+
+
+# --- The verdict gate reads a report, not a diff (#808) ----------------------
+#
+# The owner does not read code at this gate, so what the panel says IS the
+# decision's basis — and what it leaves out silently is the failure mode.
+
+
+async def _machine_report(client: AsyncClient, task_id: int, **overrides) -> None:
+    body = {
+        "harness_skill": "lite-diff-review",
+        "agent_count": 1,
+        "tokens_spent": 12000,
+        "model": "grok-4.6",
+        "raw_count": 2,
+        "findings_confirmed": [
+            {"title": "boundary lost", "severity": "medium", "file": "hub/a.py"}
+        ],
+        "findings_rejected": [
+            {"title": "style nit", "category": "style", "reason": "не дефект"}
+        ],
+        "incomplete": False,
+        "unresolved": [],
+        "lost_dimensions": [],
+        "agent": "cursor-cloud-reviewer",
+    }
+    body.update(overrides)
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 200, resp.text
+
+
+async def test_absent_review_is_stated_at_the_verdict_gate(client: AsyncClient):
+    # AC-1 (#808): no report for this submission is a fact to state, not an
+    # empty panel to interpret. Silence here used to read as "no objections".
+    task_id = await _web_task_in_review(client)
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert "Ревью за эту сдачу не проводилось" in resp.text
+    assert "без независимой проверки" in resp.text
+
+
+async def test_report_header_names_what_was_reviewed(client: AsyncClient):
+    # AC-2 (#808): the header answers "what exactly was looked at" — branch,
+    # commit, volume, model — so the reader knows the scope of the claim.
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id)
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "Проверялось:" in resp.text
+    assert f"task-{task_id}/" in resp.text
+    assert "grok-4.6" in resp.text
+    assert "Ревью за эту сдачу не проводилось" not in resp.text
+
+
+async def test_rejected_findings_are_readable_with_reasons(client: AsyncClient):
+    # AC-3 (#808): half the reviewer's work is what it decided NOT to raise.
+    # A counter alone cannot show whether it engaged or waved things away.
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id)
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "rejected findings" in resp.text
+    assert "style nit" in resp.text
+    assert "не дефект" in resp.text

@@ -35,10 +35,13 @@ So this module answers two questions the brief could not answer before:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hub import config
 from hub.integrations.registry import plugins
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from hub.models import ReviewReport
 
 log = logging.getLogger("hub")
 
@@ -287,3 +290,73 @@ def evidence_coverage(
         "checks_missing": missing,
         "checks_not_applicable": not_applicable,
     }
+
+
+async def review_report(
+    db: Any, task_row: dict[str, Any], mr_row: Any = None
+) -> "ReviewReport":
+    """The verdict gate's report, built once for both its readers (#808).
+
+    The human at the gate and the reviewing agent must see the same thing;
+    building it twice is how two renderings of one fact start to disagree.
+
+    Everything unreadable is said out loud rather than defaulted: no report
+    for this submission is ``state='none'`` (not an empty panel), a report of
+    an earlier submission is ``state='stale'`` (not a current one), and a
+    diff volume that could not be measured is None with a reason (not zero,
+    which would claim the branch changed nothing — #518).
+    """
+    from hub.models import MachineReviewView, ReviewReport
+
+    generation = task_row.get("submission_generation") or 0
+    machine_review = None
+    state = "none"
+    if mr_row is not None:
+        machine_review = MachineReviewView(**dict(mr_row))
+        machine_review.is_current = machine_review.submission_generation == generation
+        state = "current" if machine_review.is_current else "stale"
+
+    branch = (task_row.get("branch") or "").strip()
+    report = ReviewReport(
+        state=state,
+        branch=branch,
+        submission_sha=(task_row.get("submission_sha") or "").strip(),
+        machine_review=machine_review,
+    )
+
+    if not branch:
+        report.diff_note = "у задачи нет ветки — объём диффа не измерялся"
+        return report
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_row["id"])
+        workspace = ctx.get("repo")
+        base = ctx.get("base_branch") or config.PAIR_BASE_BRANCH
+        if not workspace:
+            report.diff_note = "у проекта нет workspace — объём диффа не измерялся"
+            return report
+        diff = await plugins.git_ops.branch_diff(workspace, base, branch)
+    except Exception as exc:  # noqa: BLE001 - advisory block, never fatal
+        log.warning("review report diff failed for task #%s: %s", task_row["id"], exc)
+        report.diff_note = f"объём диффа прочитать не удалось: {exc}"
+        return report
+
+    if diff is None:
+        report.diff_note = (
+            f"объём диффа прочитать не удалось: {branch} против {base} не сравнился"
+        )
+        return report
+
+    files: set[str] = set()
+    lines = 0
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            files.add(line[6:])
+        elif line.startswith("--- a/") and line[6:] != "dev/null":
+            files.add(line[6:])
+        elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+            lines += 1
+    report.diff_files = len(files)
+    report.diff_lines = lines
+    return report

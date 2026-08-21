@@ -1233,16 +1233,14 @@ async def web_task_detail(
     analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
 
-    # Machine review (#381): summary next to the verdict buttons.
-    machine_review = None
-    mr_row = await repo.get_latest_machine_review(db, task_id)
-    if mr_row is not None:
-        from hub.models import MachineReviewView
+    # Machine review (#381): summary next to the verdict buttons, assembled
+    # by the same builder the review brief uses (#808) — the human at the
+    # gate and the reviewing agent must not read two different reports.
+    from hub.services.review_evidence import review_report as _review_report
 
-        machine_review = MachineReviewView(**dict(mr_row))
-        machine_review.is_current = machine_review.submission_generation == (
-            task.submission_generation or 0
-        )
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    review_report = await _review_report(db, dict(row), mr_row)
+    machine_review = review_report.machine_review
 
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
@@ -1266,6 +1264,7 @@ async def web_task_detail(
             "task": task,
             "task_messages": task_messages,
             "machine_review": machine_review,
+            "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
             "analyst_ready": analyst_ready,
