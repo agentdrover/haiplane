@@ -852,6 +852,7 @@ async def web_edit_project(project_id: int, request: Request):
         for key in (
             "gate_policy_dor",
             "gate_policy_verdict",
+            "gate_policy_review",
             "gate_policy_dor_max_class",
             "gate_policy_risk_map",
         )
@@ -861,6 +862,13 @@ async def web_edit_project(project_id: int, request: Request):
             "verdict": str(form.get("gate_policy_verdict") or "human").strip()
             or "human",
         }
+        # #805: the review key is offered to EVERY project, including default
+        # — dispatching a reviewer takes no human out of any gate, so the
+        # #743 lock (which is about 'auto' on dor/verdict) does not apply.
+        # Only the recognised value is stored; anything else is dropped
+        # rather than saved as a knob nothing reads.
+        if str(form.get("gate_policy_review") or "").strip() == "dispatch":
+            gate_policy["review"] = "dispatch"
         # #760: the form carries the WHOLE policy, so an emptied field means
         # "remove this knob", not "leave it alone" — the same semantics the
         # selects already have, and the only ones a form can honestly offer.
@@ -1225,16 +1233,14 @@ async def web_task_detail(
     analyst_ready = await _analyst_ready_info(db, task_id, readiness, task=task)
     identity = current_identity(request)
 
-    # Machine review (#381): summary next to the verdict buttons.
-    machine_review = None
-    mr_row = await repo.get_latest_machine_review(db, task_id)
-    if mr_row is not None:
-        from hub.models import MachineReviewView
+    # Machine review (#381): summary next to the verdict buttons, assembled
+    # by the same builder the review brief uses (#808) — the human at the
+    # gate and the reviewing agent must not read two different reports.
+    from hub.services.review_evidence import review_report as _review_report
 
-        machine_review = MachineReviewView(**dict(mr_row))
-        machine_review.is_current = machine_review.submission_generation == (
-            task.submission_generation or 0
-        )
+    mr_row = await repo.get_latest_machine_review(db, task_id)
+    review_report = await _review_report(db, dict(row), mr_row)
+    machine_review = review_report.machine_review
 
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
@@ -1258,6 +1264,7 @@ async def web_task_detail(
             "task": task,
             "task_messages": task_messages,
             "machine_review": machine_review,
+            "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,
             "analyst_ready": analyst_ready,

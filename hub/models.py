@@ -234,7 +234,18 @@ RISK_MAP_BUCKETS: tuple[str, ...] = (
 # policy that could store an inert "r2" would read as permission that does
 # nothing. R3+ is not delegable at all.
 AUTO_APPROVE_CLASSES: tuple[str, ...] = ("r0", "r1")
-GATE_POLICY_KEYS: tuple[str, ...] = ("dor", "verdict", "risk_map", "dor_max_class")
+# 'review' (#805) answers a different question from the two gate keys: it
+# says whether the hub CALLS a reviewer, not who signs the verdict. It is
+# therefore not covered by the default-project lock — dispatching a reviewer
+# removes no human from any gate.
+REVIEW_POLICY_VALUES: tuple[str, ...] = ("off", "dispatch")
+GATE_POLICY_KEYS: tuple[str, ...] = (
+    "dor",
+    "verdict",
+    "review",
+    "risk_map",
+    "dor_max_class",
+)
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
@@ -690,6 +701,31 @@ class EvidenceCoverage(BaseModel):
     checks_not_applicable: list[dict[str, str]] = Field(default_factory=list)
 
 
+class ReviewReport(BaseModel):
+    """What the human reads at the verdict gate instead of the diff (#808).
+
+    The owner does not read code at this gate, so the decision rests on
+    whatever this block says — which makes its silences as important as its
+    contents. Three states, never two: a submission with no review is not a
+    clean one, and an empty panel used to be indistinguishable from a report
+    that found nothing (the #549 mistake, one level up).
+
+    ``diff_files``/``diff_lines`` are None when the volume could not be read;
+    ``diff_note`` then says why. A zero would claim the branch changed
+    nothing (#518).
+    """
+
+    # none — no report for the current submission; current — a report of this
+    # submission; stale — a report of an earlier one, kept for the trail.
+    state: str = "none"
+    branch: str = ""
+    submission_sha: str = ""
+    diff_files: int | None = None
+    diff_lines: int | None = None
+    diff_note: str = ""
+    machine_review: "MachineReviewView | None" = None
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -757,6 +793,10 @@ class ReviewBrief(BaseModel):
     # #381: latest machine-review report; forward ref — MachineReviewView is
     # declared later in this module, rebuilt below.
     machine_review: "MachineReviewView | None" = None
+    # #808: the SAME report the human sees at the verdict gate. Not a second
+    # rendering of the same facts — one builder feeds both, so the two
+    # readers cannot drift apart.
+    review_report: "ReviewReport | None" = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
     # #438: advisory — non-empty when the branch carries commits of another
@@ -1442,6 +1482,11 @@ class ProjectPatch(BaseModel):
             raise ValueError(
                 f"gate_policy values must be 'human' or 'auto', got: {bad}"
             )
+        if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
+            raise ValueError(
+                "gate_policy review must be one of "
+                f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
+            )
         if "dor_max_class" in v:
             ceiling = v["dor_max_class"]
             if ceiling not in AUTO_APPROVE_CLASSES:
@@ -1985,4 +2030,5 @@ ProposalView = TaskView
 
 # Forward-ref rebuild: ReviewBrief.machine_review points at MachineReviewView,
 # which is declared after ReviewBrief (#381).
+ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()

@@ -43,6 +43,38 @@ def gate_policy_of(project) -> dict:
     return policy if isinstance(policy, dict) else {}
 
 
+# Recognised values of the `review` key (#805). Anything else — a typo, a
+# value from a future version, an empty string — reads as OFF: an unreadable
+# policy must never spend tokens, exactly as it must never grant approval.
+REVIEW_OFF = "off"
+REVIEW_DISPATCH = "dispatch"
+
+
+def review_dispatch_enabled(policy: dict) -> bool:
+    """Whether the hub calls a reviewer for this project's submissions.
+
+    Two ways to say yes, and they mean different things:
+
+    * ``review='dispatch'`` — call the reviewer, leave the verdict to the
+      human. This is the mode the hub's own project needs: the gate keeps
+      its owner, but the owner finally has something to read (#804).
+    * ``verdict='auto'`` — the autopilot decides the verdict, and it decides
+      it BY READING THE REPORT (#745). A project asking for an auto verdict
+      is asking for the review that feeds it, so this keeps dispatching for
+      calc-kids and spike-bo without touching their stored policy.
+
+    Note what this function is NOT: it does not weaken the default-project
+    lock (#743). That lock refuses 'auto' on the dor and verdict gates, and
+    dispatching a reviewer removes no human from anywhere — it hands the
+    human evidence. The two are opposite in direction.
+    """
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("verdict") == "auto":
+        return True
+    return policy.get("review") == REVIEW_DISPATCH
+
+
 async def risk_map_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, str] | None:
