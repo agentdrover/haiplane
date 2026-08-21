@@ -918,6 +918,40 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def commit_exists(self, repo: str, sha: str) -> bool | None:
+        """Is this commit here? ``None`` when the repository could not be read.
+
+        Three answers, never two — the same rule ``resolve_ref`` follows (#725).
+        "We could not look" printed as "that commit is not here" would accuse a
+        submission of having vanished when it is the workspace that is missing.
+        """
+        rc, _, _ = await _git("rev-parse", "--git-dir", repo=repo, check=False)
+        if rc != 0:
+            return None
+        rc, _, _ = await _git(
+            "cat-file", "-e", f"{sha}^{{commit}}", repo=repo, check=False
+        )
+        return rc == 0
+
+    async def commit_diff(
+        self, repo: str, base: str, sha: str, *, context: int = 3
+    ) -> str | None:
+        """``git diff base...sha``, or None when it cannot be read (#824).
+
+        Against the PINNED sha, never the branch name: the verdict is cast on
+        one submission, and a branch that moved after it would show the human
+        code they are not approving. Carries real context lines — this diff is
+        read by a person, unlike the ``-U0`` one call-site analysis parses.
+        """
+        rc, out, _ = await _git(
+            "diff",
+            f"-U{int(context)}",
+            f"{base}...{sha}",
+            repo=repo,
+            check=False,
+        )
+        return out if rc == 0 else None
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """Refresh one base branch from origin. Read-only, never writes (#534)."""
         rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)

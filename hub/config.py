@@ -198,6 +198,12 @@ SESSION_RETENTION_DAYS = int(os.environ.get("OPENCLAW_SESSION_RETENTION_DAYS", "
 # enough that ordinary coordination never meets them, and a refusal always says
 # which limit it hit rather than failing shapelessly.
 MESSAGE_MAX_CHARS = int(os.environ.get("OPENCLAW_MESSAGE_MAX_CHARS", "4000"))
+
+# #824: how much of a submission's diff the gate renders before it says it
+# stopped. A cap the reader is not told about is worse than no diff at all —
+# it looks like the whole change and is a fragment of it.
+DIFF_MAX_LINES = int(os.environ.get("OPENCLAW_DIFF_MAX_LINES", "2000"))
+DIFF_MAX_BYTES = int(os.environ.get("OPENCLAW_DIFF_MAX_BYTES", str(400 * 1024)))
 MESSAGE_RATE_PER_MINUTE = int(os.environ.get("OPENCLAW_MESSAGE_RATE_PER_MINUTE", "30"))
 MESSAGE_RETENTION_DAYS = int(os.environ.get("OPENCLAW_MESSAGE_RETENTION_DAYS", "14"))
 

@@ -176,6 +176,10 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> list[str] | None: ...
+    async def commit_exists(self, repo: str, sha: str) -> bool | None: ...
+    async def commit_diff(
+        self, repo: str, base: str, sha: str, *, context: int = 3
+    ) -> str | None: ...
     async def auto_commit(
         self,
         task_id: int,

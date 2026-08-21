@@ -4673,3 +4673,174 @@ async def test_implementer_summary_is_secondary_to_evidence(client: AsyncClient,
     assert evidence_at < summary_at < verdict_at, (
         "evidence must come before the implementer's own account"
     )
+
+
+# ---- #824: the diff of the pinned submission, read inside the hub ----
+
+
+def _diff_repo(tmp_path) -> tuple[str, str, str]:
+    """A repo whose branch moved AFTER the submission was pinned.
+
+    Returns ``(path, submitted_sha, later_sha)``. The two commits touch
+    different files so the diff of one is recognisably not the diff of both.
+    """
+    import subprocess
+
+    root = tmp_path / "diffrepo"
+    root.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(root),
+    }
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args], cwd=root, check=True, capture_output=True, env=env
+        )
+
+    git("init", "-b", "main")
+    (root / "base.py").write_text("x = 1\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "task-x/work")
+    (root / "submitted.py").write_text(
+        "def submitted():\n    return 'in the verdict'\n"
+    )
+    git("add", ".")
+    git("commit", "-m", "submitted")
+    submitted = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    (root / "afterwards.py").write_text(
+        "def afterwards():\n    return 'not approved'\n"
+    )
+    git("add", ".")
+    git("commit", "-m", "after the submission")
+    later = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    return str(root), submitted, later
+
+
+async def _task_pinned_at(client: AsyncClient, db, sha: str, branch: str) -> int:
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await repo_module.update_task(db, task_id, branch=branch, submission_sha=sha)
+    await db.commit()
+    return task_id
+
+
+def _use_real_git(monkeypatch, workspace: str) -> None:
+    from unittest.mock import AsyncMock
+
+    from hub import app as hub_app
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+
+    real = GitOpsIntegration()
+    context = AsyncMock(return_value={"repo": workspace, "base_branch": "main"})
+    # Two patch points on purpose: callers reach this helper both through the
+    # services package and by importing it from orchestration directly, and the
+    # diff base is resolved through the second one.
+    monkeypatch.setattr(hub_app.services, "project_git_context", context)
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context", context, raising=False
+    )
+    for name in ("commit_exists", "commit_diff", "resolve_ref"):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(real, name), raising=False)
+
+
+async def test_diff_is_served_for_the_pinned_submission(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-1 (#824): the verdict is cast on one submission. A branch that moved
+    # after it must not be what the reader sees — `sha_check` warns about the
+    # move (#572), and showing the moved branch's diff would contradict it.
+    workspace, submitted, _later = _diff_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    task_id = await _task_pinned_at(client, db, submitted, "task-x/work")
+
+    resp = await client.get(f"/tasks/{task_id}/diff")
+
+    assert resp.status_code == 200
+    assert "submitted.py" in resp.text
+    assert "afterwards.py" not in resp.text, (
+        "work committed after the submission is not what the verdict covers"
+    )
+
+
+async def test_truncated_diff_says_it_was_truncated(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-2 (#824): a silently cut diff reads as the whole change while being a
+    # fragment — the most expensive kind of half-truth at a gate.
+    from hub import config as config_module
+
+    workspace, submitted, _later = _diff_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    monkeypatch.setattr(config_module, "DIFF_MAX_LINES", 1)
+    task_id = await _task_pinned_at(client, db, submitted, "task-x/work")
+
+    resp = await client.get(f"/tasks/{task_id}/diff")
+
+    assert "показано не всё" in resp.text
+    assert "потолок показа" in resp.text
+    assert "git diff" in resp.text, "a truncated diff must hand over the command"
+
+
+async def test_unreachable_sha_is_named_not_silent(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-3 (#824): "that commit is not here" and "nothing changed" are
+    # different answers. Collapsing them is how a gate reads as clean.
+    workspace, _submitted, _later = _diff_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    # A well-formed object name that this repository does not carry. Built from
+    # a non-hex marker so the CI secret scanner has nothing to match (#813).
+    absent = "".join("abcdef0123456789"[(i * 7) % 16] for i in range(40))
+    task_id = await _task_pinned_at(client, db, absent, "task-x/work")
+
+    resp = await client.get(f"/tasks/{task_id}/diff")
+
+    assert "Дифф не показан" in resp.text
+    assert "нет в рабочей копии" in resp.text
+    assert "не «изменений нет»" in resp.text
+
+
+async def test_diff_requires_the_same_auth_as_the_card(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-4 (#824): this route serves source code. It is covered by the same
+    # middleware as every other page — the test holds that fact rather than
+    # trusting it.
+    from hub import config as config_module
+
+    workspace, submitted, _later = _diff_repo(tmp_path)
+    _use_real_git(monkeypatch, workspace)
+    task_id = await _task_pinned_at(client, db, submitted, "task-x/work")
+
+    monkeypatch.setattr(config_module, "HUB_TOKENS", {"tok": "someone"})
+    monkeypatch.setattr(config_module, "HUB_AUTH_DISABLED", False)
+    resp = await client.get(
+        f"/tasks/{task_id}/diff",
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.status_code
+    assert "submitted.py" not in resp.text

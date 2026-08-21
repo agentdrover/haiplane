@@ -605,6 +605,19 @@
                 {% if review_error %}
                 <div class="task-action-note">{{ review_error }}</div>
                 {% endif %}
+                {# #824: сами изменения, а не команда сходить за ними. По
+                   закреплённой sha: одобряют конкретную сдачу, и показанное
+                   обязано совпадать с одобряемым. #}
+                {% if task.submission_sha %}
+                <details class="task-action-note"
+                         hx-get="/tasks/{{ task.id }}/diff"
+                         hx-trigger="toggle once"
+                         hx-target="find .task-diff-slot"
+                         hx-swap="innerHTML">
+                    <summary class="project-edit-summary">изменения этой сдачи ({{ task.submission_sha[:12] }})</summary>
+                    <div class="task-diff-slot"><span class="u-text-muted">читаю дифф…</span></div>
+                </details>
+                {% endif %}
                 {% if machine_review_gap %}
                 <div class="task-action-note task-action-note--warning">
                     {{ machine_review_gap }}

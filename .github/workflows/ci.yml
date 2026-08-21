@@ -50,6 +50,9 @@ jobs:
       # committed in docs/agent-context/mcp-catalog-budget.json, and a breach
       # prints which tools moved. Raising the budget is an edit to that file
       # in a reviewed change; that is the entire mechanism.
+      # Печатается всегда, а не только при провале: остаток запаса под потолком
+      # (#829) виден в логе зелёного прогона — запас, за которым никто не
+      # следит, это способ тихо перестать проверять.
       - name: MCP catalog budget
         run: uv run python scripts/mcp_catalog_budget.py
 

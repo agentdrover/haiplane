@@ -165,6 +165,16 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def commit_exists(self, repo: str, sha: str) -> bool | None:
+        """No git here — "could not look", never "the commit is gone" (#824)."""
+        return None
+
+    async def commit_diff(
+        self, repo: str, base: str, sha: str, *, context: int = 3
+    ) -> str | None:
+        """No git here — the reader must see "could not look" (#824)."""
+        return None
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
         never as "clean" (#534)."""
