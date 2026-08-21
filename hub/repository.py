@@ -3116,6 +3116,7 @@ async def insert_live_check(
     reason: str = "",
     recorded_by: int | None = None,
     recorded_agent: str = "",
+    deploy_state: str = "",
 ) -> int:
     """Append one live-check record. Rows accumulate — never overwrite.
 
@@ -3126,7 +3127,7 @@ async def insert_live_check(
     cur = await db.execute(
         "INSERT INTO live_checks "
         "(task_id, sha, outcome, probe, observation, reason, recorded_by, "
-        " recorded_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " recorded_agent, deploy_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             sha or "",
@@ -3136,6 +3137,7 @@ async def insert_live_check(
             reason or "",
             recorded_by,
             recorded_agent or "",
+            deploy_state or "",
         ),
     )
     await db.commit()

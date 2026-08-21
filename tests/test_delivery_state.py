@@ -9,68 +9,15 @@ check" must never print as "not deployed".
 
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
-import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.registry import plugins
 from hub.services.delivery_state import IN_PROD, NOT_IN_PROD, UNKNOWN, delivery_state
-
-
-def _git(root: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@t",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@t",
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "HOME": str(root),
-        },
-    ).stdout.strip()
-
-
-@pytest.fixture
-def history(tmp_path: Path) -> dict[str, str]:
-    """A repo where one commit shipped and one is merged but still waiting.
-
-    ``released`` is the tip of main; ``shipped`` is behind it, so it is part of
-    what production runs. ``pending`` sits on a side branch — merged work that
-    no release has picked up yet, which is the case the hub could not see.
-    """
-    root = tmp_path / "repo"
-    root.mkdir()
-    _git(root, "init", "-b", "main")
-    (root / "a.py").write_text("a = 1\n")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "shipped")
-    shipped = _git(root, "rev-parse", "HEAD")
-    (root / "b.py").write_text("b = 2\n")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "released")
-    released = _git(root, "rev-parse", "HEAD")
-    _git(root, "checkout", "-q", "-b", "later", shipped)
-    (root / "c.py").write_text("c = 3\n")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "merged but not released")
-    pending = _git(root, "rev-parse", "HEAD")
-    return {
-        "repo": str(root),
-        "shipped": shipped,
-        "released": released,
-        "pending": pending,
-    }
 
 
 async def _task_merged_at(client: AsyncClient, db, merge_sha: str) -> int:

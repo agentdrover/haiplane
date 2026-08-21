@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -109,3 +112,54 @@ async def client(db):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
+
+
+def _git_in(root: Path, *args: str) -> str:
+    """Run git in ``root`` with a hermetic environment, returning stdout."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "HOME": str(root),
+        },
+    ).stdout.strip()
+
+
+@pytest.fixture
+def history(tmp_path: Path) -> dict[str, str]:
+    """A repo where one commit shipped and one is merged but still waiting (#497).
+
+    ``released`` is the tip of main; ``shipped`` is behind it, so it is part of
+    what production runs. ``pending`` sits on a side branch — merged work no
+    release has picked up yet, which is the case the hub could not see before.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git_in(root, "init", "-b", "main")
+    (root / "a.py").write_text("a = 1\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "shipped")
+    shipped = _git_in(root, "rev-parse", "HEAD")
+    (root / "b.py").write_text("b = 2\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "released")
+    released = _git_in(root, "rev-parse", "HEAD")
+    _git_in(root, "checkout", "-q", "-b", "later", shipped)
+    (root / "c.py").write_text("c = 3\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "merged but not released")
+    pending = _git_in(root, "rev-parse", "HEAD")
+    return {
+        "repo": str(root),
+        "shipped": shipped,
+        "released": released,
+        "pending": pending,
+    }

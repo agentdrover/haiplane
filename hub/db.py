@@ -1071,6 +1071,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # changes no addressing — every session of that agent still reads the
         # message — it only lets the sender say who it is for, which is what
         # the sender knew and had no way to write down.
+        # #837: was this observation checked against what production runs?
+        # '' for rows written before the check existed, 'in_prod' when the
+        # task's merge was verifiably deployed, 'unknown' when the hub could
+        # not tell. The third is stored rather than refused: absence of
+        # delivery facts is not a violation, and blocking on it would turn
+        # ignorance into a gate.
+        "add_live_checks_deploy_state",
+        "ALTER TABLE live_checks ADD COLUMN deploy_state TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         "add_agent_messages_for_session",
         "ALTER TABLE agent_messages ADD COLUMN for_session TEXT NOT NULL DEFAULT ''",
     ),

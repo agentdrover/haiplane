@@ -964,6 +964,11 @@ class LiveCheckView(BaseModel):
     id: int
     task_id: int
     sha: str = ""
+    # #837: 'in_prod' when the task's merge was verifiably deployed at the
+    # moment of recording, 'unknown' when the hub could not tell, '' for rows
+    # older than the check. An unverified observation must not read like a
+    # verified one.
+    deploy_state: str = ""
     outcome: str = "done"
     probe: str = ""
     observation: str = ""

@@ -347,6 +347,15 @@
                                 {% if c.sha_mismatch %}
                                 <span class="badge badge--xs badge-alert" title="Доставлен {{ delivered_sha[:12] }}">снято не на доставленном коммите</span>
                                 {% endif %}
+                                {# #837: запись принята, но хаб не смог
+                                   подтвердить, что код раскатан. Без этой
+                                   пометки она читалась бы наравне с
+                                   проверенной — а «проверено в проде» о
+                                   нераскатанном коде выглядит сильнее всех
+                                   прочих блоков и при этом ложно. #}
+                                {% if c.deploy_state == 'unknown' %}
+                                <span class="badge badge--xs badge-pending" title="Хаб не смог сверить с фактом выката — запись принята как есть">не сверено с выкатом</span>
+                                {% endif %}
                                 <time>{{ c.created_at }}</time>
                             </div>
                             {% if c.outcome == 'not_applicable' %}

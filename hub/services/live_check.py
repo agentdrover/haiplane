@@ -52,6 +52,11 @@ def _refuse(reason: str, message: str, hint: str) -> HTTPException:
     )
 
 
+# #837: recorded, but the hub could not confirm the code was deployed. Kept
+# distinct from an empty value, which means the row predates the check.
+UNVERIFIED = "unknown"
+
+
 def live_check_view(row: aiosqlite.Row | dict) -> dict:
     data = dict(row)
     return {
@@ -65,6 +70,9 @@ def live_check_view(row: aiosqlite.Row | dict) -> dict:
         "recorded_by": data.get("recorded_by"),
         "recorded_agent": data.get("recorded_agent") or "",
         "created_at": data.get("created_at") or "",
+        # #837: whether this observation was checked against what production
+        # runs. Empty for rows written before the check existed.
+        "deploy_state": data.get("deploy_state") or "",
     }
 
 
@@ -116,6 +124,35 @@ async def record_live_check(
     # when it has none the field stays empty rather than invented.
     sha = (body.sha or "").strip() or await repo.merge_sha_for_task(db, task_id)
 
+    # #837: "verified in production" about code that is not in production is
+    # the most expensive kind of evidence — it looks stronger than every other
+    # block on the card and is false. On 21.08.2026 nothing stopped it: task
+    # #823 was completed with its PR merged into develop, the deploy job was
+    # skipped, and only opening GitHub's logs revealed that the panel being
+    # "checked" did not exist yet.
+    #
+    # Three answers, and only ONE of them refuses. Unknown is recorded, not
+    # blocked: an installation without delivery facts knows nothing about
+    # production, and refusing there would turn ignorance into a gate — the
+    # same line #839 draws for an empty release table.
+    deploy_state = ""
+    if outcome == DONE:
+        from hub.services.delivery_state import IN_PROD, NOT_IN_PROD, delivery_state
+
+        delivery = await delivery_state(db, task_id)
+        deploy_state = str(delivery.get("state") or "")
+        if deploy_state == NOT_IN_PROD:
+            raise _refuse(
+                "not_deployed_yet",
+                f"эту работу нельзя наблюдать в проде: {delivery.get('reason', '')}",
+                "Запишите not_applicable с причиной, если наблюдать нечего, "
+                "либо повторите запись после выката — свидетельство о "
+                "нераскатанном коде выглядит сильнее всех прочих блоков и "
+                "при этом ложно.",
+            )
+        if deploy_state != IN_PROD:
+            deploy_state = UNVERIFIED
+
     check_id = await repo.insert_live_check(
         db,
         task_id=task_id,
@@ -126,6 +163,7 @@ async def record_live_check(
         reason=reason,
         recorded_by=principal_id,
         recorded_agent=agent,
+        deploy_state=deploy_state,
     )
     await repo.add_task_update(
         db,
@@ -136,6 +174,7 @@ async def record_live_check(
             f"Живая проверка ({outcome}): {probe or reason} → "
             f"{observation or 'наблюдать нечего'}"
             + (f" [sha {sha[:12]}]" if sha else " [sha неизвестен]")
+            + (" [не сверено с выкатом]" if deploy_state == UNVERIFIED else "")
         ),
     )
     await db.commit()
