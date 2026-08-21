@@ -1,0 +1,40 @@
+{# Who is working right now (#771 registry, #775 view).
+
+   The status badge never travels without the age behind it: "online" alone is
+   a claim the reader cannot check, and a session dies without saying goodbye. #}
+<section class="dash-card">
+    <div class="dash-card-header">
+        <h2>Сессии агентов</h2>
+        {% if agent_sessions %}<span class="section-count">{{ agent_sessions | length }}</span>{% endif %}
+    </div>
+    {% if agent_sessions %}
+    <ul class="session-list">
+        {% for s in agent_sessions %}
+        <li class="session-row">
+            <span class="badge badge--xs session-badge--{{ s.status }}">{{ s.status }}</span>
+            <span class="session-agent">{{ s.agent or 'anonymous' }}</span>
+            {% if s.model %}<span class="session-model">{{ s.model }}</span>{% endif %}
+            {% if s.current_task_id %}
+            <a class="session-task" href="/tasks/{{ s.current_task_id }}">#{{ s.current_task_id }}</a>
+            {% endif %}
+            <span class="session-seen" title="Возраст последнего признака жизни">
+                {% if s.last_seen_age_seconds is none %}
+                    возраст неизвестен
+                {% elif s.last_seen_age_seconds < 60 %}
+                    {{ s.last_seen_age_seconds }} с назад
+                {% elif s.last_seen_age_seconds < 3600 %}
+                    {{ (s.last_seen_age_seconds // 60) }} мин назад
+                {% else %}
+                    {{ (s.last_seen_age_seconds // 3600) }} ч назад
+                {% endif %}
+            </span>
+            <span class="session-id" title="{{ s.session_id }}">{{ s.session_id[:8] }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty empty-sm">
+        <div class="empty-text">Ни одна сессия не зарегистрирована</div>
+    </div>
+    {% endif %}
+</section>

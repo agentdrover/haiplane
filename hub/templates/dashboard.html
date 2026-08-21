@@ -93,6 +93,12 @@
             </div>
         </section>
 
+        <!-- Coordination (#775): who is around and what they say to each other -->
+        <section class="section section--coordination">
+            {% include "partials/agent_sessions.html" with context %}
+            {% include "partials/message_threads.html" with context %}
+        </section>
+
         <!-- Create Task -->
         <section class="section">
             <div class="section-header collapsible-toggle" id="create-toggle" onclick="toggleCreate()">

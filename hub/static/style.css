@@ -3657,3 +3657,72 @@ body.htmx-request .htmx-progress {
 .filter-disclosure[open] > summary::before { content: "\25BC"; }
 .filter-disclosure > summary:hover { background: var(--surface-hover); color: var(--text); }
 .filter-disclosure[open] > summary { margin-bottom: var(--sp-2); }
+
+/* Координация сессий (#775): реестр сессий и переписка на дашборде.
+   Присутствие показывается цветом бейджа И возрастом рядом — цвет без
+   возраста снова стал бы уверенным индикатором над непроверенным фактом. */
+.section--coordination {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    gap: var(--sp-4);
+}
+.dash-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--sp-3);
+    min-width: 0;
+}
+.dash-card-header {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-3);
+}
+.dash-card-header h2 { font-size: 14px; color: var(--text); margin: 0; }
+
+.session-list, .thread-list { list-style: none; margin: 0; padding: 0; }
+.session-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 13px;
+}
+.session-row:last-child { border-bottom: none; }
+.session-agent { color: var(--text); font-weight: 500; }
+.session-model, .session-seen, .session-id, .thread-model, .thread-count {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+.session-badge--online { background: var(--green-dim); color: var(--green); }
+.session-badge--offline { background: var(--surface-hover); color: var(--text-muted); }
+
+.thread-row {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.thread-row:last-child { border-bottom: none; }
+.thread-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.thread-arrow { color: var(--text-muted); }
+.thread-to { color: var(--text-secondary); }
+.thread-body {
+    margin-top: var(--sp-1);
+    font-size: 13px;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+.task-message-item .task-timeline-marker { background: var(--accent); }
+
+@media (max-width: 900px) {
+    .section--coordination { grid-template-columns: minmax(0, 1fr); }
+}

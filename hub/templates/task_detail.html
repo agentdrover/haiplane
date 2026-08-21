@@ -307,6 +307,47 @@
                 {% endif %}
             </section>
 
+            {# Messages about this task (#775) — its own block, next to the
+               update feed above and never merged into it: updates are the
+               lifecycle journal, messages are the conversation. #}
+            <section class="task-content-card" id="task-messages">
+                <div class="task-card-header">
+                    <h2>Сообщения сессий</h2>
+                    {% if task_messages %}<span class="section-count">{{ task_messages | length }}</span>{% endif %}
+                </div>
+                {% if task_messages %}
+                <div class="task-timeline">
+                    {% for m in task_messages %}
+                    <article class="task-timeline-item task-message-item">
+                        <div class="task-timeline-marker"></div>
+                        <div class="task-timeline-body">
+                            <div class="task-timeline-meta">
+                                <span class="badge badge--xs">{{ m.kind }}</span>
+                                <span>{{ m.from_agent or 'anonymous' }}</span>
+                                {% if m.from_model %}<span class="badge badge--xs" title="Модель — декларация отправителя">{{ m.from_model }}</span>{% endif %}
+                                {% if m.from_session_id %}<span class="badge badge--xs" title="{{ m.from_session_id }}">сессия {{ m.from_session_id[:8] }}</span>{% endif %}
+                                {% if m.from_principal_id %}<span class="badge badge--xs" title="Аутентифицированный принципал">principal #{{ m.from_principal_id }}</span>{% endif %}
+                                <span class="thread-to">→ {{ m.to_kind }}:{{ m.to_ref }}</span>
+                                <time>{{ m.created_at }}</time>
+                            </div>
+                            <div class="task-timeline-content u-pre-wrap">{{ m.body }}</div>
+                        </div>
+                    </article>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div class="empty empty-sm">
+                    <div class="empty-text">По этой задаче сессии ещё не переписывались</div>
+                </div>
+                {% endif %}
+                <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-action-stack">
+                    <textarea name="body" rows="2" placeholder="Написать в канал задачи" required></textarea>
+                    <input type="hidden" name="to_kind" value="task">
+                    <input type="hidden" name="kind" value="note">
+                    <button type="submit" class="btn btn-secondary btn-sm">Отправить</button>
+                </form>
+            </section>
+
             {% if task.result_text %}
             <section class="task-content-card">
                 <div class="task-card-header">

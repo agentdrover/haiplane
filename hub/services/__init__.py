@@ -1,6 +1,8 @@
 """Hub services package — re-exports all public API from submodules."""
 
 from hub.services.dashboard import (
+    get_agent_sessions_panel,
+    get_message_threads_panel,
     get_dashboard_data,
     get_epic_board,
     get_project_cards,
@@ -12,6 +14,7 @@ from hub.services.dashboard import (
 from hub.services.outcomes import outcome_debt
 from hub.services.messaging import (
     inbox,
+    message_view,
     send_message,
     thread,
 )
@@ -134,11 +137,14 @@ __all__ = [
     "add_risk",
     "add_update",
     "delete_acceptance_criterion",
+    "get_agent_sessions_panel",
+    "get_message_threads_panel",
     "get_readiness",
     "heartbeat_session",
     "inbox",
     "list_acceptance_criteria",
     "list_sessions",
+    "message_view",
     "note_session_task",
     "readiness_tree",
     "refine_task",
