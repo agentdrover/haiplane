@@ -273,9 +273,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 request.state.identity = OPEN_MODE_IDENTITY
                 return await call_next(request)
 
-            identity = await _resolve_identity(request)
-            if not identity:
+            resolved = await _resolve_identity(request)
+            if not resolved:
                 return _unauthorized(request)
+            identity = resolved
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):

@@ -32,7 +32,7 @@ from hub.models import (
     TaskRefineOutcome,
     TaskRisk,
 )
-from hub.db import deserialize_str_list, serialize_str_list
+from hub.db import deserialize_str_list, fetchall, serialize_str_list
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
 from hub.services.project_policy import risk_map_for_task
@@ -539,8 +539,8 @@ async def _guard_ac_limit(db: aiosqlite.Connection, task_id: int) -> None:
     The cap was enforced in the bulk-replace path only, so single adds could
     accumulate without bound (#366).
     """
-    rows = await db.execute_fetchall(
-        "SELECT COUNT(*) AS n FROM acceptance_criteria WHERE task_id=?", (task_id,)
+    rows = await fetchall(
+        db, "SELECT COUNT(*) AS n FROM acceptance_criteria WHERE task_id=?", (task_id,)
     )
     count = dict(rows[0])["n"] if rows else 0
     if count >= MAX_ACCEPTANCE_CRITERIA:
@@ -575,7 +575,8 @@ async def add_acceptance_criterion(
     _guard_ac_locator(ac)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "add_ac"):
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT * FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
             (task_id, ac.id),
         )
@@ -587,7 +588,8 @@ async def add_acceptance_criterion(
         try:
             await repo.add_acceptance_criterion(db, task_id, ac)
         except aiosqlite.IntegrityError as exc:
-            rows = await db.execute_fetchall(
+            rows = await fetchall(
+                db,
                 "SELECT * FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
                 (task_id, ac.id),
             )
@@ -616,7 +618,8 @@ async def upsert_acceptance_criterion(
         # Overwriting an existing criterion must keep working at the limit —
         # it does not add a row. Checking unconditionally here would make a
         # task with 50 criteria impossible to edit (#366).
-        existing = await db.execute_fetchall(
+        existing = await fetchall(
+            db,
             "SELECT 1 FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
             (task_id, ac.id),
         )

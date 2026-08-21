@@ -53,6 +53,9 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check hub tests
 
+      - name: Type check
+        run: uv run mypy hub
+
       - name: Test
         run: uv run pytest -q
 

@@ -15,8 +15,10 @@ import aiosqlite
 
 from hub import config
 from hub.db import (
+    inserted_id,
     STRUCTURED_TASK_FIELDS,
     ac_to_row_kwargs,
+    fetchall,
     structured_fields_to_db,
 )
 from hub.models import (
@@ -256,7 +258,8 @@ async def count_tasks_by_state(
     if project_id is not None:
         where.append(PROJECT_SUBTREE_CONDITION)
         params.append(project_id)
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         f"SELECT {', '.join(parts)} FROM tasks WHERE {' AND '.join(where)}",  # nosec B608
         tuple(params),
     )
@@ -279,7 +282,8 @@ async def task_ids_with_update_marker(
     if not task_ids:
         return set()
     placeholders = ",".join("?" for _ in task_ids)
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         f"SELECT DISTINCT task_id FROM task_updates "  # nosec B608 - placeholders only
         f"WHERE task_id IN ({placeholders}) AND instr(content, ?) > 0",
         (*task_ids, marker),
@@ -325,7 +329,8 @@ async def get_task(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM tasks WHERE id=?",
         (task_id,),
     )
@@ -411,7 +416,8 @@ async def list_tasks_filtered(
         order = "position ASC, id DESC"
     where = " AND ".join(conditions) if conditions else "1=1"
     params.append(limit)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE {where} ORDER BY {order} LIMIT ?",  # nosec B608
         tuple(params),
     )
@@ -431,7 +437,8 @@ async def list_tasks_by_statuses(
     # why narrowing a limited list afterwards is the defect, not the fix.
     project_sql = f" AND {PROJECT_SUBTREE_CONDITION}" if project_id is not None else ""
     project_params = () if project_id is None else (project_id,)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE status IN ({placeholders}){archived_sql}"  # nosec B608
         f"{project_sql} ORDER BY id DESC LIMIT ?",
         (*statuses, *project_params, limit),
@@ -469,7 +476,8 @@ async def list_tasks_by_status(
         mine=mine,
     )
     where = " AND ".join(conditions)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE {where} ORDER BY {order_by} LIMIT ?",  # nosec B608
         (*params, limit),
     )
@@ -483,7 +491,8 @@ async def list_unmerged_branch_tasks(
 ) -> list[aiosqlite.Row]:
     """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
     placeholders = ",".join("?" for _ in statuses)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT id, title, status, branch FROM tasks "  # nosec B608
         f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
         "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
@@ -494,7 +503,8 @@ async def list_unmerged_branch_tasks(
 async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND status IN ('running', 'fix_requested') "
         "AND job_id IS NOT NULL",
     )
@@ -503,7 +513,8 @@ async def list_running_dispatchable(
 async def list_review_tasks(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND status='review' "
         "AND review_job_id IS NOT NULL",
     )
@@ -512,7 +523,8 @@ async def list_review_tasks(
 async def list_ci_check_tasks(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND status='ci_check'",
     )
 
@@ -539,7 +551,8 @@ async def list_stale_running(
         mine=mine,
     )
     where = " AND ".join(conditions)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE {where}",  # nosec B608
         tuple(params),
     )
@@ -581,14 +594,14 @@ async def create_project(
 async def get_project(
     db: aiosqlite.Connection, project_id: int
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall("SELECT * FROM projects WHERE id=?", (project_id,))
+    rows = await fetchall(db, "SELECT * FROM projects WHERE id=?", (project_id,))
     return rows[0] if rows else None
 
 
 async def get_project_by_slug(
     db: aiosqlite.Connection, slug: str
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall("SELECT * FROM projects WHERE slug=?", (slug,))
+    rows = await fetchall(db, "SELECT * FROM projects WHERE slug=?", (slug,))
     return rows[0] if rows else None
 
 
@@ -626,7 +639,8 @@ async def pipeline_merge_recorded(
     delivered task into needs_decision. Caught by #363's merges-exactly-once
     guard the first time the gate ran.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT 1 FROM pipeline_merges WHERE task_id = ? AND pr_number = ? LIMIT 1",
         (task_id, int(pr_number)),
     )
@@ -640,7 +654,8 @@ async def known_pipeline_shas(db: aiosqlite.Connection, project_id: int) -> set[
     with a NULL project_id, so a merge recorded for a task without a project
     counted as legitimate everywhere (#534, review of submission #2).
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT merge_sha FROM pipeline_merges "
         "WHERE project_id = ? AND COALESCE(merge_sha, '') != ''",
         (project_id,),
@@ -685,10 +700,11 @@ async def list_drift_commits(
     db: aiosqlite.Connection, project_id: int | None = None
 ) -> list[aiosqlite.Row]:
     if project_id is None:
-        return await db.execute_fetchall(
-            "SELECT * FROM base_branch_drift ORDER BY detected_at DESC, id DESC"
+        return await fetchall(
+            db, "SELECT * FROM base_branch_drift ORDER BY detected_at DESC, id DESC"
         )
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM base_branch_drift WHERE project_id=? "
         "ORDER BY detected_at DESC, id DESC",
         (project_id,),
@@ -708,8 +724,9 @@ async def list_projects(
         # Pending proposals (#345) stay out of routing and selectors.
         conditions.append("status='active'")
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    return await db.execute_fetchall(
-        f"SELECT * FROM projects {where} ORDER BY slug ASC"  # nosec B608
+    return await fetchall(
+        db,
+        f"SELECT * FROM projects {where} ORDER BY slug ASC",  # nosec B608
     )
 
 
@@ -729,7 +746,8 @@ async def list_task_ids_for_project(
     db: aiosqlite.Connection, project_id: int
 ) -> set[int]:
     """All task ids whose root epic belongs to the project (#336)."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """
         WITH RECURSIVE subtree(id) AS (
             SELECT id FROM tasks WHERE project_id = ?
@@ -756,7 +774,8 @@ async def resolve_project_for_task(
     for _ in range(20):  # hierarchy depth guard
         if current_id is None:
             break
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT id, parent_id, project_id FROM tasks WHERE id=?",
             (current_id,),
         )
@@ -788,8 +807,8 @@ async def create_skill_version(
     created_by: str = "",
 ) -> tuple[int, int]:
     """Insert the next version for ``name``. Returns (id, version)."""
-    rows = await db.execute_fetchall(
-        "SELECT COALESCE(MAX(version), 0) AS v FROM skills WHERE name=?", (name,)
+    rows = await fetchall(
+        db, "SELECT COALESCE(MAX(version), 0) AS v FROM skills WHERE name=?", (name,)
     )
     version = (rows[0]["v"] or 0) + 1
     cur = await db.execute(
@@ -801,7 +820,8 @@ async def create_skill_version(
 
 
 async def get_active_skill(db: aiosqlite.Connection, name: str) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM skills WHERE name=? AND status='active' "
         "ORDER BY version DESC LIMIT 1",
         (name,),
@@ -811,7 +831,8 @@ async def get_active_skill(db: aiosqlite.Connection, name: str) -> aiosqlite.Row
 
 async def list_skills(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Latest version per name (active preferred, else newest draft)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         """
         SELECT s.* FROM skills s
         JOIN (
@@ -823,23 +844,23 @@ async def list_skills(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
             FROM skills GROUP BY name
         ) latest ON latest.name = s.name AND latest.v = s.version
         ORDER BY s.name ASC
-        """
+        """,
     )
 
 
 async def list_skill_versions(
     db: aiosqlite.Connection, name: str
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
-        "SELECT * FROM skills WHERE name=? ORDER BY version DESC", (name,)
+    return await fetchall(
+        db, "SELECT * FROM skills WHERE name=? ORDER BY version DESC", (name,)
     )
 
 
 async def get_skill_version(
     db: aiosqlite.Connection, name: str, version: int
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
-        "SELECT * FROM skills WHERE name=? AND version=?", (name, version)
+    rows = await fetchall(
+        db, "SELECT * FROM skills WHERE name=? AND version=?", (name, version)
     )
     return rows[0] if rows else None
 
@@ -927,7 +948,8 @@ async def set_machine_review_provider_tokens(
 async def get_latest_machine_review(
     db: aiosqlite.Connection, task_id: int
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM machine_reviews WHERE task_id=? ORDER BY id DESC LIMIT 1",
         (task_id,),
     )
@@ -978,7 +1000,8 @@ async def upsert_finding_disposition(
 async def list_finding_dispositions(
     db: aiosqlite.Connection, review_id: int
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM finding_dispositions WHERE review_id=? "
         "ORDER BY finding_index ASC",
         (review_id,),
@@ -1010,7 +1033,8 @@ async def list_ac_test_results(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
     """All recorded AC test results for a task (any generation)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM ac_test_results WHERE task_id=?",
         (task_id,),
     )
@@ -1061,7 +1085,8 @@ async def get_ci_run_report(
     db: aiosqlite.Connection, task_id: int, head_sha: str
 ) -> aiosqlite.Row | None:
     """The report for one commit, or None when that commit was never reported."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM ci_run_reports WHERE task_id=? AND head_sha=?",
         (task_id, head_sha),
     )
@@ -1076,7 +1101,8 @@ async def latest_ci_run_report(
     Used only to explain a mismatch ("a run was reported, but for another
     commit") — never to satisfy a gate, which always keys on the pinned SHA.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM ci_run_reports WHERE task_id=? "
         "ORDER BY reported_at DESC, id DESC LIMIT 1",
         (task_id,),
@@ -1128,7 +1154,8 @@ async def list_events(
         conditions.append(f"kind IN ({placeholders})")
         params.extend(kinds)
     params.append(min(limit, 200))
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM events WHERE {' AND '.join(conditions)} "  # nosec B608
         "ORDER BY id ASC LIMIT ?",
         tuple(params),
@@ -1167,7 +1194,8 @@ async def list_stale_tasks(
     if require_null_review_job:
         conditions.append("review_job_id IS NULL")
     where = " AND ".join(conditions)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE {where}",  # nosec B608
         tuple(params),
     )
@@ -1187,12 +1215,13 @@ async def list_outcome_debt(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     Oldest first: the ones that have waited longest are the ones whose answer is
     most likely already knowable.
     """
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT id, title, task_type, outcome_metric, outcome_indicator, "
         "outcome_deadline, outcome_revisit_condition, completed_at, updated_at "
         "FROM tasks "
         "WHERE archived=0 AND status='completed' AND TRIM(outcome_metric) != '' "
-        "ORDER BY COALESCE(completed_at, updated_at) ASC"
+        "ORDER BY COALESCE(completed_at, updated_at) ASC",
     )
 
 
@@ -1228,10 +1257,11 @@ async def record_outcome_answer(
 
 async def list_outcome_answers(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Every recorded answer, oldest first, for grouping by task (#819)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT id, task_id, verdict, measured_value, note, answered_by, "
         "answered_at, hypothesis_snapshot FROM outcome_answers "
-        "ORDER BY answered_at ASC, id ASC"
+        "ORDER BY answered_at ASC, id ASC",
     )
 
 
@@ -1239,7 +1269,8 @@ async def list_outcome_answers_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
     """Answers for one task, oldest first (#576)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT id, task_id, verdict, measured_value, note, answered_by, "
         "answered_at, hypothesis_snapshot FROM outcome_answers "
         "WHERE task_id=? ORDER BY answered_at ASC, id ASC",
@@ -1270,7 +1301,7 @@ async def list_live_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     not by ``position``, which is 0 on every epic, and not by id, which ranks
     by age of creation and put a June-dead epic above yesterday's work.
     """
-    return await db.execute_fetchall(_LIVE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
+    return await fetchall(db, _LIVE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
 
 
 async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
@@ -1286,7 +1317,7 @@ async def list_done_epics(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     and an epic matching neither would vanish from both lists — the silent loss
     #569 refused when it dropped its LIMIT.
     """
-    return await db.execute_fetchall(_DONE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
+    return await fetchall(db, _DONE_EPICS_SQL, FINAL_STATUS_VALUES * 2)
 
 
 async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, Any]]:
@@ -1351,7 +1382,8 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
     """
 
     summary: dict[int, dict[str, Any]] = {}
-    for row in await db.execute_fetchall(
+    for row in await fetchall(
+        db,
         counts_sql,
         AWAITING_HUMAN_STATUS_VALUES + IN_FLIGHT_STATUS_VALUES + QUEUED_STATUS_VALUES,
     ):
@@ -1365,7 +1397,7 @@ async def project_work_summary(db: aiosqlite.Connection) -> dict[int, dict[str, 
             "queued": int(d["queued"] or 0),
             "last_activity_at": None,
         }
-    for row in await db.execute_fetchall(activity_sql):
+    for row in await fetchall(db, activity_sql):
         d = dict(row)
         pid = int(d["pid"])
         if pid in summary:
@@ -1386,7 +1418,7 @@ async def count_live_orphan_tasks(db: aiosqlite.Connection) -> int:
     (the epic list and the projects page) and two copies of the condition
     would drift — the class of defect fixed in #609, #614 and #616.
     """
-    rows = await db.execute_fetchall(_LIVE_ORPHANS_COUNT_SQL, FINAL_STATUS_VALUES)
+    rows = await fetchall(db, _LIVE_ORPHANS_COUNT_SQL, FINAL_STATUS_VALUES)
     return int(dict(rows[0])["n"]) if rows else 0
 
 
@@ -1397,12 +1429,14 @@ async def list_agent_tasks(
     limit: int = 50,
 ) -> list[aiosqlite.Row]:
     if status:
-        return await db.execute_fetchall(
+        return await fetchall(
+            db,
             "SELECT * FROM tasks WHERE archived=0 AND source='agent' AND status=? "
             "ORDER BY id DESC LIMIT ?",
             (status, limit),
         )
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND source='agent' ORDER BY id DESC LIMIT ?",
         (limit,),
     )
@@ -1413,7 +1447,8 @@ async def get_siblings(
     parent_id: int,
     exclude_id: int,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT id, title, task_type, status FROM tasks "
         "WHERE parent_id=? AND id!=? AND archived=0 ORDER BY position ASC, id ASC",
         (parent_id, exclude_id),
@@ -1697,15 +1732,15 @@ async def create_review_dispatch(
         "VALUES (?, ?, ?, ?, ?, ?)",
         (task_id, submission_generation, agent_id, run_id, model, profile),
     )
-    return cur.lastrowid
+    return inserted_id(cur)
 
 
 async def list_active_review_dispatches(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
     return list(
-        await db.execute_fetchall(
-            "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
+        await fetchall(
+            db, "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
         )
     )
 
@@ -1719,7 +1754,8 @@ async def get_settled_review_dispatch(
     generation arrived — a failed or still-active dispatch proves nothing
     about the emptiness of a review.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM review_dispatches "
         "WHERE task_id=? AND submission_generation=? AND status='done' "
         "ORDER BY id DESC LIMIT 1",
@@ -1739,7 +1775,8 @@ async def get_review_dispatch_for_generation(
     arrives while the dispatch is still 'active'.
     """
     rows = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT * FROM review_dispatches "
             "WHERE task_id=? AND submission_generation=? "
             "ORDER BY id DESC LIMIT 1",
@@ -1836,14 +1873,16 @@ async def list_task_dependencies(
     # #485: delivery travels beside the status. A closed task whose PR is not
     # merged blocks exactly as much as an open one — that is what #830 learned
     # the expensive way, and a reader given only the status would repeat it.
-    blocked_by = await db.execute_fetchall(
+    blocked_by = await fetchall(
+        db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
         "WHERE d.task_id = ? ORDER BY t.id",
         (task_id,),
     )
-    unblocks = await db.execute_fetchall(
+    unblocks = await fetchall(
+        db,
         "SELECT t.id AS task_id, t.title, t.status "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.task_id "
         "WHERE d.depends_on_task_id = ? ORDER BY t.id",
@@ -1894,7 +1933,8 @@ async def undelivered_blockers(
     merged" are different situations, and collapsing them would leave the
     reader unable to act on either.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
         "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
         "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
@@ -1935,7 +1975,8 @@ async def _dependency_path(
     queue: list[tuple[int, list[int]]] = [(start, [start])]
     while queue:
         node, path = queue.pop(0)
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?",
             (node,),
         )
@@ -1974,7 +2015,8 @@ async def create_digest(
 
 
 async def get_digest(db: aiosqlite.Connection, digest_id: int) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT d.*, p.slug AS project_slug FROM autopilot_digests d "
         "JOIN projects p ON p.id = d.project_id WHERE d.id=?",
         (digest_id,),
@@ -1986,7 +2028,8 @@ async def list_digests(
     db: aiosqlite.Connection, *, limit: int = 30
 ) -> list[aiosqlite.Row]:
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT d.*, p.slug AS project_slug FROM autopilot_digests d "
             "JOIN projects p ON p.id = d.project_id "
             "ORDER BY d.digest_date DESC, d.id DESC LIMIT ?",
@@ -2008,7 +2051,8 @@ async def list_expired_claims(
     threshold_minutes: int,
 ) -> list[aiosqlite.Row]:
     """Claimed tasks whose lease passed without a pair start (#417)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND status='claimed' "
         "AND claimed_at IS NOT NULL AND claimed_at < datetime('now', ?)",
         (f"-{threshold_minutes} minutes",),
@@ -2084,7 +2128,8 @@ async def list_stale_arbiter_dispatching(
     threshold_minutes: int,
 ) -> list[aiosqlite.Row]:
     """Tasks stuck mid-dispatch (submit started, no job id) past the grace (#421)."""
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM tasks WHERE archived=0 AND arbiter_state='dispatching' "
         "AND arbiter_job_id IS NULL AND arbiter_dispatch_at IS NOT NULL "
         "AND arbiter_dispatch_at < datetime('now', ?)",
@@ -2118,7 +2163,8 @@ async def list_past_status_deadline(
     if require_review_job_id:
         conditions.append("review_job_id IS NOT NULL")
     where = " AND ".join(conditions)
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         f"SELECT * FROM tasks WHERE {where}",  # nosec B608
         tuple(params),
     )
@@ -2226,7 +2272,8 @@ async def list_acceptance_criteria(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM acceptance_criteria WHERE task_id=? "
         "ORDER BY position ASC, id ASC",
         (task_id,),
@@ -2244,7 +2291,8 @@ async def add_acceptance_criterion(
     ``(task_id, ac_id)`` pair already exists — callers translate to 409.
     """
     if position is None:
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
             "FROM acceptance_criteria WHERE task_id=?",
             (task_id,),
@@ -2284,13 +2332,15 @@ async def upsert_acceptance_criterion(
     new row was inserted, ``False`` when an existing one was updated.
     Caller owns the commit.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT 1 FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
         (task_id, ac.id),
     )
     existed = bool(rows)
 
-    pos_rows = await db.execute_fetchall(
+    pos_rows = await fetchall(
+        db,
         "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
         "FROM acceptance_criteria WHERE task_id=?",
         (task_id,),
@@ -2389,7 +2439,8 @@ async def collect_subtree_ids(
             continue
         seen.add(tid)
         out.append(tid)
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT id FROM tasks WHERE parent_id=? ORDER BY id ASC",
             (tid,),
         )
@@ -2403,7 +2454,8 @@ async def subtree_ids_deepest_first(
     root_id: int,
 ) -> list[int]:
     """Subtree ids ordered so children always precede their ancestors."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """
         WITH RECURSIVE sub(id, depth) AS (
           SELECT id, 0 FROM tasks WHERE id = ?
@@ -2453,7 +2505,8 @@ async def get_task_updates(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM task_updates WHERE task_id=? ORDER BY id ASC",
         (task_id,),
     )
@@ -2463,7 +2516,8 @@ async def get_task_update_by_id(
     db: aiosqlite.Connection,
     update_id: int,
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM task_updates WHERE id=?",
         (update_id,),
     )
@@ -2474,7 +2528,8 @@ async def has_done_updates(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> bool:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id FROM task_updates WHERE task_id=? AND kind='done'",
         (task_id,),
     )
@@ -2485,7 +2540,8 @@ async def has_plan_updates(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> bool:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id FROM task_updates WHERE task_id=? "
         "AND kind='status' AND content LIKE 'Plan:%'",
         (task_id,),
@@ -2511,13 +2567,15 @@ async def has_stale_alert(
     status transition. All stale alerts embed ``stale in {status}`` so the
     scope key is parseable from content.
     """
-    boundary_rows = await db.execute_fetchall(
+    boundary_rows = await fetchall(
+        db,
         "SELECT COALESCE(MAX(id), 0) AS boundary FROM task_updates "
         "WHERE task_id=? AND NOT (kind='alert' AND content LIKE '%stale%')",
         (task_id,),
     )
     boundary = boundary_rows[0]["boundary"] if boundary_rows else 0
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id FROM task_updates WHERE task_id=? AND kind='alert' "
         "AND content LIKE ? AND id > ? ORDER BY id DESC LIMIT 1",
         (task_id, f"%stale in {status}%", boundary),
@@ -2567,7 +2625,8 @@ async def list_activity(
     db: aiosqlite.Connection,
     limit: int = 30,
 ) -> list[aiosqlite.Row]:
-    return await db.execute_fetchall(
+    return await fetchall(
+        db,
         "SELECT * FROM activity_log ORDER BY id DESC LIMIT ?",
         (limit,),
     )
@@ -2582,7 +2641,8 @@ async def get_task_idempotency_key(
     db: aiosqlite.Connection,
     client_request_id: str,
 ) -> dict[str, Any] | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT client_request_id, task_id, request_hash "
         "FROM task_idempotency_keys WHERE client_request_id = ?",
         (client_request_id,),
@@ -2678,7 +2738,8 @@ async def set_agent_session_task(
 async def get_agent_session(
     db: aiosqlite.Connection, session_id: str
 ) -> aiosqlite.Row | None:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT * FROM agent_sessions WHERE session_id = ? LIMIT 1",
         (session_id,),
     )
@@ -2701,7 +2762,8 @@ async def list_agent_sessions(
     where = f"WHERE {' AND '.join(conditions)} " if conditions else ""
     params.append(min(limit, 500))
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             f"SELECT * FROM agent_sessions {where}"  # nosec B608
             "ORDER BY last_seen_at DESC, id DESC LIMIT ?",
             tuple(params),
@@ -2719,7 +2781,8 @@ async def list_unaddressable_tasks(
     on purpose, their executor is the dispatch job, not a session.
     """
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT id, title, status, claimed_by, claimed_at, branch "
             "FROM tasks WHERE status IN ('claimed', 'running') "
             "AND (claim_session_id IS NULL OR claim_session_id = '') "
@@ -2798,8 +2861,8 @@ async def get_agent_message(
     db: aiosqlite.Connection, message_id: int
 ) -> aiosqlite.Row | None:
     rows = list(
-        await db.execute_fetchall(
-            "SELECT * FROM agent_messages WHERE id = ? LIMIT 1", (message_id,)
+        await fetchall(
+            db, "SELECT * FROM agent_messages WHERE id = ? LIMIT 1", (message_id,)
         )
     )
     return rows[0] if rows else None
@@ -2837,7 +2900,8 @@ async def list_inbox_messages(
     "read" bit would let the first of them hide it from the rest.
     """
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             f"SELECT * FROM agent_messages WHERE id > :after AND {_INBOX_PREDICATE} "  # nosec B608
             "ORDER BY id ASC LIMIT :limit",
             {
@@ -2854,7 +2918,8 @@ async def list_thread_messages(
     db: aiosqlite.Connection, thread_id: str, *, limit: int = 200
 ) -> list[aiosqlite.Row]:
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT * FROM agent_messages WHERE thread_id = ? ORDER BY id ASC LIMIT ?",
             (thread_id, min(limit, 500)),
         )
@@ -2885,7 +2950,8 @@ async def list_addressable_task_ids(
         params.extend(sessions)
     if not conditions:
         return []
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         f"SELECT id FROM tasks WHERE {' OR '.join(conditions)}",  # nosec B608
         tuple(params),
     )
@@ -2907,7 +2973,8 @@ async def count_visible_in_thread(
     in one branch of the endpoint and the other branch never asked for it.
     """
     rows = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT COUNT(*) AS n FROM agent_messages "  # nosec B608
             f"WHERE thread_id = :thread AND ({_INBOX_PREDICATE} "
             "  OR (from_agent = :agent AND :agent <> ''))",
@@ -2934,7 +3001,8 @@ async def count_recent_messages(
     else:
         where, param = "from_agent = ?", agent
     rows = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             f"SELECT COUNT(*) AS n FROM agent_messages WHERE {where} "  # nosec B608
             "AND created_at >= datetime('now', ?)",
             (param, f"-{within_minutes} minutes"),
@@ -2963,7 +3031,8 @@ async def list_task_messages(
     not the addressing scheme.
     """
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT * FROM agent_messages "
             "WHERE (to_kind = 'task' AND to_ref = ?) OR related_task_id = ? "
             "ORDER BY id ASC LIMIT ?",
@@ -2982,7 +3051,8 @@ async def list_recent_threads(
     to go looking for.
     """
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT m.*, t.messages AS messages FROM agent_messages m "
             "JOIN (SELECT thread_id, COUNT(*) AS messages, MAX(id) AS last_id "
             "      FROM agent_messages GROUP BY thread_id) t ON m.id = t.last_id "
@@ -3100,9 +3170,7 @@ async def mcp_usage_by_tool(
     db: aiosqlite.Connection, *, window_days: int
 ) -> list[dict[str, Any]]:
     """Per-tool usage, error and cost rows for the window. Read path only."""
-    rows = await db.execute_fetchall(
-        _MCP_USAGE_SQL, {"since": f"-{int(window_days)} days"}
-    )
+    rows = await fetchall(db, _MCP_USAGE_SQL, {"since": f"-{int(window_days)} days"})
     return [dict(row) for row in rows]
 
 
@@ -3110,7 +3178,8 @@ async def mcp_usage_by_profile(
     db: aiosqlite.Connection, *, window_days: int
 ) -> list[dict[str, Any]]:
     """Per-profile totals for the window: the cost of a surface, not a tool."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT profile, COUNT(*) AS calls, "
         "COUNT(DISTINCT tool) AS tools, "
         "COUNT(DISTINCT COALESCE(principal_id, -1)) AS principals, "
@@ -3135,7 +3204,8 @@ async def mcp_usage_by_role(
     means — genuinely unused, or used from somewhere this table cannot see
     (#816).
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT principal_role, COUNT(*) AS calls, "
         "COUNT(DISTINCT tool) AS tools, "
         "COUNT(DISTINCT COALESCE(principal_id, -1)) AS principals, "
@@ -3153,7 +3223,8 @@ async def mcp_usage_errors(
     db: aiosqlite.Connection, *, window_days: int, limit: int = 20
 ) -> list[dict[str, Any]]:
     """Top error reasons in the window, by tool. Slugs only — never messages."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT tool, error_reason, COUNT(*) AS calls "
         "FROM mcp_call_events "
         "WHERE created_at >= datetime('now', ?) AND status <> 'ok' "
@@ -3223,7 +3294,8 @@ async def list_live_checks(
 ) -> list[aiosqlite.Row]:
     """Evidence for one task, newest first."""
     return list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT * FROM live_checks WHERE task_id = ? ORDER BY id DESC LIMIT ?",
             (task_id, min(limit, 200)),
         )
@@ -3238,7 +3310,8 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
     recorded as unknown rather than guessed (#725).
     """
     rows = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT merge_sha FROM pipeline_merges WHERE task_id = ? "
             "AND COALESCE(merge_sha, '') != '' ORDER BY id DESC LIMIT 1",
             (task_id,),
@@ -3276,7 +3349,8 @@ async def record_release(
     # record is returned instead. Different STATUS for the same sha is a real
     # second event (a retry that succeeded) and is stored.
     existing = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT id FROM releases WHERE deployed_sha = ? AND status = ? "
             "AND ((? IS NULL AND project_id IS NULL) OR project_id = ?) "
             "ORDER BY id DESC LIMIT 1",
@@ -3307,7 +3381,8 @@ async def latest_successful_release(
     into a denial, which is the failure this epic exists to remove (#725).
     """
     rows = list(
-        await db.execute_fetchall(
+        await fetchall(
+            db,
             "SELECT * FROM releases WHERE status = ? "
             "AND (? IS NULL OR project_id = ?) ORDER BY id DESC LIMIT 1",
             (RELEASE_SUCCESS, project_id, project_id),
@@ -3321,6 +3396,6 @@ async def release_by_id(
 ) -> dict[str, Any] | None:
     """One release row by id, or None."""
     rows = list(
-        await db.execute_fetchall("SELECT * FROM releases WHERE id = ?", (release_id,))
+        await fetchall(db, "SELECT * FROM releases WHERE id = ?", (release_id,))
     )
     return dict(rows[0]) if rows else None

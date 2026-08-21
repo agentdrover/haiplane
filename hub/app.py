@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from hub import config, models, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.db import get_db
+from hub.db import fetchall, get_db
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
@@ -1425,7 +1425,8 @@ async def api_submit_machine_review(
     # already refuses raw_count=0). Warned once per generation, never
     # refused: the report itself is still worth keeping as evidence.
     if raw_count == 0:
-        prior_zero = await db.execute_fetchall(
+        prior_zero = await fetchall(
+            db,
             "SELECT COUNT(*) AS n FROM machine_reviews "
             "WHERE task_id=? AND submission_generation=? AND raw_count=0",
             (task_id, generation),

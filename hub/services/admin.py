@@ -13,7 +13,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
 from hub.config import TokenIdentity
-from hub.db import has_active_admin
+from hub.db import fetchall, inserted_id, has_active_admin
 
 log = logging.getLogger("hub.services.admin")
 
@@ -97,7 +97,8 @@ async def write_audit(
 async def list_audit(
     db: aiosqlite.Connection, *, limit: int = 50, offset: int = 0
 ) -> list[dict[str, Any]]:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT a.*, p.username AS actor_username "
         "FROM admin_audit_log a "
         "LEFT JOIN principals p ON a.actor_principal_id = p.id "
@@ -129,7 +130,7 @@ async def create_principal(
         "VALUES (?, ?, ?, ?, ?, ?)",
         (kind, username, display_name, email, notes, created_by),
     )
-    principal_id = cursor.lastrowid
+    principal_id = inserted_id(cursor)
 
     if password and kind == "human":
         pw_hash = hash_password(password)
@@ -139,8 +140,8 @@ async def create_principal(
         )
 
     if role_slug:
-        role_rows = await db.execute_fetchall(
-            "SELECT id FROM roles WHERE slug = ?", (role_slug,)
+        role_rows = await fetchall(
+            db, "SELECT id FROM roles WHERE slug = ?", (role_slug,)
         )
         if role_rows:
             await db.execute(
@@ -155,9 +156,7 @@ async def create_principal(
 async def get_principal(
     db: aiosqlite.Connection, principal_id: int
 ) -> dict[str, Any] | None:
-    rows = await db.execute_fetchall(
-        "SELECT * FROM principals WHERE id = ?", (principal_id,)
-    )
+    rows = await fetchall(db, "SELECT * FROM principals WHERE id = ?", (principal_id,))
     if not rows:
         return None
     p = dict(rows[0])
@@ -185,7 +184,7 @@ async def list_principals(
         sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY id ASC LIMIT ?"
     params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
+    rows = await fetchall(db, sql, params)
     result = []
     for r in rows:
         p = dict(r)
@@ -255,7 +254,8 @@ class LastAdminError(Exception):
 
 async def _is_last_admin(db: aiosqlite.Connection, principal_id: int) -> bool:
     """True if disabling/removing admin role from this principal leaves zero active admins."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """SELECT p.id FROM principals p
            JOIN principal_roles pr ON p.id = pr.principal_id
            JOIN roles r ON pr.role_id = r.id
@@ -270,7 +270,8 @@ async def _is_last_admin(db: aiosqlite.Connection, principal_id: int) -> bool:
 async def _get_principal_role_slugs(
     db: aiosqlite.Connection, principal_id: int
 ) -> list[str]:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT r.slug FROM roles r "
         "JOIN principal_roles pr ON r.id = pr.role_id "
         "WHERE pr.principal_id = ?",
@@ -282,7 +283,8 @@ async def _get_principal_role_slugs(
 async def get_principal_permissions(
     db: aiosqlite.Connection, principal_id: int
 ) -> frozenset[str]:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT DISTINCT rp.permission FROM role_permissions rp "
         "JOIN principal_roles pr ON rp.role_id = pr.role_id "
         "WHERE pr.principal_id = ?",
@@ -319,12 +321,13 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
 
 
 async def list_roles(db: aiosqlite.Connection) -> list[dict[str, Any]]:
-    rows = await db.execute_fetchall("SELECT * FROM roles ORDER BY id ASC")
+    rows = await fetchall(db, "SELECT * FROM roles ORDER BY id ASC")
     result = []
     for r in rows:
         role = dict(r)
         role["system"] = bool(role.get("system"))
-        perm_rows = await db.execute_fetchall(
+        perm_rows = await fetchall(
+            db,
             "SELECT permission FROM role_permissions WHERE role_id = ?",
             (role["id"],),
         )
@@ -354,7 +357,7 @@ async def set_principal_roles(
 
     role_ids: list[tuple[int, str]] = []
     for slug in role_slugs:
-        rows = await db.execute_fetchall("SELECT id FROM roles WHERE slug = ?", (slug,))
+        rows = await fetchall(db, "SELECT id FROM roles WHERE slug = ?", (slug,))
         if not rows:
             raise ValueError(f"role {slug!r} not found")
         role_ids.append((rows[0][0], slug))
@@ -417,13 +420,14 @@ async def list_api_keys(
     db: aiosqlite.Connection, *, principal_id: int | None = None, limit: int = 100
 ) -> list[dict[str, Any]]:
     if principal_id is not None:
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT * FROM api_keys WHERE principal_id = ? ORDER BY id DESC LIMIT ?",
             (principal_id, limit),
         )
     else:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM api_keys ORDER BY id DESC LIMIT ?", (limit,)
+        rows = await fetchall(
+            db, "SELECT * FROM api_keys ORDER BY id DESC LIMIT ?", (limit,)
         )
     return [dict(r) for r in rows]
 
@@ -443,7 +447,8 @@ async def resolve_api_key(
 ) -> TokenIdentity | None:
     """Look up an API key by hash, return a TokenIdentity or None."""
     key_hash = hash_api_key(plaintext_key)
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT ak.*, p.username, p.kind, p.status "
         "FROM api_keys ak "
         "JOIN principals p ON ak.principal_id = p.id "
@@ -530,7 +535,8 @@ async def resolve_browser_session(
     db: aiosqlite.Connection, session_token: str
 ) -> TokenIdentity | None:
     session_hash = hash_session_token(session_token)
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT bs.*, p.username, p.kind, p.status "
         "FROM browser_sessions bs "
         "JOIN principals p ON bs.principal_id = p.id "
@@ -613,7 +619,8 @@ async def authenticate_password(
     db: aiosqlite.Connection, username: str, password: str
 ) -> int | None:
     """Verify username + password. Returns principal_id on success, None on failure."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT p.id, p.status, pc.password_hash, pc.failed_attempts, pc.locked_until "
         "FROM principals p "
         "JOIN password_credentials pc ON p.id = pc.principal_id "
@@ -669,7 +676,8 @@ async def set_password(
     db: aiosqlite.Connection, principal_id: int, password: str
 ) -> None:
     pw_hash = hash_password(password)
-    existing = await db.execute_fetchall(
+    existing = await fetchall(
+        db,
         "SELECT 1 FROM password_credentials WHERE principal_id = ?",
         (principal_id,),
     )
@@ -734,30 +742,33 @@ async def bootstrap_admin(
 async def admin_summary(db: aiosqlite.Connection) -> dict[str, Any]:
     from hub import config
 
-    active_users = await db.execute_fetchall(
-        "SELECT COUNT(*) FROM principals WHERE kind = 'human' AND status = 'active'"
+    active_users = await fetchall(
+        db, "SELECT COUNT(*) FROM principals WHERE kind = 'human' AND status = 'active'"
     )
-    disabled_users = await db.execute_fetchall(
-        "SELECT COUNT(*) FROM principals WHERE kind = 'human' AND status != 'active'"
+    disabled_users = await fetchall(
+        db,
+        "SELECT COUNT(*) FROM principals WHERE kind = 'human' AND status != 'active'",
     )
-    active_agents = await db.execute_fetchall(
-        "SELECT COUNT(*) FROM principals WHERE kind = 'agent' AND status = 'active'"
+    active_agents = await fetchall(
+        db, "SELECT COUNT(*) FROM principals WHERE kind = 'agent' AND status = 'active'"
     )
-    active_keys = await db.execute_fetchall(
-        "SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL"
+    active_keys = await fetchall(
+        db, "SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL"
     )
-    locked_users = await db.execute_fetchall(
-        "SELECT COUNT(*) FROM principals WHERE status = 'locked'"
+    locked_users = await fetchall(
+        db, "SELECT COUNT(*) FROM principals WHERE status = 'locked'"
     )
-    active_sessions = await db.execute_fetchall(
+    active_sessions = await fetchall(
+        db,
         "SELECT COUNT(*) FROM browser_sessions "
-        "WHERE revoked_at IS NULL AND expires_at > datetime('now')"
+        "WHERE revoked_at IS NULL AND expires_at > datetime('now')",
     )
-    expiring_7d = await db.execute_fetchall(
+    expiring_7d = await fetchall(
+        db,
         "SELECT COUNT(*) FROM api_keys "
         "WHERE revoked_at IS NULL AND expires_at IS NOT NULL "
         "AND expires_at > datetime('now') "
-        "AND expires_at <= datetime('now', '+7 days')"
+        "AND expires_at <= datetime('now', '+7 days')",
     )
     has_admin = await has_active_admin(db)
     audit_rows = await list_audit(db, limit=5)

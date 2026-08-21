@@ -26,6 +26,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -850,7 +851,8 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             continue  # API hiccup or run still unknown — retry next pass
         if (run.get("status") or "").upper() not in _TERMINAL_RUN_STATUSES:
             continue
-        grace_rows = await db.execute_fetchall(
+        grace_rows = await fetchall(
+            db,
             "SELECT 1 FROM review_dispatches WHERE id=? "
             "AND created_at <= datetime('now', ?)",
             (dispatch["id"], f"-{config.CURSOR_REVIEW_GRACE_MINUTES} minutes"),

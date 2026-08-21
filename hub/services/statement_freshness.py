@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from hub.db import deserialize_str_list
+from hub.db import deserialize_str_list, fetchall
 
 log = logging.getLogger("hub")
 
@@ -210,7 +210,8 @@ async def statement_freshness(db: Any, task: dict[str, Any]) -> dict:
         }
 
     try:
-        rows = await db.execute_fetchall(
+        rows = await fetchall(
+            db,
             "SELECT m.task_id, m.merged_at, t.title, t.affected_areas "
             "FROM pipeline_merges m JOIN tasks t ON t.id = m.task_id "
             "WHERE m.task_id IS NOT NULL AND m.task_id != ? AND m.merged_at > ? "

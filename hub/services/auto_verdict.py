@@ -40,6 +40,7 @@ import logging
 
 import aiosqlite
 
+from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict
@@ -222,7 +223,8 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
             f"{budget} — раунд не сошёлся штатно",
         )
         return False
-    siblings = await db.execute_fetchall(
+    siblings = await fetchall(
+        db,
         "SELECT id, findings_confirmed FROM machine_reviews "
         "WHERE task_id=? AND submission_generation=? AND id != ?",
         (task_id, generation, review["id"]),

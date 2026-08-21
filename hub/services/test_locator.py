@@ -37,7 +37,7 @@ def parse_test_locator(value: str | None) -> tuple[str, str] | None:
     Best-effort by design (#505 AC-3): a legacy free-text ``test_ref`` simply
     returns ``None`` instead of raising, so existing rows keep parsing.
     """
-    if not is_valid_test_locator(value):
+    if value is None or not is_valid_test_locator(value):
         return None
     nodeid = value.strip()
     path = nodeid.split("::", 1)[0]
@@ -46,7 +46,9 @@ def parse_test_locator(value: str | None) -> tuple[str, str] | None:
 
 def _verifiable_by(ac: Any) -> str:
     vb = getattr(ac, "verifiable_by", None)
-    return getattr(vb, "value", vb)
+    # Обещали str, а при отсутствующем поле отдавали None: сравнение с "test"
+    # молча давало False, а .lower() у вызывающего дал бы AttributeError.
+    return str(getattr(vb, "value", vb) or "")
 
 
 def _ac_id(ac: Any) -> str:

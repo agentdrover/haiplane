@@ -274,7 +274,7 @@ async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
             base=base,
             fallback_command=fallback,
         )
-    files = [
+    files: list[dict[str, Any]] = [
         {"path": path, "added": added, "removed": removed}
         for added, removed, path in rows
     ]

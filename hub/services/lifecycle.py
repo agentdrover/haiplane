@@ -28,7 +28,12 @@ from hub.actionable_errors import (
 from hub import repository as repo
 from hub.services.sessions import note_session_task
 from hub.hub_instance import mutation_activity_detail
-from hub.db import deserialize_str_list, log_activity, structured_fields_from_row
+from hub.db import (
+    deserialize_str_list,
+    fetchall,
+    log_activity,
+    structured_fields_from_row,
+)
 from hub.integrations.registry import plugins
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
@@ -102,6 +107,19 @@ from hub.services.refinement import (
 log = logging.getLogger("hub")
 
 _ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+def _existing_task(row: aiosqlite.Row | None, task_id: int) -> aiosqlite.Row:
+    """Строка задачи, которая обязана существовать на этом шаге.
+
+    Инвариант «мы только что её читали/меняли, значит она есть» жил в коде
+    сорока подавлениями type: ignore. Подавление молчит и когда инвариант
+    держится, и когда он порвался; здесь он проверяется и, если не сошёлся,
+    отвечает 404 вместо AttributeError на None (#847).
+    """
+    if row is None:
+        raise HTTPException(404, f"task #{task_id} not found")
+    return row
 
 
 async def _try_restore_pair_workspace(
@@ -224,10 +242,11 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
 
 async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
     """Repair feature/epic rows left open while all children are completed."""
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT id FROM tasks WHERE archived=0 AND task_type IN ('feature','epic') "
         "AND status NOT IN ('completed','failed','rejected') "
-        "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC"
+        "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC",
     )
     repaired = 0
     for row in rows:
@@ -1744,9 +1763,9 @@ async def submit_for_review(
     except Exception:  # noqa: BLE001 - dispatch must never break a submit
         log.exception("cross-model review dispatch failed for task #%s", task_id)
 
-    row = await repo.get_task(db, task_id)
+    row = _existing_task(await repo.get_task(db, task_id), task_id)
     updates = await repo.get_task_updates(db, task_id)
-    view = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    view = row_to_task(row, updates=updates)
 
     # Machine-review policy (#382): tell the submitting agent right away
     # when the harness run is expected before the human verdict.
@@ -2197,11 +2216,11 @@ async def claim_task(
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):
-        row = await repo.get_task(db, task_id)
+        row = _existing_task(await repo.get_task(db, task_id), task_id)
         task = dict(row)
         if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
             updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            return row_to_task(row, updates=updates)
         raise HTTPException(409, f"Task #{task_id} claim conflict")
 
     session_note = f" session={body.session_id}" if body.session_id else ""
@@ -2867,7 +2886,8 @@ async def _has_incomplete_descendants(
     db: aiosqlite.Connection,
     root_id: int,
 ) -> bool:
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         """
         WITH RECURSIVE sub(id) AS (
             SELECT id FROM tasks WHERE parent_id = ?

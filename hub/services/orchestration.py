@@ -11,7 +11,7 @@ import aiosqlite
 
 from hub import commit_scope, config
 from hub import repository as repo
-from hub.db import deserialize_str_list, get_breadcrumb, log_activity
+from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
@@ -182,8 +182,9 @@ async def machine_review_gap(
 ) -> str | None:
     """None when policy is satisfied; otherwise a human-readable gap reason."""
     project = await repo.resolve_project_for_task(db, task["id"])
-    keys = project.keys() if project is not None else []
-    policy = project["machine_review"] if "machine_review" in keys else "auto"
+    policy = "auto"
+    if project is not None and "machine_review" in project.keys():
+        policy = project["machine_review"]
     if not machine_review_required(task, policy):
         return None
     generation = task.get("submission_generation") or 0
@@ -357,7 +358,8 @@ async def practice_metrics(
 
     since = f"-{since_days} days"
 
-    totals_rows = await db.execute_fetchall(
+    totals_rows = await fetchall(
+        db,
         # `reviews` counts the reports that show a sign of having run; the
         # stamps are counted beside them, never inside them (#841). Both are
         # reported, so `reports_total` still answers "how many rows landed"
@@ -443,7 +445,8 @@ async def practice_metrics(
     # stayed affordable. Kept beside by_harness rather than folded into it:
     # the harness answers "what ran", the profile answers "how much it was
     # allowed to spend".
-    profile_rows = await db.execute_fetchall(
+    profile_rows = await fetchall(
+        db,
         "SELECT CASE WHEN profile = '' THEN 'не заявлен' ELSE profile END "
         "AS profile, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
@@ -459,7 +462,8 @@ async def practice_metrics(
         (since,),
     )
 
-    harness_rows = await db.execute_fetchall(
+    harness_rows = await fetchall(
+        db,
         "SELECT harness_skill, harness_version, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
         f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
@@ -473,7 +477,8 @@ async def practice_metrics(
         (since,),
     )
 
-    category_rows = await db.execute_fetchall(
+    category_rows = await fetchall(
+        db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
         "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
@@ -506,7 +511,8 @@ async def practice_metrics(
     # duration. Every row that HAS a completion is filtered and measured by
     # the same `completed_at` — #518 fixed a version where numerator and
     # window used different clocks, and that fix stays.
-    cycle_rows = await db.execute_fetchall(
+    cycle_rows = await fetchall(
+        db,
         "SELECT work_type, completed_at IS NULL AS no_completion, "
         "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
         "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
@@ -645,7 +651,8 @@ async def _escaped_defect_metrics(
     never to the feature's closure. #518 was a bug about a numerator and a
     window keeping different clocks; this one states its clock.
     """
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         # The ancestry walk stops at the first feature, so each bug contributes
         # its NEAREST feature and no other: a bug hanging under a task under a
         # feature is attributed to that feature, not to the epic above it.
@@ -665,7 +672,8 @@ async def _escaped_defect_metrics(
         "JOIN tasks f ON f.id = a.node_id AND f.task_type = 'feature'",
         (since,),
     )
-    total_rows = await db.execute_fetchall(
+    total_rows = await fetchall(
+        db,
         "SELECT COUNT(*) AS bugs FROM tasks "
         "WHERE work_type = 'bug' AND created_at >= datetime('now', ?)",
         (since,),
@@ -741,7 +749,8 @@ async def _review_outcome_metrics(
     """
     import json as _json
 
-    rows = await db.execute_fetchall(
+    rows = await fetchall(
+        db,
         "SELECT task_id, payload FROM events "
         "WHERE kind = 'review_verdict_recorded' "
         "AND created_at >= datetime('now', ?)",
@@ -845,7 +854,8 @@ async def _human_gate_metrics(
     import json as _json
     import statistics
 
-    event_rows = await db.execute_fetchall(
+    event_rows = await fetchall(
+        db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
@@ -875,7 +885,8 @@ async def _human_gate_metrics(
     # The submission moment is written by the hub itself in a fixed shape
     # (submit_for_review), which makes it the one submission timestamp that
     # exists for the whole history — there is no dedicated event yet.
-    submit_rows = await db.execute_fetchall(
+    submit_rows = await fetchall(
+        db,
         "SELECT task_id, created_at FROM task_updates "
         "WHERE kind = 'status' "
         "AND content LIKE 'Submitted for review (submission #%'",
@@ -958,11 +969,11 @@ async def _human_gate_metrics(
                 payload = _json.loads(row["payload"] or "{}")
             except ValueError:
                 payload = {}
-            result = (payload.get("result") or "").lower()
-            if result not in {"ok", "problem"}:
+            audit_result = (payload.get("result") or "").lower()
+            if audit_result not in {"ok", "problem"}:
                 continue
             entry = bucket("audit", project_slug)
-            if result == "ok":
+            if audit_result == "ok":
                 entry["approvals"] += 1
             else:
                 entry["overrides"] += 1
@@ -1473,6 +1484,12 @@ async def merge_before_completion(
     """
     task_id = task["id"]
     pr_num = task.get("pr_number")
+    if pr_num is None:
+        # Вызывающий пускает сюда только задачи с номером PR (#605), но внутри
+        # это нигде не было сказано, и проверка типов справедливо считала, что
+        # в GitHub может уехать None. Инвариант записан явно: отказ с причиной
+        # дешевле падения на первом же вызове с None.
+        return False, "no_pr: у задачи нет номера PR — доставлять нечего"
     try:
         # Already delivered — by the headless conveyor, or by an earlier done
         # report that failed after the merge. Merging twice is not extra
@@ -2035,8 +2052,10 @@ async def transition_after_agent_done(
         # is a submission for review, not a completion. Route to
         # client-driven review (no review_job_id) and tell the agent how to
         # obtain the verdict.
-        generation = (await repo.get_task(db, task_id)) or {}
-        generation_num = dict(generation).get("submission_generation", 0)
+        task_row = await repo.get_task(db, task_id)
+        generation_num = (
+            dict(task_row).get("submission_generation", 0) if task_row else 0
+        )
         await repo.update_task(
             db,
             task_id,
