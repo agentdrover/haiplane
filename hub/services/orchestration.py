@@ -102,6 +102,75 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
     return True
 
 
+# --- Reports that carry no evidence the harness ran (#841) -------------
+#
+# 60 of the 103 reports in the 90-day window on 2026-08-21 were the same
+# shape: raw_count 0, no findings on either side, no tokens, one agent —
+# all 60 landed inside 36 minutes on 2026-08-19 (harness v7). #750 named
+# that shape at intake and left the row in place on purpose: a stamp is
+# still evidence of what a client did. What it did NOT do is change how
+# the row reads afterwards, and downstream both the gate and the practice
+# metrics counted it as a review that ran and found nothing.
+#
+# Zero candidates is absence of data, not absence of findings. Evidence is
+# taken as WIDELY as the stored columns allow — any one of a claimed
+# candidate, an adjudicated finding, a self-counted token, a provider-billed
+# token (#828) or more than one agent means something ran. Only a report
+# with none of them is "no data", so an honest cheap run that found nothing
+# but counted its cost still reads as a review.
+#
+# The condition is written ONCE. Both the gate below and the two metric
+# aggregates use this fragment; a copy would drift, and the whole point is
+# that the gate and the number agree on what a review is.
+REPORT_HAS_EVIDENCE_SQL = (
+    "(raw_count > 0 "
+    "OR json_array_length(findings_confirmed) > 0 "
+    "OR json_array_length(findings_rejected) > 0 "
+    "OR COALESCE(tokens_spent, 0) > 0 "
+    "OR COALESCE(provider_tokens, 0) > 0 "
+    "OR COALESCE(agent_count, 0) > 1)"
+)
+
+
+def report_has_evidence(review: Any) -> bool:
+    """The Python twin of :data:`REPORT_HAS_EVIDENCE_SQL`.
+
+    ``review`` is a ``machine_reviews`` row (or a dict of one). Columns are
+    read defensively: ``provider_tokens`` arrived in #828, so a row read
+    from an older snapshot may simply not have it, and a missing column
+    must read as "no such evidence" rather than raise.
+    """
+
+    def col(name: str) -> Any:
+        try:
+            if isinstance(review, dict):
+                return review.get(name)
+            return review[name]
+        except (KeyError, IndexError):
+            return None
+
+    def count(name: str) -> int:
+        value = col(name)
+        if isinstance(value, str):
+            import json as _json
+
+            try:
+                parsed = _json.loads(value or "[]")
+            except ValueError:
+                return 0
+            return len(parsed) if isinstance(parsed, list) else 0
+        return len(value) if isinstance(value, list) else 0
+
+    return bool(
+        (col("raw_count") or 0) > 0
+        or count("findings_confirmed") > 0
+        or count("findings_rejected") > 0
+        or (col("tokens_spent") or 0) > 0
+        or (col("provider_tokens") or 0) > 0
+        or (col("agent_count") or 0) > 1
+    )
+
+
 async def machine_review_gap(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> str | None:
@@ -117,6 +186,17 @@ async def machine_review_gap(
         return "machine-review отсутствует для текущего сабмишена"
     if mr["submission_generation"] != generation:
         return "machine-review устарел (работа пересдана) — прогоните харнесс заново"
+    if not report_has_evidence(mr):
+        # The requirement is that a review RAN, and this row is the record of
+        # one that shows no sign of having run. Saying "satisfied" here is the
+        # substitution #750 warned about, one step further down the pipe: in
+        # 'warn' it silences the panel line the reviewer reads instead of the
+        # diff, and in 'require' it would buy an APPROVED verdict outright.
+        return (
+            "machine-review без данных: ноль кандидатов, ноль находок, "
+            "ни одного посчитанного токена — отчёт есть, исполнения не видно "
+            "(#750/#841). Прогоните харнесс заново или выносите вердикт сами"
+        )
     return None
 
 
@@ -133,19 +213,40 @@ async def practice_metrics(
     ``no_completion_tasks`` rather than estimated from ``updated_at`` (#810).
     Token and duration fields are optional in reports, so aggregates carry
     ``reports_without_tokens`` instead of pretending coverage is full.
+
+    ``reviews`` counts only the reports that carry evidence a harness ran
+    (#841) — see :data:`REPORT_HAS_EVIDENCE_SQL`. The rest are counted as
+    ``no_data_reports`` and the row count stays available as
+    ``reports_total``, so the change is visible rather than silent: the
+    90-day window that read "103 reviews" on 2026-08-21 keeps 103 as
+    ``reports_total``, with at least the 60 rows of the v7 batch moving to
+    ``no_data_reports``.
     """
     import statistics
 
     since = f"-{since_days} days"
 
     totals_rows = await db.execute_fetchall(
-        "SELECT COUNT(*) AS reviews, "
+        # `reviews` counts the reports that show a sign of having run; the
+        # stamps are counted beside them, never inside them (#841). Both are
+        # reported, so `reports_total` still answers "how many rows landed"
+        # and no figure moves silently: the 90-day window read on 2026-08-21
+        # held 103 rows, at least 60 of them the v7 batch.
+        f"SELECT COUNT(*) AS reports_total, "  # nosec B608 - fragment is a module constant, values stay params
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
+        "AS no_data_reports, "
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(json_array_length(findings_rejected)), 0) AS rejected_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
         "COALESCE(SUM(duration_ms), 0) AS duration_ms_total, "
-        "SUM(CASE WHEN tokens_spent IS NULL THEN 1 ELSE 0 END) AS reports_without_tokens, "
+        # Counted over the reports that ran: a stamp has no cost to omit, and
+        # mixing the two made "73 of 103 reports did not count their tokens"
+        # read as a harness discipline problem when 60 of those 73 were rows
+        # where nothing ran at all (#841).
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} AND tokens_spent IS NULL "
+        "THEN 1 ELSE 0 END) AS reports_without_tokens, "
         # Findings from the reports that actually reported a cost. The ratio
         # below divides by this, not by every confirmed finding in the window.
         "COALESCE(SUM(CASE WHEN tokens_spent IS NOT NULL "
@@ -213,7 +314,10 @@ async def practice_metrics(
     # allowed to spend".
     profile_rows = await db.execute_fetchall(
         "SELECT CASE WHEN profile = '' THEN 'не заявлен' ELSE profile END "
-        "AS profile, COUNT(*) AS reviews, "
+        "AS profile, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
+        "AS no_data_reports, "
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) "
         "AS confirmed_total, "
@@ -225,7 +329,10 @@ async def practice_metrics(
     )
 
     harness_rows = await db.execute_fetchall(
-        "SELECT harness_skill, harness_version, COUNT(*) AS reviews, "
+        "SELECT harness_skill, harness_version, COUNT(*) AS reports_total, "  # nosec B608 - constant fragment
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
+        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
+        "AS no_data_reports, "
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
