@@ -1152,18 +1152,23 @@ async def record_outcome_answer(
     measured_value: str,
     note: str = "",
     answered_by: str = "",
+    hypothesis_snapshot: str | None = None,
 ) -> int:
     """Append one answer to a task's outcome (#819).
 
     Append-only on purpose: an outcome_deadline routinely names more than one
     moment, and an update-in-place would erase the evidence that anyone came
     back a second time.
+
+    ``hypothesis_snapshot`` is the ``outcome_metric`` as it stood when the
+    answer was written (#576). Empty/NULL means the row predates the column
+    and must still read as an answer, not as a revision.
     """
     cur = await db.execute(
         "INSERT INTO outcome_answers "
-        "(task_id, verdict, measured_value, note, answered_by) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, verdict, measured_value, note, answered_by),
+        "(task_id, verdict, measured_value, note, answered_by, "
+        "hypothesis_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, verdict, measured_value, note, answered_by, hypothesis_snapshot),
     )
     await db.commit()
     return int(cur.lastrowid or 0)
@@ -1173,7 +1178,20 @@ async def list_outcome_answers(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
     """Every recorded answer, oldest first, for grouping by task (#819)."""
     return await db.execute_fetchall(
         "SELECT id, task_id, verdict, measured_value, note, answered_by, "
-        "answered_at FROM outcome_answers ORDER BY answered_at ASC, id ASC"
+        "answered_at, hypothesis_snapshot FROM outcome_answers "
+        "ORDER BY answered_at ASC, id ASC"
+    )
+
+
+async def list_outcome_answers_for_task(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    """Answers for one task, oldest first (#576)."""
+    return await db.execute_fetchall(
+        "SELECT id, task_id, verdict, measured_value, note, answered_by, "
+        "answered_at, hypothesis_snapshot FROM outcome_answers "
+        "WHERE task_id=? ORDER BY answered_at ASC, id ASC",
+        (task_id,),
     )
 
 

@@ -895,3 +895,32 @@ async def test_dependency_edges_die_with_their_task():
             )
         )
         assert left == [], "edges on both sides of the deleted task must be gone"
+
+
+async def test_outcome_answer_snapshot_migration_preserves_legacy_rows():
+    """#576 AC-5. Answers written before the snapshot column stay readable
+    and do not become 'revised' just because the new column is empty."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "outcome_answers")
+        assert "hypothesis_snapshot" in cols
+        assert cols["hypothesis_snapshot"]["notnull"] == 0
+
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO outcome_answers (task_id, verdict, measured_value, "
+            "note, answered_by) VALUES (1, 'moved', '0 → 5', '', 'owner')"
+        )
+        row = (
+            await conn.execute_fetchall(
+                "SELECT verdict, measured_value, hypothesis_snapshot "
+                "FROM outcome_answers"
+            )
+        )[0]
+        assert row["verdict"] == "moved"
+        assert row["measured_value"] == "0 → 5"
+        assert row["hypothesis_snapshot"] is None
+    finally:
+        await conn.close()

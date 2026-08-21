@@ -27,6 +27,7 @@ from typing import Any
 
 from hub import config
 from hub import repository as repo
+from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
 from hub.models import (
     ACLocatorResolution,
@@ -341,6 +342,7 @@ async def build_review_brief(
         outcome_indicator=task_view.outcome_indicator,
         outcome_deadline=task_view.outcome_deadline,
         outcome_revisit_condition=task_view.outcome_revisit_condition,
+        outcome_status=await outcome_status_for_task(db, task_row),
         redesign_decision=task_view.redesign_decision,
         redesign_rationale=task_view.redesign_rationale,
         agent_fit=task_view.agent_fit,
