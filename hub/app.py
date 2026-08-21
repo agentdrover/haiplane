@@ -1547,6 +1547,18 @@ async def api_record_deploy(
         status=body.status,
         source=identity.username or "ci",
     )
+    # #883: bring the deployed commit into the workspace now, once per deploy,
+    # instead of on every card render. Best-effort by contract: the rollout has
+    # already happened, and failing this callback would report it as not having
+    # happened. A missed fetch degrades to "could not check" on read, which is
+    # a state the hub says out loud.
+    try:
+        from hub.services.delivery_state import ensure_commit_available
+
+        await ensure_commit_available(db, body.sha, body.ref, project_id=project_id)
+    except Exception:  # noqa: BLE001 - never break the callback over a fetch
+        log.warning("could not pre-fetch deployed commit %s", body.sha[:12])
+
     row = await repo.release_by_id(db, release_id)
     if row is None:  # pragma: no cover - the row was just written
         raise HTTPException(500, "release was written but could not be read back")

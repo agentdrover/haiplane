@@ -9,9 +9,12 @@ check" must never print as "not deployed".
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -122,3 +125,157 @@ async def test_card_names_the_delivery_state(
     assert "Доставка" in page
     assert "not_in_prod" in page
     assert "ждёт релиза" in page
+
+
+# ---- #883: git can only answer about objects it has ----
+#
+# Observed on prod right after #497 shipped: every card answered "could not
+# check", because the workspace tracks develop and the deployed commit — made
+# on main — was simply not there. The computation was honest and useless.
+
+
+@pytest.fixture
+def clone_missing_the_deploy(tmp_path: Path, history) -> dict[str, str]:
+    """A clone that has the merge but NOT the released commit.
+
+    Built by cloning at the older commit and leaving origin behind: exactly
+    the prod shape, where the workspace sits on one branch and the deploy came
+    from another.
+    """
+    from tests.conftest import _git_in
+
+    clone = tmp_path / "clone"
+    # Two flags, both load-bearing, both found by the precondition below
+    # failing: --single-branch, because a plain clone copies every ref; and
+    # --no-local, because a clone from a path hardlinks the WHOLE object
+    # database and the "missing" commit arrives anyway.
+    _git_in(
+        tmp_path,
+        "clone",
+        "--quiet",
+        "--no-local",
+        "--single-branch",
+        "--branch",
+        "later",
+        history["repo"],
+        str(clone),
+    )
+    return {**history, "clone": str(clone)}
+
+
+async def test_present_commit_costs_no_network(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-4 (#883): the fetch is a repair, not a routine. A workspace that
+    # already carries the commit must not pay for the network on every render.
+    _use_real_git(monkeypatch, history["repo"])
+    calls: list[str] = []
+
+    async def _refuse_to_fetch(*args, **kwargs):
+        calls.append("fetch")
+        return (False, "should not have been called")
+
+    monkeypatch.setattr(
+        plugins.git_ops, "fetch_commit", _refuse_to_fetch, raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "commit_exists",
+        GitOpsIntegration().commit_exists,
+        raising=False,
+    )
+    task_id = await _task_merged_at(client, db, history["shipped"])
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == IN_PROD
+    assert calls == [], "the commit was here — nothing should have been fetched"
+
+
+async def test_read_path_fetches_once_for_older_releases(
+    client: AsyncClient, db: aiosqlite.Connection, clone_missing_the_deploy, monkeypatch
+):
+    # AC-2 (#883): releases recorded before this task left their commit behind.
+    # One repair attempt on read turns "could not check" into a real answer.
+    workspace = clone_missing_the_deploy["clone"]
+    _use_real_git(monkeypatch, workspace)
+    real = GitOpsIntegration()
+    for name in ("commit_exists", "fetch_commit"):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(real, name), raising=False)
+    task_id = await _task_merged_at(client, db, clone_missing_the_deploy["shipped"])
+    await repo.record_release(
+        db,
+        deployed_sha=clone_missing_the_deploy["released"],
+        ref="main",
+        source="ci",
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] in (IN_PROD, NOT_IN_PROD), answer
+    assert answer["state"] == IN_PROD, "the merge is in the released history"
+
+
+async def test_failed_fetch_stays_unknown_never_denial(
+    client: AsyncClient, db: aiosqlite.Connection, clone_missing_the_deploy, monkeypatch
+):
+    # AC-3 (#883): no network, no answer — and "no answer" must never be
+    # spelled "not deployed". This is the same line #839 and #497 hold.
+    workspace = clone_missing_the_deploy["clone"]
+    _use_real_git(monkeypatch, workspace)
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "commit_exists",
+        GitOpsIntegration().commit_exists,
+        raising=False,
+    )
+
+    async def _no_network(*args, **kwargs):
+        return (False, "origin unreachable")
+
+    monkeypatch.setattr(plugins.git_ops, "fetch_commit", _no_network, raising=False)
+    task_id = await _task_merged_at(client, db, clone_missing_the_deploy["shipped"])
+    await repo.record_release(
+        db,
+        deployed_sha=clone_missing_the_deploy["released"],
+        ref="main",
+        source="ci",
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == UNKNOWN
+    assert "подтянуть" in answer["reason"]
+    assert "origin unreachable" in answer["reason"], "the cause travels to the reader"
+
+
+async def test_recording_a_deploy_fetches_its_commit(
+    db: aiosqlite.Connection, clone_missing_the_deploy, monkeypatch
+):
+    # AC-1 (#883): the repair happens once per deploy, where the deploy is
+    # recorded — not once per card render.
+    from hub.services.delivery_state import ensure_commit_available
+
+    workspace = clone_missing_the_deploy["clone"]
+    real = GitOpsIntegration()
+    for name in ("commit_exists", "fetch_commit"):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(real, name), raising=False)
+    # The in-memory database has no seeded project, so the row is created
+    # rather than updated: an UPDATE that matches nothing fails silently and
+    # the helper would answer "no workspace" for a reason unrelated to fetching.
+    await db.execute(
+        "INSERT INTO projects (slug, name, workspace_path) VALUES (?, ?, ?) "
+        "ON CONFLICT(slug) DO UPDATE SET workspace_path = excluded.workspace_path",
+        ("default", "Default", workspace),
+    )
+    await db.commit()
+    released = clone_missing_the_deploy["released"]
+    assert await real.commit_exists(workspace, released) is False, (
+        "fixture precondition"
+    )
+
+    assert await ensure_commit_available(db, released, "main") is True
+    assert await real.commit_exists(workspace, released) is True

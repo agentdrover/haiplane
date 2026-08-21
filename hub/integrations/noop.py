@@ -187,6 +187,12 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def fetch_commit(
+        self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
+    ) -> tuple[bool, str]:
+        """No git here — nothing is fetched, and the caller must say so (#883)."""
+        return (False, "git integration is not configured")
+
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
         never as "clean" (#534)."""

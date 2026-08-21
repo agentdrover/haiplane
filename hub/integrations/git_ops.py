@@ -1021,6 +1021,41 @@ class GitOpsIntegration:
         rc, _, err = await _git("fetch", "origin", base, repo=repo, check=False)
         return (rc == 0, err or "")
 
+    async def fetch_commit(
+        self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
+    ) -> tuple[bool, str]:
+        """Bring one commit's objects into ``repo`` (#883). Objects ONLY.
+
+        No checkout, no reset, no HEAD movement: pair tasks and their worktrees
+        live in this same clone, and moving its working tree to answer a
+        question about history would break work in progress.
+
+        Two attempts, because servers differ: fetching a bare sha is allowed
+        only when ``uploadpack.allowReachableSHA1InWant`` is on, so a refusal
+        falls back to the ref the deploy reported. Failure is returned, never
+        raised — the caller degrades to "could not check", which must stay
+        distinguishable from "not deployed".
+        """
+        rc, _, err = await _git(
+            "fetch", "--quiet", "origin", sha, repo=repo, check=False, timeout=timeout
+        )
+        if rc == 0:
+            return (True, "")
+        if ref:
+            rc, _, err_ref = await _git(
+                "fetch",
+                "--quiet",
+                "origin",
+                ref,
+                repo=repo,
+                check=False,
+                timeout=timeout,
+            )
+            if rc == 0:
+                return (True, "")
+            return (False, (err_ref or err or "").strip())
+        return (False, (err or "").strip())
+
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         """Commits on the base's own line, newest first, or None on failure.
 
