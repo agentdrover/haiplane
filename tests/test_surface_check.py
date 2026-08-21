@@ -210,3 +210,27 @@ async def test_submit_distinguishes_empty_diff_from_unreadable(
         "an unreadable diff must name itself as unreadable"
     )
     assert empty_note != unreadable_note
+
+
+async def test_surfaces_default_mode_stays_warn(monkeypatch) -> None:
+    """#854: tightening is an installation's decision, never a new default.
+
+    The check has been in ``warn`` since #550, and the measurement behind #854
+    is why that stays: over the 30 days to 2026-08-21, 46 of 104 checkable
+    submissions (44%) would have been refused rather than alerted. A default
+    that refuses two submissions in five is not a default — it is a migration,
+    and it belongs to whoever runs the installation, switched on through the
+    environment with the number in hand.
+    """
+    import importlib
+    import os
+
+    monkeypatch.delenv("OPENCLAW_SDD_SURFACES", raising=False)
+    fresh = importlib.reload(config)
+    try:
+        assert fresh.SDD_SURFACES == "warn"
+    finally:
+        # Leave the module as the rest of the suite expects to find it.
+        if "OPENCLAW_SDD_SURFACES" in os.environ:
+            del os.environ["OPENCLAW_SDD_SURFACES"]
+        importlib.reload(config)
