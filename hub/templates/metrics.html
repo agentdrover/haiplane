@@ -13,7 +13,13 @@ latency и размер ответов — на отдельной страни�
 <h2>Machine reviews</h2>
 <table class="task-table">
     <tbody>
-        <tr><td>Reviews</td><td>{{ m.machine_reviews.reviews }}</td></tr>
+        <tr><td>Отчётов всего</td><td>{{ m.machine_reviews.reports_total }}</td></tr>
+        <tr><td>Reviews <span class="muted">(с данными)</span></td>
+            <td>{{ m.machine_reviews.reviews }}</td></tr>
+        <tr><td>Без данных
+            <span class="muted">(ноль кандидатов, ноль находок, ноль токенов —
+            отчёт есть, исполнения не видно)</span></td>
+            <td>{% if m.machine_reviews.no_data_reports %}{{ m.machine_reviews.no_data_reports }} из {{ m.machine_reviews.reports_total }}{% else %}—{% endif %}</td></tr>
         <tr><td>Findings: raw → confirmed / rejected</td>
             <td>{{ m.machine_reviews.raw_total }} → {{ m.machine_reviews.confirmed_total }} / {{ m.machine_reviews.rejected_total }}</td></tr>
         <tr><td>Filtration rate (отсев шума)</td>
@@ -93,12 +99,14 @@ first-pass от того, что её одобрили следом.</p>
 самого себя; «не заявлен» значит, что за отчётом не стояло диспетчера, и это
 не то же самое, что дешёвый прогон.</p>
 <table class="task-table">
-    <thead><tr><th>Профиль</th><th>Прогонов</th><th>Raw</th><th>Confirmed</th>
-        <th>Tokens</th><th>Неполных</th></tr></thead>
+    <thead><tr><th>Профиль</th><th>Прогонов</th><th>Без данных</th><th>Raw</th>
+        <th>Confirmed</th><th>Tokens</th><th>Неполных</th></tr></thead>
     <tbody>
         {% for pr in m.by_profile %}
         <tr>
-            <td>{{ pr.profile }}</td><td>{{ pr.reviews }}</td><td>{{ pr.raw_total }}</td>
+            <td>{{ pr.profile }}</td><td>{{ pr.reviews }}</td>
+            <td>{% if pr.no_data_reports %}{{ pr.no_data_reports }}{% else %}—{% endif %}</td>
+            <td>{{ pr.raw_total }}</td>
             <td>{{ pr.confirmed_total }}</td><td>{{ pr.tokens_total }}</td>
             <td>{% if pr.incomplete_runs %}{{ pr.incomplete_runs }}{% else %}—{% endif %}</td>
         </tr>
@@ -108,12 +116,15 @@ first-pass от того, что её одобрили следом.</p>
 
 <h2>By harness version</h2>
 <table class="task-table">
-    <thead><tr><th>Harness</th><th>Reviews</th><th>Raw</th><th>Confirmed</th><th>Tokens</th></tr></thead>
+    <thead><tr><th>Harness</th><th>Reviews</th><th>Без данных</th><th>Raw</th>
+        <th>Confirmed</th><th>Tokens</th></tr></thead>
     <tbody>
         {% for h in m.by_harness %}
         <tr>
             <td>{{ h.harness_skill or '—' }}{% if h.harness_version %} v{{ h.harness_version }}{% endif %}</td>
-            <td>{{ h.reviews }}</td><td>{{ h.raw_total }}</td><td>{{ h.confirmed_total }}</td><td>{{ h.tokens_total }}</td>
+            <td>{{ h.reviews }}</td>
+            <td>{% if h.no_data_reports %}{{ h.no_data_reports }}{% else %}—{% endif %}</td>
+            <td>{{ h.raw_total }}</td><td>{{ h.confirmed_total }}</td><td>{{ h.tokens_total }}</td>
         </tr>
         {% endfor %}
     </tbody>

@@ -181,9 +181,53 @@ jobs:
             "$DEPLOY_USER@$DEPLOY_HOST:~/openclaw-hub-src-staging/"
 
       - name: Deploy and health check
+        id: rollout
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           ssh -i "$HOME/.ssh/id_deploy" -o BatchMode=yes \
             "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh
+
+      # #496: tell the Hub what is now running. Until this step existed the
+      # Hub knew only when it MERGED something and read that as delivery — on
+      # 21.08.2026 a task sat completed while this very job was skipped,
+      # because deployment runs from main and the merge went to develop.
+      #
+      # always(): a rollout that FAILED is a fact too. Reporting successes
+      # only would show the Hub a pipeline that never breaks.
+      #
+      # continue-on-error: a red job here would say the deploy did not happen,
+      # when it did — the reporting failed, not the rollout. Silence is not the
+      # alternative: the failure is printed, and the Hub reads a missing record
+      # as "unknown" rather than as "not deployed" (#839).
+      - name: Report deploy to Hub
+        if: always()
+        continue-on-error: true
+        env:
+          OPENCLAW_HUB_URL: ${{ secrets.OPENCLAW_HUB_URL }}
+          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          ROLLOUT_OUTCOME: ${{ steps.rollout.outcome }}
+          DEPLOYED_SHA: ${{ github.sha }}
+          DEPLOYED_REF: ${{ github.ref_name }}
+        run: |
+          if [ -z "$OPENCLAW_HUB_URL" ] || [ -z "$OPENCLAW_HUB_CI_TOKEN" ]; then
+            echo "::notice::Hub secrets absent — deploy not reported (fork or clone)"
+            exit 0
+          fi
+          if [ "$ROLLOUT_OUTCOME" = "success" ]; then
+            STATUS=success
+          else
+            STATUS=failed
+          fi
+          code=$(curl -sS -o /tmp/deploy-callback.out -w '%{http_code}' \
+            -X POST "$OPENCLAW_HUB_URL/api/deploys" \
+            -H "Authorization: Bearer $OPENCLAW_HUB_CI_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\"}" \
+          ) || code=000
+          if [ "$code" != "200" ]; then
+            echo "::warning::Hub did not record the deploy (HTTP $code): $(cat /tmp/deploy-callback.out)"
+            exit 0
+          fi
+          echo "Deploy reported to Hub: $DEPLOYED_SHA ($STATUS)"
