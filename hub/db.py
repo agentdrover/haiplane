@@ -889,6 +889,49 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_agent_messages_address "
         "ON agent_messages(to_kind, to_ref, id)",
     ),
+    (
+        # MCP usage telemetry (#780, epic #776): what every Agent API call
+        # cost and how it ended, so the core surface is chosen from data
+        # instead of taste.
+        #
+        # The privacy property is the shape of this table, not a rule someone
+        # remembers to follow: there is no column an argument value, a token,
+        # a message body or a response payload could be written into. A leak
+        # here would have to be an ALTER TABLE, which a review can see, rather
+        # than one careless call site nobody reads again.
+        #
+        # task_id is the single exception to "no argument values" and it is
+        # INTEGER for exactly that reason — a task reference is the one piece
+        # of routing worth having in a usage report, and a number cannot carry
+        # a secret. error_reason holds a slug produced by the hub itself
+        # (validated at the call site), never an error message, which is where
+        # argument values would otherwise surface.
+        #
+        # principal_id is a plain INTEGER with no FK for the same
+        # identity-snapshot reason agent_sessions gives: the record of a call
+        # must outlive the key that made it.
+        "create_mcp_call_events",
+        """CREATE TABLE IF NOT EXISTS mcp_call_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool           TEXT    NOT NULL,
+            profile        TEXT    NOT NULL DEFAULT 'v1',
+            principal_id   INTEGER,
+            principal_role TEXT    NOT NULL DEFAULT '',
+            status         TEXT    NOT NULL DEFAULT 'ok',
+            error_reason   TEXT    NOT NULL DEFAULT '',
+            latency_ms     INTEGER NOT NULL DEFAULT 0,
+            response_chars INTEGER NOT NULL DEFAULT 0,
+            task_id        INTEGER,
+            created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # The report always reads a time window first and groups by tool
+        # second, so the index leads with created_at.
+        "idx_mcp_call_events_window",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_call_events_window "
+        "ON mcp_call_events(created_at, tool)",
+    ),
 ]
 
 

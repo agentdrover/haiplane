@@ -2600,3 +2600,160 @@ async def list_recent_threads(
             (min(limit, 50),),
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# MCP usage telemetry (#780)
+# ---------------------------------------------------------------------------
+
+# The full write surface of the telemetry table. Both the INSERT below and the
+# redaction test read this tuple, so a column added to the schema without a
+# deliberate decision here writes nothing, and a column added here without a
+# schema change fails loudly at the first call.
+MCP_CALL_EVENT_COLUMNS: tuple[str, ...] = (
+    "tool",
+    "profile",
+    "principal_id",
+    "principal_role",
+    "status",
+    "error_reason",
+    "latency_ms",
+    "response_chars",
+    "task_id",
+)
+
+
+async def insert_mcp_call_event(
+    db: aiosqlite.Connection,
+    *,
+    tool: str,
+    profile: str,
+    principal_id: int | None,
+    principal_role: str,
+    status: str,
+    error_reason: str,
+    latency_ms: int,
+    response_chars: int,
+    task_id: int | None,
+) -> int:
+    """Append one call record. One INSERT, no read-back, no aggregation.
+
+    This runs inside every MCP call, so it stays the cheapest write in the
+    codebase: the moment measuring the Agent API makes the Agent API slower,
+    the measurement starts changing what it measures.
+    """
+    cur = await db.execute(
+        "INSERT INTO mcp_call_events "
+        "(tool, profile, principal_id, principal_role, status, error_reason, "
+        " latency_ms, response_chars, task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            tool,
+            profile,
+            principal_id,
+            principal_role,
+            status,
+            error_reason,
+            latency_ms,
+            response_chars,
+            task_id,
+        ),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+# Percentiles use the nearest-rank method: index = ceil(p/100 * n), which
+# integer division writes as (n*p + 99)/100. No interpolation, so every value
+# reported is a latency that actually happened — an averaged p95 nobody
+# observed is a worse answer than a real one from a small sample.
+_MCP_USAGE_SQL = """
+WITH win AS (
+    SELECT tool, profile, principal_id, status, latency_ms, response_chars
+    FROM mcp_call_events
+    WHERE created_at >= datetime('now', :since)
+),
+agg AS (
+    SELECT tool,
+           COUNT(*)                                             AS calls,
+           COUNT(DISTINCT COALESCE(principal_id, -1))           AS principals,
+           SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END)       AS ok_calls,
+           SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END)      AS error_calls,
+           SUM(response_chars)                                  AS total_chars
+    FROM win GROUP BY tool
+),
+ranked AS (
+    SELECT tool,
+           latency_ms,
+           response_chars,
+           ROW_NUMBER() OVER (PARTITION BY tool ORDER BY latency_ms)     AS lat_rank,
+           ROW_NUMBER() OVER (PARTITION BY tool ORDER BY response_chars) AS size_rank,
+           COUNT(*)    OVER (PARTITION BY tool)                          AS n
+    FROM win
+),
+pct AS (
+    SELECT tool,
+           MAX(CASE WHEN lat_rank  = (n * 50 + 99) / 100 THEN latency_ms     END) AS p50_latency_ms,
+           MAX(CASE WHEN lat_rank  = (n * 95 + 99) / 100 THEN latency_ms     END) AS p95_latency_ms,
+           MAX(CASE WHEN size_rank = (n * 50 + 99) / 100 THEN response_chars END) AS p50_response_chars,
+           MAX(CASE WHEN size_rank = (n * 95 + 99) / 100 THEN response_chars END) AS p95_response_chars
+    FROM ranked GROUP BY tool
+)
+SELECT agg.tool, agg.calls, agg.principals, agg.ok_calls, agg.error_calls,
+       agg.total_chars, pct.p50_latency_ms, pct.p95_latency_ms,
+       pct.p50_response_chars, pct.p95_response_chars
+FROM agg JOIN pct ON pct.tool = agg.tool
+ORDER BY agg.calls DESC, agg.tool ASC
+"""
+
+
+async def mcp_usage_by_tool(
+    db: aiosqlite.Connection, *, window_days: int
+) -> list[dict[str, Any]]:
+    """Per-tool usage, error and cost rows for the window. Read path only."""
+    rows = await db.execute_fetchall(
+        _MCP_USAGE_SQL, {"since": f"-{int(window_days)} days"}
+    )
+    return [dict(row) for row in rows]
+
+
+async def mcp_usage_by_profile(
+    db: aiosqlite.Connection, *, window_days: int
+) -> list[dict[str, Any]]:
+    """Per-profile totals for the window: the cost of a surface, not a tool."""
+    rows = await db.execute_fetchall(
+        "SELECT profile, COUNT(*) AS calls, "
+        "COUNT(DISTINCT tool) AS tools, "
+        "COUNT(DISTINCT COALESCE(principal_id, -1)) AS principals, "
+        "SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_calls, "
+        "SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS error_calls, "
+        "SUM(response_chars) AS total_chars "
+        "FROM mcp_call_events WHERE created_at >= datetime('now', ?) "
+        "GROUP BY profile ORDER BY calls DESC",
+        (f"-{int(window_days)} days",),
+    )
+    return [dict(row) for row in rows]
+
+
+async def mcp_usage_errors(
+    db: aiosqlite.Connection, *, window_days: int, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Top error reasons in the window, by tool. Slugs only — never messages."""
+    rows = await db.execute_fetchall(
+        "SELECT tool, error_reason, COUNT(*) AS calls "
+        "FROM mcp_call_events "
+        "WHERE created_at >= datetime('now', ?) AND status <> 'ok' "
+        "GROUP BY tool, error_reason ORDER BY calls DESC, tool ASC LIMIT ?",
+        (f"-{int(window_days)} days", int(limit)),
+    )
+    return [dict(row) for row in rows]
+
+
+async def prune_mcp_call_events(
+    db: aiosqlite.Connection, *, keep_days: int = 120
+) -> int:
+    """Delete call records older than ``keep_days``. Returns rows removed."""
+    cur = await db.execute(
+        "DELETE FROM mcp_call_events WHERE created_at < datetime('now', ?)",
+        (f"-{keep_days} days",),
+    )
+    return cur.rowcount or 0

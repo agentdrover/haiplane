@@ -33,7 +33,12 @@ from hub.actionable_errors import (
     withdraw_agent_only_detail,
 )
 from hub.config import TokenIdentity
-from hub.mcp_internal_auth import bearer_context_reset, bearer_context_set
+from hub.mcp_internal_auth import (
+    bearer_context_reset,
+    bearer_context_set,
+    identity_context_reset,
+    identity_context_set,
+)
 
 log = logging.getLogger("hub.auth")
 
@@ -250,6 +255,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         path = request.url.path
         mcp_ctx: Any = None
+        identity_ctx: Any = None
         if path.startswith("/mcp"):
             br = _extract_bearer(request)
             if br:
@@ -272,10 +278,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 return _unauthorized(request)
             request.state.user = identity.username
             request.state.identity = identity
+            if path.startswith("/mcp"):
+                # Usage telemetry (#780) names the caller by principal and
+                # role. It is set here, where the identity is already
+                # resolved, rather than re-resolved inside the MCP layer —
+                # two places deciding who the caller is eventually disagree.
+                identity_ctx = identity_context_set(
+                    identity.principal_id, identity.role
+                )
             return await call_next(request)
         finally:
             if mcp_ctx is not None:
                 bearer_context_reset(mcp_ctx)
+            if identity_ctx is not None:
+                identity_context_reset(identity_ctx)
 
 
 def _unauthorized(request: Request) -> Response:

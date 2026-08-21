@@ -193,6 +193,23 @@ MESSAGE_MAX_CHARS = int(os.environ.get("OPENCLAW_MESSAGE_MAX_CHARS", "4000"))
 MESSAGE_RATE_PER_MINUTE = int(os.environ.get("OPENCLAW_MESSAGE_RATE_PER_MINUTE", "30"))
 MESSAGE_RETENTION_DAYS = int(os.environ.get("OPENCLAW_MESSAGE_RETENTION_DAYS", "14"))
 
+# MCP usage telemetry (#780, epic #776): the Agent API cannot be trimmed by
+# taste. What every knob below protects is the same property — the record is
+# metadata about a call, never its content. Retention is longer than the
+# longest report window on purpose: a 90-day report drawn from a 90-day
+# horizon is always missing its own oldest edge while looking complete.
+MCP_TELEMETRY_ENABLED = os.environ.get("OPENCLAW_MCP_TELEMETRY", "1") != "0"
+MCP_TELEMETRY_RETENTION_DAYS = int(
+    os.environ.get("OPENCLAW_MCP_TELEMETRY_RETENTION_DAYS", "120")
+)
+MCP_TELEMETRY_MAX_WINDOW_DAYS = int(
+    os.environ.get("OPENCLAW_MCP_TELEMETRY_MAX_WINDOW_DAYS", "90")
+)
+# Which Agent API surface answered the call. One value today; feature B (#778)
+# splits it into core/extension profiles, and the reports built here are what
+# decides where the line falls.
+MCP_PROFILE = os.environ.get("OPENCLAW_MCP_PROFILE", "v1")
+
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
 PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 

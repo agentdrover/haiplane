@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% set active = "metrics" %}
+{% block title %}Agent API usage — OpenClaw Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Agent API usage <span class="badge badge-review">last {{ u.window_days }}d</span></h1>
+</header>
+
+<p class="muted">Окна: <a href="/metrics/agent-api?window_days=14">14</a> ·
+    <a href="/metrics/agent-api?window_days=30">30</a> ·
+    <a href="/metrics/agent-api?window_days=90">90</a> дней.
+    Хранение — {{ u.retention_days }} дней, дольше самого длинного окна: отчёт за
+    90 дней не должен молча собираться из 90 дней минус то, что уже удалено.
+    {% if not u.enabled %}<strong>Телеметрия выключена</strong> (OPENCLAW_MCP_TELEMETRY=0) —
+    цифры ниже относятся к тому, что успело записаться.{% endif %}</p>
+
+<h2>Итого</h2>
+<table class="task-table">
+    <tbody>
+        <tr><td>Вызовов</td><td>{{ u.totals.calls }}</td></tr>
+        <tr><td>Инструментов вызвано / опубликовано</td>
+            <td>{{ u.totals.tools_used }} из {{ u.published_tools or '—' }}</td></tr>
+        <tr><td>Уникальных вызывающих</td><td>{{ u.totals.principals }}</td></tr>
+        <tr><td>Ошибки</td>
+            <td>{{ u.totals.error_calls }} ({{ (u.totals.error_rate * 100) | round(1) }}%)</td></tr>
+        <tr><td>Размер ответов, символов</td>
+            <td>{{ u.totals.response_chars }} (в среднем {{ u.totals.avg_response_chars }} на вызов)</td></tr>
+    </tbody>
+</table>
+
+{% if u.catalog %}
+<h2>Каталог: постоянный налог</h2>
+<p class="muted">Это то, что агент платит до первого вызова: описания и схемы всех
+инструментов плюс инструкция сервера, которую клиент повторяет для каждого
+инструмента. Бюджет заморожен в <code>docs/agent-context/mcp-catalog-budget.json</code>
+и проверяется в CI.</p>
+<table class="task-table">
+    <tbody>
+        <tr><td>Инструментов</td><td>{{ u.catalog.tools }}</td></tr>
+        <tr><td>Описания / схемы</td>
+            <td>{{ u.catalog.description_chars }} / {{ u.catalog.schema_chars }}</td></tr>
+        <tr><td>Инструкция × инструменты</td>
+            <td>{{ u.catalog.instruction_chars }} × {{ u.catalog.tools }} =
+                {{ u.catalog.duplicated_instruction_chars }}</td></tr>
+        <tr><td>Видно модели, символов</td><td>{{ u.catalog.model_visible_chars }}</td></tr>
+    </tbody>
+</table>
+{% endif %}
+
+<h2>По инструментам</h2>
+<table class="task-table">
+    <thead><tr><th>Tool</th><th>Вызовов</th><th>Вызывающих</th><th>Ошибки</th>
+        <th>p50 / p95 latency, ms</th><th>p50 / p95 ответа, символов</th></tr></thead>
+    <tbody>
+        {% for t in u.by_tool %}
+        <tr>
+            <td>{{ t.tool }}</td>
+            <td>{{ t.calls }}</td>
+            <td>{{ t.principals }}</td>
+            <td>{% if t.error_calls %}{{ t.error_calls }} ({{ (t.error_rate * 100) | round(1) }}%){% else %}—{% endif %}</td>
+            <td>{{ t.p50_latency_ms }} / {{ t.p95_latency_ms }}</td>
+            <td>{{ t.p50_response_chars }} / {{ t.p95_response_chars }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">За окно вызовов не записано.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>По профилям</h2>
+<table class="task-table">
+    <thead><tr><th>Profile</th><th>Вызовов</th><th>Инструментов</th><th>Ошибки</th>
+        <th>Символов</th></tr></thead>
+    <tbody>
+        {% for p in u.by_profile %}
+        <tr><td>{{ p.profile }}</td><td>{{ p.calls }}</td><td>{{ p.tools }}</td>
+            <td>{{ p.error_calls }} ({{ (p.error_rate * 100) | round(1) }}%)</td>
+            <td>{{ p.total_chars }}</td></tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">Нет данных.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Частые причины отказов</h2>
+<p class="muted">Хранится только слаг причины, который хаб выдал сам. Ни аргументов,
+ни текста сообщения: сообщение об ошибке — это как раз то место, где всплывают
+значения аргументов.</p>
+<table class="task-table">
+    <thead><tr><th>Tool</th><th>Reason</th><th>Вызовов</th></tr></thead>
+    <tbody>
+        {% for e in u.top_errors %}
+        <tr><td>{{ e.tool }}</td><td>{{ e.error_reason or '—' }}</td><td>{{ e.calls }}</td></tr>
+        {% else %}
+        <tr><td colspan="3" class="muted">Отказов за окно нет.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Не вызывали ни разу</h2>
+<p class="muted">Инструменты, опубликованные в каталоге, но не вызванные за окно.
+Каждый из них берёт плату описанием и схемой с каждого агента на каждом ходу.</p>
+{% if u.unused_tools %}
+<p>{{ u.unused_tools | join(', ') }}</p>
+{% else %}
+<p class="muted">Все опубликованные инструменты вызывались за окно.</p>
+{% endif %}
+{% endblock %}

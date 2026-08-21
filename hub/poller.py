@@ -1027,6 +1027,21 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                     config.MESSAGE_RETENTION_DAYS,
                 )
 
+            # MCP usage telemetry retention (#780): the records answer "what
+            # does the Agent API cost now", and the horizon is deliberately
+            # longer than the longest report window so a 90-day report is
+            # never quietly drawn from 90 days minus whatever was pruned.
+            pruned_calls = await repo.prune_mcp_call_events(
+                db, keep_days=config.MCP_TELEMETRY_RETENTION_DAYS
+            )
+            if pruned_calls:
+                await db.commit()
+                log.info(
+                    "Poll: pruned %d MCP call records older than %d days",
+                    pruned_calls,
+                    config.MCP_TELEMETRY_RETENTION_DAYS,
+                )
+
         except Exception:
             log.exception("Poll error")
 

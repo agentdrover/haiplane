@@ -701,3 +701,69 @@ async def test_gate_policy_migration_preserves_projects(monkeypatch):
         assert rows[0]["gate_policy"] == "{}"
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# MCP usage telemetry (#780)
+# ---------------------------------------------------------------------------
+
+MCP_CALL_EVENT_COLUMNS = {
+    "id",
+    "tool",
+    "profile",
+    "principal_id",
+    "principal_role",
+    "status",
+    "error_reason",
+    "latency_ms",
+    "response_chars",
+    "task_id",
+    "created_at",
+}
+
+
+async def test_mcp_call_events_table_has_no_payload_column():
+    """The privacy property of #780 is the schema, not a rule to remember.
+
+    An argument value can only be stored where a column accepts one, so the
+    column list is pinned here: adding somewhere to put a request body would
+    have to fail this test first.
+    """
+    conn = await _make_db()
+    try:
+        columns = await _table_columns(conn, "mcp_call_events")
+        assert set(columns) == MCP_CALL_EVENT_COLUMNS
+        assert columns["task_id"]["type"] == "INTEGER"
+        assert columns["latency_ms"]["notnull"] == 1
+        assert columns["response_chars"]["notnull"] == 1
+    finally:
+        await conn.close()
+
+
+async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
+    """An existing hub upgrades into the same schema a new one is born with."""
+    fresh = await _make_db()
+    upgraded = await _make_db()
+    try:
+        # An older database: no telemetry table and no record of the migration.
+        await upgraded.execute("DROP TABLE mcp_call_events")
+        await upgraded.execute(
+            "DELETE FROM _migrations WHERE name IN "
+            "('create_mcp_call_events', 'idx_mcp_call_events_window')"
+        )
+        await upgraded.commit()
+
+        await _migrate(upgraded)
+        await _migrate(upgraded)  # second run must change nothing
+
+        assert await _table_columns(upgraded, "mcp_call_events") == (
+            await _table_columns(fresh, "mcp_call_events")
+        )
+        indexes = await upgraded.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+            ("mcp_call_events",),
+        )
+        assert "idx_mcp_call_events_window" in {row["name"] for row in indexes}
+    finally:
+        await fresh.close()
+        await upgraded.close()
