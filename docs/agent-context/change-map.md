@@ -27,7 +27,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 - Changing task row fields usually means touching both migration logic in `hub/db.py` and serialization/deserialization paths.
 - Changing DoR or readiness logic can break approval behavior even if the API schema stays the same.
 - Changing plugin protocols is a cross-cutting contract change; inspect noop and real adapters together.
-- Editing a tool docstring or adding a parameter changes the published `tools/list` and can breach the catalog budget (#780). CI runs `uv run python scripts/mcp_catalog_budget.py`; re-freeze deliberately with `--update` and say why in the change.
+- Editing a tool docstring or adding a parameter changes the published `tools/list` and eats headroom under the catalog ceiling (#780, #829). CI runs `uv run python scripts/mcp_catalog_budget.py` and prints how much headroom is left. Ordinary delivery fits under the ceiling and must NOT touch `mcp-catalog-budget.json` — that file is edited only when the ceiling itself is being raised (`--update`), with the reason stated.
 
 ## Safe Read Order
 

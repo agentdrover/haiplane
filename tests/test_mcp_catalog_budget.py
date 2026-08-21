@@ -141,6 +141,127 @@ async def test_typo_in_a_budget_key_is_a_failure_not_a_silent_no_op():
     assert "never applied" in format_report(result)
 
 
+def test_report_names_remaining_headroom():
+    """AC-3 (#829): slack nobody watches is how a check stops checking.
+
+    The report says how much of the declared headroom has been spent, not how
+    full the ceiling is: with a 10% ceiling a healthy catalog sits at ~91% of
+    it from the first run, and a warning that fires on day one is a warning
+    everyone learns to skip.
+    """
+    snapshot = _fake_catalog({"hub_a": 100, "hub_b": 100})
+    measured = {key: snapshot[key] for key in BUDGET_KEYS}
+    ceilings = {key: int(value * 1.5) for key, value in measured.items()}
+
+    fresh = check_budget(snapshot, ceilings, {}, measured)
+    rows = {row["metric"]: row for row in fresh["headroom"]}
+    assert fresh["ok"]
+    assert all(row["used_pct"] == 0.0 for row in rows.values())
+    assert rows["tools"]["remaining"] == ceilings["tools"] - measured["tools"]
+    report = format_report(fresh)
+    assert "of headroom spent" in report
+    assert "⚠" not in report
+
+    # The slack spent down to the ceiling: still green, and the report says so
+    # out loud instead of waiting for the next change to turn red.
+    grown = _fake_catalog({"hub_a": 100, "hub_b": 100, "hub_c": 100})
+    eaten = check_budget(grown, ceilings, {}, measured)
+    assert eaten["ok"]
+    tools_row = {row["metric"]: row for row in eaten["headroom"]}["tools"]
+    assert tools_row["used_pct"] == 100.0
+    assert "⚠" in format_report(eaten)
+    assert "Headroom nearly gone" in format_report(eaten)
+
+
+def test_headroom_without_a_recorded_baseline_says_so_instead_of_guessing():
+    """An older budget file has no `measured`; the report must not invent it."""
+    snapshot = _fake_catalog({"hub_a": 100})
+    ceilings = {key: snapshot[key] * 2 for key in BUDGET_KEYS}
+
+    result = check_budget(snapshot, ceilings, {}, None)
+
+    assert all(row["used_pct"] is None for row in result["headroom"])
+    assert "no baseline" in format_report(result)
+
+
+def test_two_tool_adding_branches_merge_without_conflict(tmp_path: Path):
+    """AC-1 (#829): the budget file stops serializing parallel branches.
+
+    Reproduces the incident from #815 in miniature: two branches off one
+    commit, each adding a tool. Under an exact freeze both had to rewrite the
+    ceilings and the merge conflicted every time. Under a ceiling with
+    headroom neither branch touches the file, so there is nothing to conflict
+    over — and the merged catalog still passes the check without a manual
+    edit.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+
+    base_catalog = _fake_catalog({"hub_a": 100, "hub_b": 100})
+    measured = {key: base_catalog[key] for key in BUDGET_KEYS}
+    budget_file = repo / "budget.json"
+    budget_file.write_text(
+        json.dumps(
+            {
+                "measured_at": "2026-08-21",
+                "headroom_pct": 100.0,
+                "measured": measured,
+                "budgets": {key: value * 2 for key, value in measured.items()},
+                "baseline_tools": {
+                    entry["name"]: entry["total_chars"]
+                    for entry in base_catalog["tools_list"]
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (repo / "tools.txt").write_text("hub_a\nhub_b\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+
+    # Each branch delivers a tool. Neither has any reason to touch the budget:
+    # the new tool fits under the ceiling.
+    git("checkout", "-q", "-b", "branch-a")
+    (repo / "tools.txt").write_text("hub_a\nhub_b\nhub_new_a\n", encoding="utf-8")
+    git("commit", "-qam", "add hub_new_a")
+
+    git("checkout", "-q", "main")
+    git("checkout", "-q", "-b", "branch-b")
+    (repo / "tools.txt").write_text("hub_a\nhub_b\nhub_new_b\n", encoding="utf-8")
+    git("commit", "-qam", "add hub_new_b")
+
+    merge = subprocess.run(
+        ["git", "merge", "branch-a", "-m", "merge"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert merge.returncode == 0 or "budget.json" not in merge.stdout + merge.stderr
+    assert "budget.json" not in git("status", "--porcelain")
+
+    # And the merged surface — both new tools — is still inside the ceilings,
+    # so nobody has to edit the file after the merge either.
+    merged = _fake_catalog(
+        {"hub_a": 100, "hub_b": 100, "hub_new_a": 20, "hub_new_b": 20}
+    )
+    doc = json.loads(budget_file.read_text(encoding="utf-8"))
+    result = check_budget(
+        merged, doc["budgets"], doc["baseline_tools"], doc["measured"]
+    )
+    assert result["ok"], format_report(result)
+
+
 @pytest.mark.parametrize("flag", ["--json", ""])
 def test_ci_script_exits_zero_on_the_committed_budget(flag: str):
     args = [sys.executable, str(SCRIPT)] + ([flag] if flag else [])

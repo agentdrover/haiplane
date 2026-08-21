@@ -27,17 +27,27 @@ assumed is still reported as
 it, but the field costs nothing and a third client is not obliged to behave
 like the two that were measured.
 
-Two more decisions matter here:
+Three more decisions matter here:
+
+* **A budget is a ceiling with declared headroom, not an exact freeze
+  (#829).** An exact freeze meant every task that added a tool had to edit
+  this one file, so any two such branches conflicted by construction — on
+  #815 that cost three resubmission rounds, none of which touched the work
+  being reviewed. A ceiling with headroom keeps the file untouched by
+  ordinary delivery, and a file nobody edits cannot serialize anybody.
+  Headroom is the price: it is declared, and every run prints how much of it
+  is left, because slack that nobody watches is how a check quietly stops
+  checking.
 
 * **The budget is measured from the real catalog, never from source.** The
   numbers come from ``tools/list`` as a client receives it, so a docstring
   edit, a new parameter and a new tool all land in the same measurement, and
   none of them can grow the surface while a source-level count stays flat.
 
-* **A budget is a decision, not a limit that drifts.** Exceeding it fails the
-  check and prints which tools moved; raising it means editing the committed
-  budget file in a reviewed change. That is the whole mechanism: growth stays
-  possible and stops being silent.
+* **A budget is a decision, not a limit that drifts.** Exceeding the ceiling
+  fails the check and prints which tools moved; raising the ceiling means
+  editing the committed budget file in a reviewed change. That is the whole
+  mechanism: growth stays possible and stops being silent.
 """
 
 from __future__ import annotations
@@ -51,6 +61,16 @@ BUDGET_PATH = HERE.parent / "docs" / "agent-context" / "mcp-catalog-budget.json"
 
 # Fields a budget file may set. Anything else is a typo, and a typo in a
 # budget file is a budget that silently never applied.
+# How much of the DECLARED HEADROOM may be eaten before the report starts
+# saying so. Measured against the headroom rather than against the ceiling on
+# purpose: with a 10% ceiling every healthy catalog sits at ~91% of it on day
+# one, so a ceiling-relative warning would fire from the first run and teach
+# everyone to ignore it. Headroom-relative starts at 0% the moment a ceiling
+# is set and answers the question that matters — how much slack has been spent
+# since someone last decided. Not a failure: the point is to see it going
+# while there is still time to choose.
+HEADROOM_WARN_PCT = 75.0
+
 BUDGET_KEYS: tuple[str, ...] = (
     "tools",
     "description_chars",
@@ -130,8 +150,30 @@ def load_budget(path: Path | None = None) -> dict[str, Any]:
     return budgets if isinstance(budgets, dict) else {}
 
 
+def load_measured(path: Path | None = None) -> dict[str, int]:
+    """The catalog as it was when the ceilings were set (#829).
+
+    Without it a report can still say how much room is left, but not how much
+    of the slack has been spent — and the second number is the one that says
+    whether anybody needs to act.
+    """
+    target = path or BUDGET_PATH
+    if not target.exists():
+        return {}
+    data = json.loads(target.read_text(encoding="utf-8"))
+    measured = data.get("measured") if isinstance(data, dict) else None
+    if not isinstance(measured, dict):
+        return {}
+    return {str(key): int(value) for key, value in measured.items()}
+
+
 def load_baseline(path: Path | None = None) -> dict[str, int]:
-    """Per-tool sizes recorded with the budget, for the diff on a breach."""
+    """Per-tool sizes at the LAST deliberate freeze, for the diff on a breach.
+
+    Not a snapshot of every commit: ordinary delivery no longer touches this
+    file (#829), so the diff answers "what has moved since someone last
+    decided the ceiling" — which is the question a breach actually raises.
+    """
     target = path or BUDGET_PATH
     if not target.exists():
         return {}
@@ -146,6 +188,7 @@ def check_budget(
     snapshot: dict[str, Any],
     budgets: dict[str, Any],
     baseline: dict[str, int] | None = None,
+    measured: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Compare a snapshot against the budget and say what moved.
 
@@ -155,20 +198,40 @@ def check_budget(
     author.
     """
     breaches: list[dict[str, Any]] = []
+    headroom: list[dict[str, Any]] = []
     for key in BUDGET_KEYS:
         limit = budgets.get(key)
         if limit is None:
             continue
         actual = int(snapshot.get(key, 0))
-        if actual > int(limit):
+        ceiling = int(limit)
+        if actual > ceiling:
             breaches.append(
                 {
                     "metric": key,
-                    "budget": int(limit),
+                    "budget": ceiling,
                     "actual": actual,
-                    "over_by": actual - int(limit),
+                    "over_by": actual - ceiling,
                 }
             )
+        # Reported whether or not anything breached: headroom bought the
+        # mergeability, and the only thing that keeps it honest is seeing it
+        # shrink (#829).
+        base = (measured or {}).get(key)
+        span = ceiling - int(base) if base is not None else 0
+        used_pct = (
+            round(100 * max(0, actual - int(base)) / span, 1) if span > 0 else None
+        )
+        headroom.append(
+            {
+                "metric": key,
+                "actual": actual,
+                "ceiling": ceiling,
+                "measured": int(base) if base is not None else None,
+                "remaining": ceiling - actual,
+                "used_pct": used_pct,
+            }
+        )
 
     unknown = sorted(set(budgets) - set(BUDGET_KEYS))
     current = {
@@ -194,6 +257,7 @@ def check_budget(
     return {
         "ok": not breaches and not unknown,
         "breaches": breaches,
+        "headroom": headroom,
         "unknown_budget_keys": unknown,
         "tool_diff": diff,
         "snapshot": {
@@ -231,6 +295,28 @@ def format_report(result: dict[str, Any], *, limit: int = 15) -> str:
             "Unknown budget keys (a typo here is a budget that never applied): "
             + ", ".join(result["unknown_budget_keys"])
         )
+    if result.get("headroom"):
+        lines.append("Headroom left under each ceiling:")
+        for row in result["headroom"]:
+            used = row["used_pct"]
+            marker = "  ⚠" if used is not None and used >= HEADROOM_WARN_PCT else "   "
+            spent = f"{used}% of headroom spent" if used is not None else "no baseline"
+            lines.append(
+                f"{marker} {row['metric']}: {row['actual']} / {row['ceiling']} "
+                f"({spent}, {row['remaining']} left)"
+            )
+        tight = [
+            r["metric"]
+            for r in result["headroom"]
+            if r["used_pct"] is not None and r["used_pct"] >= HEADROOM_WARN_PCT
+        ]
+        if tight:
+            lines.append(
+                "Headroom nearly gone on: "
+                + ", ".join(tight)
+                + " — decide now whether to trim the surface or raise the "
+                "ceiling, rather than at the next red check."
+            )
     for breach in result["breaches"]:
         lines.append(
             f"OVER BUDGET {breach['metric']}: {breach['actual']} > "
