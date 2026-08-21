@@ -16,3 +16,9 @@ htmlcov/
 .cursor/mcp.json
 !.cursor/mcp.json.example
 .DS_Store
+# Ожидания Stop-хука: рантайм-состояние чекаута, не исходник. С #800 их стало
+# по одному на сессию (hub-wait.<session_id>.json и одноимённый .lock), плюс
+# hub-wait-unidentified.json, когда сессию определить не удалось. До этого файл
+# был один и не попадал в коммиты по случайности, а не по правилу.
+.claude/hub-wait*.json
+.claude/hub-wait*.lock
