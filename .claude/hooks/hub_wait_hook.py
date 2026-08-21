@@ -15,12 +15,24 @@
 - Доставка «хотя бы раз»: сработавшее ожидание остаётся в файле с пометкой
   fired_at/refire_count — потерянное пробуждение переоткроется следующим Stop
   (до 3 повторов). Проснувшийся агент снимает ожидание сам: удаляет файл.
-- Владелец ожидания (#772): файл общий на каталог, а сессий в нём может быть
-  несколько, поэтому запись может нести "owner": "<session_id>", и хук следит
-  только за своими. Запись БЕЗ owner считается общей и ведёт себя как раньше —
-  иначе раскатка была бы всё-или-ничего. Чужие записи хук не трогает вообще:
-  ни будит по ним, ни переписывает их.
-- Лок-файл защищает от параллельных поллеров при повторных Stop.
+- Владелец ожидания (#772): запись может нести "owner": "<session_id>", и хук
+  следит только за своими. Запись БЕЗ owner считается общей и ведёт себя как
+  раньше — иначе раскатка была бы всё-или-ничего. Чужие записи хук не трогает
+  вообще: ни будит по ним, ни переписывает их.
+- Файл на сессию: каждая сессия пишет СВОЙ .claude/hub-wait.<session_id>.json,
+  а старый общий .claude/hub-wait.json продолжает читаться (по правилу owner
+  выше), пока в нём есть записи. Общий файл переживал два вида поломок за один
+  день 20.08.2026: сессия перезаписывала его целиком и стирала чужое ожидание,
+  и чужое сработавшее ожидание будило не ту сессию по три раза. Разделение
+  убирает обе: писать в чужой файл больше некуда, а читает хук только своё.
+- Если session_id определить не удалось, хук читает ВСЕ файлы ожиданий и следит
+  за всеми записями — ровно сегодняшнее поведение. Неопределённость не должна
+  выключать пробуждения: молча не проснуться на свой вердикт хуже, чем
+  проснуться на чужой. Хук называет это состояние вслух в тексте пробуждения,
+  чтобы «не разбудило» не выяснялось задним числом.
+- Лок-файл на сессию: общий лок означал, что вторая сессия, дошедшая до Stop
+  при живом чужом поллере, молча оставалась без своего (acquire_lock → False →
+  exit 0). Своё ожидание при этом не отслеживал никто.
 
 Токен и URL берутся из ~/.claude.json (mcpServers.openclaw-hub) — как у MCP.
 """
@@ -36,8 +48,10 @@ import urllib.request
 from pathlib import Path
 
 CLAUDE_DIR = Path(__file__).resolve().parent.parent
-STATE_FILE = CLAUDE_DIR / "hub-wait.json"
-LOCK_FILE = CLAUDE_DIR / "hub-wait.lock"
+# Общий файл прежнего формата. Читается по-прежнему, чтобы сессии, которые ещё
+# пишут в него, не остались без пробуждений на время раскатки.
+SHARED_STATE_FILE = CLAUDE_DIR / "hub-wait.json"
+STATE_GLOB = "hub-wait.*.json"
 POLL_SEC = int(os.environ.get("HUB_WAIT_POLL_SEC", "15"))  # fallback без фида
 FEED_WAIT_SEC = int(os.environ.get("HUB_WAIT_FEED_SEC", "55"))  # long-poll #349
 MAX_WAIT_SEC = int(os.environ.get("HUB_WAIT_MAX_SEC", "14400"))  # 4 часа
@@ -145,6 +159,22 @@ def session_id_from(payload: str) -> str:
     return Path(transcript).stem if transcript else ""
 
 
+def session_id_from_env() -> str:
+    """Тот же идентификатор из окружения, если payload его не принёс.
+
+    Stop-хук с asyncRewake запускается в фоне, и полагаться на то, что stdin
+    донесёт JSON, нельзя: до 20.08.2026 все пробуждения приходили без строки
+    «Сессия», то есть payload был пуст, а разделение владельцев из #772 всё это
+    время работало вхолостую. Два источника вместо одного — чтобы механизм не
+    выключался молча.
+    """
+    for key in ("CLAUDE_SESSION_ID", "CLAUDE_SESSION", "CLAUDE_CODE_SESSION_ID"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def is_own_wait(wait: dict, session: str) -> bool:
     """Своё ли это ожидание: без owner — общее, с owner — только своё."""
     owner = str(wait.get("owner") or "").strip()
@@ -153,20 +183,95 @@ def is_own_wait(wait: dict, session: str) -> bool:
     return owner == session
 
 
-def acquire_lock() -> bool:
+def own_state_file(session: str) -> Path:
+    """Куда ЭТА сессия пишет свои ожидания."""
+    return CLAUDE_DIR / (f"hub-wait.{session}.json" if session else "hub-wait.json")
+
+
+def state_files(session: str) -> list[Path]:
+    """Файлы, которые этот поллер читает.
+
+    Со своим session_id — только свой файл и общий (в общем ещё могут лежать
+    записи сессий, не перешедших на раздельные файлы; правило owner отсеет
+    чужие). Без session_id — все файлы: тогда неизвестно, что своё, и
+    пропущенное пробуждение хуже лишнего.
+    """
+    if not session:
+        return sorted(
+            {SHARED_STATE_FILE, *CLAUDE_DIR.glob(STATE_GLOB)},
+            key=lambda p: p.name,
+        )
+    return [own_state_file(session), SHARED_STATE_FILE]
+
+
+def read_waits(path: Path, session: str) -> tuple[dict, list[dict], list[dict]]:
+    """(state, свои ожидания, чужие) из одного файла; пустое — если нечитаем."""
     try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        state = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}, [], []
+    if not isinstance(state, dict):
+        return {}, [], []
+    all_waits = [w for w in (state.get("waits") or []) if isinstance(w, dict)]
+    own = [w for w in all_waits if is_own_wait(w, session)]
+    foreign = [w for w in all_waits if not is_own_wait(w, session)]
+    return state, own, foreign
+
+
+def lock_file(session: str) -> Path:
+    """Лок на сессию, не на каталог (#767 разбор): общий лок глушил вторую."""
+    return CLAUDE_DIR / (f"hub-wait.{session}.lock" if session else "hub-wait.lock")
+
+
+def acquire_lock(path: Path) -> bool:
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
         return True
     except FileExistsError:
         try:
-            pid = int(LOCK_FILE.read_text().strip())
+            pid = int(path.read_text().strip())
             os.kill(pid, 0)  # жив ли предыдущий поллер
             return False
         except (ValueError, ProcessLookupError, PermissionError, OSError):
-            LOCK_FILE.unlink(missing_ok=True)
-            return acquire_lock()
+            path.unlink(missing_ok=True)
+            return acquire_lock(path)
+
+
+def note_unidentified_session(payload: str) -> None:
+    """След на диске, когда сессию определить не удалось.
+
+    Пишется ТОЛЬКО в этом случае и намеренно: без него «хук следит за чужими
+    файлами» проявляется лишь как лишние пробуждения через час, и разбор
+    начинается с догадок о том, что именно не сработало. Отсутствие файла —
+    сигнал, что всё в порядке.
+    """
+    try:
+        keys = sorted(json.loads(payload or "{}").keys())
+    except (json.JSONDecodeError, AttributeError):
+        keys = ["<не json>"]
+    try:
+        (CLAUDE_DIR / "hub-wait-unidentified.json").write_text(
+            json.dumps(
+                {
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "payload_len": len(payload or ""),
+                    "payload_keys": keys,
+                    "claude_env": sorted(
+                        k for k in os.environ if k.startswith("CLAUDE")
+                    ),
+                    "hint": (
+                        "ни payload Stop-хука, ни CLAUDE_CODE_SESSION_ID не дали "
+                        "идентификатор — поллер следит за всеми файлами ожиданий"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -174,40 +279,40 @@ def main() -> int:
         payload = sys.stdin.read()  # стрим надо дочитать в любом случае
     except Exception:
         payload = ""
-    session = session_id_from(payload)
+    session = session_id_from(payload) or session_id_from_env()
+    if not session:
+        note_unidentified_session(payload)
 
-    if not STATE_FILE.exists():
-        return 0
-    try:
-        state = json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return 0
-    waits = [w for w in (state.get("waits") or []) if is_own_wait(w, session)]
-    if not waits:
-        return 0  # в файле только чужие ожидания — не наше дело
+    files = state_files(session)
+    if not any(read_waits(p, session)[1] for p in files):
+        return 0  # своих ожиданий нет — не наше дело
 
-    if not acquire_lock():
-        return 0
+    lock = lock_file(session)
+    if not acquire_lock(lock):
+        return 0  # у этой сессии уже есть живой поллер
     try:
         base, auth = hub_config()
         deadline = time.monotonic() + MAX_WAIT_SEC
         cursor = feed_tail_cursor(base, auth)  # None → фид недоступен
         first_pass = True
         while time.monotonic() < deadline:
-            if not STATE_FILE.exists():  # агент снял ожидание — уходим
-                return 0
             # Перечитываем ожидания КАЖДЫЙ цикл: агент мог переписать файл
             # после старта поллера; работа по снимку со старта затирала
             # свежие ожидания при срабатывании (инцидент #383/#385).
-            try:
-                state = json.loads(STATE_FILE.read_text())
-            except (json.JSONDecodeError, OSError):
-                return 0
-            all_waits = state.get("waits") or []
-            waits = [w for w in all_waits if is_own_wait(w, session)]
-            foreign = [w for w in all_waits if not is_own_wait(w, session)]
+            # Каждое ожидание помнит СВОЙ файл: сработавшее дописывается туда,
+            # откуда пришло, а не в один общий — иначе разделение по сессиям
+            # вернуло бы ту же перезапись чужого через чёрный ход.
+            per_file: dict[Path, tuple[dict, list[dict], list[dict]]] = {}
+            waits = []
+            for path in state_files(session):
+                state, own, foreign = read_waits(path, session)
+                if not own and not foreign:
+                    continue
+                per_file[path] = (state, own, foreign)
+                for w in own:
+                    waits.append((path, w))
             if not waits:
-                return 0
+                return 0  # агент снял свои ожидания — уходим
             # Просыпаемся от событий фида (#349, ~1с реакции); baseline по
             # задачам остаётся источником истины. Первый проход всегда
             # проверяет baseline напрямую: событие могло случиться до
@@ -221,20 +326,17 @@ def main() -> int:
             elif not first_pass:
                 time.sleep(POLL_SEC)
             first_pass = False
-            fired, remaining = [], []
-            for wait in waits:
+            fired = []
+            for path, wait in waits:
                 if wait.get("project_id"):
                     obj = fetch_project(base, auth, wait["project_id"])
                 else:
                     obj = fetch_task(base, auth, wait["task_id"])
                 if obj is None:
-                    remaining.append(wait)
                     continue
                 diff = changed_fields(obj, wait.get("baseline") or {})
                 if diff:
-                    fired.append((wait, obj, diff))
-                else:
-                    remaining.append(wait)
+                    fired.append((path, wait, obj, diff))
             if fired:
                 # Доставка «хотя бы раз», не «ровно раз»: сработавшее ожидание
                 # НЕ удаляем, а помечаем fired_at/refire_count и оставляем в
@@ -248,21 +350,20 @@ def main() -> int:
                 # страхует от вечного цикла, если агент забыл прибраться.
                 stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 give_up = []
-                for wait, obj, diff in fired:
+                for _path, wait, _obj, _diff in fired:
                     wait.setdefault("fired_at", stamp)
                     wait["refire_count"] = int(wait.get("refire_count") or 0) + 1
                     if wait["refire_count"] > 3:
-                        give_up.append(wait)
-                kept = foreign + [w for w in waits if w not in give_up]
-                if kept:
-                    state["waits"] = kept
-                    STATE_FILE.write_text(
-                        json.dumps(state, ensure_ascii=False, indent=2)
-                    )
-                else:
-                    STATE_FILE.unlink(missing_ok=True)
+                        give_up.append(id(wait))
+                for path, (state, own, foreign) in per_file.items():
+                    kept = foreign + [w for w in own if id(w) not in give_up]
+                    if kept:
+                        state["waits"] = kept
+                        path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+                    elif not foreign:
+                        path.unlink(missing_ok=True)
                 lines = ["Событие в OpenClaw Hub — продолжай работу по плану:"]
-                for wait, obj, diff in fired:
+                for _path, wait, obj, diff in fired:
                     parts = ", ".join(
                         f"{f}: {c['was']!r} → {c['now']!r}" for f, c in diff.items()
                     )
@@ -282,18 +383,28 @@ def main() -> int:
                         f"- {subject}: {parts}. "
                         f"Ожидание было: {wait.get('reason', '—')}.{note}"
                     )
+                touched = sorted({str(p.name) for p, _w, _o, _d in fired})
                 lines.append(
-                    "Обработав событие, сними ожидание: удали .claude/hub-wait.json "
-                    "(или перепиши waits) — иначе следующий Stop разбудит повторно."
+                    "Обработав событие, сними ожидание: перепиши waits в "
+                    f"{', '.join(touched)} (или удали файл) — иначе следующий "
+                    "Stop разбудит повторно."
                 )
                 if session:
-                    # #772: назвать разрешённый идентификатор прямо в сообщении.
-                    # Это и есть проверка совпадения: агент пишет owner тем же
-                    # значением, и если оно когда-нибудь разъедется, это видно
-                    # здесь, а не в виде тихо не наступивших пробуждений.
+                    # Назвать и сессию, и её файл: агент пишет ожидания именно
+                    # туда, и если идентификатор когда-нибудь разъедется, это
+                    # видно здесь, а не в виде тихо не наступивших пробуждений.
                     lines.append(
-                        f"Сессия: {session} — это же значение пиши в owner "
-                        "своих ожиданий, чтобы чужие события тебя не будили."
+                        f"Сессия: {session}. Свои ожидания пиши в "
+                        f".claude/{own_state_file(session).name} (owner={session}) "
+                        "— чужие файлы не трогай."
+                    )
+                else:
+                    # Состояние «не знаю, кто я» названо вслух: иначе разбор
+                    # чужих пробуждений начинается с догадок.
+                    lines.append(
+                        "Внимание: session_id не определён, поэтому этот поллер "
+                        "следит за ВСЕМИ файлами ожиданий — событие могло быть "
+                        "адресовано другой сессии."
                     )
                 msg = "\n".join(lines)
                 print(msg)
@@ -301,7 +412,7 @@ def main() -> int:
                 return 2  # exit 2 + asyncRewake → Claude Code будит агента
         return 0  # таймаут: ожидания остаются, следующий Stop перезапустит
     finally:
-        LOCK_FILE.unlink(missing_ok=True)
+        lock.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
