@@ -1650,6 +1650,23 @@ async def web_batch_approve_selected(
     return RedirectResponse(f"/{query}", status_code=303)
 
 
+def _split_anchor(message: str) -> tuple[str, str, int | None]:
+    """Split a trailing ``@ path:line`` anchor off a finding's text (#826).
+
+    Optional by design. A required anchor would be answered with a click on
+    whatever line happened to be under the cursor, and a made-up address is
+    worse than an honest none — this is the same reason the panel never
+    invents an attribution (#825).
+    """
+    head, sep, tail = message.rpartition("@")
+    if not sep or not head.strip():
+        return message, "", None
+    path, colon, number = tail.strip().rpartition(":")
+    if not colon or not number.strip().isdigit() or not path.strip():
+        return message, "", None
+    return head.strip(), path.strip(), int(number.strip())
+
+
 def _parse_findings_form(text: str) -> list[ReviewFinding]:
     """Parse the review-panel findings textarea into structured findings.
 
@@ -1657,6 +1674,11 @@ def _parse_findings_form(text: str) -> list[ReviewFinding]:
     ``high: message`` / ``medium: message`` / ``low: message``. Lines
     without a recognized severity prefix default to medium. Ids are
     assigned by position — stable within this submission (#308).
+
+    A line may end with ``@ path/to/file.py:42`` (#826) — clicking a line in
+    the rendered diff appends exactly that. The anchor lands in the finding's
+    own ``file``/``line`` fields, the ones machine review already fills, so a
+    human finding and an agent finding stay one kind of thing.
     """
     findings: list[ReviewFinding] = []
     for raw_line in text.splitlines():
@@ -1666,19 +1688,25 @@ def _parse_findings_form(text: str) -> list[ReviewFinding]:
         severity, _, rest = line.partition(":")
         sev_token = severity.strip().lower()
         if sev_token in ReviewSeverity.__members__ and rest.strip():
+            message, path, number = _split_anchor(rest.strip())
             findings.append(
                 ReviewFinding(
                     id=len(findings) + 1,
                     severity=ReviewSeverity(sev_token),
-                    message=rest.strip(),
+                    message=message,
+                    file=path,
+                    line=number,
                 )
             )
         else:
+            message, path, number = _split_anchor(line)
             findings.append(
                 ReviewFinding(
                     id=len(findings) + 1,
                     severity=ReviewSeverity.medium,
-                    message=line,
+                    message=message,
+                    file=path,
+                    line=number,
                 )
             )
     return findings
