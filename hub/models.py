@@ -1299,6 +1299,11 @@ class TaskUpdateView(BaseModel):
     # "legacy" predates the field, "hub" is the hub writing its own updates,
     # "anonymous" is a request with no authenticated identity. One NULL could
     # not have told those apart.
+    # #498: advisory notes about THIS report, filled on the done path. The
+    # feed is where the owner reads them and the response is where the agent
+    # does — a warning that reaches only one of the two reaches nobody who can
+    # act on it (the lesson of #826).
+    warnings: list[str] = Field(default_factory=list)
     principal_id: int | None = None
     author_kind: str = "legacy"
 

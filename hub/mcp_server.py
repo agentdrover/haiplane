@@ -851,6 +851,7 @@ async def hub_task_update(
     status = task.get("status", "?")
     if kind == "done":
         message = _format_hub_report_done_message(task_id, result["id"], status)
+        message += _format_report_warnings(result)
     else:
         message = f"Update #{result['id']} added to task #{task_id}."
     if task.get("lifecycle_hint"):
@@ -863,6 +864,14 @@ async def hub_task_update(
             "hub_task_update kind=done", "hub_report_done", response
         )
     return response
+
+
+def _format_report_warnings(result: dict[str, Any]) -> str:
+    """Advisory notes about this report, or "" (#498)."""
+    warnings = result.get("warnings") or []
+    if not warnings:
+        return ""
+    return "\n" + "\n".join(f"Внимание: {w}" for w in warnings)
 
 
 def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -> str:
@@ -976,6 +985,7 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
         return _format_hub_api_error(exc)
     status = task.get("status", "?")
     msg = _format_hub_report_done_message(task_id, result["id"], status)
+    msg += _format_report_warnings(result)
     if task.get("lifecycle_hint"):
         msg += f"\nLifecycle: {task['lifecycle_hint']}"
     return _format_mutation_success(msg, task, transition_from=prior_status)

@@ -2602,6 +2602,18 @@ async def add_update(
     if body.kind == "done":
         _validate_done_report(task)
 
+    # #498: work that never started its way out, named while the report is
+    # being written rather than found weeks later. Advisory by design: the
+    # completion is not blocked, and anything unknown stays silent.
+    undelivered = ""
+    if body.kind == "done":
+        from hub.services.delivery_gate import undelivered_warning
+
+        try:
+            undelivered = await undelivered_warning(db, task)
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            log.warning("delivery check for #%s failed: %s", task_id, exc)
+
     # Serialize the whole mutation (insert + status transition + commits) on the
     # shared connection so it cannot interleave with a refinement ``_atomic``
     # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
@@ -2735,8 +2747,15 @@ async def add_update(
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
 
+    if undelivered:
+        await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
+        await db.commit()
+
     update_row = await repo.get_task_update_by_id(db, update_id)
-    return TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
+    view = TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
+    if undelivered:
+        view.warnings = [undelivered]
+    return view
 
 
 async def refresh_task(
