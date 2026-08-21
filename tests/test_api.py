@@ -2577,13 +2577,15 @@ async def test_practice_metrics_cycle_times(client: AsyncClient, db):
     from hub import services as services_module
     from hub.models import TaskCreate
 
+    # #810: the completion has to be stamped. These rows used to carry only
+    # ready_at and updated_at, and the median was built from the latter.
     for hours in (2, 4, 100):
         tv = await services_module.create_task(
             db, TaskCreate(title=f"Cycle {hours}", work_type="bug")
         )
         await db.execute(
-            "UPDATE tasks SET status='completed', "
-            "ready_at=datetime('now', ?), updated_at=datetime('now') WHERE id=?",
+            "UPDATE tasks SET status='completed', ready_at=datetime('now', ?), "
+            "completed_at=datetime('now'), updated_at=datetime('now') WHERE id=?",
             (f"-{hours} hours", tv.id),
         )
     await db.commit()
@@ -2620,7 +2622,8 @@ async def test_practice_metrics_cycle_times_measure_completion(client: AsyncClie
     # Finished 100 days ago, edited yesterday. Under the old query updated_at
     # both admitted it to the 90-day window and gave it a 100-day cycle time.
     await _mk("spike", "-200 days", "-100 days", "-1 days")
-    # Finished before completed_at was ever written: estimated from updated_at.
+    # Finished before completed_at was ever written. It used to be estimated
+    # from updated_at; since #810 it is counted, not estimated.
     await _mk("docs", "-8 hours", None, "-2 hours")
     await db.commit()
 
@@ -2628,13 +2631,13 @@ async def test_practice_metrics_cycle_times_measure_completion(client: AsyncClie
     cycles = {c["work_type"]: c for c in resp.json()["cycle_times"]}
 
     assert 5.5 <= cycles["refactor"]["median_hours"] <= 6.5
-    assert cycles["refactor"]["estimated_tasks"] == 0
+    assert cycles["refactor"]["no_completion_tasks"] == 0
     assert "spike" not in cycles, "row completed outside the window must not count"
-    assert 5.5 <= cycles["docs"]["median_hours"] <= 6.5
-    assert cycles["docs"]["estimated_tasks"] == 1, (
-        "a row measured by fallback has to be visible as such, "
-        "otherwise an inferred median reads as a measured one"
-    )
+    # #810: no completion stamp, so no duration — the row is counted and named
+    # instead of being given a plausible median built from updated_at.
+    assert cycles["docs"]["median_hours"] is None
+    assert cycles["docs"]["tasks"] == 0
+    assert cycles["docs"]["no_completion_tasks"] == 1
 
 
 async def test_metrics_page_renders(client: AsyncClient, db):
