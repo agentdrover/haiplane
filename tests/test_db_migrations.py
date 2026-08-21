@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import aiosqlite
 import pytest
 
@@ -788,3 +790,108 @@ async def test_provider_tokens_migration_is_additive():
             )
         )
         assert rows and rows[0]["provider_tokens"] is None
+
+
+# --- First-class task dependencies (#482, epic #478) -------------------------
+#
+# The order of work has lived outside the hub since the beginning: in a chat,
+# in an agent's memory, in a sentence inside somebody's constraints. This is
+# the table that lets it live in the system.
+
+
+@asynccontextmanager
+async def _deps_db():
+    """A migrated in-memory database with foreign keys ON.
+
+    The runtime enables them (hub/db.py); a cascade test with them off would
+    prove the cascade works where nothing enforces it.
+    """
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        yield db
+
+
+async def _task_row(db: aiosqlite.Connection, title: str) -> int:
+    cur = await db.execute(
+        "INSERT INTO tasks (title, description, status) VALUES (?, '', 'open')",
+        (title,),
+    )
+    return cur.lastrowid
+
+
+async def test_task_dependencies_table_present():
+    # AC-1 (#482): the table exists with an index on BOTH ends of the edge —
+    # "who blocks me" is walked at start, "whom do I unblock" at finish.
+    async with _deps_db() as db:
+        names = {
+            r["name"]
+            for r in await db.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+            )
+        }
+        assert "task_dependencies" in names
+        assert "idx_task_dependencies_task" in names
+        assert "idx_task_dependencies_depends_on" in names
+
+
+async def test_duplicate_dependency_edge_is_refused():
+    # AC-2 (#482): an edge is a fact, not a tally. Two identical rows would
+    # make "how many things block me" depend on how often somebody clicked.
+    async with _deps_db() as db:
+        a = await _task_row(db, "blocked")
+        b = await _task_row(db, "blocker")
+        await db.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
+            (a, b),
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await db.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id) "
+                "VALUES (?, ?)",
+                (a, b),
+            )
+
+
+async def test_self_dependency_is_refused_by_schema():
+    # AC-3 (#482): a task blocking itself is a cycle of length one. Cycle
+    # detection proper is #483, but this case needs no graph walk, so it is
+    # closed in the schema — unwritable even from a SQL prompt.
+    async with _deps_db() as db:
+        a = await _task_row(db, "lonely")
+        with pytest.raises(aiosqlite.IntegrityError):
+            await db.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id) "
+                "VALUES (?, ?)",
+                (a, a),
+            )
+
+
+async def test_dependency_edges_die_with_their_task():
+    # AC-4 (#482): an edge pointing at a task that no longer exists would
+    # read as a blocker nobody can ever satisfy.
+    async with _deps_db() as db:
+        a = await _task_row(db, "blocked")
+        b = await _task_row(db, "blocker")
+        c = await _task_row(db, "dependent")
+        await db.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
+            (a, b),
+        )
+        await db.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
+            (c, a),
+        )
+        await db.commit()
+
+        await db.execute("DELETE FROM tasks WHERE id = ?", (a,))
+        await db.commit()
+
+        left = list(
+            await db.execute_fetchall(
+                "SELECT task_id, depends_on_task_id FROM task_dependencies"
+            )
+        )
+        assert left == [], "edges on both sides of the deleted task must be gone"
