@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
@@ -12,6 +13,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import config
 from hub.actionable_errors import normalize_api_error_detail
+from hub.mcp_internal_auth import identity_context_get
+from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
     TreeOutputOptions,
     render_task_tree,
@@ -43,11 +46,53 @@ from hub.mcp_structured import (
     structured_tool_result,
 )
 
+
 # FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
 # The hub mounts streamable HTTP under the main FastAPI app, so clients send the
 # public Host (e.g. agenthai.ru) — the SDK default rejects them with 421. Disable
 # MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
-mcp = FastMCP(
+class InstrumentedFastMCP(FastMCP):
+    """FastMCP that records what each tool call cost (#780, epic #776).
+
+    The measurement sits on the one funnel every call passes through instead
+    of on each tool function. Sixty-two decorated functions would be
+    sixty-two chances to forget one, and a report with silent holes is worse
+    than no report: it makes an uninstrumented tool and an unused tool look
+    identical, which is exactly the distinction the core surface will be
+    chosen on.
+
+    Recording happens after the answer exists, never before, and cannot fail
+    the call — see ``record_call``. Cancellation is deliberately not recorded
+    as an error: the tool did not fail, the client left.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        principal_id, role = identity_context_get()
+        started = time.perf_counter()
+        try:
+            result = await super().call_tool(name, arguments)
+        except Exception as exc:
+            await record_call(
+                tool=name,
+                arguments=arguments,
+                latency_ms=round((time.perf_counter() - started) * 1000),
+                error=exc,
+                principal_id=principal_id,
+                principal_role=role,
+            )
+            raise
+        await record_call(
+            tool=name,
+            arguments=arguments,
+            latency_ms=round((time.perf_counter() - started) * 1000),
+            result=result,
+            principal_id=principal_id,
+            principal_role=role,
+        )
+        return result
+
+
+mcp = InstrumentedFastMCP(
     "openclaw-hub",
     instructions=build_mcp_instructions(),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),

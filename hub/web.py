@@ -957,6 +957,26 @@ async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1
     return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
 
 
+@router.get("/metrics/agent-api", response_class=HTMLResponse)
+async def web_agent_api_metrics(
+    request: Request, window_days: int = Query(default=14, ge=1)
+):
+    """Agent API usage, errors and cost (#780).
+
+    A page of its own rather than a section on practice metrics: this one
+    reads a different window (bounded by telemetry retention) and answers a
+    different question — what the tool surface costs, not how the practice
+    performs.
+    """
+    from hub.mcp_catalog import catalog_snapshot
+    from hub.services.mcp_telemetry import usage_report
+
+    data = await usage_report(
+        _db(request), window_days=window_days, catalog=await catalog_snapshot()
+    )
+    return TEMPLATES.TemplateResponse(request, "agent_api.html", {"u": data})
+
+
 @router.get("/digests", response_class=HTMLResponse)
 async def web_digests(request: Request):
     """Autopilot daily digests with the audit sample (#739)."""

@@ -104,6 +104,13 @@ from hub.auth import (
 )
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
+from hub.mcp_catalog import (
+    catalog_snapshot,
+    check_budget,
+    load_baseline,
+    load_budget,
+)
+from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
     DuplicateAcceptanceCriterionError,
@@ -192,6 +199,11 @@ async def lifespan(app: FastAPI):
     _register_plugins()
     app.state.db = await get_db()
     log.info("Hub database ready at %s", config.HUB_DB_PATH)
+    # MCP usage telemetry (#780) writes through this connection. It is handed
+    # over rather than discovered: the MCP module is importable without an app
+    # (stdio against a remote hub), and there "nowhere to record" is a mode,
+    # not a failure.
+    set_telemetry_sink(app.state.db)
     poll_task = start_poller(app)
 
     # Drive the MCP session manager lifespan inside ours so /mcp/* requests
@@ -233,6 +245,7 @@ async def lifespan(app: FastAPI):
             yield
     finally:
         poll_task.cancel()
+        set_telemetry_sink(None)
         await app.state.db.close()
 
 
@@ -664,6 +677,39 @@ async def api_practice_metrics(
     """Practice metrics (#384): review economics, harness versions,
     recurring finding categories, cycle times."""
     return await services.practice_metrics(_db(request), since_days=since_days)
+
+
+@app.get("/api/metrics/mcp-usage")
+async def api_mcp_usage(
+    request: Request,
+    window_days: int = Query(default=14, ge=1, le=3650),
+    include_catalog: bool = Query(default=True),
+):
+    """Agent API usage, errors and cost over a window (#780).
+
+    Popularity, unique callers, success/error rate, p50/p95 latency and p50/p95
+    response size per tool and per profile — plus the tools nobody called,
+    which is the finding this report exists for and the one that call records
+    alone cannot show.
+
+    The window is clamped to what retention actually covers: a report that
+    answers a 365-day question from a 120-day table would look complete and be
+    wrong.
+    """
+    catalog = await catalog_snapshot() if include_catalog else None
+    return await usage_report(_db(request), window_days=window_days, catalog=catalog)
+
+
+@app.get("/api/metrics/mcp-catalog")
+async def api_mcp_catalog(request: Request):
+    """The published catalog measured against its committed budget (#780).
+
+    The same check CI runs, served live so the cost of the surface is visible
+    without reading a workflow log.
+    """
+    snapshot = await catalog_snapshot()
+    result = check_budget(snapshot, load_budget(), load_baseline())
+    return {**result, "tools_list": snapshot["tools_list"]}
 
 
 @app.get("/api/metrics/outcome-debt")
