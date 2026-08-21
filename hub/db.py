@@ -932,6 +932,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_mcp_call_events_window "
         "ON mcp_call_events(created_at, tool)",
     ),
+    (
+        # Review profiles (#807): which profile a dispatched run was launched
+        # with. Written by the hub at dispatch time, never by the report about
+        # itself — the #750 lesson: a client's own claim about its run is not
+        # evidence of the run.
+        "add_review_dispatches_profile",
+        "ALTER TABLE review_dispatches ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # The profile the report was produced under, copied from the dispatch
+        # of the same generation. Empty means "no dispatch behind this report"
+        # — distinguishable from 'lite', because "we do not know how this was
+        # reviewed" and "it was reviewed cheaply" are different facts.
+        "add_machine_reviews_profile",
+        "ALTER TABLE machine_reviews ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

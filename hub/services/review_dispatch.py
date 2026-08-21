@@ -28,6 +28,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.models import RiskClass
 from hub.services.model_family import family
 
 log = logging.getLogger(__name__)
@@ -64,11 +65,82 @@ def pick_review_model(implementer_model: str) -> str:
     return _REVIEW_MODEL_PREFERENCES[0]
 
 
-def _review_prompt(task_id: int, branch: str, model_id: str) -> str:
-    return (
+LITE = "lite"
+DEEP = "deep"
+
+# Risk classes at or above this one never get the cheap profile.
+_DEEP_FROM_CLASS = RiskClass.r3
+
+
+def pick_review_profile(task: dict[str, Any]) -> str:
+    """Which review profile this submission deserves (#807).
+
+    deep is the multi-agent harness; lite is a single pass over the branch
+    diff under a token ceiling. The rule leans toward deep on every kind of
+    ignorance:
+
+    * a human who pressed "request machine review" asked for the real thing;
+    * a high or security risk is exactly what the expensive harness is for;
+    * an UNCOMPUTED risk class is not a low one (#582) — an unknown path is
+      not cheaper than a known-harmless one, and treating a missing class as
+      lite would let any task skip the harness by never being classified.
+
+    Everything else is ordinary work inside known contracts, and paying
+    434k tokens per confirmed finding for it is what made "review every
+    submission" unaffordable in the first place.
+    """
+    if (task.get("machine_review_override") or "").strip() == "require":
+        return DEEP
+    try:
+        risks = json.loads(task.get("risks") or "[]")
+    except ValueError:
+        risks = []
+    for risk in risks:
+        if isinstance(risk, dict) and (
+            risk.get("severity") == "high" or risk.get("kind") == "security"
+        ):
+            return DEEP
+    raw_class = (task.get("risk_class") or "").strip()
+    if not raw_class:
+        return DEEP
+    try:
+        risk_class = RiskClass(raw_class)
+    except ValueError:
+        # An unreadable class is an unknown class, and unknown means deep.
+        return DEEP
+    order = list(RiskClass)
+    if order.index(risk_class) >= order.index(_DEEP_FROM_CLASS):
+        return DEEP
+    return LITE
+
+
+def _review_prompt(task_id: int, branch: str, model_id: str, profile: str) -> str:
+    common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба OpenClaw "
         f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
-        "не менять — только читать код и запускать проверки. Порядок: "
+        "не менять — только читать код и запускать проверки. "
+    )
+    if profile == LITE:
+        budget = config.REVIEW_LITE_TOKEN_BUDGET
+        return (
+            common + "Это ЛЁГКОЕ ревью: один проход, бюджет "
+            f"{budget} токенов. Порядок: "
+            f"1) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
+            "2) прочитай ДИФФ ветки к базовой (git diff) и только его — "
+            "не исследуй репозиторий целиком, контекст берётся из диффа; "
+            "3) один проход по изменённым файлам: ищи дефекты корректности, "
+            "потерянные граничные случаи, несоответствие заявленным AC; "
+            f"4) сдай hub_submit_machine_review(task_id={task_id}, "
+            "harness_skill='lite-diff-review', ...) с реальными raw_count, "
+            f"находками, tokens_spent и model='{model_id}'. "
+            "ЧЕСТНОСТЬ ОХВАТА: если дифф не помещается в бюджет — сдавай "
+            "incomplete=true и перечисли непрочитанные файлы в "
+            "lost_dimensions. Ноль находок при обрезанном диффе — это "
+            "«не проверено», а не «чисто»; выдать одно за другое хуже, чем "
+            "не найти ничего. Вердикт НЕ выноси — он не твой."
+        )
+    return (
+        common + "Порядок: "
         "1) hub_get_skill('multi-agent-review') и работай по нему; "
         f"2) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
         "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
@@ -123,12 +195,13 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         return False
 
     model_id = pick_review_model((task.get("submission_model") or "").strip())
+    profile = pick_review_profile(task)
     hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=branch,
         model_id=model_id,
-        prompt_text=_review_prompt(task_id, branch, model_id),
+        prompt_text=_review_prompt(task_id, branch, model_id, profile),
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
     )
@@ -155,6 +228,12 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         agent_id=agent_id,
         run_id=run_info.get("id") or agent_info.get("latestRunId") or "",
         model=model_id,
+        profile=profile,
+    )
+    profile_note = (
+        f"профиль {profile} (бюджет {config.REVIEW_LITE_TOKEN_BUDGET} токенов)"
+        if profile == LITE
+        else f"профиль {profile} (многоагентный харнесс)"
     )
     await repo.add_task_update(
         db,
@@ -163,8 +242,9 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         "status",
         f"Кросс-модельное ревью вызвано хабом: модель {model_id} "
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
-        f"агент {agent_id}. Отчёт придёт через hub_submit_machine_review "
-        "от принципала cursor-cloud-reviewer (#757).",
+        f"{profile_note}, агент {agent_id}. Отчёт придёт через "
+        "hub_submit_machine_review от принципала cursor-cloud-reviewer "
+        "(#757, #807).",
     )
     await repo.insert_event(
         db,
@@ -176,6 +256,7 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
             "agent_id": agent_id,
             "run_id": run_info.get("id") or "",
             "generation": generation,
+            "profile": profile,
         },
     )
     await db.commit()

@@ -177,6 +177,23 @@ async def practice_metrics(
         round(1 - confirmed / adjudicated, 3) if adjudicated else None
     )
 
+    # #807: the profile split is what tells whether "review every submission"
+    # stayed affordable. Kept beside by_harness rather than folded into it:
+    # the harness answers "what ran", the profile answers "how much it was
+    # allowed to spend".
+    profile_rows = await db.execute_fetchall(
+        "SELECT CASE WHEN profile = '' THEN 'не заявлен' ELSE profile END "
+        "AS profile, COUNT(*) AS reviews, "
+        "COALESCE(SUM(raw_count), 0) AS raw_total, "
+        "COALESCE(SUM(json_array_length(findings_confirmed)), 0) "
+        "AS confirmed_total, "
+        "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
+        "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        "GROUP BY profile ORDER BY reviews DESC",
+        (since,),
+    )
+
     harness_rows = await db.execute_fetchall(
         "SELECT harness_skill, harness_version, COUNT(*) AS reviews, "
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
@@ -271,6 +288,7 @@ async def practice_metrics(
         "since_days": since_days,
         "machine_reviews": totals,
         "by_harness": [dict(r) for r in harness_rows],
+        "by_profile": [dict(r) for r in profile_rows],
         "recurring_categories": recurring,
         "cycle_times": cycle_times,
         "human_gates": human_gates,

@@ -874,14 +874,15 @@ async def insert_machine_review(
     incomplete: bool | None = None,
     unresolved: str = "[]",
     lost_dimensions: str = "[]",
+    profile: str = "",
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "lost_dimensions, profile) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -899,6 +900,7 @@ async def insert_machine_review(
             None if incomplete is None else int(incomplete),
             unresolved,
             lost_dimensions,
+            profile,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1567,12 +1569,13 @@ async def create_review_dispatch(
     agent_id: str,
     run_id: str,
     model: str,
+    profile: str = "",
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches "
-        "(task_id, submission_generation, agent_id, run_id, model) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, submission_generation, agent_id, run_id, model),
+        "(task_id, submission_generation, agent_id, run_id, model, profile) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, submission_generation, agent_id, run_id, model, profile),
     )
     return cur.lastrowid
 
@@ -1603,6 +1606,26 @@ async def get_settled_review_dispatch(
         (task_id, generation),
     )
     rows = list(rows)
+    return rows[0] if rows else None
+
+
+async def get_review_dispatch_for_generation(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The latest dispatch of this generation, whatever its status (#807).
+
+    Deliberately status-agnostic, unlike get_settled_review_dispatch: the
+    profile is decided when the run is launched, and the report normally
+    arrives while the dispatch is still 'active'.
+    """
+    rows = list(
+        await db.execute_fetchall(
+            "SELECT * FROM review_dispatches "
+            "WHERE task_id=? AND submission_generation=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, generation),
+        )
+    )
     return rows[0] if rows else None
 
 
