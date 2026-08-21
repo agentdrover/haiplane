@@ -127,10 +127,10 @@ async def practice_metrics(
     harness-version comparison, recurring finding categories, cycle times.
 
     Aggregated on the fly from machine_reviews and task timestamps. Cycle time
-    is measured from ``completed_at`` (#517), falling back to ``updated_at``
-    for tasks finished before that column started being written; each row
-    carries ``estimated_tasks`` so the inferred share stays visible. Token and
-    duration fields are optional in reports, so aggregates carry
+    is measured from ``completed_at`` (#517) and from nothing else: a row
+    without that stamp has no measurable completion, so it is counted in
+    ``no_completion_tasks`` rather than estimated from ``updated_at`` (#810).
+    Token and duration fields are optional in reports, so aggregates carry
     ``reports_without_tokens`` instead of pretending coverage is full.
     """
     import statistics
@@ -223,37 +223,55 @@ async def practice_metrics(
     )
     recurring = [dict(r) | {"recurring": r["tasks"] > 1} for r in category_rows]
 
-    # `completed_at` is the measured completion moment (#517); rows finished
-    # before it started being written fall back to `updated_at`.
+    # `completed_at` is the only completion clock (#517). Until #810 a row
+    # without it was filled in from `updated_at`, and that fallback was
+    # defended as a small bias — 0–13.3h against durations of 280–340h. The
+    # comparison used the fallback rows as their own yardstick. Split by
+    # source on production data (21.08.2026, 518 completed tasks), the two are
+    # not the same quantity: measured rows have a median of 0.83h for bug and
+    # 1.70h for feature, while the rows filled in from `updated_at` sit at
+    # 254h and 550h. So the blended median tracked the share of filled-in rows
+    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
+    # bugs take eight times longer than features when measured bugs are in
+    # fact the fastest rows in the table.
     #
-    # The fallback is a decision from the data, not a convenience. The obvious
-    # alternative — `status_entered_at` — is provably wrong for the older rows:
-    # the backfill migration stamped every NULL with its own run time, so on
-    # production 107 of the 145 rows in the window carry the migration date.
-    # Dropping them instead would discard three quarters of the sample to
-    # correct a bias measured at 0–13.3h against durations of 280–340h. The
-    # window rolls forward, so the estimated share shrinks to zero on its own.
+    # The other half of that argument — dropping them costs three quarters of
+    # the sample — expired as the window rolled forward: 46 measured bugs and
+    # 119 measured features now stand on their own.
     #
-    # The same expression filters the window. It used to filter on `updated_at`
-    # while claiming to measure completion, so a task finished six months ago
-    # and touched yesterday entered a 90-day window carrying a six-month cycle
-    # time. Numerator and window must be the same clock or the metric is only
-    # half repaired.
+    # Rows without the stamp are counted, never estimated. Their membership in
+    # the window is decided by `updated_at` only because nothing else about
+    # them is dated: that is a "recent enough to mention" test, never a
+    # duration. Every row that HAS a completion is filtered and measured by
+    # the same `completed_at` — #518 fixed a version where numerator and
+    # window used different clocks, and that fix stays.
     cycle_rows = await db.execute_fetchall(
-        "SELECT work_type, completed_at IS NULL AS estimated, "
-        "(julianday(COALESCE(completed_at, updated_at)) - julianday(ready_at)) "
-        "* 24.0 AS hours "
+        "SELECT work_type, completed_at IS NULL AS no_completion, "
+        "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
         "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
-        "AND COALESCE(completed_at, updated_at) >= datetime('now', ?)",
-        (since,),
+        "AND (completed_at >= datetime('now', ?) "
+        "OR (completed_at IS NULL AND updated_at >= datetime('now', ?)))",
+        (since, since),
     )
     by_type: dict[str, list[float]] = {}
-    estimated_by_type: dict[str, int] = {}
+    no_completion_by_type: dict[str, int] = {}
     unmeasurable_by_type: dict[str, int] = {}
     for r in cycle_rows:
+        wt = r["work_type"] or "feature"
+        if r["no_completion"]:
+            # Checked before the start test below, so a row missing BOTH stamps
+            # is counted once, here. The two exclusions overlap almost entirely
+            # in today's data: on production every row with a bulk-stamped
+            # ready_at also predates completed_at, so unmeasurable_tasks now
+            # reads 0 across the board and no_completion_tasks absorbs those
+            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
+            # of label, not of exclusion — the #518 test below still guards the
+            # case it was written for: a future row that has a completion but a
+            # start stamped after it.
+            no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
+            continue
         if r["hours"] is None:
             continue
-        wt = r["work_type"] or "feature"
         if r["hours"] <= 0:
             # A non-positive duration is not a fast task, it is a task whose
             # start is unknown (#518). On production every such row carries the
@@ -268,24 +286,26 @@ async def practice_metrics(
             unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
             continue
         by_type.setdefault(wt, []).append(r["hours"])
-        estimated_by_type[wt] = estimated_by_type.get(wt, 0) + bool(r["estimated"])
-    # `estimated_tasks` is reported per row rather than folded into the median:
-    # a number that silently mixes measured and inferred values reads as fact.
-    # Same principle as n_excluded in #518 — say what is not known.
-    # A work type all of whose rows are unmeasurable still gets a line: saying
-    # "5 tasks, start unknown, no median" is information, while omitting the
-    # row entirely reads as "no work of this type happened" (#518).
+    # Both exclusions are reported per row rather than folded into the median:
+    # a number that silently mixes measured with inferred values reads as fact.
+    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
+    # say what is not known instead of estimating it.
+    # A work type all of whose rows are excluded still gets a line: saying
+    # "5 tasks, no completion stamp, no median" is information, while omitting
+    # the row entirely reads as "no work of this type happened" (#518).
     cycle_times = [
         {
             "work_type": wt,
             "tasks": len(by_type.get(wt, [])),
-            "estimated_tasks": estimated_by_type.get(wt, 0),
+            "no_completion_tasks": no_completion_by_type.get(wt, 0),
             "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
             "median_hours": (
                 round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
             ),
         }
-        for wt in sorted(set(by_type) | set(unmeasurable_by_type))
+        for wt in sorted(
+            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
+        )
     ]
 
     human_gates = await _human_gate_metrics(db, since)
