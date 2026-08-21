@@ -1781,6 +1781,55 @@ async def list_task_dependencies(
     }
 
 
+async def undelivered_blockers(
+    db: aiosqlite.Connection, task_id: int
+) -> list[dict[str, Any]]:
+    """Blockers of ``task_id`` whose CODE has not been delivered (#484).
+
+    Readiness is judged by delivery, not by status — the owner's decision of
+    21.08.2026, taken after five cases in which the blocker was undelivered
+    code rather than an unfinished task. #830 stopped after pair-start
+    because the module it needed sat in an unmerged PR while its task was in
+    review; and even ``completed`` would not have saved it, since the window
+    between a done report and the gate's merge is real and a PR can still go
+    back for rework.
+
+    Delivery is read from ``pipeline_merges`` (#534) — merges the hub
+    performed itself, keyed by task and carrying the merge SHA. A merge made
+    outside the gate leaves no row here, so its task reads as undelivered:
+    for the hub's own project that is a property (manual merges into the base
+    branch are forbidden and the drift guard catches them), and the gate this
+    feeds is advisory anyway.
+
+    Each entry names WHY it is not delivered — "PR not declared" and "PR not
+    merged" are different situations, and collapsing them would leave the
+    reader unable to act on either.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
+        "FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id "
+        "WHERE d.task_id = ? ORDER BY t.id",
+        (task_id,),
+    )
+    blockers: list[dict[str, Any]] = []
+    for row in rows:
+        if row["merges"]:
+            continue
+        pr_number = row["pr_number"]
+        reason = f"PR #{pr_number} не смержен гейтом" if pr_number else "PR не заявлен"
+        blockers.append(
+            {
+                "task_id": row["task_id"],
+                "title": row["title"],
+                "status": row["status"],
+                "pr_number": pr_number,
+                "reason": reason,
+            }
+        )
+    return blockers
+
+
 async def _dependency_path(
     db: aiosqlite.Connection, start: int, target: int
 ) -> list[int] | None:

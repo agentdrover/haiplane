@@ -12,7 +12,10 @@ from __future__ import annotations
 import aiosqlite
 import pytest
 
+from httpx import AsyncClient
+
 from hub import repository as repo
+from hub.services import lifecycle
 from hub.repository import DependencyCycleError, SelfDependencyError
 
 
@@ -116,3 +119,117 @@ async def test_list_shows_both_sides_with_statuses(db: aiosqlite.Connection):
     assert edges["blocked_by"][0]["title"] == "blocks"
     assert [e["task_id"] for e in edges["unblocks"]] == [dependent]
     assert edges["unblocks"][0]["status"] == "open"
+
+
+# --- Readiness is delivery, not status (#484) --------------------------------
+#
+# The owner's decision of 21.08.2026, taken after five cases where the blocker
+# was undelivered code rather than an unfinished task. A gate reading status
+# alone would have closed four of them and missed the most expensive: #830
+# stopped after pair-start because its dependency sat in an open PR while its
+# task was in review.
+
+
+async def _pipeline_merge(
+    db: aiosqlite.Connection, task_id: int, pr_number: int
+) -> None:
+    """What the gate writes when it merges a PR itself (#534)."""
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (NULL, ?, ?, ?)",
+        (pr_number, task_id, "a" * 40),
+    )
+    await db.commit()
+
+
+async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+        and "недоставленных блокерах" in dict(u)["content"]
+    ]
+
+
+async def test_completed_but_unmerged_blocker_warns_on_start(
+    db: aiosqlite.Connection,
+):
+    # AC-1 (#484): closing a task is not delivering its code. Between the done
+    # report and the gate's merge there is a window, and a PR can still go back
+    # for rework — exactly the shape that stopped #830.
+    blocked = await _task(db, "waits for undelivered work")
+    blocker = await _task(db, "closed but unmerged")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="completed", pr_number=8)
+    await db.commit()
+
+    blockers = await lifecycle.warn_about_undelivered_blockers(db, blocked)
+
+    assert [b["task_id"] for b in blockers] == [blocker]
+    assert blockers[0]["reason"] == "PR #8 не смержен гейтом"
+    alerts = await _alerts(db, blocked)
+    assert len(alerts) == 1 and f"#{blocker}" in alerts[0]
+
+
+async def test_delivered_blocker_makes_a_task_startable(db: aiosqlite.Connection):
+    # AC-2 (#484): a merge the gate performed is the evidence. The SHA is not
+    # text the pusher controls, unlike "(#N)" in a commit subject (#534).
+    blocked = await _task(db, "waits")
+    blocker = await _task(db, "delivered")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="completed", pr_number=42)
+    await _pipeline_merge(db, blocker, 42)
+
+    assert await lifecycle.warn_about_undelivered_blockers(db, blocked) == []
+    assert await _alerts(db, blocked) == []
+
+
+async def test_blocker_without_a_pr_says_so(db: aiosqlite.Connection):
+    # AC-3 (#484): "no PR declared" and "PR not merged" are different
+    # situations. Collapsed into one line, neither can be acted on.
+    blocked = await _task(db, "waits")
+    blocker = await _task(db, "still working")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="running")
+    await db.commit()
+
+    blockers = await lifecycle.warn_about_undelivered_blockers(db, blocked)
+
+    assert blockers[0]["reason"] == "PR не заявлен"
+
+
+async def test_task_without_blockers_starts_silently(db: aiosqlite.Connection):
+    # AC-4 (#484): silence where everything is in order. A check that speaks
+    # on every start would be tuned out before it ever mattered.
+    lonely = await _task(db, "no blockers at all")
+
+    assert await lifecycle.warn_about_undelivered_blockers(db, lonely) == []
+    assert await _alerts(db, lonely) == []
+
+
+async def test_warning_never_blocks_the_start(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-5 (#484): advisory means advisory. The emergency flow and deliberate
+    # work on a branch stack stay possible; the task really does reach running.
+    resp = await client.post("/api/tasks", json={"title": "blocked but starting"})
+    blocked = resp.json()["id"]
+    blocker = await _task(db, "undelivered")
+    await repo.add_task_dependency(db, blocked, blocker)
+    await repo.update_task(db, blocker, status="completed", pr_number=7)
+    await db.commit()
+    await client.post(
+        f"/api/tasks/{blocked}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+
+    started = await client.post(
+        f"/api/tasks/{blocked}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert started.status_code == 200, started.text
+    assert started.json()["status"] == "running", "a warning must not gate the start"
+    contents = [u["content"] for u in started.json()["updates"] or []]
+    assert any("недоставленных блокерах" in c for c in contents), (
+        "the warning travels in the same response the agent already reads"
+    )

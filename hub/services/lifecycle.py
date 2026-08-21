@@ -1051,6 +1051,47 @@ async def reject_task(
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+async def warn_about_undelivered_blockers(
+    db: aiosqlite.Connection, task_id: int
+) -> list[dict[str, Any]]:
+    """Say out loud that this task starts on top of undelivered work (#484).
+
+    Advisory by design: the emergency flow and deliberate work on a branch
+    stack must stay possible, so nothing here refuses a start. What it does
+    refuse is silence — an unmet dependency that says nothing reads as
+    readiness, which is how #830 got approved, claimed and pair-started
+    before anyone noticed the code it needs was still in an open PR.
+
+    Written into the task feed rather than into a new response field: the
+    feed already travels to every reader — MCP, REST and the task card —
+    and the dependency contracts that would carry a field of their own are
+    #481, not this task.
+    """
+    blockers = await repo.undelivered_blockers(db, task_id)
+    if not blockers:
+        # Nothing to say. A task with no blockers must start exactly as it
+        # did before this check existed.
+        return []
+    listed = "; ".join(
+        f"#{b['task_id']} «{b['title']}» ({b['status']}) — {b['reason']}"
+        for b in blockers
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            f"Старт при недоставленных блокерах: {listed}. Готовность считается "
+            "по факту доставки, а не по статусу: между отчётом о завершении и "
+            "мержем гейтом есть окно, а PR может уйти на доработку (#484). "
+            "Старт не запрещён — предупреждение, а не гейт."
+        ),
+    )
+    await db.commit()
+    return blockers
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1097,6 +1138,9 @@ async def start_task(
         f"Task #{task_id} dispatched",
         detail=mutation_activity_detail(),
     )
+    # #484: after the start, not before it — the check informs, it does not
+    # gate. Reading the feed the caller gets back is how they learn.
+    await warn_about_undelivered_blockers(db, task_id)
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1220,6 +1264,10 @@ async def pair_start_task(
         f"Task #{task_id} pair session started",
         detail=mutation_activity_detail(),
     )
+
+    # #484: the warning is written BEFORE the view is assembled, so it
+    # travels back inside the same response the agent already reads.
+    await warn_about_undelivered_blockers(db, task_id)
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
