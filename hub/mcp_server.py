@@ -1276,6 +1276,16 @@ async def hub_submit_for_review(
         f"status: {task.get('status', '?')}). Awaiting reviewer verdict via "
         "hub_submit_review."
     )
+    # #836: name the baseline here, in the response the waiting agent reads.
+    # Watching `verdict` instead fires on the PREVIOUS generation's approval,
+    # which reads as "my resubmission was approved" — that happened.
+    baseline = task.get("wait_baseline")
+    if baseline:
+        message += (
+            "\nБазис ожидания вердикта по ЭТОЙ сдаче (копируйте как есть, "
+            "не сочиняйте свой — поле verdict несёт вердикт прошлой "
+            f"генерации и на пересдачу не меняется): {json.dumps(baseline)}"
+        )
     return await _task_mutation_response(
         task_id,
         message,
