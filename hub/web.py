@@ -426,6 +426,29 @@ async def _analyst_ready_map(
     return result
 
 
+def _form_strings(values: list[Any]) -> list[str]:
+    """Только текстовые значения поля формы.
+
+    ``form.getlist`` отдаёт ``UploadFile | str``: одно и то же имя поля может
+    принести файл. Для ролей это не режим работы, а мусор на входе, и он
+    отбрасывается здесь, а не превращается в имя роли где-то ниже (#848).
+    """
+    return [v for v in values if isinstance(v, str)]
+
+
+def _task_list(result: list[Any] | dict[str, Any]) -> list[Any]:
+    """Список задач из ответа ``services.list_tasks``.
+
+    Он возвращает либо список, либо страничный конверт (#254). Страницы и
+    HTMX-фрагменты никогда не пагинируют, поэтому конверт здесь означал бы не
+    другой режим, а изменение контракта под нами — и лучше сказать об этом
+    сразу, чем отрисовать пустую таблицу (#848).
+    """
+    if isinstance(result, dict):
+        raise HTTPException(500, "list_tasks вернул страничный конверт без запроса")
+    return result
+
+
 async def _apply_analyst_ready_filter(
     db: aiosqlite.Connection,
     tasks: list[Any],
@@ -613,7 +636,7 @@ async def web_tasks_list_partial(
         project=(project or "").strip() or None,
     )
     tasks, ready_by_id = await _apply_analyst_ready_filter(
-        _db(request), tasks, analyst_ready=analyst_ready
+        _db(request), _task_list(tasks), analyst_ready=analyst_ready
     )
     # #630: the fragment renders the SAME shape the page does. Serving a table
     # here while the page shows the queue would rearrange the screen under a
@@ -1245,7 +1268,7 @@ async def web_tasks(
         project=current_project or None,
     )
     tasks, ready_by_id = await _apply_analyst_ready_filter(
-        db, tasks, analyst_ready=analyst_ready
+        db, _task_list(tasks), analyst_ready=analyst_ready
     )
 
     parent_breadcrumb = None
@@ -1574,12 +1597,14 @@ async def web_approve_task(
         await services.approve_task(_db(request), task_id, body)
     except HTTPException as exc:
         detail = exc.detail
-        is_dor = (
-            exc.status_code == 422
-            and isinstance(detail, dict)
-            and detail.get("error") == "dor_failed"
-        )
-        if not is_dor:
+        # Проверка и её следствие должны стоять рядом: isinstance, спрятанный
+        # в булев флаг, не сужает тип на строках ниже — и dict там держался на
+        # честном слове автора.
+        if (
+            exc.status_code != 422
+            or not isinstance(detail, dict)
+            or detail.get("error") != "dor_failed"
+        ):
             raise
         if _is_htmx(request):
             return _htmx_dor_failed_fragment(task_id, detail)
@@ -1827,14 +1852,17 @@ async def web_review_verdict(
     )
     try:
         body = TaskReviewVerdict(
-            verdict=verdict,  # type: ignore[arg-type]
+            verdict=verdict,
             agent=identity.username,
             comments=comments,
             findings=_parse_findings_form(findings_text),
         )
     except ValidationError as exc:
-        first = exc.errors()[0] if exc.errors() else {}
-        msg = f"Invalid review form: {first.get('msg', 'validation error')}"
+        errors = exc.errors()
+        first_msg = (
+            errors[0].get("msg", "validation error") if errors else "validation error"
+        )
+        msg = f"Invalid review form: {first_msg}"
         if _is_htmx(request):
             return HTMLResponse(
                 f'<div class="task-action-note">{msg}</div>', status_code=422
@@ -2390,7 +2418,7 @@ async def web_admin_edit_roles(principal_id: int, request: Request):
         )
     try:
         new_slugs = await admin_svc.set_principal_roles(
-            db, principal_id, list(selected_roles), granted_by=actor_id
+            db, principal_id, _form_strings(selected_roles), granted_by=actor_id
         )
         p = await admin_svc.get_principal(db, principal_id)
         uname = p["username"] if p else f"#{principal_id}"
@@ -2490,7 +2518,7 @@ async def web_admin_edit_agent_roles(principal_id: int, request: Request):
         )
     try:
         new_slugs = await admin_svc.set_principal_roles(
-            db, principal_id, list(selected_roles), granted_by=actor_id
+            db, principal_id, _form_strings(selected_roles), granted_by=actor_id
         )
         p = await admin_svc.get_principal(db, principal_id)
         uname = p["username"] if p else f"#{principal_id}"

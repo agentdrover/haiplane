@@ -261,6 +261,19 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 
 
+def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:
+    """Строка, которой обязана быть после успешной операции.
+
+    Все восемь мест ниже читают запись сразу после того, как её создали или
+    изменили, и передают дальше без проверки: если бы её не оказалось, ответом
+    стал бы TypeError внутри dict(None), то есть 500 без объяснения. Здесь это
+    честный 404 с именем того, чего не нашли (#848).
+    """
+    if row is None:
+        raise HTTPException(404, missing)
+    return row
+
+
 def _db(request: Request) -> aiosqlite.Connection:
     return request.app.state.db
 
@@ -354,7 +367,11 @@ async def api_create_project(
     body: ProjectCreate,
     request: Request,
     identity=Depends(current_identity),
-    background_tasks: BackgroundTasks = None,
+    # Единственное подавление в этой задаче, и оно про ограничение FastAPI, а
+    # не про код: Optional здесь ломает инжекцию ("Invalid args for response
+    # field"), а дефолт None нужен по-настоящему — hub/web.py вызывает эту
+    # функцию напрямую и без задач, и проверка ниже на этом держится (#848).
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
 ):
     """Create a project (#338/#345).
 
@@ -405,7 +422,7 @@ async def api_create_project(
         background_tasks.add_task(
             services.provision_project, db, pid, actor=identity.username
         )
-    row = await repo.get_project(db, pid)
+    row = _row_or_404(await repo.get_project(db, pid), "project not found")
     return ProjectView(**dict(row))
 
 
@@ -475,7 +492,7 @@ async def api_patch_project(
                 payload={"slug": before["slug"]},
             )
         await db.commit()
-    row = await repo.get_project(db, project_id)
+    row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     return ProjectView(**dict(row))
 
 
@@ -659,7 +676,9 @@ async def api_create_skill(
         f"Skill {body.name} v{version} created as {status_value} "
         f"by {identity.username}",
     )
-    row = await repo.get_skill_version(db, body.name, version)
+    row = _row_or_404(
+        await repo.get_skill_version(db, body.name, version), "skill version not found"
+    )
     return SkillView(**dict(row))
 
 
@@ -689,7 +708,9 @@ async def api_activate_skill(
             "skill_activated",
             f"Skill {name} v{version} activated by {_identity.username}",
         )
-    row = await repo.get_skill_version(db, name, version)
+    row = _row_or_404(
+        await repo.get_skill_version(db, name, version), "skill version not found"
+    )
     return SkillView(**dict(row))
 
 
@@ -705,7 +726,7 @@ async def api_provision_project(
     if await repo.get_project(db, project_id) is None:
         raise HTTPException(404, "project not found")
     result = await services.provision_project(db, project_id, actor=_identity.username)
-    row = await repo.get_project(db, project_id)
+    row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     return {**result, "project": ProjectView(**dict(row))}
 
 
@@ -1491,7 +1512,9 @@ async def api_submit_machine_review(
         f"{len(body.findings_confirmed)} confirmed, "
         f"{len(body.findings_rejected)} rejected",
     )
-    saved = await repo.get_latest_machine_review(db, task_id)
+    saved = _row_or_404(
+        await repo.get_latest_machine_review(db, task_id), "machine review not found"
+    )
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
@@ -2085,7 +2108,7 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
     except ProjectBindError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    row = await repo.get_task(db, task_id)
+    row = _row_or_404(await repo.get_task(db, task_id), "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
@@ -2122,7 +2145,7 @@ async def api_add_risk(task_id: int, body: TaskRisk, request: Request):
     except LimitExceededError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    row = await repo.get_task(db, task_id)
+    row = _row_or_404(await repo.get_task(db, task_id), "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
@@ -2342,11 +2365,13 @@ async def api_proposal_action_compat(
     action = raw.get("action", "")
     comment = raw.get("comment", "")
     if action == "approved":
-        body = TaskApprove(comment=comment, run=True)
-        return await services.approve_task(_db(request), proposal_id, body)
+        return await services.approve_task(
+            _db(request), proposal_id, TaskApprove(comment=comment, run=True)
+        )
     elif action == "rejected":
-        body = TaskReject(comment=comment)
-        return await services.reject_task(_db(request), proposal_id, body)
+        return await services.reject_task(
+            _db(request), proposal_id, TaskReject(comment=comment)
+        )
     raise HTTPException(400, f"unknown action: {action}")
 
 
