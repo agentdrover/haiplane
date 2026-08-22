@@ -4527,6 +4527,153 @@ async def test_project_form_reverts_policy_to_human(client: AsyncClient):
     assert row["gate_policy"] == {"dor": "human", "verdict": "human"}
 
 
+# --- Релизная политика в форме проекта (#926) -------------------------------
+#
+# #812 дал проекту ручку release, но переключать её можно было только PATCH-ом,
+# то есть curl вместо клика. Стоп-кран, записанный первым шагом условия
+# пересмотра в #927, обязан жить там же, где остальные ручки политики.
+
+
+async def _project_with_policy(client: AsyncClient, slug: str, policy: dict) -> int:
+    resp = await client.post("/api/projects", json={"slug": slug, "name": slug})
+    pid = resp.json()["id"]
+    if policy:
+        resp = await client.patch(f"/api/projects/{pid}", json={"gate_policy": policy})
+        assert resp.status_code == 200, resp.text
+    return pid
+
+
+async def _policy_of(client: AsyncClient, pid: int) -> dict:
+    listed = (await client.get("/api/projects")).json()
+    return next(p for p in listed if p["id"] == pid)["gate_policy"]
+
+
+async def test_project_form_saves_release_auto(client: AsyncClient):
+    # AC-1: the knob is offered to the default project too — the #743 lock is
+    # about taking a human OUT of a gate, and a release merge decides nothing
+    # that was not already approved task by task (#812).
+    from hub.services.project_policy import release_auto_enabled
+
+    pid = await _project_with_policy(client, "default", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "auto"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    policy = await _policy_of(client, pid)
+    assert release_auto_enabled(policy), (
+        "the reader is what decides whether the autopilot releases; asserting "
+        f"on the raw string would pass a key it never reads. Stored: {policy}"
+    )
+
+
+async def test_project_form_switches_release_back_to_manual(client: AsyncClient):
+    # AC-2: the half that carry-through (#886) can silently undo. release is
+    # in _FORM_GATE_POLICY_KEYS precisely so an un-chosen knob the form DID
+    # show means "remove it" — otherwise the stored 'auto' comes straight back
+    # and the stop-lever only works in one direction.
+    from hub.services.project_policy import release_auto_enabled
+
+    pid = await _project_with_policy(client, "spike-release", {"release": "auto"})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "manual"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    policy = await _policy_of(client, pid)
+    assert "release" not in policy, f"manual is the absence of the key: {policy}"
+    assert not release_auto_enabled(policy)
+
+
+async def test_unknown_release_value_is_dropped(client: AsyncClient):
+    # AC-3: same shape as review (#805) — only the recognised value is stored,
+    # never a knob nothing reads.
+    pid = await _project_with_policy(client, "spike-garbage", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "yes-please"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    policy = await _policy_of(client, pid)
+    assert "release" not in policy, f"garbage must not become a knob: {policy}"
+
+
+async def test_release_auto_allowed_on_default_but_verdict_lock_holds(
+    client: AsyncClient,
+):
+    # AC-4: the two must not be confused. Release is delegable on default;
+    # the verdict gate is not, and adding this knob may not open that door.
+    pid = await _project_with_policy(client, "default", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "auto"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+    assert (await _policy_of(client, pid)).get("release") == "auto"
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "auto", "gate_policy_verdict": "auto"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" in resp.headers.get("location", ""), (
+        "the #743 lock refuses 'auto' on the verdict gate for the default "
+        "project, and a release select on the same form cannot soften it"
+    )
+    policy = await _policy_of(client, pid)
+    assert policy.get("verdict") != "auto"
+    assert policy.get("release") == "auto", "the refused submit changed nothing"
+
+
+async def test_projects_page_shows_current_release_policy(client: AsyncClient):
+    # AC-5: a switch that always renders its default is a switch that lies
+    # about the state it is in.
+    await _project_with_policy(client, "spike-auto", {"release": "auto"})
+    await _project_with_policy(client, "spike-manual", {})
+
+    page = (await client.get("/projects")).text
+    assert 'name="gate_policy_release"' in page
+    assert '<option value="auto" selected>' in page
+    assert '<option value="manual" selected>' in page
+
+
+async def test_release_select_does_not_break_carry_through(client: AsyncClient):
+    # AC-6: ci_runner is still a knob the form never shows, and #886 says a
+    # submit cannot mean "remove it". Adding release to _FORM_GATE_POLICY_KEYS
+    # must move release out of that set and nothing else.
+    pid = await _project_with_policy(
+        client, "spike-carry", {"ci_runner": "make test", "release": "auto"}
+    )
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_release": "auto"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    policy = await _policy_of(client, pid)
+    assert policy.get("ci_runner") == "make test", (
+        "the form has no ci_runner field, so submitting it cannot mean "
+        f"'remove ci_runner' (#886). Stored: {policy}"
+    )
+    assert policy.get("release") == "auto"
+
+
 # --- The verdict gate reads a report, not a diff (#808) ----------------------
 #
 # The owner does not read code at this gate, so what the panel says IS the

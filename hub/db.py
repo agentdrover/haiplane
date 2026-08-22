@@ -1220,6 +1220,23 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_category_checks_unique "
         "ON category_checks(category)",
     ),
+    (
+        # Which deterministic checks ran on this commit, and how they ended
+        # (#875, feature #870). JSON object: step name → pass | fail | skipped.
+        #
+        # Until now the hub learned only whether the TASK's own
+        # validation_commands passed. The repository's toolchain — ruff, the
+        # formatter, mypy, pytest, bandit, pip-audit — ran in CI and stopped
+        # there, so the reviewer kept hunting, at model prices and with the
+        # false positives that class is famous for, the exact defects a linter
+        # had already proven absent minutes earlier.
+        #
+        # '{}' rather than NULL: an empty object says "this report named no
+        # checks", which is what every report written before this column did.
+        # It grants nothing, which is the point — see prepass_state.
+        "add_ci_run_reports_checks",
+        "ALTER TABLE ci_run_reports ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'",
+    ),
 ]
 
 

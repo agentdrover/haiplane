@@ -324,3 +324,161 @@ async def test_brief_and_card_share_one_evidence_builder(client: AsyncClient):
     assert brief["ci_run_report"]["reason"] in card, (
         "the cause the agent is given must be the cause the human is given"
     )
+
+
+# --- The deterministic prepass (#875, feature #870) --------------------------
+#
+# The reviewer was paying model prices to rediscover defects ruff and mypy had
+# proven absent minutes earlier: those steps ran in CI and stopped there. The
+# grant "do not look at this class" is worth only as much as the fact behind
+# it, so it is tied to a check that RAN and PASSED on the pinned commit.
+
+
+_PINNED_SHA = "a" * 40
+
+
+async def _submitted_task(client: AsyncClient, db, title: str) -> int:
+    resp = await client.post("/api/tasks", json={"title": title})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    # There is no git behind these tests, so nothing pins a commit. The prepass
+    # is keyed on the pinned sha, so one is written here — the fixture stands in
+    # for the workspace, not for the rule.
+    await repo.update_task(db, task_id, submission_sha=_PINNED_SHA)
+    await db.commit()
+    return task_id
+
+
+async def _report_checks(
+    client: AsyncClient, db, task_id: int, checks: dict, *, head_sha: str = ""
+) -> None:
+    """Report a CI run through the service the endpoint calls.
+
+    Straight to the service on purpose: the HTTP route is guarded by the narrow
+    tasks.ci_report permission, and wiring a ci_runner token here would test
+    the auth layer rather than the prepass.
+    """
+    from hub.services.ci_report import accept_ci_run_report
+
+    row = dict(await repo.get_task(db, task_id))
+    await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha=head_sha or row["submission_sha"],
+        ac_results={},
+        checks=checks,
+        reported_by="github-actions",
+    )
+
+
+async def test_prepass_block_present_and_passed_to_prompt(client: AsyncClient, db):
+    # AC-1 (#875): checks that ran and passed on THIS commit reach the brief and
+    # the reviewer's prompt, and the prompt names what each one covers.
+    from hub.services.review_brief import build_review_brief
+
+    task_id = await _submitted_task(client, db, "Prepass task")
+    await _report_checks(
+        client,
+        db,
+        task_id,
+        {"lint": "pass", "types": "pass", "tests": "pass", "security": "skipped"},
+    )
+
+    brief = await build_review_brief(db, task_id)
+
+    assert brief.prepass.state == "covered"
+    assert brief.prepass.passed == ["lint", "tests", "types"]
+    assert brief.prepass.skipped == ["security"]
+
+    block = review_evidence.prepass_block(brief.prepass)
+    assert "НЕ трать проход" in block
+    assert "ruff" in block and "mypy" in block, "the grant names the tool, not a topic"
+    # The grant must not read as "there are no defects left".
+    assert "не что дефектов больше нет" in block
+    # A skipped step proves nothing and says so.
+    assert "Пропущены (ничего не доказывают): security" in block
+
+
+async def test_missing_prepass_states_cause_and_grants_nothing(client: AsyncClient, db):
+    # AC-2 (#875): no report for this commit is a NAMED absence, and it hands
+    # out no silence. "Nobody checked" and "checked, nothing found" are the two
+    # states this whole block exists to keep apart.
+    from hub.services.review_brief import build_review_brief
+
+    task_id = await _submitted_task(client, db, "No prepass task")
+
+    brief = await build_review_brief(db, task_id)
+
+    assert brief.prepass.state == "unknown"
+    assert brief.prepass.passed == []
+    assert "не присылал отчёт" in brief.prepass.reason
+
+    block = review_evidence.prepass_block(brief.prepass)
+    assert "данных нет" in block
+    assert "Ничего не считай проверенным" in block
+    assert "НЕ трать проход" not in block, "no report must never buy silence"
+
+
+async def test_report_without_checks_grants_nothing_either(client: AsyncClient, db):
+    # A report that names no checks is every report written before #875. It
+    # must read as "nothing is proven", not as "everything passed".
+    from hub.services.review_brief import build_review_brief
+
+    task_id = await _submitted_task(client, db, "Checkless report task")
+    await _report_checks(client, db, task_id, {})
+
+    brief = await build_review_brief(db, task_id)
+
+    assert brief.prepass.state == "unknown"
+    assert "не назвал ни одной" in brief.prepass.reason
+    assert "НЕ трать проход" not in review_evidence.prepass_block(brief.prepass)
+
+
+async def test_failed_check_is_told_to_the_reviewer_as_a_fact(client: AsyncClient, db):
+    # A check that RAN and FAILED is louder than one that passed: the code
+    # under review is known-broken in a way a tool already proved, and that is
+    # a fact for the report rather than the reviewer's own finding.
+    from hub.services.review_brief import build_review_brief
+
+    task_id = await _submitted_task(client, db, "Red prepass task")
+    await _report_checks(client, db, task_id, {"lint": "pass", "types": "fail"})
+
+    brief = await build_review_brief(db, task_id)
+
+    assert brief.prepass.state == "failed"
+    assert brief.prepass.failed == ["types"] and brief.prepass.passed == ["lint"]
+    block = review_evidence.prepass_block(brief.prepass)
+    assert "проверки УПАЛИ: types" in block
+    assert "не твоя находка" in block
+    # What DID pass still buys its silence — the two facts are independent.
+    assert "НЕ трать проход" in block
+
+
+async def test_report_for_another_commit_grants_nothing(client: AsyncClient, db):
+    # The pinned commit is the whole basis of the grant. A run on other code
+    # proves nothing about this submission (#572).
+    from hub.services.review_brief import build_review_brief
+
+    task_id = await _submitted_task(client, db, "Other commit task")
+    await _report_checks(client, db, task_id, {"lint": "pass"}, head_sha="f" * 40)
+
+    brief = await build_review_brief(db, task_id)
+
+    assert brief.prepass.state == "unknown"
+    assert brief.prepass.passed == []
+
+
+async def test_unknown_check_outcome_is_refused(client: AsyncClient, db):
+    # The same enumeration discipline the AC statuses get: an outcome the hub
+    # cannot name is refused, not stored for the block to interpret later.
+    task_id = await _submitted_task(client, db, "Weird outcome task")
+
+    with pytest.raises(ValueError, match="unknown check outcome"):
+        await _report_checks(client, db, task_id, {"lint": "probably"})
