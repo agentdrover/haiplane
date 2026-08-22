@@ -825,7 +825,7 @@ def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
 # form showed them, so the submitter had a say. Everything else in the stored
 # policy is carried through untouched (#886).
 _FORM_GATE_POLICY_KEYS = frozenset(
-    {"dor", "verdict", "review", "dor_max_class", "risk_map"}
+    {"dor", "verdict", "review", "dor_max_class", "risk_map", "release"}
 )
 
 
@@ -906,6 +906,7 @@ async def web_edit_project(project_id: int, request: Request):
             "gate_policy_dor",
             "gate_policy_verdict",
             "gate_policy_review",
+            "gate_policy_release",
             "gate_policy_dor_max_class",
             "gate_policy_risk_map",
         )
@@ -922,6 +923,22 @@ async def web_edit_project(project_id: int, request: Request):
         # rather than saved as a knob nothing reads.
         if str(form.get("gate_policy_review") or "").strip() == "dispatch":
             gate_policy["review"] = "dispatch"
+        # #926: the release knob follows the same shape as review — one
+        # recognised value stored, everything else dropped — and for the same
+        # reason it is offered to EVERY project including default: the #743
+        # lock is about taking a human OUT of a gate, and the content of a
+        # release was already approved task by task (#812). manual is the
+        # ABSENCE of the key, which is why 'release' belongs in
+        # _FORM_GATE_POLICY_KEYS above: the form shows this knob, so an
+        # un-chosen one really does mean "remove it". Left out of that set,
+        # the carry-through below would restore the stored 'auto' and the
+        # switch would only work in one direction — a stop-lever that cannot
+        # stop.
+        if (
+            str(form.get("gate_policy_release") or "").strip()
+            == project_policy.RELEASE_AUTO
+        ):
+            gate_policy["release"] = project_policy.RELEASE_AUTO
         # #760: the form carries the WHOLE policy, so an emptied field means
         # "remove this knob", not "leave it alone" — the same semantics the
         # selects already have, and the only ones a form can honestly offer.
@@ -933,7 +950,7 @@ async def web_edit_project(project_id: int, request: Request):
             return _projects_error_redirect(err.replace("policy:", "risk_map:"))
         if risk_map is not None:
             gate_policy["risk_map"] = risk_map
-        # Keys the form does not offer (#886: release, ci_runner) are carried
+        # Keys the form does not offer (#886: ci_runner) are carried
         # over untouched. "The form carries the whole policy" is true of the
         # knobs it shows; a knob it never showed cannot be said to have been
         # emptied by the person who submitted it, and dropping it here would
