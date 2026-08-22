@@ -1826,6 +1826,53 @@ class GitOpsIntegration:
             details=",".join(sorted(set(conclusions) | set(statuses))),
         )
 
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Push runs on ``branch``, newest first — or None if unreadable (#929).
+
+        The PR probe above asks about one commit; this asks about the branch's
+        own history, which is what says whether the BASE is green right now
+        and, if not, which commits arrived since it last was.
+
+        None rather than an empty list when the question could not be asked:
+        "no runs" and "could not look" lead to opposite conclusions, and the
+        caller must not be able to confuse them by accident (#725).
+        """
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/runs"
+            f"?branch={branch}&event=push&per_page={max(1, min(limit, 100))}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            log.warning(
+                "branch CI history for %s unavailable: %s", branch, (err or "").strip()
+            )
+            return None
+        try:
+            runs = json.loads(out).get("workflow_runs")
+        except (json.JSONDecodeError, AttributeError):
+            log.warning("branch CI history for %s: invalid json", branch)
+            return None
+        if runs is None:
+            return None
+        return [
+            {
+                "sha": str(r.get("head_sha") or ""),
+                "status": str(r.get("status") or "").lower(),
+                "conclusion": str(r.get("conclusion") or "").lower(),
+                "created_at": str(r.get("created_at") or ""),
+                "name": str(r.get("name") or ""),
+            }
+            for r in runs
+        ]
+
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult:
