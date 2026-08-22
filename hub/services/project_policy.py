@@ -17,7 +17,7 @@ import logging
 
 import aiosqlite
 
-from hub import config
+from hub import config, git_policy
 from hub import repository as repo
 
 log = logging.getLogger(__name__)
@@ -108,6 +108,58 @@ def release_base_of(project) -> str:
     if isinstance(policy, dict):
         declared = str(policy.get(RELEASE_BASE_KEY) or "").strip()
     return declared or config.RELEASE_BRANCH
+
+
+def _workspace_of(project) -> str:
+    """The clone path a project declares; ``""`` when it declares none."""
+    if project is None:
+        return ""
+    try:
+        return str(project["workspace_path"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def clone_branch_state(project) -> git_policy.BranchSyncState:
+    """Does this project's clone protect the branch the project declares (#887).
+
+    The project card and the API read the SAME function, because a divergence
+    visible in one place and not the other is how two answers to one question
+    start to disagree — the defect ``base_branch_of`` removed for the branch
+    itself.
+
+    Three states, and the third is load-bearing: a project with no workspace,
+    or a workspace the hub cannot read, is ``unknown`` with a cause, never
+    ``match``. Reading "could not look" as "agrees" is the exact shape of the
+    bug this task fixes, and the rule is already settled twice in this code
+    base — CIRunReportState (#546) and sha_check (#572).
+    """
+    return git_policy.branch_sync(_workspace_of(project), base_branch_of(project))
+
+
+def rearm_clone(project) -> git_policy.HookStatus | None:
+    """Rewrite the branch keys in this project's clone; None when there is none.
+
+    The single point where a project's branches reach its clone outside the two
+    moments #475 covered (cloning, and hub startup). Between those two, an owner
+    changing ``default_branch`` in the UI changed nothing the hook could see
+    until the next restart: the card showed the new branch while the clone kept
+    refusing pushes from it.
+
+    Not a second way to write the keys — it calls the same
+    ``git_policy.activate_quietly`` those two moments call, with the same two
+    readers for the branches. Idempotent (git config sets a key to a value it
+    may already hold) and it touches no key but these; never raises, because a
+    clone the hub cannot reach must not fail the edit that reached the database.
+    """
+    workspace = _workspace_of(project)
+    if not workspace:
+        return None
+    return git_policy.activate_quietly(
+        workspace,
+        base_branch=base_branch_of(project),
+        release_branch=release_base_of(project),
+    )
 
 
 async def gate_policy_for_task(db: aiosqlite.Connection, task_id: int) -> dict:

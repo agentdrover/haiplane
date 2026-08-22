@@ -5274,3 +5274,79 @@ async def test_unbilled_review_run_reads_as_unknown_not_free(client: AsyncClient
 
     assert "Прогонов ревью: 1" in page.text
     assert "счёт провайдера неизвестен" in page.text
+
+
+# ---- #500: the delivery snapshot on the dashboard ----
+
+
+async def test_dashboard_shows_what_is_deployed(
+    client: AsyncClient, db, tmp_path, monkeypatch
+):
+    # AC-1 (#500): the deployed commit and the tasks either side of it, in one
+    # place. Until now the answer existed per-card and had to be walked.
+    from hub import repository as repo_module
+    from tests.test_delivery_state import _task_merged_at, _use_real_git
+    from tests.conftest import _git_in
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git_in(root, "init", "-b", "main")
+    (root / "a.py").write_text("a = 1\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "shipped")
+    shipped = _git_in(root, "rev-parse", "HEAD")
+    (root / "b.py").write_text("b = 2\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "released")
+    released = _git_in(root, "rev-parse", "HEAD")
+
+    _use_real_git(monkeypatch, str(root))
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "commit_exists",
+        GitOpsIntegration().commit_exists,
+        raising=False,
+    )
+    task_id = await _task_merged_at(client, db, shipped)
+    await repo_module.update_task(db, task_id, status="completed")
+    await repo_module.record_release(db, deployed_sha=released, ref="main", source="ci")
+    await db.commit()
+
+    page = (await client.get("/")).text
+
+    assert "Что в проде" in page
+    assert released[:12] in page
+    assert f"/tasks/{task_id}" in page
+
+
+async def test_dashboard_keeps_unknown_apart(client: AsyncClient, db):
+    # AC-2 (#500): a task the hub never merged is "could not tell", and the
+    # section must not file it under "did not ship" — the same line the whole
+    # epic holds (#839, #497, #883, #498).
+    from hub import repository as repo_module
+
+    task_id = (await client.post("/api/tasks", json={"title": "Never merged"})).json()[
+        "id"
+    ]
+    await repo_module.update_task(db, task_id, status="completed")
+    await db.commit()
+
+    page = (await client.get("/")).text
+
+    assert "Состояние неизвестно" in page
+    unknown_at = page.index("Состояние неизвестно")
+    not_in_prod_at = page.index("Смёржено, но не раскатано")
+    assert unknown_at != not_in_prod_at, "two lists, not one"
+
+
+async def test_dashboard_states_the_window_and_the_absence(client: AsyncClient):
+    # AC-3 (#500): an empty board must explain itself, and the window the
+    # snapshot covers must be printed — a bounded list shown as the whole
+    # board is what #824 refused to ship.
+    page = (await client.get("/")).text
+
+    assert "выкатов не записано" in page.lower() or "неизвестно" in page
+    assert "окно" in page

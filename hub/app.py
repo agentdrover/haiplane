@@ -71,6 +71,7 @@ from hub.models import (
     MachineReviewSubmit,
     MachineReviewView,
     CategoryCheckSubmit,
+    CloneBranchState,
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
@@ -113,6 +114,7 @@ from hub.mcp_catalog import (
     load_budget,
     load_measured,
 )
+from hub.services import project_policy
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
@@ -363,6 +365,26 @@ async def api_create_subtasks_bulk(
     return await services.create_subtasks_bulk(_db(request), parent_id, body)
 
 
+async def _project_view(row) -> ProjectView:
+    """The one way a project leaves this API (#887).
+
+    The clone check is attached HERE rather than at each call site so that a
+    surface added later cannot ship a project card without it — the same reason
+    the branch itself has one reader. Off the event loop because it shells out
+    to git: a workspace on unreachable storage must delay one response, not
+    block the server.
+    """
+    view = ProjectView(**dict(row))
+    sync = await asyncio.to_thread(project_policy.clone_branch_state, row)
+    view.clone_branch = CloneBranchState(
+        state=sync.state,
+        reason=sync.reason,
+        project_branch=sync.project_branch,
+        clone_branch=sync.clone_branch,
+    )
+    return view
+
+
 @app.post("/api/projects", response_model=ProjectView)
 async def api_create_project(
     body: ProjectCreate,
@@ -424,7 +446,7 @@ async def api_create_project(
             services.provision_project, db, pid, actor=identity.username
         )
     row = _row_or_404(await repo.get_project(db, pid), "project not found")
-    return ProjectView(**dict(row))
+    return await _project_view(row)
 
 
 @app.get("/api/projects", response_model=list[ProjectView])
@@ -433,7 +455,7 @@ async def api_list_projects(
     include_archived: bool = Query(default=False),
 ):
     rows = await repo.list_projects(_db(request), include_archived=include_archived)
-    return [ProjectView(**dict(r)) for r in rows]
+    return [await _project_view(r) for r in rows]
 
 
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
@@ -494,7 +516,15 @@ async def api_patch_project(
             )
         await db.commit()
     row = _row_or_404(await repo.get_project(db, project_id), "project not found")
-    return ProjectView(**dict(row))
+    # #887: the branch keys reach the clone in the same operation that changed
+    # them. Before this, the hook kept protecting the previous branch until the
+    # next hub restart — the card said master, the clone refused pushes from it,
+    # and nothing anywhere said why. Re-armed AFTER the row is re-read so the
+    # clone gets the stored values, and only when the branch policy actually
+    # moved: an edit to the project name must not touch a git config.
+    if any(key in fields for key in ("default_branch", "default_branch_policy")):
+        await asyncio.to_thread(project_policy.rearm_clone, row)
+    return await _project_view(row)
 
 
 @app.get("/api/digests")
@@ -728,7 +758,7 @@ async def api_provision_project(
         raise HTTPException(404, "project not found")
     result = await services.provision_project(db, project_id, actor=_identity.username)
     row = _row_or_404(await repo.get_project(db, project_id), "project not found")
-    return {**result, "project": ProjectView(**dict(row))}
+    return {**result, "project": await _project_view(row)}
 
 
 @app.get("/api/metrics/practices")

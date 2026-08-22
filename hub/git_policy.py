@@ -241,6 +241,107 @@ def record_branch_policy(
     return written
 
 
+# Sync between what the project declares and what its clone protects (#887).
+# Three states, and the third is not a shade of the first: "could not look" is
+# its own answer with its own cause, the rule CIRunReportState (#546) and
+# sha_check (#572) already carry. A clone the hub cannot read is not a clone in
+# agreement — it is a clone nobody checked, and the two call for different acts.
+BRANCH_IN_SYNC = "match"
+BRANCH_DIVERGED = "diverged"
+BRANCH_UNCHECKED = "unknown"
+
+
+@dataclass
+class BranchSyncState:
+    """Whether the clone protects the branch its project declares.
+
+    Both values are carried, always: a divergence report that names only one
+    side tells the reader something is wrong and not what to change. ``reason``
+    is filled in every state, including agreement, so the field never reads as
+    an empty assertion.
+    """
+
+    state: str = BRANCH_UNCHECKED
+    reason: str = "сверка клона с проектом не выполнялась"
+    project_branch: str = ""
+    clone_branch: str = ""
+
+    @property
+    def agrees(self) -> bool:
+        """True only for observed agreement — never for an unread clone."""
+        return self.state == BRANCH_IN_SYNC
+
+
+def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
+    """Compare ``project.default_branch`` with what ``repo`` records (#887).
+
+    The comparison is against the key the hook actually reads, not against the
+    hub's own configuration: the hook runs offline and obeys the clone.
+
+    A readable clone with NO key recorded is reported as diverged rather than
+    unknown, and deliberately: we did look, and what we found is a hook falling
+    back to its own built-in branch instead of protecting the project's. Only a
+    clone that could not be read at all — no workspace configured, no such
+    directory, not a git repository — is unknown, and it always says why.
+    """
+    declared = (project_branch or "").strip()
+    path = (repo or "").strip()
+    if not path:
+        return BranchSyncState(
+            BRANCH_UNCHECKED,
+            "у проекта не задан workspace_path — клона, который можно сверить, нет",
+            declared,
+        )
+    if not os.path.isdir(path):
+        return BranchSyncState(
+            BRANCH_UNCHECKED,
+            f"{path} не существует — workspace не провижинен",
+            declared,
+        )
+    rc, out = _git(path, "rev-parse", "--git-dir")
+    if rc != 0:
+        return BranchSyncState(
+            BRANCH_UNCHECKED,
+            f"{path} не читается как git-репозиторий: {out[:200] or 'git не ответил'}",
+            declared,
+        )
+    if not declared:
+        return BranchSyncState(
+            BRANCH_UNCHECKED,
+            "проект не объявляет ветку — сверять не с чем",
+            "",
+            _recorded_base(path),
+        )
+    recorded = _recorded_base(path)
+    if recorded == declared:
+        return BranchSyncState(
+            BRANCH_IN_SYNC,
+            f"клон защищает ветку проекта: {declared}",
+            declared,
+            recorded,
+        )
+    if not recorded:
+        return BranchSyncState(
+            BRANCH_DIVERGED,
+            f"в клоне не записан {BASE_BRANCH_KEY}: хук защищает свою "
+            f"умолчательную ветку, а не объявленную проектом ({declared})",
+            declared,
+            "",
+        )
+    return BranchSyncState(
+        BRANCH_DIVERGED,
+        f"проект объявляет {declared}, клон защищает {recorded}",
+        declared,
+        recorded,
+    )
+
+
+def _recorded_base(repo: str) -> str:
+    """The base branch this clone records, or "" when the key is unset."""
+    rc, out = _git(repo, "config", "--get", BASE_BRANCH_KEY)
+    return out.strip() if rc == 0 else ""
+
+
 def activate(repo: str) -> HookStatus:
     """Point git at the hook. Idempotent; returns the resulting status.
 

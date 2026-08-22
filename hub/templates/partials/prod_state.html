@@ -1,0 +1,65 @@
+{# #500: что раскатано и что до прода не доехало — одним взглядом.
+
+   Читает снимок из #499, тот же сборщик, что кормит REST, CLI и MCP:
+   четвёртый читатель одной правды, а не четвёртая её версия.
+
+   unknown отдельным списком, как и везде в эпике: слить его с not_in_prod
+   значило бы превратить «не смогли определить» в «не доехало». #}
+<div class="task-content-card" id="prod-state">
+    <div class="task-card-header">
+        <h2>Что в проде</h2>
+        {% if prod_state and prod_state.deployed.sha %}
+        <span class="badge badge--xs badge-test">{{ prod_state.deployed.sha[:12] }}</span>
+        {% else %}
+        <span class="badge badge--xs badge-pending">неизвестно</span>
+        {% endif %}
+    </div>
+
+    {% if prod_state %}
+    <div class="task-action-note">
+        {% if prod_state.deployed.sha %}
+        Раскатано: <code class="code-sm">{{ prod_state.deployed.sha[:12] }}</code>
+        {% if prod_state.deployed.ref %}({{ prod_state.deployed.ref }}){% endif %}
+        {% if prod_state.deployed.at %}от {{ prod_state.deployed.at }}{% endif %}
+        {% if prod_state.deployed.source %}<span class="muted">записал {{ prod_state.deployed.source }}</span>{% endif %}
+        {% else %}
+        <span class="muted">Успешных выкатов не записано — хаб не знает, что раскатано.
+        Это незнание, а не «ничего не доехало».</span>
+        {% endif %}
+    </div>
+
+    {% for bucket, label, style in [
+        ('not_in_prod', 'Смёржено, но не раскатано', 'failed'),
+        ('unknown', 'Состояние неизвестно', 'pending'),
+        ('in_prod', 'В проде', 'test')
+    ] %}
+    {% set entries = prod_state[bucket] %}
+    <details class="task-action-note"{% if bucket == 'not_in_prod' and entries %} open{% endif %}>
+        <summary class="project-edit-summary">
+            {{ label }}
+            <span class="badge badge--xs badge-{{ style }}">{{ entries | length }}</span>
+        </summary>
+        {% if entries %}
+        <ul class="task-review-findings">
+            {% for e in entries %}
+            <li><a href="/tasks/{{ e.task_id }}">#{{ e.task_id }}</a> {{ e.title }}
+                {% if bucket != 'in_prod' and e.reason %}<span class="muted">— {{ e.reason }}</span>{% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <div class="u-text-muted">пусто</div>
+        {% endif %}
+    </details>
+    {% endfor %}
+
+    {# Окно печатается всегда: ограниченный список, поданный как вся доска,
+       читается как полная картина — то, что #824 отказался выпускать. #}
+    <div class="u-text-muted">{{ prod_state.note }}</div>
+    {% else %}
+    <div class="task-action-note">
+        <span class="muted">Снимок прод-состояния собрать не удалось — причина в логе хаба.
+        Это не значит, что ничего не раскатано.</span>
+    </div>
+    {% endif %}
+</div>

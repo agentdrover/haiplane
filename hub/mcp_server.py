@@ -6,7 +6,7 @@ import json
 import time
 import urllib.parse
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -43,6 +43,7 @@ from hub.mcp_structured import (
     HubTaskStatusResult,
     HubTaskStatusStructured,
     structured_echo_result,
+    structured_error_result,
     structured_tool_result,
 )
 
@@ -680,7 +681,7 @@ async def hub_add_dependency(task_id: int, depends_on_task_id: int) -> CallToolR
             {"depends_on_task_id": depends_on_task_id},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     verb = "создано" if result.get("created") else "уже было"
     return structured_echo_result(
         f"Зависимость #{task_id} → #{depends_on_task_id}: ребро {verb}.",
@@ -706,7 +707,7 @@ async def hub_remove_dependency(
             f"/api/tasks/{task_id}/dependencies/{depends_on_task_id}"
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     verb = "снято" if result.get("removed") else "и так отсутствовало"
     return structured_echo_result(
         f"Зависимость #{task_id} → #{depends_on_task_id}: ребро {verb}.",
@@ -727,7 +728,7 @@ async def hub_list_dependencies(task_id: int) -> CallToolResult:
     try:
         edges = await _api_get(f"/api/tasks/{task_id}/dependencies")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     return structured_echo_result(_format_dependency_edges(edges), dependencies=edges)
 
 
@@ -901,7 +902,25 @@ def _format_hub_report_done_message(task_id: int, report_id: int, status: str) -
 
 
 def _format_hub_api_error(err: HubApiError) -> str:
+    """Отказ для инструментов, чей УСПЕХ тоже строка.
+
+    В модуле два семейства инструментов: одни отвечают структурой, другие —
+    строкой. Формат отказа должен совпадать с форматом успеха ТОГО ЖЕ
+    инструмента, иначе клиент разбирает его ответ двумя способами — ровно то,
+    что чинит #895. Для структурных есть _error_result ниже.
+    """
     return json.dumps(enrich_error_payload(err.payload), ensure_ascii=False)
+
+
+def _error_result(err: HubApiError) -> CallToolResult:
+    """Отказ для инструментов, чей успех — CallToolResult (#895).
+
+    Семнадцать инструментов объявляли CallToolResult, а на пути ошибки отдавали
+    строку: тип обещал одно, код возвращал другое, и уточнить сигнатуру было
+    нельзя — SDK запрещает CallToolResult в Union. Текст при этом не меняется,
+    он остаётся тем же плоским payload.
+    """
+    return structured_error_result(enrich_error_payload(err.payload))
 
 
 def _format_mutation_success(
@@ -1023,11 +1042,14 @@ async def hub_task_tree(
         mode=mode,
     )
     tree = await _api_get(f"/api/tasks/{task_id}/tree{query}")
+    # Условное выражение внутри вызова не сужало str до допустимых значений:
+    # проверка была, а тип оставался прежним.
+    tree_mode: Literal["full", "summary"] = "summary" if mode == "summary" else "full"
     options = TreeOutputOptions(
         depth=depth,
         max_nodes=max_nodes,
         max_chars=max_chars,
-        mode=mode if mode in ("full", "summary") else "full",
+        mode=tree_mode,
     )
     rendered = render_task_tree(tree, options)
     return structured_echo_result(rendered.text, tree=tree)
@@ -1464,7 +1486,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     try:
         brief = await _api_get(f"/api/tasks/{task_id}/review-brief")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     parts = []
     # #433: fail-fast self-review notice goes FIRST so the reviewer stops
     # before spending review effort — hub_submit_review would reject anyway.
@@ -2135,7 +2157,7 @@ async def hub_submit_machine_review(
     try:
         result = await _api_post(f"/api/tasks/{task_id}/machine-review", body)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     confirmed = len(result.get("findings_confirmed") or [])
     rejected = len(result.get("findings_rejected") or [])
     # Every number in this line comes from what was STORED, not from what was
@@ -2170,7 +2192,7 @@ async def hub_outcome_debt() -> CallToolResult:
     try:
         data = await _api_get("/api/metrics/outcome-debt")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     items = data.get("items", [])
     answered = data.get("answered_total", 0)
     # Both numbers in the header: the unanswered count alone can only grow, so
@@ -2237,7 +2259,7 @@ async def hub_answer_outcome(
             {"verdict": verdict, "measured_value": measured_value, "note": note},
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     latest = result.get("latest_answer") or {}
     return structured_echo_result(
         f"Outcome of task #{task_id} answered: {latest.get('verdict', verdict)} "
@@ -2258,7 +2280,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     try:
         data = await _api_get(f"/api/metrics/practices?since_days={since_days}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     mr = data.get("machine_reviews", {})
     lines = [
         f"Machine reviews ({data.get('since_days')}d): {mr.get('reviews', 0)} "
@@ -2347,7 +2369,7 @@ async def hub_record_live_check(
     try:
         check = await _api_post(f"/api/tasks/{task_id}/live-check", payload)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     where = check.get("sha") or "sha неизвестен"
     return structured_echo_result(
         f"Живая проверка записана для #{task_id} [{check.get('outcome')}, {where}].",
@@ -2417,7 +2439,7 @@ async def hub_send_message(
     try:
         result = await _api_post("/api/messages", payload)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     delivery = result.get("delivery", {})
     message = result.get("message", {})
     return structured_echo_result(
@@ -2455,7 +2477,7 @@ async def hub_inbox(
     try:
         rows = await _api_get("/api/messages?" + "&".join(query))
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     if not rows:
         return structured_echo_result("Инбокс пуст.", messages=[])
     return structured_echo_result(
@@ -2512,7 +2534,7 @@ async def hub_session_register(
             },
         )
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     return structured_echo_result(
         f"Session registered: {_format_session(session)}", session=session
     )
@@ -2531,7 +2553,7 @@ async def hub_session_heartbeat(session_id: str) -> CallToolResult:
     try:
         session = await _api_post(f"/api/sessions/{session_id}/heartbeat", {})
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     return structured_echo_result(
         f"Heartbeat recorded: {_format_session(session)}", session=session
     )
@@ -2557,7 +2579,7 @@ async def hub_sessions(agent: str = "", status: str = "") -> CallToolResult:
     try:
         rows = await _api_get(path)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     # #852: the registry answers "who is around", and on its own that reads as
     # the whole picture. A task claimed or running with no session behind it is
     # invisible here for exactly the reason it matters — there is no address to
@@ -2621,7 +2643,7 @@ async def hub_get_skill(name: str) -> CallToolResult:
     try:
         skill = await _api_get(f"/api/skills/{name}")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     return structured_echo_result(
         f"{skill['name']} v{skill['version']} [{skill['kind']}]\n\n{skill['content']}",
         skill=skill,
@@ -2650,7 +2672,7 @@ async def hub_propose_skill(
     try:
         skill = await _api_post("/api/skills", body)
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     return structured_echo_result(
         f"Skill {skill['name']} v{skill['version']} proposed "
         f"(status: {skill['status']}). A human activates it.",
@@ -2673,7 +2695,7 @@ async def hub_provision_project(project_id: int) -> CallToolResult:
     try:
         result = await _api_post(f"/api/projects/{project_id}/provision")
     except HubApiError as exc:
-        return _format_hub_api_error(exc)
+        return _error_result(exc)
     status_value = result.get("provision_status", "?")
     detail = result.get("provision_detail", "")
     project = result.get("project") or {}
@@ -2706,7 +2728,7 @@ async def hub_wait_events(
     """
     from urllib.parse import urlencode
 
-    params = {"since": since, "wait": wait}
+    params: dict[str, Any] = {"since": since, "wait": wait}
     if kinds:
         # "message" is what an agent means; "message_posted" is what the feed
         # calls it. Translating here keeps the internal name internal instead

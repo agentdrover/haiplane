@@ -2137,6 +2137,22 @@ class SkillView(BaseModel):
         return v
 
 
+class CloneBranchState(BaseModel):
+    """Whether a project's clone protects the branch the project declares (#887).
+
+    ``state`` is ``match`` | ``diverged`` | ``unknown``, and the three are never
+    collapsed into two: a clone the hub could not read is not a clone that
+    agrees. ``reason`` is filled in every state, and both branch names are
+    carried in ``diverged`` — a report that names one side says something is
+    wrong without saying what to change.
+    """
+
+    state: str = "unknown"
+    reason: str = "сверка клона с проектом не выполнялась"
+    project_branch: str = ""
+    clone_branch: str = ""
+
+
 class ProjectView(BaseModel):
     id: int
     slug: str
@@ -2151,6 +2167,10 @@ class ProjectView(BaseModel):
     archived: bool = False
     provision_status: str = "none"
     provision_detail: str = ""
+    # #887: what the clone actually protects, next to what the project declares.
+    # Default is the unchecked state with its own reason, so a reader that never
+    # filled it cannot be mistaken for one that looked and found agreement.
+    clone_branch: CloneBranchState = Field(default_factory=CloneBranchState)
     created_at: str = ""
     updated_at: str = ""
 

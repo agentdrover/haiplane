@@ -74,6 +74,27 @@ def structured_echo_result(summary: str, **payload: Any) -> CallToolResult:
     )
 
 
+def structured_error_result(payload: dict[str, Any]) -> CallToolResult:
+    """Отказ инструмента в том же виде, в каком приходит успех (#895).
+
+    Текстовая часть — ровно та строка, которую FastMCP делал из возвращаемой
+    ``str``: плоский JSON payload, БЕЗ echo-обёртки ``{"message": ...}``,
+    которой заворачиваются успехи. Клиент, читающий текст, не видит разницы.
+
+    ``isError`` намеренно не выставляется. Сегодня его нет, отказ разбирают по
+    полю ``reason`` в payload, а клиенты трактуют ``isError`` как протокольный
+    сбой и обрабатывают отдельным путём. Поставить его значило бы поменять
+    поведение, тогда как задача — выпрямить объявленный тип. Решение владельца
+    от 22.08.2026; если понадобится обратное, это отдельное изменение.
+    """
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))
+        ],
+        structuredContent=payload,
+    )
+
+
 def structured_tool_result(summary: str, payload: BaseModel) -> CallToolResult:
     """Return MCP CallToolResult with human text and machine-readable structuredContent."""
     data = with_instance_echo(payload.model_dump(mode="json"))

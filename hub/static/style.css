@@ -3531,6 +3531,8 @@ body.htmx-request .htmx-progress {
 .project-admin-facts { display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; margin: .5rem 0; font-size: .85rem; }
 .project-admin-facts dt { color: var(--text-secondary); }
 .project-admin-facts dd { margin: 0; word-break: break-all; }
+/* #887: причина расхождения клона с проектом — текстом под бейджем. */
+.project-admin-note { display: block; margin-top: .15rem; color: var(--text-secondary); font-size: .8rem; word-break: normal; }
 .project-admin-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .4rem; }
 .project-admin-edit { margin-top: .3rem; }
 
