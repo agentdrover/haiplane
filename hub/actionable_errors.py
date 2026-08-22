@@ -230,21 +230,62 @@ def claim_without_session_detail(*, task_id: int, tool: str) -> dict[str, Any]:
     a holder check made of names. Everything addressable routes by session
     (registry #771, messages #773, wake-up #774), so such a task cannot be
     asked a question or woken up.
+
+    The hint also names a REST fallback (#899). A client fixes its tool
+    schemas when the session starts and never refreshes them, so a session
+    opened before the hub shipped this requirement has no ``session_id``
+    parameter to pass: it is told to do something its own schema makes
+    impossible. That happened on #498 and twice more the next day, and each
+    time the work continued only because the agent happened to know REST and
+    hold a token. An agent without that knowledge simply stops, and from the
+    outside it reads as "the agent is broken" rather than "two versions
+    disagree".
+
+    So the refusal answers both readers. A caller that CAN pass the field is
+    told to pass it — that stays the first line. A caller whose schema
+    predates the field is told what actually happened and given a call it can
+    make today. The fallback is called temporary on purpose: a workaround
+    that reads as a normal mode of operation becomes one.
     """
+    # Spelled out per tool: the two take the task through different endpoints
+    # and different bodies, and a hint that leaves the reader to guess the
+    # shape is the same dead end as one naming an impossible field.
+    if tool == "hub_pair_start":
+        rest_call = (
+            f"POST /api/tasks/{task_id}/pair-start with body "
+            '{"assigned_agent": "<your agent name>", '
+            '"session_id": "<your session>", "plan": "Plan: ..."}'
+        )
+    else:
+        rest_call = (
+            f"POST /api/tasks/{task_id}/claim with body "
+            '{"agent": "<your agent name>", "session_id": "<your session>"}'
+        )
     return enrich_error_payload(
         {
             "reason": "claim_without_session",
             "actor_hint": "agent",
             "message": (
                 f"Task #{task_id}: session_id is required to take a task — "
-                "an agent name does not identify which session is working"
+                "an agent name does not identify which session is working. "
+                "If your tool schema offers no session_id, your session "
+                "predates the requirement and the hint names a call that "
+                "works today"
             ),
             "hint": (
                 f"Pass your session id: {tool}(task_id={task_id}, "
                 "session_id='<your session>'). Register it first with "
                 "hub_session_register(session_id=...) so other sessions can "
                 "reach you about this task. The same id must be used for "
-                "hub_pair_start and hub_release_task."
+                "hub_pair_start and hub_release_task. "
+                "IF YOUR TOOL SCHEMA HAS NO session_id PARAMETER: this is a "
+                "version mismatch, not your mistake — your client fixed its "
+                "tool list when the session started, and the hub has shipped "
+                "the field since. Nothing you can call adds the parameter. "
+                "Until this session is restarted, take the task over REST "
+                f"with the same token: {rest_call}. That is a way around a "
+                "version gap, not the normal route — a session started now "
+                "gets the field and should use the tool."
             ),
             "task_id": task_id,
             "suggested_tool": tool,
