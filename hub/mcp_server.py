@@ -1734,7 +1734,9 @@ async def hub_release_task(
 
 
 @mcp.tool()
-async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
+async def hub_force_complete_task(
+    task_id: int, comment: str = "", pr_disposition: str = ""
+) -> str:
     """Human force-completes a stuck task without an agent done report.
 
     Audited override for any non-terminal ``task`` or ``subtask`` when no *active*
@@ -1748,10 +1750,14 @@ async def hub_force_complete_task(task_id: int, comment: str = "") -> str:
     Args:
         task_id: Task or subtask to complete
         comment: Audit-trail reason; required for most active lifecycle states
+        pr_disposition: The PR's fate — 'deliver'|'abandon'|''. Recorded,
+            never acted on (#897).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
-    body = {"comment": comment} if comment else None
+    body: dict[str, Any] | None = None
+    if comment or pr_disposition:
+        body = {"comment": comment, "pr_disposition": pr_disposition}
     try:
         result = await _api_post(f"/api/tasks/{task_id}/force-complete", body)
     except HubApiError as exc:
@@ -1958,6 +1964,7 @@ async def hub_decide_task(
     instructions: str = "",
     decision_summary: str = "",
     record_decision: bool = False,
+    pr_disposition: str = "",
 ) -> str:
     """Human decision after arbiter review — the Decision Gate.
 
@@ -1977,12 +1984,16 @@ async def hub_decide_task(
         instructions: When action='rework', what needs to be fixed
         decision_summary: Short summary/reason for the decision (recorded in task updates)
         record_decision: If True, also persist the decision through the notes integration
+        pr_disposition: On accept, the PR's fate — 'deliver'|'abandon'|''.
+            Recorded, never acted on: the task stays in
+            hub_undelivered_completed until the PR itself moves (#897).
     """
     body: dict[str, Any] = {
         "action": action,
         "instructions": instructions,
         "decision_summary": decision_summary,
         "record_decision": record_decision,
+        "pr_disposition": pr_disposition,
     }
     prior_status: str | None = None
     try:
@@ -2173,6 +2184,43 @@ async def hub_submit_machine_review(
         f"{confirmed} confirmed / {rejected} rejected.",
         machine_review=result,
     )
+
+
+@mcp.tool()
+async def hub_undelivered_completed() -> CallToolResult:
+    """Completed tasks whose PR is neither merged nor closed (#897).
+
+    Reads answers stored by the periodic sweep, so it costs nothing. Rows the
+    hub could not establish come back apart: "could not ask" is not "nobody
+    delivered it".
+    """
+    try:
+        data = await _api_get("/api/delivery/discrepancies")
+    except HubApiError as exc:
+        return _error_result(exc)
+    rows = data.get("undelivered", [])
+    unknown = data.get("unknown", [])
+    if not rows:
+        lines = ["No completed task is waiting on an open PR."]
+    else:
+        lines = [f"{len(rows)} completed task(s) with an open PR:", ""]
+        for row in rows:
+            lines.append(
+                f"#{row['task_id']} {row.get('title', '')} — PR "
+                f"#{row.get('pr_number')} open for {row.get('age_hours', '?')}h"
+            )
+            lines.append(f"    {row.get('reason', '')}")
+            if row.get("accepted_via"):
+                lines.append(
+                    f"    completed via: {row['accepted_via']}"
+                    f" · owner said: {row.get('disposition') or 'nothing about the PR'}"
+                )
+    if unknown:
+        lines.append("")
+        lines.append(f"{len(unknown)} task(s) the hub could not check:")
+        for row in unknown:
+            lines.append(f"#{row['task_id']} — {row.get('reason', '')}")
+    return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 
 @mcp.tool()

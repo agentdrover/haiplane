@@ -24,6 +24,14 @@ Computed, never stored. The answer changes with every deploy — a task that is
 ``not_in_prod`` at noon is ``in_prod`` after the next release without anything
 about the task changing. A cached flag would be one more thing that goes stale,
 which is precisely the class of defect this epic exists to remove.
+
+One later question in this file is stored, and the difference is worth naming
+(#897, bottom of the file): "is this completed task's PR still open" is asked
+of GitHub, not of git, and it is asked on behalf of a list that renders on
+every dashboard load. Recomputing it per render would put the whole board at
+the mercy of a provider that has no opinion about how often people refresh a
+page. So that one is swept on a timer and read from a table — the same trade
+#883 made for deploy commits — while everything above stays computed.
 """
 
 from __future__ import annotations
@@ -378,3 +386,337 @@ async def with_delivery(
     """The same enrichment for every reader (#885) — the gate (#484), the task
     context (#485), REST (#486) and MCP (#487) must not answer differently."""
     return [await blocker_delivery(db, b) for b in blockers]
+
+
+# --- Completed, but where is the work? (#897) -------------------------------
+#
+# 21.08.2026: #878 and #885 were ``completed`` for two hours with their code
+# outside develop. Nothing lied. The gate refused to merge because CI was still
+# running and said so; the human took the exit the refusal offered and accepted
+# the task; CI went green minutes later and by then the PR had no owner —
+# the gate delivers on a done report, and a completed task never files one
+# again. Two right behaviours, and the work fell through the seam between them.
+#
+# What is added here is the missing fact, not a new rule: after this, a
+# completed task whose PR is still open is a row somebody can read, and manual
+# acceptance says out loud what it is leaving behind. Accepting by hand stays
+# allowed in every form — it is the owner's way out, sometimes because the work
+# is deliberately cancelled.
+
+DELIVERED = "delivered"
+PR_OPEN = "pr_open"
+PR_CLOSED = "pr_closed"
+# UNKNOWN, defined above for #497, is reused verbatim: one vocabulary for
+# "could not look", so a reader does not have to learn a second one.
+
+#: What the owner said should happen to the PR when they accepted by hand.
+#: Empty is a real value — "not stated" — and never reads as either choice.
+DISPOSITION_DELIVER = "deliver"
+DISPOSITION_ABANDON = "abandon"
+DISPOSITIONS = (DISPOSITION_DELIVER, DISPOSITION_ABANDON)
+
+_DISPOSITION_TEXT = {
+    DISPOSITION_DELIVER: "Владелец сказал: работу довезти, PR остаётся к мержу",
+    DISPOSITION_ABANDON: "Владелец сказал: работа отменена, PR закрыть",
+    "": "Судьба PR не выбрана",
+}
+
+
+def _task_answer(
+    state: str, reason: str, *, pr_number: int | None, delivery_path: str
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "reason": reason,
+        "pr_number": pr_number,
+        "delivery_path": delivery_path,
+    }
+
+
+async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
+    """Did this task's work reach the base branch — and if not, why not?
+
+    Four named answers, three of which are the #546/#572 triad applied to one
+    task: ``delivered`` (yes), ``pr_open`` (no, and the PR is still standing),
+    ``unknown`` (could not look, with the cause). ``pr_closed`` is the fourth
+    because it is neither: a PR closed without a merge is work dropped on
+    purpose, and calling that ``delivered`` would be a lie while calling it
+    ``pr_open`` would raise an alarm about a decision already taken. What is
+    NOT done here is collapsing ignorance into either definite answer — that is
+    the line this codebase has now drawn three times.
+
+    The delivery fact is computed exactly the way #885 computes it for a
+    blocker, through the same functions: the gate's own merge first (free),
+    then the base branch, and only then the provider. There is no second source
+    of truth about delivery in this file or anywhere else.
+
+    ``delivery_path`` keeps #885's vocabulary — gate | outside_gate | unknown |
+    none — so the two readers describe the same world with the same words.
+
+    Not a rival to ``prod_state`` (#499), which asks a later question: whether
+    a MERGED task is in the deployed commit. A task whose PR never merged has
+    no merge sha, so it lands in that snapshot's ``unknown`` bucket alongside
+    everything else the hub did not merge — correct there, and useless for
+    finding the case here. Both read the same facts through this module; they
+    differ in what they ask of them, which is why neither is a second source.
+    """
+    task_id = int(task["id"])
+    pr_raw = task.get("pr_number")
+    pr_number = int(pr_raw) if pr_raw is not None else None
+
+    if await repo.merge_sha_for_task(db, task_id):
+        return _task_answer(
+            DELIVERED,
+            "хаб смержил эту задачу сам — работа в базовой ветке",
+            pr_number=pr_number,
+            delivery_path="gate",
+        )
+
+    reached = await merged_into_base(db, task)
+    if reached is True:
+        return _task_answer(
+            DELIVERED,
+            "код в базовой ветке, но мерж прошёл мимо гейта",
+            pr_number=pr_number,
+            delivery_path="outside_gate",
+        )
+
+    if pr_number is None:
+        # Assumption stated on the task: a completed task with no pinned PR is
+        # indistinguishable here from work that never needed one. Saying so is
+        # the honest answer; guessing would put research and spikes on a list
+        # about undelivered pull requests.
+        return _task_answer(
+            UNKNOWN,
+            "у задачи не закреплён PR — по нему сверять нечего. "
+            "Это не «не доставлено»: работы без ветки здесь не отличить",
+            pr_number=None,
+            delivery_path="none",
+        )
+
+    base_note = "" if reached is False else "; базовую ветку проверить не удалось"
+    workspace, gh_repo = "", ""
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_id)
+        workspace = (ctx.get("repo") or "").strip()
+        gh_repo = (ctx.get("gh_repo") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - a refusal to answer, never a 500
+        log.warning("delivery check for #%s: no git context: %s", task_id, exc)
+        return _task_answer(
+            UNKNOWN,
+            f"рабочую копию проекта определить не удалось: {exc}. "
+            f"Состояние PR #{pr_number} не спрашивали{base_note}",
+            pr_number=pr_number,
+            delivery_path="unknown",
+        )
+
+    try:
+        state = (
+            (
+                await plugins.git_ops.pr_state(
+                    pr_number, repo=workspace or None, gh_repo=gh_repo or None
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+    except Exception as exc:  # noqa: BLE001 - the provider blinking is not a verdict
+        log.warning("pr_state for #%s (PR #%s): %s", task_id, pr_number, exc)
+        state = ""
+
+    if state == "merged":
+        return _task_answer(
+            DELIVERED,
+            f"PR #{pr_number} смержен, но записи о мерже у хаба нет — "
+            "доставка прошла мимо гейта",
+            pr_number=pr_number,
+            delivery_path="outside_gate",
+        )
+    if state == "open":
+        return _task_answer(
+            PR_OPEN,
+            f"PR #{pr_number} открыт и не смержен — работа не в базовой ветке",
+            pr_number=pr_number,
+            delivery_path="none",
+        )
+    if state == "closed":
+        return _task_answer(
+            PR_CLOSED,
+            f"PR #{pr_number} закрыт без мержа — работу свернули намеренно",
+            pr_number=pr_number,
+            delivery_path="none",
+        )
+    return _task_answer(
+        UNKNOWN,
+        f"состояние PR #{pr_number} узнать не удалось: провайдер не ответил. "
+        f"Это не «доставлено» и не «не доставлено»{base_note}",
+        pr_number=pr_number,
+        delivery_path="unknown",
+    )
+
+
+def _acceptance_note(answer: dict[str, Any], disposition: str) -> str:
+    """The sentence a manual acceptance leaves behind instead of silence."""
+    intent = _DISPOSITION_TEXT.get(disposition, _DISPOSITION_TEXT[""])
+    if answer["state"] == PR_OPEN:
+        head = f"Задача принята вручную, но работа НЕ доставлена: {answer['reason']}."
+    elif answer["state"] == UNKNOWN:
+        head = (
+            f"Задача принята вручную, доставку подтвердить не удалось: "
+            f"{answer['reason']}."
+        )
+    else:
+        head = f"Задача принята вручную: {answer['reason']}."
+    # Not ``.capitalize()``: it lowercases the rest of the string, and "PR"
+    # became "pr" in the one sentence whose job is to name a pull request.
+    return (
+        f"{head} {intent}. "
+        "Принятие руками — законный выход, и оно ничего не отменяет: "
+        "запись оставлена, чтобы работа не потерялась молча (#897)."
+    )
+
+
+async def note_completion_without_delivery(
+    db: Any,
+    task_id: int,
+    *,
+    via: str,
+    actor: str = "human",
+    disposition: str = "",
+) -> dict[str, Any] | None:
+    """Say out loud what a completion outside the delivery gate left behind.
+
+    Called from every path that turns a task ``completed`` without the gate
+    having merged anything — human acceptance after arbitration, the human
+    force-complete override, and the unreviewed ``pending_report`` done report.
+    The gate's own path needs nothing: it completes only after merging.
+
+    Never raises and never blocks: a completion that already happened must not
+    be undone because GitHub was slow, and manual acceptance stays available in
+    every form. Returns the answer it recorded, or ``None`` if it could not
+    look at the task at all.
+    """
+    try:
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            return None
+        task = dict(row)
+        if not task.get("pr_number"):
+            # No pinned PR: #498's warning already covers "work that never
+            # started delivering", and repeating it here would put two
+            # different findings under one name.
+            return None
+        answer = await task_delivery(db, task)
+        disposition = disposition if disposition in DISPOSITIONS else ""
+        await repo.record_delivery_discrepancy(
+            db,
+            task_id=task_id,
+            state=answer["state"],
+            reason=answer["reason"],
+            pr_number=answer["pr_number"],
+            delivery_path=answer["delivery_path"],
+            disposition=disposition,
+            accepted_via=via,
+            # The alert below IS this state's alert, so the sweep must not
+            # repeat it. Delivered rows carry no alert to suppress.
+            alerted_state=(answer["state"] if answer["state"] != DELIVERED else ""),
+        )
+        if answer["state"] != DELIVERED:
+            await repo.add_task_update(
+                db, task_id, "hub", "alert", _acceptance_note(answer, disposition)
+            )
+            await repo.insert_event(
+                db,
+                kind="completed_without_delivery",
+                task_id=task_id,
+                actor=actor,
+                payload={
+                    "via": via,
+                    "state": answer["state"],
+                    "pr": answer["pr_number"],
+                    "disposition": disposition,
+                },
+            )
+            await db.commit()
+        return answer
+    except Exception:  # noqa: BLE001 - a note about a completion, not a gate
+        log.exception("could not record delivery state for completed #%s", task_id)
+        return None
+
+
+async def scan_completed_deliveries(
+    db: Any, *, lookback_days: int = 30, limit: int = 100
+) -> list[dict[str, Any]]:
+    """Periodic reconciliation of "completed" against "the PR is still open".
+
+    Modelled on the stale-alert loop in ``hub/poller.py``: run on a timer, look
+    only at rows that can still be news, and alert at most once per state so
+    the owner is told something new rather than reminded every half minute.
+    Repeats are damped by ``alerted_state`` on the stored row rather than by
+    matching alert text — durable, and it survives an unrelated update landing
+    on the task, which the text heuristic does not.
+
+    This is the only place that pays a provider call for this question. Every
+    reader — the inbox, REST, MCP — reads the rows it writes, which is what
+    keeps "показать расхождение" from costing a network round trip per card.
+    """
+    candidates = await repo.completed_tasks_awaiting_delivery(
+        db, lookback_days=lookback_days, limit=limit
+    )
+    found: list[dict[str, Any]] = []
+    for row in candidates:
+        task = dict(row)
+        task_id = int(task["id"])
+        try:
+            answer = await task_delivery(db, task)
+            prior = await repo.get_delivery_discrepancy(db, task_id)
+            already = (prior or {}).get("alerted_state") or ""
+            should_alert = answer["state"] in (PR_OPEN, UNKNOWN) and (
+                already != answer["state"]
+            )
+            await repo.record_delivery_discrepancy(
+                db,
+                task_id=task_id,
+                state=answer["state"],
+                reason=answer["reason"],
+                pr_number=answer["pr_number"],
+                delivery_path=answer["delivery_path"],
+                alerted_state=(answer["state"] if should_alert else None),
+            )
+            if should_alert:
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "alert",
+                    f"Задача числится completed, но работа не доставлена: "
+                    f"{answer['reason']}. Расхождение видно в списке "
+                    "недоставленных завершённых задач (#897).",
+                )
+                await db.commit()
+            if answer["state"] == PR_OPEN:
+                found.append({"task_id": task_id, **answer})
+        except Exception:  # noqa: BLE001 - one bad row must not stop the sweep
+            log.exception("delivery sweep failed for #%s", task_id)
+    return found
+
+
+async def undelivered_completed_tasks(
+    db: Any, *, project_id: int | None = None, limit: int = 50
+) -> dict[str, Any]:
+    """The discrepancy list as the owner reads it — stored answers only.
+
+    ``unknown`` rows travel beside the list, never inside it: a question the
+    hub could not ask is not a task somebody forgot to deliver, and mixing the
+    two is how a list stops being believed.
+    """
+    open_rows = await repo.list_delivery_discrepancies(
+        db, states=(PR_OPEN,), project_id=project_id, limit=limit
+    )
+    unknown_rows = await repo.list_delivery_discrepancies(
+        db, states=(UNKNOWN,), project_id=project_id, limit=limit
+    )
+    return {"undelivered": open_rows, "unknown": unknown_rows}

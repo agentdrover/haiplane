@@ -533,9 +533,20 @@ class TaskReject(BaseModel):
     comment: str = ""
 
 
+#: What the owner wants done with the PR of a task they accept by hand (#897).
+#: Empty is the honest default — "not stated" — and is recorded as such rather
+#: than guessed. It is a declaration of intent, never a fact about delivery
+#: (#484) and never a trigger: nothing is merged or closed on its strength.
+PR_DISPOSITION_PATTERN = "^(|deliver|abandon)$"
+
+
 class TaskForceComplete(BaseModel):
     # Reason for the human override; recorded as the audit-trail message.
     comment: str = ""
+    # The same choice the Decision Gate offers (#897): force-complete is the
+    # other door a human walks through to close a task without the delivery
+    # gate, and closing one of two doors is how this class of hole survives.
+    pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
 
 
 class TaskStart(BaseModel):
@@ -1105,6 +1116,7 @@ class TaskDecide(BaseModel):
     instructions: str = Field("", max_length=10000)
     decision_summary: str = Field("", max_length=5000)
     record_decision: bool = False
+    pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
 
 
 REPORT_KINDS = frozenset({"done", "status", "blocker"})
