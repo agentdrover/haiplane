@@ -78,6 +78,15 @@ COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
 # submit the hub has the truth, so there are no name-matching heuristics and
 # no false positives by construction.
 SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
+# Deterministic submit rules (#855): the cheap layer that runs BEFORE the paid
+# reviewer, on the diff the submission already resolved (#583) — no extra git
+# call, no tokens. 'warn' (default) reports; 'require' refuses a submission
+# that changes code without touching a single test; 'off' disables it. The
+# measurement behind it (#854, 30 days): the paid reviewer confirmed
+# test-coverage / test-adequacy / missing-test-hides-defect findings at 124k
+# tokens each, and 61% of its raw findings were rejected — two thirds of the
+# budget spent on noise a rule cannot produce.
+SUBMIT_RULES = os.environ.get("OPENCLAW_SUBMIT_RULES", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved

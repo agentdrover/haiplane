@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from hub import commit_scope
 from hub.commit_scope import foreign_paths, parse_porcelain_paths
 
 
@@ -110,3 +111,36 @@ def test_untracked_and_modified_are_both_seen(tmp_path: Path) -> None:
 
     assert sorted(paths) == ["app.py", "notes.txt"]
     assert foreign_paths(paths, ["app.py"]) == ["notes.txt"]
+
+
+# ---- #855: deterministic rules over the diff, before the paid reviewer ----
+
+
+def test_is_test_path_decides_by_location_and_name():
+    assert commit_scope.is_test_path("tests/test_api.py")
+    assert commit_scope.is_test_path("hub/services/tests/test_thing.py")
+    assert commit_scope.is_test_path("pkg/thing_test.py")
+    assert not commit_scope.is_test_path("hub/services/lifecycle.py")
+    # "testing" is not "tests": a substring match would swallow real code.
+    assert not commit_scope.is_test_path("hub/testing_helpers.py")
+    assert not commit_scope.is_test_path("")
+
+
+def test_code_without_tests_names_the_code_it_speaks_about():
+    diff = ["hub/app.py", "hub/db.py", "uv.lock"]
+    assert commit_scope.code_without_tests(diff) == ["hub/app.py", "hub/db.py"]
+
+    # A single touched test satisfies the rule: it asks whether tests moved
+    # with the code, not whether they moved enough — that is a reviewer's
+    # question, and a path check must not pretend to answer it.
+    assert commit_scope.code_without_tests(diff + ["tests/test_api.py"]) == []
+
+    # Routine-only and empty diffs have no code to speak about.
+    assert commit_scope.code_without_tests(["uv.lock"]) == []
+    assert commit_scope.code_without_tests([]) == []
+
+
+def test_tests_only_is_a_signal_about_bug_fixes():
+    assert commit_scope.tests_only(["tests/test_api.py", "uv.lock"])
+    assert not commit_scope.tests_only(["tests/test_api.py", "hub/app.py"])
+    assert not commit_scope.tests_only([])

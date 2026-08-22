@@ -23,6 +23,9 @@ __all__ = [
     "foreign_paths",
     "ROUTINE_PATHS",
     "SCOPE_GROWTH_MARKER",
+    "is_test_path",
+    "code_without_tests",
+    "tests_only",
 ]
 
 # #890: the opening words of the update that records areas accepted at
@@ -105,3 +108,51 @@ def foreign_paths(dirty: list[str], affected_areas: list[str]) -> list[str]:
         if not any(path == a or path.startswith(a + "/") for a in areas):
             out.append(raw)
     return out
+
+
+def is_test_path(path: str) -> bool:
+    """Whether a repo path is a test file (#855).
+
+    By location and filename, never by content: the rule must be decidable
+    from the diff alone, without reading or running anything. It answers
+    "was a test touched", not "is the test any good" — the second question
+    belongs to a reviewer, and pretending a path check answers it is how a
+    cheap layer starts being read as an expensive one.
+    """
+    norm = _normalize(path)
+    if not norm:
+        return False
+    parts = norm.split("/")
+    if any(part in {"tests", "test"} for part in parts[:-1]):
+        return True
+    name = parts[-1]
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def code_without_tests(paths: list[str]) -> list[str]:
+    """Code files in a diff that brought no test file with them (#855).
+
+    Empty when the diff touched any test, when it touched no code at all, or
+    when everything in it is routine. What comes back is the code the rule is
+    speaking about, so the report can name files instead of scolding.
+
+    Measured reason this exists (#854, 30 days): the paid reviewer confirmed
+    findings in categories test-coverage, test-adequacy and
+    missing-test-hides-defect at 124k tokens apiece. This costs nothing and
+    runs on every submission rather than when a reviewer thinks to look.
+    """
+    candidates = [p for p in paths if _normalize(p) not in ROUTINE_PATHS]
+    if any(is_test_path(p) for p in candidates):
+        return []
+    return [p for p in candidates if not is_test_path(p)]
+
+
+def tests_only(paths: list[str]) -> bool:
+    """Whether a diff touches tests and nothing else (#855).
+
+    On a bug this is a signal worth naming — a test written to match already
+    changed behaviour proves nothing about the fix — but never a refusal: a
+    genuinely missing test IS the whole fix often enough.
+    """
+    candidates = [p for p in paths if _normalize(p) not in ROUTINE_PATHS]
+    return bool(candidates) and all(is_test_path(p) for p in candidates)

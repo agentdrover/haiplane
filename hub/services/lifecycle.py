@@ -1645,6 +1645,12 @@ async def submit_for_review(
                 # may accept the truth in one step — explicitly, and on the
                 # record below.
                 accepted_paths = list(undeclared)
+                # Deliberately NOT the "Вне объявленной области" wording: an
+                # accepted scope is a recorded fact, not an open divergence.
+                surface_note = (
+                    f"Область: объём признан на сдаче — +{len(undeclared)} "
+                    "путь(ей) дописан(ы) в affected_areas."
+                )
             elif surfaces_mode == "require":
                 raise HTTPException(
                     422,
@@ -1668,6 +1674,67 @@ async def submit_for_review(
                 f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
                 "Это не значит, что расхождений нет."
             )
+
+    # #855: the cheap deterministic layer, on the diff this submission already
+    # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
+    # paid reviewer for a measured reason: over 30 days the harness confirmed
+    # findings at 124k tokens apiece and 61% of its raw findings were
+    # rejected, while the categories test-coverage, test-adequacy and
+    # missing-test-hides-defect follow from the diff by rule, not by
+    # reasoning. Refusals happen here, still before the transition.
+    rules_mode = (config.SUBMIT_RULES or "warn").strip().lower()
+    rule_lines: list[str] = []
+    clean_lines: list[str] = []
+    unchecked_lines: list[str] = []
+    if rules_mode != "off":
+        if diff_paths is None:
+            # The honesty contract of #550/#725: a check that could not run
+            # says so. Silence here would read as "no rule fired".
+            unchecked_lines.append(
+                f"Правила по диффу НЕ проверялись: {diff_reason or 'дифф не разрешён'}. "
+                "Это не значит, что нарушений нет."
+            )
+        else:
+            code_no_tests = commit_scope.code_without_tests(diff_paths)
+            if code_no_tests:
+                listed = ", ".join(code_no_tests[:10])
+                more = (
+                    f" и ещё {len(code_no_tests) - 10}"
+                    if len(code_no_tests) > 10
+                    else ""
+                )
+                if rules_mode == "require":
+                    raise HTTPException(
+                        422,
+                        f"дифф меняет код и не трогает ни одного теста: "
+                        f"{listed}{more}. Принесите тест либо назовите в сдаче "
+                        "причину, по которой его здесь быть не должно. "
+                        "Правило смотрит на пути в диффе, не на содержимое.",
+                    )
+                rule_lines.append(
+                    f"Тесты рядом с кодом: СРАБОТАЛО — дифф меняет код и не "
+                    f"трогает ни одного теста: {listed}{more}. Принесите тест "
+                    "или назовите причину в сдаче."
+                )
+            else:
+                # Silence on a clean run is deliberate. A line on every
+                # submission would be the noise this layer is supposed to
+                # replace — and #593 already names the failure mode: a gate
+                # that speaks constantly stops being read. What ran cleanly
+                # is listed below only when the report exists for some other
+                # reason.
+                clean_lines.append("Тесты рядом с кодом: проверено, чисто.")
+            if (task.get("work_type") or "") == "bug" and commit_scope.tests_only(
+                diff_paths
+            ):
+                # Named, never refused: a missing test genuinely is the whole
+                # fix often enough, and a rule that cannot tell the two apart
+                # must not be the one deciding.
+                rule_lines.append(
+                    "Баг правит только тесты: отмечено. Тест, написанный под "
+                    "уже изменённое поведение, ничего не доказывает о "
+                    "починке — но это признак, а не запрет."
+                )
 
     # #572: pin the code the reviewer will actually be judging. Resolved by
     # the hub BEFORE the write lock — this walks to the network. An empty
@@ -1791,8 +1858,21 @@ async def submit_for_review(
                 f"{len(declared)}, стало {len(merged)}. Это признание факта "
                 "сдающим, а не предсказание из постановки.",
             )
-        if surface_note:
-            await repo.add_task_update(db, task_id, "hub", "alert", surface_note)
+        # #855: ONE report instead of scattered alerts. The area verdict is a
+        # line in it, not a second independent message — a submission should
+        # leave the reader with a single list of what was checked. The wording
+        # of each line is preserved verbatim, so anything that read the old
+        # alerts still finds its phrase.
+        report_lines = [ln for ln in ([surface_note] + rule_lines) if ln]
+        report_lines += unchecked_lines
+        if report_lines:
+            # Only now is "what ran and found nothing" worth printing: inside
+            # a report the reader is already looking at.
+            report_lines += clean_lines
+            header = f"Отчёт проверок на сдаче (режим правил: {rules_mode})."
+            await repo.add_task_update(
+                db, task_id, "hub", "alert", header + "\n— " + "\n— ".join(report_lines)
+            )
         if risk_alert:
             await repo.add_task_update(db, task_id, "hub", "alert", risk_alert)
         await db.commit()
