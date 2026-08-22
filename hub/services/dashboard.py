@@ -23,6 +23,7 @@ from hub.models import (
     TaskView,
 )
 from hub.services.lifecycle import row_to_task
+from hub.services.project_policy import clone_branch_state
 
 log = logging.getLogger("hub")
 
@@ -415,6 +416,10 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
                 "last_activity_at": None,
             },
         )
+        # #887: the same reader the API uses, so the card and the API cannot
+        # disagree about whether the clone protects the project's branch. Off
+        # the loop: it shells out to git in a workspace that may be unreachable.
+        sync = await asyncio.to_thread(clone_branch_state, project)
         epics = epics_by_project.get(p["slug"], [])
         cards.append(
             {
@@ -422,6 +427,7 @@ async def get_project_cards(db: aiosqlite.Connection) -> list[dict[str, Any]]:
                 "live_epics": epics[:PROJECT_CARD_EPIC_LIMIT],
                 "epics_hidden": max(0, len(epics) - PROJECT_CARD_EPIC_LIMIT),
                 "activity_human": humanize_since(counts.get("last_activity_at")),
+                "clone_branch": sync,
                 **counts,
             }
         )

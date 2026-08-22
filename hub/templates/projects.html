@@ -118,6 +118,22 @@
                 <dt>slug</dt><dd>{{ c.project.slug }}</dd>
                 <dt>repo</dt><dd>{{ c.project.repo or '—' }}</dd>
                 <dt>ветка</dt><dd>{{ c.project.default_branch }}</dd>
+                {# #887: что клон РЕАЛЬНО защищает, рядом с тем, что объявлено.
+                   Три состояния, и третье не сливается с первым: клон, который
+                   не смогли прочитать, — не клон, который согласен. #}
+                <dt>клон</dt><dd>
+                    {% if c.clone_branch.state == 'match' %}
+                    <span class="badge badge-completed" title="{{ c.clone_branch.reason }}">сходится: {{ c.clone_branch.project_branch }}</span>
+                    {% elif c.clone_branch.state == 'diverged' %}
+                    <span class="badge badge-needs_decision" title="{{ c.clone_branch.reason }}">расходится: проект {{ c.clone_branch.project_branch }}, клон {{ c.clone_branch.clone_branch or 'ключ не записан' }}</span>
+                    {% else %}
+                    <span class="badge badge-draft" title="{{ c.clone_branch.reason }}">не смогли посмотреть</span>
+                    {% endif %}
+                    {# Причина показана текстом только там, где она нужна: в
+                       согласии её несёт сам бейдж, а у «не смогли посмотреть»
+                       и «расходится» без причины читателю некуда пойти. #}
+                    {% if c.clone_branch.state != 'match' %}<span class="project-admin-note">{{ c.clone_branch.reason }}</span>{% endif %}
+                </dd>
                 {% if c.project.gate_policy.get('dor') == 'auto' or c.project.gate_policy.get('verdict') == 'auto' or c.project.gate_policy.get('review') == 'dispatch' %}
                 <dt>автопилот</dt><dd>
                     {% if c.project.gate_policy.get('dor') == 'auto' %}<span class="badge badge-running" title="DoR-апрув драфтов выполняет политика (#744)">dor: auto</span>{% endif %}

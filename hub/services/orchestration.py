@@ -23,6 +23,7 @@ from hub.services import workflow_seed
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
+    rearm_clone,
     release_base_of,
 )
 
@@ -1170,6 +1171,12 @@ async def provision_project(
                 ac_runner=ci_runner_of(project),
             )
             detail = f"{detail}; workflows: {seed.detail}"
+            # #887: clone_repo records only the base branch, and only for the
+            # clone it just made or verified. Re-arming here through the same
+            # writer adds the release branch and makes provisioning a way to
+            # repair a clone whose keys drifted — the "existing clone verified"
+            # path is the only one that ever runs on a production workspace.
+            rearm_clone(row)
     status = "ok" if ok else "error"
     await repo.update_project(
         db, project_id, provision_status=status, provision_detail=detail[:1000]
