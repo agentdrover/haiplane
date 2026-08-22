@@ -1399,6 +1399,31 @@ async def web_task_detail(
             # never an empty list that reads as "nothing changed" (#725).
             change_map = {"unavailable": listing["reason"]}
 
+    # #893: what this task has cost in REVIEW RUNS. Measured across eleven
+    # billed runs, the run is the unit that tracks spend — none billed under
+    # 777k tokens, and the size of the diff explained none of the spread — so
+    # five resubmissions cost five entry prices. A sum alone would hide that;
+    # the count is the point. Runs whose bill never arrived say "неизвестно",
+    # never nothing, because a missing bill is not a free run (#725).
+    review_runs = [
+        {
+            "generation": int(r["submission_generation"] or 0),
+            "profile": (r["profile"] or "") or "не заявлен",
+            "provider_tokens": r["provider_tokens"],
+            "tokens_spent": r["tokens_spent"],
+            "created_at": r["created_at"],
+        }
+        for r in map(dict, await repo.list_machine_reviews(db, task_id))
+    ]
+    review_runs_billed = [
+        r["provider_tokens"] for r in review_runs if r["provider_tokens"] is not None
+    ]
+    review_runs_cost = {
+        "runs": len(review_runs),
+        "billed_runs": len(review_runs_billed),
+        "provider_total": sum(review_runs_billed) if review_runs_billed else None,
+    }
+
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
     if task.status.value == "review" and not task.review_job_id:
@@ -1442,6 +1467,8 @@ async def web_task_detail(
             "evidence": evidence,
             "change_map": change_map,
             "machine_review": machine_review,
+            "review_runs": review_runs,
+            "review_runs_cost": review_runs_cost,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,

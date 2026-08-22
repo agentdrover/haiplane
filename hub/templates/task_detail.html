@@ -723,6 +723,41 @@
                     {% if machine_review and machine_review.model %}, модель {{ machine_review.model }}{% endif %}
                 </div>
                 {% endif %}
+                {# #893: цена задачи считается в ПРОГОНАХ. Порог входа одного
+                   прогона — 777k токенов по счёту провайдера, и размер диффа
+                   разброс не объясняет: пять пересдач стоят пять входов.
+                   Сумма одна этого не показывает, поэтому счётчик рядом. #}
+                {% if review_runs_cost and review_runs_cost.runs %}
+                <div class="task-action-note">
+                    Прогонов ревью: {{ review_runs_cost.runs }}
+                    {% if review_runs_cost.provider_total is not none %}
+                    &mdash; по счёту провайдера {{ '{:,}'.format(review_runs_cost.provider_total).replace(',', ' ') }} токенов
+                    {% if review_runs_cost.billed_runs < review_runs_cost.runs %}
+                    <span class="badge badge-self-approved">счёт есть у {{ review_runs_cost.billed_runs }} из {{ review_runs_cost.runs }}</span>
+                    {% endif %}
+                    {% else %}
+                    <span class="badge badge-self-approved">счёт провайдера неизвестен</span>
+                    {% endif %}
+                    <details>
+                        <summary class="project-edit-summary">прогоны по одному</summary>
+                        <ul class="tight-list">
+                            {% for run in review_runs %}
+                            <li>
+                                сдача #{{ run.generation }}, профиль {{ run.profile }} &mdash;
+                                {% if run.provider_tokens is not none %}
+                                {{ '{:,}'.format(run.provider_tokens).replace(',', ' ') }} токенов по счёту
+                                {% else %}
+                                <span class="muted">счёт неизвестен</span>
+                                {% endif %}
+                                {% if run.tokens_spent is not none %}
+                                <span class="muted">(самоотчёт {{ '{:,}'.format(run.tokens_spent).replace(',', ' ') }})</span>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                </div>
+                {% endif %}
                 {% if machine_review %}
                 <div class="task-action-note">
                     Machine review: {{ machine_review.raw_count }} raw &rarr;

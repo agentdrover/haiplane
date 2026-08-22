@@ -1404,33 +1404,20 @@ async def api_submit_machine_review(
     # profile empty, which reads as "unknown", not as "cheap".
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     profile = (dispatch["profile"] if dispatch is not None else "") or ""
-    # A lite run that spent its whole ceiling did not finish looking, it ran
-    # out of budget. Left as incomplete=false it would read as a clean review
-    # of the whole diff — the substitution #549 exists to prevent. Forced
-    # here rather than trusted to the client, for the same reason the profile
-    # is: the report cannot be the only witness to its own completeness.
+    # #807 forced incomplete=true on a lite run whose SELF-REPORTED spend
+    # reached the ceiling. Removed in #893: it never once fired, and could
+    # not. Eleven runs measured against the provider's bill cost 777k-6.0M
+    # while reporting 25k-312k — the report's own number missed the bill by
+    # 12-62x every time, so a run that burned 1.5M and declared 36k sailed
+    # through as complete. A guard that reads the checked party's estimate of
+    # itself is not a guard; keeping it would only say we have one.
+    #
+    # Coverage honesty stays, and it never depended on the number: the
+    # reviewer declares which files it did not read, and that IS checkable
+    # against the diff. The provider-vs-self gap keeps being recorded as an
+    # audit signal (#828), where it belongs — beside the numbers, not
+    # pretending to bound them.
     incomplete = body.incomplete
-    budget_exhausted = (
-        profile == "lite"
-        and body.tokens_spent is not None
-        and body.tokens_spent >= config.REVIEW_LITE_TOKEN_BUDGET
-    )
-    if budget_exhausted and not incomplete:
-        incomplete = True
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            (
-                f"Лёгкое ревью израсходовало бюджет целиком "
-                f"({body.tokens_spent} ≥ {config.REVIEW_LITE_TOKEN_BUDGET} "
-                "токенов) и сдало отчёт как полный. Прогон помечен неполным "
-                "хабом: упершийся бюджет — это «дочитать не успели», а не "
-                "«претензий нет» (#807). Для полного разбора запросите "
-                "machine-review вручную — он пойдёт по тяжёлому профилю."
-            ),
-        )
     await repo.insert_machine_review(
         db,
         task_id=task_id,

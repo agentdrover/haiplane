@@ -561,6 +561,12 @@ async def practice_metrics(
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) "
         "AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total, "
+        # #893: the provider's bill per RUN, and how many runs it covers.
+        # The average alone would invite reading a two-run sample as a rate;
+        # the sample size beside it says how much the number is worth.
+        "COALESCE(SUM(provider_tokens), 0) AS provider_tokens_total, "
+        "SUM(CASE WHEN provider_tokens IS NOT NULL THEN 1 ELSE 0 END) "
+        "AS billed_runs, "
         "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
         "GROUP BY profile ORDER BY reviews DESC",
@@ -694,6 +700,15 @@ async def practice_metrics(
         entry["judged"] = rates["judged"] if rates else 0
         entry["precision"] = rates["precision"] if rates else None
         entry["resolution_rate"] = rates["resolution_rate"] if rates else None
+        # #893: the number the profile decision actually rests on — what one
+        # run of it bills. None when no run of this profile has a bill yet:
+        # dividing by zero billed runs would print 0 and read as "free".
+        billed = int(entry.get("billed_runs") or 0)
+        entry["provider_tokens_per_run"] = (
+            round(int(entry.get("provider_tokens_total") or 0) / billed)
+            if billed
+            else None
+        )
         profile_dicts.append(entry)
 
     escaped = await _escaped_defect_metrics(db, since)

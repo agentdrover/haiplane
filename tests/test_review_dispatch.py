@@ -312,13 +312,11 @@ async def test_low_risk_task_gets_lite_profile(
     # profile travels with the run instead of being inferred later.
     recorder = _DispatchRecorder({"agent": {"id": "bc-lite"}, "run": {"id": "r-lite"}})
     _wire(monkeypatch, recorder)
-    monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 40000)
 
     task_id = await _submitted(client, db, "spike-lite")
 
     prompt = recorder.calls[0]["prompt_text"]
     assert "ЛЁГКОЕ ревью" in prompt
-    assert "40000" in prompt, "the ceiling must be stated to the reviewer"
     assert "multi-agent-review" not in prompt, "lite must not call the harness"
     assert (await _dispatch_row(db, task_id))["profile"] == "lite"
 
@@ -377,12 +375,38 @@ async def test_unclassified_task_gets_deep_profile(
     ), "a human who asked for machine review asked for the real thing"
 
 
-async def test_budget_truncation_marks_run_incomplete(
+async def test_lite_prompt_names_no_token_ceiling(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-4 (#807): a lite run that spent its whole ceiling did not finish
-    # looking. Left as the client sent it, the report would read as a clean
-    # review of the whole diff — the substitution #549 exists to prevent.
+    # AC-1 (#893): the prompt asks for BEHAVIOUR, not for a token count.
+    # The ceiling used to be spelled out; measured against the provider's
+    # bill, the same runs cost 777k-1.97M, so the number told the reviewer
+    # nothing it could act on. "One pass over the diff" it can act on, and
+    # the report can be checked against it.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-l"}, "run": {"id": "r-l"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 40000)
+
+    await _submitted(client, db, "spike-no-ceiling")
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "40000" not in prompt, "no token ceiling is quoted to the reviewer"
+    assert "бюджет" not in prompt, "and it is not called a budget either"
+    assert "ОДИН проход" in prompt
+    assert "не исследуй репозиторий целиком" in prompt
+    # Coverage honesty never rested on the number and must survive its removal.
+    assert "incomplete=true" in prompt and "lost_dimensions" in prompt
+
+
+async def test_self_reported_overspend_follows_the_recorded_decision(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#893): a self-reported spend above the old ceiling no longer
+    # rewrites the run's completeness. #807 forced incomplete=true here; in
+    # eleven measured runs it never fired, because the reported number missed
+    # the provider's bill by 12-62x — a run billed 1.5M declared 36k and
+    # passed. The hub keeps the report as submitted and says nothing it
+    # cannot know.
     recorder = _DispatchRecorder({"agent": {"id": "bc-b"}, "run": {"id": "r-b"}})
     _wire(monkeypatch, recorder)
     monkeypatch.setattr(config, "REVIEW_LITE_TOKEN_BUDGET", 1000)
@@ -392,7 +416,7 @@ async def test_budget_truncation_marks_run_incomplete(
     body = {
         "harness_skill": "lite-diff-review",
         "agent_count": 1,
-        "tokens_spent": 1000,
+        "tokens_spent": 1_500_000,
         "raw_count": 1,
         "findings_confirmed": [
             {"title": "off-by-one", "severity": "medium", "file": "a.py"}
@@ -407,16 +431,47 @@ async def test_budget_truncation_marks_run_incomplete(
     assert resp.status_code == 200, resp.text
 
     saved = dict(await repo.get_latest_machine_review(db, task_id))
-    assert saved["profile"] == "lite", "the profile comes from the dispatch"
-    assert saved["incomplete"] == 1, "an exhausted budget is not a complete run"
+    assert saved["profile"] == "lite", "the profile still comes from the dispatch"
+    assert saved["incomplete"] == 0, "the hub does not rewrite what it cannot see"
 
     data = (await client.get(f"/api/tasks/{task_id}")).json()
-    alerts = [
-        u["content"]
+    assert not [
+        u
         for u in data["updates"] or []
         if u["kind"] == "alert" and "бюджет" in u["content"]
-    ]
-    assert len(alerts) == 1 and "неполным" in alerts[0]
+    ], "no alert about a ceiling that bounds nothing"
+
+
+async def test_declared_incomplete_still_stands(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # The half of #807 AC-4 that was never in doubt: when the REVIEWER says it
+    # did not read everything, that is a fact about coverage and it is kept.
+    # Removing the budget guard must not quietly take this with it.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-i"}, "run": {"id": "r-i"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-declared-incomplete")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "tokens_spent": 12_000,
+            "raw_count": 0,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": True,
+            "unresolved": [],
+            "lost_dimensions": ["hub/app.py не прочитан"],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["incomplete"] == 1
 
 
 async def test_report_without_dispatch_has_no_profile(

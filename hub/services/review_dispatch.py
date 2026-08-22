@@ -439,7 +439,14 @@ CHARS_PER_TOKEN = 4
 
 
 def rules_char_cap() -> int:
-    """How many characters of rules the cheap profile can afford."""
+    """How many characters of rules the cheap profile can afford.
+
+    The one place the constant still earns its keep (#893): rules are text the
+    HUB puts into the prompt, so their size is genuinely ours to bound. What
+    the reviewer then spends is not — measured at 777k-1.97M per lite run
+    against a stated 40k ceiling, so the number is no longer told to anyone
+    as a budget.
+    """
     budget = max(int(config.REVIEW_LITE_TOKEN_BUDGET), 0)
     return int(budget * RULES_BUDGET_SHARE * CHARS_PER_TOKEN)
 
@@ -573,10 +580,15 @@ def _review_prompt(
         f"{diff_block}\n\n"
     )
     if profile == LITE:
-        budget = config.REVIEW_LITE_TOKEN_BUDGET
+        # No token ceiling is stated (#893). It used to say "бюджет 40000
+        # токенов", and eight runs measured against the provider's bill cost
+        # 777k-1.97M each: the number bounded nothing, because the reviewer
+        # counts its own tokens while the bill counts context, tool calls and
+        # repeat passes. What DOES shape the run is behaviour — one pass over
+        # the diff instead of a walk through the repository — so that is what
+        # the prompt asks for, in words the report can be checked against.
         return (
-            common + "Это ЛЁГКОЕ ревью: один проход, бюджет "
-            f"{budget} токенов. Порядок: "
+            common + "Это ЛЁГКОЕ ревью: ОДИН проход. Порядок: "
             f"1) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
             "2) прочитай дифф КОМАНДОЙ ИЗ ПРЕДМЕТА РЕВЬЮ выше и только его — "
             "не исследуй репозиторий целиком, контекст берётся из диффа; "
@@ -585,7 +597,7 @@ def _review_prompt(
             f"4) сдай hub_submit_machine_review(task_id={task_id}, "
             "harness_skill='lite-diff-review', ...) с реальными raw_count, "
             f"находками, tokens_spent и model='{model_id}'. "
-            "ЧЕСТНОСТЬ ОХВАТА: если дифф не помещается в бюджет — сдавай "
+            "ЧЕСТНОСТЬ ОХВАТА: если дифф прочитан не целиком — сдавай "
             "incomplete=true и перечисли непрочитанные файлы в "
             "lost_dimensions. Ноль находок при обрезанном диффе — это "
             "«не проверено», а не «чисто»; выдать одно за другое хуже, чем "
@@ -738,7 +750,7 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         profile=profile,
     )
     profile_note = (
-        f"профиль {profile} (бюджет {config.REVIEW_LITE_TOKEN_BUDGET} токенов)"
+        f"профиль {profile} (один проход по диффу)"
         if profile == LITE
         else f"профиль {profile} (многоагентный харнесс)"
     )
