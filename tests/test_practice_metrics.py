@@ -1024,3 +1024,58 @@ async def test_debt_blocks_nothing_and_says_so_when_empty(
         await fresh.executescript(_SCHEMA)
         await _migrate(fresh)
         assert (await practice_metrics(fresh))["category_debt"] == []
+
+
+async def test_provider_cost_per_run_split_by_profile(db: aiosqlite.Connection):
+    # AC-4 (#893): the number a profile decision rests on is what ONE run of
+    # it bills. Measured, lite averaged 1.38M and deep 3.85M — a 2.8x gap,
+    # not the 5x the self-reported tokens suggested. The sample size travels
+    # with the average because two billed runs and two hundred are different
+    # grounds for the same decision (#516).
+    lite_a = await _task(db, title="lite one")
+    lite_b = await _task(db, title="lite two")
+    deep_one = await _task(db, title="deep one")
+    unbilled = await _task(db, title="lite with no bill")
+    await _report(db, lite_a, tokens_spent=25_000, provider_tokens=800_000)
+    await _report(db, lite_b, tokens_spent=36_000, provider_tokens=1_600_000)
+    await _report(db, deep_one, tokens_spent=104_000, provider_tokens=3_900_000)
+    await _report(db, unbilled, tokens_spent=31_000)
+    for task_id, profile in (
+        (lite_a, "lite"),
+        (lite_b, "lite"),
+        (deep_one, "deep"),
+        (unbilled, "lite"),
+    ):
+        await db.execute(
+            "UPDATE machine_reviews SET profile=? WHERE task_id=?", (profile, task_id)
+        )
+    await db.commit()
+
+    metrics = await services.practice_metrics(db)
+    by_profile = {row["profile"]: row for row in metrics["by_profile"]}
+
+    assert by_profile["lite"]["provider_tokens_per_run"] == 1_200_000
+    # Three lite runs, two of them billed: the average must be over the two,
+    # and the count must say so instead of quietly averaging a zero in.
+    assert by_profile["lite"]["billed_runs"] == 2
+    assert by_profile["deep"]["provider_tokens_per_run"] == 3_900_000
+
+
+async def test_profile_with_no_bill_reports_unknown_not_zero(
+    db: aiosqlite.Connection,
+):
+    # A profile nobody has a bill for costs an unknown amount, not nothing.
+    # Zero here would read as "free" and make the cheapest profile the one we
+    # simply never measured (#725).
+    task_id = await _task(db, title="unbilled profile")
+    await _report(db, task_id, tokens_spent=12_000)
+    await db.execute(
+        "UPDATE machine_reviews SET profile='lite' WHERE task_id=?", (task_id,)
+    )
+    await db.commit()
+
+    metrics = await services.practice_metrics(db)
+    lite = {row["profile"]: row for row in metrics["by_profile"]}["lite"]
+
+    assert lite["provider_tokens_per_run"] is None
+    assert lite["billed_runs"] == 0

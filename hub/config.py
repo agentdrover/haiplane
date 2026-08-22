@@ -78,6 +78,15 @@ COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
 # submit the hub has the truth, so there are no name-matching heuristics and
 # no false positives by construction.
 SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
+# Deterministic submit rules (#855): the cheap layer that runs BEFORE the paid
+# reviewer, on the diff the submission already resolved (#583) — no extra git
+# call, no tokens. 'warn' (default) reports; 'require' refuses a submission
+# that changes code without touching a single test; 'off' disables it. The
+# measurement behind it (#854, 30 days): the paid reviewer confirmed
+# test-coverage / test-adequacy / missing-test-hides-defect findings at 124k
+# tokens each, and 61% of its raw findings were rejected — two thirds of the
+# budget spent on noise a rule cannot produce.
+SUBMIT_RULES = os.environ.get("OPENCLAW_SUBMIT_RULES", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved
@@ -123,10 +132,15 @@ CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
 CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
 CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
 # Review profiles (#807). The lite profile reviews the branch diff in one
-# pass under a token ceiling; deep is the multi-agent harness. The ceiling is
-# what makes "review every submission" affordable: on production a deep run
-# cost 434 784 tokens per confirmed finding, and a v3 run over one stack cost
-# 1 467 701 tokens in total.
+# pass; deep is the multi-agent harness.
+#
+# This number is NOT a run budget any more (#893). As one it was measured and
+# failed: eight lite runs billed 777k-1.97M tokens against a stated 40k, and
+# the ceiling reached the reviewer only as a sentence in a prompt. What it
+# still bounds is the rules text the hub itself puts into that prompt
+# (review_dispatch.rules_char_cap) — hub-written input, genuinely ours to
+# size. The unit that tracks cost is the RUN: none billed under 777k, lite
+# averages 1.38M, deep 3.85M.
 REVIEW_LITE_TOKEN_BUDGET = int(
     os.environ.get("OPENCLAW_REVIEW_LITE_TOKEN_BUDGET", "40000")
 )

@@ -5241,3 +5241,36 @@ async def test_web_disposition_route_rejects_agent_token(
     assert resp.status_code == 403
     review = await repo_module.get_latest_machine_review(db, task_id)
     assert not await repo_module.list_finding_dispositions(db, review["id"])
+
+
+async def test_task_card_shows_review_runs_and_their_provider_cost(
+    client: AsyncClient, db
+):
+    # AC-3 (#893): the card counts RUNS and prices each one by the provider's
+    # bill. The run is the unit that tracks spend — none billed under 777k,
+    # and the size of the diff explained none of the spread — so a task
+    # reviewed twice cost two entry prices, which a single total would hide.
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id, tokens_spent=25_000)
+    await repo_module.set_machine_review_provider_tokens(db, task_id, 1, 777_389)
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert "Прогонов ревью: 1" in page.text
+    assert "777 389" in page.text, "the bill is shown, not the self-report alone"
+    assert "25 000" in page.text, "and the self-report stays visible beside it"
+
+
+async def test_unbilled_review_run_reads_as_unknown_not_free(client: AsyncClient, db):
+    # A run whose bill never arrived is an unknown cost, not a free one.
+    # Printing nothing (or a zero) would make the runs we failed to measure
+    # look like the cheap ones — the substitution #725 exists to stop.
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id, tokens_spent=31_000)
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert "Прогонов ревью: 1" in page.text
+    assert "счёт провайдера неизвестен" in page.text

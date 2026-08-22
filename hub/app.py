@@ -33,6 +33,7 @@ from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     DeployCallback,
     DeployView,
+    ProdStateView,
     CIRunReportResult,
     CIRunReportSubmit,
     BulkChildTasksCreate,
@@ -261,6 +262,19 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
 
 
+def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:
+    """Строка, которой обязана быть после успешной операции.
+
+    Все восемь мест ниже читают запись сразу после того, как её создали или
+    изменили, и передают дальше без проверки: если бы её не оказалось, ответом
+    стал бы TypeError внутри dict(None), то есть 500 без объяснения. Здесь это
+    честный 404 с именем того, чего не нашли (#848).
+    """
+    if row is None:
+        raise HTTPException(404, missing)
+    return row
+
+
 def _db(request: Request) -> aiosqlite.Connection:
     return request.app.state.db
 
@@ -354,7 +368,11 @@ async def api_create_project(
     body: ProjectCreate,
     request: Request,
     identity=Depends(current_identity),
-    background_tasks: BackgroundTasks = None,
+    # Единственное подавление в этой задаче, и оно про ограничение FastAPI, а
+    # не про код: Optional здесь ломает инжекцию ("Invalid args for response
+    # field"), а дефолт None нужен по-настоящему — hub/web.py вызывает эту
+    # функцию напрямую и без задач, и проверка ниже на этом держится (#848).
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
 ):
     """Create a project (#338/#345).
 
@@ -405,7 +423,7 @@ async def api_create_project(
         background_tasks.add_task(
             services.provision_project, db, pid, actor=identity.username
         )
-    row = await repo.get_project(db, pid)
+    row = _row_or_404(await repo.get_project(db, pid), "project not found")
     return ProjectView(**dict(row))
 
 
@@ -475,7 +493,7 @@ async def api_patch_project(
                 payload={"slug": before["slug"]},
             )
         await db.commit()
-    row = await repo.get_project(db, project_id)
+    row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     return ProjectView(**dict(row))
 
 
@@ -659,7 +677,9 @@ async def api_create_skill(
         f"Skill {body.name} v{version} created as {status_value} "
         f"by {identity.username}",
     )
-    row = await repo.get_skill_version(db, body.name, version)
+    row = _row_or_404(
+        await repo.get_skill_version(db, body.name, version), "skill version not found"
+    )
     return SkillView(**dict(row))
 
 
@@ -689,7 +709,9 @@ async def api_activate_skill(
             "skill_activated",
             f"Skill {name} v{version} activated by {_identity.username}",
         )
-    row = await repo.get_skill_version(db, name, version)
+    row = _row_or_404(
+        await repo.get_skill_version(db, name, version), "skill version not found"
+    )
     return SkillView(**dict(row))
 
 
@@ -705,7 +727,7 @@ async def api_provision_project(
     if await repo.get_project(db, project_id) is None:
         raise HTTPException(404, "project not found")
     result = await services.provision_project(db, project_id, actor=_identity.username)
-    row = await repo.get_project(db, project_id)
+    row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     return {**result, "project": ProjectView(**dict(row))}
 
 
@@ -1382,33 +1404,20 @@ async def api_submit_machine_review(
     # profile empty, which reads as "unknown", not as "cheap".
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     profile = (dispatch["profile"] if dispatch is not None else "") or ""
-    # A lite run that spent its whole ceiling did not finish looking, it ran
-    # out of budget. Left as incomplete=false it would read as a clean review
-    # of the whole diff — the substitution #549 exists to prevent. Forced
-    # here rather than trusted to the client, for the same reason the profile
-    # is: the report cannot be the only witness to its own completeness.
+    # #807 forced incomplete=true on a lite run whose SELF-REPORTED spend
+    # reached the ceiling. Removed in #893: it never once fired, and could
+    # not. Eleven runs measured against the provider's bill cost 777k-6.0M
+    # while reporting 25k-312k — the report's own number missed the bill by
+    # 12-62x every time, so a run that burned 1.5M and declared 36k sailed
+    # through as complete. A guard that reads the checked party's estimate of
+    # itself is not a guard; keeping it would only say we have one.
+    #
+    # Coverage honesty stays, and it never depended on the number: the
+    # reviewer declares which files it did not read, and that IS checkable
+    # against the diff. The provider-vs-self gap keeps being recorded as an
+    # audit signal (#828), where it belongs — beside the numbers, not
+    # pretending to bound them.
     incomplete = body.incomplete
-    budget_exhausted = (
-        profile == "lite"
-        and body.tokens_spent is not None
-        and body.tokens_spent >= config.REVIEW_LITE_TOKEN_BUDGET
-    )
-    if budget_exhausted and not incomplete:
-        incomplete = True
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            (
-                f"Лёгкое ревью израсходовало бюджет целиком "
-                f"({body.tokens_spent} ≥ {config.REVIEW_LITE_TOKEN_BUDGET} "
-                "токенов) и сдало отчёт как полный. Прогон помечен неполным "
-                "хабом: упершийся бюджет — это «дочитать не успели», а не "
-                "«претензий нет» (#807). Для полного разбора запросите "
-                "machine-review вручную — он пойдёт по тяжёлому профилю."
-            ),
-        )
     await repo.insert_machine_review(
         db,
         task_id=task_id,
@@ -1491,7 +1500,9 @@ async def api_submit_machine_review(
         f"{len(body.findings_confirmed)} confirmed, "
         f"{len(body.findings_rejected)} rejected",
     )
-    saved = await repo.get_latest_machine_review(db, task_id)
+    saved = _row_or_404(
+        await repo.get_latest_machine_review(db, task_id), "machine review not found"
+    )
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
@@ -1577,6 +1588,18 @@ async def api_run_validation(task_id: int, request: Request):
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return await run_validation_commands(db, task_id)
+
+
+@app.get("/api/prod-state", response_model=ProdStateView)
+async def api_prod_state(request: Request, limit: int = 50):
+    """What production runs, and which completed tasks are where (#499).
+
+    One builder answers here, in the CLI and in MCP: the three interfaces agree
+    by construction rather than by keeping three call sites in step.
+    """
+    from hub.services.prod_state import prod_state
+
+    return ProdStateView(**await prod_state(_db(request), limit=limit))
 
 
 @app.post("/api/deploys", response_model=DeployView)
@@ -2085,7 +2108,7 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
     except ProjectBindError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    row = await repo.get_task(db, task_id)
+    row = _row_or_404(await repo.get_task(db, task_id), "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
@@ -2122,7 +2145,7 @@ async def api_add_risk(task_id: int, body: TaskRisk, request: Request):
     except LimitExceededError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    row = await repo.get_task(db, task_id)
+    row = _row_or_404(await repo.get_task(db, task_id), "task not found")
     updates = await repo.get_task_updates(db, task_id)
     task_view = services.row_to_task(row, updates=updates)
     return await services.enrich_task_view(db, task_view)
@@ -2342,11 +2365,13 @@ async def api_proposal_action_compat(
     action = raw.get("action", "")
     comment = raw.get("comment", "")
     if action == "approved":
-        body = TaskApprove(comment=comment, run=True)
-        return await services.approve_task(_db(request), proposal_id, body)
+        return await services.approve_task(
+            _db(request), proposal_id, TaskApprove(comment=comment, run=True)
+        )
     elif action == "rejected":
-        body = TaskReject(comment=comment)
-        return await services.reject_task(_db(request), proposal_id, body)
+        return await services.reject_task(
+            _db(request), proposal_id, TaskReject(comment=comment)
+        )
     raise HTTPException(400, f"unknown action: {action}")
 
 

@@ -956,6 +956,28 @@ async def get_latest_machine_review(
     return rows[0] if rows else None
 
 
+async def list_machine_reviews(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    """Every review RUN this task has cost, oldest first (#893).
+
+    The unit that tracks spend is the run, not the token: measured across
+    eleven billed runs, none came in under 777k tokens and the size of the
+    diff explained none of the variance. A task reviewed five times cost five
+    times the entry price, and that is only visible when the runs are counted
+    rather than summed.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, submission_generation, profile, model, agent_count, "
+            "tokens_spent, provider_tokens, incomplete, created_at "
+            "FROM machine_reviews WHERE task_id=? ORDER BY id",
+            (task_id,),
+        )
+    )
+
+
 # --- Finding dispositions (#876) -------------------------------------------
 
 

@@ -3940,6 +3940,29 @@ async def hub_whoami() -> str:
 
 
 @mcp.tool()
+async def hub_prod_state(limit: int = 50) -> str:
+    """What production runs, and which completed tasks did not get there (#499).
+
+    Same snapshot the REST endpoint and ``oc-hub prod-state`` return — one
+    builder, one formatter, three readers.
+
+    ``unknown`` is listed apart from ``not_in_prod`` on purpose: "could not
+    tell" is not "did not ship". The answer also states the window it covers;
+    tasks older than the window are not in it.
+
+    Args:
+        limit: How many of the newest completed tasks to examine
+    """
+    from hub.services.prod_state import format_prod_state
+
+    try:
+        data = await _api_get(f"/api/prod-state?limit={int(limit)}")
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    return format_prod_state(data)
+
+
+@mcp.tool()
 async def hub_health() -> str:
     """Show public Hub health: bind host/port and auth/vast flags (no secrets)."""
     data = await _api_get("/health")

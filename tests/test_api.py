@@ -3756,3 +3756,150 @@ async def test_review_brief_shows_scope_growth(client, db, monkeypatch):
 
     task = dict(await repo_module.get_task(db, task_id))
     assert "hub/services/sessions.py" in (task["affected_areas"] or "")
+
+
+# ---- #855: the cheap rule layer that runs before the paid reviewer ----
+
+
+async def _rules_task(db, client, *, areas, work_type="feature"):
+    """A running pair task with declared areas, ready to submit."""
+    from hub import services as services_module
+    from hub.models import TaskCreate, TaskRefine
+
+    tv = await services_module.create_task(db, TaskCreate(title="Rules under test"))
+    await repo_module.update_task_structured(
+        db, tv.id, TaskRefine(affected_areas=areas, work_type=work_type)
+    )
+    await repo_module.add_task_update(db, tv.id, "dev", "status", "Plan: work")
+    await db.commit()
+    await services_module.pair_start_task(db, tv.id, caller="dev")
+    return tv.id
+
+
+from hub import repository as repo_module  # noqa: E402
+from hub.integrations.noop import NoopGitOps  # noqa: E402
+
+
+class _RulesDiff(NoopGitOps):
+    def __init__(self, paths):
+        self._paths = paths
+
+    async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+        return self._paths
+
+
+async def _rule_alerts(db, task_id):
+    updates = await repo_module.get_task_updates(db, task_id)
+    return [u["content"] for u in updates if u["kind"] == "alert"]
+
+
+async def test_code_without_tests_is_reported_in_warn(client, db, monkeypatch):
+    """#855 AC-1: the rule names the code it is speaking about, and lets it through."""
+    from hub import config
+    from hub import services as services_module
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "warn")
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _rules_task(db, client, areas=["hub"])
+    plugins.git_ops = _RulesDiff(["hub/app.py", "hub/db.py", "uv.lock"])
+
+    view = await services_module.submit_for_review(db, task_id)
+
+    assert view.status.value == "review", "warn never blocks"
+    alerts = await _rule_alerts(db, task_id)
+    report = [a for a in alerts if "Отчёт проверок на сдаче" in a]
+    assert len(report) == 1, alerts
+    assert "Тесты рядом с кодом: СРАБОТАЛО" in report[0]
+    assert "hub/app.py" in report[0] and "hub/db.py" in report[0]
+    assert "uv.lock" not in report[0], "routine paths are not code"
+
+
+async def test_code_without_tests_blocks_in_require(client, db, monkeypatch):
+    """#855 AC-2: require refuses, and the refusal names both ways out."""
+    import pytest as _pytest
+    from fastapi import HTTPException as _HTTPException
+
+    from hub import config
+    from hub import services as services_module
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "require")
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    task_id = await _rules_task(db, client, areas=["hub"])
+    plugins.git_ops = _RulesDiff(["hub/app.py"])
+
+    with _pytest.raises(_HTTPException) as exc_info:
+        await services_module.submit_for_review(db, task_id)
+
+    assert exc_info.value.status_code == 422
+    detail = str(exc_info.value.detail)
+    assert "hub/app.py" in detail
+    assert "Принесите тест" in detail and "причину" in detail
+    task = dict(await repo_module.get_task(db, task_id))
+    assert task["status"] == "running", "a refused submission stays put"
+
+    # The same diff with a test alongside passes untouched.
+    plugins.git_ops = _RulesDiff(["hub/app.py", "tests/test_app.py"])
+    view = await services_module.submit_for_review(db, task_id)
+    assert view.status.value == "review"
+
+
+async def test_rules_report_unknown_is_not_green(client, db, monkeypatch):
+    """#855 AC-3: a diff that could not be read says so, in every mode."""
+    from hub import config
+    from hub import services as services_module
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "require")
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    task_id = await _rules_task(db, client, areas=["hub"])
+    plugins.git_ops = _RulesDiff(None)  # could not be determined
+
+    view = await services_module.submit_for_review(db, task_id)
+
+    assert view.status.value == "review", "unknown is not a refusal"
+    report = " ".join(await _rule_alerts(db, task_id))
+    assert "Правила по диффу НЕ проверялись" in report
+    assert "Это не значит, что нарушений нет" in report
+
+
+async def test_area_verdict_folds_into_rules_report(client, db, monkeypatch):
+    """#855 AC-4: one report, not two independent alerts."""
+    from hub import config
+    from hub import services as services_module
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "warn")
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    task_id = await _rules_task(db, client, areas=["hub/app.py"])
+    plugins.git_ops = _RulesDiff(["hub/app.py", "hub/db.py"])
+
+    await services_module.submit_for_review(db, task_id)
+
+    alerts = await _rule_alerts(db, task_id)
+    combined = [a for a in alerts if "Отчёт проверок на сдаче" in a]
+    assert len(combined) == 1, alerts
+    # Both subjects live in the SAME message...
+    assert "Вне объявленной области изменены" in combined[0]
+    assert "Тесты рядом с кодом: СРАБОТАЛО" in combined[0]
+    # ...and neither arrives as its own separate alert any more.
+    assert [a for a in alerts if "Класс риска" not in a] == combined
+
+
+async def test_bug_touching_only_tests_is_flagged_not_blocked(client, db, monkeypatch):
+    """#855 AC-5: a signal on bug fixes, never a refusal."""
+    from hub import config
+    from hub import services as services_module
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "require")
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    task_id = await _rules_task(db, client, areas=["tests"], work_type="bug")
+    plugins.git_ops = _RulesDiff(["tests/test_api.py"])
+
+    view = await services_module.submit_for_review(db, task_id)
+
+    assert view.status.value == "review", "even require does not block this one"
+    report = " ".join(await _rule_alerts(db, task_id))
+    assert "Баг правит только тесты: отмечено" in report
