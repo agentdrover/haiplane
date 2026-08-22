@@ -3903,3 +3903,90 @@ async def test_bug_touching_only_tests_is_flagged_not_blocked(client, db, monkey
     assert view.status.value == "review", "even require does not block this one"
     report = " ".join(await _rule_alerts(db, task_id))
     assert "Баг правит только тесты: отмечено" in report
+
+
+# ---- #899: a refusal must be obeyable by the one it is addressed to ----
+#
+# A client fixes its tool schemas when the session starts. A session opened
+# before #852 shipped has no session_id parameter, so "pass your session id"
+# asks for something that session cannot do — observed on #498 and twice more
+# the next day, each time rescued only because the agent knew REST by hand.
+
+
+def _agent_headers(monkeypatch) -> dict[str, str]:
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"agent-token": TokenIdentity("bot", "agent", principal_id=7)},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return {"Authorization": "Bearer agent-token"}
+
+
+async def test_missing_session_names_a_workable_path(
+    client: AsyncClient, monkeypatch, db
+):
+    # AC-1 (#899): the refusal names a call the caller can make TODAY, with
+    # the endpoint and the body — not a parameter its schema does not have.
+    from hub import services
+    from hub.models import TaskCreate
+
+    task_id = (await services.create_task(db, TaskCreate(title="no session"))).id
+    headers = _agent_headers(monkeypatch)
+
+    claim = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": ""},
+        headers=headers,
+    )
+    assert claim.status_code == 422, claim.text
+    hint = claim.json()["detail"]["hint"]
+    assert f"POST /api/tasks/{task_id}/claim" in hint
+    assert '"agent"' in hint and '"session_id"' in hint
+
+    # The other door into the task takes a different body, and the hint says
+    # which — a reader left to guess the shape is stuck the same way.
+    pair = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "session_id": ""},
+        headers=headers,
+    )
+    assert pair.status_code == 422, pair.text
+    pair_hint = pair.json()["detail"]["hint"]
+    assert f"POST /api/tasks/{task_id}/pair-start" in pair_hint
+    assert '"assigned_agent"' in pair_hint and '"plan"' in pair_hint
+
+
+async def test_refusal_names_the_version_mismatch(client: AsyncClient, monkeypatch, db):
+    # AC-2 (#899): the cause is stated as two versions disagreeing, not as
+    # the caller getting it wrong. An agent that reads "your mistake" looks
+    # for a mistake it cannot find, and stops.
+    from hub import services
+    from hub.models import TaskCreate
+
+    task_id = (await services.create_task(db, TaskCreate(title="old schema"))).id
+    headers = _agent_headers(monkeypatch)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "bot", "session_id": ""},
+        headers=headers,
+    )
+    detail = resp.json()["detail"]
+
+    assert "version mismatch" in detail["hint"]
+    assert "not your mistake" in detail["hint"]
+    # And the way out is marked temporary: a workaround that reads as the
+    # normal route becomes the normal route.
+    assert "not the normal route" in detail["hint"]
+    # The message carries the pointer too — a reader who only sees the one
+    # line still learns that the hint has something usable in it.
+    assert "predates the requirement" in detail["message"]
+    # Passing the field is still the first thing asked for: this is a
+    # fallback for schemas that cannot, not a replacement for the tool.
+    assert detail["hint"].index("Pass your session id") < detail["hint"].index(
+        "IF YOUR TOOL SCHEMA"
+    )
