@@ -33,6 +33,7 @@ from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     DeployCallback,
     DeployView,
+    ProdStateView,
     CIRunReportResult,
     CIRunReportSubmit,
     BulkChildTasksCreate,
@@ -1600,6 +1601,18 @@ async def api_run_validation(task_id: int, request: Request):
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return await run_validation_commands(db, task_id)
+
+
+@app.get("/api/prod-state", response_model=ProdStateView)
+async def api_prod_state(request: Request, limit: int = 50):
+    """What production runs, and which completed tasks are where (#499).
+
+    One builder answers here, in the CLI and in MCP: the three interfaces agree
+    by construction rather than by keeping three call sites in step.
+    """
+    from hub.services.prod_state import prod_state
+
+    return ProdStateView(**await prod_state(_db(request), limit=limit))
 
 
 @app.post("/api/deploys", response_model=DeployView)

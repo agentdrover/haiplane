@@ -1321,6 +1321,32 @@ class ReadinessReport(BaseModel):
 # --- Response models ---
 
 
+class ProdStateEntry(BaseModel):
+    """One completed task in the production snapshot (#499)."""
+
+    task_id: int
+    title: str = ""
+    reason: str = ""
+
+
+class ProdStateView(BaseModel):
+    """What production runs, and which completed tasks are where (#499).
+
+    ``unknown`` is a list of its own: merging it into ``not_in_prod`` would
+    turn "could not tell" into "did not ship". ``note`` states the window the
+    snapshot covers — a bounded list presented as the whole board is the
+    failure #824 refused to ship.
+    """
+
+    deployed: dict[str, str] = Field(default_factory=dict)
+    in_prod: list[ProdStateEntry] = Field(default_factory=list)
+    not_in_prod: list[ProdStateEntry] = Field(default_factory=list)
+    unknown: list[ProdStateEntry] = Field(default_factory=list)
+    examined: int = 0
+    window: int = 0
+    note: str = ""
+
+
 class TaskUpdateView(BaseModel):
     id: int
     task_id: int

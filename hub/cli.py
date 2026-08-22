@@ -954,6 +954,18 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prod_state(args: argparse.Namespace) -> int:
+    """What production runs and which completed tasks are where (#499)."""
+    from hub.services.prod_state import format_prod_state
+
+    result = _api("GET", f"/api/prod-state?limit={int(args.limit)}")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(format_prod_state(result))
+    return 0
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     result = _api("GET", "/health")
     if args.json:
@@ -1944,6 +1956,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_whoami.add_argument("--json", action="store_true", help="Print raw JSON")
     p_whoami.set_defaults(func=cmd_whoami)
+
+    p_prod = sub.add_parser(
+        "prod-state", help="What is deployed and which tasks did not get there"
+    )
+    p_prod.add_argument(
+        "--limit", type=int, default=50, help="How many completed tasks to examine"
+    )
+    p_prod.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_prod.set_defaults(func=cmd_prod_state)
 
     p_health = sub.add_parser(
         "health", help="Show Hub bind/auth/vast configuration (no secrets)"
