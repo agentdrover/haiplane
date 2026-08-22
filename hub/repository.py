@@ -1030,9 +1030,7 @@ async def upsert_category_check(
 
 
 async def list_category_checks(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
-    return list(
-        await db.execute_fetchall("SELECT * FROM category_checks ORDER BY category ASC")
-    )
+    return await fetchall(db, "SELECT * FROM category_checks ORDER BY category ASC")
 
 
 # --- AC test results (#507) ------------------------------------------------
