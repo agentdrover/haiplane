@@ -661,12 +661,113 @@ async def _submission_diff(
         return None
 
 
-async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
+# How many cloud runs one submission may buy (#879). Two: the cheap default
+# and, when it declares it did not finish, one heavy top-up.
+#
+# A ceiling rather than a loop, and counted from the dispatch rows rather than
+# from a flag — a flag would have to live somewhere and would drift from the
+# fact it claims. A reviewer that keeps declaring itself incomplete is a
+# problem for a person to look at, not a reason to keep buying runs.
+REVIEW_LADDER_MAX_STEPS = 2
+
+
+async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Buy the heavy profile when the cheap run said it did not finish (#879).
+
+    The trigger is the reviewer's OWN declaration of what it did not read.
+    That is the only honest signal left: #893 removed the budget guard because
+    a run that burned 1.5M tokens while reporting 36k sailed through as
+    complete, and a guard reading the checked party's estimate of itself is
+    not a guard. The declaration, unlike the number, is checkable against the
+    diff.
+
+    Returns True when a top-up was dispatched. Every other path leaves the task
+    exactly where it was — on its way to a human — and says why in the task's
+    own updates rather than in silence.
+    """
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return False
+    task = dict(row)
+    generation = task.get("submission_generation") or 0
+    if task.get("status") != "review" or generation <= 0:
+        return False
+
+    review = await repo.get_latest_machine_review(db, task_id)
+    if review is None:
+        return False
+    report = dict(review)
+    if report.get("submission_generation") != generation:
+        return False
+    if not report.get("incomplete"):
+        return False
+
+    # Order matters here. The ceiling is checked BEFORE the profile, because
+    # the report that hits it is the top-up's own — a deep one — and a
+    # profile-first check would return on it silently, leaving the ladder's
+    # loudest moment unannounced.
+    steps = await repo.count_review_dispatches(db, task_id, generation)
+    if steps >= REVIEW_LADDER_MAX_STEPS:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Неполный отчёт после {steps} прогон(ов): потолок лестницы "
+            f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
+            "Ревью этой сдачи так и не состоялось полностью — решение за "
+            "человеком (#879).",
+        )
+        await db.commit()
+        return False
+
+    # The profile comes from the dispatch, never from the report about itself
+    # (#807, #750). Only a CHEAP run earns a top-up: an unknown profile is not
+    # a cheap one, and a deep run that did not finish has nothing above it to
+    # climb to — both go to the human, and both say so.
+    profile = (report.get("profile") or "").strip()
+    if profile != LITE:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Неполный отчёт, добор не положен: профиль "
+            + (f"«{profile}»" if profile else "не заявлен")
+            + " — выше дешёвого подниматься некуда. Решение за человеком (#879).",
+        )
+        await db.commit()
+        return False
+
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    if not dispatched:
+        # maybe_dispatch_review already alerted when policy asked and the call
+        # failed; when policy never asked, silence there is correct. Either
+        # way the human is the next reader, and the cause is on the card.
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Дешёвый прогон сдал неполный отчёт, а добор тяжёлым профилем "
+            "поставить не удалось. Решение за человеком (#879).",
+        )
+        await db.commit()
+    return dispatched
+
+
+async def maybe_dispatch_review(
+    db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
+) -> bool:
     """Queue a cloud reviewer for a fresh submission when policy allows.
 
     Called after submit_for_review commits. Returns True when a dispatch
     was recorded. Every refusal is either silent (policy does not ask for
     it) or a single visible alert (policy asked, the call failed).
+
+    ``force_profile`` skips the profile choice and runs the named one — the
+    top-up step of the ladder (#879), where the profile is no longer a guess
+    about the task but a fact about the run that just failed to finish.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -709,7 +810,10 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
     # areas the author declared — self-assessment cannot exempt work from
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
-    profile, profile_reasons = pick_review_profile(task, diff)
+    if force_profile:
+        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+    else:
+        profile, profile_reasons = pick_review_profile(task, diff)
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     # #874: which base the reviewer diffs against. Unknown base falls back to
     # the configured one rather than to nothing — a command the reviewer cannot

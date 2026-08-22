@@ -1836,6 +1836,23 @@ async def get_review_dispatch_for_generation(
     return rows[0] if rows else None
 
 
+async def count_review_dispatches(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """How many cloud runs this submission has already bought (#879).
+
+    Counted from the rows, not from a flag: the ladder's ceiling has to be the
+    same fact the bill is, and a flag would drift from it.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=?",
+        (task_id, generation),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
+
+
 async def set_review_dispatch_status(
     db: aiosqlite.Connection, dispatch_id: int, status: str
 ) -> None:
