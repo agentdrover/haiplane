@@ -1738,3 +1738,139 @@ async def test_unreadable_ci_outcome_is_not_a_green_base(db):
         red_base.read_state("develop", [_run("abc", "", status="in_progress")]).status
         == red_base.UNKNOWN
     )
+
+
+# ---------------------------------------------------------------------------
+# Характеризующие тесты перед разрезом _poll_running_tasks (#850).
+#
+# Функция на 966 строк переживает рефакторинг только при одном условии: есть с
+# чем сравнить результат. Ветки ниже до этого файла не исполнялись ни разу —
+# то есть разрез мог потерять любую из них молча. Тесты написаны ДО правки
+# продакшен-кода и намеренно проверяют СЕГОДНЯШНЕЕ поведение, каким бы оно ни
+# было, а не желаемое.
+# ---------------------------------------------------------------------------
+
+
+async def _running_task(db, **fields) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=fields.pop("title", "Задача"),
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id=fields.pop("job_id", "job-1"), **fields)
+    await db.commit()
+    return task_id
+
+
+def _dispatch_with(job: dict | None, log_text: str = "") -> NoopDispatch:
+    d = NoopDispatch()
+    d.get_job = MagicMock(return_value=job)
+    d.job_log_full = MagicMock(return_value=log_text)
+    return d
+
+
+async def test_failed_job_marks_the_task_failed_with_its_exit_code(db):
+    """Провал агента доезжает до задачи вместе с кодом и текстом.
+
+    Без этого задача осталась бы в running навсегда: джоб мёртв, а хаб про это
+    не знает.
+    """
+    task_id = await _running_task(db)
+    plugins.dispatch = _dispatch_with(
+        {"status": "failed", "exit_code": 137, "result_text": "убит по памяти"}
+    )
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _run_poll_once(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "failed"
+    assert task["exit_code"] == 137
+    assert task["result_text"] == "убит по памяти"
+
+
+async def test_reported_blocker_sends_the_task_to_a_human(db):
+    """Блокер — это просьба о решении, а не провал.
+
+    Разница видна в статусе: needs_decision зовёт человека, failed просто
+    закрывает попытку.
+    """
+    task_id = await _running_task(db)
+    await repo.add_task_update(db, task_id, "agent", "blocker", "нужен доступ к прод")
+    await db.commit()
+    plugins.dispatch = _dispatch_with({"status": "completed", "exit_code": 0})
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _run_poll_once(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "переход к человеку должен быть виден в ленте, а не только в статусе"
+
+
+async def test_agent_summary_is_recovered_from_the_dispatch_log(db):
+    """Агент завершился, но отчёт в хаб не записал.
+
+    Хаб достаёт сводку из лога джоба и заводит done сам — иначе задача с
+    выполненной работой уходит в needs_decision как «отчёта нет».
+    """
+    task_id = await _running_task(db)
+    plugins.dispatch = _dispatch_with(
+        {"status": "completed", "exit_code": 0},
+        # Формат лога джоба: JSON, РАЗЛОЖЕННЫЙ ПО СТРОКАМ. Разбор идёт построчно
+        # и берёт то, что стоит после первого двоеточия, поэтому однострочный
+        # {"text": "..."} он не понимает — закрывающая скобка ломает json.loads.
+        # Сводкой считается только текст длиннее 30 символов, чтобы служебные
+        # реплики не стали отчётом.
+        log_text='{\n  "text": "Сделал что просили: поправил поллер и прогнал тесты"\n}',
+    )
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _run_poll_once(db)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    done = [u for u in updates if u["kind"] == "done"]
+    assert done, "сводка из лога должна стать done-записью"
+    assert "поправил поллер" in done[0]["content"]
+
+
+async def test_a_job_that_came_back_clears_the_missing_mark(db):
+    """Джоб пропал и вернулся: отметка о пропаже снимается.
+
+    Иначе задача остаётся помеченной как потерянная и попадёт под эскалацию,
+    хотя работа идёт.
+    """
+    task_id = await _running_task(db)
+    await repo.mark_job_missing(db, task_id)
+    await db.commit()
+    assert dict(await repo.get_task(db, task_id))["job_missing_since"]
+
+    plugins.dispatch = _dispatch_with({"status": "running"})
+
+    await _run_poll_once(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert not task["job_missing_since"], "вернувшийся джоб снимает отметку"
+    assert task["status"] == "running", "и статус при этом не трогается"
+
+
+async def test_a_job_still_running_is_left_alone(db):
+    """Незавершённый джоб не двигает задачу никуда."""
+    task_id = await _running_task(db)
+    plugins.dispatch = _dispatch_with({"status": "running"})
+
+    await _run_poll_once(db)
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
