@@ -26,6 +26,7 @@ from hub.services.review_dispatch import (
     diff_plan,
     file_line_counts,
     is_generated,
+    maybe_dispatch_review,
     pick_review_model,
     pick_review_profile,
     rules_candidates,
@@ -1148,3 +1149,193 @@ async def test_top_up_never_fires_on_an_unknown_profile(
     assert alerts and "не заявлен" in alerts[-1]["content"], (
         "the refusal names its cause instead of passing in silence"
     )
+
+
+# --- Incremental review: pay for the fixes, not the branch (#880) ------------
+#
+# A report is pinned to a generation, so a resubmission makes it stale — right
+# in substance, expensive in practice: the next run re-read the whole branch,
+# including code the previous generation had already read and called clean.
+
+
+class _AncestryGitOps(_PinnedGitOps):
+    """Git that answers the three questions the delta stands on."""
+
+    def __init__(self, *args, ancestor: bool | None = True, delta: str = "", **kw):
+        super().__init__(*args, **kw)
+        self._ancestor = ancestor
+        self._delta = delta
+
+    async def is_ancestor(self, repo, ancestor, descendant):
+        return self._ancestor
+
+    async def branch_diff(self, repo, base, branch):
+        # The delta call passes the previous SHA as `base`; anything else is
+        # the ordinary branch diff.
+        if base == _PREV_SHA:
+            return self._delta
+        return self._diff
+
+
+_PREV_SHA = "b" * 40
+_DELTA = "+++ b/hub/services/fixed.py\n+исправление\n"
+
+
+async def _second_generation(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    slug: str,
+    *,
+    ancestor: bool | None = True,
+    base_branch: str = "develop",
+    record_previous: bool = True,
+) -> int:
+    """A task on its SECOND submission, with the first one in the ledger."""
+    task_id = await _submitted(client, db, slug)
+    if record_previous:
+        # submit_for_review already wrote this row; the upsert pins the sha and
+        # base the test wants to reason about.
+        await repo.record_submission(
+            db,
+            task_id=task_id,
+            generation=1,
+            sha=_PREV_SHA,
+            base_branch=base_branch,
+        )
+    else:
+        # A task already in flight when the ledger appeared has no row at all.
+        await db.execute("DELETE FROM submissions WHERE task_id = ?", (task_id,))
+    # Bump to generation 2 the way a resubmission would, and pin a new tip.
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2, submission_sha = ? WHERE id = ?",
+        ("c" * 40, task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_resubmission_reviews_generation_delta(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#880): the second run reads the files this round of fixes touched,
+    # whole and against the BASE — and says that is what it read.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r-d"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-delta")
+    plugins.git_ops = _AncestryGitOps(_TIP, ["docs/notes.md"], delta=_DELTA)
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "'hub/services/fixed.py'" in prompt, "the command is narrowed to the delta"
+    assert "прочитана ДЕЛЬТА" in prompt
+    assert "дельта к поколению #1" in prompt
+    # Whole files against the base: old code beside the new edit stays visible.
+    assert "git diff develop...task-" in prompt
+    assert "ЦЕЛИКОМ и против базовой ветки" in prompt
+
+
+async def test_rebase_invalidates_delta(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#880): after a rebase the two commits no longer share a history,
+    # so "what changed since last time" is unanswerable — full diff, and the
+    # reason is named rather than left to be inferred from a wider command.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r"}, "run": {"id": "r-r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-rebase")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], ancestor=False, delta=_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "не предок текущего" in prompt and "перебазировали" in prompt
+    assert "прочитан ВЕСЬ дифф" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
+
+
+async def test_changed_base_branch_invalidates_delta(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # The same two commits answer a different question once the base moves.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-b"}, "run": {"id": "r-b"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-base", base_branch="main")
+    plugins.git_ops = _AncestryGitOps(_TIP, ["docs/notes.md"], delta=_DELTA)
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "базовая ветка сменилась" in prompt
+    assert "прочитан ВЕСЬ дифф" in prompt
+
+
+async def test_unrecorded_previous_submission_reads_everything(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Tasks that were already in flight when the ledger appeared have no
+    # previous row. Claiming a delta against a commit nobody recorded would be
+    # reading less than the report says.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-n"}, "run": {"id": "r-n"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(
+        client, db, "spike-noledger", record_previous=False
+    )
+    plugins.git_ops = _AncestryGitOps(_TIP, ["docs/notes.md"], delta=_DELTA)
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "предыдущая сдача не записана" in prompt
+    assert "прочитан ВЕСЬ дифф" in prompt
+
+
+async def test_unreadable_ancestry_reads_everything(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # "Could not look" is not "they are related" (#725). An unanswerable
+    # ancestry question must widen the review, never narrow it.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-u"}, "run": {"id": "r-u"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-unknown-ancestry")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], ancestor=None, delta=_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "историю проверить не удалось" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
+
+
+async def test_previous_findings_travel_with_the_delta(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # The delta tells the reviewer to skip files it did not touch — so what the
+    # last run confirmed has to arrive with it, or the fixes go unchecked.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-f"}, "run": {"id": "r-f"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-prior")
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "race on retry", "severity": "high", "file": "hub/a.py"}]
+        ),
+        incomplete=False,
+    )
+    await db.commit()
+    plugins.git_ops = _AncestryGitOps(_TIP, ["docs/notes.md"], delta=_DELTA)
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "НА ПРОШЛОМ ПОКОЛЕНИИ БЫЛИ ПОДТВЕРЖДЕНЫ" in prompt
+    assert "hub/a.py: race on retry" in prompt
+    assert "не считай их закрытыми по факту" in prompt
