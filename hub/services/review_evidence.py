@@ -34,6 +34,7 @@ So this module answers two questions the brief could not answer before:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -373,6 +374,112 @@ def evidence_coverage(
         "checks_missing": missing,
         "checks_not_applicable": not_applicable,
     }
+
+
+# What a passing check proves, in words the reviewer can act on (#875). The
+# map is deliberately narrow and per-tool: the grant is "ruff found nothing",
+# never "style is fine". A tool that is not here grants nothing, which is the
+# safe direction — an over-broad promise silences a real defect.
+_CHECK_MEANING: dict[str, str] = {
+    "lint": "стиль и простые дефекты, которые ловит ruff",
+    "format": "форматирование",
+    "types": "несоответствия типов, которые ловит mypy",
+    "tests": "объявленные тесты репозитория",
+    "security": "шаблоны небезопасного кода, которые ловит bandit",
+    "audit": "известные уязвимости зависимостей",
+}
+
+
+async def prepass_state(db, task: dict):
+    """Which deterministic checks passed on the commit under review (#875).
+
+    Three answers, never two. The distinction that matters here is between "no
+    check ran" and "a check ran and found nothing": only the second may buy the
+    reviewer's silence on a class, and collapsing them would hand out that
+    silence for free — the same substitution #549 removed from coverage.
+    """
+    from hub import repository as repo_module
+    from hub.models import PrepassState
+    from hub.services.ci_report import CHECK_FAIL, CHECK_PASS, CHECK_SKIPPED
+
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        return PrepassState(
+            state="unknown",
+            reason="коммит сдачи не закреплён — предпас не с чем сверить",
+        )
+    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    if row is None:
+        return PrepassState(
+            state="unknown",
+            head_sha=pinned,
+            reason=(
+                f"CI не присылал отчёт о прогоне для коммита {pinned[:12]} — "
+                "какие проверки прошли, неизвестно"
+            ),
+        )
+    try:
+        checks = json.loads(dict(row).get("checks") or "{}")
+    except ValueError:
+        checks = {}
+    if not isinstance(checks, dict) or not checks:
+        return PrepassState(
+            state="unknown",
+            head_sha=pinned,
+            reason=(
+                f"отчёт о коммите {pinned[:12]} есть, но он не назвал ни одной "
+                "проверки — считать их пройденными нельзя"
+            ),
+        )
+    passed = sorted(k for k, v in checks.items() if v == CHECK_PASS)
+    failed = sorted(k for k, v in checks.items() if v == CHECK_FAIL)
+    skipped = sorted(k for k, v in checks.items() if v == CHECK_SKIPPED)
+    return PrepassState(
+        # A failed check is louder than a passing one: it means the code under
+        # review is known-broken in a way a tool already proved, and the
+        # reviewer should be told rather than left to rediscover it.
+        state="failed" if failed else ("covered" if passed else "unknown"),
+        reason=(
+            f"упали: {', '.join(failed)}"
+            if failed
+            else ("" if passed else "все названные проверки пропущены")
+        ),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        head_sha=pinned,
+    )
+
+
+def prepass_block(state) -> str:
+    """The prepass as the reviewer reads it, in its prompt (#875)."""
+    if state.state == "unknown":
+        return (
+            "ДЕТЕРМИНИРОВАННЫЙ ПРЕДПАС: данных нет — "
+            f"{state.reason}. Ничего не считай проверенным: ищи как обычно."
+        )
+    lines: list[str] = []
+    if state.passed:
+        covered = ", ".join(
+            f"{name} ({_CHECK_MEANING[name]})" if name in _CHECK_MEANING else name
+            for name in state.passed
+        )
+        lines.append(
+            "ДЕТЕРМИНИРОВАННЫЙ ПРЕДПАС на этом же коммите ПРОШЁЛ: "
+            f"{covered}. НЕ трать проход на эти классы — инструмент уже "
+            "доказал их отсутствие, и находка такого класса будет ложной. "
+            "Всё остальное ищи как обычно: список говорит, что проверено "
+            "инструментом, а не что дефектов больше нет."
+        )
+    if state.failed:
+        lines.append(
+            f"ВНИМАНИЕ, проверки УПАЛИ: {', '.join(state.failed)}. Код под "
+            "ревью уже сломан по этим проверкам — это факт для отчёта, а не "
+            "твоя находка."
+        )
+    if state.skipped:
+        lines.append(f"Пропущены (ничего не доказывают): {', '.join(state.skipped)}.")
+    return " ".join(lines)
 
 
 async def attach_dispositions(db, view) -> None:

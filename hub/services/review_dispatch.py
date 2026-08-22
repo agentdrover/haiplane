@@ -567,6 +567,7 @@ def _review_prompt(
     profile: str,
     rules_block: str,
     diff_block: str,
+    prepass_block: str,
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба OpenClaw "
@@ -578,6 +579,9 @@ def _review_prompt(
         # So does the diff plan (#874): the deep harness reads the same branch
         # and has the same reason not to spend its passes on lock files.
         f"{diff_block}\n\n"
+        # And the prepass (#875): both profiles pay model prices for what a
+        # linter already proved, and the expensive one pays them per pass.
+        f"{prepass_block}\n\n"
     )
     if profile == LITE:
         # No token ceiling is stated (#893). It used to say "бюджет 40000
@@ -713,13 +717,28 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
     ctx = await _git_context(db, task_id)
     base = ctx[1] if ctx else config.PAIR_BASE_BRANCH
     diff_block, diff_note = diff_plan(diff, base, branch)
+    # #875: what the toolchain already proved on THIS commit. Built from the
+    # task row the caller already read, so no extra query for the common case.
+    # Imported here, not at module level: review_evidence reaches back into
+    # this module's siblings, and the top-level cycle is the reason every
+    # other cross-service call in this file is local too.
+    from hub.services import review_evidence
+
+    prepass = await review_evidence.prepass_state(db, task)
+    prepass_block = review_evidence.prepass_block(prepass)
     hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=branch,
         model_id=model_id,
         prompt_text=_review_prompt(
-            task_id, branch, model_id, profile, rules_block, diff_block
+            task_id,
+            branch,
+            model_id,
+            profile,
+            rules_block,
+            diff_block,
+            prepass_block,
         ),
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
@@ -766,7 +785,10 @@ async def maybe_dispatch_review(db: aiosqlite.Connection, task_id: int) -> bool:
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
         f"{profile_note}, агент {agent_id}. Правила репозитория: "
         f"{rules_note} (#873). Предмет ревью: {diff_note} (#874). "
-        "Отчёт придёт через "
+        f"Предпас: {prepass.state}"
+        + (f" ({', '.join(prepass.passed)})" if prepass.passed else "")
+        + " (#875). "
+        + "Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
         "(#757, #807).",
     )

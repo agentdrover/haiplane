@@ -181,6 +181,41 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
     return out
 
 
+# GitHub spells a step's result its own way; the hub's contract has three
+# outcomes (#875). Anything unrecognised is dropped rather than guessed: a
+# check whose result we cannot name must not become one the reviewer trusts.
+_OUTCOME_MAP = {
+    "success": "pass",
+    "pass": "pass",
+    "passed": "pass",
+    "failure": "fail",
+    "fail": "fail",
+    "failed": "fail",
+    "skipped": "skipped",
+    "cancelled": "skipped",
+    "canceled": "skipped",
+}
+
+
+def parse_checks(raw: str) -> dict[str, str]:
+    """``"lint=success, types=failure"`` → ``{"lint": "pass", "types": "fail"}``.
+
+    Silence in, silence out: an empty or unparsable entry contributes nothing.
+    An empty map means "this report names no checks", which the hub reads as
+    "nothing is proven" — never as "everything passed".
+    """
+    checks: dict[str, str] = {}
+    for chunk in (raw or "").replace("\n", ",").split(","):
+        name, _, outcome = chunk.partition("=")
+        name = name.strip()
+        mapped = _OUTCOME_MAP.get(outcome.strip().lower())
+        if name and mapped:
+            checks[name] = mapped
+        elif name:
+            log(f"check {name!r}: outcome {outcome.strip()!r} not recognised — dropped")
+    return checks
+
+
 def run_validation(commands: list[str]) -> tuple[str, str, str]:
     """(status, log_tail, reason) for the task's validation_commands."""
     if not commands:
@@ -254,6 +289,10 @@ def main() -> int:
 
     v_status, v_log, v_reason = run_validation(task.get("validation_commands") or [])
 
+    checks = parse_checks(os.environ.get("OPENCLAW_HUB_CI_CHECKS") or "")
+    if checks:
+        log(f"deterministic checks reported: {checks}")
+
     payload = {
         "head_sha": head_sha,
         "ac_results": ac_results,
@@ -261,6 +300,7 @@ def main() -> int:
         "validation_log": v_log,
         "reason": v_reason,
         "reported_by": "github-actions",
+        "checks": checks,
     }
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:

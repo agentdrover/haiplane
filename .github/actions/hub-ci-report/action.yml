@@ -33,6 +33,16 @@ inputs:
       pytest", "pytest". Default is the hub repository's own runner.
     required: false
     default: "uv run pytest"
+  checks:
+    description: >-
+      Which deterministic checks this job ran and how they ended, as
+      "name=outcome" pairs separated by commas or newlines; outcome is
+      pass | fail | skipped. Example: "lint=success,types=failure" — GitHub's
+      own step outcomes are accepted and mapped. Reported so the reviewer stops
+      paying model prices for defects a linter already proved absent (#875).
+      Absent ⇒ the report names no checks, which grants nothing.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -44,6 +54,7 @@ runs:
         OPENCLAW_HUB_CI_TOKEN: ${{ inputs.hub-token }}
         HEAD_SHA: ${{ inputs.head-sha }}
         OPENCLAW_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
+        OPENCLAW_HUB_CI_CHECKS: ${{ inputs.checks }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter
