@@ -115,6 +115,28 @@ class WorkType(str, Enum):
     incident = "incident"
 
 
+class DefectFoundIn(str, Enum):
+    """Stage at which a defect was caught (#909, epic #900).
+
+    The stages are ordered by how much a miss costs: a defect stopped at
+    ``review`` cost one reviewer's attention, the same defect at ``prod`` cost
+    a user. Counting them apart is the whole point — a first-pass acceptance
+    rate of 99.5% and an escape to production are both true at once, and only
+    this field can tell which of the two a number is about.
+
+    ``unknown`` is a legitimate answer and stays visible in every report. The
+    alternative — deriving the stage from timestamps — is how the current
+    escaped-defect metric ended up measuring which fields got filled in.
+    """
+
+    unknown = "unknown"
+    review = "review"
+    ci = "ci"
+    test = "test"
+    staging = "staging"
+    prod = "prod"
+
+
 class ClassOfService(str, Enum):
     """Kanban class of service for prioritization and SLA."""
 
@@ -1572,6 +1594,14 @@ class TaskView(BaseModel):
     # The observable features that produced the class (#582). Empty while
     # risk_class is None; otherwise each entry names one triggered feature.
     risk_class_reasons: list[str] = Field(default_factory=list)
+    # --- Defect passport (#909, epic #900) ---
+    # Read-only surface, like risk_class above: written through
+    # ``repo.set_defect_passport`` so the causal link is resolved before it
+    # lands, never accepted straight off a refine payload.
+    found_in: DefectFoundIn = DefectFoundIn.unknown
+    caused_by_task_id: int | None = None
+    detected_at: str | None = None
+    resolved_at: str | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)

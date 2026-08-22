@@ -2288,6 +2288,70 @@ async def update_task_structured(
     return updates
 
 
+class DefectPassportError(ValueError):
+    """Raised when a defect passport write would store an unusable fact (#909).
+
+    Two cases: a ``found_in`` outside the stage list, and a causal link that
+    does not resolve. Both are refused here rather than upstream because every
+    surface (REST, MCP, CLI) writes through this function — a check in one of
+    them is a check the other two do not have.
+    """
+
+
+async def set_defect_passport(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    found_in: str | None = None,
+    caused_by_task_id: int | None = None,
+    detected_at: str | None = None,
+    resolved_at: str | None = None,
+    clear_caused_by: bool = False,
+) -> dict[str, Any]:
+    """Write the defect passport for one task and return the applied columns.
+
+    PATCH semantics: ``None`` means "leave as is", so a caller that only knows
+    the stage does not have to restate the rest. Dropping an attribution is a
+    deliberate act with its own flag (``clear_caused_by``) instead of an
+    overloaded ``None`` — otherwise "I don't know who broke it" and "nobody
+    broke it, remove the link" would be the same call.
+
+    Raises ``DefectPassportError`` when the stage is not a known one or the
+    causal link does not resolve; nothing is written in that case.
+    """
+    from hub.db import validate_caused_by
+    from hub.models import DefectFoundIn
+
+    updates: dict[str, Any] = {}
+
+    if found_in is not None:
+        try:
+            updates["found_in"] = DefectFoundIn(found_in).value
+        except ValueError as exc:
+            allowed = ", ".join(stage.value for stage in DefectFoundIn)
+            raise DefectPassportError(
+                f"unknown found_in {found_in!r}; allowed: {allowed}"
+            ) from exc
+
+    if clear_caused_by:
+        updates["caused_by_task_id"] = None
+    elif caused_by_task_id is not None:
+        problem = await validate_caused_by(db, task_id, caused_by_task_id)
+        if problem:
+            raise DefectPassportError(problem)
+        updates["caused_by_task_id"] = caused_by_task_id
+
+    if detected_at is not None:
+        updates["detected_at"] = detected_at
+    if resolved_at is not None:
+        updates["resolved_at"] = resolved_at
+
+    if not updates:
+        return {}
+    await update_task(db, task_id, **updates)
+    return updates
+
+
 async def append_task_risk(
     db: aiosqlite.Connection,
     task_id: int,
