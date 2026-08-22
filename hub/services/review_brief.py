@@ -289,6 +289,13 @@ async def build_review_brief(
         head_sha=task_view.submission_sha or "",
     )
 
+    # #875: WHICH checks ran, not just whether a run was reported. "A run
+    # exists" and "ruff found nothing" are different facts, and only the second
+    # can buy the reviewer's silence on a class.
+    prepass = await review_evidence.prepass_state(
+        db, {"id": task_id, "submission_sha": task_view.submission_sha}
+    )
+
     # #615: the statement the reviewer is judging may predate the work that
     # invalidated it. Same computation as pair-start, one source.
     freshness = await statement_freshness(db, task_row)
@@ -343,6 +350,7 @@ async def build_review_brief(
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
         ci_run_report=ci_run_report,
+        prepass=prepass,
         live_check=LiveCheckState(**live_check),
         statement_freshness=freshness,
         scope_in=task_view.scope_in,

@@ -47,16 +47,26 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
+      # #875: these steps get ids so their outcomes can be REPORTED to the
+      # hub. The reviewer was paying model prices to rediscover defects ruff
+      # and mypy had proven absent minutes earlier, because the result stopped
+      # here. `continue-on-error` is deliberately NOT set: a red job must stay
+      # red — the point is to tell the reviewer what passed, not to soften the
+      # gate.
       - name: Lint
+        id: lint
         run: uv run ruff check hub tests
 
       - name: Check formatting
+        id: format
         run: uv run ruff format --check hub tests
 
       - name: Type check
+        id: types
         run: uv run mypy hub
 
       - name: Test
+        id: tests
         run: uv run pytest -q
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
@@ -109,6 +119,13 @@ jobs:
           hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: uv run pytest
+          # A step that never ran reports its outcome as '' and is dropped by
+          # the reporter — silence, not a pass (#875).
+          checks: >-
+            lint=${{ steps.lint.outcome }},
+            format=${{ steps.format.outcome }},
+            types=${{ steps.types.outcome }},
+            tests=${{ steps.tests.outcome }}
 
       # #611: the audit no longer decides whether anything ships. The delivery
       # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery

@@ -61,6 +61,14 @@ VALIDATION_WRITABLE = frozenset({VALIDATION_PASS, VALIDATION_FAIL})
 STATE_CURRENT = "current"
 STATE_UNKNOWN = "unknown"
 
+# How a deterministic check can end (#875). "skipped" is a real outcome, not a
+# missing one: a step the workflow chose not to run proves nothing, and saying
+# so is different from not mentioning it.
+CHECK_PASS = "pass"  # nosec B105 - an outcome name, not a credential
+CHECK_FAIL = "fail"
+CHECK_SKIPPED = "skipped"
+CHECK_OUTCOMES = frozenset({CHECK_PASS, CHECK_FAIL, CHECK_SKIPPED})
+
 
 def _pinned_sha(task: dict) -> str:
     return (task.get("submission_sha") or "").strip()
@@ -76,6 +84,7 @@ async def accept_ci_run_report(
     validation_log: str = "",
     reason: str = "",
     reported_by: str = "",
+    checks: dict[str, str] | None = None,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -99,6 +108,16 @@ async def accept_ci_run_report(
             f"unknown validation status {validation_status!r}; "
             f"expected one of {sorted(VALIDATION_STATUSES)}"
         )
+
+    # #875: the same enumeration discipline the AC statuses get. A check whose
+    # outcome the hub cannot name is refused rather than stored as something
+    # the prepass block would then have to interpret.
+    for name, outcome in (checks or {}).items():
+        if (outcome or "").strip() not in CHECK_OUTCOMES:
+            raise ValueError(
+                f"unknown check outcome {outcome!r} for {name!r}; "
+                f"expected one of {sorted(CHECK_OUTCOMES)}"
+            )
 
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
@@ -146,6 +165,11 @@ async def accept_ci_run_report(
         validation_log=validation_log or "",
         reason=reason or "",
         reported_by=reported_by or "",
+        checks=json.dumps(
+            {k: (v or "").strip() for k, v in (checks or {}).items()},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
     )
 
     recorded: list[dict] = []

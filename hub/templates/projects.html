@@ -187,6 +187,15 @@
                         <option value="off" {% if c.project.gate_policy.get('review') != 'dispatch' %}selected{% endif %}>off — ревьюера не запускать</option>
                         <option value="dispatch" {% if c.project.gate_policy.get('review') == 'dispatch' %}selected{% endif %}>dispatch — хаб зовёт кросс-модельного ревьюера</option>
                     </select>
+                    {# #926: релизная политика — тоже не автопилот гейта:
+                       содержимое релиза одобрено по задачам, а мерж develop→main
+                       решений не принимает (#812). Поэтому селект доступен всем
+                       проектам, включая default, и стоит ВНЕ ветки замка #743. #}
+                    <label class="task-action-label">Релиз develop→main (деплой по-прежнему делает CI на мерже)</label>
+                    <select name="gate_policy_release" class="task-action-control">
+                        <option value="manual" {% if c.project.gate_policy.get('release') != 'auto' %}selected{% endif %}>manual — релиз открывают и мержат руками</option>
+                        <option value="auto" {% if c.project.gate_policy.get('release') == 'auto' %}selected{% endif %}>auto — хаб открывает релизный PR и мержит его по зелёному CI</option>
+                    </select>
                     {% if c.project.slug == 'default' %}
                     <label class="task-action-label">Автопилот гейтов</label>
                     <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743)">заперт: всегда human</span>

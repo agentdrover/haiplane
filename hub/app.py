@@ -1546,6 +1546,19 @@ async def api_submit_machine_review(
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("auto-verdict failed for task #%s", task_id)
 
+    # The ladder (#879): a cheap run that declared it did not finish buys the
+    # heavy profile instead of handing a human unfinished work. After the
+    # auto-verdict, not before — an incomplete report can never earn one
+    # (auto_verdict refuses on `incomplete`), so the order costs nothing and
+    # keeps the clean path first. Best-effort like the verdict above: the
+    # report intake must not fail because the ladder stumbled.
+    try:
+        from hub.services.review_dispatch import maybe_top_up_incomplete
+
+        await maybe_top_up_incomplete(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("review top-up failed for task #%s", task_id)
+
     return view
 
 
@@ -1727,6 +1740,7 @@ async def api_ci_run_report(
             validation_log=body.validation_log,
             reason=body.reason,
             reported_by=body.reported_by or identity.username,
+            checks=body.checks,
         )
     except LookupError:
         raise HTTPException(404, "task not found") from None

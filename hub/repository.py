@@ -1100,6 +1100,7 @@ async def upsert_ci_run_report(
     validation_log: str,
     reason: str,
     reported_by: str,
+    checks: str = "{}",
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
 
@@ -1108,13 +1109,14 @@ async def upsert_ci_run_report(
     """
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
-        "validation_status, validation_log, reason, reported_by, reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "validation_status, validation_log, reason, reported_by, checks, "
+        "reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
         "ac_results=excluded.ac_results, "
         "validation_status=excluded.validation_status, "
         "validation_log=excluded.validation_log, "
         "reason=excluded.reason, reported_by=excluded.reported_by, "
+        "checks=excluded.checks, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -1124,6 +1126,7 @@ async def upsert_ci_run_report(
             validation_log,
             reason,
             reported_by,
+            checks,
         ),
     )
 
@@ -1831,6 +1834,23 @@ async def get_review_dispatch_for_generation(
         )
     )
     return rows[0] if rows else None
+
+
+async def count_review_dispatches(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """How many cloud runs this submission has already bought (#879).
+
+    Counted from the rows, not from a flag: the ladder's ceiling has to be the
+    same fact the bill is, and a flag would drift from it.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=?",
+        (task_id, generation),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
 
 
 async def set_review_dispatch_status(

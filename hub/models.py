@@ -747,6 +747,28 @@ class CIRunReportState(BaseModel):
     head_sha: str = ""
 
 
+class PrepassState(BaseModel):
+    """Which deterministic checks already ran on the code under review (#875).
+
+    ``state`` is ``covered`` (at least one check ran and passed on the pinned
+    commit), ``failed`` (a check ran and did NOT pass) or ``unknown`` (no report
+    for this commit, or a report that named no checks). ``reason`` is always
+    filled for the last two, so a reader gets a cause instead of a blank.
+
+    ``passed`` lists only the checks that ran AND passed on THIS commit. It is
+    the sole basis on which the reviewer is told not to spend its pass on a
+    class — a list built from anything else would be a promise the run cannot
+    keep.
+    """
+
+    state: str = "unknown"
+    reason: str = "отчёт CI о прогоне не запрашивался"
+    passed: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list)
+    skipped: list[str] = Field(default_factory=list)
+    head_sha: str = ""
+
+
 class DiffBaseState(BaseModel):
     """Which base the diff is taken against, and whether it exists (#725).
 
@@ -831,6 +853,10 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    # #875: which deterministic checks already passed on this very commit. The
+    # reviewer reads it to stop paying model prices for what a linter proved
+    # minutes earlier; the human reads it beside the report.
+    prepass: PrepassState = Field(default_factory=lambda: PrepassState())
     live_check: LiveCheckState = Field(default_factory=lambda: LiveCheckState())
     # #615: the reviewer judges a statement too — and it may be older than the
     # work that invalidated it.
@@ -1894,6 +1920,10 @@ class CIRunReportSubmit(BaseModel):
     head_sha: str = Field(..., min_length=7, max_length=64)
     submission_generation: int | None = Field(default=None, ge=0)
     ac_results: dict[str, str] = Field(default_factory=dict)
+    # Which deterministic checks ran and how they ended (#875): step name →
+    # pass | fail | skipped. Optional, and an omitted map means "this report
+    # names no checks" — never "everything passed".
+    checks: dict[str, str] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)

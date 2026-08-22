@@ -606,6 +606,24 @@
                         {% if evidence.ci_run_report.state != 'current' %}<span class="muted">{{ evidence.ci_run_report.reason }}</span>{% endif %}
                     </div>
 
+                    {# #875: КАКИЕ проверки прошли, а не только «прогон был».
+                       Право сказать ревьюеру «этот класс покрыт» даёт только
+                       шаг, выполнившийся и прошедший на этом коммите. #}
+                    <div class="task-evidence-row">
+                        <span class="u-text-muted">Детерминированный предпас:</span>
+                        <span class="badge badge--xs badge-{{ 'test' if evidence.prepass.state == 'covered' else ('failed' if evidence.prepass.state == 'failed' else 'pending') }}">{{ evidence.prepass.state }}</span>
+                        {% if evidence.prepass.passed %}
+                        <span>прошли: {{ evidence.prepass.passed|join(', ') }}</span>
+                        {% endif %}
+                        {% if evidence.prepass.failed %}
+                        <span class="badge badge-failed">упали: {{ evidence.prepass.failed|join(', ') }}</span>
+                        {% endif %}
+                        {% if evidence.prepass.skipped %}
+                        <span class="muted">пропущены: {{ evidence.prepass.skipped|join(', ') }}</span>
+                        {% endif %}
+                        {% if evidence.prepass.state == 'unknown' %}<span class="muted">{{ evidence.prepass.reason }}</span>{% endif %}
+                    </div>
+
                     {% if evidence.statement_freshness %}
                     <div class="task-evidence-row">
                         <span class="u-text-muted">Свежесть постановки:</span>
