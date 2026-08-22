@@ -9,7 +9,9 @@ import json
 from mcp.types import CallToolResult, TextContent
 
 from hub.mcp_structured import MCP_STRUCTURED_SCHEMA_VERSION
+from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_server import (
+    hub_add_dependency,
     hub_submit_machine_review,
     HubApiError,
     hub_add_acceptance_criterion,
@@ -2991,3 +2993,34 @@ def test_refine_docstring_and_signature_agree() -> None:
     )
     # And the seven from the incident are specifically among the parameters.
     assert set(_DISCOVERY_FIELDS) <= parameters
+
+
+async def test_tool_error_keeps_its_text_and_gains_structure(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """AC-1 (#895): отказ инструмента — тот же текст, но теперь структура.
+
+    Текст сравнивается с прямой сериализацией payload, а не с образцом в
+    константе: поля instance/base_url/server_id зависят от окружения, зато
+    ФОРМА проверяется строго. Именно она и могла поехать: успехи заворачивают
+    текст в echo-обёртку {"message": ...}, и повторить это для ошибок значило
+    бы сломать всех, кто сегодня читает отказ как плоский payload.
+    """
+    detail = {"reason": "cycle_refused", "message": "would close a cycle"}
+    mock_api_post.side_effect = HubApiError(dict(detail))
+
+    # Инструмент из СТРУКТУРНОГО семейства: его успех — CallToolResult, значит
+    # и отказ обязан быть им же. Строковые инструменты остаются строковыми —
+    # формат отказа следует за форматом успеха того же инструмента (#895).
+    out = await hub_add_dependency(41, 42)
+
+    expected_text = json.dumps(enrich_error_payload(dict(detail)), ensure_ascii=False)
+    assert _mcp_text(out) == expected_text, "текст отказа не должен меняться"
+
+    structured = _mcp_structured(out)
+    assert structured is not None, "отказ теперь приходит структурой, как и успех"
+    assert structured["reason"] == "cycle_refused"
+    assert structured == json.loads(_mcp_text(out)), (
+        "текст и структура обязаны нести одно и то же: расхождение между ними "
+        "хуже, чем отсутствие структуры"
+    )

@@ -81,3 +81,20 @@ async def test_mcp_endpoint_requires_bearer_at_public_path(client, monkeypatch):
         )
     assert authenticated.status_code == 200
     assert "serverInfo" in authenticated.text
+
+
+def test_server_builds():
+    """AC-3 (#895): сигнатуры инструментов принимаются SDK при регистрации.
+
+    Эта проверка существует потому, что mypy её не делает: в #848 попытка
+    объявить возврат как ``CallToolResult | str`` прошла проверку типов и
+    упала уже на регистрации — SDK запрещает CallToolResult в Union, и сервер
+    просто не собирался. Зелёный mypy тут ничего не гарантирует.
+    """
+    import importlib
+
+    import hub.mcp_server as mcp_server
+
+    importlib.reload(mcp_server)
+    tools = mcp_server.mcp._tool_manager.list_tools()
+    assert tools, "сервер должен зарегистрировать хотя бы один инструмент"
