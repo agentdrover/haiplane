@@ -93,6 +93,11 @@
             </div>
         </section>
 
+        <!-- Prod state (#500): что раскатано и что до прода не доехало -->
+        <section class="section">
+            {% include "partials/prod_state.html" with context %}
+        </section>
+
         <!-- Coordination (#775): who is around and what they say to each other -->
         <section class="section section--coordination">
             {% include "partials/agent_sessions.html" with context %}

@@ -751,6 +751,19 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         "projects_list": projects_list,
         "current_project": current_project,
     }
+
+    # #500: the delivery snapshot, read from the builder that already answers
+    # REST, CLI and MCP (#499) — a fourth reader of one truth, not a fourth
+    # version of it. Best-effort: a dashboard must render even when the
+    # snapshot cannot be built, and the section says so rather than showing
+    # empty lists that read as "nothing shipped".
+    try:
+        from hub.services.prod_state import prod_state as _prod_state
+
+        ctx["prod_state"] = await _prod_state(db)
+    except Exception as exc:  # noqa: BLE001 - the dashboard must render
+        log.warning("prod-state section failed: %s", exc)
+        ctx["prod_state"] = None
     ctx.update(inbox)
     tasks_for_badges = [
         *data.active_tasks,
