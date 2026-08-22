@@ -69,6 +69,7 @@ from hub.models import (
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    CategoryCheckSubmit,
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
@@ -755,6 +756,32 @@ async def api_mcp_catalog(request: Request):
     return {**result, "tools_list": snapshot["tools_list"]}
 
 
+@app.post("/api/metrics/category-checks")
+async def api_record_category_check(
+    body: CategoryCheckSubmit,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Close a recurring finding category by naming its check (#878).
+
+    Open to agents and humans alike: this is a declaration about the codebase,
+    like an outcome answer (#819), and the agent that wrote the lint rule is
+    the one that knows its name. What keeps it honest is not the caller's role
+    but ``check_ref`` — a category closed without naming a real check is
+    refused, because that hides the debt instead of paying it.
+    """
+    try:
+        return await services.record_category_check(
+            _db(request),
+            category=body.category,
+            check_ref=body.check_ref,
+            note=body.note,
+            recorded_by=identity.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/metrics/outcome-debt")
 async def api_outcome_debt(request: Request):
     """Outcome promises and the answers to them (#766, #819).
@@ -988,6 +1015,11 @@ async def api_list_task_dependencies(task_id: int, request: Request):
     db = _db(request)
     await _require_task(db, task_id)
     edges = await repo.list_task_dependencies(db, task_id)
+    # #885: one enrichment for every reader — this endpoint, the task context,
+    # the start gate and the MCP tools that call this endpoint.
+    from hub.services.delivery_state import with_delivery
+
+    edges["blocked_by"] = await with_delivery(db, edges["blocked_by"])
     return models.TaskDependencies(
         blocked_by=[models.TaskDependencyRef(**e) for e in edges["blocked_by"]],
         unblocks=[models.TaskDependencyRef(**e) for e in edges["unblocks"]],

@@ -1189,6 +1189,37 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dispositions_unique "
         "ON finding_dispositions(review_id, finding_index)",
     ),
+    (
+        # A finding class that keeps coming back, and the check that ended it
+        # (#878, feature #871). ``recurring_categories`` has counted repeats
+        # since #384 and closed nothing: a class found in three tasks is still
+        # hunted by a model, at full price, on the fourth.
+        #
+        # This is the only lever in the review economics that improves
+        # monotonically. A defect turned into a lint rule or a CI check costs
+        # zero tokens forever after; every other saving here is a one-off.
+        #
+        # ``check_ref`` is NOT NULL and refused when blank at the call site: a
+        # category closed by a tick rather than by a named check is a category
+        # nobody covered, and the debt list would shrink while the bill stayed
+        # exactly where it was.
+        "create_category_checks",
+        """CREATE TABLE IF NOT EXISTS category_checks (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            category    TEXT    NOT NULL,
+            check_ref   TEXT    NOT NULL,
+            note        TEXT    NOT NULL DEFAULT '',
+            recorded_by TEXT    NOT NULL DEFAULT '',
+            recorded_at TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        # One live check per category: recording a better one replaces the
+        # claim rather than leaving two answers to "is this covered?".
+        "idx_category_checks_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_category_checks_unique "
+        "ON category_checks(category)",
+    ),
 ]
 
 

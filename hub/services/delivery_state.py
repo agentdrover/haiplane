@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from hub import config
 from hub import repository as repo
 from hub.integrations.registry import plugins
 
@@ -174,3 +175,85 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
         "работа смёржена, но ждёт релиза",
         **known,
     )
+
+
+async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
+    """Is this task's submitted commit already in its project's base branch (#885)?
+
+    True — yes, wherever the merge came from. False — looked and it is not.
+    None — could not look, which is NOT the same as "not delivered" (#725).
+
+    Exists because delivery was read from ``pipeline_merges`` alone — merges
+    the hub performed itself (#534). A merge made outside the gate leaves no
+    row there, so the blocker read as undelivered while its code sat in the
+    base branch. On 21.08.2026 the edge #830 → #818 said exactly that, an hour
+    after #818 was merged. A warning that is wrong in the obvious case teaches
+    the reader to skip the line, and then it is silent in the case that
+    mattered.
+
+    Cheap by construction: callers ask ONLY for blockers with no pipeline
+    merge, so in the normal path this runs zero git commands.
+    """
+    sha = (task_row.get("submission_sha") or "").strip()
+    if not sha:
+        return None
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_row["id"])
+        workspace = (ctx.get("repo") or "").strip()
+        base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    except Exception as exc:  # noqa: BLE001 - advisory path, never fatal
+        log.warning("delivery check for #%s: no git context: %s", task_row["id"], exc)
+        return None
+    if not workspace:
+        return None
+    # origin/<base> rather than <base>: the shared clone sits on the base
+    # branch but may be behind, and the question is about what has landed
+    # upstream, not about this checkout.
+    return await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
+
+
+async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
+    """Fill in ``delivered``/``reason`` for one blocker row (#885).
+
+    The gate's own merges answer first and cost nothing. Only when there is
+    none does the base branch get asked — and its answer is kept distinct:
+    delivered outside the gate clears the block, and says so, because manual
+    merges into the base branch are against the rules here and the drift guard
+    (#534) has its own opinion about them. Hiding that would trade one silent
+    wrong answer for another.
+    """
+    if blocker.get("delivered"):
+        return {**blocker, "delivery_path": "gate"}
+    row = await repo.get_task(db, blocker["task_id"])
+    task = dict(row) if row is not None else {}
+    reached = await merged_into_base(db, task) if task else None
+    # A blocker that never pinned a commit has nothing to look for, so the
+    # second source staying silent is not news — saying "could not check"
+    # there would add noise to a reason that is already complete.
+    had_something_to_check = bool((task.get("submission_sha") or "").strip())
+    if reached is True:
+        return {
+            **blocker,
+            "delivered": True,
+            "delivery_path": "outside_gate",
+            "reason": "код в базовой ветке, но мерж прошёл мимо гейта",
+        }
+    if reached is None and had_something_to_check and blocker.get("reason"):
+        # Keep the original reason and say the second source stayed silent —
+        # "could not look" must not read as "looked and it is not there".
+        return {
+            **blocker,
+            "delivery_path": "unknown",
+            "reason": f"{blocker['reason']}; проверить базовую ветку не удалось",
+        }
+    return {**blocker, "delivery_path": "none"}
+
+
+async def with_delivery(
+    db: Any, blockers: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The same enrichment for every reader (#885) — the gate (#484), the task
+    context (#485), REST (#486) and MCP (#487) must not answer differently."""
+    return [await blocker_delivery(db, b) for b in blockers]

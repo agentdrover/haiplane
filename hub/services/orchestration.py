@@ -335,6 +335,108 @@ async def _tokens_per_fixed(
     return round(int(row.get("tokens") or 0) / fixed) if fixed else None
 
 
+# How many DISTINCT tasks a finding category must appear in before it stops
+# being a finding and becomes a property of the codebase (#878). Three, because
+# two can be one author's habit inside one week; the number is a judgement, and
+# the revisit condition on the task watches whether it was the right one.
+RECURRENCE_DEBT_THRESHOLD = 3
+
+
+async def recurring_categories(
+    db: aiosqlite.Connection, since: str
+) -> list[dict[str, Any]]:
+    """Confirmed-finding categories in the window, with how far they spread.
+
+    ``findings`` counts hits, ``tasks`` counts the DISTINCT tasks they landed
+    in. The second is the one the debt is built from: ten hits inside one
+    sprawling task say something about that task, three hits across three
+    tasks say something about the repository.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
+        "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
+        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
+        "WHERE mr.created_at >= datetime('now', ?) "
+        "GROUP BY category HAVING category != '' "
+        "ORDER BY findings DESC LIMIT 50",
+        (since,),
+    )
+    return [dict(r) | {"recurring": r["tasks"] > 1} for r in rows]
+
+
+async def build_category_debt(
+    db: aiosqlite.Connection, recurring: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Which recurring finding categories owe a deterministic check (#878).
+
+    Takes the already-computed recurrence rows so the caller pays for that
+    query once. Returns every category over the threshold — covered and open
+    alike: a list that silently drops what was closed cannot show that anything
+    ever gets closed, and the habit is the thing being measured.
+    """
+    covered = {
+        dict(row)["category"]: dict(row) for row in await repo.list_category_checks(db)
+    }
+    debt: list[dict[str, Any]] = []
+    for row in recurring:
+        if row["tasks"] < RECURRENCE_DEBT_THRESHOLD:
+            continue
+        check = covered.get(row["category"])
+        debt.append(
+            {
+                "category": row["category"],
+                "tasks": row["tasks"],
+                "findings": row["findings"],
+                "covered": check is not None,
+                "check_ref": check["check_ref"] if check else "",
+                "recorded_by": check["recorded_by"] if check else "",
+            }
+        )
+    return debt
+
+
+async def record_category_check(
+    db: aiosqlite.Connection,
+    *,
+    category: str,
+    check_ref: str,
+    note: str = "",
+    recorded_by: str = "",
+) -> dict[str, Any]:
+    """Close a category by naming the check that now covers it (#878).
+
+    ``check_ref`` must name something real — a test nodeid, a lint rule, a CI
+    step. A blank one is refused rather than stored: a category closed by a
+    tick is a category nobody covered, and the debt list would shrink while
+    the token bill stayed exactly where it was.
+    """
+    category = (category or "").strip()
+    check_ref = (check_ref or "").strip()
+    if not category:
+        raise ValueError("category is required")
+    if not check_ref:
+        raise ValueError(
+            "check_ref is required: name the test, lint rule or CI step that "
+            "covers this category — closing it without one only hides the debt"
+        )
+    await repo.upsert_category_check(
+        db,
+        category=category,
+        check_ref=check_ref,
+        note=note,
+        recorded_by=recorded_by,
+    )
+    await repo.insert_event(
+        db,
+        kind="category_check_recorded",
+        actor=recorded_by or "hub",
+        payload={"category": category, "check_ref": check_ref},
+    )
+    await db.commit()
+    return {"category": category, "check_ref": check_ref, "covered": True}
+
+
 async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = 90
 ) -> dict[str, Any]:
@@ -480,17 +582,12 @@ async def practice_metrics(
         (since,),
     )
 
-    category_rows = await fetchall(
-        db,
-        "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
-        "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
-        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
-        "WHERE mr.created_at >= datetime('now', ?) "
-        "GROUP BY category HAVING category != '' "
-        "ORDER BY findings DESC LIMIT 50",
-        (since,),
-    )
-    recurring = [dict(r) | {"recurring": r["tasks"] > 1} for r in category_rows]
+    recurring = await recurring_categories(db, since)
+    # #878: the flywheel. A category the reviewer has found in enough DISTINCT
+    # tasks is no longer a finding, it is a property of the codebase, and
+    # paying a model to rediscover it every submission is the one cost here
+    # that never has to be paid again.
+    debt = await build_category_debt(db, recurring)
 
     # `completed_at` is the only completion clock (#517). Until #810 a row
     # without it was filled in from `updated_at`, and that fallback was
@@ -611,6 +708,7 @@ async def practice_metrics(
         "by_profile": profile_dicts,
         "by_reviewer_model": dispositions["by_model"],
         "recurring_categories": recurring,
+        "category_debt": debt,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
         "human_gates": human_gates,

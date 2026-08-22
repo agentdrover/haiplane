@@ -544,6 +544,11 @@ async def enrich_task_view(
     # #485: edges on the single-task read only. Lists of hundreds of tasks
     # must not pay for links most of them do not have.
     edges = await repo.list_task_dependencies(db, task_view.id)
+    # #885: same enrichment the gate uses, so the card and the warning cannot
+    # disagree about one blocker.
+    from hub.services.delivery_state import with_delivery
+
+    edges["blocked_by"] = await with_delivery(db, edges["blocked_by"])
     if edges["blocked_by"] or edges["unblocks"]:
         from hub.models import TaskDependencies, TaskDependencyRef
 
@@ -1103,6 +1108,13 @@ async def warn_about_undelivered_blockers(
     #481, not this task.
     """
     blockers = await repo.undelivered_blockers(db, task_id)
+    # #885: the gate's own merges are not the only way code reaches the base
+    # branch. Ask the branch itself before calling a blocker undelivered —
+    # otherwise the warning is wrong exactly where it is easiest to check,
+    # and a reader who catches it lying once stops reading it.
+    from hub.services.delivery_state import with_delivery
+
+    blockers = [b for b in await with_delivery(db, blockers) if not b.get("delivered")]
     if not blockers:
         # Nothing to say. A task with no blockers must start exactly as it
         # did before this check existed.

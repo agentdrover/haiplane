@@ -1416,6 +1416,12 @@ class TaskDependencyRef(BaseModel):
     # Delivery, not status, decides whether a blocker still blocks (#484).
     # None on the `unblocks` side: nobody asked whether THIS task shipped.
     delivered: bool | None = None
+    # HOW delivery was established (#885): "gate" — the hub merged it itself;
+    # "outside_gate" — the commit is in the base branch but the merge did not
+    # come through the pipeline, which clears the block and stays visible,
+    # since manual merges are against the rules here; "unknown" — the base
+    # branch could not be asked; "none" — looked and it is not there.
+    delivery_path: str = ""
     reason: str = ""
 
 
@@ -1952,6 +1958,18 @@ class MachineReviewSubmit(BaseModel):
     )
     lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
+
+
+class CategoryCheckSubmit(BaseModel):
+    """The deterministic check that ends a recurring finding category (#878)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str = Field(..., min_length=1, max_length=60)
+    # Required and non-blank by the type as well as by the service: the whole
+    # point of the record is that something real now catches this class.
+    check_ref: str = Field(..., min_length=1, max_length=500)
+    note: str = Field("", max_length=1000)
 
 
 class FindingDisposition(str, Enum):

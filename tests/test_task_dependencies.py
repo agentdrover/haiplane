@@ -15,6 +15,8 @@ import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.integrations.noop import NoopGitOps
+from hub.integrations.registry import plugins
 from hub.services import lifecycle
 from hub.repository import DependencyCycleError, SelfDependencyError
 
@@ -547,3 +549,148 @@ async def test_mcp_list_shows_delivery(
 
     assert "НЕ доставлен" in text
     assert "PR #8 не смержен гейтом" in text
+
+
+# --- Delivery is about the base branch, not about who pressed merge (#885) ---
+#
+# Readiness was read from pipeline_merges alone — merges the hub performed
+# itself. A merge made outside the gate left no row, so the blocker read as
+# undelivered while its code sat in the base branch: on 21.08.2026 the edge
+# #830 → #818 said exactly that, an hour after #818 was merged. A warning
+# that is wrong in the obvious case teaches the reader to skip the line.
+
+
+class _AncestorGitOps(NoopGitOps):
+    """Answers whether a commit is in the base branch, like the real one does."""
+
+    def __init__(self, reachable: bool | None) -> None:
+        self._reachable = reachable
+        self.calls: list[tuple[str, str]] = []
+
+    async def is_ancestor(self, repo, ancestor, descendant):
+        self.calls.append((ancestor, descendant))
+        return self._reachable
+
+
+async def _blocked_pair(
+    client: AsyncClient, db: aiosqlite.Connection, **blocker_fields
+):
+    # The base-branch question needs a workspace to ask it in; without one the
+    # answer is "could not look", which is a different test than these.
+    project = await repo.get_project_by_slug(db, "default")
+    if project is None:
+        await repo.create_project(
+            db, slug="default", name="default", workspace_path="/tmp/ws"
+        )
+    else:
+        await repo.update_project(db, dict(project)["id"], workspace_path="/tmp/ws")
+    blocked = (await client.post("/api/tasks", json={"title": "waits"})).json()["id"]
+    blocker = (await client.post("/api/tasks", json={"title": "upstream"})).json()["id"]
+    await repo.add_task_dependency(db, blocked, blocker)
+    if blocker_fields:
+        await repo.update_task(db, blocker, **blocker_fields)
+    await db.commit()
+    return blocked, blocker
+
+
+async def test_merge_outside_the_gate_still_counts_as_delivered(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-1 (#885): the code is in the base branch. Who merged it is a
+    # separate question, and the answer says which — a manual merge is
+    # against the rules here and stays visible instead of being smoothed over.
+    blocked, blocker = await _blocked_pair(
+        client, db, status="completed", pr_number=8, submission_sha="a" * 40
+    )
+    plugins.git_ops = _AncestorGitOps(True)
+
+    edges = (await client.get(f"/api/tasks/{blocked}/dependencies")).json()
+
+    entry = edges["blocked_by"][0]
+    assert entry["delivered"] is True
+    assert entry["delivery_path"] == "outside_gate"
+    assert "мимо гейта" in entry["reason"]
+
+
+async def test_completed_without_a_merge_still_blocks(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-2 (#885): the rule of #484 is untouched. Between a done report and a
+    # merge there is a window, and a PR can still go back for rework — so
+    # "closed" never means "delivered", however tempting the shortcut is.
+    blocked, blocker = await _blocked_pair(
+        client, db, status="completed", pr_number=8, submission_sha="b" * 40
+    )
+    plugins.git_ops = _AncestorGitOps(False)
+
+    edges = (await client.get(f"/api/tasks/{blocked}/dependencies")).json()
+
+    entry = edges["blocked_by"][0]
+    assert entry["status"] == "completed"
+    assert entry["delivered"] is False
+    assert entry["delivery_path"] == "none"
+
+
+async def test_unreadable_base_branch_is_not_a_denial(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # "Could not look" and "looked and it is not there" are different answers
+    # (#725). The reason keeps its original text and says the second source
+    # stayed silent — it does not invent a verdict.
+    blocked, blocker = await _blocked_pair(
+        client, db, status="completed", pr_number=8, submission_sha="c" * 40
+    )
+    plugins.git_ops = _AncestorGitOps(None)
+
+    edges = (await client.get(f"/api/tasks/{blocked}/dependencies")).json()
+
+    entry = edges["blocked_by"][0]
+    assert entry["delivered"] is False
+    assert entry["delivery_path"] == "unknown"
+    assert "PR #8 не смержен гейтом" in entry["reason"]
+    assert "проверить базовую ветку не удалось" in entry["reason"]
+
+
+async def test_gate_merge_reads_as_before(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#885): a gate merge answers from pipeline_merges and costs no git
+    # call at all — the cheap path stays cheap.
+    blocked, blocker = await _blocked_pair(client, db, submission_sha="d" * 40)
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (1, 7, ?, 'deadbeef')",
+        (blocker,),
+    )
+    await db.commit()
+    ops = _AncestorGitOps(False)
+    plugins.git_ops = ops
+
+    edges = (await client.get(f"/api/tasks/{blocked}/dependencies")).json()
+
+    entry = edges["blocked_by"][0]
+    assert entry["delivered"] is True
+    assert entry["delivery_path"] == "gate"
+    assert ops.calls == [], "a gate merge must not cost a git call"
+
+
+async def test_all_readers_agree_on_delivery(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-4 (#885): the start gate, the task context and REST run the same
+    # enrichment. Three answers about one blocker would leave the reader
+    # unable to tell which one aged.
+    blocked, blocker = await _blocked_pair(
+        client, db, status="completed", pr_number=8, submission_sha="e" * 40
+    )
+    plugins.git_ops = _AncestorGitOps(True)
+
+    from hub.services import lifecycle
+
+    rest = (await client.get(f"/api/tasks/{blocked}/dependencies")).json()
+    context = (await client.get(f"/api/tasks/{blocked}")).json()["dependencies"]
+    still_blocking = await lifecycle.warn_about_undelivered_blockers(db, blocked)
+
+    assert rest == context
+    assert rest["blocked_by"][0]["delivered"] is True
+    assert still_blocking == [], "a delivered blocker must not warn at start"

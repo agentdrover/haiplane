@@ -1008,6 +1008,31 @@ async def list_finding_dispositions(
     )
 
 
+# --- Category checks (#878) ------------------------------------------------
+
+
+async def upsert_category_check(
+    db: aiosqlite.Connection,
+    *,
+    category: str,
+    check_ref: str,
+    note: str = "",
+    recorded_by: str = "",
+) -> None:
+    """Record the deterministic check that covers a finding category."""
+    await db.execute(
+        "INSERT INTO category_checks (category, check_ref, note, recorded_by) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(category) DO UPDATE SET "
+        "check_ref=excluded.check_ref, note=excluded.note, "
+        "recorded_by=excluded.recorded_by, recorded_at=datetime('now')",
+        (category, check_ref, note, recorded_by),
+    )
+
+
+async def list_category_checks(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    return await fetchall(db, "SELECT * FROM category_checks ORDER BY category ASC")
+
+
 # --- AC test results (#507) ------------------------------------------------
 
 
