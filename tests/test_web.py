@@ -5497,3 +5497,56 @@ async def test_dashboard_states_the_window_and_the_absence(client: AsyncClient):
 
     assert "выкатов не записано" in page.lower() or "неизвестно" in page
     assert "окно" in page
+
+
+async def test_defect_passport_block_rendered(client: AsyncClient):
+    """A defect shows its passport, and an unrecorded stage says so out loud.
+
+    Hiding 'unknown' would make an unfilled passport look like an absent one,
+    which is the difference between "nobody wrote it down" and "not a defect".
+    """
+    create = await client.post(
+        "/api/tasks", json={"title": "Дефект без паспорта", "work_type": "bug"}
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert "Паспорт дефекта" in resp.text
+    assert 'data-found-in="unknown"' in resp.text
+    assert "не записано" in resp.text
+
+
+async def test_defect_passport_shows_cause_link(client: AsyncClient):
+    cause = await client.post("/api/tasks", json={"title": "Изменение"})
+    cause_id = cause.json()["id"]
+    create = await client.post(
+        "/api/tasks", json={"title": "Дефект с прода", "work_type": "bug"}
+    )
+    task_id = create.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"found_in": "prod", "caused_by_task_id": cause_id},
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert 'data-found-in="prod"' in resp.text
+    assert f'href="/tasks/{cause_id}"' in resp.text
+
+
+async def test_no_passport_block_for_ordinary_feature(client: AsyncClient):
+    """A feature with an empty passport must not carry an empty section.
+
+    Every task in the backlog would otherwise grow a 'Паспорт дефекта' card
+    saying nothing, and a card that always says nothing stops being read.
+    """
+    create = await client.post(
+        "/api/tasks", json={"title": "Обычная фича", "work_type": "feature"}
+    )
+    task_id = create.json()["id"]
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert "Паспорт дефекта" not in resp.text

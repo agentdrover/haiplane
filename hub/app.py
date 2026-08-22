@@ -2151,6 +2151,10 @@ async def api_refine_task(task_id: int, body: TaskRefine, request: Request):
         raise _duplicate_to_http(exc, 422) from exc
     except ProjectBindError as exc:
         raise HTTPException(422, str(exc)) from exc
+    except repo.DefectPassportError as exc:
+        # Same shape as the other refine refusals: the message already names
+        # the allowed stages or the link that did not resolve (#910).
+        raise HTTPException(422, str(exc)) from exc
 
     row = _row_or_404(await repo.get_task(db, task_id), "task not found")
     updates = await repo.get_task_updates(db, task_id)
@@ -2172,6 +2176,10 @@ async def api_refine_tasks_bulk(body: BulkRefine, request: Request):
         raise _not_found_to_http(exc) from exc
     except DuplicateAcceptanceCriterionError as exc:
         raise _duplicate_to_http(exc, 422) from exc
+    except repo.DefectPassportError as exc:
+        # The bulk flow is one SAVEPOINT: a bad passport in item 7 rolls back
+        # items 1-6 too, which is the documented all-or-nothing contract.
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.post(

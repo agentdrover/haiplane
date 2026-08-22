@@ -102,6 +102,45 @@
                 {% endif %}
             </section>
 
+            {% set is_defect = task.work_type and task.work_type.value in ('bug', 'incident') %}
+            {% set has_passport = task.caused_by_task_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
+            {% if is_defect or has_passport %}
+            <section class="task-content-card" data-defect-passport>
+                <div class="task-card-header">
+                    <h2>Паспорт дефекта</h2>
+                </div>
+                <dl class="task-meta-list task-detail-brief-list">
+                    <dt>Где поймали</dt>
+                    {% set stage_labels = {
+                        'unknown': 'не записано',
+                        'review': 'ревью',
+                        'ci': 'CI',
+                        'test': 'тесты',
+                        'staging': 'стенд',
+                        'prod': 'прод',
+                    } %}
+                    {% set stage = task.found_in.value if task.found_in else 'unknown' %}
+                    <dd data-found-in="{{ stage }}">{{ stage_labels.get(stage, stage) }}</dd>
+                    <dt>Что сломало</dt>
+                    <dd>
+                        {% if task.caused_by_task_id %}
+                        <a href="/tasks/{{ task.caused_by_task_id }}">#{{ task.caused_by_task_id }}</a>
+                        {% else %}
+                        <span class="u-text-muted">не установлено</span>
+                        {% endif %}
+                    </dd>
+                    {% if task.detected_at %}
+                    <dt>Обнаружен</dt>
+                    <dd>{{ task.detected_at }}</dd>
+                    {% endif %}
+                    {% if task.resolved_at %}
+                    <dt>Закрыт</dt>
+                    <dd>{{ task.resolved_at }}</dd>
+                    {% endif %}
+                </dl>
+            </section>
+            {% endif %}
+
             {% set has_discovery = task.outcome_status or task.outcome_metric or task.outcome_indicator or task.outcome_deadline or task.outcome_revisit_condition or task.redesign_decision or task.agent_fit %}
             {% set has_brief = task.user_story or task.problem_statement or task.business_value or task.technical_hints or task.scope_in or task.scope_out or task.affected_areas or task.validation_commands or task.constraints or task.assumptions or task.out_of_scope_for_review %}
             {% if has_brief or has_discovery %}

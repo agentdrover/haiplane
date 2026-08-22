@@ -1204,6 +1204,17 @@ class TaskRefine(BaseModel):
     redesign_decision: RedesignDecision | None = None
     redesign_rationale: str | None = Field(default=None, max_length=1000)
     agent_fit: AgentFit | None = None
+    # --- Defect passport (#910, epic #900) ---
+    # Accepted here but NOT written as plain columns: the refine service routes
+    # them through ``repo.set_defect_passport``, which resolves the causal link
+    # before it lands. ``resolved_at`` is deliberately absent — it is stamped
+    # when the defect is actually closed (#916), and a field that lets a caller
+    # declare a defect fixed without closing it would be a second, quieter
+    # completion path.
+    found_in: DefectFoundIn | None = None
+    caused_by_task_id: int | None = Field(default=None, ge=1)
+    detected_at: str | None = Field(default=None, max_length=32)
+    clear_caused_by: bool = False
     scope_in: list[str] | None = Field(default=None, max_length=20)
     scope_out: list[str] | None = Field(default=None, max_length=20)
     affected_areas: list[str] | None = Field(default=None, max_length=20)

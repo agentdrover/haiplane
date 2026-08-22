@@ -305,3 +305,160 @@ async def test_task_view_defaults_to_unknown(db):
 
     assert view.found_in is DefectFoundIn.unknown
     assert view.caused_by_task_id is None
+
+
+# ---------------------------------------------------------------------------
+# Surfaces (#910): the passport is filled through refine, not through SQL
+# ---------------------------------------------------------------------------
+
+
+async def _api_task(client, **fields) -> int:
+    resp = await client.post("/api/tasks", json={"title": "дефект", **fields})
+    assert resp.status_code in (200, 201), resp.text
+    return resp.json()["id"]
+
+
+async def test_refine_writes_passport_fields(client):
+    cause_id = await _api_task(client, title="изменение")
+    defect_id = await _api_task(client, work_type="bug")
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine",
+        json={
+            "found_in": "prod",
+            "caused_by_task_id": cause_id,
+            "detected_at": "2026-08-22 06:00:00",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["found_in"] == "prod"
+    assert body["caused_by_task_id"] == cause_id
+    assert body["detected_at"] == "2026-08-22 06:00:00"
+
+
+async def test_invalid_found_in_is_refused_over_api(client):
+    """A bad stage is a 4xx that names the stages, never a 500.
+
+    Deliberately NOT named like the repository-level test above: two functions
+    with one name in a module leave the first silently uncollected, which is
+    how a test disappears without anyone deleting it.
+    """
+    defect_id = await _api_task(client, work_type="bug")
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine", json={"found_in": "production"}
+    )
+
+    assert resp.status_code in (400, 422), resp.text
+    assert "prod" in resp.text and "staging" in resp.text
+
+
+async def test_caused_by_must_resolve_over_api(client):
+    defect_id = await _api_task(client, work_type="bug")
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine", json={"caused_by_task_id": 999999}
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "999999" in resp.text.replace(" ", "")
+    read = await client.get(f"/api/tasks/{defect_id}")
+    assert read.json()["caused_by_task_id"] is None
+
+
+async def test_refused_passport_rolls_back_the_whole_refine(client):
+    """The refine is one transaction: a refused link takes the rest with it.
+
+    Without this the caller gets an error and a partially applied PATCH, which
+    is the worst of both — the write they were told did not happen.
+    """
+    defect_id = await _api_task(client, work_type="bug")
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine",
+        json={"problem_statement": "что-то сломалось", "caused_by_task_id": 999999},
+    )
+
+    assert resp.status_code == 422, resp.text
+    read = await client.get(f"/api/tasks/{defect_id}")
+    assert read.json()["problem_statement"] == ""
+
+
+async def test_passport_is_not_written_as_a_plain_column(client):
+    """found_in must travel through the validating writer, not the column PATCH.
+
+    If the field ever rejoins ``structured_fields_to_db``, this test still
+    passes on the happy path — so it checks the property that actually breaks:
+    the value lands and the causal link is still validated alongside it.
+    """
+    defect_id = await _api_task(client, work_type="bug")
+
+    ok = await client.post(f"/api/tasks/{defect_id}/refine", json={"found_in": "ci"})
+    assert ok.status_code == 200
+    bad = await client.post(
+        f"/api/tasks/{defect_id}/refine",
+        json={"found_in": "review", "caused_by_task_id": 999999},
+    )
+
+    assert bad.status_code == 422
+    read = await client.get(f"/api/tasks/{defect_id}")
+    assert read.json()["found_in"] == "ci", "the refused call must change nothing"
+
+
+async def test_clear_caused_by_over_api(client):
+    cause_id = await _api_task(client, title="изменение")
+    defect_id = await _api_task(client, work_type="bug")
+    await client.post(
+        f"/api/tasks/{defect_id}/refine", json={"caused_by_task_id": cause_id}
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine", json={"clear_caused_by": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["caused_by_task_id"] is None
+
+
+async def test_refine_without_passport_keys_touches_nothing(client):
+    defect_id = await _api_task(client, work_type="bug")
+    await client.post(f"/api/tasks/{defect_id}/refine", json={"found_in": "test"})
+
+    resp = await client.post(
+        f"/api/tasks/{defect_id}/refine", json={"problem_statement": "уточнение"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["found_in"] == "test"
+
+
+def test_cli_refine_builds_passport_payload():
+    """The CLI speaks the same PATCH as REST and MCP (#833 surface parity)."""
+    import argparse
+
+    from hub.cli import _build_refine_payload
+
+    args = argparse.Namespace(
+        found_in="prod", caused_by=42, detected_at="2026-08-22 06:00:00"
+    )
+
+    payload = _build_refine_payload(args)
+
+    assert payload == {
+        "found_in": "prod",
+        "caused_by_task_id": 42,
+        "detected_at": "2026-08-22 06:00:00",
+    }
+
+
+def test_cli_clear_caused_by_is_a_verb():
+    import argparse
+
+    from hub.cli import _build_refine_payload
+
+    assert _build_refine_payload(argparse.Namespace(clear_caused_by=True)) == {
+        "clear_caused_by": True
+    }
+    assert _build_refine_payload(argparse.Namespace(clear_caused_by=False)) == {}

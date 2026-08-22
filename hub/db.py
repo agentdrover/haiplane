@@ -1338,6 +1338,13 @@ def deserialize_risks(raw: str | None) -> list[dict[str, Any]]:
 
 # --- Pydantic <-> DB mapping for structured task form ---
 
+# Defect passport keys that arrive on a refine payload and are NOT written as
+# plain columns (#910). They travel through ``repo.set_defect_passport`` so the
+# causal link is resolved first; ``clear_caused_by`` is a verb, not a column.
+PASSPORT_REFINE_FIELDS = frozenset(
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+)
+
 # All list[str] columns serialized as JSON in TEXT.
 LIST_STR_COLUMNS = frozenset(
     {
@@ -1429,6 +1436,12 @@ def structured_fields_to_db(
         if key == "project":
             # Virtual refine field (#338): binds an epic to a project via
             # slug in the service layer; there is no 'project' column.
+            continue
+        if key in PASSPORT_REFINE_FIELDS:
+            # Defect passport (#910): accepted on the refine payload, written
+            # by ``repo.set_defect_passport``. Letting it through here would
+            # store a causal link nobody resolved — the one thing #909 built
+            # the validator to prevent.
             continue
         if key == "risks":
             if value is None:
