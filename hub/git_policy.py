@@ -36,6 +36,8 @@ import shlex
 import subprocess  # nosec B404
 from dataclasses import dataclass
 
+from hub import brand
+
 log = logging.getLogger("hub.git_policy")
 
 HOOKS_DIR = ".githooks"
@@ -48,8 +50,15 @@ ACTIVATE_COMMAND = f"git config core.hooksPath {HOOKS_DIR}"
 # clone it just armed. Two keys, because "where work lands" and "what is in
 # production" are two different questions (the same split as PAIR_BASE_BRANCH
 # vs RELEASE_BRANCH in hub/config.py).
-BASE_BRANCH_KEY = "openclaw.baseBranch"
-RELEASE_BRANCH_KEY = "openclaw.releaseBranch"
+#
+# Two FAMILIES since the Haiplane rename (Wave 3): writes land on both
+# haiplane.* and openclaw.*, because a clone whose .githooks/pre-push predates
+# the rename still reads only the legacy family — writing just the new keys
+# would silently disable branch policy there. Reads try new, then legacy.
+BASE_BRANCH_KEY = brand.GIT_BASE_BRANCH_KEY
+RELEASE_BRANCH_KEY = brand.GIT_RELEASE_BRANCH_KEY
+BASE_BRANCH_KEY_LEGACY = brand.GIT_BASE_BRANCH_KEY_LEGACY
+RELEASE_BRANCH_KEY_LEGACY = brand.GIT_RELEASE_BRANCH_KEY_LEGACY
 
 
 def activate_command(repo: str) -> str:
@@ -227,17 +236,24 @@ def record_branch_policy(
     could not be written leaves the hook on its documented fallback.
     """
     written: dict[str, str] = {}
-    for key, value in (
-        (BASE_BRANCH_KEY, (base_branch or "").strip()),
-        (RELEASE_BRANCH_KEY, (release_branch or "").strip()),
+    for keys, value in (
+        ((BASE_BRANCH_KEY, BASE_BRANCH_KEY_LEGACY), (base_branch or "").strip()),
+        (
+            (RELEASE_BRANCH_KEY, RELEASE_BRANCH_KEY_LEGACY),
+            (release_branch or "").strip(),
+        ),
     ):
         if not value:
             continue
-        rc, out = _git(repo, "config", key, value)
-        if rc != 0:
-            log.warning("could not record %s in %s: %s", key, repo, out)
-            continue
-        written[key] = value
+        # Both key families, deliberately: a clone whose hook file predates
+        # the Haiplane rename reads only openclaw.*, and a value written only
+        # under haiplane.* would leave that hook on its fallback branches.
+        for key in keys:
+            rc, out = _git(repo, "config", key, value)
+            if rc != 0:
+                log.warning("could not record %s in %s: %s", key, repo, out)
+                continue
+            written[key] = value
     return written
 
 
@@ -323,7 +339,8 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
     if not recorded:
         return BranchSyncState(
             BRANCH_DIVERGED,
-            f"в клоне не записан {BASE_BRANCH_KEY}: хук защищает свою "
+            f"в клоне не записан {BASE_BRANCH_KEY} (ни {BASE_BRANCH_KEY_LEGACY}): "
+            "хук защищает свою "
             f"умолчательную ветку, а не объявленную проектом ({declared})",
             declared,
             "",
@@ -337,8 +354,17 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
 
 
 def _recorded_base(repo: str) -> str:
-    """The base branch this clone records, or "" when the key is unset."""
+    """The base branch this clone records, or "" when neither key is set.
+
+    New family first, then legacy — and an EMPTY new key falls through, the
+    same rule the shell in .githooks/pre-push follows: ``git config --get``
+    succeeds on an empty value, so `new || old` would hide the legacy answer.
+    """
     rc, out = _git(repo, "config", "--get", BASE_BRANCH_KEY)
+    value = out.strip() if rc == 0 else ""
+    if value:
+        return value
+    rc, out = _git(repo, "config", "--get", BASE_BRANCH_KEY_LEGACY)
     return out.strip() if rc == 0 else ""
 
 

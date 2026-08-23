@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from hub import config
+from hub import brand, config
 from hub.config import TokenIdentity
 
 PASSWORD_WITHOUT_DIGIT = "abcdefgh!"  # pragma: allowlist secret
@@ -217,6 +217,131 @@ async def test_logout_clears_cookie(client, monkeypatch):
     assert resp.headers["Location"] == "/login"
     set_cookie = resp.headers.get("set-cookie", "")
     assert config.HUB_COOKIE_NAME in set_cookie
+
+
+# ---------------------------------------------------------------------------
+# Cookie rename (Haiplane rebrand, Wave 3) — dual-accept, dual-delete
+# ---------------------------------------------------------------------------
+
+
+async def _password_user(db, username: str) -> None:
+    """A DB principal that can pass the real /login credential check."""
+    from hub.services import admin as admin_svc
+
+    await admin_svc.create_principal(
+        db,
+        kind="human",
+        username=username,
+        password=VALID_ADMIN_PASSWORD,
+        role_slug="operator",
+    )
+
+
+def test_cookie_default_is_the_new_name():
+    """With no HAIPLANE_HUB_COOKIE / OPENCLAW_HUB_COOKIE override, the
+    default session-cookie name is the Haiplane one."""
+    assert config.HUB_COOKIE_NAME == brand.COOKIE_NAME
+    assert config.HUB_COOKIE_NAME_EXPLICIT is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_cookie_still_authenticates(client, monkeypatch):
+    """A browser that still holds openclaw_hub_session stays signed in."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    client.cookies.set(brand.COOKIE_NAME_LEGACY, "secret-token")
+    resp = await client.get("/", headers={"Accept": "text/html"})
+    assert resp.status_code == 200
+    assert "alice" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_login_accepts_legacy_csrf_cookie(client, db, monkeypatch):
+    """A login form loaded before the deploy carries openclaw_csrf; the
+    submit path (web_login_submit, not verify_csrf directly) must accept
+    it."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await _password_user(db, "dana")
+
+    client.cookies.set(brand.CSRF_COOKIE_NAME_LEGACY, "legacy-form-token")
+    resp = await client.post(
+        "/login",
+        data={
+            "username": "dana",
+            "password": VALID_ADMIN_PASSWORD,
+            "csrf_token": "legacy-form-token",
+            "next": "/tasks",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["Location"] == "/tasks", resp.headers["Location"]
+    assert config.HUB_COOKIE_NAME in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_login_accepts_legacy_csrf_when_both_cookies_present(
+    client, db, monkeypatch
+):
+    """Verify-both, not pick-first: a browser can hold BOTH CSRF cookies (a
+    login tab opened before the deploy plus a later one). The old form's
+    token matches only the legacy cookie and must still pass."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await _password_user(db, "erin")
+
+    client.cookies.set(brand.CSRF_COOKIE_NAME, "newer-tab-token")
+    client.cookies.set(brand.CSRF_COOKIE_NAME_LEGACY, "older-tab-token")
+    resp = await client.post(
+        "/login",
+        data={
+            "username": "erin",
+            "password": VALID_ADMIN_PASSWORD,
+            "csrf_token": "older-tab-token",
+            "next": "/tasks",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["Location"] == "/tasks", resp.headers["Location"]
+    assert config.HUB_COOKIE_NAME in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_login_and_logout_delete_both_csrf_names(client, db, monkeypatch):
+    """Both haiplane_csrf and openclaw_csrf are expired on login success and
+    on logout, so no stale CSRF cookie survives the rename."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await _password_user(db, "fred")
+
+    client.cookies.set(brand.CSRF_COOKIE_NAME, "fresh-token")
+    login = await client.post(
+        "/login",
+        data={
+            "username": "fred",
+            "password": VALID_ADMIN_PASSWORD,
+            "csrf_token": "fresh-token",
+            "next": "/",
+        },
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+    assert "error=" not in login.headers["Location"]
+    deleted = login.headers.get_list("set-cookie")
+    assert any(c.startswith(f"{brand.CSRF_COOKIE_NAME}=") for c in deleted), deleted
+    assert any(c.startswith(f"{brand.CSRF_COOKIE_NAME_LEGACY}=") for c in deleted), (
+        deleted
+    )
+
+    logout = await client.post("/logout", follow_redirects=False)
+    deleted = logout.headers.get_list("set-cookie")
+    assert any(c.startswith(f"{brand.CSRF_COOKIE_NAME}=") for c in deleted), deleted
+    assert any(c.startswith(f"{brand.CSRF_COOKIE_NAME_LEGACY}=") for c in deleted), (
+        deleted
+    )
 
 
 # ---------------------------------------------------------------------------

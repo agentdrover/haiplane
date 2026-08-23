@@ -259,7 +259,13 @@ HUB_TOKENS_RAW = env_get("HUB_TOKENS", "")
 HUB_AUTH_DISABLED = env_get("HUB_AUTH_DISABLED", "0") == "1"
 HUB_ALLOW_UNAUTH_NETWORK = env_get("HUB_ALLOW_UNAUTHENTICATED_NETWORK", "0") == "1"
 HUB_ALLOWED_HOSTS_RAW = env_get("HUB_ALLOWED_HOSTS", "")
-HUB_COOKIE_NAME = env_get("HUB_COOKIE", "openclaw_hub_session")
+# Session cookie (Haiplane rebrand, Wave 3). An operator override via
+# HAIPLANE_HUB_COOKIE / OPENCLAW_HUB_COOKIE names the ONLY cookie the hub
+# reads; without one the default is the new name and hub/auth.py also accepts
+# the legacy openclaw_hub_session so live sessions survive the rename.
+_cookie_explicit = env_get("HUB_COOKIE")
+HUB_COOKIE_NAME_EXPLICIT = bool(_cookie_explicit)
+HUB_COOKIE_NAME = _cookie_explicit or brand.COOKIE_NAME
 # 30 days by default — Hub is an internal tool, long-lived sessions are fine.
 HUB_COOKIE_MAX_AGE = int(env_get("HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
 HUB_COOKIE_SECURE = env_get("HUB_COOKIE_SECURE", "0") == "1"

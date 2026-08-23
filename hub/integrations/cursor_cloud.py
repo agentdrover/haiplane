@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from hub import config
+from hub import brand, config
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ async def create_review_agent(
         "workOnCurrentBranch": False,
         "mcpServers": [
             {
-                "name": "openclaw-hub",
+                "name": brand.MCP_SERVER_NAME,
                 "type": "http",
                 "url": hub_mcp_url,
                 "headers": {"Authorization": f"Bearer {reviewer_token}"},

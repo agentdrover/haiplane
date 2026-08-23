@@ -5,13 +5,24 @@ remote_name="${1:-}"
 zero="0000000000000000000000000000000000000000"
 
 # #475: which branches this clone protects is a property of the PROJECT, not
-# of this file. The hub writes both keys when it arms the hook (hub/git_policy),
-# so a calc-kids workspace protects master and a spike-bo one protects main.
-# The literals below are the fallback for a clone nobody configured — the hub's
-# own, which is where these names came from in the first place.
-base_branch="$(git config --get openclaw.baseBranch 2>/dev/null || true)"
+# of this file. The hub writes both key families when it arms the hook
+# (hub/git_policy), so a calc-kids workspace protects master and a spike-bo
+# one protects main. The literals below are the fallback for a clone nobody
+# configured — the hub's own, which is where these names came from.
+#
+# haiplane.* first, then openclaw.* (Haiplane rename, Wave 3). NOT
+# `new || old`: `git config --get` succeeds on a key that exists with an
+# empty value, so the chain would stop there and hide the legacy answer.
+# Read the new value, test it for emptiness, then read the legacy one.
+base_branch="$(git config --get haiplane.baseBranch 2>/dev/null || true)"
+if [ -z "$base_branch" ]; then
+  base_branch="$(git config --get openclaw.baseBranch 2>/dev/null || true)"
+fi
 [ -n "$base_branch" ] || base_branch="develop"
-release_branch="$(git config --get openclaw.releaseBranch 2>/dev/null || true)"
+release_branch="$(git config --get haiplane.releaseBranch 2>/dev/null || true)"
+if [ -z "$release_branch" ]; then
+  release_branch="$(git config --get openclaw.releaseBranch 2>/dev/null || true)"
+fi
 [ -n "$release_branch" ] || release_branch="main"
 
 while read -r local_ref local_oid remote_ref remote_oid; do

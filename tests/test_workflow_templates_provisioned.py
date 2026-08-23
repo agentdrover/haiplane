@@ -33,8 +33,10 @@ from hub.services.project_policy import ci_runner_of
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = REPO_ROOT / "hub" / "workflow_templates"
 
-CI_FILE = "openclaw-ci.yml"
-STALE_FILE = "openclaw-stale.yml"
+CI_FILE = "haiplane-ci.yml"
+STALE_FILE = "haiplane-stale.yml"
+CI_FILE_LEGACY = "openclaw-ci.yml"
+STALE_FILE_LEGACY = "openclaw-stale.yml"
 
 
 # --------------------------------------------------------------------------
@@ -310,6 +312,37 @@ async def test_a_repository_with_its_own_workflow_is_left_alone(
     assert sorted(p.name for p in workflows.iterdir()) == ["ci.yml"]
     assert _git(work, "rev-parse", "HEAD") == before
     assert "already carries workflows" in result["provision_detail"]
+
+
+def test_legacy_only_workflows_are_present_without_second_pair(tmp_path: Path):
+    """Haiplane rebrand (Wave 3): a repository the hub seeded before the
+    rename carries only openclaw-ci.yml / openclaw-stale.yml. Those files are
+    hub-owned and complete — the answer is PRESENT, and no haiplane-* pair is
+    written beside them."""
+    work, _ = _repo_pair(tmp_path, "develop")
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / CI_FILE_LEGACY).write_text("name: OpenClaw CI\n", "utf-8")
+    (workflows / STALE_FILE_LEGACY).write_text("name: OpenClaw stale\n", "utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "seeded before the rename")
+
+    result = workflow_seed.seed_project_workflows(
+        str(work), base_branch="develop", release_branch="main", push=False
+    )
+
+    assert result.state == workflow_seed.PRESENT
+    assert result.written == ()
+    assert sorted(p.name for p in workflows.iterdir()) == sorted(
+        [CI_FILE_LEGACY, STALE_FILE_LEGACY]
+    ), "the hub must never lay a second pair beside its legacy-named files"
+
+
+def test_the_seeded_names_are_the_haiplane_pair():
+    """Fresh repositories get the new names; the legacy pair stays known so
+    pre-rename repositories read as hub-owned."""
+    assert set(workflow_seed.SEEDED_WORKFLOWS.values()) == {CI_FILE, STALE_FILE}
+    assert workflow_seed.LEGACY_SEEDED == {CI_FILE_LEGACY, STALE_FILE_LEGACY}
 
 
 # --------------------------------------------------------------------------

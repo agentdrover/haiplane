@@ -1,12 +1,13 @@
-# Laid down by OpenClaw Hub provisioning (#476) — do not rename this file.
+# Laid down by Haiplane Hub provisioning (#476) — do not rename this file.
 #
-# The hub owns the name `openclaw-stale.yml`. Like the CI template it is
-# written only into a repository that carried no workflows of its own.
+# The hub owns the name `haiplane-stale.yml` (and the pre-rename
+# `openclaw-stale.yml`). Like the CI template it is written only into a
+# repository that carried no workflows of its own.
 #
 # Why it ships with the CI template rather than separately: the operational
 # load epic (#460) is about pull requests that accumulate, and provisioning is
 # the one moment where nobody has to remember to add this.
-name: OpenClaw stale pull requests
+name: Haiplane stale pull requests
 
 on:
   schedule:
