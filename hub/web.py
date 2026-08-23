@@ -1496,6 +1496,15 @@ async def web_task_detail(
     # #814: what was observed in production, and on which build. The delivered
     # sha is what the evidence should be about — a record taken elsewhere is
     # shown with that said out loud rather than quietly counted as proof.
+    # PR-ссылка строится от репозитория проекта задачи, не от жёстко зашитого
+    # слага: хаб обслуживает несколько проектов с разными репозиториями.
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    pr_repo = ""
+    if project_row is not None:
+        pr_repo = (dict(project_row).get("repo") or "").strip()
+    if not pr_repo:
+        pr_repo = config.REPO_NAME
+
     delivered_sha = await repo.merge_sha_for_task(db, task_id)
     live_checks = [
         {
@@ -1514,6 +1523,7 @@ async def web_task_detail(
         "task_detail.html",
         {
             "task": task,
+            "pr_repo": pr_repo,
             "task_messages": task_messages,
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,

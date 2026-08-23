@@ -21,7 +21,7 @@ if [[ ! -f "$DB_PATH" ]]; then
   echo "База не найдена: $DB_PATH"
   echo "Создайте пустую (hub создаст схему при старте) или скопируйте с agenthai.ru:"
   echo "  mkdir -p $(dirname "$DB_PATH")"
-  echo "  ssh user1@194.113.34.33 'sudo cat /var/lib/openclaw-hub/hub.db' > \"$DB_PATH\""
+  echo "  ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo cat /var/lib/openclaw-hub/hub.db' > \"$DB_PATH\""
   exit 1
 fi
 

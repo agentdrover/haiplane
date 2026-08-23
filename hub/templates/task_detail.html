@@ -1026,7 +1026,7 @@
                     {% endif %}
                     {% if task.pr_number %}
                     <dt>PR</dt>
-                    <dd><a href="https://github.com/mrPDA/vkuswill_bot/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a></dd>
+                    <dd>{% if pr_repo %}<a href="https://github.com/{{ pr_repo }}/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a>{% else %}#{{ task.pr_number }}{% endif %}</dd>
                     {% endif %}
                     {% if task.auto_review %}
                     <dt>Review</dt>
