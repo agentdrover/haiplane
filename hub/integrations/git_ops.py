@@ -244,8 +244,8 @@ async def _default_workspace_error() -> str | None:
         return None
     return (
         f"default workspace is not a git repository ({root}); "
-        "set OPENCLAW_WORKSPACE_REPO to a git clone or use a project "
-        "with workspace_path"
+        "set HAIPLANE_WORKSPACE_REPO (or legacy OPENCLAW_WORKSPACE_REPO) "
+        "to a git clone or use a project with workspace_path"
     )
 
 
@@ -1620,7 +1620,7 @@ class GitOpsIntegration:
         body = (
             f"## Task #{task_id}\n\n"
             f"{description or 'No description'}\n\n"
-            "---\n*Created automatically by OpenClaw Hub*"
+            "---\n*Created automatically by Haiplane Hub*"
         )
 
         rc, out, err = await _gh(

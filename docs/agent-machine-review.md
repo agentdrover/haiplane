@@ -2,7 +2,7 @@
 
 # Machine-review cycle (v1) — контракт для любого агента-клиента
 
-Как выполнить machine-review задачи в OpenClaw Hub без контекста чужих
+Как выполнить machine-review задачи в Haiplane Hub без контекста чужих
 сессий. Оркестратор любой (Claude Code Workflow, Cursor, свой скрипт) —
 контракт один.
 

@@ -1,4 +1,4 @@
-# Инструкция для ИИ-агента администратора: развёртывание OpenClaw Hub на внешнем сервере
+# Инструкция для ИИ-агента администратора: развёртывание Haiplane Hub на внешнем сервере
 
 Документ описывает пошаговый протокол, по которому ИИ-агент с ролью администратора
 разворачивает сервис `openclaw-hub` на внешнем Linux-сервере (Ubuntu 22.04/24.04
@@ -186,7 +186,7 @@ sudo chmod 0600 /etc/openclaw-hub/secrets.env
 
 ```ini
 [Unit]
-Description=OpenClaw Hub
+Description=Haiplane Hub
 After=network-online.target
 Wants=network-online.target
 

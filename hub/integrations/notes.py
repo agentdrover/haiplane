@@ -80,7 +80,8 @@ class NotesIntegration:
         if not spaces:
             return {
                 "status": "no_space",
-                "detail": "OPENCLAW_N4L_SPACE is not set and no spaces exist",
+                "detail": "HAIPLANE_N4L_SPACE (or legacy OPENCLAW_N4L_SPACE) "
+                "is not set and no spaces exist",
             }
         return {
             "status": "available",

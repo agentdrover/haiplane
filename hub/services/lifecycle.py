@@ -418,8 +418,10 @@ def self_review_brief_warning(
                 "self-review"
             ),
             hint=(
-                "OPENCLAW_REVIEW_SELF_APPROVE=allow is active: hub_submit_review "
-                "will accept your verdict. This note is informational."
+                "HAIPLANE_REVIEW_SELF_APPROVE=allow (legacy "
+                "OPENCLAW_REVIEW_SELF_APPROVE also accepted) is active: "
+                "hub_submit_review will accept your verdict. "
+                "This note is informational."
             ),
             required_role=None,
         )
@@ -431,7 +433,8 @@ def self_review_brief_warning(
             "your verdict. The Universal Review Gate requires an independent "
             "reviewer — another agent principal or a human token. You may "
             "still use this brief for self-checking. "
-            "Solo mode: set OPENCLAW_REVIEW_SELF_APPROVE=allow."
+            "Solo mode: set HAIPLANE_REVIEW_SELF_APPROVE=allow "
+            "(legacy OPENCLAW_REVIEW_SELF_APPROVE also accepted)."
         ),
         required_role="independent_reviewer",
     )
@@ -2176,10 +2179,14 @@ async def record_review_verdict(
         elif sha_note:
             content += f"\n{sha_note}"
         if self_approved:
-            content += " [self-approved: solo mode, OPENCLAW_REVIEW_SELF_APPROVE=allow]"
+            content += (
+                " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow "
+                "(legacy OPENCLAW_REVIEW_SELF_APPROVE also accepted)]"
+            )
             log.warning(
                 "Task #%s: review verdict %s accepted via "
-                "OPENCLAW_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
+                "HAIPLANE_REVIEW_SELF_APPROVE=allow (legacy "
+                "OPENCLAW_REVIEW_SELF_APPROVE also accepted) — reviewer '%s' "
                 "implemented this task (no independent review)",
                 task_id,
                 body.verdict.value,

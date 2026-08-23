@@ -570,7 +570,7 @@ def _review_prompt(
     prepass_block: str,
 ) -> str:
     common = (
-        f"Ты — независимый код-ревьюер задачи #{task_id} хаба OpenClaw "
+        f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
         f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
         "не менять — только читать код и запускать проверки.\n\n"
         # The rules travel with BOTH profiles: the expensive harness has no

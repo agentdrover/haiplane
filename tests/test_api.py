@@ -1414,7 +1414,10 @@ async def test_review_brief_solo_mode_note_for_implementer(
     warning = resp.json()["self_review_warning"]
     assert warning is not None
     assert warning["reason"] == "solo_mode_self_review"
-    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in warning["hint"]
+    assert "HAIPLANE_REVIEW_SELF_APPROVE=allow" in warning["hint"]
+    assert "OPENCLAW_REVIEW_SELF_APPROVE" in warning["hint"], (
+        "the legacy name must stay documented during the soak"
+    )
     assert warning["required_role"] is None
 
 

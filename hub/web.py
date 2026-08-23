@@ -1,4 +1,4 @@
-"""Web UI routes (HTML / HTMX) for OpenClaw Hub dashboard."""
+"""Web UI routes (HTML / HTMX) for Haiplane Hub dashboard."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from hub import brand
 from hub import config
 from hub import db as db_module
 from hub import repository as repo
@@ -26,6 +27,7 @@ from hub.actionable_errors import (
 )
 from hub.auth import (
     CSRF_COOKIE_NAME,
+    CSRF_COOKIE_NAME_LEGACY,
     current_user,
     current_identity,
     require_human_or_admin,
@@ -36,6 +38,7 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.services import project_policy
+from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
     FindingDispositionItem,
@@ -71,6 +74,9 @@ TEMPLATES = Jinja2Templates(
     directory=str(HERE / "templates"),
     context_processors=[_user_context],
 )
+TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
+TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
+TEMPLATES.env.globals["app_version"] = get_app_version()
 
 router = APIRouter()
 
@@ -201,9 +207,14 @@ async def web_login_submit(
     ):
         return RedirectResponse(safe_next, status_code=303)
 
-    # CSRF verification
-    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
-    if not verify_csrf(csrf_token, csrf_cookie):
+    # CSRF verification — against BOTH cookie names, not pick-first: a
+    # browser can hold both at once (a login tab opened before the rename
+    # deploy plus a later one), and picking the first non-empty cookie would
+    # fail the older form whose token matches the legacy cookie.
+    if not (
+        verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, ""))
+        or verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME_LEGACY, ""))
+    ):
         return RedirectResponse(
             f"/login?error=Invalid%20form%20submission.%20Please%20try%20again.&next={safe_next}",
             status_code=303,
@@ -249,6 +260,7 @@ async def web_login_submit(
             secure=config.HUB_COOKIE_SECURE,
         )
         response.delete_cookie(CSRF_COOKIE_NAME)
+        response.delete_cookie(CSRF_COOKIE_NAME_LEGACY)
         return response
 
     return RedirectResponse(
@@ -276,7 +288,13 @@ async def web_logout(request: Request):
     """
     from hub.services import admin as admin_svc
 
+    # Wave 3 dual-read: the browser may still present the session under the
+    # legacy openclaw_hub_session name. Whichever name carried the token,
+    # that token is the one to revoke. An explicit cookie override narrows
+    # the hub to that single name, exactly as in auth._extract_cookie.
     session_token = request.cookies.get(config.HUB_COOKIE_NAME)
+    if not session_token and not config.HUB_COOKIE_NAME_EXPLICIT:
+        session_token = request.cookies.get(brand.COOKIE_NAME_LEGACY)
     if session_token:
         try:
             await admin_svc.revoke_browser_session(_db(request), session_token)
@@ -289,6 +307,12 @@ async def web_logout(request: Request):
 
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(config.HUB_COOKIE_NAME)
+    if not config.HUB_COOKIE_NAME_EXPLICIT:
+        # Both session names must die: leaving openclaw_hub_session alive
+        # after "logout" would keep the browser signed in via dual-accept.
+        response.delete_cookie(brand.COOKIE_NAME_LEGACY)
+    response.delete_cookie(CSRF_COOKIE_NAME)
+    response.delete_cookie(CSRF_COOKIE_NAME_LEGACY)
     return response
 
 

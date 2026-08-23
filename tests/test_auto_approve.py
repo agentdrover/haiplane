@@ -366,7 +366,10 @@ async def test_auto_approval_names_both_ceilings(
     assert auto, "an auto-approval without a recorded reason is unanswerable"
     assert "проектный R1" in auto[0], "the project ceiling must be named"
     assert "глобальный R1" in auto[0], "and the global one beside it"
-    assert "OPENCLAW_AUTO_APPROVE_MAX_CLASS=r1" in auto[0]
+    assert "HAIPLANE_AUTO_APPROVE_MAX_CLASS=r1" in auto[0]
+    assert "OPENCLAW_AUTO_APPROVE_MAX_CLASS" in auto[0], (
+        "the legacy name must stay documented during the soak"
+    )
 
 
 async def test_project_risk_map_lets_a_satellite_draft_pass(

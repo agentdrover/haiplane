@@ -266,7 +266,9 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
                     "Автовердикт НЕ вынесен: пустое ревью выше потолка "
                     f"класса. Класс задачи: {task.get('risk_class') or 'не вычислен'}, "
                     f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
-                    f"(OPENCLAW_PROVEN_EMPTY_MAX_CLASS={config.PROVEN_EMPTY_MAX_CLASS!r}). "
+                    f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
+                    f"{config.PROVEN_EMPTY_MAX_CLASS!r}; принимается и legacy "
+                    f"OPENCLAW_PROVEN_EMPTY_MAX_CLASS). "
                     f"Работа ревьюера доказана (usage={proven_usage}), способность — нет. "
                     "Вердикт остаётся человеку."
                 ),

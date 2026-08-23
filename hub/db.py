@@ -2014,7 +2014,7 @@ confirmed[] (severity, file:line, detail, цитаты голосов), rejected
 MACHINE_REVIEW_CYCLE_SKILL = """\
 # Machine-review cycle (v1) — контракт для любого агента-клиента
 
-Как выполнить machine-review задачи в OpenClaw Hub без контекста чужих
+Как выполнить machine-review задачи в Haiplane Hub без контекста чужих
 сессий. Оркестратор любой (Claude Code Workflow, Cursor, свой скрипт) —
 контракт один.
 
@@ -2024,8 +2024,9 @@ MACHINE_REVIEW_CYCLE_SKILL = """\
 feature/bug M+ — да; риск high или security — всегда). Хаб сам сообщает:
 `lifecycle_hint` в ответе `hub_submit_for_review`, предупреждение в панели
 ревью, событие `machine_review_requested` в фиде. Режим
-OPENCLAW_MACHINE_REVIEW=require блокирует человеческий вердикт без
-актуального отчёта; дефолт warn — только предупреждает.
+HAIPLANE_MACHINE_REVIEW=require (fallback OPENCLAW_MACHINE_REVIEW)
+блокирует человеческий вердикт без актуального отчёта; дефолт warn —
+только предупреждает.
 
 ## Шаги
 1. `hub_get_skill("multi-agent-review")` — актуальная версия промта-харнесса

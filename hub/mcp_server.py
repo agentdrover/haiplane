@@ -1,4 +1,4 @@
-"""OpenClaw Hub MCP server — exposes hub tools for Cursor and remote agents."""
+"""Haiplane Hub MCP server — exposes hub tools for Cursor and remote agents."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from hub import config
+from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
 from hub.mcp_internal_auth import identity_context_get
 from hub.services.mcp_telemetry import record_call
@@ -94,22 +94,22 @@ class InstrumentedFastMCP(FastMCP):
 
 
 mcp = InstrumentedFastMCP(
-    "openclaw-hub",
+    brand.MCP_SERVER_NAME,
     instructions=build_mcp_instructions(),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
 def _hub_url() -> str:
-    import os
+    from hub.config import env_get
 
-    return os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    return env_get("HUB_URL", "http://127.0.0.1:8080")
 
 
 def _hub_token() -> str:
-    import os
+    from hub.config import env_get
 
-    env_tok = (os.environ.get("OPENCLAW_HUB_TOKEN") or "").strip()
+    env_tok = (env_get("HUB_TOKEN", "") or "").strip()
     if env_tok:
         return env_tok
     # Streamable MCP mounted in the same process: reuse caller's Bearer (set by

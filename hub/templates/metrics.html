@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active = "metrics" %}
-{% block title %}Metrics — OpenClaw Hub{% endblock %}
+{% block title %}Metrics — {{ product_title }}{% endblock %}
 {% block content %}
 <header class="page-header">
     <h1 class="page-title">Practice Metrics <span class="badge badge-review">last {{ m.since_days }}d</span></h1>

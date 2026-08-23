@@ -2,82 +2,94 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import overload
 
-HOME = Path(os.environ.get("OPENCLAW_HUB_HOME", Path.home()))
+from hub import brand
 
-REPO_NAME = os.environ.get("OPENCLAW_HUB_REPO", "")
+
+@overload
+def env_get(suffix: str) -> str | None: ...
+@overload
+def env_get(suffix: str, default: str) -> str: ...
+
+
+def env_get(suffix: str, default: str | None = None) -> str | None:
+    new = os.environ.get(brand.ENV_PREFIX + suffix)
+    if new:
+        return new
+    old = os.environ.get(brand.ENV_PREFIX_LEGACY + suffix)
+    if old:
+        return old
+    return default
+
+
+HOME = Path(env_get("HUB_HOME", str(Path.home())))
+
+REPO_NAME = env_get("HUB_REPO", "")
 WORKSPACE_REPO_LINK = Path(
-    os.environ.get(
-        "OPENCLAW_WORKSPACE_REPO", str(HOME / ".openclaw" / "workspace" / "repo")
-    )
+    env_get("WORKSPACE_REPO", str(HOME / ".openclaw" / "workspace" / "repo"))
 )
 
 DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "jobs"
 DISPATCH_LOGS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "logs"
-DISPATCH_BIN = os.environ.get(
-    "OPENCLAW_DISPATCH_BIN", str(HOME / ".local" / "bin" / "oc-dev-dispatch")
-)
+DISPATCH_BIN = env_get("DISPATCH_BIN", str(HOME / ".local" / "bin" / "oc-dev-dispatch"))
 
-N4L_BIN = os.environ.get("OPENCLAW_N4L_BIN", str(HOME / ".local" / "bin" / "n4l"))
-N4L_SPACE_ID = os.environ.get("OPENCLAW_N4L_SPACE", "")
+N4L_BIN = env_get("N4L_BIN", str(HOME / ".local" / "bin" / "n4l"))
+N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
-VAST_JOB_BIN = os.environ.get(
-    "OPENCLAW_VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-openclaw")
-)
+VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-openclaw"))
 # Vast.ai is opt-in. Disabled by default — set OPENCLAW_VAST_ENABLED=1 to turn on.
-VAST_ENABLED = os.environ.get("OPENCLAW_VAST_ENABLED", "0") == "1"
+VAST_ENABLED = env_get("VAST_ENABLED", "0") == "1"
 
 TRANSCRIPTS_DIR = Path(
-    os.environ.get("OPENCLAW_TRANSCRIPTS_DIR", str(HOME / ".openclaw" / "transcripts"))
+    env_get("TRANSCRIPTS_DIR", str(HOME / ".openclaw" / "transcripts"))
 )
 
 HUB_DB_PATH = Path(
-    os.environ.get(
-        "OPENCLAW_HUB_DB", str(HOME / ".local" / "state" / "openclaw-hub" / "hub.db")
-    )
+    env_get("HUB_DB", str(HOME / ".local" / "state" / "openclaw-hub" / "hub.db"))
 )
-HUB_HOST = os.environ.get("OPENCLAW_HUB_HOST", "127.0.0.1")
-HUB_PORT = int(os.environ.get("OPENCLAW_HUB_PORT", "8080"))
+HUB_HOST = env_get("HUB_HOST", "127.0.0.1")
+HUB_PORT = int(env_get("HUB_PORT", "8080"))
 
-MAX_REVIEW_CYCLES = int(os.environ.get("OPENCLAW_MAX_REVIEW_CYCLES", "3"))
+MAX_REVIEW_CYCLES = int(env_get("MAX_REVIEW_CYCLES", "3"))
 # Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
 # from the agent principal that implemented the task (assigned_agent or
 # claimed_by); 'allow' is the explicit solo-mode opt-out.
-REVIEW_SELF_APPROVE = os.environ.get("OPENCLAW_REVIEW_SELF_APPROVE", "forbid")
+REVIEW_SELF_APPROVE = env_get("REVIEW_SELF_APPROVE", "forbid")
 # Projects V2 (#345): 'propose' (default) — agent-created projects start as
 # pending and need human activation; 'direct' is the solo-mode opt-out.
-ALLOW_AGENT_PROJECTS = os.environ.get("OPENCLAW_ALLOW_AGENT_PROJECTS", "propose")
+ALLOW_AGENT_PROJECTS = env_get("ALLOW_AGENT_PROJECTS", "propose")
 # Agent Practices (#382): 'warn' (default) — a missing machine-review report
 # only warns in the review panel; 'require' blocks the human verdict until a
 # current report exists. Applies only where policy says a review is needed.
-MACHINE_REVIEW_MODE = os.environ.get("OPENCLAW_MACHINE_REVIEW", "warn")
+MACHINE_REVIEW_MODE = env_get("MACHINE_REVIEW", "warn")
 # Verifiable SDD (#501/#505): 'off' (default) — refine does not enforce that a
 # verifiable_by=test AC carries a resolvable pytest test locator; 'require'
 # rejects such AC at refine time. Default off so existing refine flows and the
 # hub's own tasks (which predate locators) keep working; opt in per project.
-SDD_AC_LOCATOR = os.environ.get("OPENCLAW_SDD_AC_LOCATOR", "off")
+SDD_AC_LOCATOR = env_get("SDD_AC_LOCATOR", "off")
 # Verifiable SDD (#508): 'warn' (default) — a red/absent AC test only shows in
 # the review brief; 'require' blocks an APPROVED verdict until every current
 # verifiable_by=test AC is green. Only APPROVED is gated — CHANGES_REQUESTED
 # always passes so a reviewer can always reject (lesson from #382).
-SDD_AC_TESTS = os.environ.get("OPENCLAW_SDD_AC_TESTS", "warn")
+SDD_AC_TESTS = env_get("SDD_AC_TESTS", "warn")
 # Verifiable SDD (#510): 'warn' (default) — a failed validation_commands run only
 # warns; 'require' blocks completion until the current validation run is green.
-SDD_VALIDATION = os.environ.get("OPENCLAW_SDD_VALIDATION", "warn")
+SDD_VALIDATION = env_get("SDD_VALIDATION", "warn")
 # Commit scope (#361): 'warn' (default) — files dirty at commit time that fall
 # outside the task's declared affected_areas are named in a task update and
 # committed anyway; 'require' stops the git tail and escalates to
 # needs_decision instead. 'off' disables the check. Headless tasks share the
 # main clone for their whole run, so this is the only attribution the hub has.
-COMMIT_SCOPE_GATE = os.environ.get("OPENCLAW_COMMIT_SCOPE", "warn")
+COMMIT_SCOPE_GATE = env_get("COMMIT_SCOPE", "warn")
 # Declared surfaces vs the actual diff (#550): 'warn' (default) — files the
 # branch changes that no declared area covers are named in a task update and
 # the submission proceeds; 'require' refuses the submission; 'off' disables
 # the check. Compared against the branch diff, not against a prediction: on
 # submit the hub has the truth, so there are no name-matching heuristics and
 # no false positives by construction.
-SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
+SDD_SURFACES = env_get("SDD_SURFACES", "warn")
 # Deterministic submit rules (#855): the cheap layer that runs BEFORE the paid
 # reviewer, on the diff the submission already resolved (#583) — no extra git
 # call, no tokens. 'warn' (default) reports; 'require' refuses a submission
@@ -86,7 +98,7 @@ SDD_SURFACES = os.environ.get("OPENCLAW_SDD_SURFACES", "warn")
 # test-coverage / test-adequacy / missing-test-hides-defect findings at 124k
 # tokens each, and 61% of its raw findings were rejected — two thirds of the
 # budget spent on noise a rule cannot produce.
-SUBMIT_RULES = os.environ.get("OPENCLAW_SUBMIT_RULES", "warn")
+SUBMIT_RULES = env_get("SUBMIT_RULES", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved
@@ -94,20 +106,18 @@ SUBMIT_RULES = os.environ.get("OPENCLAW_SUBMIT_RULES", "warn")
 # setting is the switch the task demands: flipping it back to 'off' restores
 # the human gate completely. 'r2' is deliberately NOT accepted here — that
 # band opens only with #585, after measured reviewer agreement.
-AUTO_APPROVE_MAX_CLASS = os.environ.get("OPENCLAW_AUTO_APPROVE_MAX_CLASS", "off")
+AUTO_APPROVE_MAX_CLASS = env_get("AUTO_APPROVE_MAX_CLASS", "off")
 # Review-round token budget (#745): a machine-review report that spent more
 # than this escalates the verdict to the human instead of auto-approving —
 # a round that did not converge normally is itself a risk signal. Matches
 # the multi-agent-review skill's per-round bar. 0 disables the trigger.
-REVIEW_TOKEN_BUDGET = int(os.environ.get("OPENCLAW_REVIEW_TOKEN_BUDGET", "300000"))
+REVIEW_TOKEN_BUDGET = int(env_get("REVIEW_TOKEN_BUDGET", "300000"))
 # Proven-empty review (#769): raw_count=0 may still auto-approve when the
 # provider's own usage numbers prove the reviewer actually worked. This is
 # the minimum billed tokens for a hub-dispatched run to count as proof;
 # below it (or without a settled dispatch at all) the #750 rule stands and
 # the verdict stays with the human. 0 disables the proven-empty path.
-EMPTY_REVIEW_MIN_USAGE = int(
-    os.environ.get("OPENCLAW_EMPTY_REVIEW_MIN_USAGE", "200000")
-)
+EMPTY_REVIEW_MIN_USAGE = int(env_get("EMPTY_REVIEW_MIN_USAGE", "200000"))
 # Class ceiling for the proven-empty path (#835): usage proves the reviewer
 # WORKED, never that it was ABLE to find — and the cross-model reviewer runs
 # on the free tier of its provider. So an empty report may stand in for a
@@ -115,7 +125,7 @@ EMPTY_REVIEW_MIN_USAGE = int(
 # this class. Above it the human keeps the verdict even when the emptiness
 # is proven. An unknown value reads as the strictest band, not as "off" —
 # a typo in a drop-in must not silently disable a safeguard.
-PROVEN_EMPTY_MAX_CLASS = os.environ.get("OPENCLAW_PROVEN_EMPTY_MAX_CLASS", "r1")
+PROVEN_EMPTY_MAX_CLASS = env_get("PROVEN_EMPTY_MAX_CLASS", "r1")
 # Cursor Cloud Agents API (#756): the server-side executor for cross-model
 # reviews. Empty key = the integration is off and every client method
 # degrades to None without a network call. The key comes from the Cursor
@@ -141,118 +151,94 @@ CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", 
 # (review_dispatch.rules_char_cap) — hub-written input, genuinely ours to
 # size. The unit that tracks cost is the RUN: none billed under 777k, lite
 # averages 1.38M, deep 3.85M.
-REVIEW_LITE_TOKEN_BUDGET = int(
-    os.environ.get("OPENCLAW_REVIEW_LITE_TOKEN_BUDGET", "40000")
-)
-MAX_CI_FIX_CYCLES = int(os.environ.get("OPENCLAW_MAX_CI_FIX_CYCLES", "3"))
-REVIEW_RUNTIME = os.environ.get("OPENCLAW_REVIEW_RUNTIME", "openrouter")
-REVIEW_AGENT = os.environ.get("OPENCLAW_REVIEW_AGENT", "code-reviewer")
+REVIEW_LITE_TOKEN_BUDGET = int(env_get("REVIEW_LITE_TOKEN_BUDGET", "40000"))
+MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
+REVIEW_RUNTIME = env_get("REVIEW_RUNTIME", "openrouter")
+REVIEW_AGENT = env_get("REVIEW_AGENT", "code-reviewer")
 
-ARBITER_RUNTIME = os.environ.get("OPENCLAW_ARBITER_RUNTIME", "openrouter")
-ARBITER_AGENT = os.environ.get("OPENCLAW_ARBITER_AGENT", "architect-analyst")
+ARBITER_RUNTIME = env_get("ARBITER_RUNTIME", "openrouter")
+ARBITER_AGENT = env_get("ARBITER_AGENT", "architect-analyst")
 # At-most-once arbiter dispatch (#421): if the marker sits in 'dispatching'
 # (submit started, job id never recorded — a crash window) past this grace, the
 # task fails safe to needs_decision rather than risk a duplicate paid dispatch.
-ARBITER_DISPATCH_GRACE_MINUTES = int(
-    os.environ.get("OPENCLAW_ARBITER_DISPATCH_GRACE_MINUTES", "15")
-)
+ARBITER_DISPATCH_GRACE_MINUTES = int(env_get("ARBITER_DISPATCH_GRACE_MINUTES", "15"))
 
-STALE_THRESHOLD_MINUTES = int(os.environ.get("OPENCLAW_STALE_MINUTES", "30"))
+STALE_THRESHOLD_MINUTES = int(env_get("STALE_MINUTES", "30"))
 # Stale watchdog (#319): silent dead-end statuses get their own, longer
 # thresholds — review and human answers move slower than execution.
-STALE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_STALE_REVIEW_MINUTES", "120"))
+STALE_REVIEW_MINUTES = int(env_get("STALE_REVIEW_MINUTES", "120"))
 # Unrefined-draft watchdog (#751): a draft older than this without a passed
 # DoR gets one feed alert naming what is missing — approval of such a draft
 # mechanically fails (422 dor_failed), and until this watchdog the author
 # learned that only when the owner hit the button.
-UNREFINED_DRAFT_MINUTES = int(os.environ.get("OPENCLAW_UNREFINED_DRAFT_MINUTES", "240"))
-STALE_CLAIMED_MINUTES = int(os.environ.get("OPENCLAW_STALE_CLAIMED_MINUTES", "240"))
-STALE_NEEDS_INFO_MINUTES = int(
-    os.environ.get("OPENCLAW_STALE_NEEDS_INFO_MINUTES", "480")
-)
+UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
+STALE_CLAIMED_MINUTES = int(env_get("STALE_CLAIMED_MINUTES", "240"))
+STALE_NEEDS_INFO_MINUTES = int(env_get("STALE_NEEDS_INFO_MINUTES", "480"))
 # Machine-owned dead-end statuses (#393): visible via stale alerts until the
 # durable deadline transitions from F2 land. F1 only alerts — status unchanged.
-STALE_CI_CHECK_MINUTES = int(os.environ.get("OPENCLAW_STALE_CI_CHECK_MINUTES", "60"))
-STALE_FIX_REQUESTED_MINUTES = int(
-    os.environ.get("OPENCLAW_STALE_FIX_REQUESTED_MINUTES", "60")
-)
-STALE_PENDING_REPORT_MINUTES = int(
-    os.environ.get("OPENCLAW_STALE_PENDING_REPORT_MINUTES", "30")
-)
+STALE_CI_CHECK_MINUTES = int(env_get("STALE_CI_CHECK_MINUTES", "60"))
+STALE_FIX_REQUESTED_MINUTES = int(env_get("STALE_FIX_REQUESTED_MINUTES", "60"))
+STALE_PENDING_REPORT_MINUTES = int(env_get("STALE_PENDING_REPORT_MINUTES", "30"))
 
 # Bounded recovery (#417): a headless dispatch/review job that stays missing
 # past the grace escalates to needs_decision; a claim held past the lease is
 # auto-released back to open. Both decisions read persisted timestamps so a
 # restart never resets them.
-MISSING_JOB_GRACE_MINUTES = int(
-    os.environ.get("OPENCLAW_MISSING_JOB_GRACE_MINUTES", "5")
-)
-CLAIM_LEASE_MINUTES = int(os.environ.get("OPENCLAW_CLAIM_LEASE_MINUTES", "240"))
+MISSING_JOB_GRACE_MINUTES = int(env_get("MISSING_JOB_GRACE_MINUTES", "5"))
+CLAIM_LEASE_MINUTES = int(env_get("CLAIM_LEASE_MINUTES", "240"))
 
 # Machine-owned deadlines (#418): a backstop, deliberately generous so normal
 # work never trips them — the stale watchdog (#393) alerts long before. When a
 # machine-owned instance sits past its deadline the watchdog transitions it to
 # needs_decision, so no combination stays stuck without an owner.
-DEADLINE_CI_CHECK_MINUTES = int(
-    os.environ.get("OPENCLAW_DEADLINE_CI_CHECK_MINUTES", "180")
-)
-DEADLINE_FIX_REQUESTED_MINUTES = int(
-    os.environ.get("OPENCLAW_DEADLINE_FIX_REQUESTED_MINUTES", "180")
-)
-DEADLINE_PENDING_REPORT_MINUTES = int(
-    os.environ.get("OPENCLAW_DEADLINE_PENDING_REPORT_MINUTES", "120")
-)
-DEADLINE_RUNNING_MINUTES = int(
-    os.environ.get("OPENCLAW_DEADLINE_RUNNING_MINUTES", "360")
-)
-DEADLINE_REVIEW_MINUTES = int(os.environ.get("OPENCLAW_DEADLINE_REVIEW_MINUTES", "180"))
+DEADLINE_CI_CHECK_MINUTES = int(env_get("DEADLINE_CI_CHECK_MINUTES", "180"))
+DEADLINE_FIX_REQUESTED_MINUTES = int(env_get("DEADLINE_FIX_REQUESTED_MINUTES", "180"))
+DEADLINE_PENDING_REPORT_MINUTES = int(env_get("DEADLINE_PENDING_REPORT_MINUTES", "120"))
+DEADLINE_RUNNING_MINUTES = int(env_get("DEADLINE_RUNNING_MINUTES", "360"))
+DEADLINE_REVIEW_MINUTES = int(env_get("DEADLINE_REVIEW_MINUTES", "180"))
 
 # Agent session registry (#771): presence is a derived fact, not a stored flag.
 # A session counts as online while its last heartbeat is younger than the TTL;
 # past it the registry says offline and names the age, because an agent that
 # died without saying goodbye must not keep looking alive. Retention mirrors the
 # events feed: the registry is a directory of who is around, not an archive.
-SESSION_TTL_MINUTES = int(os.environ.get("OPENCLAW_SESSION_TTL_MINUTES", "10"))
-SESSION_RETENTION_DAYS = int(os.environ.get("OPENCLAW_SESSION_RETENTION_DAYS", "14"))
+SESSION_TTL_MINUTES = int(env_get("SESSION_TTL_MINUTES", "10"))
+SESSION_RETENTION_DAYS = int(env_get("SESSION_RETENTION_DAYS", "14"))
 
 # Agent messages (#773): a channel without limits becomes a dump nobody reads,
 # and one that blocks work becomes a toll booth. Both defaults are generous
 # enough that ordinary coordination never meets them, and a refusal always says
 # which limit it hit rather than failing shapelessly.
-MESSAGE_MAX_CHARS = int(os.environ.get("OPENCLAW_MESSAGE_MAX_CHARS", "4000"))
+MESSAGE_MAX_CHARS = int(env_get("MESSAGE_MAX_CHARS", "4000"))
 
 # #824: how much of a submission's diff the gate renders before it says it
 # stopped. A cap the reader is not told about is worse than no diff at all —
 # it looks like the whole change and is a fragment of it.
-DIFF_MAX_LINES = int(os.environ.get("OPENCLAW_DIFF_MAX_LINES", "2000"))
-DIFF_MAX_BYTES = int(os.environ.get("OPENCLAW_DIFF_MAX_BYTES", str(400 * 1024)))
-MESSAGE_RATE_PER_MINUTE = int(os.environ.get("OPENCLAW_MESSAGE_RATE_PER_MINUTE", "30"))
-MESSAGE_RETENTION_DAYS = int(os.environ.get("OPENCLAW_MESSAGE_RETENTION_DAYS", "14"))
+DIFF_MAX_LINES = int(env_get("DIFF_MAX_LINES", "2000"))
+DIFF_MAX_BYTES = int(env_get("DIFF_MAX_BYTES", str(400 * 1024)))
+MESSAGE_RATE_PER_MINUTE = int(env_get("MESSAGE_RATE_PER_MINUTE", "30"))
+MESSAGE_RETENTION_DAYS = int(env_get("MESSAGE_RETENTION_DAYS", "14"))
 
 # MCP usage telemetry (#780, epic #776): the Agent API cannot be trimmed by
 # taste. What every knob below protects is the same property — the record is
 # metadata about a call, never its content. Retention is longer than the
 # longest report window on purpose: a 90-day report drawn from a 90-day
 # horizon is always missing its own oldest edge while looking complete.
-MCP_TELEMETRY_ENABLED = os.environ.get("OPENCLAW_MCP_TELEMETRY", "1") != "0"
-MCP_TELEMETRY_RETENTION_DAYS = int(
-    os.environ.get("OPENCLAW_MCP_TELEMETRY_RETENTION_DAYS", "120")
-)
-MCP_TELEMETRY_MAX_WINDOW_DAYS = int(
-    os.environ.get("OPENCLAW_MCP_TELEMETRY_MAX_WINDOW_DAYS", "90")
-)
+MCP_TELEMETRY_ENABLED = env_get("MCP_TELEMETRY", "1") != "0"
+MCP_TELEMETRY_RETENTION_DAYS = int(env_get("MCP_TELEMETRY_RETENTION_DAYS", "120"))
+MCP_TELEMETRY_MAX_WINDOW_DAYS = int(env_get("MCP_TELEMETRY_MAX_WINDOW_DAYS", "90"))
 # Which Agent API surface answered the call. One value today; feature B (#778)
 # splits it into core/extension profiles, and the reports built here are what
 # decides where the line falls.
-MCP_PROFILE = os.environ.get("OPENCLAW_MCP_PROFILE", "v1")
+MCP_PROFILE = env_get("MCP_PROFILE", "v1")
 
 # Release branch (#812): where develop is carried when the project releases by
 # policy. Separate from PAIR_BASE_BRANCH so "where work lands" and "what is in
 # production" stay two different questions.
-RELEASE_BRANCH = os.environ.get("OPENCLAW_RELEASE_BRANCH", "main")
+RELEASE_BRANCH = env_get("RELEASE_BRANCH", "main")
 
 # Pair mode: base branch for safe branch creation (default develop per repo-rules).
-PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
+PAIR_BASE_BRANCH = env_get("PAIR_BASE_BRANCH", "develop")
 
 # ---------------------------------------------------------------------------
 # Authentication (multi-user)
@@ -269,21 +255,23 @@ PAIR_BASE_BRANCH = os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")
 #   and /mcp/* request must authenticate via Bearer header or session cookie.
 # - OPENCLAW_HUB_AUTH_DISABLED=1 force-disables the gate even when tokens are
 #   configured. Useful for one-off debugging; never enable in production.
-HUB_TOKENS_RAW = os.environ.get("OPENCLAW_HUB_TOKENS", "")
-HUB_AUTH_DISABLED = os.environ.get("OPENCLAW_HUB_AUTH_DISABLED", "0") == "1"
-HUB_ALLOW_UNAUTH_NETWORK = (
-    os.environ.get("OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK", "0") == "1"
-)
-HUB_ALLOWED_HOSTS_RAW = os.environ.get("OPENCLAW_HUB_ALLOWED_HOSTS", "")
-HUB_COOKIE_NAME = os.environ.get("OPENCLAW_HUB_COOKIE", "openclaw_hub_session")
+HUB_TOKENS_RAW = env_get("HUB_TOKENS", "")
+HUB_AUTH_DISABLED = env_get("HUB_AUTH_DISABLED", "0") == "1"
+HUB_ALLOW_UNAUTH_NETWORK = env_get("HUB_ALLOW_UNAUTHENTICATED_NETWORK", "0") == "1"
+HUB_ALLOWED_HOSTS_RAW = env_get("HUB_ALLOWED_HOSTS", "")
+# Session cookie (Haiplane rebrand, Wave 3). An operator override via
+# HAIPLANE_HUB_COOKIE / OPENCLAW_HUB_COOKIE names the ONLY cookie the hub
+# reads; without one the default is the new name and hub/auth.py also accepts
+# the legacy openclaw_hub_session so live sessions survive the rename.
+_cookie_explicit = env_get("HUB_COOKIE")
+HUB_COOKIE_NAME_EXPLICIT = bool(_cookie_explicit)
+HUB_COOKIE_NAME = _cookie_explicit or brand.COOKIE_NAME
 # 30 days by default — Hub is an internal tool, long-lived sessions are fine.
-HUB_COOKIE_MAX_AGE = int(
-    os.environ.get("OPENCLAW_HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600))
-)
-HUB_COOKIE_SECURE = os.environ.get("OPENCLAW_HUB_COOKIE_SECURE", "0") == "1"
+HUB_COOKIE_MAX_AGE = int(env_get("HUB_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
+HUB_COOKIE_SECURE = env_get("HUB_COOKIE_SECURE", "0") == "1"
 
 
-HUB_BOOTSTRAP_TOKEN = os.environ.get("OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN", "")
+HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")
 
 
 class TokenIdentity:
@@ -446,6 +434,7 @@ def validate_network_auth() -> None:
         return
     raise RuntimeError(
         f"Refusing to bind to {HUB_HOST!r} without authentication. "
-        f"Either set OPENCLAW_HUB_TOKENS, bind to 127.0.0.1, or set "
-        f"OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 to override."
+        f"Either set HAIPLANE_HUB_TOKENS (or the legacy OPENCLAW_HUB_TOKENS), "
+        f"bind to 127.0.0.1, or set HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 "
+        f"(legacy OPENCLAW_ prefix also accepted) to override."
     )

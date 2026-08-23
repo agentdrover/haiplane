@@ -3,16 +3,16 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Sign in - OpenClaw Hub</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f980;</text></svg>">
+    <title>Sign in - {{ product_title }}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><polygon points='18,12 88,50 18,88' fill='%236c5ce7'/></svg>">
     <link rel="stylesheet" href="/static/style.css?v={{ asset_version|default('20260605b') }}">
 </head>
 <body class="login-body">
-<main class="login-focus-page" aria-label="OpenClaw Hub sign in">
+<main class="login-focus-page" aria-label="{{ product_title }} sign in">
     <section class="login-focus-wrap">
         <div class="login-card login-card--focus">
             <div class="login-logo">
-                <span class="login-logo-main">OpenClaw</span>
+                <span class="login-logo-main">{{ product_name }}</span>
                 <span class="login-logo-sub">Hub</span>
             </div>
             <h1 class="login-title">Sign in</h1>

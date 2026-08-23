@@ -1,7 +1,8 @@
 [project]
-name = "openclaw-hub"
+name = "haiplane-hub"
 version = "0.1.0"
-description = "Web dashboard + MCP server for managing OpenClaw agent development"
+description = "Web dashboard + MCP server for Haiplane agent development"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -18,6 +19,10 @@ dependencies = [
 ]
 
 [project.scripts]
+haiplane-hub = "hub.app:main"
+hp-hub = "hub.cli:main"
+haiplane-hub-mcp = "hub.mcp_server:main"
+hp-git-policy = "hub.git_policy:main"
 openclaw-hub = "hub.app:main"
 oc-hub = "hub.cli:main"
 openclaw-hub-mcp = "hub.mcp_server:main"

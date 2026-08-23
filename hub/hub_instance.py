@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -28,7 +27,7 @@ def hub_hostname() -> str:
 
 def hub_base_url() -> str:
     """Resolved public base URL for this Hub process."""
-    explicit = (os.environ.get("OPENCLAW_HUB_URL") or "").strip()
+    explicit = (config.env_get("HUB_URL") or "").strip()
     if explicit:
         return explicit.rstrip("/")
     return f"http://{config.HUB_HOST}:{config.HUB_PORT}".rstrip("/")

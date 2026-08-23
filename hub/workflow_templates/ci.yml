@@ -1,14 +1,14 @@
-# Laid down by OpenClaw Hub provisioning (#476) — do not rename this file.
+# Laid down by Haiplane Hub provisioning (#476) — do not rename this file.
 #
-# The hub owns the name `openclaw-ci.yml` and nothing else in this directory.
-# It is written only into a repository that carried NO workflows of its own,
-# so this file never replaced an opinion somebody else had already expressed
-# about CI here.
+# The hub owns the name `haiplane-ci.yml` (and the pre-rename
+# `openclaw-ci.yml`) and nothing else in this directory. It is written only
+# into a repository that carried NO workflows of its own, so this file never
+# replaced an opinion somebody else had already expressed about CI here.
 #
 # What it is for: the delivery gate merges a pull request only after reading a
 # workflow's outcome. With no workflow at all the probe answers "absent" and
 # approved, green work cannot be delivered by any supported path.
-name: OpenClaw CI
+name: Haiplane CI
 
 on:
   # No base-branch allowlist, deliberately (#475/#476). The gate reads THIS
@@ -69,6 +69,9 @@ jobs:
         continue-on-error: true
         uses: mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main
         with:
+          # HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN secrets will be picked up
+          # here after Wave 4-code switches these lines to fallback
+          # expressions; until then the legacy secret names below stay.
           hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
           hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}

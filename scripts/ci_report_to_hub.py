@@ -15,9 +15,10 @@ Two rules this script exists to obey:
   AC and left unreported for validation, with the reason attached. A false
   ``fail`` would block a verdict for something unrelated to the work.
 
-Env: OPENCLAW_HUB_URL, OPENCLAW_HUB_CI_TOKEN (both absent ⇒ report nothing and
-say so), GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
-OPENCLAW_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
+Env: HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_TOKEN (legacy OPENCLAW_* names are
+accepted as fallback; both absent ⇒ report nothing and say so),
+GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
+HAIPLANE_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
 pytest`` — this repository's own way, and exactly what a satellite repository
 with different tooling has to be able to change).
 """
@@ -44,9 +45,22 @@ COMMAND_TOKEN = re.compile(r"^[A-Za-z0-9._/-]+$")
 _RUN_TIMEOUT = 900
 _LOG_TAIL = 4000
 # The default is this repository's own runner. A satellite repository sets
-# OPENCLAW_HUB_CI_PYTEST to whatever runs ITS tests; an unparsable or missing
+# HAIPLANE_HUB_CI_PYTEST to whatever runs ITS tests; an unparsable or missing
 # runner reports not_found with a reason, never a failure about the work.
 _DEFAULT_AC_RUNNER = "uv run pytest"
+
+
+def env_get(suffix: str) -> str:
+    """HAIPLANE_ first, legacy OPENCLAW_ fallback; empty counts as unset.
+
+    Standalone twin of ``hub.config.env_get`` — this script also runs in
+    satellite repositories where the hub package is not importable.
+    """
+    return (
+        os.environ.get(f"HAIPLANE_{suffix}")
+        or os.environ.get(f"OPENCLAW_{suffix}")
+        or ""
+    )
 
 
 def log(msg: str) -> None:
@@ -123,7 +137,7 @@ def ac_runner() -> list[str]:
     that guessed "failed" because the runner was missing would accuse the work
     of something the tooling did.
     """
-    raw = (os.environ.get("OPENCLAW_HUB_CI_PYTEST") or _DEFAULT_AC_RUNNER).strip()
+    raw = (env_get("HUB_CI_PYTEST") or _DEFAULT_AC_RUNNER).strip()
     try:
         argv = shlex.split(raw)
     except ValueError as exc:
@@ -249,12 +263,13 @@ def run_validation(commands: list[str]) -> tuple[str, str, str]:
 
 
 def main() -> int:
-    base = (os.environ.get("OPENCLAW_HUB_URL") or "").rstrip("/")
-    token = os.environ.get("OPENCLAW_HUB_CI_TOKEN") or ""
+    base = env_get("HUB_URL").rstrip("/")
+    token = env_get("HUB_CI_TOKEN")
     if not base or not token:
         log(
-            "OPENCLAW_HUB_URL / OPENCLAW_HUB_CI_TOKEN not configured — "
-            "reporting nothing; the hub will read this as unknown, not as failure"
+            "HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN (or legacy OPENCLAW_*) "
+            "not configured — reporting nothing; the hub will read this as "
+            "unknown, not as failure"
         )
         return 0
 
@@ -289,7 +304,7 @@ def main() -> int:
 
     v_status, v_log, v_reason = run_validation(task.get("validation_commands") or [])
 
-    checks = parse_checks(os.environ.get("OPENCLAW_HUB_CI_CHECKS") or "")
+    checks = parse_checks(env_get("HUB_CI_CHECKS"))
     if checks:
         log(f"deterministic checks reported: {checks}")
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-OpenClaw Hub is a standalone task-orchestration server for AI-agent work.
+Haiplane Hub is a standalone task-orchestration server for AI-agent work.
 It exposes the same domain through four main surfaces:
 
 | Surface | Entry point | Purpose |
