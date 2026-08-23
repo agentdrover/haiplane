@@ -53,7 +53,8 @@ async def test_open_mode_dashboard_renders(client, monkeypatch):
     monkeypatch.setattr(config, "HUB_TOKENS", {})
     resp = await client.get("/")
     assert resp.status_code == 200
-    assert "OpenClaw Hub" in resp.text
+    assert "Haiplane Hub" in resp.text
+    assert "OpenClaw Hub" not in resp.text
 
 
 # ---------------------------------------------------------------------------

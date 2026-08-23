@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% set active = "dashboard" %}
 
-{% block title %}Dashboard — OpenClaw Hub{% endblock %}
+{% block title %}Dashboard — {{ product_title }}{% endblock %}
 
 {% block content %}
 {% set _running_count = (data.active_tasks|selectattr("status.value", "equalto", "running")|list|length) + (data.active_tasks|selectattr("status.value", "equalto", "fix_requested")|list|length) %}

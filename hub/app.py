@@ -1,4 +1,4 @@
-"""OpenClaw Hub — FastAPI application with REST API and web dashboard."""
+"""Haiplane Hub — FastAPI application with REST API and web dashboard."""
 
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from hub import config, models, services
+from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import fetchall, get_db
+from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
@@ -253,7 +254,7 @@ async def lifespan(app: FastAPI):
         await app.state.db.close()
 
 
-app = FastAPI(title="OpenClaw Hub", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)

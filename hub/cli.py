@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""oc-hub — CLI for agents on Pi to interact with OpenClaw Hub."""
+"""oc-hub — CLI for agents on Pi to interact with Haiplane Hub."""
 
 from __future__ import annotations
 

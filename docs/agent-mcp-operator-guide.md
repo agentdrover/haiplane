@@ -1,4 +1,4 @@
-# OpenClaw Hub — MCP operator guide
+# Haiplane Hub — MCP operator guide
 
 Единая инструкция для оператора и агента: как подключить Hub через MCP
 (streamable HTTP или stdio), проверить соединение и устранить типовые ошибки.

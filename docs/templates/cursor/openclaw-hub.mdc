@@ -1,11 +1,11 @@
 ---
-description: OpenClaw Hub lifecycle rules for Cursor agents
+description: Haiplane Hub lifecycle rules for Cursor agents
 alwaysApply: true
 ---
 
-# OpenClaw Hub Cursor Rules
+# Haiplane Hub Cursor Rules
 
-OpenClaw Hub is the source of truth for task state, questions, blockers,
+Haiplane Hub is the source of truth for task state, questions, blockers,
 decisions, and completion reports.
 
 - Before starting work on a task, call `hub_my_context(task_id)`.

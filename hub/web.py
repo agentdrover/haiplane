@@ -1,4 +1,4 @@
-"""Web UI routes (HTML / HTMX) for OpenClaw Hub dashboard."""
+"""Web UI routes (HTML / HTMX) for Haiplane Hub dashboard."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from hub import brand
 from hub import config
 from hub import db as db_module
 from hub import repository as repo
@@ -36,6 +37,7 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.services import project_policy
+from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
     FindingDispositionItem,
@@ -71,6 +73,9 @@ TEMPLATES = Jinja2Templates(
     directory=str(HERE / "templates"),
     context_processors=[_user_context],
 )
+TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
+TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
+TEMPLATES.env.globals["app_version"] = get_app_version()
 
 router = APIRouter()
 

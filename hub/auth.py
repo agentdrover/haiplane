@@ -1,4 +1,4 @@
-"""Multi-user authentication for OpenClaw Hub.
+"""Multi-user authentication for Haiplane Hub.
 
 Auth sources (checked in order):
 
@@ -317,7 +317,7 @@ def _unauthorized(request: Request) -> Response:
         status_code=status.HTTP_401_UNAUTHORIZED,
         content='{"detail":"authentication required"}',
         media_type="application/json",
-        headers={"WWW-Authenticate": 'Bearer realm="openclaw-hub"'},
+        headers={"WWW-Authenticate": 'Bearer realm="haiplane-hub"'},
     )
 
 

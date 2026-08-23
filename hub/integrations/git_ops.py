@@ -1620,7 +1620,7 @@ class GitOpsIntegration:
         body = (
             f"## Task #{task_id}\n\n"
             f"{description or 'No description'}\n\n"
-            "---\n*Created automatically by OpenClaw Hub*"
+            "---\n*Created automatically by Haiplane Hub*"
         )
 
         rc, out, err = await _gh(

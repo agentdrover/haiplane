@@ -1,6 +1,6 @@
 ---
 name: hub-testing
-description: Use when writing, fixing, or expanding tests for the standalone OpenClaw Hub project, especially for API routes, MCP tools, CLI behavior, lifecycle transitions, readiness checks, and database regressions.
+description: Use when writing, fixing, or expanding tests for the standalone Haiplane Hub project, especially for API routes, MCP tools, CLI behavior, lifecycle transitions, readiness checks, and database regressions.
 ---
 
 # Hub Testing

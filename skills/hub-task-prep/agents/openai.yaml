@@ -1,7 +1,7 @@
 interface:
   display_name: "Hub Task Prep"
-  short_description: "Prepare structured OpenClaw Hub tasks"
-  default_prompt: "Use $hub-task-prep to turn a request into a ready, structured OpenClaw Hub task."
+  short_description: "Prepare structured Haiplane Hub tasks"
+  default_prompt: "Use $hub-task-prep to turn a request into a ready, structured Haiplane Hub task."
 
 policy:
   allow_implicit_invocation: true

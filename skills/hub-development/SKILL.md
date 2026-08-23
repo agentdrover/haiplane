@@ -1,6 +1,6 @@
 ---
 name: hub-development
-description: Use when implementing or modifying code in the standalone OpenClaw Hub project, including FastAPI routes, services, CLI, MCP tools, database migrations, web UI, and integrations.
+description: Use when implementing or modifying code in the standalone Haiplane Hub project, including FastAPI routes, services, CLI, MCP tools, database migrations, web UI, and integrations.
 ---
 
 # Hub Development

@@ -5497,3 +5497,11 @@ async def test_dashboard_states_the_window_and_the_absence(client: AsyncClient):
 
     assert "выкатов не записано" in page.lower() or "неизвестно" in page
     assert "окно" in page
+
+
+async def test_login_page_uses_haiplane_brand(client: AsyncClient) -> None:
+    response = await client.get("/login")
+    assert response.status_code == 200
+    assert "Haiplane" in response.text
+    assert "OpenClaw" not in response.text
+    assert "&#x1f980;" not in response.text
