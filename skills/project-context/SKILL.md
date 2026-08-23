@@ -1,6 +1,6 @@
 ---
 name: project-context
-description: Use when onboarding to the standalone OpenClaw Hub project, analyzing impact before changes, or needing a fast map of architecture, invariants, contract boundaries, and test routing without rereading the whole codebase.
+description: Use when onboarding to the standalone Haiplane Hub project, analyzing impact before changes, or needing a fast map of architecture, invariants, contract boundaries, and test routing without rereading the whole codebase.
 ---
 
 # Project Context

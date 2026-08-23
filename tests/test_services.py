@@ -2455,7 +2455,7 @@ async def test_solo_self_approved_verdict_is_marked(db: aiosqlite.Connection, ca
         for u in view.updates or []
     )
     assert any(
-        "OPENCLAW_REVIEW_SELF_APPROVE=allow" in r.getMessage() for r in caplog.records
+        "HAIPLANE_REVIEW_SELF_APPROVE=allow" in r.getMessage() for r in caplog.records
     )
 
 

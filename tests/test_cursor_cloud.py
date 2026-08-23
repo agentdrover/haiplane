@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from hub import config
+from hub import brand, config
 from hub.integrations import cursor_cloud
 
 
@@ -105,6 +105,7 @@ async def test_review_agent_request_matches_spec(monkeypatch, _configured):
     assert body["autoCreatePR"] is False
     assert body["workOnCurrentBranch"] is False
     (mcp,) = body["mcpServers"]
+    assert mcp["name"] == brand.MCP_SERVER_NAME
     assert mcp["url"] == "https://agenthai.ru/mcp"
     assert mcp["headers"]["Authorization"] == "Bearer reviewer-token"
 

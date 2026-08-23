@@ -12,7 +12,7 @@ import aiosqlite
 import pytest
 from httpx import AsyncClient
 
-from hub import config
+from hub import brand, config
 from hub.services import admin as admin_svc
 
 TEST_PASSWORD = "s3cur3pw!"  # pragma: allowlist secret
@@ -87,6 +87,40 @@ async def test_logout_without_a_cookie_still_reaches_the_login_page(
     resp = await client.post("/logout", follow_redirects=False)
     assert resp.status_code == 303
     assert resp.headers["location"] == "/login"
+
+
+@pytest.mark.asyncio
+async def test_logout_deletes_both_session_cookie_names(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Haiplane rebrand (Wave 3): after logout the browser must hold neither
+    haiplane_hub_session nor a leftover openclaw_hub_session."""
+    _, token = await _user_with_session(db, "dave")
+    client.cookies.set(config.HUB_COOKIE_NAME, token)
+
+    resp = await client.post("/logout", follow_redirects=False)
+
+    assert resp.status_code == 303
+    deleted = resp.headers.get_list("set-cookie")
+    assert any(c.startswith(f"{brand.COOKIE_NAME}=") for c in deleted), deleted
+    assert any(c.startswith(f"{brand.COOKIE_NAME_LEGACY}=") for c in deleted), deleted
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_a_session_presented_under_the_legacy_name(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """A browser still carrying only openclaw_hub_session logs out for real:
+    the server-side session is revoked, not just the cookie dropped."""
+    _, token = await _user_with_session(db, "grace")
+    client.cookies.set(brand.COOKIE_NAME_LEGACY, token)
+
+    resp = await client.post("/logout", follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert await admin_svc.resolve_browser_session(db, token) is None, (
+        "a legacy-named session cookie must still be revoked on logout"
+    )
 
 
 @pytest.mark.asyncio

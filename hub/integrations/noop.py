@@ -352,6 +352,17 @@ class NoopGitOps:
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict] | None:
+        # None, not []: this plugin cannot look, and "looked and found no
+        # runs" is a different answer that would read as a green base (#929).
+        return None
+
     async def merge_pr(
         self,
         pr_number: int,

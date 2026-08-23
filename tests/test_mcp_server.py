@@ -3024,3 +3024,38 @@ async def test_tool_error_keeps_its_text_and_gains_structure(
         "текст и структура обязаны нести одно и то же: расхождение между ними "
         "хуже, чем отсутствие структуры"
     )
+
+
+# ---------------------------------------------------------------------------
+# Haiplane rebrand — public MCP face (Wave 1)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_server_name_is_haiplane_hub():
+    from hub import brand
+    from hub.mcp_server import mcp
+
+    assert mcp.name == brand.MCP_SERVER_NAME
+    assert mcp.name == "haiplane-hub"
+
+
+def test_mcp_instructions_use_haiplane_brand():
+    from hub.workflow_reference import build_mcp_instructions
+
+    instructions = build_mcp_instructions()
+    assert "Haiplane" in instructions
+    assert "OpenClaw Hub" not in instructions
+
+
+def test_mcp_initialize_server_name_is_haiplane_hub():
+    # initialize serverInfo.name and instructions come from these options.
+    # The wire-level initialize round-trip lives in test_mcp_transport.py:
+    # the streamable session manager is one-shot per process, so only one
+    # test may drive the real HTTP lifespan.
+    from hub.mcp_server import mcp
+
+    options = mcp._mcp_server.create_initialization_options()
+    assert options.server_name == "haiplane-hub"
+    instructions = options.instructions or ""
+    assert "Haiplane" in instructions
+    assert "OpenClaw Hub" not in instructions

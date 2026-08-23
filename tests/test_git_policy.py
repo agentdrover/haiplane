@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from hub import git_policy, repository as repo
+from hub import brand, git_policy, repository as repo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_HOOK = REPO_ROOT / ".githooks" / "pre-push"
@@ -485,6 +485,73 @@ def test_startup_actually_reaches_the_sweep():
         "start_poller must launch the sweep, or existing workspaces wait for "
         "a human to press Provision"
     )
+
+
+# ---- Haiplane rebrand (Wave 3): dual git-config key families --------------
+
+
+def test_record_branch_policy_writes_both_key_families(tmp_path: Path):
+    """The hub writes haiplane.* AND openclaw.*: a clone whose pre-push hook
+    is still the old file reads the legacy family, and writing only the new
+    one would silently disable branch policy there."""
+    target = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(target)], check=True, timeout=30)
+
+    written = git_policy.record_branch_policy(str(target), "develop", "main")
+
+    for key in (brand.GIT_BASE_BRANCH_KEY, brand.GIT_BASE_BRANCH_KEY_LEGACY):
+        assert _git(target, "config", "--get", key).stdout.strip() == "develop"
+        assert written[key] == "develop"
+    for key in (brand.GIT_RELEASE_BRANCH_KEY, brand.GIT_RELEASE_BRANCH_KEY_LEGACY):
+        assert _git(target, "config", "--get", key).stdout.strip() == "main"
+        assert written[key] == "main"
+
+
+def test_an_empty_new_key_does_not_hide_the_legacy_value(tmp_path: Path):
+    """git config --get succeeds on an empty key, so `new || old` would stop
+    at the empty new value. The reader must test for emptiness and fall back."""
+    target = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(target)], check=True, timeout=30)
+    _git(target, "config", brand.GIT_BASE_BRANCH_KEY, "")
+    _git(target, "config", brand.GIT_BASE_BRANCH_KEY_LEGACY, "master")
+
+    assert git_policy._recorded_base(str(target)) == "master"
+
+
+def test_the_hook_reads_the_new_key_family(clone: Path):
+    """A clone configured only with haiplane.baseBranch protects that branch."""
+    git_policy.activate(str(clone))
+    _git(clone, "config", brand.GIT_BASE_BRANCH_KEY, "integration")
+    _git(clone, "checkout", "-q", "-b", "integration")
+
+    pushed = _git(clone, "push", "origin", "integration")
+
+    assert pushed.returncode == 0, pushed.stderr
+
+
+def test_the_hook_still_reads_the_legacy_key_family(clone: Path):
+    """A clone recorded before the rename carries only openclaw.*; the hook
+    must keep honouring it."""
+    git_policy.activate(str(clone))
+    _git(clone, "config", brand.GIT_BASE_BRANCH_KEY_LEGACY, "integration")
+    _git(clone, "checkout", "-q", "-b", "integration")
+
+    pushed = _git(clone, "push", "origin", "integration")
+
+    assert pushed.returncode == 0, pushed.stderr
+
+
+def test_the_hook_ignores_an_empty_new_key_and_reads_legacy(clone: Path):
+    """The shell reader mirrors _recorded_base: an empty haiplane.baseBranch
+    must not shadow a real openclaw.baseBranch."""
+    git_policy.activate(str(clone))
+    _git(clone, "config", brand.GIT_BASE_BRANCH_KEY, "")
+    _git(clone, "config", brand.GIT_BASE_BRANCH_KEY_LEGACY, "integration")
+    _git(clone, "checkout", "-q", "-b", "integration")
+
+    pushed = _git(clone, "push", "origin", "integration")
+
+    assert pushed.returncode == 0, pushed.stderr
 
 
 def test_the_clone_path_arms_the_hook_itself():

@@ -1,4 +1,4 @@
-"""OpenClaw Hub — Data access layer (repository).
+"""Haiplane Hub — Data access layer (repository).
 
 All SQL queries live here. Functions take ``aiosqlite.Connection`` as the
 first argument and return raw rows (``aiosqlite.Row``) or primitives.
@@ -1648,7 +1648,8 @@ async def record_review_verdict(
     the stored findings wholesale: findings belong to their verdict, so a
     verdict without findings clears the previous list (#308).
     ``self_approved`` marks verdicts accepted only via the
-    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
+    ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434; the legacy
+    ``OPENCLAW_REVIEW_SELF_APPROVE`` name is also accepted); it belongs
     to the verdict, so every new verdict overwrites the flag.
     """
     await db.execute(
@@ -1834,6 +1835,23 @@ async def get_review_dispatch_for_generation(
         )
     )
     return rows[0] if rows else None
+
+
+async def count_review_dispatches(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """How many cloud runs this submission has already bought (#879).
+
+    Counted from the rows, not from a flag: the ladder's ceiling has to be the
+    same fact the bill is, and a flag would drift from it.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=?",
+        (task_id, generation),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
 
 
 async def set_review_dispatch_status(

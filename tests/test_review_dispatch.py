@@ -1028,3 +1028,123 @@ async def test_oversized_file_is_named_not_left_to_eat_budget(
         "the small file is not the one that did not fit"
     )
     assert "git diff" in prompt, "the rest of the subject is still under review"
+
+
+# --- The ladder: buy deep when cheap said it did not finish (#879) ----------
+#
+# The trigger is the reviewer's own declaration of what it did not read. #893
+# removed the budget guard because a run that burned 1.5M while reporting 36k
+# sailed through as complete; the declaration, unlike the number, is checkable
+# against the diff.
+
+
+async def _machine_report(
+    client: AsyncClient,
+    task_id: int,
+    *,
+    incomplete: bool,
+    confirmed: list | None = None,
+) -> None:
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "tokens_spent": 12000,
+            "model": "grok-4.6",
+            "raw_count": 1,
+            "findings_confirmed": confirmed or [],
+            "findings_rejected": [],
+            "incomplete": incomplete,
+            "unresolved": [],
+            "lost_dimensions": ["hub/services/big.py"] if incomplete else [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_incomplete_lite_report_buys_a_deep_top_up(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#879): a cheap run that says it did not finish is topped up in the
+    # SAME generation, and the human is not handed the unfinished work.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-topup")
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
+
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 2, "the incomplete run bought a second one"
+    row = await _dispatch_row(db, task_id)
+    assert row["profile"] == "deep"
+    task = dict(await repo.get_task(db, task_id))
+    assert row["submission_generation"] == task["submission_generation"], (
+        "the top-up belongs to the submission it tops up"
+    )
+    assert task["status"] == "review", "still under review, not handed over"
+    assert "multi-agent-review" in recorder.calls[1]["prompt_text"]
+
+
+async def test_complete_lite_report_buys_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # The ladder must not fire on a run that finished. Otherwise "lite by
+    # default" becomes "always both", which costs more than always-deep did.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-2"}, "run": {"id": "r-2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-complete")
+
+    await _machine_report(client, task_id, incomplete=False)
+
+    assert len(recorder.calls) == 1, "a finished run buys no top-up"
+
+
+async def test_escalation_ladder_has_a_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#879): a second incomplete report does NOT buy a third run. The
+    # human gets a named cause instead of silence — a reviewer that keeps
+    # declaring itself unfinished is a problem to look at, not to fund.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-3"}, "run": {"id": "r-3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-ceiling")
+
+    await _machine_report(client, task_id, incomplete=True)
+    assert len(recorder.calls) == 2
+    # The top-up itself comes back unfinished.
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 2, "the ceiling holds at two runs"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alerts = [u for u in updates if u["kind"] == "alert" and "потолок" in u["content"]]
+    assert alerts, "the ceiling is announced, not silent"
+    assert "решение за человеком" in alerts[-1]["content"].lower()
+
+
+async def test_top_up_never_fires_on_an_unknown_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # "We do not know how this was reviewed" is not "it was reviewed cheaply"
+    # (#807). Topping up an unknown profile would buy a run on a guess.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-4"}, "run": {"id": "r-4"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-unknown-profile")
+    await db.execute(
+        "UPDATE review_dispatches SET profile = '' WHERE task_id = ?", (task_id,)
+    )
+    await db.commit()
+
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 1, "an unknown profile buys nothing"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alerts = [
+        u
+        for u in updates
+        if u["kind"] == "alert" and "добор не положен" in u["content"]
+    ]
+    assert alerts and "не заявлен" in alerts[-1]["content"], (
+        "the refusal names its cause instead of passing in silence"
+    )

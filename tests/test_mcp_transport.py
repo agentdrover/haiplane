@@ -81,6 +81,11 @@ async def test_mcp_endpoint_requires_bearer_at_public_path(client, monkeypatch):
         )
     assert authenticated.status_code == 200
     assert "serverInfo" in authenticated.text
+    # Haiplane rebrand (Wave 1): the wire-level initialize answer carries the
+    # new server name and instructions with the new product name.
+    assert "haiplane-hub" in authenticated.text
+    assert "Haiplane" in authenticated.text
+    assert "OpenClaw Hub" not in authenticated.text
 
 
 def test_server_builds():

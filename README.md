@@ -1,4 +1,9 @@
-# OpenClaw Hub
+# Haiplane Hub
+
+Formerly OpenClaw Hub.
+
+The public home is moving to https://github.com/agentdrover/haiplane. Until
+the remotes move, the live clone stays `mrPDA/openclaw-hub-standalone`.
 
 Task orchestration server for AI agent pipelines. Manages task lifecycle, dispatches work to agents, runs automated code review cycles, and provides a web dashboard.
 
@@ -37,7 +42,7 @@ openclaw-hub
 
 ## Cursor + Hub Workflow
 
-Run the hub, connect Cursor to its MCP endpoint, and treat OpenClaw Hub as the
+Run the hub, connect Cursor to its MCP endpoint, and treat Haiplane Hub as the
 task state source. Step-by-step MCP setup (streamable URL, headers, stdio vs
 HTTP, troubleshooting) is in
 [docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).

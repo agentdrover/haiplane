@@ -1,10 +1,9 @@
-"""OpenClaw Hub — FastAPI application with REST API and web dashboard."""
+"""Haiplane Hub — FastAPI application with REST API and web dashboard."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -24,10 +23,11 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from hub import config, models, services
+from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import fetchall, get_db
+from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
@@ -222,13 +222,14 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 log.info(
-                    "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
+                    "Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS "
+                    "(or legacy OPENCLAW_HUB_TOKENS) to enable)"
                 )
 
             # Workspace git health-check (#455): opt-in network probe so a
             # broken deploy key on the default workspace is loud, not silent.
             # Off by default to keep startup (and tests) free of network I/O.
-            if os.environ.get("OPENCLAW_WORKSPACE_HEALTHCHECK") == "1":
+            if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
                 from hub.services.diagnostics import check_default_workspace_origin
 
                 try:
@@ -242,7 +243,8 @@ async def lifespan(app: FastAPI):
 
                 if await has_active_admin(app.state.db):
                     log.warning(
-                        "SECURITY: OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                        "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN (or legacy "
+                        "OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN) is still set "
                         "but an admin already exists. Remove it from the environment "
                         "to prevent unauthorized bootstrap attempts."
                     )
@@ -253,7 +255,7 @@ async def lifespan(app: FastAPI):
         await app.state.db.close()
 
 
-app = FastAPI(title="OpenClaw Hub", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
@@ -1546,6 +1548,19 @@ async def api_submit_machine_review(
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("auto-verdict failed for task #%s", task_id)
 
+    # The ladder (#879): a cheap run that declared it did not finish buys the
+    # heavy profile instead of handing a human unfinished work. After the
+    # auto-verdict, not before — an incomplete report can never earn one
+    # (auto_verdict refuses on `incomplete`), so the order costs nothing and
+    # keeps the clean path first. Best-effort like the verdict above: the
+    # report intake must not fail because the ladder stumbled.
+    try:
+        from hub.services.review_dispatch import maybe_top_up_incomplete
+
+        await maybe_top_up_incomplete(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("review top-up failed for task #%s", task_id)
+
     return view
 
 
@@ -2768,7 +2783,9 @@ async def api_admin_bootstrap(request: Request):
 
     if not _is_open_mode() and not _check_bootstrap_token(request):
         raise HTTPException(
-            403, "bootstrap requires OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN or open mode"
+            403,
+            "bootstrap requires HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN "
+            "(or legacy OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN) or open mode",
         )
     body = AdminBootstrap(**(await request.json()))
     try:

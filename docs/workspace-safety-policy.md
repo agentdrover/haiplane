@@ -1,6 +1,6 @@
 # Workspace Safety Policy
 
-Эта политика фиксирует инварианты, при которых несколько людей и AI-агентов могут безопасно работать в одном workspace repo через OpenClaw Hub. Цель — исключить тихое перетирание чужой работы, размывание scope и ложное завершение задач при конфликтах в git/CI.
+Эта политика фиксирует инварианты, при которых несколько людей и AI-агентов могут безопасно работать в одном workspace repo через Haiplane Hub. Цель — исключить тихое перетирание чужой работы, размывание scope и ложное завершение задач при конфликтах в git/CI.
 
 Связанные документы:
 - [software-development-workflow.md](software-development-workflow.md) — общий жизненный цикл задачи и [Pair mode: git policy](software-development-workflow.md#pair-mode-git-policy).

@@ -47,3 +47,10 @@ def test_instance_from_openclaw_hub_url(monkeypatch: pytest.MonkeyPatch) -> None
     fields = instance_echo_fields()
     assert fields["instance"] == "prod"
     assert fields["base_url"] == "https://agenthai.ru/mcp"
+
+
+def test_instance_from_haiplane_hub_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENCLAW_HUB_URL", raising=False)
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://haiplane.com/mcp")
+    fields = instance_echo_fields()
+    assert fields["base_url"] == "https://haiplane.com/mcp"
