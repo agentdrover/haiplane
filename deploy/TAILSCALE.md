@@ -63,11 +63,15 @@ Pick a random token per developer (`openssl rand -hex 24`), build the env:
 cat > ~/.openclaw-hub.env <<'EOF'
 OPENCLAW_HUB_TOKENS=denis:dXX...,alice:aYY...,bob:bZZ...
 OPENCLAW_HUB_ALLOWED_HOSTS=openclaw-hub:8080,openclaw-hub.tailXXXX.ts.net
-OPENCLAW_HUB_DB_PATH=/home/openclaw/hub.db
+OPENCLAW_HUB_DB=/home/openclaw/hub.db
 OPENCLAW_HUB_PORT=8080
 EOF
 chmod 600 ~/.openclaw-hub.env
 ```
+
+Every `OPENCLAW_*` key above is also accepted under the canonical
+`HAIPLANE_*` prefix (e.g. `HAIPLANE_HUB_DB`); the hub reads the new name
+first and falls back to the legacy one.
 
 Tokens are environment-driven on purpose for the MVP — to add or revoke a
 user, edit the file and restart the service. A future task will move this

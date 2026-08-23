@@ -1,4 +1,8 @@
+import os
+import subprocess
+import sys
 from importlib.metadata import PackageNotFoundError
+from pathlib import Path
 
 from hub import brand
 from hub import version as hub_version
@@ -95,3 +99,88 @@ def test_get_app_version_defaults_when_neither_installed(monkeypatch) -> None:
 
     monkeypatch.setattr(hub_version, "version", fake_version)
     assert hub_version.get_app_version() == "0.1.0"
+
+
+# ---------------------------------------------------------------------------
+# Import-time env precedence (Task 4). ``hub.config`` and ``hub.cli`` bind
+# URL/token/path at import, so monkeypatching the environment after import
+# proves nothing — these tests spawn a fresh interpreter with a controlled
+# environment instead.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _clean_env(extra: dict[str, str]) -> dict[str, str]:
+    """Process env with every HAIPLANE_/OPENCLAW_ variable removed, plus extra."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("HAIPLANE_", "OPENCLAW_"))
+    }
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    env.update(extra)
+    return env
+
+
+def _module_attr(module: str, attr: str, env: dict[str, str]) -> str:
+    proc = subprocess.run(
+        [sys.executable, "-c", f"from {module} import {attr}; print({attr})"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(env),
+        cwd=str(_REPO_ROOT),
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def test_config_db_default_stays_openclaw_family() -> None:
+    path = _module_attr("hub.config", "HUB_DB_PATH", {})
+    assert "openclaw-hub" in path
+    assert "haiplane-hub" not in path
+
+
+def test_cli_prefers_haiplane_url() -> None:
+    url = _module_attr(
+        "hub.cli",
+        "HUB_URL",
+        {
+            "HAIPLANE_HUB_URL": "https://haiplane.com",
+            "OPENCLAW_HUB_URL": "https://agenthai.ru",
+        },
+    )
+    assert url.strip() == "https://haiplane.com"
+
+
+def test_legacy_only_tokens_authenticate(tmp_path: Path) -> None:
+    """A process configured only with OPENCLAW_HUB_TOKENS still authenticates.
+
+    Both assertions matter: 401 without a token proves the legacy tokens were
+    actually loaded (open mode would answer 200 to anyone and mask a broken
+    fallback), 200 with the token proves the legacy value authenticates.
+    """
+    code = (
+        "from fastapi.testclient import TestClient\n"
+        "from hub.app import app\n"
+        "with TestClient(app) as client:\n"
+        "    anon = client.get('/api/tasks')\n"
+        "    authed = client.get(\n"
+        "        '/api/tasks', headers={'Authorization': 'Bearer tok-legacy'}\n"
+        "    )\n"
+        "print(anon.status_code, authed.status_code)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=_clean_env(
+            {
+                "OPENCLAW_HUB_TOKENS": "legacy:tok-legacy:human",
+                "OPENCLAW_HUB_DB": str(tmp_path / "hub.db"),
+            }
+        ),
+        cwd=str(_REPO_ROOT),
+        check=True,
+    )
+    assert proc.stdout.strip() == "401 200", proc.stdout + proc.stderr

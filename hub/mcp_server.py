@@ -101,15 +101,15 @@ mcp = InstrumentedFastMCP(
 
 
 def _hub_url() -> str:
-    import os
+    from hub.config import env_get
 
-    return os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    return env_get("HUB_URL", "http://127.0.0.1:8080")
 
 
 def _hub_token() -> str:
-    import os
+    from hub.config import env_get
 
-    env_tok = (os.environ.get("OPENCLAW_HUB_TOKEN") or "").strip()
+    env_tok = (env_get("HUB_TOKEN", "") or "").strip()
     if env_tok:
         return env_tok
     # Streamable MCP mounted in the same process: reuse caller's Bearer (set by

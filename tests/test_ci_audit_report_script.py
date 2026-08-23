@@ -38,6 +38,40 @@ def script():
     return _load()
 
 
+@pytest.fixture(autouse=True)
+def _clean_prefixed_env(monkeypatch):
+    """Neither prefix may leak in from the developer's shell (Task 4)."""
+    for suffix in ("HUB_URL", "HUB_CI_TOKEN"):
+        monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
+        monkeypatch.delenv(f"OPENCLAW_{suffix}", raising=False)
+
+
+def test_hub_credentials_accepted_under_the_haiplane_prefix(
+    script, monkeypatch, tmp_path
+):
+    """The filer reads HAIPLANE_* first, with OPENCLAW_* as legacy fallback."""
+    report = tmp_path / "audit.json"
+    report.write_text(
+        json.dumps(
+            _report({"id": "PYSEC-9", "fix_versions": ["1.0"], "description": "d"})
+        )
+    )
+    monkeypatch.setenv("AUDIT_JSON", str(report))
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "new-prefix-token")  # noqa: S105
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        script,
+        "hub_post",
+        lambda base, token, path, payload: (
+            seen.append((base, token)) or {"id": 1, "status": "draft"}
+        ),
+    )
+    assert script.main() == 0
+    assert seen == [("https://hub.example", "new-prefix-token")]
+
+
 def _report(*vulns: dict) -> dict:
     return {
         "dependencies": [

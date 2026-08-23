@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -223,13 +222,14 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 log.info(
-                    "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
+                    "Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS "
+                    "(or legacy OPENCLAW_HUB_TOKENS) to enable)"
                 )
 
             # Workspace git health-check (#455): opt-in network probe so a
             # broken deploy key on the default workspace is loud, not silent.
             # Off by default to keep startup (and tests) free of network I/O.
-            if os.environ.get("OPENCLAW_WORKSPACE_HEALTHCHECK") == "1":
+            if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
                 from hub.services.diagnostics import check_default_workspace_origin
 
                 try:
@@ -243,7 +243,8 @@ async def lifespan(app: FastAPI):
 
                 if await has_active_admin(app.state.db):
                     log.warning(
-                        "SECURITY: OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                        "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN (or legacy "
+                        "OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN) is still set "
                         "but an admin already exists. Remove it from the environment "
                         "to prevent unauthorized bootstrap attempts."
                     )
@@ -2782,7 +2783,9 @@ async def api_admin_bootstrap(request: Request):
 
     if not _is_open_mode() and not _check_bootstrap_token(request):
         raise HTTPException(
-            403, "bootstrap requires OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN or open mode"
+            403,
+            "bootstrap requires HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN "
+            "(or legacy OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN) or open mode",
         )
     body = AdminBootstrap(**(await request.json()))
     try:

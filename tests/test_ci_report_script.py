@@ -30,6 +30,52 @@ def script():
     return _load()
 
 
+@pytest.fixture(autouse=True)
+def _clean_prefixed_env(monkeypatch):
+    """Neither prefix may leak in from the developer's shell (Task 4)."""
+    for suffix in ("HUB_URL", "HUB_CI_TOKEN", "HUB_CI_PYTEST", "HUB_CI_CHECKS"):
+        monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
+        monkeypatch.delenv(f"OPENCLAW_{suffix}", raising=False)
+
+
+def test_env_get_prefers_haiplane_and_falls_back(script, monkeypatch):
+    """The reporter reads HAIPLANE_* first and keeps OPENCLAW_* as fallback."""
+    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "old runner")
+    assert script.env_get("HUB_CI_PYTEST") == "old runner"
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "new runner")
+    assert script.env_get("HUB_CI_PYTEST") == "new runner"
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "")
+    assert script.env_get("HUB_CI_PYTEST") == "old runner", (
+        "an empty canonical value counts as unset, not as an override"
+    )
+
+
+def test_hub_credentials_accepted_under_the_haiplane_prefix(script, monkeypatch):
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "new-prefix-token")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+
+    seen: dict[str, str] = {}
+
+    def fake_request(url, token, payload=None):
+        seen.setdefault("token", token)
+        if payload is None:
+            return {"acceptance_criteria": [], "validation_commands": []}
+        seen["payload_url"] = url
+        return {"applied": True, "reason": "ok"}
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    assert script.main() == 0
+    assert seen["token"] == "new-prefix-token"  # noqa: S105
+    assert seen["payload_url"].startswith("https://hub.example/")
+
+
+def test_ac_runner_reads_the_haiplane_prefix(script, monkeypatch):
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
+    assert script.ac_runner() == ["python3", "-m", "pytest"]
+
+
 def test_prose_among_validation_commands_reports_unknown_not_failure(script):
     # #546's own validation_commands end with a Russian sentence describing a
     # manual check on a live PR. Executed in a shell that is a non-zero exit —

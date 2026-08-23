@@ -69,6 +69,9 @@ jobs:
         continue-on-error: true
         uses: mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main
         with:
+          # HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN secrets will be picked up
+          # here after Wave 4-code switches these lines to fallback
+          # expressions; until then the legacy secret names below stay.
           hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
           hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}

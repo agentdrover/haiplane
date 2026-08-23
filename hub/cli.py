@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.parse
@@ -15,8 +14,8 @@ from typing import Any
 
 from hub import config
 
-HUB_URL = os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
-HUB_TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN", "")
+HUB_URL = config.env_get("HUB_URL", "http://127.0.0.1:8080") or "http://127.0.0.1:8080"
+HUB_TOKEN = config.env_get("HUB_TOKEN", "") or ""
 
 
 def _validated_hub_base_url() -> str:
@@ -24,7 +23,8 @@ def _validated_hub_base_url() -> str:
     parsed = urllib.parse.urlsplit(HUB_URL)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         print(
-            "OPENCLAW_HUB_URL must use http/https and include host:port.",
+            "HAIPLANE_HUB_URL (or legacy OPENCLAW_HUB_URL) must use "
+            "http/https and include host:port.",
             file=sys.stderr,
         )
         sys.exit(2)

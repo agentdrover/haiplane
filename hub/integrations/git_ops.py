@@ -244,8 +244,8 @@ async def _default_workspace_error() -> str | None:
         return None
     return (
         f"default workspace is not a git repository ({root}); "
-        "set OPENCLAW_WORKSPACE_REPO to a git clone or use a project "
-        "with workspace_path"
+        "set HAIPLANE_WORKSPACE_REPO (or legacy OPENCLAW_WORKSPACE_REPO) "
+        "to a git clone or use a project with workspace_path"
     )
 
 
