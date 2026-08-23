@@ -1,4 +1,4 @@
-"""OpenClaw Hub — Data access layer (repository).
+"""Haiplane Hub — Data access layer (repository).
 
 All SQL queries live here. Functions take ``aiosqlite.Connection`` as the
 first argument and return raw rows (``aiosqlite.Row``) or primitives.

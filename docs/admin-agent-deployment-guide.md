@@ -186,7 +186,7 @@ sudo chmod 0600 /etc/openclaw-hub/secrets.env
 
 ```ini
 [Unit]
-Description=OpenClaw Hub
+Description=Haiplane Hub
 After=network-online.target
 Wants=network-online.target
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenClaw Hub (FastAPI dashboard + API)
+Description=Haiplane Hub (FastAPI dashboard + API)
 After=network-online.target
 Wants=network-online.target
 

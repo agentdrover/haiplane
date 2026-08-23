@@ -1,6 +1,6 @@
 # Multi-user Hub on a fresh VM via Tailscale
 
-Operations guide for running OpenClaw Hub for a small team. The combination is:
+Operations guide for running Haiplane Hub (formerly OpenClaw Hub) for a small team. The combination is:
 
 1. **Tailscale** for the network — every developer's machine and the VM join the same private tailnet, no public ports, no certificates.
 2. **Bearer-token auth** built into the Hub (`OPENCLAW_HUB_TOKENS`) — every request is attributed to a real user.
@@ -85,7 +85,7 @@ developers will use for the Hub, with ports when they must match exactly.
 ```ini
 # /etc/systemd/system/openclaw-hub.service
 [Unit]
-Description=OpenClaw Hub
+Description=Haiplane Hub
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
