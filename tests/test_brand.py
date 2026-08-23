@@ -1,4 +1,7 @@
+from importlib.metadata import PackageNotFoundError
+
 from hub import brand
+from hub import version as hub_version
 from hub.config import env_get
 
 
@@ -64,3 +67,31 @@ def test_require_github_owner_raises_while_empty(monkeypatch) -> None:
     except ValueError:
         return
     raise AssertionError("require_github_owner must refuse an empty owner")
+
+
+def test_get_app_version_prefers_new_distribution(monkeypatch) -> None:
+    def fake_version(name: str) -> str:
+        if name == brand.PACKAGE_NAME:
+            return "9.9.9"
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(hub_version, "version", fake_version)
+    assert hub_version.get_app_version() == "9.9.9"
+
+
+def test_get_app_version_falls_back_to_legacy_distribution(monkeypatch) -> None:
+    def fake_version(name: str) -> str:
+        if name == brand.PACKAGE_NAME_LEGACY:
+            return "8.8.8"
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(hub_version, "version", fake_version)
+    assert hub_version.get_app_version() == "8.8.8"
+
+
+def test_get_app_version_defaults_when_neither_installed(monkeypatch) -> None:
+    def fake_version(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(hub_version, "version", fake_version)
+    assert hub_version.get_app_version() == "0.1.0"

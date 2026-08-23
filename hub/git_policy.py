@@ -395,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="oc-git-policy",
+        prog="hp-git-policy",
         description="Check or activate the pre-push hook that enforces branch policy.",
     )
     parser.add_argument("command", choices=["doctor", "activate"])

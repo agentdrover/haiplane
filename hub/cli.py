@@ -1172,7 +1172,7 @@ def cmd_readiness_tree(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="oc-hub", description="CLI for OpenClaw Hub")
+    parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # task — create a task (open by default, or running with --run)
