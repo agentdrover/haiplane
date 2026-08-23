@@ -75,7 +75,7 @@ stateDiagram-v2
 | Инстанс | URL | Назначение |
 |---|---|---|
 | **Локальный** | `http://127.0.0.1:8080` | разработка, своя `hub.db` |
-| **Production** | `http://agenthai.ru:8080` (IP `194.113.34.33`) | боевой сервер |
+| **Production** | `http://agenthai.ru:8080` | боевой сервер |
 
 Ключевые факты:
 
@@ -86,12 +86,11 @@ stateDiagram-v2
 - Порт `8080` снаружи закрыт. К production MCP подключайся через SSH-туннель:
 
   ```bash
-  ssh -L 8080:127.0.0.1:8080 user1@194.113.34.33
+  ssh -L 8080:127.0.0.1:8080 <DEPLOY_USER>@<DEPLOY_HOST>
   # затем MCP URL: http://127.0.0.1:8080/mcp
   ```
 
-- Токен для Cursor лежит на сервере: `~/openclaw-hub-cursor-token.txt`
-  (только наличие проверяй, **в чат токены не печатай**).
+- Токен для Cursor хранится у оператора вне репозитория и вне домашних каталогов сервера
 - Каждый ответ MCP-инструмента содержит поля **`instance`** (`prod`|`local`) и
   **`base_url`** (значение `OPENCLAW_HUB_URL` на сервере). Для JSON-ответов парси
   `json.loads(result)`; для mutation-envelope поля рядом с `status`/`awaiting`.

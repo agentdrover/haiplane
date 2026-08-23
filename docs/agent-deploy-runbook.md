@@ -15,8 +15,7 @@
 Текущий production-like сервер:
 
 - HTTP UI: `http://agenthai.ru:8080/`
-- IP: `194.113.34.33`
-- SSH user: `user1`
+- SSH-доступ: значения `DEPLOY_HOST` / `DEPLOY_USER` — в секретах CI и у оператора; в репозитории они не публикуются
 - systemd service: `openclaw-hub`
 - runtime user на сервере: `openclaw`
 - исходники сервиса: `/opt/openclaw-hub/src`
@@ -36,17 +35,13 @@
 Разрешено проверять только наличие доступа и наличие файлов:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=15 user1@194.113.34.33 'echo ssh_ok'
-ssh user1@194.113.34.33 'test -f ~/openclaw-hub-credentials.txt && echo credentials_file_present'
-ssh user1@194.113.34.33 'test -f ~/openclaw-hub-ip-access.txt && echo ip_access_file_present'
+ssh -o BatchMode=yes -o ConnectTimeout=15 <DEPLOY_USER>@<DEPLOY_HOST> 'echo ssh_ok'
 ```
 
 Не делайте так без явного запроса пользователя:
 
 ```bash
 # НЕ выполнять по умолчанию: выведет секреты в лог/чат
-ssh user1@194.113.34.33 'cat ~/openclaw-hub-credentials.txt'
-ssh user1@194.113.34.33 'cat ~/openclaw-hub-ip-access.txt'
 sudo cat /etc/openclaw-hub/secrets.env
 ```
 
@@ -54,7 +49,7 @@ sudo cat /etc/openclaw-hub/secrets.env
 значений:
 
 ```bash
-ssh user1@194.113.34.33 '
+ssh <DEPLOY_USER>@<DEPLOY_HOST> '
   sudo test -s /etc/openclaw-hub/openclaw-hub.env && echo openclaw_env_present
   sudo test -s /etc/openclaw-hub/secrets.env && echo secrets_env_present || true
   sudo grep -q "^OPENCLAW_HUB_TOKENS=" /etc/openclaw-hub/openclaw-hub.env \
@@ -81,7 +76,7 @@ ssh user1@194.113.34.33 '
 Команда проверки сервера:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=15 user1@194.113.34.33 '
+ssh -o BatchMode=yes -o ConnectTimeout=15 <DEPLOY_USER>@<DEPLOY_HOST> '
   echo ssh_ok
   sudo test -d /opt/openclaw-hub/src && echo src_ok
   sudo test -f /etc/openclaw-hub/openclaw-hub.env && echo env_ok
@@ -109,7 +104,7 @@ uv run ruff check hub tests
 в `/opt/openclaw-hub/src`. Это текущий рабочий процесс для этого сервера. Та же
 логика серверной части версионируется в `deploy/remote-deploy.sh` и используется
 авто-деплоем; при желании после `rsync` в staging можно запустить именно её:
-`ssh user1@194.113.34.33 'bash -s' < deploy/remote-deploy.sh`.
+`ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' < deploy/remote-deploy.sh`.
 
 > **Правка `deploy/remote-deploy.sh` требует ручного шага на сервере.** SSH-ключ
 > CI (`openclaw-hub-ci-deploy`) с 14.08.2026 ограничен форсированной командой
@@ -124,8 +119,8 @@ uv run ruff check hub tests
 > пока копию на сервере не обновит человек:
 >
 > ```bash
-> ssh user1@194.113.34.33 'sudo tee /usr/local/sbin/openclaw-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh
-> ssh user1@194.113.34.33 'sudo chmod 0755 /usr/local/sbin/openclaw-remote-deploy.sh'
+> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/openclaw-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh
+> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/openclaw-remote-deploy.sh'
 > ```
 >
 > Падение будет громким, а не тихим: job упадёт красным, а в логе будут оба
@@ -144,10 +139,10 @@ rsync -az --delete \
   --exclude '.pytest_cache' \
   --exclude '*.pyc' \
   --exclude '.git' \
-  /Users/denispukinov/openclaw-hub-standalone/ \
-  user1@194.113.34.33:~/openclaw-hub-src-staging/
+  /Users/<user>/openclaw-hub-standalone/ \
+  <DEPLOY_USER>@<DEPLOY_HOST>:~/openclaw-hub-src-staging/
 
-ssh user1@194.113.34.33 'bash -s' <<'REMOTE'
+ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' <<'REMOTE'
 set -euo pipefail
 STAGING="$HOME/openclaw-hub-src-staging"
 DEST=/opt/openclaw-hub/src
@@ -172,7 +167,7 @@ REMOTE
 Минимальная проверка:
 
 ```bash
-ssh user1@194.113.34.33 '
+ssh <DEPLOY_USER>@<DEPLOY_HOST> '
   echo "service=$(systemctl is-active openclaw-hub)"
   curl -sf http://127.0.0.1:8080/healthz
 '
@@ -181,7 +176,7 @@ ssh user1@194.113.34.33 '
 Если сервис не стартует:
 
 ```bash
-ssh user1@194.113.34.33 '
+ssh <DEPLOY_USER>@<DEPLOY_HOST> '
   sudo journalctl -u openclaw-hub -n 80 --no-pager
   echo "--- service.err ---"
   sudo tail -80 /var/log/openclaw-hub/service.err 2>/dev/null || true
@@ -203,8 +198,6 @@ ssh user1@194.113.34.33 '
 /var/lib/openclaw-hub/hub.db           SQLite база
 /var/log/openclaw-hub/service.log      stdout сервиса
 /var/log/openclaw-hub/service.err      stderr сервиса
-/home/user1/openclaw-hub-credentials.txt  админские доступы, не читать без запроса
-/home/user1/openclaw-hub-ip-access.txt    API/MCP токен и заметки по IP-доступу, не читать без запроса
 ```
 
 ## 7. Когда использовать полный deployment guide
