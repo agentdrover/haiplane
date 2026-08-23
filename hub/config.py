@@ -2,6 +2,26 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import overload
+
+from hub import brand
+
+
+@overload
+def env_get(suffix: str) -> str | None: ...
+@overload
+def env_get(suffix: str, default: str) -> str: ...
+
+
+def env_get(suffix: str, default: str | None = None) -> str | None:
+    new = os.environ.get(brand.ENV_PREFIX + suffix)
+    if new:
+        return new
+    old = os.environ.get(brand.ENV_PREFIX_LEGACY + suffix)
+    if old:
+        return old
+    return default
+
 
 HOME = Path(os.environ.get("OPENCLAW_HUB_HOME", Path.home()))
 
