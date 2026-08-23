@@ -76,7 +76,7 @@ This plan does not publish to PyPI; the reservation only protects the name.
 2. Import this repository into `agentdrover/haiplane`, or create it empty (no README) and push existing history. Default branch `main`. Add `develop`. No `filter-repo`. No `gh repo rename` on `mrPDA`.
 3. Push the existing history as-is: `main`, `develop`, and any live task branches still needed. No `filter-repo`. No force-push of rewritten history.
 4. Recreate on the **new** repo, do not assume transfer copied them:
-   - Actions secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, **both** `HAIPLANE_HUB_URL` / `HAIPLANE_HUB_CI_TOKEN` **and** the existing `OPENCLAW_*` names
+   - Actions secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, **both** `HAIPLANE_HUB_URL` / `HAIPLANE_HUB_CI_TOKEN` **and** the existing `OPENCLAW_*` names <!-- pragma: allowlist secret -->
    - Environment `production` (required reviewers / wait timer if used today)
    - Branch protection for `main` and `develop`
    - Deploy key / machine user for the server clone (today `openclaw@agenthai` talks to `mrPDA/openclaw-hub-standalone`)
