@@ -3520,6 +3520,9 @@ async def hub_refine_task(
     review_checklist: list[str] | None = None,
     human_owner: str | None = None,
     human_reviewer: str | None = None,
+    found_in: str | None = None,
+    caused_by_task_id: int | None = None,
+    detected_at: str | None = None,
     acceptance_criteria: list[dict[str, Any]] | None = None,
     risks: list[dict[str, Any]] | None = None,
 ) -> HubRefineTaskResult:
@@ -3555,6 +3558,10 @@ async def hub_refine_task(
             old process gets automated onto new technology.
         agent_fit: deterministic | assistant | sdd_native | agentic — how
             much agency the work wants.
+        found_in: Defect stage: unknown | review | ci | test | staging | prod.
+        caused_by_task_id: Task whose change introduced the defect; refused if
+            it does not resolve or is the defect itself.
+        detected_at: When the defect was noticed.
         technical_hints: Hints, references, suggested approach.
         scope_in: In-scope items (REPLACES the list).
         scope_out: Out-of-scope items (REPLACES the list).
@@ -3598,6 +3605,9 @@ async def hub_refine_task(
         ("redesign_decision", redesign_decision),
         ("redesign_rationale", redesign_rationale),
         ("agent_fit", agent_fit),
+        ("found_in", found_in),
+        ("caused_by_task_id", caused_by_task_id),
+        ("detected_at", detected_at),
     ):
         if val is not None:
             body[key] = val

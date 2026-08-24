@@ -1237,6 +1237,53 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_ci_run_reports_checks",
         "ALTER TABLE ci_run_reports ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'",
     ),
+    (
+        # Defect passport (#909, epic #900): the stage a defect was caught at.
+        #
+        # Until now the answer was reconstructed — ``escaped_defects`` infers a
+        # leak from the ``completed_at`` of the nearest feature ancestor and says
+        # in its own docstring that the result is mostly a measurement of which
+        # fields got filled in. A reconstruction cannot be contradicted; a
+        # recorded fact can.
+        #
+        # The default is 'unknown' and it is a real answer, not a placeholder to
+        # be cleaned up later: the 69 bugs already on production were caught
+        # somewhere nobody wrote down, and back-filling them from dates would
+        # manufacture exactly the kind of number this column exists to replace.
+        "add_found_in_column",
+        "ALTER TABLE tasks ADD COLUMN found_in TEXT NOT NULL DEFAULT 'unknown'",
+    ),
+    (
+        # The change this defect came from (#909). Nullable on purpose: an
+        # unattributed defect is the normal state until somebody confirms the
+        # link, and an empty column says that out loud. A guess written here
+        # would read as a finding.
+        "add_caused_by_task_id_column",
+        "ALTER TABLE tasks ADD COLUMN caused_by_task_id INTEGER REFERENCES tasks(id)",
+    ),
+    (
+        # When the defect was noticed and when it stopped hurting (#909).
+        # Both are NULL until somebody records them, and neither is ever
+        # derived from updated_at — that substitution is the defect #810
+        # removed from cycle time, and repeating it here would put a median
+        # on the metrics page that no fix could move.
+        "add_detected_at_column",
+        "ALTER TABLE tasks ADD COLUMN detected_at TEXT",
+    ),
+    (
+        "add_resolved_at_column",
+        "ALTER TABLE tasks ADD COLUMN resolved_at TEXT",
+    ),
+    (
+        # Reads are "defects caught at stage X in this window" and "defects
+        # blamed on change Y" — both scans without an index.
+        "idx_tasks_found_in",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_found_in ON tasks(found_in)",
+    ),
+    (
+        "idx_tasks_caused_by",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_caused_by ON tasks(caused_by_task_id)",
+    ),
 ]
 
 
@@ -1290,6 +1337,13 @@ def deserialize_risks(raw: str | None) -> list[dict[str, Any]]:
 
 
 # --- Pydantic <-> DB mapping for structured task form ---
+
+# Defect passport keys that arrive on a refine payload and are NOT written as
+# plain columns (#910). They travel through ``repo.set_defect_passport`` so the
+# causal link is resolved first; ``clear_caused_by`` is a verb, not a column.
+PASSPORT_REFINE_FIELDS = frozenset(
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+)
 
 # All list[str] columns serialized as JSON in TEXT.
 LIST_STR_COLUMNS = frozenset(
@@ -1349,6 +1403,15 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # The features that produced the class (#582): "R3, потому что миграция"
     # can be argued with; a bare "R3" cannot. Read-path only, same as above.
     "risk_class_reasons",
+    # Defect passport (#909). Read-path only for now: the columns are written
+    # through ``repo.set_defect_passport``, which resolves the causal link
+    # before it lands, and never through a bare refine payload. Listing them
+    # here is what makes them visible in TaskView — a field stored and not
+    # listed is stored and never seen again.
+    "found_in",
+    "caused_by_task_id",
+    "detected_at",
+    "resolved_at",
 )
 
 
@@ -1373,6 +1436,12 @@ def structured_fields_to_db(
         if key == "project":
             # Virtual refine field (#338): binds an epic to a project via
             # slug in the service layer; there is no 'project' column.
+            continue
+        if key in PASSPORT_REFINE_FIELDS:
+            # Defect passport (#910): accepted on the refine payload, written
+            # by ``repo.set_defect_passport``. Letting it through here would
+            # store a causal link nobody resolved — the one thing #909 built
+            # the validator to prevent.
             continue
         if key == "risks":
             if value is None:
@@ -1614,6 +1683,36 @@ async def validate_hierarchy(
         return None
     if parent_type != required_parent.value:
         return f"{task_type} requires parent of type {required_parent.value}, got {parent_type}"
+    return None
+
+
+async def validate_caused_by(
+    db: aiosqlite.Connection,
+    task_id: int,
+    caused_by_task_id: int | None,
+) -> str | None:
+    """Validate a defect's causal link. Returns an error message or None.
+
+    Mirrors ``validate_hierarchy``: the check lives next to the schema and
+    answers in prose, so every caller (API, MCP, CLI) can refuse with the same
+    sentence instead of inventing its own.
+
+    Two ways to get this wrong are refused rather than stored:
+
+    * a link to a task that does not exist — a dangling blame is worse than no
+      blame, because reports would count it as an attributed defect;
+    * a link to the defect itself — the change that introduced a defect is
+      never the record of the defect.
+
+    ``None`` is always valid: an unattributed defect is the normal state.
+    """
+    if caused_by_task_id is None:
+        return None
+    if caused_by_task_id == task_id:
+        return f"Task #{task_id} cannot be its own caused_by_task_id"
+    rows = await fetchall(db, "SELECT id FROM tasks WHERE id=?", (caused_by_task_id,))
+    if not rows:
+        return f"caused_by task #{caused_by_task_id} not found"
     return None
 
 
