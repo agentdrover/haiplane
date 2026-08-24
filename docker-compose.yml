@@ -1,0 +1,22 @@
+# Haiplane Hub — one-command cold start (#944).
+#
+#   docker compose up -d --build
+#   open http://localhost:8080
+#
+# The SQLite database lives in ./data on the host, so `down`/`up` keeps state.
+services:
+  hub:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      # Demo data (project "demo" with sample tasks) is seeded on first
+      # start. Set to "0" — or delete the line — to start with an empty hub.
+      # The seed is idempotent: it never runs twice against the same DB.
+      HAIPLANE_DEMO_SEED: "1"
+      # The container binds 0.0.0.0 with no auth tokens configured — fine
+      # for a local demo, unsafe on a shared host. For real use set
+      # HAIPLANE_HUB_TOKENS=name:token[:role] and remove this override.
+      HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK: "1"
