@@ -1,7 +1,7 @@
 interface:
   display_name: "Hub Development"
-  short_description: "Implement changes in standalone OpenClaw Hub"
-  default_prompt: "Use $hub-development to implement a focused change in this standalone OpenClaw Hub project."
+  short_description: "Implement changes in standalone Haiplane Hub"
+  default_prompt: "Use $hub-development to implement a focused change in this standalone Haiplane Hub project."
 
 policy:
   allow_implicit_invocation: true

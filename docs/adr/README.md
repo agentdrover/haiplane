@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Lightweight ADRs for OpenClaw Hub. Numbering is sequential; filename format:
+Lightweight ADRs for Haiplane Hub. Numbering is sequential; filename format:
 `NNNN-<short-slug>.md`.
 
 | ADR | Title | Hub link |

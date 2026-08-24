@@ -2106,7 +2106,7 @@ async def test_hub_get_review_brief_self_review_warning(
 
 
 async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> None:
-    # #433: OPENCLAW_REVIEW_SELF_APPROVE=allow — solo-mode note, not a stop.
+    # #433: HAIPLANE_REVIEW_SELF_APPROVE=allow — solo-mode note, not a stop.
     mock_api_get.return_value = {
         "task_id": 42,
         "title": "Solo task",
@@ -2115,14 +2115,14 @@ async def test_hub_get_review_brief_solo_mode_note(mock_api_get: AsyncMock) -> N
             "reason": "solo_mode_self_review",
             "message": "agent 'impl-bot' implemented this task; solo mode "
             "permits self-review",
-            "hint": "OPENCLAW_REVIEW_SELF_APPROVE=allow is active.",
+            "hint": "HAIPLANE_REVIEW_SELF_APPROVE=allow is active.",
             "required_role": None,
         },
     }
     out = await hub_get_review_brief(42)
     text = json.loads(_mcp_text(out))["message"]
     assert text.startswith("WARNING [solo_mode_self_review]:")
-    assert "OPENCLAW_REVIEW_SELF_APPROVE=allow" in text
+    assert "HAIPLANE_REVIEW_SELF_APPROVE=allow" in text
 
 
 async def test_hub_submit_review_changes_requested(
@@ -3024,3 +3024,38 @@ async def test_tool_error_keeps_its_text_and_gains_structure(
         "текст и структура обязаны нести одно и то же: расхождение между ними "
         "хуже, чем отсутствие структуры"
     )
+
+
+# ---------------------------------------------------------------------------
+# Haiplane rebrand — public MCP face (Wave 1)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_server_name_is_haiplane_hub():
+    from hub import brand
+    from hub.mcp_server import mcp
+
+    assert mcp.name == brand.MCP_SERVER_NAME
+    assert mcp.name == "haiplane-hub"
+
+
+def test_mcp_instructions_use_haiplane_brand():
+    from hub.workflow_reference import build_mcp_instructions
+
+    instructions = build_mcp_instructions()
+    assert "Haiplane" in instructions
+    assert ("Open" + "Claw") not in instructions
+
+
+def test_mcp_initialize_server_name_is_haiplane_hub():
+    # initialize serverInfo.name and instructions come from these options.
+    # The wire-level initialize round-trip lives in test_mcp_transport.py:
+    # the streamable session manager is one-shot per process, so only one
+    # test may drive the real HTTP lifespan.
+    from hub.mcp_server import mcp
+
+    options = mcp._mcp_server.create_initialization_options()
+    assert options.server_name == "haiplane-hub"
+    instructions = options.instructions or ""
+    assert "Haiplane" in instructions
+    assert ("Open" + "Claw") not in instructions

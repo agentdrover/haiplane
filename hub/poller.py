@@ -1151,6 +1151,7 @@ async def _session_reaper(app: FastAPI) -> None:
 
 
 DRIFT_CHECK_INTERVAL = 900  # 15 minutes
+RED_BASE_CHECK_INTERVAL = 180  # 3 minutes
 
 
 async def _drift_watch(app: FastAPI) -> None:
@@ -1229,15 +1230,45 @@ async def arm_workspace_hooks(db) -> list[tuple[str, str]]:
     return outcomes
 
 
+async def _red_base_watch(app: FastAPI) -> None:
+    """Watch the base branch's own CI and announce a fresh breakage (#929).
+
+    Its own interval, faster than the drift check: measured in #921, a red
+    base stood for 8 hours 25 minutes because nobody was looking, while every
+    branch taken from it inherited the red. Three minutes is the difference
+    between "found by whoever was unlucky" and "known".
+
+    Cheap by construction: one API call per project per tick, and nothing at
+    all is written unless the base is red for a reason not already announced.
+    """
+    from hub.services import red_base
+
+    while True:
+        await asyncio.sleep(RED_BASE_CHECK_INTERVAL)
+        try:
+            for state in await red_base.check_all_projects(app.state.db):
+                if state.status == red_base.UNKNOWN:
+                    # Never silent: "could not look" is a state the operator
+                    # has to see, not an absence of news (#725).
+                    log.warning(
+                        "base CI state unknown for %s: %s", state.branch, state.reason
+                    )
+        except Exception:
+            log.exception("Red base watch error")
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
     """Create and return the background poller task."""
     task = asyncio.create_task(_poll_running_tasks(app))
     asyncio.create_task(_session_reaper(app))
     asyncio.create_task(_drift_watch(app))
+    asyncio.create_task(_red_base_watch(app))
     asyncio.create_task(arm_workspace_hooks(app.state.db))
     log.info(
-        "Background poller started (every %ds; drift check every %ds)",
+        "Background poller started (every %ds; drift check every %ds; "
+        "red-base check every %ds)",
         POLL_INTERVAL,
         DRIFT_CHECK_INTERVAL,
+        RED_BASE_CHECK_INTERVAL,
     )
     return task

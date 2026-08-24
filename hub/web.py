@@ -1,4 +1,4 @@
-"""Web UI routes (HTML / HTMX) for OpenClaw Hub dashboard."""
+"""Web UI routes (HTML / HTMX) for Haiplane Hub dashboard."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from hub import brand
 from hub import config
 from hub import db as db_module
 from hub import repository as repo
@@ -36,6 +37,7 @@ from hub.auth import (
 )
 from hub.integrations.registry import plugins
 from hub.services import project_policy
+from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
     FindingDispositionItem,
@@ -71,6 +73,9 @@ TEMPLATES = Jinja2Templates(
     directory=str(HERE / "templates"),
     context_processors=[_user_context],
 )
+TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
+TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
+TEMPLATES.env.globals["app_version"] = get_app_version()
 
 router = APIRouter()
 
@@ -201,9 +206,8 @@ async def web_login_submit(
     ):
         return RedirectResponse(safe_next, status_code=303)
 
-    # CSRF verification
-    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
-    if not verify_csrf(csrf_token, csrf_cookie):
+    # CSRF verification (double-submit cookie).
+    if not verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, "")):
         return RedirectResponse(
             f"/login?error=Invalid%20form%20submission.%20Please%20try%20again.&next={safe_next}",
             status_code=303,
@@ -289,6 +293,7 @@ async def web_logout(request: Request):
 
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(config.HUB_COOKIE_NAME)
+    response.delete_cookie(CSRF_COOKIE_NAME)
     return response
 
 
@@ -1472,6 +1477,15 @@ async def web_task_detail(
     # #814: what was observed in production, and on which build. The delivered
     # sha is what the evidence should be about — a record taken elsewhere is
     # shown with that said out loud rather than quietly counted as proof.
+    # PR-ссылка строится от репозитория проекта задачи, не от жёстко зашитого
+    # слага: хаб обслуживает несколько проектов с разными репозиториями.
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    pr_repo = ""
+    if project_row is not None:
+        pr_repo = (dict(project_row).get("repo") or "").strip()
+    if not pr_repo:
+        pr_repo = config.REPO_NAME
+
     delivered_sha = await repo.merge_sha_for_task(db, task_id)
     live_checks = [
         {
@@ -1490,6 +1504,7 @@ async def web_task_detail(
         "task_detail.html",
         {
             "task": task,
+            "pr_repo": pr_repo,
             "task_messages": task_messages,
             "live_checks": live_checks,
             "delivered_sha": delivered_sha,

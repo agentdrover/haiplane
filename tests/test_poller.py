@@ -1603,3 +1603,138 @@ async def test_fresh_and_refined_drafts_are_left_alone(mock_sleep, db):
 
     assert not await _stale_alerts(db, fresh)
     assert not await _stale_alerts(db, refined)
+
+
+# ---- #929: a red base branch becomes an event, with the pair that met ----
+#
+# Measured in #921: the base was red for 574 of 738 minutes across two
+# breakages, both caught by push-CI at the moment of the merge and followed
+# by nothing. The second stood 8h25m and was found by a human busy with
+# another task, while merges kept landing into it.
+
+
+class _BranchCIGitOps(NoopGitOps):
+    """Answers with a canned run history and commit range."""
+
+    def __init__(self, runs, subjects=None):
+        self._runs = runs
+        self._subjects = subjects or []
+        self.range_calls: list[tuple[str, str]] = []
+
+    async def branch_ci_runs(self, branch, limit=20, repo=None, gh_repo=None):
+        return self._runs
+
+    async def release_range(self, base, head, repo=None, gh_repo=None):
+        self.range_calls.append((base, head))
+        return self._subjects
+
+
+def _run(sha: str, conclusion: str, status: str = "completed") -> dict:
+    return {
+        "sha": sha,
+        "status": status,
+        "conclusion": conclusion,
+        "created_at": "2026-08-21T18:53:33Z",
+        "name": "CI",
+    }
+
+
+async def _default_project(db):
+    row = await repo.get_project_by_slug(db, "default")
+    if row is None:
+        await repo.create_project(
+            db, slug="default", name="default", workspace_path="/tmp/ws"
+        )
+        row = await repo.get_project_by_slug(db, "default")
+    await db.commit()
+    return row
+
+
+async def test_red_base_branch_becomes_an_event(db):
+    # AC-1: the hub notices, and the notice carries the branch and the commit.
+    from hub.services import red_base
+
+    project = await _default_project(db)
+    plugins.git_ops = _BranchCIGitOps([_run("e60fef5c", "failure")])
+
+    state = await red_base.check_project(db, project)
+
+    assert state.status == red_base.RED
+    events = [dict(r) for r in await repo.list_events(db, kinds=[red_base.EVENT_KIND])]
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    if isinstance(payload, str):
+        import json
+
+        payload = json.loads(payload)
+    assert payload["sha"] == "e60fef5c"
+    assert payload["branch"] == "develop"
+
+
+async def test_event_names_the_commits_that_met(db):
+    # AC-2: what met is the interval between the last green run and the first
+    # red one — computed, never a guess at the culprit inside it.
+    from hub.services import red_base
+
+    project = await _default_project(db)
+    ops = _BranchCIGitOps(
+        [
+            _run("e60fef5c", "failure"),
+            _run("1ea5e120", "success"),
+        ],
+        subjects=["ci(task): mypy обязательным шагом (#847)"],
+    )
+    plugins.git_ops = ops
+
+    state = await red_base.check_project(db, project)
+
+    assert state.last_green_sha == "1ea5e120"
+    assert ops.range_calls == [("1ea5e120", "e60fef5c")]
+    assert state.met == ["ci(task): mypy обязательным шагом (#847)"]
+
+
+async def test_red_base_is_announced_once_per_breakage(db):
+    # AC-3: while the base stays red the event is not repeated — a line per
+    # poll cycle is how a real signal gets muted (#534). A NEW breakage, with
+    # a new sha, is announced again.
+    from hub.services import red_base
+
+    project = await _default_project(db)
+    plugins.git_ops = _BranchCIGitOps([_run("e60fef5c", "failure")])
+
+    await red_base.check_project(db, project)
+    await red_base.check_project(db, project)
+    await red_base.check_project(db, project)
+
+    events = await repo.list_events(db, kinds=[red_base.EVENT_KIND])
+    assert len(events) == 1, "one signal per breakage, not per cycle"
+
+    plugins.git_ops = _BranchCIGitOps(
+        [_run("0c69ba10", "failure"), _run("fe8759dd", "success")]
+    )
+    await red_base.check_project(db, project)
+
+    assert len(await repo.list_events(db, kinds=[red_base.EVENT_KIND])) == 2
+
+
+async def test_unreadable_ci_outcome_is_not_a_green_base(db):
+    # AC-4: "could not look" is its own answer with a reason. Reporting health
+    # while blind is the failure this codebase keeps re-learning (#725).
+    from hub.services import red_base
+
+    project = await _default_project(db)
+    plugins.git_ops = _BranchCIGitOps(None)
+
+    state = await red_base.check_project(db, project)
+
+    assert state.status == red_base.UNKNOWN
+    assert state.reason
+    assert not await repo.list_events(db, kinds=[red_base.EVENT_KIND])
+
+    # An unrecognised conclusion is not green either.
+    assert red_base.read_state("develop", [_run("abc", "")]).status == red_base.UNKNOWN
+    # Nor is a run still in flight.
+    assert (
+        red_base.read_state("develop", [_run("abc", "", status="in_progress")]).status
+        == red_base.UNKNOWN
+    )

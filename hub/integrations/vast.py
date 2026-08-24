@@ -46,7 +46,7 @@ async def _run_vast_job(*args: str, timeout: int = 30) -> tuple[int, str, str]:
 
 
 class VastIntegration:
-    """Concrete Vast.ai plugin backed by the vast-openclaw CLI."""
+    """Concrete Vast.ai plugin backed by the vast-haiplane CLI."""
 
     async def vast_up(self) -> dict[str, Any]:
         rc, out, err = await _run_vast_job("up", timeout=1200)

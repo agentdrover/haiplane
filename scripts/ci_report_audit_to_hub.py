@@ -37,6 +37,15 @@ from pathlib import Path
 TASK_SOURCE = "agent"
 
 
+def env_get(suffix: str) -> str:
+    """HAIPLANE_-prefixed env value; empty counts as unset.
+
+    Standalone twin of ``hub.config.env_get`` — this script runs in CI
+    without the hub package installed.
+    """
+    return os.environ.get(f"HAIPLANE_{suffix}") or ""
+
+
 def log(msg: str) -> None:
     print(f"[hub-audit] {msg}", flush=True)
 
@@ -130,8 +139,8 @@ def draft_payload(finding: dict) -> dict:
 
 
 def main() -> int:
-    base = (os.environ.get("OPENCLAW_HUB_URL") or "").rstrip("/")
-    token = os.environ.get("OPENCLAW_HUB_CI_TOKEN") or ""
+    base = env_get("HUB_URL").rstrip("/")
+    token = env_get("HUB_CI_TOKEN")
     report_path = Path(os.environ.get("AUDIT_JSON") or "audit.json")
 
     if not report_path.exists():
@@ -153,8 +162,9 @@ def main() -> int:
 
     if not base or not token:
         log(
-            f"{len(found)} vulnerability(ies) found but OPENCLAW_HUB_URL / "
-            "OPENCLAW_HUB_CI_TOKEN are not configured — printing them here and "
+            f"{len(found)} vulnerability(ies) found but HAIPLANE_HUB_URL / "
+            "HAIPLANE_HUB_CI_TOKEN are not configured — "
+            "printing them here and "
             "filing nothing: " + ", ".join(f["id"] for f in found)
         )
         return 0

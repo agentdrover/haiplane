@@ -5,13 +5,13 @@ remote_name="${1:-}"
 zero="0000000000000000000000000000000000000000"
 
 # #475: which branches this clone protects is a property of the PROJECT, not
-# of this file. The hub writes both keys when it arms the hook (hub/git_policy),
-# so a calc-kids workspace protects master and a spike-bo one protects main.
-# The literals below are the fallback for a clone nobody configured — the hub's
-# own, which is where these names came from in the first place.
-base_branch="$(git config --get openclaw.baseBranch 2>/dev/null || true)"
+# of this file. The hub writes the haiplane.* keys when it arms the hook
+# (hub/git_policy), so a calc-kids workspace protects master and a spike-bo
+# one protects main. The literals below are the fallback for a clone nobody
+# configured — the hub's own, which is where these names came from.
+base_branch="$(git config --get haiplane.baseBranch 2>/dev/null || true)"
 [ -n "$base_branch" ] || base_branch="develop"
-release_branch="$(git config --get openclaw.releaseBranch 2>/dev/null || true)"
+release_branch="$(git config --get haiplane.releaseBranch 2>/dev/null || true)"
 [ -n "$release_branch" ] || release_branch="main"
 
 while read -r local_ref local_oid remote_ref remote_oid; do

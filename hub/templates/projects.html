@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active = "projects" %}
-{% block title %}Проекты — OpenClaw Hub{% endblock %}
+{% block title %}Проекты — {{ product_title }}{% endblock %}
 {% block content %}
 <header class="page-header">
     <h1 class="page-title">Проекты{% if cards %} <span class="badge">{{ cards|length }}</span>{% endif %}</h1>

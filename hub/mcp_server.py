@@ -1,4 +1,4 @@
-"""OpenClaw Hub MCP server — exposes hub tools for Cursor and remote agents."""
+"""Haiplane Hub MCP server — exposes hub tools for Cursor and remote agents."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from hub import config
+from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
 from hub.mcp_internal_auth import identity_context_get
 from hub.services.mcp_telemetry import record_call
@@ -94,26 +94,26 @@ class InstrumentedFastMCP(FastMCP):
 
 
 mcp = InstrumentedFastMCP(
-    "openclaw-hub",
+    brand.MCP_SERVER_NAME,
     instructions=build_mcp_instructions(),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
 def _hub_url() -> str:
-    import os
+    from hub.config import env_get
 
-    return os.environ.get("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    return env_get("HUB_URL", "http://127.0.0.1:8080")
 
 
 def _hub_token() -> str:
-    import os
+    from hub.config import env_get
 
-    env_tok = (os.environ.get("OPENCLAW_HUB_TOKEN") or "").strip()
+    env_tok = (env_get("HUB_TOKEN", "") or "").strip()
     if env_tok:
         return env_tok
     # Streamable MCP mounted in the same process: reuse caller's Bearer (set by
-    # AuthMiddleware via hub.mcp_internal_auth) so tools work without OPENCLAW_HUB_TOKEN.
+    # AuthMiddleware via hub.mcp_internal_auth) so tools work without HAIPLANE_HUB_TOKEN.
     from hub.mcp_internal_auth import bearer_context_get
 
     return (bearer_context_get() or "").strip()
@@ -1307,7 +1307,7 @@ async def hub_pair_start(
     principal is accepted even when the presentational name differs.
 
     Workspace mode (#530/#459): when the server runs with
-    OPENCLAW_WORKTREE_PER_TASK=1 the response names your task's isolated git
+    HAIPLANE_WORKTREE_PER_TASK=1 the response names your task's isolated git
     worktree path — work THERE, not in the shared clone (the main clone stays
     on the base branch). In legacy mode the response is unchanged.
 
@@ -2950,7 +2950,7 @@ async def hub_list_decisions(limit: int = 10) -> CallToolResult:
 
 
 # ---------------------------------------------------------------------------
-# Vast.ai instance management — registered only when OPENCLAW_VAST_ENABLED=1
+# Vast.ai instance management — registered only when HAIPLANE_VAST_ENABLED=1
 # ---------------------------------------------------------------------------
 
 if config.VAST_ENABLED:
@@ -2964,7 +2964,7 @@ if config.VAST_ENABLED:
         instance already exists.
 
         Returns the OpenAI-compatible API endpoint. After this tool completes,
-        write the returned base_url to ~/.openclaw/vast-upstream.json on Mac
+        write the returned base_url to ~/.haiplane/vast-upstream.json on Mac
         so the local proxy picks it up automatically.
         """
         import httpx
@@ -2998,7 +2998,7 @@ if config.VAST_ENABLED:
             f"  Endpoint:  {base_url}",
             "",
             "UPDATE LOCAL PROXY by running this command on Mac:",
-            f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.openclaw/vast-upstream.json',
+            f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.haiplane/vast-upstream.json',
             "",
             "Local proxy → http://localhost:8741/v1",
             "Cursor model ready to use.",
@@ -3964,7 +3964,7 @@ def _format_health(data: dict[str, Any]) -> str:
 async def hub_whoami() -> str:
     """Show the current caller identity: role, permissions summary, and auth source.
 
-    Auth source is ``env`` for OPENCLAW_HUB_TOKENS map entries or ``db`` for
+    Auth source is ``env`` for HAIPLANE_HUB_TOKENS map entries or ``db`` for
     DB-backed API keys (includes api_key_id, never the secret).
     """
     data = await _api_get("/api/whoami")

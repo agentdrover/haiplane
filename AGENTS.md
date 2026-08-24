@@ -1,4 +1,4 @@
-# OpenClaw Hub Standalone
+# Haiplane Hub Standalone
 
 ## General Rules
 

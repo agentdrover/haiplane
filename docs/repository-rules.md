@@ -2,7 +2,7 @@
 
 ## Назначение
 
-Этот репозиторий содержит standalone OpenClaw Hub: FastAPI backend, Web UI, CLI, MCP tools, интеграции, документацию для агентов и регрессионные тесты.
+Этот репозиторий содержит standalone Haiplane Hub: FastAPI backend, Web UI, CLI, MCP tools, интеграции, документацию для агентов и регрессионные тесты.
 
 Репозиторий должен оставаться воспроизводимым: новый разработчик или агент должен иметь возможность поднять окружение, понять архитектуру, внести узкое изменение и проверить его без устных договоренностей.
 
@@ -97,7 +97,7 @@ test: cover pending report force complete api
 - Локальная защита push хранится в `.githooks/pre-push`. **Вооружается шагом установки:** `make setup` ставит окружение и активирует хук вместе. Вручную: `git config core.hooksPath .githooks`. Проверить: `make doctor` — ненулевой код, если push не будет проверен.
 - Копирование хука в `.git/hooks` (как советовала прежняя редакция) тоже работает, но копия перестаёт соответствовать политике при первом же её изменении, и никто об этом не узнаёт. `doctor` такой клон распознаёт и предлагает перейти на `core.hooksPath`.
 - Emergency push в `main` допускается только владельцем и только явно: `ALLOW_MAIN_PUSH=1 git push origin main`.
-- **Какие ветки защищает хук — свойство проекта, а не этого файла (#475).** Хук читает локальный git-config клона: `openclaw.baseBranch` (интеграционная ветка) и `openclaw.releaseBranch` (релизная). Хаб записывает оба ключа, когда вооружает хук — при `clone_repo` и на старте поллера для каждого workspace, — из `project.default_branch` и `default_branch_policy.release_base`. В клоне, где ключи не выставлены, хук откатывается на `develop`/`main`, то есть на ветки самого хаба. Без этого клон calc-kids (`master`) отклонял каждый push из `master` как «недопустимое имя ветки» и при этом не защищал `master` вовсе.
+- **Какие ветки защищает хук — свойство проекта, а не этого файла (#475).** Хук читает локальный git-config клона: `haiplane.baseBranch` (интеграционная ветка) и `haiplane.releaseBranch` (релизная). Хаб записывает оба ключа, когда вооружает хук — при `clone_repo` и на старте поллера для каждого workspace, — из `project.default_branch` и `default_branch_policy.release_base`. В клоне, где ключи не выставлены, хук откатывается на `develop`/`main`, то есть на ветки самого хаба. Без этого клон calc-kids (`master`) отклонял каждый push из `master` как «недопустимое имя ветки» и при этом не защищал `master` вовсе.
 
 ## Что хранить в git
 
@@ -192,7 +192,7 @@ uv run pytest -q
 - держать изменения узкими;
 - не переписывать чужие изменения;
 - перед кодом читать контекст задачи и архитектурные документы;
-- фиксировать вопросы, блокеры и результаты через OpenClaw Hub;
+- фиксировать вопросы, блокеры и результаты через Haiplane Hub;
 - не расширять scope молча, а создавать draft proposal для новой работы;
 - в done report указывать changed files, behavior change и validation commands;
 - **Universal Review Gate**: нормальное завершение задачи возможно только при
@@ -237,7 +237,7 @@ uv run pytest -q
   стартует только после успешного `test` и только на `push` в `main`
   (на pull_request деплой не идёт).
 - Деплой повторяет ручной процесс из `docs/agent-deploy-runbook.md` раздел 4:
-  `rsync` в staging → `deploy/remote-deploy.sh` (промоут в `/opt/openclaw-hub/src`,
+  `rsync` в staging → `deploy/remote-deploy.sh` (промоут в `/opt/haiplane-hub/src`,
   `pip install -e`, restart systemd, проверка `/healthz`).
 - Логика деплоя версионируется в `deploy/remote-deploy.sh`; её правят там, а не в YAML.
 - Шаг отчётности в хаб вынесен в composite action `.github/actions/hub-ci-report`
@@ -249,7 +249,7 @@ uv run pytest -q
   `@@…@@`; `hub/services/workflow_seed.py` подставляет ветки проекта — из
   `project_policy.base_branch_of` / `release_base_of`, как и всё остальное
   (#475) — и коммитит результат в базовую ветку под именами
-  `.github/workflows/openclaw-ci.yml` и `openclaw-stale.yml`.
+  `.github/workflows/haiplane-ci.yml` и `haiplane-stale.yml`.
   Три правила, каждое из которых закрывает конкретный способ навредить:
   - **Раскладка только в репозиторий, где своих workflow нет вовсе.** Тот, у
     кого CI уже есть, уже ответил на вопрос гейта, и хаб не правит чужой

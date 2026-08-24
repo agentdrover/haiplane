@@ -1,10 +1,9 @@
-"""OpenClaw Hub — FastAPI application with REST API and web dashboard."""
+"""Haiplane Hub — FastAPI application with REST API and web dashboard."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -24,10 +23,11 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from hub import config, models, services
+from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import fetchall, get_db
+from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
@@ -222,13 +222,13 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 log.info(
-                    "Hub auth DISABLED (open mode — set OPENCLAW_HUB_TOKENS to enable)"
+                    "Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS to enable)"
                 )
 
             # Workspace git health-check (#455): opt-in network probe so a
             # broken deploy key on the default workspace is loud, not silent.
             # Off by default to keep startup (and tests) free of network I/O.
-            if os.environ.get("OPENCLAW_WORKSPACE_HEALTHCHECK") == "1":
+            if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
                 from hub.services.diagnostics import check_default_workspace_origin
 
                 try:
@@ -242,7 +242,7 @@ async def lifespan(app: FastAPI):
 
                 if await has_active_admin(app.state.db):
                     log.warning(
-                        "SECURITY: OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                        "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
                         "but an admin already exists. Remove it from the environment "
                         "to prevent unauthorized bootstrap attempts."
                     )
@@ -253,12 +253,12 @@ async def lifespan(app: FastAPI):
         await app.state.db.close()
 
 
-app = FastAPI(title="OpenClaw Hub", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
 # Added last so it runs first. Empty allowlist preserves local/dev behavior;
-# production deployments can set OPENCLAW_HUB_ALLOWED_HOSTS.
+# production deployments can set HAIPLANE_HUB_ALLOWED_HOSTS.
 app.add_middleware(HostAllowlistMiddleware, allowed_hosts=config.HUB_ALLOWED_HOSTS)
 app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 app.include_router(web_router)
@@ -321,7 +321,7 @@ async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
 
     ``connected_via`` reflects the address the client actually reached (the
     request Host), so ``config_mismatch`` catches a server whose
-    OPENCLAW_HUB_URL disagrees with reality — the trap that had an operator
+    HAIPLANE_HUB_URL disagrees with reality — the trap that had an operator
     editing prod while believing it was local.
     """
     connected_via = str(request.base_url).rstrip("/")
@@ -400,7 +400,7 @@ async def api_create_project(
 
     Humans create active projects. Agents PROPOSE: their projects start
     as ``pending`` and stay out of git routing until a human activates
-    them (PATCH status=active). OPENCLAW_ALLOW_AGENT_PROJECTS=direct is
+    them (PATCH status=active). HAIPLANE_ALLOW_AGENT_PROJECTS=direct is
     the solo-mode opt-out.
     """
     db = _db(request)
@@ -1575,7 +1575,7 @@ async def api_review_verdict(
     task (assigned_agent or claimed_by) may not review it. The check uses
     the AUTHENTICATED identity — the ``agent`` field in the body is
     display-only. Human/admin tokens always pass;
-    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` is the solo-mode opt-out.
+    ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` is the solo-mode opt-out.
 
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
@@ -2789,7 +2789,8 @@ async def api_admin_bootstrap(request: Request):
 
     if not _is_open_mode() and not _check_bootstrap_token(request):
         raise HTTPException(
-            403, "bootstrap requires OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN or open mode"
+            403,
+            "bootstrap requires HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN or open mode",
         )
     body = AdminBootstrap(**(await request.json()))
     try:

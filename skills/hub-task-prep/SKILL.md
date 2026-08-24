@@ -1,6 +1,6 @@
 ---
 name: hub-task-prep
-description: Use when turning a request into a structured OpenClaw Hub task pack with work type selection, scope, acceptance criteria, risks, readiness expectations, and validation commands.
+description: Use when turning a request into a structured Haiplane Hub task pack with work type selection, scope, acceptance criteria, risks, readiness expectations, and validation commands.
 ---
 
 # Hub Task Prep

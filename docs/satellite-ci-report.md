@@ -19,12 +19,12 @@
    одно право `tasks.ci_report`. Он не может двигать задачу и не может писать
    вердикт; это не токен исполнителей и не человеческий токен.
 2. Два секрета в GitHub сателлитного репозитория:
-   `OPENCLAW_HUB_URL` и `OPENCLAW_HUB_CI_TOKEN`.
+   `HAIPLANE_HUB_URL` и `HAIPLANE_HUB_CI_TOKEN`.
 
 ## Если workflow ещё нет
 
 С #476 его кладёт провижининг: в репозиторий, где нет ни одного файла в
-`.github/workflows`, хаб коммитит `openclaw-ci.yml` (и `openclaw-stale.yml`) с
+`.github/workflows`, хаб коммитит `haiplane-ci.yml` (и `haiplane-stale.yml`) с
 уже подставленными ветками проекта и уже вписанным шагом отчётности ниже.
 Остаётся добавить туда сборку и прогон тестов этого репозитория — шаблон
 намеренно не угадывает их — и объявить проекту `ci_runner` в `gate_policy`,
@@ -54,10 +54,10 @@ jobs:
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
-        uses: mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main
+        uses: agentdrover/haiplane/.github/actions/hub-ci-report@main
         with:
-          hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
-          hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL || secrets.HAIPLANE_HUB_URL }}
+          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.HAIPLANE_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: pytest
 ```

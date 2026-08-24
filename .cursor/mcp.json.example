@@ -1,17 +1,18 @@
 {
+  "_comment": "HAIPLANE_HUB_URL / HAIPLANE_HUB_MCP_TOKEN are the canonical env names.",
   "mcpServers": {
-    "openclaw-hub-local": {
+    "haiplane-hub-local": {
       "command": "uv",
-      "args": ["run", "openclaw-hub-mcp"],
+      "args": ["run", "haiplane-hub-mcp"],
       "env": {
-        "OPENCLAW_HUB_URL": "http://127.0.0.1:8080"
+        "HAIPLANE_HUB_URL": "http://127.0.0.1:8080"
       }
     },
-    "openclaw-hub": {
+    "haiplane-hub": {
       "type": "streamable-http",
       "url": "https://agenthai.ru/mcp",
       "headers": {
-        "Authorization": "Bearer ${env:OPENCLAW_HUB_MCP_TOKEN}",
+        "Authorization": "Bearer ${env:HAIPLANE_HUB_MCP_TOKEN}",
         "Accept": "application/json, text/event-stream"
       }
     }

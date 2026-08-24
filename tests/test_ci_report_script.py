@@ -30,6 +30,51 @@ def script():
     return _load()
 
 
+@pytest.fixture(autouse=True)
+def _clean_prefixed_env(monkeypatch):
+    """Neither prefix may leak in from the developer's shell (Task 4)."""
+    for suffix in ("HUB_URL", "HUB_CI_TOKEN", "HUB_CI_PYTEST", "HUB_CI_CHECKS"):
+        monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
+
+
+def test_env_get_reads_canonical_only(script, monkeypatch):
+    """Wave 5: the reporter reads HAIPLANE_* and nothing else."""
+    monkeypatch.setenv("OPEN" + "CLAW" + "_HUB_CI_PYTEST", "old runner")
+    assert script.env_get("HUB_CI_PYTEST") == ""
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "new runner")
+    assert script.env_get("HUB_CI_PYTEST") == "new runner"
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "")
+    assert script.env_get("HUB_CI_PYTEST") == "", (
+        "an empty canonical value counts as unset"
+    )
+
+
+def test_hub_credentials_accepted_under_the_haiplane_prefix(script, monkeypatch):
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "new-prefix-token")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+
+    seen: dict[str, str] = {}
+
+    def fake_request(url, token, payload=None):
+        seen.setdefault("token", token)
+        if payload is None:
+            return {"acceptance_criteria": [], "validation_commands": []}
+        seen["payload_url"] = url
+        return {"applied": True, "reason": "ok"}
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    assert script.main() == 0
+    assert seen["token"] == "new-prefix-token"  # noqa: S105
+    assert seen["payload_url"].startswith("https://hub.example/")
+
+
+def test_ac_runner_reads_the_haiplane_prefix(script, monkeypatch):
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
+    assert script.ac_runner() == ["python3", "-m", "pytest"]
+
+
 def test_prose_among_validation_commands_reports_unknown_not_failure(script):
     # #546's own validation_commands end with a Russian sentence describing a
     # manual check on a live PR. Executed in a shell that is a non-zero exit —
@@ -85,8 +130,8 @@ def test_task_id_comes_from_the_branch_and_missing_is_not_an_error(script, monke
 def test_without_hub_credentials_the_step_reports_nothing_and_succeeds(
     script, monkeypatch, capsys
 ):
-    monkeypatch.delenv("OPENCLAW_HUB_URL", raising=False)
-    monkeypatch.delenv("OPENCLAW_HUB_CI_TOKEN", raising=False)
+    monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
+    monkeypatch.delenv("HAIPLANE_HUB_CI_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
 
     assert script.main() == 0, "a missing secret must not fail the job"
@@ -96,8 +141,8 @@ def test_without_hub_credentials_the_step_reports_nothing_and_succeeds(
 
 
 def test_an_unreachable_hub_does_not_fail_the_job(script, monkeypatch, capsys):
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.invalid")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.invalid")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
     monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
     monkeypatch.setenv("GITHUB_SHA", "sha-github-head")
     monkeypatch.delenv("HEAD_SHA", raising=False)
@@ -128,8 +173,8 @@ def test_the_reported_commit_is_the_branch_head_not_the_merge(script, monkeypatc
 
 def test_a_missing_commit_sha_stops_the_report(script, monkeypatch, capsys):
     # Without a commit the report could be applied to code it never ran.
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
     monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
     monkeypatch.setenv("GITHUB_SHA", "")
     monkeypatch.delenv("HEAD_SHA", raising=False)
@@ -145,8 +190,8 @@ def test_unrun_tests_are_reported_as_not_found(script, monkeypatch):
     # The runner reports what it observed; an AC whose test never ran is
     # not_found, never fail. The hub's gate then reads "no evidence", not
     # "broken work".
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
     monkeypatch.setenv("GITHUB_HEAD_REF", "task-546/x")
     monkeypatch.setenv("HEAD_SHA", "sha-github-head")
 
@@ -183,12 +228,12 @@ def test_ac_runner_is_configurable(script, monkeypatch):
     satellite with different tooling would have reported not_found for every
     AC — evidence missing for a reason that has nothing to do with the work.
     """
-    monkeypatch.delenv("OPENCLAW_HUB_CI_PYTEST", raising=False)
+    monkeypatch.delenv("HAIPLANE_HUB_CI_PYTEST", raising=False)
     assert script.ac_runner()[:3] == ["uv", "run", "pytest"], (
         "without configuration the hub's own runner must stay"
     )
 
-    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "python3 -m pytest")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
     assert script.ac_runner() == ["python3", "-m", "pytest"]
 
     captured: dict[str, list[str]] = {}
@@ -207,15 +252,15 @@ def test_ac_runner_is_configurable(script, monkeypatch):
 
 def test_missing_runner_reports_not_found(script, monkeypatch, capsys):
     """#761 AC-2: an absent runner is missing evidence, never a failure."""
-    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "definitely-not-installed-xyz")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "definitely-not-installed-xyz")
     assert script.ac_runner() == []
     assert script.run_nodeids(["t.py::a"]) == {}
     assert "not on PATH" in capsys.readouterr().out
 
-    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", "   ")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "   ")
     assert script.ac_runner() == [], "an empty runner is not a reason to guess"
 
-    monkeypatch.setenv("OPENCLAW_HUB_CI_PYTEST", 'pytest "unclosed')
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", 'pytest "unclosed')
     assert script.ac_runner() == [], "an unparsable runner must not reach a shell"
 
 

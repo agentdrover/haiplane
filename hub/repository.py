@@ -1,4 +1,4 @@
-"""OpenClaw Hub — Data access layer (repository).
+"""Haiplane Hub — Data access layer (repository).
 
 All SQL queries live here. Functions take ``aiosqlite.Connection`` as the
 first argument and return raw rows (``aiosqlite.Row``) or primitives.
@@ -1648,7 +1648,7 @@ async def record_review_verdict(
     the stored findings wholesale: findings belong to their verdict, so a
     verdict without findings clears the previous list (#308).
     ``self_approved`` marks verdicts accepted only via the
-    ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
+    ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
     to the verdict, so every new verdict overwrites the flag.
     """
     await db.execute(

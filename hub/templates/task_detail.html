@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% set active = "tasks" %}
 
-{% block title %}Task #{{ task.id }} - OpenClaw Hub{% endblock %}
+{% block title %}Task #{{ task.id }} - {{ product_title }}{% endblock %}
 
 {% block content %}
 <article class="task-detail-page">
@@ -927,7 +927,7 @@
                     for submission #{{ task.latest_review.submission_generation }}
                     ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
                     {% if task.latest_review.self_approved %}
-                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via OPENCLAW_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
+                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via HAIPLANE_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
                     {% endif %}
                     {% if task.latest_review.findings %}
                     <ul class="task-review-findings">
@@ -1065,7 +1065,7 @@
                     {% endif %}
                     {% if task.pr_number %}
                     <dt>PR</dt>
-                    <dd><a href="https://github.com/mrPDA/vkuswill_bot/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a></dd>
+                    <dd>{% if pr_repo %}<a href="https://github.com/{{ pr_repo }}/pull/{{ task.pr_number }}" target="_blank" rel="noopener">#{{ task.pr_number }}</a>{% else %}#{{ task.pr_number }}{% endif %}</dd>
                     {% endif %}
                     {% if task.auto_review %}
                     <dt>Review</dt>

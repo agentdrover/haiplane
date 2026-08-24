@@ -36,6 +36,8 @@ import shlex
 import subprocess  # nosec B404
 from dataclasses import dataclass
 
+from hub import brand
+
 log = logging.getLogger("hub.git_policy")
 
 HOOKS_DIR = ".githooks"
@@ -48,8 +50,9 @@ ACTIVATE_COMMAND = f"git config core.hooksPath {HOOKS_DIR}"
 # clone it just armed. Two keys, because "where work lands" and "what is in
 # production" are two different questions (the same split as PAIR_BASE_BRANCH
 # vs RELEASE_BRANCH in hub/config.py).
-BASE_BRANCH_KEY = "openclaw.baseBranch"
-RELEASE_BRANCH_KEY = "openclaw.releaseBranch"
+#
+BASE_BRANCH_KEY = brand.GIT_BASE_BRANCH_KEY
+RELEASE_BRANCH_KEY = brand.GIT_RELEASE_BRANCH_KEY
 
 
 def activate_command(repo: str) -> str:
@@ -337,7 +340,7 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
 
 
 def _recorded_base(repo: str) -> str:
-    """The base branch this clone records, or "" when the key is unset."""
+    """The base branch this clone records, or "" when the key is not set."""
     rc, out = _git(repo, "config", "--get", BASE_BRANCH_KEY)
     return out.strip() if rc == 0 else ""
 
@@ -395,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="oc-git-policy",
+        prog="hp-git-policy",
         description="Check or activate the pre-push hook that enforces branch policy.",
     )
     parser.add_argument("command", choices=["doctor", "activate"])

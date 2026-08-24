@@ -232,6 +232,13 @@ class GitOpsPlugin(Protocol):
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None: ...
     # Читатели git и GitHub, которые вызываются из services/, но в протоколе
     # отсутствовали: реализации (git_ops, noop) их имеют, контракт — нет. То
     # есть подменить плагин по этому протоколу было можно только угадав, что

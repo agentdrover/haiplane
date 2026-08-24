@@ -2,7 +2,7 @@
 
 ## Цель
 
-Превратить описанный в `docs/software-development-workflow.md` процесс в рабочий Cursor + OpenClaw Hub workflow. План разбит на этапы так, чтобы сначала закрыть быстрые контрактные разрывы без миграций, а затем перейти к более крупным изменениям модели данных и UI.
+Превратить описанный в `docs/software-development-workflow.md` процесс в рабочий Cursor + Haiplane Hub workflow. План разбит на этапы так, чтобы сначала закрыть быстрые контрактные разрывы без миграций, а затем перейти к более крупным изменениям модели данных и UI.
 
 ## Этап 1. Минимальный Cursor workflow без миграций
 
@@ -71,7 +71,7 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
 **Итог**
 
 - `docs/cursor-agent-rules.md` — 8 обязательных правил + раздел human gates + minimum MCP tools.
-- `docs/templates/cursor/openclaw-hub.mdc` — installable Cursor rule со `alwaysApply: true`.
+- `docs/templates/cursor/haiplane-hub.mdc` — installable Cursor rule со `alwaysApply: true`.
 
 
 
@@ -91,7 +91,7 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
   - завершение через `hub_report_done`;
   - новые найденные работы только через draft proposal;
   - не закрывать задачу при failed CI, unresolved blocker или review changes.
-- Добавить шаблон `.cursor/rules/openclaw-hub.mdc` или `docs/templates/cursor/openclaw-hub.mdc`, если не хочется навязывать Cursor-файлы в корне.
+- Добавить шаблон `.cursor/rules/haiplane-hub.mdc` или `docs/templates/cursor/haiplane-hub.mdc`, если не хочется навязывать Cursor-файлы в корне.
 
 **Валидация**
 
@@ -136,7 +136,7 @@ uv run pytest tests/test_mcp_server.py tests/test_api.py tests/test_services.py 
 
 **Итог**
 
-В `README.md` добавлен раздел `Cursor + Hub Workflow` со ссылками на `docs/software-development-workflow.md`, `docs/software-development-workflow-implementation-plan.md`, `docs/cursor-agent-rules.md`, шаблон `docs/templates/cursor/openclaw-hub.mdc` и минимальный набор MCP tools.
+В `README.md` добавлен раздел `Cursor + Hub Workflow` со ссылками на `docs/software-development-workflow.md`, `docs/software-development-workflow-implementation-plan.md`, `docs/cursor-agent-rules.md`, шаблон `docs/templates/cursor/haiplane-hub.mdc` и минимальный набор MCP tools.
 
 
 
@@ -242,7 +242,7 @@ uv run pytest -q
 **Итог**
 
 - `docs/workspace-safety-policy.md` — 4 инварианта: один branch на задачу, неприкосновенность чужого branch, out-of-scope только через draft proposal, конфликт branch/PR/CI → `needs_decision`. Секции по ролям и аудиту.
-- Ссылки: `docs/software-development-workflow.md` (секция «Branch, PR и CI»), `docs/cursor-agent-rules.md` (вступление), `docs/templates/cursor/openclaw-hub.mdc` (правило branch isolation), `README.md` (секция «Cursor + Hub Workflow»).
+- Ссылки: `docs/software-development-workflow.md` (секция «Branch, PR и CI»), `docs/cursor-agent-rules.md` (вступление), `docs/templates/cursor/haiplane-hub.mdc` (правило branch isolation), `README.md` (секция «Cursor + Hub Workflow»).
 
 **Проблема**
 

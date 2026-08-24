@@ -35,7 +35,7 @@ async def check_default_workspace_origin() -> bool | None:
     if not ok:
         log.warning(
             "Default workspace %s cannot reach origin: pair branches would be "
-            "cut from a possibly stale base. Fix the openclaw service git access "
+            "cut from a possibly stale base. Fix the haiplane service git access "
             "(deploy key / ssh) — see docs/agent-deploy-runbook.md.",
             repo,
         )

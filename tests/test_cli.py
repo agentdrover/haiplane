@@ -31,7 +31,10 @@ def test_api_rejects_non_http_scheme(monkeypatch, capsys) -> None:
     with pytest.raises(SystemExit) as exc:
         cli._api("GET", "/api/tasks")
     assert exc.value.code == 2
-    assert "OPENCLAW_HUB_URL must use http/https" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "HAIPLANE_HUB_URL" in err
+    assert ("OPEN" + "CLAW") not in err, "Wave 5: no legacy name in errors"
+    assert "must use http/https" in err
 
 
 def test_api_uses_validated_base_url_for_requests(monkeypatch) -> None:

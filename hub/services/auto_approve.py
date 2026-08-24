@@ -153,7 +153,7 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
             f"{risk.value} не выше действующего потолка {ceiling.value}. "
             f"Потолки: проектный "
             f"{project_ceiling.value if project_ceiling else '—'}, глобальный "
-            f"{global_ceiling.value} (OPENCLAW_AUTO_APPROVE_MAX_CLASS={mode}). "
+            f"{global_ceiling.value} (HAIPLANE_AUTO_APPROVE_MAX_CLASS={mode}). "
             f"Признаки: {'; '.join(reasons) or '—'}."
         ),
         author_kind="hub",

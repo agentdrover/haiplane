@@ -225,14 +225,14 @@ async def test_surfaces_default_mode_stays_warn(monkeypatch) -> None:
     import importlib
     import os
 
-    monkeypatch.delenv("OPENCLAW_SDD_SURFACES", raising=False)
+    monkeypatch.delenv("HAIPLANE_SDD_SURFACES", raising=False)
     fresh = importlib.reload(config)
     try:
         assert fresh.SDD_SURFACES == "warn"
     finally:
         # Leave the module as the rest of the suite expects to find it.
-        if "OPENCLAW_SDD_SURFACES" in os.environ:
-            del os.environ["OPENCLAW_SDD_SURFACES"]
+        if "HAIPLANE_SDD_SURFACES" in os.environ:
+            del os.environ["HAIPLANE_SDD_SURFACES"]
         importlib.reload(config)
 
 

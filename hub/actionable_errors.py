@@ -178,7 +178,7 @@ def self_review_forbidden_detail(agent: str) -> dict[str, Any]:
             "message": f"agent '{agent}' implemented this task and cannot review it",
             "hint": "The Universal Review Gate requires an independent reviewer: "
             "another agent principal or a human token must submit the verdict. "
-            "Solo mode: set OPENCLAW_REVIEW_SELF_APPROVE=allow.",
+            "Solo mode: set HAIPLANE_REVIEW_SELF_APPROVE=allow.",
             "required_role": "independent_reviewer",
             "suggested_tool": None,
         }

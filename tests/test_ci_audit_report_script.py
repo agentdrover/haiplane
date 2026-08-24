@@ -38,6 +38,39 @@ def script():
     return _load()
 
 
+@pytest.fixture(autouse=True)
+def _clean_prefixed_env(monkeypatch):
+    """Neither prefix may leak in from the developer's shell (Task 4)."""
+    for suffix in ("HUB_URL", "HUB_CI_TOKEN"):
+        monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
+
+
+def test_hub_credentials_accepted_under_the_haiplane_prefix(
+    script, monkeypatch, tmp_path
+):
+    """The filer reads the HAIPLANE_* credentials."""
+    report = tmp_path / "audit.json"
+    report.write_text(
+        json.dumps(
+            _report({"id": "PYSEC-9", "fix_versions": ["1.0"], "description": "d"})
+        )
+    )
+    monkeypatch.setenv("AUDIT_JSON", str(report))
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "new-prefix-token")  # noqa: S105
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        script,
+        "hub_post",
+        lambda base, token, path, payload: (
+            seen.append((base, token)) or {"id": 1, "status": "draft"}
+        ),
+    )
+    assert script.main() == 0
+    assert seen == [("https://hub.example", "new-prefix-token")]
+
+
 def _report(*vulns: dict) -> dict:
     return {
         "dependencies": [
@@ -83,8 +116,8 @@ def test_each_vulnerability_becomes_a_hub_draft(script, monkeypatch, tmp_path):
         )
     )
     monkeypatch.setenv("AUDIT_JSON", str(report))
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
 
     sent: list[dict] = []
     monkeypatch.setattr(
@@ -121,8 +154,8 @@ def test_repeated_runs_neither_duplicate_nor_conflict(script, monkeypatch, tmp_p
         )
     )
     monkeypatch.setenv("AUDIT_JSON", str(report))
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
 
     payloads: list[dict] = []
     monkeypatch.setattr(
@@ -153,8 +186,8 @@ def test_a_clean_audit_creates_nothing(script, monkeypatch, tmp_path):
         json.dumps({"dependencies": [{"name": "x", "version": "1", "vulns": []}]})
     )
     monkeypatch.setenv("AUDIT_JSON", str(report))
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
 
     called: list = []
     monkeypatch.setattr(script, "hub_post", lambda *a, **k: called.append(a) or {})
@@ -167,8 +200,8 @@ def test_the_reporter_never_fails_the_job(script, monkeypatch, tmp_path, capsys)
     # AC-5 (#611): every failure path ends in exit 0 WITH a reason. A reporting
     # hiccup that reddened the job would block merges for every task — the exact
     # failure this task exists to remove.
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://hub.example")
-    monkeypatch.setenv("OPENCLAW_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
 
     # 1. No report file at all (the audit step itself died early).
     monkeypatch.setenv("AUDIT_JSON", str(tmp_path / "missing.json"))
@@ -198,7 +231,7 @@ def test_the_reporter_never_fails_the_job(script, monkeypatch, tmp_path, capsys)
 
     # 5. Findings exist but no credentials: they must still be printed, so the
     #    run is not silent about a vulnerability it could not file.
-    monkeypatch.delenv("OPENCLAW_HUB_CI_TOKEN", raising=False)
+    monkeypatch.delenv("HAIPLANE_HUB_CI_TOKEN", raising=False)
     assert script.main() == 0
     out = capsys.readouterr().out
     assert "PYSEC-2" in out and "not configured" in out

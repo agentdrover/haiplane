@@ -166,7 +166,8 @@ def workflow_reference_dict() -> dict[str, Any]:
                 "rule": "when policy requires it (#382): run the "
                 "multi-agent harness (hub_get_skill 'machine-review-cycle') "
                 "and submit the report BEFORE the human verdict; "
-                "OPENCLAW_MACHINE_REVIEW=require blocks the verdict without "
+                "HAIPLANE_MACHINE_REVIEW=require "
+                "blocks the verdict without "
                 "a current report, default 'warn' only surfaces the gap",
             },
             "decision": {
@@ -250,7 +251,7 @@ def mcp_workflow_instruction_section() -> str:
 def build_mcp_instructions() -> str:
     """Full MCP server instructions including workflow discoverability."""
     return (
-        "MCP server for OpenClaw Hub — project state, tasks, proposals, decisions. "
+        "MCP server for Haiplane Hub — project state, tasks, proposals, decisions. "
         "Agent canonical task completion: hub_report_done only (not hub_decide_task, "
         "hub_force_complete_task, or hub_approve_task). hub_task_update kind=done is "
         "a deprecated alias of hub_report_done with the same response contract. "
@@ -259,6 +260,7 @@ def build_mcp_instructions() -> str:
         "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
         "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
         "actor_hint (agent|human|ci|none). Every response also includes instance "
-        "(prod|local) and base_url echoing OPENCLAW_HUB_URL. Structured errors use "
+        "(prod|local) and base_url echoing HAIPLANE_HUB_URL. "
+        "Structured errors use "
         "the same envelope plus reason and hint." + mcp_workflow_instruction_section()
     )

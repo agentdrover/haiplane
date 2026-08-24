@@ -1,6 +1,6 @@
 ---
 name: hub-development
-description: Use when implementing or modifying code in the standalone OpenClaw Hub project, including FastAPI routes, services, CLI, MCP tools, database migrations, web UI, and integrations.
+description: Use when implementing or modifying code in the standalone Haiplane Hub project, including FastAPI routes, services, CLI, MCP tools, database migrations, web UI, and integrations.
 ---
 
 # Hub Development
@@ -30,7 +30,7 @@ description: Use when implementing or modifying code in the standalone OpenClaw 
 - `uv run ruff check hub tests`
 - `uv run ruff format hub tests`
 - `uv run pytest -q`
-- `uv run openclaw-hub`
+- `uv run haiplane-hub`
 
 ## File Map
 

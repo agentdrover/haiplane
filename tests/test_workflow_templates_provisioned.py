@@ -24,6 +24,7 @@ import aiosqlite
 import pytest
 import yaml
 
+from hub import brand
 from hub import repository as repo
 from hub import services
 from hub.integrations.registry import plugins
@@ -33,8 +34,12 @@ from hub.services.project_policy import ci_runner_of
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = REPO_ROOT / "hub" / "workflow_templates"
 
-CI_FILE = "openclaw-ci.yml"
-STALE_FILE = "openclaw-stale.yml"
+CI_FILE = "haiplane-ci.yml"
+STALE_FILE = "haiplane-stale.yml"
+# Собрано конкатенацией: негативный тест называет старую пару файлов, а страж
+# (tests/test_no_legacy_name.py) не должен ловить его самого.
+CI_FILE_LEGACY = "open" + "claw" + "-ci.yml"
+STALE_FILE_LEGACY = "open" + "claw" + "-stale.yml"
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +216,30 @@ def test_the_templates_name_no_branch_and_leave_no_placeholder(name: str):
         workflow_seed.render(name, base_branch="", release_branch="production")
 
 
+def test_rendered_ci_template_has_no_placeholders(monkeypatch):
+    """Wave 4-code: the seeded ``uses:`` line goes through the renderer, fed
+    from ``brand.ci_report_action()`` after ``require_github_owner()``. An
+    unresolved ``@@`` would ship a step referencing an action called
+    ``@@CI_REPORT_ACTION@@``, which GitHub reports as a broken workflow — and
+    an EMPTY owner must refuse the render loudly rather than quietly emit the
+    legacy ``mrPDA`` slug into a freshly provisioned repository."""
+    monkeypatch.setattr(brand, "GITHUB_OWNER", "agentdrover")
+    rendered = workflow_seed.render(
+        "ci.yml", base_branch="develop", release_branch="main"
+    )
+    assert "@@" not in rendered
+    assert "agentdrover/haiplane/.github/actions/hub-ci-report@main" in rendered
+    assert "secrets.HAIPLANE_HUB_URL }}" in rendered
+    assert "secrets.HAIPLANE_HUB_CI_TOKEN }}" in rendered
+    assert ("OPEN" + "CLAW") not in rendered.upper(), (
+        "Wave 5: no legacy secret fallback in the seeded workflow"
+    )
+
+    monkeypatch.setattr(brand, "GITHUB_OWNER", "")
+    with pytest.raises(ValueError):
+        workflow_seed.render("ci.yml", base_branch="develop", release_branch="main")
+
+
 def test_the_seeded_ci_trigger_names_no_base_branch_allowlist():
     """The mistake #475 fixed in the hub's own workflow, in the file that
     would have copied it into every project: an allowlist that does not name a
@@ -310,6 +339,38 @@ async def test_a_repository_with_its_own_workflow_is_left_alone(
     assert sorted(p.name for p in workflows.iterdir()) == ["ci.yml"]
     assert _git(work, "rev-parse", "HEAD") == before
     assert "already carries workflows" in result["provision_detail"]
+
+
+def test_legacy_named_workflows_read_as_foreign_ci(tmp_path: Path):
+    """Wave 5: pre-rename file names are no longer hub-owned. A repository
+    carrying them is simply "a repository that already runs CI" — the answer
+    is PRESENT because workflows exist, and nothing is written beside them."""
+    work, _ = _repo_pair(tmp_path, "develop")
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / CI_FILE_LEGACY).write_text("name: legacy CI\n", "utf-8")
+    (workflows / STALE_FILE_LEGACY).write_text("name: legacy stale\n", "utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "seeded before the rename")
+
+    result = workflow_seed.seed_project_workflows(
+        str(work), base_branch="develop", release_branch="main", push=False
+    )
+
+    assert result.state == workflow_seed.PRESENT
+    assert result.written == ()
+    assert sorted(p.name for p in workflows.iterdir()) == sorted(
+        [CI_FILE_LEGACY, STALE_FILE_LEGACY]
+    ), "a repository that already runs something gets nothing written"
+
+
+def test_the_seeded_names_are_the_haiplane_pair():
+    """Fresh repositories get the haiplane names, and the seeder knows no
+    other family."""
+    assert set(workflow_seed.SEEDED_WORKFLOWS.values()) == {CI_FILE, STALE_FILE}
+    assert not hasattr(workflow_seed, "LEGACY_SEEDED"), (
+        "Wave 5: the legacy seeded-name set must be gone"
+    )
 
 
 # --------------------------------------------------------------------------

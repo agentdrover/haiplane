@@ -3,8 +3,8 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}OpenClaw Hub{% endblock %}</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f980;</text></svg>">
+    <title>{% block title %}{{ product_title }}{% endblock %}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><polygon points='18,12 88,50 18,88' fill='%236c5ce7'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -20,7 +20,7 @@
 <div class="layout">
     <aside class="sidebar">
         <div class="logo">
-            <span class="logo-main">OpenClaw</span>
+            <span class="logo-main">{{ product_name }}</span>
             <span class="logo-sub">Hub</span>
         </div>
         <nav>
@@ -53,7 +53,7 @@
             {% endif %}
         </nav>
         <div class="sidebar-footer">
-            <div>OpenClaw Hub v0.2</div>
+            <div>{{ product_title }} v{{ app_version }}</div>
             {% if current_user and current_user != 'anonymous' %}
             <div class="sidebar-user">
                 <span class="sidebar-user-name">{{ current_user }}</span>

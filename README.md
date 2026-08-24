@@ -1,4 +1,6 @@
-# OpenClaw Hub
+# Haiplane Hub
+
+The public home is https://github.com/agentdrover/haiplane.
 
 Task orchestration server for AI agent pipelines. Manages task lifecycle, dispatches work to agents, runs automated code review cycles, and provides a web dashboard.
 
@@ -10,7 +12,7 @@ Task orchestration server for AI agent pipelines. Manages task lifecycle, dispat
 - **Plugin architecture**: integrations (dispatch, git_ops, GitHub, Vast.ai, notes) are pluggable
 - **Web dashboard**: HTMX-powered UI with inbox, kanban, task detail, log viewer
 - **MCP server**: Model Context Protocol tools for Cursor/remote agents
-- **CLI**: `oc-hub` command for agents and humans
+- **CLI**: `hp-hub` command for agents and humans (legacy alias: `oc-hub`)
 - **Background poller**: auto-sync with dispatch jobs, stale detection, review dispatch
 
 For the recommended human + AI-agent software delivery flow, see
@@ -22,22 +24,37 @@ passwords, see [docs/admin-section-design.md](docs/admin-section-design.md).
 
 ## Quick Start
 
+### Docker (fastest)
+
 ```bash
-# Clone
-git clone https://github.com/mrPDA/openclaw-hub.git
-cd openclaw-hub
+git clone https://github.com/agentdrover/haiplane.git
+cd haiplane
+docker compose up -d --build
+# → http://localhost:8080
+```
+
+The container starts with demo data (project `demo`: an epic, a feature and
+tasks across the whole lifecycle) so the dashboard is alive on first open.
+To start empty, set `HAIPLANE_DEMO_SEED: "0"` in `docker-compose.yml`.
+The SQLite database persists in `./data` on the host.
+
+### From source (dev)
+
+```bash
+git clone https://github.com/agentdrover/haiplane.git
+cd haiplane
 
 # Install (also arms the pre-push hook that enforces branch policy)
 make setup
 
 # Run
-openclaw-hub
+haiplane-hub
 # → http://localhost:8080
 ```
 
 ## Cursor + Hub Workflow
 
-Run the hub, connect Cursor to its MCP endpoint, and treat OpenClaw Hub as the
+Run the hub, connect Cursor to its MCP endpoint, and treat Haiplane Hub as the
 task state source. Step-by-step MCP setup (streamable URL, headers, stdio vs
 HTTP, troubleshooting) is in
 [docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).
@@ -48,7 +65,7 @@ the staged rollout lives in
 Cursor-specific rules are in
 [docs/cursor-agent-rules.md](docs/cursor-agent-rules.md), with an installable
 template at
-[docs/templates/cursor/openclaw-hub.mdc](docs/templates/cursor/openclaw-hub.mdc).
+[docs/templates/cursor/haiplane-hub.mdc](docs/templates/cursor/haiplane-hub.mdc).
 
 Branch and workspace safety invariants for multi-agent work are in
 [docs/workspace-safety-policy.md](docs/workspace-safety-policy.md).
@@ -64,28 +81,28 @@ Minimum MCP tools for daily work:
 
 ## Configuration
 
-All configuration via environment variables:
+All configuration via environment variables, under the `HAIPLANE_*` prefix.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENCLAW_HUB_REPO` | `""` | GitHub repo (e.g. `owner/repo`) for PR/commit integration |
-| `OPENCLAW_WORKSPACE_REPO` | `~/.openclaw/workspace/repo` | Path to the workspace git repo |
-| `OPENCLAW_DISPATCH_BIN` | `~/.local/bin/oc-dev-dispatch` | Path to dispatch binary |
-| `OPENCLAW_HUB_DB` | `~/.local/state/openclaw-hub/hub.db` | SQLite database path |
-| `OPENCLAW_HUB_HOST` | `0.0.0.0` | Server bind host |
-| `OPENCLAW_HUB_PORT` | `8080` | Server bind port |
-| `OPENCLAW_TRANSCRIPTS_DIR` | `~/.openclaw/transcripts` | Agent transcript directory |
-| `OPENCLAW_N4L_BIN` | `~/.local/bin/n4l` | notesforllm CLI path |
-| `OPENCLAW_N4L_SPACE` | `""` | notesforllm space ID |
-| `OPENCLAW_VAST_JOB_BIN` | `~/.local/bin/vast-openclaw` | Vast.ai CLI path |
+| `HAIPLANE_HUB_REPO` | `""` | GitHub repo (e.g. `owner/repo`) for PR/commit integration |
+| `HAIPLANE_WORKSPACE_REPO` | `~/.haiplane/workspace/repo` | Path to the workspace git repo |
+| `HAIPLANE_DISPATCH_BIN` | `~/.local/bin/hp-dev-dispatch` | Path to dispatch binary |
+| `HAIPLANE_HUB_DB` | `~/.local/state/haiplane-hub/hub.db` | SQLite database path |
+| `HAIPLANE_HUB_HOST` | `0.0.0.0` | Server bind host |
+| `HAIPLANE_HUB_PORT` | `8080` | Server bind port |
+| `HAIPLANE_TRANSCRIPTS_DIR` | `~/.haiplane/transcripts` | Agent transcript directory |
+| `HAIPLANE_N4L_BIN` | `~/.local/bin/n4l` | notesforllm CLI path |
+| `HAIPLANE_N4L_SPACE` | `""` | notesforllm space ID |
+| `HAIPLANE_VAST_JOB_BIN` | `~/.local/bin/vast-haiplane` | Vast.ai CLI path |
 | `GH_BIN` | `gh` | GitHub CLI binary |
-| `OPENCLAW_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
-| `OPENCLAW_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
-| `OPENCLAW_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
-| `OPENCLAW_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
-| `OPENCLAW_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |
-| `OPENCLAW_STALE_CLAIMED_MINUTES` | `240` | Minutes before a claim without pair start is flagged stale |
-| `OPENCLAW_STALE_NEEDS_INFO_MINUTES` | `480` | Minutes before an unanswered question is flagged stale |
+| `HAIPLANE_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
+| `HAIPLANE_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
+| `HAIPLANE_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
+| `HAIPLANE_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
+| `HAIPLANE_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |
+| `HAIPLANE_STALE_CLAIMED_MINUTES` | `240` | Minutes before a claim without pair start is flagged stale |
+| `HAIPLANE_STALE_NEEDS_INFO_MINUTES` | `480` | Minutes before an unanswered question is flagged stale |
 
 ## Structured task form & readiness
 
@@ -155,7 +172,7 @@ Full Pydantic schema in `hub/models.py` (`TaskCreate`, `TaskRefine`,
 
 ### Readiness score and recommendations
 
-`GET /api/tasks/{id}/readiness` (and `oc-hub readiness <id>`) returns a
+`GET /api/tasks/{id}/readiness` (and `hp-hub readiness <id>`) returns a
 deterministic 0–100 score:
 
 - start at 100;
@@ -202,29 +219,29 @@ pass — so explicit human overrides are never invisible.
 
 ```bash
 # 1. Pick a template for the work type and write it to a file
-oc-hub template list
-oc-hub template feature --out task-17.yaml
+hp-hub template list
+hp-hub template feature --out task-17.yaml
 
 # 2. Edit task-17.yaml, then push it onto an existing draft (PATCH semantics)
-oc-hub refine 17 --from-file task-17.yaml
+hp-hub refine 17 --from-file task-17.yaml
 
 # 3. Add or replace acceptance criteria
-oc-hub ac add 17 --id AC-1 --given "..." --when "..." --then "..." --by test
-oc-hub ac list 17
-oc-hub ac replace 17 --from-file acs.yaml         # atomic replace
-oc-hub ac delete 17 AC-1
+hp-hub ac add 17 --id AC-1 --given "..." --when "..." --then "..." --by test
+hp-hub ac list 17
+hp-hub ac replace 17 --from-file acs.yaml         # atomic replace
+hp-hub ac delete 17 AC-1
 
 # 4. Add risks (read-modify-write)
-oc-hub risk add 17 --kind security --severity high \
+hp-hub risk add 17 --kind security --severity high \
                     --description "auth bypass" --mitigation "add audit + 2FA"
 
 # 5. Check readiness before approving
-oc-hub readiness 17                # human summary
-oc-hub readiness 17 --explain      # full JSON with score breakdown
+hp-hub readiness 17                # human summary
+hp-hub readiness 17 --explain      # full JSON with score breakdown
 
 # 6. Approve (or force-approve, audited)
-oc-hub approve 17 --comment "ready"
-oc-hub approve 17 --force --comment "deploy now, will fix gaps in PR"
+hp-hub approve 17 --comment "ready"
+hp-hub approve 17 --force --comment "deploy now, will fix gaps in PR"
 ```
 
 `--from-file` accepts JSON or YAML (`.json`, `.yaml`, `.yml`). YAML
@@ -258,7 +275,7 @@ Hub uses a plugin architecture for external integrations. Each integration imple
 - `GitOpsPlugin` — git branch/PR/merge via local git + `gh` CLI
 - `GitHubPlugin` — commits/PRs via `gh` CLI
 - `NotesPlugin` — decisions via `n4l` CLI
-- `VastPlugin` — GPU instance management via `vast-openclaw`
+- `VastPlugin` — GPU instance management via `vast-haiplane`
 - `TranscriptsPlugin` — agent transcript viewer
 
 **Without plugins**: Hub starts with noop implementations — all features work, integrations gracefully return empty data.
@@ -283,7 +300,7 @@ uv pip install -e . && uv pip install pytest pytest-asyncio pytest-cov ruff
 
 ```bash
 # In your project
-git submodule add git@github.com:mrPDA/openclaw-hub.git hub
+git submodule add git@github.com:agentdrover/haiplane.git hub
 git submodule update --init --recursive
 
 # Install
@@ -302,7 +319,7 @@ hub/
 ├── models.py           # Pydantic models and enums
 ├── poller.py           # Background task sync
 ├── config.py           # Environment-based configuration
-├── cli.py              # oc-hub CLI
+├── cli.py              # hp-hub CLI
 ├── mcp_server.py       # MCP tools for agents
 ├── integrations/
 │   ├── protocols.py    # Plugin protocol definitions

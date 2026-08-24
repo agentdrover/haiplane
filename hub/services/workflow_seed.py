@@ -8,14 +8,15 @@ given work, could finish it, could have it approved, and then had no
 supported path to delivery at all. ``.github/workflows`` existed in the hub's
 own repository and nowhere else.
 
-WHAT THE HUB OWNS, AND ONLY THAT. Two file names — ``openclaw-ci.yml`` and
-``openclaw-stale.yml``. It writes them into a repository that carries NO
-workflows of its own, and into no other. A repository that already runs
-something on a pull request has already answered the question this seeding
-asks, and the gate can read that answer; overwriting it, or adding a second
-opinion beside it, would be the hub editing somebody else's CI. That rule is
-also what keeps the hub's own repository out of scope here: it carries
-``ci.yml``, so this code never touches it.
+WHAT THE HUB OWNS, AND ONLY THAT. Two file names — ``haiplane-ci.yml`` and
+``haiplane-stale.yml``. New files are written only into a repository that
+carries NO workflows of its own, and into no other.
+A repository that already runs something on a pull request has already
+answered the question this seeding asks, and the gate can read that answer;
+overwriting it, or adding a second opinion beside it, would be the hub
+editing somebody else's CI. That rule is also what keeps the hub's own
+repository out of scope here: it carries ``ci.yml``, so this code never
+touches it.
 
 WHY NOTHING IS GUESSED. The CI template contains no build command. Inventing
 one for a repository the hub has never read would turn ``ci_absent`` into
@@ -42,6 +43,8 @@ import subprocess  # nosec B404
 from dataclasses import dataclass, field
 from importlib import resources
 
+from hub import brand
+
 log = logging.getLogger(__name__)
 
 TEMPLATE_PACKAGE = "hub.workflow_templates"
@@ -55,8 +58,8 @@ WORKFLOW_SUFFIXES = (".yml", ".yaml")
 #: carry the owner on purpose: re-provisioning may rewrite a file the hub
 #: wrote, and must never rewrite one it did not.
 SEEDED_WORKFLOWS = {
-    "ci.yml": "openclaw-ci.yml",
-    "stale.yml": "openclaw-stale.yml",
+    "ci.yml": brand.SEEDED_CI,
+    "stale.yml": brand.SEEDED_STALE,
 }
 
 #: The runner the shared reporting action documents as its default
@@ -145,9 +148,13 @@ def render(
             f"{name}: both the integration and the release branch must be known "
             "before a workflow can be rendered for this project"
         )
+    # require_github_owner() first: an empty owner must refuse the render
+    # as a provisioning detail somebody reads, not fail deeper in.
+    brand.require_github_owner()
     values = {
         "BASE_BRANCH": base,
         "RELEASE_BRANCH": release,
+        "CI_REPORT_ACTION": brand.ci_report_action(),
         # A JSON array is also a valid YAML flow sequence, and it quotes and
         # escapes every element for us — a branch name with a slash in it is
         # the ordinary case here, not the exotic one.
@@ -330,12 +337,12 @@ def _seed(
     rc, out = _git(
         workspace,
         "-c",
-        "user.name=OpenClaw Hub",
+        "user.name=Haiplane Hub",
         "-c",
-        "user.email=hub@openclaw.local",
+        "user.email=hub@haiplane.local",
         "commit",
         "-m",
-        "ci: add OpenClaw workflows (hub provisioning, #476)",
+        "ci: add Haiplane workflows (hub provisioning, #476)",
         "--",
         *paths,
     )

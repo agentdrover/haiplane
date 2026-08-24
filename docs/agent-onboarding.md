@@ -1,7 +1,7 @@
-# Онбординг агента: как работать с OpenClaw Hub
+# Онбординг агента: как работать с Haiplane Hub
 
 Эта инструкция — единая точка входа для нового ИИ-агента (Cursor или удалённого),
-который начинает работать с сервисом OpenClaw Hub. Прочитай её целиком до первого
+который начинает работать с сервисом Haiplane Hub. Прочитай её целиком до первого
 действия. Hub — это **источник правды** по состоянию задач, вопросам, блокерам,
 решениям и отчётам о завершении.
 
@@ -75,7 +75,7 @@ stateDiagram-v2
 | Инстанс | URL | Назначение |
 |---|---|---|
 | **Локальный** | `http://127.0.0.1:8080` | разработка, своя `hub.db` |
-| **Production** | `http://agenthai.ru:8080` (IP `194.113.34.33`) | боевой сервер |
+| **Production** | `http://agenthai.ru:8080` | боевой сервер |
 
 Ключевые факты:
 
@@ -86,14 +86,13 @@ stateDiagram-v2
 - Порт `8080` снаружи закрыт. К production MCP подключайся через SSH-туннель:
 
   ```bash
-  ssh -L 8080:127.0.0.1:8080 user1@194.113.34.33
+  ssh -L 8080:127.0.0.1:8080 <DEPLOY_USER>@<DEPLOY_HOST>
   # затем MCP URL: http://127.0.0.1:8080/mcp
   ```
 
-- Токен для Cursor лежит на сервере: `~/openclaw-hub-cursor-token.txt`
-  (только наличие проверяй, **в чат токены не печатай**).
+- Токен для Cursor хранится у оператора вне репозитория и вне домашних каталогов сервера
 - Каждый ответ MCP-инструмента содержит поля **`instance`** (`prod`|`local`) и
-  **`base_url`** (значение `OPENCLAW_HUB_URL` на сервере). Для JSON-ответов парси
+  **`base_url`** (значение `HAIPLANE_HUB_URL` на сервере). Для JSON-ответов парси
   `json.loads(result)`; для mutation-envelope поля рядом с `status`/`awaiting`.
 
 ---
@@ -105,7 +104,7 @@ MCP смонтирован на `/mcp` (streamable HTTP). Аутентифика
 Минимальная проверка, что сервер жив:
 
 ```bash
-# initialize → ожидаем serverInfo: openclaw-hub
+# initialize → ожидаем serverInfo: haiplane-hub
 curl -sS \
   -H "Authorization: Bearer <TOKEN>" \
   -H "Accept: application/json, text/event-stream" \
@@ -122,7 +121,7 @@ curl -sS \
 - После `initialize` сервер возвращает `Mcp-Session-Id` — передавай его в
   последующих запросах (`tools/list`, `tools/call`).
 - Конфигурация окружения локального hub — в `.env.local`
-  (`OPENCLAW_HUB_URL`, `OPENCLAW_HUB_TOKEN`, `OPENCLAW_HUB_DB`, `OPENCLAW_HUB_TOKENS`).
+  (`HAIPLANE_HUB_URL`, `HAIPLANE_HUB_TOKEN`, `HAIPLANE_HUB_DB`, `HAIPLANE_HUB_TOKENS`).
 
 ---
 
@@ -242,12 +241,12 @@ Universal Review Gate сравнивает **принципалов**, а не �
 для env-токенов — по имени против `assigned_agent`/`claimed_by`. Поэтому
 один токен `cursor` на «имплементацию + ревью» стопорит цикл ревью.
 
-Решение — вторая агентская идентичность в `OPENCLAW_HUB_TOKENS` (код менять
+Решение — вторая агентская идентичность в `HAIPLANE_HUB_TOKENS` (код менять
 не нужно, поддерживается любое число токенов):
 
 ```bash
-# .env.local / /etc/openclaw-hub/openclaw-hub.env — только плейсхолдеры!
-OPENCLAW_HUB_TOKENS=you:your-human-token:human,cursor:your-agent-token:agent,cursor-reviewer:your-reviewer-token:agent
+# .env.local / /etc/haiplane-hub/haiplane-hub.env — только плейсхолдеры!
+HAIPLANE_HUB_TOKENS=you:your-human-token:human,cursor:your-agent-token:agent,cursor-reviewer:your-reviewer-token:agent
 ```
 
 Требования к reviewer-токену:
@@ -257,26 +256,26 @@ OPENCLAW_HUB_TOKENS=you:your-human-token:human,cursor:your-agent-token:agent,cur
 - секрет генерируй локально (`openssl rand -hex 32`), в git и чат не печатай.
 
 Передача ревью другой идентичности (оркестратор): у MCP/CLI-клиента hub
-токен берётся из `OPENCLAW_HUB_TOKEN`. Reviewer-сессия (отдельный агент,
+токен берётся из `HAIPLANE_HUB_TOKEN`. Reviewer-сессия (отдельный агент,
 subagent или профиль MCP-сервера) запускается с reviewer-токеном:
 
 ```bash
 # сессия исполнителя
-OPENCLAW_HUB_TOKEN=your-agent-token      # identity: cursor
+HAIPLANE_HUB_TOKEN=your-agent-token      # identity: cursor
 # сессия ревьюера — другой env-профиль / MCP-конфиг
-OPENCLAW_HUB_TOKEN=your-reviewer-token   # identity: cursor-reviewer
+HAIPLANE_HUB_TOKEN=your-reviewer-token   # identity: cursor-reviewer
 ```
 
 Проверить, кто ты сейчас: `hub_admin_my_identity`. Solo-режим без второго
-токена — явный opt-out `OPENCLAW_REVIEW_SELF_APPROVE=allow` (не для прода).
+токена — явный opt-out `HAIPLANE_REVIEW_SELF_APPROVE=allow` (не для прода).
 Роли: `agents/python-senior-developer.md` (исполнитель) и
 `agents/code-reviewer.md` (ревьюер).
 
-### Соло-режим: `OPENCLAW_REVIEW_SELF_APPROVE`
+### Соло-режим: `HAIPLANE_REVIEW_SELF_APPROVE`
 
 Universal Review Gate требует независимого ревьюера: агент, который
 реализовал задачу (`assigned_agent`/`claimed_by`/principal), не может сам
-принять вердикт. `OPENCLAW_REVIEW_SELF_APPROVE=allow` — осознанное
+принять вердикт. `HAIPLANE_REVIEW_SELF_APPROVE=allow` — осознанное
 ослабление гейта для соло-работы. Допустимо: локальная разработка в
 одиночку (один человек + один агент, второго агента-ревьюера нет),
 прототипы, личные стенды. Недопустимо: общий/продакшн-инстанс с
@@ -523,7 +522,7 @@ CI на PR гоняет также `pip-audit`, `bandit` и secret-scan — сл
 - `docs/repository-rules.md` — ветки, коммиты, процесс.
 - `docs/task-workflow.html` — pair path B и git-сценарии (визуально).
 - `docs/software-development-workflow.md` — полный lifecycle.
-- `docs/agent-deploy-runbook.md` — сервер, env, деплой, `OPENCLAW_WORKSPACE_REPO`.
+- `docs/agent-deploy-runbook.md` — сервер, env, деплой, `HAIPLANE_WORKSPACE_REPO`.
 - `deploy/CD.md` — автодеплой при merge в `main`.
 - `docs/agent-context/` — `system-map.md`, `change-map.md`, `invariants.md`,
   `contracts.md`, `testing-playbook.md`.
@@ -534,7 +533,7 @@ CI на PR гоняет также `pip-audit`, `bandit` и secret-scan — сл
 
 1. `make setup` в свежем клоне (ставит окружение И вооружает pre-push хук); проверить — `make doctor`.
 2. Понять, на каком инстансе работаешь (локальный vs agenthai).
-3. Проверить доступ к MCP (`initialize` → `serverInfo: openclaw-hub`).
+3. Проверить доступ к MCP (`initialize` → `serverInfo: haiplane-hub`).
 4. `hub_my_context(task_id)` или `hub_project_status` для контекста.
 5. Убедиться, что задача готова (`hub_get_readiness`), иначе — refine.
 6. Зафиксировать план (`hub_task_update kind="status"`).

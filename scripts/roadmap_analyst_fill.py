@@ -3,17 +3,18 @@
 
 from __future__ import annotations
 
-import os
 import sys
 
 import httpx
 
-TOKEN = os.environ.get("OPENCLAW_HUB_TOKEN") or os.environ.get("OPENCLAW_HUB_MCP_TOKEN")
+from hub.config import env_get
+
+TOKEN = env_get("HUB_TOKEN") or env_get("HUB_MCP_TOKEN")
 if not TOKEN:
-    print("Set OPENCLAW_HUB_TOKEN", file=sys.stderr)
+    print("Set HAIPLANE_HUB_TOKEN", file=sys.stderr)
     sys.exit(1)
 
-BASE = os.environ.get("OPENCLAW_HUB_URL", "https://agenthai.ru").rstrip("/")
+BASE = env_get("HUB_URL", "https://agenthai.ru").rstrip("/")
 
 
 def ac(_id: str, g: str, w: str, t: str, vb: str = "manual") -> dict:
@@ -403,7 +404,7 @@ TASKS: dict[int, dict] = {
                 "AC-1",
                 "Env-токен",
                 "whoami",
-                "Совпадает с ожидаемой ролью из OPENCLAW_HUB_TOKENS",
+                "Совпадает с ожидаемой ролью из HAIPLANE_HUB_TOKENS",
             ),
             ac(
                 "AC-2",

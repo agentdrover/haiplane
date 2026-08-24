@@ -357,8 +357,8 @@ class DispatchIntegration:
 
         env = dict(os.environ)
         if agent:
-            env["OPENCLAW_OPENROUTER_DEV_AGENT"] = agent
-            env["OPENCLAW_VAST_DEV_AGENT"] = agent
+            env["HAIPLANE_OPENROUTER_DEV_AGENT"] = agent
+            env["HAIPLANE_VAST_DEV_AGENT"] = agent
 
         try:
             proc = await asyncio.create_subprocess_exec(

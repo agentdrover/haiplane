@@ -26,6 +26,7 @@ that declares one is never overridden.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from unittest.mock import AsyncMock
 
@@ -430,5 +431,30 @@ def test_the_ci_trigger_names_no_base_branch_allowlist():
 def test_the_only_sanctioned_fallback_is_the_configured_one():
     """config.PAIR_BASE_BRANCH is the single place the word may be written,
     and it stays env-overridable so a different deployment is a setting."""
-    source = (REPO_ROOT / "hub" / "config.py").read_text()
-    assert 'os.environ.get("OPENCLAW_PAIR_BASE_BRANCH", "develop")' in source
+    import sys
+
+    from hub import config
+
+    # In this process (no override set in CI): the configured default.
+    assert config.PAIR_BASE_BRANCH == config.env_get("PAIR_BASE_BRANCH", "develop")
+    # In a fresh process with no override under either prefix, the value is
+    # exactly the sanctioned fallback — behaviour, not a frozen source line.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("HAIPLANE_", "OPEN" + "CLAW_"))
+    }
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hub.config import PAIR_BASE_BRANCH; print(PAIR_BASE_BRANCH)",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+        check=True,
+    )
+    assert proc.stdout.strip() == "develop"

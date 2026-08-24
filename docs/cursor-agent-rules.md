@@ -1,6 +1,6 @@
 # Cursor Agent Rules
 
-These rules bind Cursor agents to the OpenClaw Hub lifecycle. The hub is the
+These rules bind Cursor agents to the Haiplane Hub lifecycle. The hub is the
 source of truth for task state, questions, blockers, decisions, and completion
 reports.
 

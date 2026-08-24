@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from hub import git_policy, repository as repo
+from hub import brand, git_policy, repository as repo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_HOOK = REPO_ROOT / ".githooks" / "pre-push"
@@ -143,7 +143,7 @@ def test_setup_runs_the_arming_target(clone: Path):
     # The command itself, expanded through the sub-make — not the word
     # "hooks", which a stub echoing that word would satisfy just as well. The
     # first version of this assertion did exactly that and survived mutation.
-    assert "oc-git-policy activate" in ran.stdout, (
+    assert "hp-git-policy activate" in ran.stdout, (
         "setup must reach the arming command, or the README documents a step "
         f"that leaves the clone unprotected. Dry run was:\n{ran.stdout}"
     )
@@ -484,6 +484,58 @@ def test_startup_actually_reaches_the_sweep():
     assert "arm_workspace_hooks" in launched, (
         "start_poller must launch the sweep, or existing workspaces wait for "
         "a human to press Provision"
+    )
+
+
+# ---- Haiplane git-config keys (Wave 5: single family) ---------------------
+
+# Собрано конкатенацией: негативные тесты называют старую семью ключей,
+# а страж (tests/test_no_legacy_name.py) не должен ловить их самих.
+_LEGACY_BASE_KEY = "open" + "claw" + ".baseBranch"
+
+
+def test_record_branch_policy_writes_only_the_haiplane_keys(tmp_path: Path):
+    """Wave 5: the hub writes haiplane.* and nothing else — every armed clone
+    reads the canonical family."""
+    target = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(target)], check=True, timeout=30)
+
+    written = git_policy.record_branch_policy(str(target), "develop", "main")
+
+    assert written == {
+        brand.GIT_BASE_BRANCH_KEY: "develop",
+        brand.GIT_RELEASE_BRANCH_KEY: "main",
+    }
+    key = brand.GIT_BASE_BRANCH_KEY
+    assert _git(target, "config", "--get", key).stdout.strip() == "develop"
+    key = brand.GIT_RELEASE_BRANCH_KEY
+    assert _git(target, "config", "--get", key).stdout.strip() == "main"
+    legacy = _git(target, "config", "--get", _LEGACY_BASE_KEY)
+    assert legacy.returncode != 0, "no legacy key family may be written"
+
+
+def test_the_hook_reads_the_haiplane_key_family(clone: Path):
+    """A clone configured with haiplane.baseBranch protects that branch."""
+    git_policy.activate(str(clone))
+    _git(clone, "config", brand.GIT_BASE_BRANCH_KEY, "integration")
+    _git(clone, "checkout", "-q", "-b", "integration")
+
+    pushed = _git(clone, "push", "origin", "integration")
+
+    assert pushed.returncode == 0, pushed.stderr
+
+
+def test_the_hook_ignores_the_legacy_key_family(clone: Path):
+    """Wave 5: a clone carrying only the pre-rename key family falls back to
+    the hook's default branches — the legacy family is not read any more."""
+    git_policy.activate(str(clone))
+    _git(clone, "config", _LEGACY_BASE_KEY, "integration")
+    _git(clone, "checkout", "-q", "-b", "integration")
+
+    pushed = _git(clone, "push", "origin", "integration")
+
+    assert pushed.returncode != 0, (
+        "the legacy key must not name a protected base branch any more"
     )
 
 

@@ -4,7 +4,7 @@
 
 Текущая auth-модель уже сдвинулась от single-user режима к multi-user MVP:
 
-- токены задаются через `OPENCLAW_HUB_TOKENS`;
+- токены задаются через `HAIPLANE_HUB_TOKENS`;
 - формат токена поддерживает роль: `name:token[:role]`;
 - роли: `human`, `agent`, `admin`;
 - `AuthMiddleware` кладет `request.state.identity`;
@@ -277,12 +277,12 @@ admin_audit_log(
 
 1. Если нет ни одного active `super_admin` / `admin`, хаб находится в `admin_bootstrap_required`.
 2. Bootstrap допускается только:
-   - через `OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN`; или
+   - через `HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN`; или
    - через локальный CLI `oc-hub admin bootstrap`, выполняемый на машине сервера.
 3. Bootstrap создает первого `super_admin`, password credential и optional API key.
 4. После успешного bootstrap токен считается использованным; его нельзя оставлять постоянным credential.
 
-Env tokens из `OPENCLAW_HUB_TOKENS`:
+Env tokens из `HAIPLANE_HUB_TOKENS`:
 
 - сохранить как compatibility fallback на один переходный релиз;
 - помечать в UI как `external/env credential`;
@@ -300,7 +300,7 @@ Env tokens из `OPENCLAW_HUB_TOKENS`:
 5. Положить в `request.state.identity`.
 6. Обновить `last_used_at` асинхронно или best-effort.
 
-Fallback: если key не найден в DB, проверить `OPENCLAW_HUB_TOKENS` до удаления env compatibility.
+Fallback: если key не найден в DB, проверить `HAIPLANE_HUB_TOKENS` (env-токены).
 
 ### Browser
 
@@ -459,7 +459,7 @@ oc-hub admin roles list
 oc-hub admin audit --limit 50
 ```
 
-CLI должен поддерживать `OPENCLAW_HUB_TOKEN` и не печатать plaintext secret повторно.
+CLI должен поддерживать `HAIPLANE_HUB_TOKEN` и не печатать plaintext secret повторно.
 
 ## MCP
 

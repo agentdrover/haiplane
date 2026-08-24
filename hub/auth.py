@@ -1,4 +1,4 @@
-"""Multi-user authentication for OpenClaw Hub.
+"""Multi-user authentication for Haiplane Hub.
 
 Auth sources (checked in order):
 
@@ -26,7 +26,7 @@ from fastapi import HTTPException, Request, status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from hub import config
+from hub import brand, config
 from hub.actionable_errors import (
     human_only_gate_detail,
     permission_denied_detail,
@@ -92,7 +92,7 @@ login_limiter = LoginRateLimiter(max_attempts=10, window_seconds=300)
 # CSRF protection (double-submit cookie)
 # ---------------------------------------------------------------------------
 
-CSRF_COOKIE_NAME = "openclaw_csrf"
+CSRF_COOKIE_NAME = brand.CSRF_COOKIE_NAME
 CSRF_FIELD_NAME = "csrf_token"
 CSRF_HEADER_NAME = "X-CSRF-Token"
 
@@ -169,9 +169,14 @@ def _extract_bearer(request: Request) -> str | None:
 
 
 def _extract_cookie(request: Request) -> str | None:
+    """The session token the browser presented.
+
+    An explicit HAIPLANE_HUB_COOKIE override names the cookie read;
+    otherwise it is the canonical ``haiplane_hub_session``.
+    """
     cookie_token = request.cookies.get(config.HUB_COOKIE_NAME)
-    if cookie_token:
-        return cookie_token.strip() or None
+    if cookie_token and cookie_token.strip():
+        return cookie_token.strip()
     return None
 
 
@@ -317,7 +322,7 @@ def _unauthorized(request: Request) -> Response:
         status_code=status.HTTP_401_UNAUTHORIZED,
         content='{"detail":"authentication required"}',
         media_type="application/json",
-        headers={"WWW-Authenticate": 'Bearer realm="openclaw-hub"'},
+        headers={"WWW-Authenticate": 'Bearer realm="haiplane-hub"'},
     )
 
 

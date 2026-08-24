@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenClaw Hub — task workflow (pair path B)</title>
+  <title>Haiplane Hub — task workflow (pair path B)</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -88,63 +88,63 @@
         <td>#37</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/7">#7 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/7">#7 merged</a></td>
       </tr>
       <tr>
         <td>Done → CI (<code>hub_report_done</code>)</td>
         <td>#38</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/7">#7 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/7">#7 merged</a></td>
       </tr>
       <tr>
         <td>Git policy path B</td>
         <td>#43</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/6">#6 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/6">#6 merged</a></td>
       </tr>
       <tr>
         <td>B7 — ask из <code>open</code></td>
         <td>#39</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/9">#9 merged</a></td>
       </tr>
       <tr>
         <td>B8 — answer без dispatch</td>
         <td>#40</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/9">#9 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/9">#9 merged</a></td>
       </tr>
       <tr>
         <td><code>hub_report_done</code> MCP message</td>
         <td>#44</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/10">#10 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/10">#10 merged</a></td>
       </tr>
       <tr>
         <td>Claim / release Cursor-сессии</td>
         <td>#41</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/11">#11 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/11">#11 merged</a></td>
       </tr>
       <tr>
         <td>Inbox filter owner/claim</td>
         <td>#42</td>
         <td><span class="badge ok">develop</span></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/13">#13 merged</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/13">#13 merged</a></td>
       </tr>
     </tbody>
   </table>
 
   <div class="panel">
     <p><span class="badge ok">группа #36</span> Индексная задача закрыта: все gap-задачи pair path B (#37–#44) в <code>develop</code> и <code>completed</code> в hub.</p>
-    <p><span class="badge ok">#45</span> <code>hub_refine_task(title=...)</code> — закрыта отдельно (<a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/18">PR #18</a>), не входит в pair lifecycle gaps, но входит в roadmap MCP (#12).</p>
+    <p><span class="badge ok">#45</span> <code>hub_refine_task(title=...)</code> — закрыта отдельно (<a href="https://github.com/agentdrover/haiplane/pull/18">PR #18</a>), не входит в pair lifecycle gaps, но входит в roadmap MCP (#12).</p>
   </div>
 
   <h2>Два пути после approve</h2>
@@ -173,7 +173,7 @@
 
   <h3>Сценарий 1 — Local clone (hub и Cursor на одном каталоге)</h3>
   <div class="panel warn">
-    <p><span class="badge warn">риск</span> <code>OPENCLAW_WORKSPACE_REPO</code> = каталог в Cursor. При dirty worktree <code>hub_pair_start</code> вернёт 422 — commit/stash до старта. См. <code>pair_prepare_branch</code> в коде.</p>
+    <p><span class="badge warn">риск</span> <code>HAIPLANE_WORKSPACE_REPO</code> = каталог в Cursor. При dirty worktree <code>hub_pair_start</code> вернёт 422 — commit/stash до старта. См. <code>pair_prepare_branch</code> в коде.</p>
   </div>
   <ol class="checklist">
     <li>Commit или stash <em>до</em> <code>hub_pair_start</code>.</li>
@@ -185,7 +185,7 @@
   </ol>
 
   <h3>Сценарий 2 — Server workspace (hub на agenthai, Cursor на ноутбуке)</h3>
-  <p><code>OPENCLAW_WORKSPACE_REPO</code> на сервере; pair-start создаёт branch <em>там</em>. Локальный Cursor не переключается сам.</p>
+  <p><code>HAIPLANE_WORKSPACE_REPO</code> на сервере; pair-start создаёт branch <em>там</em>. Локальный Cursor не переключается сам.</p>
   <ol class="checklist">
     <li>Локально: <code>git fetch</code>, <code>git checkout -b task-&lt;id&gt;/&lt;slug&gt;</code> (имя из задачи в hub).</li>
     <li>Работа и коммиты на ноутбуке.</li>
@@ -245,7 +245,7 @@
   </ol>
 
   <h2 id="feature-12">Feature #12 — MCP контракт (parent)</h2>
-  <p class="status-meta">Feature <strong>#12</strong> · parent epic #11 · <span class="badge ok">completed</span> · PR <a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/20">#20</a>–<a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/24">#24</a></p>
+  <p class="status-meta">Feature <strong>#12</strong> · parent epic #11 · <span class="badge ok">completed</span> · PR <a href="https://github.com/agentdrover/haiplane/pull/20">#20</a>–<a href="https://github.com/agentdrover/haiplane/pull/24">#24</a></p>
   <table>
     <thead>
       <tr><th>Task</th><th>Тема</th><th>Hub</th><th>PR</th></tr>
@@ -255,25 +255,25 @@
         <td>#13</td>
         <td><code>hub_refine_task</code> + AC/risks</td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/20">#20</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/20">#20</a></td>
       </tr>
       <tr>
         <td>#14</td>
         <td><code>hub_create_subtasks</code> bulk</td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/22">#22</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/22">#22</a></td>
       </tr>
       <tr>
         <td>#15</td>
         <td>StructuredContent MCP</td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/24">#24</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/24">#24</a></td>
       </tr>
       <tr>
         <td>#45</td>
         <td><code>hub_refine_task(title=...)</code></td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/18">#18</a></td>
+        <td><a href="https://github.com/agentdrover/haiplane/pull/18">#18</a></td>
       </tr>
       <tr>
         <td>#35</td>
@@ -285,7 +285,7 @@
         <td>#36–#44</td>
         <td>Pair path B gaps</td>
         <td><span class="badge ok">completed</span></td>
-        <td><a href="#gap-status">§ gaps</a> · <a href="https://github.com/mrPDA/openclaw-hub-standalone/pull/15">#15 docs</a></td>
+        <td><a href="#gap-status">§ gaps</a> · <a href="https://github.com/agentdrover/haiplane/pull/15">#15 docs</a></td>
       </tr>
     </tbody>
   </table>
@@ -330,7 +330,7 @@
   <ul>
     <li><a href="software-development-workflow.md#pair-mode-git-policy">Pair mode: git policy (markdown)</a></li>
     <li><a href="workspace-safety-policy.md">Workspace safety policy</a> — § Pair mode P1–P4</li>
-    <li><a href="agent-deploy-runbook.md">Agent deploy runbook</a> — §9 локальный hub и <code>OPENCLAW_WORKSPACE_REPO</code></li>
+    <li><a href="agent-deploy-runbook.md">Agent deploy runbook</a> — §9 локальный hub и <code>HAIPLANE_WORKSPACE_REPO</code></li>
   </ul>
 </body>
 </html>
