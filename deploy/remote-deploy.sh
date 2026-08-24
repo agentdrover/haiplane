@@ -27,9 +27,18 @@ if [ ! -d "$STAGING" ]; then
   exit 1
 fi
 
+# The runtime user's NAME is a server fact, not this script's business: it is
+# read from the owner of the live service tree, so the script keeps working
+# both before and after any unix-user rename on the host.
+SERVICE_USER="$(sudo stat -c %U "$DEST" 2>/dev/null || true)"
+if [ -z "$SERVICE_USER" ] || [ "$SERVICE_USER" = "root" ]; then
+  echo "cannot resolve service user from $DEST (got '${SERVICE_USER:-none}')" >&2
+  exit 1
+fi
+
 sudo rsync -a --delete "$STAGING/" "$DEST/"
-sudo chown -R haiplane:haiplane "$DEST"
-sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST"
+sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
 sudo systemctl restart haiplane-hub
 
 # Readiness is polled, not slept for. The unit is Type=simple, so systemd calls
