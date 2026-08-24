@@ -28,8 +28,8 @@
 
 | Что | Зачем |
 |---|---|
-| Рабочий Hub (`openclaw-hub` или systemd) | REST + MCP на одном процессе |
-| Bearer-токен | `OPENCLAW_HUB_TOKENS`, DB API key или `OPENCLAW_HUB_TOKEN` (stdio) |
+| Рабочий Hub (`haiplane-hub` или systemd) | REST + MCP на одном процессе |
+| Bearer-токен | `HAIPLANE_HUB_TOKENS`, DB API key или `HAIPLANE_HUB_TOKEN` (stdio) |
 | Доступ к URL Hub | localhost, SSH-туннель, Tailscale или reverse proxy |
 | Cursor ≥ поддержки streamable HTTP MCP | для удалённого инстанса |
 
@@ -66,13 +66,13 @@ Hub также подмешивает недостающие части `Accept`
 | | **stdio** | **streamable HTTP** |
 |---|---|---|
 | Когда | локальная разработка, Pi рядом с Hub | Cursor на ноутбуке → удалённый/staging/prod Hub |
-| Cursor config | `"command": "uv", "args": ["run", "openclaw-hub-mcp"]` | `"type": "streamable-http", "url": "…/mcp"` |
-| Токен | env `OPENCLAW_HUB_TOKEN` | заголовок `Authorization: Bearer …` |
-| URL Hub | env `OPENCLAW_HUB_URL` (REST backend для subprocess) | URL в `mcp.json` |
+| Cursor config | `"command": "uv", "args": ["run", "haiplane-hub-mcp"]` | `"type": "streamable-http", "url": "…/mcp"` |
+| Токен | env `HAIPLANE_HUB_TOKEN` | заголовок `Authorization: Bearer …` |
+| URL Hub | env `HAIPLANE_HUB_URL` (REST backend для subprocess) | URL в `mcp.json` |
 | Сессия MCP | управляет subprocess | `initialize` → заголовок `Mcp-Session-Id` на follow-up |
 
-**stdio** запускает `openclaw-hub-mcp`, который проксирует вызовы инструментов
-в REST API Hub по `OPENCLAW_HUB_URL`. Токен берётся из `OPENCLAW_HUB_TOKEN`.
+**stdio** запускает `haiplane-hub-mcp`, который проксирует вызовы инструментов
+в REST API Hub по `HAIPLANE_HUB_URL`. Токен берётся из `HAIPLANE_HUB_TOKEN`.
 
 **streamable HTTP** — клиент (Cursor) говорит напрямую с `/mcp` того же
 uvicorn-процесса, что и Web UI. Auth — Bearer на каждый запрос; после
@@ -89,12 +89,12 @@ uvicorn-процесса, что и Web UI. Auth — Bearer на каждый з
 ### 3.1 Поднять Hub
 
 ```bash
-cd openclaw-hub-standalone
+cd haiplane
 uv sync
-export OPENCLAW_HUB_TOKENS="dev:YOUR_TOKEN_HERE:agent"
-export OPENCLAW_HUB_HOST=127.0.0.1
-export OPENCLAW_HUB_PORT=8080
-uv run openclaw-hub
+export HAIPLANE_HUB_TOKENS="dev:YOUR_TOKEN_HERE:agent"
+export HAIPLANE_HUB_HOST=127.0.0.1
+export HAIPLANE_HUB_PORT=8080
+uv run haiplane-hub
 ```
 
 Проверка liveness (без auth):
@@ -129,7 +129,7 @@ curl -sS -D /tmp/mcp-headers.txt \
 Критерии успеха:
 
 - HTTP **200**
-- в теле есть `serverInfo` с именем `openclaw-hub`
+- в теле есть `serverInfo` с именем `haiplane-hub`
 - в заголовках ответа есть **`Mcp-Session-Id`**
 
 Сохраните session id:
@@ -166,11 +166,11 @@ curl -sS \
 ```json
 {
   "mcpServers": {
-    "openclaw-hub": {
+    "haiplane-hub": {
       "type": "streamable-http",
       "url": "http://127.0.0.1:8080/mcp",
       "headers": {
-        "Authorization": "Bearer ${env:OPENCLAW_HUB_MCP_TOKEN}",
+        "Authorization": "Bearer ${env:HAIPLANE_HUB_MCP_TOKEN}",
         "Accept": "application/json, text/event-stream"
       }
     }
@@ -180,23 +180,23 @@ curl -sS \
 
 Рекомендации:
 
-1. Токен храните в env (`OPENCLAW_HUB_MCP_TOKEN`), не в git.
+1. Токен храните в env (`HAIPLANE_HUB_MCP_TOKEN`), не в git.
 2. URL заканчивается на **`/mcp`**, не `/mcp/mcp`.
 3. После смены `mcp.json` перезагрузите MCP в Cursor (Reload Window).
 4. Для production за reverse proxy используйте `https://<domain>/mcp` и
-   убедитесь, что `Host` входит в `OPENCLAW_HUB_ALLOWED_HOSTS` на сервере.
+   убедитесь, что `Host` входит в `HAIPLANE_HUB_ALLOWED_HOSTS` на сервере.
 
 **Локальный stdio-вариант** (Hub на той же машине):
 
 ```json
 {
   "mcpServers": {
-    "openclaw-hub-local": {
+    "haiplane-hub-local": {
       "command": "uv",
-      "args": ["run", "openclaw-hub-mcp"],
+      "args": ["run", "haiplane-hub-mcp"],
       "env": {
-        "OPENCLAW_HUB_URL": "http://127.0.0.1:8080",
-        "OPENCLAW_HUB_TOKEN": "<same token as OPENCLAW_HUB_TOKENS value>"
+        "HAIPLANE_HUB_URL": "http://127.0.0.1:8080",
+        "HAIPLANE_HUB_TOKEN": "<same token as HAIPLANE_HUB_TOKENS value>"
       }
     }
   }
@@ -234,7 +234,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$HUB/api/whoami" | jq .
 | MCP | `hub_whoami` / `hub_health` | то же для агента в Cursor |
 
 Если `hub_whoami` показывает не ту роль — сверьте токен в заголовке с
-`OPENCLAW_HUB_TOKENS` или с выданным DB API key (источник `db`, id ключа без секрета).
+`HAIPLANE_HUB_TOKENS` или с выданным DB API key (источник `db`, id ключа без секрета).
 
 ---
 
@@ -242,8 +242,8 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$HUB/api/whoami" | jq .
 
 | Симптом | HTTP | Вероятная причина | Что делать |
 |---|---|---|---|
-| **401 Unauthorized** | 401 | Нет или неверный `Authorization: Bearer` | Выдайте токен из `OPENCLAW_HUB_TOKENS` / admin API keys; для stdio — `OPENCLAW_HUB_TOKEN`; не используйте пустой Bearer |
-| **421 Misdirected Request** / rebinding | 421 | Неверный `Host` / DNS rebinding protection у клиента | Используйте hostname из `OPENCLAW_HUB_ALLOWED_HOSTS`; для Tailscale — MagicDNS из [`deploy/TAILSCALE.md`](../deploy/TAILSCALE.md); Hub отключает MCP-layer rebinding, но nginx/proxy должен проксировать правильный Host |
+| **401 Unauthorized** | 401 | Нет или неверный `Authorization: Bearer` | Выдайте токен из `HAIPLANE_HUB_TOKENS` / admin API keys; для stdio — `HAIPLANE_HUB_TOKEN`; не используйте пустой Bearer |
+| **421 Misdirected Request** / rebinding | 421 | Неверный `Host` / DNS rebinding protection у клиента | Используйте hostname из `HAIPLANE_HUB_ALLOWED_HOSTS`; для Tailscale — MagicDNS из [`deploy/TAILSCALE.md`](../deploy/TAILSCALE.md); Hub отключает MCP-layer rebinding, но nginx/proxy должен проксировать правильный Host |
 | **406 Not Acceptable** | 406 | В `Accept` нет `application/json` и/или `text/event-stream` | Добавьте `Accept: application/json, text/event-stream` в Cursor headers и curl |
 | **Missing session** / tools fail после initialize | 400/ошибка MCP | Вызов `tools/list` или `tools/call` без `Mcp-Session-Id` | Сначала `initialize`, возьмите `Mcp-Session-Id` из ответа, передайте во все follow-up запросы |
 | **404 на `/mcp/mcp`** | 404 | Устаревший путь | Используйте **`/mcp`** |
@@ -252,8 +252,8 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$HUB/api/whoami" | jq .
 
 ### 401 — подробнее
 
-- REST `/api/*` и `/mcp` требуют auth, когда настроен `OPENCLAW_HUB_TOKENS`
-  и не включён `OPENCLAW_HUB_AUTH_DISABLED`.
+- REST `/api/*` и `/mcp` требуют auth, когда настроен `HAIPLANE_HUB_TOKENS`
+  и не включён `HAIPLANE_HUB_AUTH_DISABLED`.
 - `/healthz` и `/health` публичны; 401 на них не ожидается.
 - Cookie-сессия Web UI и Bearer — разные пути; MCP использует **только Bearer**.
 
