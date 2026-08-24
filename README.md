@@ -24,8 +24,23 @@ passwords, see [docs/admin-section-design.md](docs/admin-section-design.md).
 
 ## Quick Start
 
+### Docker (fastest)
+
 ```bash
-# Clone
+git clone https://github.com/agentdrover/haiplane.git
+cd haiplane
+docker compose up -d --build
+# → http://localhost:8080
+```
+
+The container starts with demo data (project `demo`: an epic, a feature and
+tasks across the whole lifecycle) so the dashboard is alive on first open.
+To start empty, set `HAIPLANE_DEMO_SEED: "0"` in `docker-compose.yml`.
+The SQLite database persists in `./data` on the host.
+
+### From source (dev)
+
+```bash
 git clone https://github.com/agentdrover/haiplane.git
 cd haiplane
 
