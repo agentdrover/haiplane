@@ -24,6 +24,7 @@ import aiosqlite
 import pytest
 import yaml
 
+from hub import brand
 from hub import repository as repo
 from hub import services
 from hub.integrations.registry import plugins
@@ -211,6 +212,27 @@ def test_the_templates_name_no_branch_and_leave_no_placeholder(name: str):
 
     with pytest.raises(ValueError):
         workflow_seed.render(name, base_branch="", release_branch="production")
+
+
+def test_rendered_ci_template_has_no_placeholders(monkeypatch):
+    """Wave 4-code: the seeded ``uses:`` line goes through the renderer, fed
+    from ``brand.ci_report_action()`` after ``require_github_owner()``. An
+    unresolved ``@@`` would ship a step referencing an action called
+    ``@@CI_REPORT_ACTION@@``, which GitHub reports as a broken workflow — and
+    an EMPTY owner must refuse the render loudly rather than quietly emit the
+    legacy ``mrPDA`` slug into a freshly provisioned repository."""
+    monkeypatch.setattr(brand, "GITHUB_OWNER", "agentdrover")
+    rendered = workflow_seed.render(
+        "ci.yml", base_branch="develop", release_branch="main"
+    )
+    assert "@@" not in rendered
+    assert "agentdrover/haiplane/.github/actions/hub-ci-report@main" in rendered
+    assert "secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL" in rendered
+    assert "secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN" in rendered
+
+    monkeypatch.setattr(brand, "GITHUB_OWNER", "")
+    with pytest.raises(ValueError):
+        workflow_seed.render("ci.yml", base_branch="develop", release_branch="main")
 
 
 def test_the_seeded_ci_trigger_names_no_base_branch_allowlist():

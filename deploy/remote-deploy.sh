@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# Remote deploy step for OpenClaw Hub, executed on the target server via `ssh ... 'bash -s'`.
+# Remote deploy step for Haiplane Hub, executed on the target server via `ssh ... 'bash -s'`.
 #
 # Mirrors docs/agent-deploy-runbook.md section 4. The CI runner first rsyncs the
 # working tree into the user's staging directory; this script promotes it into the
 # service source tree, reinstalls the package, restarts systemd and probes /healthz.
 #
-# Assumptions (already true on the current server, see docs/agent-deploy-runbook.md):
-#   - staging dir:     $HOME/openclaw-hub-src-staging
-#   - service source:  /opt/openclaw-hub/src
-#   - service venv:    /opt/openclaw-hub/venv
-#   - runtime user:    openclaw
-#   - systemd unit:    openclaw-hub
+# Assumptions (Wave 4-operator prepares these BEFORE this script deploys — a
+# symlink from the old /opt path and an aliased unit are enough; see
+# docs/agent-deploy-runbook.md and the haiplane cutover runbook):
+#   - staging dir:     $HOME/openclaw-hub-src-staging (unchanged on purpose:
+#                      the rsync side of the CI job writes it)
+#   - service source:  /opt/haiplane-hub/src
+#   - service venv:    /opt/haiplane-hub/venv
+#   - runtime user:    openclaw (full unix-user cutover is a separate operator
+#                      step, not this script's business)
+#   - systemd unit:    haiplane-hub
 #   - the deploy SSH user has passwordless sudo for the commands below.
 set -euo pipefail
 
 STAGING="$HOME/openclaw-hub-src-staging"
-DEST=/opt/openclaw-hub/src
+DEST=/opt/haiplane-hub/src
 # Overridable so the failure branch can be exercised against a dead port instead
 # of staging an outage on the live service to prove the gate still bites (#547).
 # CI never sets it; the default is the real endpoint.
@@ -28,8 +32,15 @@ fi
 
 sudo rsync -a --delete "$STAGING/" "$DEST/"
 sudo chown -R openclaw:openclaw "$DEST"
-sudo -u openclaw /opt/openclaw-hub/venv/bin/pip install -e "$DEST" -q
-sudo systemctl restart openclaw-hub
+# Pip order is deliberate: uninstall the old `openclaw-hub` distribution FIRST,
+# then install the new one. The reverse can delete shared console-script names
+# from the old package RECORD and remove the aliases the new distribution just
+# installed — pyproject.toml re-declares both the new and the legacy scripts.
+# `|| true`: on a host where the old distribution is already gone this is a
+# no-op, not a failed deploy.
+sudo -u openclaw /opt/haiplane-hub/venv/bin/pip uninstall -y openclaw-hub -q || true
+sudo -u openclaw /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+sudo systemctl restart haiplane-hub
 
 # Readiness is polled, not slept for. The unit is Type=simple, so systemd calls
 # it active the moment the process spawns — uvicorn may still be minutes away
@@ -53,7 +64,7 @@ state=""
 # `SECONDS` is integer and an iteration costs more than its sleep, so the loop
 # also drifts: a measured run probed at 0s, 1s, 2s, 4s and skipped 3s entirely.
 while :; do
-  state="$(systemctl is-active openclaw-hub || true)"
+  state="$(systemctl is-active haiplane-hub || true)"
   # `failed` is terminal — waiting out the budget would only delay the report.
   if [ "$state" = "failed" ]; then
     break
@@ -86,7 +97,7 @@ elapsed=$(( SECONDS - started_at ))
 # before the probe, and a probe may take up to --max-time: a service that dies
 # during the last one would be reported as "active but unhealthy" from a stale
 # reading, sending the reader after a health bug that is really a crash.
-state="$(systemctl is-active openclaw-hub || true)"
+state="$(systemctl is-active haiplane-hub || true)"
 
 echo "service=$state healthz=${code:-000} elapsed=${elapsed}s budget=${HEALTH_BUDGET_SECONDS}s"
 
@@ -94,16 +105,16 @@ echo "service=$state healthz=${code:-000} elapsed=${elapsed}s budget=${HEALTH_BU
 # came up, it came up but never answered, or it is serving. Previously the last
 # two collapsed into the same silent `exit 1`.
 if [ "$state" != "active" ]; then
-  echo "FAIL: openclaw-hub is not active after restart (state=$state)" >&2
-  sudo journalctl -u openclaw-hub -n 40 --no-pager || true
+  echo "FAIL: haiplane-hub is not active after restart (state=$state)" >&2
+  sudo journalctl -u haiplane-hub -n 40 --no-pager || true
   exit 1
 fi
 
 if [ "$code" != "200" ]; then
-  echo "FAIL: openclaw-hub is active but /healthz never returned 200 within ${HEALTH_BUDGET_SECONDS}s (last=${code:-000})" >&2
+  echo "FAIL: haiplane-hub is active but /healthz never returned 200 within ${HEALTH_BUDGET_SECONDS}s (last=${code:-000})" >&2
   # The unit log belongs on this branch too. It used to be printed only when the
   # service was down — that is, only when the cause was already obvious.
-  sudo journalctl -u openclaw-hub -n 40 --no-pager || true
+  sudo journalctl -u haiplane-hub -n 40 --no-pager || true
   exit 1
 fi
 

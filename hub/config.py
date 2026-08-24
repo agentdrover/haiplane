@@ -27,7 +27,7 @@ HOME = Path(env_get("HUB_HOME", str(Path.home())))
 
 REPO_NAME = env_get("HUB_REPO", "")
 WORKSPACE_REPO_LINK = Path(
-    env_get("WORKSPACE_REPO", str(HOME / ".openclaw" / "workspace" / "repo"))
+    env_get("WORKSPACE_REPO", str(HOME / ".haiplane" / "workspace" / "repo"))
 )
 
 DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "jobs"
@@ -43,11 +43,11 @@ VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-openc
 VAST_ENABLED = env_get("VAST_ENABLED", "0") == "1"
 
 TRANSCRIPTS_DIR = Path(
-    env_get("TRANSCRIPTS_DIR", str(HOME / ".openclaw" / "transcripts"))
+    env_get("TRANSCRIPTS_DIR", str(HOME / ".haiplane" / "transcripts"))
 )
 
 HUB_DB_PATH = Path(
-    env_get("HUB_DB", str(HOME / ".local" / "state" / "openclaw-hub" / "hub.db"))
+    env_get("HUB_DB", str(HOME / ".local" / "state" / "haiplane-hub" / "hub.db"))
 )
 HUB_HOST = env_get("HUB_HOST", "127.0.0.1")
 HUB_PORT = int(env_get("HUB_PORT", "8080"))
