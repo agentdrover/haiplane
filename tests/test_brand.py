@@ -168,8 +168,10 @@ def test_config_defaults_are_haiplane_family() -> None:
     assert ".openclaw" not in workspace
     assert transcripts.endswith(os.path.join(".haiplane", "transcripts"))
     assert ".openclaw" not in transcripts
-    assert "oc-dev-dispatch" in dispatch_bin, "dispatch binary moves in Task 9 only"
-    assert "vast-openclaw" in vast_bin, "vast binary moves in Task 9 only"
+    assert "hp-dev-dispatch" in dispatch_bin, (
+        "Task 9 landed: haiplane dispatch binary (#938)"
+    )
+    assert "vast-haiplane" in vast_bin, "Task 9 landed: haiplane vast binary (#938)"
 
 
 def test_cli_prefers_haiplane_url() -> None:
