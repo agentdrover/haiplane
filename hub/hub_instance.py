@@ -15,7 +15,7 @@ InstanceLabel = Literal["prod", "local"]
 def hub_hostname() -> str:
     """Server hostname — a config-independent instance fact (#452).
 
-    Unlike ``base_url``/``instance`` (echoed from OPENCLAW_HUB_URL), the
+    Unlike ``base_url``/``instance`` (echoed from HAIPLANE_HUB_URL), the
     hostname cannot be faked by a misconfigured env var, so it disambiguates
     which machine actually served the response.
     """

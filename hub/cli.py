@@ -23,8 +23,7 @@ def _validated_hub_base_url() -> str:
     parsed = urllib.parse.urlsplit(HUB_URL)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         print(
-            "HAIPLANE_HUB_URL (or legacy OPENCLAW_HUB_URL) must use "
-            "http/https and include host:port.",
+            "HAIPLANE_HUB_URL must use http/https and include host:port.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -68,7 +67,7 @@ def _api(
         sys.exit(1)
     except urllib.error.URLError as e:
         print(
-            f"Connection error: {e.reason}\nIs openclaw-hub running at {HUB_URL}?",
+            f"Connection error: {e.reason}\nIs haiplane-hub running at {HUB_URL}?",
             file=sys.stderr,
         )
         sys.exit(1)

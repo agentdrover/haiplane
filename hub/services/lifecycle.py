@@ -349,7 +349,7 @@ def ensure_reviewer_independence(
     Shared by the REST endpoint and the web review panel so verdict
     independence has exactly one definition. Principal comparison wins;
     the name-based check is the fallback for env tokens and legacy tasks.
-    Humans and the solo opt-out (OPENCLAW_REVIEW_SELF_APPROVE=allow) pass.
+    Humans and the solo opt-out (HAIPLANE_REVIEW_SELF_APPROVE=allow) pass.
 
     Returns True only when the caller IS the implementer and passed solely
     because of the solo opt-out — so the verdict can be audited as
@@ -403,7 +403,7 @@ def self_review_brief_warning(
     Mirrors ensure_reviewer_independence but warns instead of raising: the
     implementer may still read the brief for self-checking, yet must know
     BEFORE spending review effort that hub_submit_review will reject the
-    verdict. With OPENCLAW_REVIEW_SELF_APPROVE=allow the warning becomes an
+    verdict. With HAIPLANE_REVIEW_SELF_APPROVE=allow the warning becomes an
     informational solo-mode note. Humans and non-implementers get None.
     """
     if not is_agent:
@@ -418,8 +418,7 @@ def self_review_brief_warning(
                 "self-review"
             ),
             hint=(
-                "HAIPLANE_REVIEW_SELF_APPROVE=allow (legacy "
-                "OPENCLAW_REVIEW_SELF_APPROVE also accepted) is active: "
+                "HAIPLANE_REVIEW_SELF_APPROVE=allow is active: "
                 "hub_submit_review will accept your verdict. "
                 "This note is informational."
             ),
@@ -433,8 +432,7 @@ def self_review_brief_warning(
             "your verdict. The Universal Review Gate requires an independent "
             "reviewer — another agent principal or a human token. You may "
             "still use this brief for self-checking. "
-            "Solo mode: set HAIPLANE_REVIEW_SELF_APPROVE=allow "
-            "(legacy OPENCLAW_REVIEW_SELF_APPROVE also accepted)."
+            "Solo mode: set HAIPLANE_REVIEW_SELF_APPROVE=allow."
         ),
         required_role="independent_reviewer",
     )
@@ -2094,7 +2092,7 @@ async def record_review_verdict(
                 ),
             )
 
-    # Machine-review hard gate (#382): only in OPENCLAW_MACHINE_REVIEW=require,
+    # Machine-review hard gate (#382): only in HAIPLANE_MACHINE_REVIEW=require,
     # and only for APPROVED — the reviewer must always be able to reject work
     # (changes_requested), harness or no harness. Default 'warn' keeps every
     # verdict available; the panel shows the gap.
@@ -2179,14 +2177,10 @@ async def record_review_verdict(
         elif sha_note:
             content += f"\n{sha_note}"
         if self_approved:
-            content += (
-                " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow "
-                "(legacy OPENCLAW_REVIEW_SELF_APPROVE also accepted)]"
-            )
+            content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
             log.warning(
                 "Task #%s: review verdict %s accepted via "
-                "HAIPLANE_REVIEW_SELF_APPROVE=allow (legacy "
-                "OPENCLAW_REVIEW_SELF_APPROVE also accepted) — reviewer '%s' "
+                "HAIPLANE_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
                 "implemented this task (no independent review)",
                 task_id,
                 body.verdict.value,

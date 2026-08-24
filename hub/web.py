@@ -27,7 +27,6 @@ from hub.actionable_errors import (
 )
 from hub.auth import (
     CSRF_COOKIE_NAME,
-    CSRF_COOKIE_NAME_LEGACY,
     current_user,
     current_identity,
     require_human_or_admin,
@@ -207,14 +206,8 @@ async def web_login_submit(
     ):
         return RedirectResponse(safe_next, status_code=303)
 
-    # CSRF verification — against BOTH cookie names, not pick-first: a
-    # browser can hold both at once (a login tab opened before the rename
-    # deploy plus a later one), and picking the first non-empty cookie would
-    # fail the older form whose token matches the legacy cookie.
-    if not (
-        verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, ""))
-        or verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME_LEGACY, ""))
-    ):
+    # CSRF verification (double-submit cookie).
+    if not verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, "")):
         return RedirectResponse(
             f"/login?error=Invalid%20form%20submission.%20Please%20try%20again.&next={safe_next}",
             status_code=303,
@@ -260,7 +253,6 @@ async def web_login_submit(
             secure=config.HUB_COOKIE_SECURE,
         )
         response.delete_cookie(CSRF_COOKIE_NAME)
-        response.delete_cookie(CSRF_COOKIE_NAME_LEGACY)
         return response
 
     return RedirectResponse(
@@ -288,13 +280,7 @@ async def web_logout(request: Request):
     """
     from hub.services import admin as admin_svc
 
-    # Wave 3 dual-read: the browser may still present the session under the
-    # legacy openclaw_hub_session name. Whichever name carried the token,
-    # that token is the one to revoke. An explicit cookie override narrows
-    # the hub to that single name, exactly as in auth._extract_cookie.
     session_token = request.cookies.get(config.HUB_COOKIE_NAME)
-    if not session_token and not config.HUB_COOKIE_NAME_EXPLICIT:
-        session_token = request.cookies.get(brand.COOKIE_NAME_LEGACY)
     if session_token:
         try:
             await admin_svc.revoke_browser_session(_db(request), session_token)
@@ -307,12 +293,7 @@ async def web_logout(request: Request):
 
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(config.HUB_COOKIE_NAME)
-    if not config.HUB_COOKIE_NAME_EXPLICIT:
-        # Both session names must die: leaving openclaw_hub_session alive
-        # after "logout" would keep the browser signed in via dual-accept.
-        response.delete_cookie(brand.COOKIE_NAME_LEGACY)
     response.delete_cookie(CSRF_COOKIE_NAME)
-    response.delete_cookie(CSRF_COOKIE_NAME_LEGACY)
     return response
 
 

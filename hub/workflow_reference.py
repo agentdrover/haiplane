@@ -166,7 +166,7 @@ def workflow_reference_dict() -> dict[str, Any]:
                 "rule": "when policy requires it (#382): run the "
                 "multi-agent harness (hub_get_skill 'machine-review-cycle') "
                 "and submit the report BEFORE the human verdict; "
-                "HAIPLANE_MACHINE_REVIEW=require (fallback OPENCLAW_MACHINE_REVIEW) "
+                "HAIPLANE_MACHINE_REVIEW=require "
                 "blocks the verdict without "
                 "a current report, default 'warn' only surfaces the gap",
             },
@@ -260,7 +260,7 @@ def build_mcp_instructions() -> str:
         "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
         "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
         "actor_hint (agent|human|ci|none). Every response also includes instance "
-        "(prod|local) and base_url echoing HAIPLANE_HUB_URL (fallback OPENCLAW_HUB_URL). "
+        "(prod|local) and base_url echoing HAIPLANE_HUB_URL. "
         "Structured errors use "
         "the same envelope plus reason and hint." + mcp_workflow_instruction_section()
     )

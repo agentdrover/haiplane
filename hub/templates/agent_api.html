@@ -11,7 +11,7 @@
     <a href="/metrics/agent-api?window_days=90">90</a> дней.
     Хранение — {{ u.retention_days }} дней, дольше самого длинного окна: отчёт за
     90 дней не должен молча собираться из 90 дней минус то, что уже удалено.
-    {% if not u.enabled %}<strong>Телеметрия выключена</strong> (HAIPLANE_MCP_TELEMETRY=0; принимается и legacy OPENCLAW_MCP_TELEMETRY=0) —
+    {% if not u.enabled %}<strong>Телеметрия выключена</strong> (HAIPLANE_MCP_TELEMETRY=0) —
     цифры ниже относятся к тому, что успело записаться.{% endif %}</p>
 
 <h2>Итого</h2>

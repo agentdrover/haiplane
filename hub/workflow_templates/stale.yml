@@ -1,7 +1,7 @@
 # Laid down by Haiplane Hub provisioning (#476) — do not rename this file.
 #
-# The hub owns the name `haiplane-stale.yml` (and the pre-rename
-# `openclaw-stale.yml`). Like the CI template it is written only into a
+# The hub owns the name `haiplane-stale.yml`. Like the CI template it is
+# written only into a
 # repository that carried no workflows of its own.
 #
 # Why it ships with the CI template rather than separately: the operational

@@ -113,7 +113,7 @@ def _hub_token() -> str:
     if env_tok:
         return env_tok
     # Streamable MCP mounted in the same process: reuse caller's Bearer (set by
-    # AuthMiddleware via hub.mcp_internal_auth) so tools work without OPENCLAW_HUB_TOKEN.
+    # AuthMiddleware via hub.mcp_internal_auth) so tools work without HAIPLANE_HUB_TOKEN.
     from hub.mcp_internal_auth import bearer_context_get
 
     return (bearer_context_get() or "").strip()
@@ -1307,7 +1307,7 @@ async def hub_pair_start(
     principal is accepted even when the presentational name differs.
 
     Workspace mode (#530/#459): when the server runs with
-    OPENCLAW_WORKTREE_PER_TASK=1 the response names your task's isolated git
+    HAIPLANE_WORKTREE_PER_TASK=1 the response names your task's isolated git
     worktree path — work THERE, not in the shared clone (the main clone stays
     on the base branch). In legacy mode the response is unchanged.
 
@@ -2950,7 +2950,7 @@ async def hub_list_decisions(limit: int = 10) -> CallToolResult:
 
 
 # ---------------------------------------------------------------------------
-# Vast.ai instance management — registered only when OPENCLAW_VAST_ENABLED=1
+# Vast.ai instance management — registered only when HAIPLANE_VAST_ENABLED=1
 # ---------------------------------------------------------------------------
 
 if config.VAST_ENABLED:
@@ -2964,7 +2964,7 @@ if config.VAST_ENABLED:
         instance already exists.
 
         Returns the OpenAI-compatible API endpoint. After this tool completes,
-        write the returned base_url to ~/.openclaw/vast-upstream.json on Mac
+        write the returned base_url to ~/.haiplane/vast-upstream.json on Mac
         so the local proxy picks it up automatically.
         """
         import httpx
@@ -2998,7 +2998,7 @@ if config.VAST_ENABLED:
             f"  Endpoint:  {base_url}",
             "",
             "UPDATE LOCAL PROXY by running this command on Mac:",
-            f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.openclaw/vast-upstream.json',
+            f'  echo \'{{"base_url":"{proxy_upstream}"}}\' > ~/.haiplane/vast-upstream.json',
             "",
             "Local proxy → http://localhost:8741/v1",
             "Cursor model ready to use.",
@@ -3954,7 +3954,7 @@ def _format_health(data: dict[str, Any]) -> str:
 async def hub_whoami() -> str:
     """Show the current caller identity: role, permissions summary, and auth source.
 
-    Auth source is ``env`` for OPENCLAW_HUB_TOKENS map entries or ``db`` for
+    Auth source is ``env`` for HAIPLANE_HUB_TOKENS map entries or ``db`` for
     DB-backed API keys (includes api_key_id, never the secret).
     """
     data = await _api_get("/api/whoami")
