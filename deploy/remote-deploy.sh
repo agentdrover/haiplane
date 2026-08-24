@@ -5,20 +5,17 @@
 # working tree into the user's staging directory; this script promotes it into the
 # service source tree, reinstalls the package, restarts systemd and probes /healthz.
 #
-# Assumptions (Wave 4-operator prepares these BEFORE this script deploys — a
-# symlink from the old /opt path and an aliased unit are enough; see
-# docs/agent-deploy-runbook.md and the haiplane cutover runbook):
-#   - staging dir:     $HOME/openclaw-hub-src-staging (unchanged on purpose:
-#                      the rsync side of the CI job writes it)
+# Assumptions (see docs/agent-deploy-runbook.md):
+#   - staging dir:     $HOME/haiplane-hub-src-staging (the rsync side of the
+#                      CI job writes it)
 #   - service source:  /opt/haiplane-hub/src
 #   - service venv:    /opt/haiplane-hub/venv
-#   - runtime user:    openclaw (full unix-user cutover is a separate operator
-#                      step, not this script's business)
+#   - runtime user:    haiplane
 #   - systemd unit:    haiplane-hub
 #   - the deploy SSH user has passwordless sudo for the commands below.
 set -euo pipefail
 
-STAGING="$HOME/openclaw-hub-src-staging"
+STAGING="$HOME/haiplane-hub-src-staging"
 DEST=/opt/haiplane-hub/src
 # Overridable so the failure branch can be exercised against a dead port instead
 # of staging an outage on the live service to prove the gate still bites (#547).
@@ -30,16 +27,18 @@ if [ ! -d "$STAGING" ]; then
   exit 1
 fi
 
+# The runtime user's NAME is a server fact, not this script's business: it is
+# read from the owner of the live service tree, so the script keeps working
+# both before and after any unix-user rename on the host.
+SERVICE_USER="$(sudo stat -c %U "$DEST" 2>/dev/null || true)"
+if [ -z "$SERVICE_USER" ] || [ "$SERVICE_USER" = "root" ]; then
+  echo "cannot resolve service user from $DEST (got '${SERVICE_USER:-none}')" >&2
+  exit 1
+fi
+
 sudo rsync -a --delete "$STAGING/" "$DEST/"
-sudo chown -R openclaw:openclaw "$DEST"
-# Pip order is deliberate: uninstall the old `openclaw-hub` distribution FIRST,
-# then install the new one. The reverse can delete shared console-script names
-# from the old package RECORD and remove the aliases the new distribution just
-# installed — pyproject.toml re-declares both the new and the legacy scripts.
-# `|| true`: on a host where the old distribution is already gone this is a
-# no-op, not a failed deploy.
-sudo -u openclaw /opt/haiplane-hub/venv/bin/pip uninstall -y openclaw-hub -q || true
-sudo -u openclaw /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST"
+sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
 sudo systemctl restart haiplane-hub
 
 # Readiness is polled, not slept for. The unit is Type=simple, so systemd calls

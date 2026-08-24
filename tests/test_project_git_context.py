@@ -38,8 +38,8 @@ async def _configure_default(db, **fields):
 async def test_a_configured_default_project_yields_its_context(client: AsyncClient, db):
     await _configure_default(
         db,
-        repo="mrPDA/openclaw-hub-standalone",
-        workspace_path="/var/lib/openclaw-hub/workspaces/hub",
+        repo="agentdrover/haiplane",
+        workspace_path="/var/lib/haiplane-hub/workspaces/hub",
         default_branch="develop",
     )
     task_id = await _task_in_default(client)
@@ -47,8 +47,8 @@ async def test_a_configured_default_project_yields_its_context(client: AsyncClie
     ctx = await project_git_context(db, task_id)
 
     assert ctx == {
-        "repo": "/var/lib/openclaw-hub/workspaces/hub",
-        "gh_repo": "mrPDA/openclaw-hub-standalone",
+        "repo": "/var/lib/haiplane-hub/workspaces/hub",
+        "gh_repo": "agentdrover/haiplane",
         "base_branch": "develop",
     }, "the owner configured these values; dropping any of them is the defect"
 
@@ -85,7 +85,7 @@ async def test_the_brief_sees_the_default_workspace_once_configured(
     workspace.mkdir()
     await _configure_default(
         db,
-        repo="mrPDA/openclaw-hub-standalone",
+        repo="agentdrover/haiplane",
         workspace_path=str(workspace),
         default_branch="develop",
     )

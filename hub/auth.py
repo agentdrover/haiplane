@@ -93,7 +93,6 @@ login_limiter = LoginRateLimiter(max_attempts=10, window_seconds=300)
 # ---------------------------------------------------------------------------
 
 CSRF_COOKIE_NAME = brand.CSRF_COOKIE_NAME
-CSRF_COOKIE_NAME_LEGACY = brand.CSRF_COOKIE_NAME_LEGACY
 CSRF_FIELD_NAME = "csrf_token"
 CSRF_HEADER_NAME = "X-CSRF-Token"
 
@@ -170,21 +169,14 @@ def _extract_bearer(request: Request) -> str | None:
 
 
 def _extract_cookie(request: Request) -> str | None:
-    """The session token the browser presented, under any accepted name.
+    """The session token the browser presented.
 
-    An explicit HAIPLANE_HUB_COOKIE / OPENCLAW_HUB_COOKIE override names the
-    only cookie read. Otherwise the new name is tried first and the legacy
-    ``openclaw_hub_session`` second, so sessions issued before the rename
-    keep authenticating (Wave 3 dual-accept).
+    An explicit HAIPLANE_HUB_COOKIE override names the cookie read;
+    otherwise it is the canonical ``haiplane_hub_session``.
     """
-    if config.HUB_COOKIE_NAME_EXPLICIT:
-        names: tuple[str, ...] = (config.HUB_COOKIE_NAME,)
-    else:
-        names = (brand.COOKIE_NAME, brand.COOKIE_NAME_LEGACY)
-    for name in names:
-        cookie_token = request.cookies.get(name)
-        if cookie_token and cookie_token.strip():
-            return cookie_token.strip()
+    cookie_token = request.cookies.get(config.HUB_COOKIE_NAME)
+    if cookie_token and cookie_token.strip():
+        return cookie_token.strip()
     return None
 
 

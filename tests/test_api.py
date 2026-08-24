@@ -1398,7 +1398,7 @@ async def test_review_brief_warns_implementer_of_self_review(
 async def test_review_brief_solo_mode_note_for_implementer(
     client: AsyncClient, monkeypatch
 ):
-    # AC-2: with OPENCLAW_REVIEW_SELF_APPROVE=allow the warning turns into
+    # AC-2: with HAIPLANE_REVIEW_SELF_APPROVE=allow the warning turns into
     # an informational solo-mode note instead.
     from hub import config
 
@@ -1415,8 +1415,8 @@ async def test_review_brief_solo_mode_note_for_implementer(
     assert warning is not None
     assert warning["reason"] == "solo_mode_self_review"
     assert "HAIPLANE_REVIEW_SELF_APPROVE=allow" in warning["hint"]
-    assert "OPENCLAW_REVIEW_SELF_APPROVE" in warning["hint"], (
-        "the legacy name must stay documented during the soak"
+    assert ("OPEN" + "CLAW") not in warning["hint"], (
+        "Wave 5: the legacy name must be gone from operator hints"
     )
     assert warning["required_role"] is None
 
@@ -1580,7 +1580,7 @@ async def test_claim_records_and_release_clears_implementer_principal(
 # The documented deploy setup (deploy/local-hub.env.example,
 # docs/agent-onboarding.md): TWO env tokens with role `agent` — the
 # implementer (`cursor`) and a dedicated reviewer (`cursor-reviewer`).
-# Parsed straight from the OPENCLAW_HUB_TOKENS format so the tests pin the
+# Parsed straight from the HAIPLANE_HUB_TOKENS format so the tests pin the
 # exact configuration operators are told to provision.
 
 

@@ -11,7 +11,7 @@ from hub.config import env_get
 
 TOKEN = env_get("HUB_TOKEN") or env_get("HUB_MCP_TOKEN")
 if not TOKEN:
-    print("Set HAIPLANE_HUB_TOKEN (or legacy OPENCLAW_HUB_TOKEN)", file=sys.stderr)
+    print("Set HAIPLANE_HUB_TOKEN", file=sys.stderr)
     sys.exit(1)
 
 BASE = env_get("HUB_URL", "https://agenthai.ru").rstrip("/")
@@ -404,7 +404,7 @@ TASKS: dict[int, dict] = {
                 "AC-1",
                 "Env-токен",
                 "whoami",
-                "Совпадает с ожидаемой ролью из OPENCLAW_HUB_TOKENS",
+                "Совпадает с ожидаемой ролью из HAIPLANE_HUB_TOKENS",
             ),
             ac(
                 "AC-2",

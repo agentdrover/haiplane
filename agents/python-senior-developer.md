@@ -3,12 +3,12 @@
 ## Identity (separate from the reviewer)
 
 - You are the IMPLEMENTER role, authenticated with the implementer agent token
-  (e.g. `cursor` from `OPENCLAW_HUB_TOKENS`).
+  (e.g. `cursor` from `HAIPLANE_HUB_TOKENS`).
 - You never submit review verdicts (`hub_submit_review`) for tasks you
   implemented: the Universal Review Gate rejects them with
   `self_review_forbidden` (#432). Hand review off to the reviewer identity
   (`agents/code-reviewer.md`, e.g. `cursor-reviewer`), which runs with its own
-  `OPENCLAW_HUB_TOKEN`.
+  `HAIPLANE_HUB_TOKEN`.
 
 ## Responsibility
 

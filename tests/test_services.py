@@ -3472,7 +3472,7 @@ async def test_pair_start_conflict_returns_structured_detail(db: aiosqlite.Conne
             "Uncommitted changes in workspace; commit or stash before pair-start",
             reason="pair_branch_dirty",
             hint="Commit or stash, then hub_pair_start.",
-            workspace_path="/var/lib/openclaw-hub/workspaces/_default",
+            workspace_path="/var/lib/haiplane-hub/workspaces/_default",
             hostname="agenthai",
         )
 
@@ -3484,7 +3484,7 @@ async def test_pair_start_conflict_returns_structured_detail(db: aiosqlite.Conne
     assert exc_info.value.status_code == 422
     detail = exc_info.value.detail
     assert detail["reason"] == "pair_branch_dirty"
-    assert detail["workspace_path"] == "/var/lib/openclaw-hub/workspaces/_default"
+    assert detail["workspace_path"] == "/var/lib/haiplane-hub/workspaces/_default"
     assert detail["hostname"] == "agenthai"
     assert "hub_pair_start" in detail["hint"]
 
@@ -4194,7 +4194,7 @@ async def test_worktree_mode_prepare_and_cleanup(db: aiosqlite.Connection, monke
 
     from hub.integrations.registry import plugins
 
-    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
     prep = AsyncMock(return_value="task-1/worktree-task")
     remove = AsyncMock(return_value=True)
     plugins.git_ops.pair_prepare_worktree = prep
@@ -4220,7 +4220,7 @@ async def test_worktree_mode_rework_recreates_worktree(
 
     from hub.integrations.registry import plugins
 
-    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
     prep = AsyncMock(return_value="task-1/worktree-task")
     plugins.git_ops.pair_prepare_worktree = prep
     plugins.git_ops.pair_remove_worktree = AsyncMock(return_value=True)
@@ -4244,7 +4244,7 @@ async def test_worktree_mode_off_uses_legacy(db: aiosqlite.Connection, monkeypat
 
     from hub.integrations.registry import plugins
 
-    monkeypatch.delenv("OPENCLAW_WORKTREE_PER_TASK", raising=False)
+    monkeypatch.delenv("HAIPLANE_WORKTREE_PER_TASK", raising=False)
     prep_wt = AsyncMock()
     plugins.git_ops.pair_prepare_worktree = prep_wt
 
@@ -4296,7 +4296,7 @@ async def test_worktree_mode_done_pipeline_targets_worktree(
     from hub.integrations.registry import plugins
     from hub.services import orchestration
 
-    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
     task_id = await _wt_done_task(db, job_id=None)  # pair task
     wt = str(tmp_path / f".main-worktrees/task-{task_id}")
     os.makedirs(wt, exist_ok=True)  # worktree exists → redirect applies
@@ -4323,7 +4323,7 @@ async def test_worktree_mode_headless_uses_main_clone(
     from hub.integrations.registry import plugins
     from hub.services import orchestration
 
-    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
     task_id = await _wt_done_task(db, job_id="dispatch-42")  # headless task
     ctx = await orchestration.project_git_context(db, task_id)
     workspace = ctx.get("repo")
@@ -4350,7 +4350,7 @@ async def test_pair_start_surfaces_worktree_path(db: aiosqlite.Connection, monke
 
     from hub.integrations.registry import plugins
 
-    monkeypatch.setenv("OPENCLAW_WORKTREE_PER_TASK", "1")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
     plugins.git_ops.pair_prepare_worktree = AsyncMock(return_value="task-1/wt")
     plugins.git_ops.worktree_path = MagicMock(return_value="/srv/.ws-worktrees/task-1")
 
@@ -4372,7 +4372,7 @@ async def test_pair_start_legacy_no_worktree_path(
 
     from hub.integrations.registry import plugins
 
-    monkeypatch.delenv("OPENCLAW_WORKTREE_PER_TASK", raising=False)
+    monkeypatch.delenv("HAIPLANE_WORKTREE_PER_TASK", raising=False)
     plugins.git_ops.pair_prepare_branch = AsyncMock(return_value="task-1/leg")
 
     tv = await services.create_task(db, TaskCreate(title="Legacy surface"))
@@ -4857,7 +4857,7 @@ async def test_failing_git_tail_leaves_no_done_report(
     from hub.integrations.noop import NoopGitOps
     from hub.integrations.registry import plugins
 
-    monkeypatch.setenv("OPENCLAW_WORKSPACE_REPO", "/tmp")
+    monkeypatch.setenv("HAIPLANE_WORKSPACE_REPO", "/tmp")
     task_id = await _task_ready_for_done_with_git_tail(db)
 
     class _Exploding(NoopGitOps):
@@ -4888,7 +4888,7 @@ async def test_retry_after_a_failing_git_tail_does_not_pile_up_done_rows(
     from hub.integrations.noop import NoopGitOps
     from hub.integrations.registry import plugins
 
-    monkeypatch.setenv("OPENCLAW_WORKSPACE_REPO", "/tmp")
+    monkeypatch.setenv("HAIPLANE_WORKSPACE_REPO", "/tmp")
     task_id = await _task_ready_for_done_with_git_tail(db)
 
     class _Exploding(NoopGitOps):

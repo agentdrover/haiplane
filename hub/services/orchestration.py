@@ -1324,8 +1324,7 @@ def worktree_per_task_enabled() -> bool:
     """Opt-in git-worktree isolation for pair tasks (#459).
 
     Default OFF keeps the single-working-tree behavior of #451/#457 unchanged
-    in production; set HAIPLANE_WORKTREE_PER_TASK=1 (or the legacy
-    OPENCLAW_WORKTREE_PER_TASK=1) to give each task its own
+    in production; set HAIPLANE_WORKTREE_PER_TASK=1 to give each task its own
     worktree so concurrent pair-starts never share a working tree.
     """
     return config.env_get("WORKTREE_PER_TASK") == "1"
@@ -2073,8 +2072,7 @@ async def transition_after_agent_done(
                         f"В коммит задачи уходят {len(foreign)} файлов вне "
                         f"объявленной области: {', '.join(foreign[:10])}. "
                         "Режим проверки — warn, коммит выполнен. Включите "
-                        "HAIPLANE_COMMIT_SCOPE=require (принимается и legacy "
-                        "OPENCLAW_COMMIT_SCOPE), чтобы останавливать.",
+                        "HAIPLANE_COMMIT_SCOPE=require, чтобы останавливать.",
                     )
         # expected_branch is defence in depth: the checkout above may report
         # success while HEAD ends up elsewhere. Its refusal RAISES rather than

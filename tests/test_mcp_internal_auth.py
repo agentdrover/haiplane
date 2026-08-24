@@ -16,11 +16,10 @@ from hub.mcp_server import _hub_token
 def _clean_prefixed_env(monkeypatch):
     """Neither prefix may leak in from the developer's shell (Task 4)."""
     monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
-    monkeypatch.delenv("OPENCLAW_HUB_TOKEN", raising=False)
 
 
 def test_hub_token_prefers_env_over_context(monkeypatch):
-    monkeypatch.setenv("OPENCLAW_HUB_TOKEN", "env-secret")
+    monkeypatch.setenv("HAIPLANE_HUB_TOKEN", "env-secret")
     h = bearer_context_set("ctx-secret")
     try:
         assert _hub_token() == "env-secret"
@@ -28,9 +27,9 @@ def test_hub_token_prefers_env_over_context(monkeypatch):
         bearer_context_reset(h)
 
 
-def test_hub_token_prefers_haiplane_env_name(monkeypatch):
+def test_hub_token_ignores_legacy_env_name(monkeypatch):
     monkeypatch.setenv("HAIPLANE_HUB_TOKEN", "new-secret")
-    monkeypatch.setenv("OPENCLAW_HUB_TOKEN", "old-secret")
+    monkeypatch.setenv("OPEN" + "CLAW" + "_HUB_TOKEN", "old-secret")
     h = bearer_context_set("ctx-secret")
     try:
         assert _hub_token() == "new-secret"

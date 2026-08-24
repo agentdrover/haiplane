@@ -13,7 +13,7 @@ Haiplane Hub должен быть общей контрольной плоск�
 У проекта есть две разные среды:
 
 - **Hub repo**: этот репозиторий, где живет сервер хаба, Web UI, REST API, CLI и MCP.
-- **Workspace repo**: рабочий git-репозиторий продукта, с которым будут работать агенты. Он задается через `OPENCLAW_WORKSPACE_REPO`.
+- **Workspace repo**: рабочий git-репозиторий продукта, с которым будут работать агенты. Он задается через `HAIPLANE_WORKSPACE_REPO`.
 
 Все люди и агенты должны видеть один и тот же хаб. Cursor подключается к MCP-поверхности хаба, а хаб уже обращается к REST API, базе, dispatch, git, GitHub, notes и transcripts через плагины.
 
@@ -259,14 +259,14 @@ Human-переопределения (`hub_decide_task` accept, `hub_force_compl
 
 ## Pair mode: git policy
 
-Path B — человек + Cursor-агент без headless dispatch (`hub_pair_start`). Хаб переводит задачу в `running` и может создать branch через git ops plugin в каталоге `OPENCLAW_WORKSPACE_REPO`. **Исходный код и коммиты остаются ответственностью разработчика в git**, не хаба.
+Path B — человек + Cursor-агент без headless dispatch (`hub_pair_start`). Хаб переводит задачу в `running` и может создать branch через git ops plugin в каталоге `HAIPLANE_WORKSPACE_REPO`. **Исходный код и коммиты остаются ответственностью разработчика в git**, не хаба.
 
 ### Два типичных сценария
 
-| Сценарий | `OPENCLAW_WORKSPACE_REPO` | Кто коммитит | Где CI видит код |
+| Сценарий | `HAIPLANE_WORKSPACE_REPO` | Кто коммитит | Где CI видит код |
 |----------|---------------------------|--------------|------------------|
 | **Local clone** | тот же каталог, что открыт в Cursor на ноутбуке | человек/агент в Cursor | после `git push origin task-<id>/<slug>` |
-| **Server workspace** | clone на сервере (например `/opt/openclaw-hub/src`) | headless auto-commit после done **или** ручной push с ноутбука | remote branch после push с любой машины |
+| **Server workspace** | clone на сервере (например `/opt/haiplane-hub/src`) | headless auto-commit после done **или** ручной push с ноутбука | remote branch после push с любой машины |
 
 В обоих случаях каноническое имя branch задачи: `task-<hub-task-id>/<slug>` (slug из title). Поле `branch` в задаче хаба — источник правды для **имени**, не для содержимого коммитов.
 
@@ -295,7 +295,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 
 ### Checklist: server workspace
 
-Когда `OPENCLAW_WORKSPACE_REPO` указывает на clone **на сервере**, а Cursor открыт на **другом** clone:
+Когда `HAIPLANE_WORKSPACE_REPO` указывает на clone **на сервере**, а Cursor открыт на **другом** clone:
 
 1. Pair-start на сервере создаёт branch в server clone; локальный Cursor **не переключается** автоматически.
 2. Локально создайте ту же ветку от актуального `develop`: `git checkout -b task-<id>/<slug>`.

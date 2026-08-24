@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop-hook: ждёт событий человека в OpenClaw Hub и будит агента.
+"""Stop-hook: ждёт событий человека в Haiplane Hub и будит агента.
 
 Механизм:
 - Агент перед завершением хода пишет .claude/hub-wait.json со списком ожиданий:
@@ -39,7 +39,8 @@
   при живом чужом поллере, молча оставалась без своего (acquire_lock → False →
   exit 0). Своё ожидание при этом не отслеживал никто.
 
-Токен и URL берутся из ~/.claude.json (mcpServers.openclaw-hub) — как у MCP.
+Токен и URL берутся из ~/.claude.json (mcpServers.haiplane-hub; если такого
+ключа нет — первый сервер, чей url оканчивается на /mcp) — как у MCP.
 """
 
 from __future__ import annotations
@@ -64,7 +65,16 @@ MAX_WAIT_SEC = int(os.environ.get("HUB_WAIT_MAX_SEC", "14400"))  # 4 часа
 
 def hub_config() -> tuple[str, str]:
     cfg = json.loads((Path.home() / ".claude.json").read_text())
-    srv = cfg["mcpServers"]["openclaw-hub"]
+    servers = cfg["mcpServers"]
+    srv = servers.get("haiplane-hub")
+    if srv is None:
+        # Ключ назван иначе (например, ещё по-старому): берём первый сервер,
+        # который выглядит как хаб — url оканчивается на /mcp.
+        srv = next(
+            s
+            for s in servers.values()
+            if str(s.get("url", "")).rstrip("/").endswith("/mcp")
+        )
     base = srv["url"].rsplit("/mcp", 1)[0].rstrip("/")
     return base, srv["headers"]["Authorization"]
 
@@ -403,7 +413,7 @@ def main() -> int:
                         path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
                     elif not foreign:
                         path.unlink(missing_ok=True)
-                lines = ["Событие в OpenClaw Hub — продолжай работу по плану:"]
+                lines = ["Событие в Haiplane Hub — продолжай работу по плану:"]
                 for _path, wait, obj, diff in fired:
                     if wait.get("kind") == "message":
                         # Кто и какого типа — да; тело — нет: сообщение читается

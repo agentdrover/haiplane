@@ -115,8 +115,8 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/hub-ci-report
         with:
-          hub-url: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
-          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL }}
+          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: uv run pytest
           # A step that never ran reports its outcome as '' and is dropped by
@@ -142,8 +142,8 @@ jobs:
         if: ${{ always() }}
         continue-on-error: true
         env:
-          OPENCLAW_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
-          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
+          HAIPLANE_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL }}
+          HAIPLANE_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
           AUDIT_JSON: audit.json
         run: uv run python scripts/ci_report_audit_to_hub.py
 
@@ -206,7 +206,7 @@ jobs:
             --exclude '*.pyc' \
             --exclude '.git' \
             ./ \
-            "$DEPLOY_USER@$DEPLOY_HOST:~/openclaw-hub-src-staging/"
+            "$DEPLOY_USER@$DEPLOY_HOST:~/haiplane-hub-src-staging/"
 
       - name: Deploy and health check
         id: rollout
@@ -233,13 +233,13 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          OPENCLAW_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
-          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
+          HAIPLANE_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL }}
+          HAIPLANE_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
           ROLLOUT_OUTCOME: ${{ steps.rollout.outcome }}
           DEPLOYED_SHA: ${{ github.sha }}
           DEPLOYED_REF: ${{ github.ref_name }}
         run: |
-          if [ -z "$OPENCLAW_HUB_URL" ] || [ -z "$OPENCLAW_HUB_CI_TOKEN" ]; then
+          if [ -z "$HAIPLANE_HUB_URL" ] || [ -z "$HAIPLANE_HUB_CI_TOKEN" ]; then
             echo "::notice::Hub secrets absent — deploy not reported (fork or clone)"
             exit 0
           fi
@@ -249,8 +249,8 @@ jobs:
             STATUS=failed
           fi
           code=$(curl -sS -o /tmp/deploy-callback.out -w '%{http_code}' \
-            -X POST "$OPENCLAW_HUB_URL/api/deploys" \
-            -H "Authorization: Bearer $OPENCLAW_HUB_CI_TOKEN" \
+            -X POST "$HAIPLANE_HUB_URL/api/deploys" \
+            -H "Authorization: Bearer $HAIPLANE_HUB_CI_TOKEN" \
             -H 'Content-Type: application/json' \
             -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\"}" \
           ) || code=000

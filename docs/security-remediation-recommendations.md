@@ -13,8 +13,8 @@ together when behavior or contracts change.
 
 ## Finding 1: Network-Open Unauthenticated Default
 
-**Risk:** `OPENCLAW_HUB_HOST` defaults to `0.0.0.0`, while an empty
-`OPENCLAW_HUB_TOKENS` enables open mode. A default `openclaw-hub` run can expose
+**Risk:** `HAIPLANE_HUB_HOST` defaults to `0.0.0.0`, while an empty
+`HAIPLANE_HUB_TOKENS` enables open mode. A default `haiplane-hub` run can expose
 REST, Web, and `/mcp` to the LAN without authentication.
 
 **Files to inspect/change:**
@@ -30,16 +30,16 @@ REST, Web, and `/mcp` to the LAN without authentication.
 - Change the default host to `127.0.0.1`.
 - Add a startup guard that rejects non-loopback binds when auth is open, unless
 an explicit unsafe override is set, for example
-`OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`.
+`HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`.
 - Keep Tailscale/team deployment documented, but require tokens for non-loopback
 examples.
 
 **Acceptance criteria:**
 
-- Default `openclaw-hub` binds to localhost only.
-- `OPENCLAW_HUB_HOST=0.0.0.0` with no tokens fails startup unless the explicit
+- Default `haiplane-hub` binds to localhost only.
+- `HAIPLANE_HUB_HOST=0.0.0.0` with no tokens fails startup unless the explicit
 unsafe override is set.
-- `OPENCLAW_HUB_HOST=0.0.0.0` with `OPENCLAW_HUB_TOKENS` configured starts.
+- `HAIPLANE_HUB_HOST=0.0.0.0` with `HAIPLANE_HUB_TOKENS` configured starts.
 - Tests cover localhost default, guarded non-loopback open mode, and tokenized
 non-loopback mode.
 
@@ -176,11 +176,11 @@ uv run pytest tests/test_models.py tests/test_api_refine.py -q
 
 ## Additional Hardening
 
-- Add `OPENCLAW_HUB_COOKIE_SECURE=1` support and set the cookie `secure` flag
+- Add `HAIPLANE_HUB_COOKIE_SECURE=1` support and set the cookie `secure` flag
 for TLS deployments.
 - Prefer opaque browser session IDs or signed session cookies instead of storing
 the bearer token directly in the browser cookie.
-- Add `OPENCLAW_HUB_TOKEN` support to MCP and CLI HTTP clients so authenticated
+- Add `HAIPLANE_HUB_TOKEN` support to MCP and CLI HTTP clients so authenticated
 deployments are usable consistently.
 - Add optional dependency/security checks to CI if the project wants automated
 coverage:

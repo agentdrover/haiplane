@@ -1,7 +1,7 @@
 # Инструкция для ИИ-агента администратора: развёртывание Haiplane Hub на внешнем сервере
 
 Документ описывает пошаговый протокол, по которому ИИ-агент с ролью администратора
-разворачивает сервис `openclaw-hub` на внешнем Linux-сервере (Ubuntu 22.04/24.04
+разворачивает сервис `haiplane-hub` на внешнем Linux-сервере (Ubuntu 22.04/24.04
 или Debian 12). Все шаги предполагают неинтерактивный запуск под учётной записью
 с правами `sudo`.
 
@@ -16,7 +16,7 @@
 >   `rm -rf`, изменение DNS, ротация секретов — только после явного подтверждения
 >    оператора.
 > 3. **Аудит.** Все выполненные команды и их вывод сохраняются в журнал
->   `/var/log/openclaw-hub/deploy.log`.
+>   `/var/log/haiplane-hub/deploy.log`.
 > 4. **Секреты не печатать в чат.** Токены, пароли, приватные ключи — только в
 >   переменные окружения и файлы с правами `0600`.
 
@@ -34,8 +34,8 @@
 | `SSH_KEY_PATH`           | `~/.ssh/id_ed25519_hub`                       | да                                  |
 | `DOMAIN`                 | `hub.example.com`                             | да (для TLS)                        |
 | `ADMIN_EMAIL`            | `ops@example.com`                             | да (для Let's Encrypt)              |
-| `GITHUB_REPO`            | `mrPDA/openclaw-hub`                          | да                                  |
-| `OPENCLAW_HUB_REPO`      | `owner/managed-repo`                          | опционально                         |
+| `GITHUB_REPO`            | `mrPDA/haiplane-hub`                          | да                                  |
+| `HAIPLANE_HUB_REPO`      | `owner/managed-repo`                          | опционально                         |
 | `GH_TOKEN`               | `ghp_…`                                       | если используется GitHub-интеграция |
 | `INITIAL_ADMIN_LOGIN`    | `admin`                                       | да                                  |
 | `INITIAL_ADMIN_PASSWORD` | сгенерировать через `openssl rand -base64 24` | да                                  |
@@ -91,14 +91,14 @@ python3.11 --version   # должна быть >= 3.11
 
 ```bash
 # Системный пользователь без shell — запускать сервис под ним
-sudo useradd --system --create-home --home-dir /var/lib/openclaw-hub \
-    --shell /usr/sbin/nologin openclaw || true
+sudo useradd --system --create-home --home-dir /var/lib/haiplane-hub \
+    --shell /usr/sbin/nologin haiplane || true
 
 # Каталоги
-sudo install -d -o openclaw -g openclaw -m 0750 /etc/openclaw-hub
-sudo install -d -o openclaw -g openclaw -m 0750 /var/lib/openclaw-hub
-sudo install -d -o openclaw -g openclaw -m 0750 /var/log/openclaw-hub
-sudo install -d -o openclaw -g openclaw -m 0750 /opt/openclaw-hub
+sudo install -d -o haiplane -g haiplane -m 0750 /etc/haiplane-hub
+sudo install -d -o haiplane -g haiplane -m 0750 /var/lib/haiplane-hub
+sudo install -d -o haiplane -g haiplane -m 0750 /var/log/haiplane-hub
+sudo install -d -o haiplane -g haiplane -m 0750 /opt/haiplane-hub
 ```
 
 ---
@@ -106,61 +106,61 @@ sudo install -d -o openclaw -g openclaw -m 0750 /opt/openclaw-hub
 ## 4. Установка кода
 
 ```bash
-sudo -u openclaw git clone https://github.com/${GITHUB_REPO}.git /opt/openclaw-hub/src
-cd /opt/openclaw-hub/src
+sudo -u haiplane git clone https://github.com/${GITHUB_REPO}.git /opt/haiplane-hub/src
+cd /opt/haiplane-hub/src
 LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "main")
-sudo -u openclaw git checkout "$LATEST_TAG"
+sudo -u haiplane git checkout "$LATEST_TAG"
 ```
 
 Создать виртуальное окружение и установить пакет:
 
 ```bash
-sudo -u openclaw python3.11 -m venv /opt/openclaw-hub/venv
-sudo -u openclaw /opt/openclaw-hub/venv/bin/pip install --upgrade pip wheel
-sudo -u openclaw /opt/openclaw-hub/venv/bin/pip install -e /opt/openclaw-hub/src
+sudo -u haiplane python3.11 -m venv /opt/haiplane-hub/venv
+sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install --upgrade pip wheel
+sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e /opt/haiplane-hub/src
 ```
 
 Проверка:
 
 ```bash
-sudo -u openclaw /opt/openclaw-hub/venv/bin/openclaw-hub --help || true
-sudo -u openclaw /opt/openclaw-hub/venv/bin/oc-hub --help
+sudo -u haiplane /opt/haiplane-hub/venv/bin/haiplane-hub --help || true
+sudo -u haiplane /opt/haiplane-hub/venv/bin/oc-hub --help
 ```
 
 ---
 
 ## 5. Конфигурация (переменные окружения)
 
-Создать файл `/etc/openclaw-hub/openclaw-hub.env` (права `0640`,
-владелец `root:openclaw`):
+Создать файл `/etc/haiplane-hub/haiplane-hub.env` (права `0640`,
+владелец `root:haiplane`):
 
 ```dotenv
 # --- сетевые параметры ---
-OPENCLAW_HUB_HOST=127.0.0.1
-OPENCLAW_HUB_PORT=8080
+HAIPLANE_HUB_HOST=127.0.0.1
+HAIPLANE_HUB_PORT=8080
 # Публичный URL за reverse proxy — echo в MCP (instance/base_url, #174).
-OPENCLAW_HUB_URL=https://__DOMAIN__
+HAIPLANE_HUB_URL=https://__DOMAIN__
 
 # --- хранилище ---
-OPENCLAW_HUB_HOME=/var/lib/openclaw-hub
-OPENCLAW_HUB_DB=/var/lib/openclaw-hub/hub.db
-OPENCLAW_TRANSCRIPTS_DIR=/var/lib/openclaw-hub/transcripts
+HAIPLANE_HUB_HOME=/var/lib/haiplane-hub
+HAIPLANE_HUB_DB=/var/lib/haiplane-hub/hub.db
+HAIPLANE_TRANSCRIPTS_DIR=/var/lib/haiplane-hub/transcripts
 
 # --- аутентификация ---
 # Cookie защищён, потому что сервис стоит за HTTPS-прокси
-OPENCLAW_HUB_COOKIE_SECURE=1
+HAIPLANE_HUB_COOKIE_SECURE=1
 # Одноразовый bootstrap-токен для создания первого администратора через UI/CLI.
 # После создания админа — закомментировать строку и перезапустить сервис.
-OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN=__REPLACE_ME__
+HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN=__REPLACE_ME__
 
 # --- интеграции (опционально) ---
-OPENCLAW_HUB_REPO=__OWNER__/__REPO__
+HAIPLANE_HUB_REPO=__OWNER__/__REPO__
 GH_BIN=/usr/bin/gh
-# GH_TOKEN кладётся в /etc/openclaw-hub/secrets.env (см. ниже)
+# GH_TOKEN кладётся в /etc/haiplane-hub/secrets.env (см. ниже)
 ```
 
-Секреты вынести в отдельный файл `/etc/openclaw-hub/secrets.env`
-(права `0600`, владелец `root:openclaw`):
+Секреты вынести в отдельный файл `/etc/haiplane-hub/secrets.env`
+(права `0600`, владелец `root:haiplane`):
 
 ```dotenv
 GH_TOKEN=ghp_xxx
@@ -170,10 +170,10 @@ GH_TOKEN=ghp_xxx
 
 ```bash
 BOOTSTRAP=$(openssl rand -hex 32)
-sudo sed -i "s|__REPLACE_ME__|$BOOTSTRAP|" /etc/openclaw-hub/openclaw-hub.env
-sudo chown root:openclaw /etc/openclaw-hub/*.env
-sudo chmod 0640 /etc/openclaw-hub/openclaw-hub.env
-sudo chmod 0600 /etc/openclaw-hub/secrets.env
+sudo sed -i "s|__REPLACE_ME__|$BOOTSTRAP|" /etc/haiplane-hub/haiplane-hub.env
+sudo chown root:haiplane /etc/haiplane-hub/*.env
+sudo chmod 0640 /etc/haiplane-hub/haiplane-hub.env
+sudo chmod 0600 /etc/haiplane-hub/secrets.env
 ```
 
 Значение `BOOTSTRAP` передать оператору **один раз** и не сохранять в логах.
@@ -182,7 +182,7 @@ sudo chmod 0600 /etc/openclaw-hub/secrets.env
 
 ## 6. systemd unit
 
-Файл `/etc/systemd/system/openclaw-hub.service`:
+Файл `/etc/systemd/system/haiplane-hub.service`:
 
 ```ini
 [Unit]
@@ -192,23 +192,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=openclaw
-Group=openclaw
-WorkingDirectory=/opt/openclaw-hub/src
-EnvironmentFile=/etc/openclaw-hub/openclaw-hub.env
-EnvironmentFile=-/etc/openclaw-hub/secrets.env
-ExecStart=/opt/openclaw-hub/venv/bin/openclaw-hub
+User=haiplane
+Group=haiplane
+WorkingDirectory=/opt/haiplane-hub/src
+EnvironmentFile=/etc/haiplane-hub/haiplane-hub.env
+EnvironmentFile=-/etc/haiplane-hub/secrets.env
+ExecStart=/opt/haiplane-hub/venv/bin/haiplane-hub
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/openclaw-hub/service.log
-StandardError=append:/var/log/openclaw-hub/service.err
+StandardOutput=append:/var/log/haiplane-hub/service.log
+StandardError=append:/var/log/haiplane-hub/service.err
 
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/openclaw-hub /var/log/openclaw-hub
+ReadWritePaths=/var/lib/haiplane-hub /var/log/haiplane-hub
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -225,8 +225,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now openclaw-hub
-sudo systemctl status openclaw-hub --no-pager
+sudo systemctl enable --now haiplane-hub
+sudo systemctl status haiplane-hub --no-pager
 ```
 
 Проверка локального доступа:
@@ -239,7 +239,7 @@ curl -fsS http://127.0.0.1:8080/healthz || curl -fsS http://127.0.0.1:8080/
 
 ## 7. Reverse proxy (nginx + TLS)
 
-Конфиг `/etc/nginx/sites-available/openclaw-hub`:
+Конфиг `/etc/nginx/sites-available/haiplane-hub`:
 
 ```nginx
 server {
@@ -280,8 +280,8 @@ server {
 Подставить домен и активировать:
 
 ```bash
-sudo sed -i "s|__DOMAIN__|$DOMAIN|g" /etc/nginx/sites-available/openclaw-hub
-sudo ln -sf /etc/nginx/sites-available/openclaw-hub /etc/nginx/sites-enabled/
+sudo sed -i "s|__DOMAIN__|$DOMAIN|g" /etc/nginx/sites-available/haiplane-hub
+sudo ln -sf /etc/nginx/sites-available/haiplane-hub /etc/nginx/sites-enabled/
 sudo install -d /var/www/letsencrypt
 sudo nginx -t && sudo systemctl reload nginx
 ```
@@ -335,9 +335,9 @@ curl -fsS -X POST "https://${DOMAIN}/api/admin/bootstrap" \
 
 После успешного ответа:
 
-1. Закомментировать `OPENCLAW_HUB_BOOTSTRAP_ADMIN_TOKEN` в
-  `/etc/openclaw-hub/openclaw-hub.env`.
-2. Перезапустить сервис: `sudo systemctl restart openclaw-hub`.
+1. Закомментировать `HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN` в
+  `/etc/haiplane-hub/haiplane-hub.env`.
+2. Перезапустить сервис: `sudo systemctl restart haiplane-hub`.
 3. Передать оператору учётные данные администратора по защищённому каналу
   (1Password / Bitwarden / Vaultwarden) — **не в чат**.
 
@@ -348,21 +348,21 @@ curl -fsS -X POST "https://${DOMAIN}/api/admin/bootstrap" \
 База — SQLite, поэтому корректное копирование — через `.backup`:
 
 ```bash
-sudo install -d -o openclaw -g openclaw -m 0750 /var/backups/openclaw-hub
-sudo tee /etc/cron.daily/openclaw-hub-backup >/dev/null <<'EOF'
+sudo install -d -o haiplane -g haiplane -m 0750 /var/backups/haiplane-hub
+sudo tee /etc/cron.daily/haiplane-hub-backup >/dev/null <<'EOF'
 #!/bin/sh
 set -e
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-DEST="/var/backups/openclaw-hub/hub-$TS.db"
-sudo -u openclaw /opt/openclaw-hub/venv/bin/python -c \
+DEST="/var/backups/haiplane-hub/hub-$TS.db"
+sudo -u haiplane /opt/haiplane-hub/venv/bin/python -c \
     "import sqlite3,sys; \
-     src=sqlite3.connect('/var/lib/openclaw-hub/hub.db'); \
+     src=sqlite3.connect('/var/lib/haiplane-hub/hub.db'); \
      dst=sqlite3.connect(sys.argv[1]); \
      src.backup(dst); dst.close(); src.close()" "$DEST"
 gzip -9 "$DEST"
-find /var/backups/openclaw-hub -name 'hub-*.db.gz' -mtime +14 -delete
+find /var/backups/haiplane-hub -name 'hub-*.db.gz' -mtime +14 -delete
 EOF
-sudo chmod 0755 /etc/cron.daily/openclaw-hub-backup
+sudo chmod 0755 /etc/cron.daily/haiplane-hub-backup
 ```
 
 Один раз вручную проверить корректность бэкапа и восстановления на тестовом
@@ -376,7 +376,7 @@ sudo chmod 0755 /etc/cron.daily/openclaw-hub-backup
 
 ```bash
 # 1. Сервис жив
-systemctl is-active openclaw-hub
+systemctl is-active haiplane-hub
 # 2. Порт слушается только локально
 sudo ss -tlnp | grep ':8080'
 # 3. HTTPS отвечает
@@ -385,7 +385,7 @@ curl -fsSI "https://$DOMAIN/" | head -5
 echo | openssl s_client -servername "$DOMAIN" -connect "$DOMAIN":443 2>/dev/null \
     | openssl x509 -noout -dates -subject
 # 5. Логи без критики за последние 5 минут
-sudo journalctl -u openclaw-hub --since '5 min ago' --no-pager | tail -50
+sudo journalctl -u haiplane-hub --since '5 min ago' --no-pager | tail -50
 ```
 
 Если хоть одна проверка упала — фиксируем причину в логе деплоя и
@@ -399,19 +399,19 @@ sudo journalctl -u openclaw-hub --since '5 min ago' --no-pager | tail -50
 что задействует БД и рестарт сервиса):
 
 ```bash
-cd /opt/openclaw-hub/src
-sudo -u openclaw git fetch --tags
+cd /opt/haiplane-hub/src
+sudo -u haiplane git fetch --tags
 NEW_TAG=<запросить у оператора>
-sudo -u openclaw git checkout "$NEW_TAG"
-sudo -u openclaw /opt/openclaw-hub/venv/bin/pip install -e .
+sudo -u haiplane git checkout "$NEW_TAG"
+sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e .
 # Бэкап перед рестартом
-sudo /etc/cron.daily/openclaw-hub-backup
-sudo systemctl restart openclaw-hub
-sudo journalctl -u openclaw-hub -f --since '1 min ago'
+sudo /etc/cron.daily/haiplane-hub-backup
+sudo systemctl restart haiplane-hub
+sudo journalctl -u haiplane-hub -f --since '1 min ago'
 ```
 
 При ошибке миграции — откатить `git checkout <предыдущий тег>` и восстановить
-БД из последнего архива в `/var/backups/openclaw-hub`.
+БД из последнего архива в `/var/backups/haiplane-hub`.
 
 ---
 
@@ -421,9 +421,9 @@ sudo journalctl -u openclaw-hub -f --since '1 min ago'
 
 - SSH-доступ проверен.
 - Системные пакеты установлены, Python ≥ 3.11.
-- Пользователь `openclaw` и каталоги созданы с правильными правами.
+- Пользователь `haiplane` и каталоги созданы с правильными правами.
 - Код выкачен на тег `<TAG>`, venv собран.
-- Файлы `/etc/openclaw-hub/*.env` созданы, права `0640/0600`.
+- Файлы `/etc/haiplane-hub/*.env` созданы, права `0640/0600`.
 - systemd-юнит установлен, сервис активен, рестартует автоматически.
 - nginx + Let's Encrypt настроены, HTTPS отвечает 200/301.
 - UFW активен, наружу открыты только 22/80/443.
@@ -436,12 +436,12 @@ sudo journalctl -u openclaw-hub -f --since '1 min ago'
 
 ## 14. Что НЕЛЬЗЯ делать без явной команды оператора
 
-- Удалять `/var/lib/openclaw-hub/hub.db` или каталог бэкапов.
-- Запускать `git reset --hard`, `git clean -fdx` в `/opt/openclaw-hub/src`.
-- Открывать порт `8080` наружу или менять `OPENCLAW_HUB_HOST` на `0.0.0.0`
+- Удалять `/var/lib/haiplane-hub/hub.db` или каталог бэкапов.
+- Запускать `git reset --hard`, `git clean -fdx` в `/opt/haiplane-hub/src`.
+- Открывать порт `8080` наружу или менять `HAIPLANE_HUB_HOST` на `0.0.0.0`
 без TLS-прокси.
-- Отключать аутентификацию (`OPENCLAW_HUB_AUTH_DISABLED=1`,
-`OPENCLAW_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`).
+- Отключать аутентификацию (`HAIPLANE_HUB_AUTH_DISABLED=1`,
+`HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`).
 - Менять DNS-записи или ротацию TLS-сертификата.
 - Передавать секреты в чат или в публичные репозитории.
 

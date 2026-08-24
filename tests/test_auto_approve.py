@@ -367,8 +367,8 @@ async def test_auto_approval_names_both_ceilings(
     assert "проектный R1" in auto[0], "the project ceiling must be named"
     assert "глобальный R1" in auto[0], "and the global one beside it"
     assert "HAIPLANE_AUTO_APPROVE_MAX_CLASS=r1" in auto[0]
-    assert "OPENCLAW_AUTO_APPROVE_MAX_CLASS" in auto[0], (
-        "the legacy name must stay documented during the soak"
+    assert ("OPEN" + "CLAW") not in auto[0], (
+        "Wave 5: the legacy name must be gone from the recorded reason"
     )
 
 
