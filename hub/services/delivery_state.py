@@ -29,6 +29,7 @@ which is precisely the class of defect this epic exists to remove.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from hub import config
@@ -40,6 +41,38 @@ log = logging.getLogger("hub")
 IN_PROD = "in_prod"
 NOT_IN_PROD = "not_in_prod"
 UNKNOWN = "unknown"
+
+# #937: the ANSWER is still computed, never stored — what is cached is the
+# FACT of a failed network fetch for (workspace, sha), so a dashboard that
+# renders fifty cards does not repeat the same doomed round-trip on every
+# render. A deploy that later makes the sha fetchable is picked up after the
+# TTL, or immediately once commit_exists starts answering True.
+FETCH_MISS_TTL_SECONDS = 600.0
+_FETCH_MISS_CAP = 512
+_fetch_misses: dict[tuple[str, str], float] = {}
+
+
+def _fetch_miss_fresh(workspace: str, sha: str) -> float | None:
+    """Seconds since the cached miss, or None when there is no fresh miss."""
+    at = _fetch_misses.get((workspace, sha))
+    if at is None:
+        return None
+    age = time.monotonic() - at
+    if age >= FETCH_MISS_TTL_SECONDS:
+        _fetch_misses.pop((workspace, sha), None)
+        return None
+    return age
+
+
+def _record_fetch_miss(workspace: str, sha: str) -> None:
+    if len(_fetch_misses) >= _FETCH_MISS_CAP:
+        now = time.monotonic()
+        for key, at in list(_fetch_misses.items()):
+            if now - at >= FETCH_MISS_TTL_SECONDS:
+                _fetch_misses.pop(key, None)
+        if len(_fetch_misses) >= _FETCH_MISS_CAP:
+            _fetch_misses.clear()
+    _fetch_misses[(workspace, sha)] = time.monotonic()
 
 
 def _answer(state: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -135,16 +168,40 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             **known,
         )
 
+    # #937: the release the hub records is a deploy of the HUB's repository.
+    # For a task whose project lives in a different repo, that sha cannot
+    # exist in the project's workspace — asking git (and then the network)
+    # was a guaranteed miss paid on every dashboard render.
+    project_repo = (ctx.get("gh_repo") or "").strip().lower()
+    hub_repo = (config.REPO_NAME or "").strip().lower()
+    if project_repo and hub_repo and project_repo != hub_repo:
+        return _answer(
+            UNKNOWN,
+            f"релиз хаба ({hub_repo}) не применим к проекту в {project_repo} — "
+            "у этого проекта свой репозиторий, факт его выката хаб не записывает",
+            **known,
+        )
+
     # #883: the objects have to be here before git can be asked about them.
     # The workspace tracks the base branch, so a commit deployed from another
     # ref is simply absent — and that absence was answering "could not check"
     # for every task on this installation. Checked first, and only fetched
     # when missing: a present commit must cost no network at all.
     if await plugins.git_ops.commit_exists(workspace, deployed_sha) is False:
+        miss_age = _fetch_miss_fresh(workspace, deployed_sha)
+        if miss_age is not None:
+            return _answer(
+                UNKNOWN,
+                f"коммита {deployed_sha[:12]} нет в рабочей копии; недавний "
+                f"промах fetch ({int(miss_age)}с назад) — повторная попытка "
+                "отложена. Это не «не раскатано»",
+                **known,
+            )
         fetched, fetch_error = await plugins.git_ops.fetch_commit(
             workspace, deployed_sha, str(release.get("ref") or "")
         )
         if not fetched:
+            _record_fetch_miss(workspace, deployed_sha)
             return _answer(
                 UNKNOWN,
                 f"коммита {deployed_sha[:12]} нет в рабочей копии, и подтянуть "
