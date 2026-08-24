@@ -21,9 +21,7 @@ SEEDED_CI = "haiplane-ci.yml"
 SEEDED_STALE = "haiplane-stale.yml"
 SEEDED_CI_LEGACY = "openclaw-ci.yml"
 SEEDED_STALE_LEGACY = "openclaw-stale.yml"
-GITHUB_OWNER = (
-    ""  # "agentdrover" once agentdrover/haiplane exists; do not default to mrPDA
-)
+GITHUB_OWNER = "agentdrover"
 GITHUB_REPO = "haiplane"
 GITHUB_OWNER_LEGACY = "mrPDA"
 GITHUB_REPO_LEGACY = "openclaw-hub-standalone"

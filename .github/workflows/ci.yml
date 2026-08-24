@@ -115,8 +115,8 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/hub-ci-report
         with:
-          hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
-          hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
+          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: uv run pytest
           # A step that never ran reports its outcome as '' and is dropped by
@@ -142,8 +142,8 @@ jobs:
         if: ${{ always() }}
         continue-on-error: true
         env:
-          OPENCLAW_HUB_URL: ${{ secrets.OPENCLAW_HUB_URL }}
-          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          OPENCLAW_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
+          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
           AUDIT_JSON: audit.json
         run: uv run python scripts/ci_report_audit_to_hub.py
 
@@ -233,8 +233,8 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          OPENCLAW_HUB_URL: ${{ secrets.OPENCLAW_HUB_URL }}
-          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          OPENCLAW_HUB_URL: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
+          OPENCLAW_HUB_CI_TOKEN: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
           ROLLOUT_OUTCOME: ${{ steps.rollout.outcome }}
           DEPLOYED_SHA: ${{ github.sha }}
           DEPLOYED_REF: ${{ github.ref_name }}

@@ -156,9 +156,16 @@ def render(
             f"{name}: both the integration and the release branch must be known "
             "before a workflow can be rendered for this project"
         )
+    # require_github_owner() BEFORE ci_report_action(): with an empty owner
+    # the latter would quietly fall back to the legacy mrPDA slug, and a
+    # freshly provisioned repository would reference the archived action for
+    # the rest of its life. Refusing the render turns that into a provisioning
+    # detail somebody reads.
+    brand.require_github_owner()
     values = {
         "BASE_BRANCH": base,
         "RELEASE_BRANCH": release,
+        "CI_REPORT_ACTION": brand.ci_report_action(),
         # A JSON array is also a valid YAML flow sequence, and it quotes and
         # escapes every element for us — a branch name with a slash in it is
         # the ordinary case here, not the exotic one.
