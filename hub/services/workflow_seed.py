@@ -9,11 +9,8 @@ supported path to delivery at all. ``.github/workflows`` existed in the hub's
 own repository and nowhere else.
 
 WHAT THE HUB OWNS, AND ONLY THAT. Two file names — ``haiplane-ci.yml`` and
-``haiplane-stale.yml`` — plus their pre-rename twins ``openclaw-ci.yml`` and
-``openclaw-stale.yml``, which remain hub-owned in repositories seeded before
-the Haiplane rename. New files are written only into a repository that
-carries NO workflows of its own, and into no other; a repository holding
-only the legacy pair is already provisioned and never grows a second pair.
+``haiplane-stale.yml``. New files are written only into a repository that
+carries NO workflows of its own, and into no other.
 A repository that already runs something on a pull request has already
 answered the question this seeding asks, and the gate can read that answer;
 overwriting it, or adding a second opinion beside it, would be the hub
@@ -64,11 +61,6 @@ SEEDED_WORKFLOWS = {
     "ci.yml": brand.SEEDED_CI,
     "stale.yml": brand.SEEDED_STALE,
 }
-
-#: Names the hub wrote before the Haiplane rename. Still hub-owned: a
-#: repository carrying only this pair is provisioned (PRESENT), and the hub
-#: never lays the new pair beside it — one CI opinion per repository.
-LEGACY_SEEDED = {brand.SEEDED_CI_LEGACY, brand.SEEDED_STALE_LEGACY}
 
 #: The runner the shared reporting action documents as its default
 #: (docs/satellite-ci-report.md). A project that runs its tests some other way
@@ -156,11 +148,8 @@ def render(
             f"{name}: both the integration and the release branch must be known "
             "before a workflow can be rendered for this project"
         )
-    # require_github_owner() BEFORE ci_report_action(): with an empty owner
-    # the latter would quietly fall back to the legacy mrPDA slug, and a
-    # freshly provisioned repository would reference the archived action for
-    # the rest of its life. Refusing the render turns that into a provisioning
-    # detail somebody reads.
+    # require_github_owner() first: an empty owner must refuse the render
+    # as a provisioning detail somebody reads, not fail deeper in.
     brand.require_github_owner()
     values = {
         "BASE_BRANCH": base,

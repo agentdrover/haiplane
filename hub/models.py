@@ -604,7 +604,7 @@ class LatestReview(BaseModel):
     ``is_current`` is False when work was resubmitted after the verdict was
     recorded — the verdict is history, not a judgement of the latest work.
     ``self_approved`` is True when the verdict was accepted only because of
-    the ``OPENCLAW_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
+    the ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
     reviewed their own work, so the verdict is not independent (#434).
     """
 
@@ -2445,7 +2445,7 @@ class IdentityDiagnosticsView(BaseModel):
     """One-call identity + environment truth for agents (#452).
 
     ``connected_via`` is the base URL the client actually reached (from the
-    request Host), independent of ``base_url`` echoed from OPENCLAW_HUB_URL;
+    request Host), independent of ``base_url`` echoed from HAIPLANE_HUB_URL;
     ``config_mismatch`` flags when the two disagree so an operator never acts
     on the wrong instance. ``workspace_path``/``workspace_branch`` expose the
     server-side git workspace state in the same response.

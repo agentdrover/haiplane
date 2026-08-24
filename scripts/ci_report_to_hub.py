@@ -15,8 +15,8 @@ Two rules this script exists to obey:
   AC and left unreported for validation, with the reason attached. A false
   ``fail`` would block a verdict for something unrelated to the work.
 
-Env: HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_TOKEN (legacy OPENCLAW_* names are
-accepted as fallback; both absent ⇒ report nothing and say so),
+Env: HAIPLANE_HUB_URL, HAIPLANE_HUB_CI_TOKEN (both absent ⇒ report
+nothing and say so),
 GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
 HAIPLANE_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
 pytest`` — this repository's own way, and exactly what a satellite repository
@@ -51,16 +51,12 @@ _DEFAULT_AC_RUNNER = "uv run pytest"
 
 
 def env_get(suffix: str) -> str:
-    """HAIPLANE_ first, legacy OPENCLAW_ fallback; empty counts as unset.
+    """HAIPLANE_-prefixed env value; empty counts as unset.
 
     Standalone twin of ``hub.config.env_get`` — this script also runs in
     satellite repositories where the hub package is not importable.
     """
-    return (
-        os.environ.get(f"HAIPLANE_{suffix}")
-        or os.environ.get(f"OPENCLAW_{suffix}")
-        or ""
-    )
+    return os.environ.get(f"HAIPLANE_{suffix}") or ""
 
 
 def log(msg: str) -> None:
@@ -267,7 +263,7 @@ def main() -> int:
     token = env_get("HUB_CI_TOKEN")
     if not base or not token:
         log(
-            "HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN (or legacy OPENCLAW_*) "
+            "HAIPLANE_HUB_URL / HAIPLANE_HUB_CI_TOKEN "
             "not configured — reporting nothing; the hub will read this as "
             "unknown, not as failure"
         )

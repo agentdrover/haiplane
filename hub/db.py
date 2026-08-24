@@ -523,7 +523,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE projects ADD COLUMN provision_detail TEXT NOT NULL DEFAULT ''",
     ),
     # ---- Audited solo mode (#434): verdicts accepted only because of
-    # OPENCLAW_REVIEW_SELF_APPROVE=allow stay distinguishable in hindsight.
+    # HAIPLANE_REVIEW_SELF_APPROVE=allow stay distinguishable in hindsight.
     (
         "add_review_self_approved_column",
         "ALTER TABLE tasks ADD COLUMN review_self_approved INTEGER NOT NULL DEFAULT 0",
@@ -2024,7 +2024,7 @@ MACHINE_REVIEW_CYCLE_SKILL = """\
 feature/bug M+ — да; риск high или security — всегда). Хаб сам сообщает:
 `lifecycle_hint` в ответе `hub_submit_for_review`, предупреждение в панели
 ревью, событие `machine_review_requested` в фиде. Режим
-HAIPLANE_MACHINE_REVIEW=require (fallback OPENCLAW_MACHINE_REVIEW)
+HAIPLANE_MACHINE_REVIEW=require
 блокирует человеческий вердикт без актуального отчёта; дефолт warn —
 только предупреждает.
 

@@ -14,12 +14,9 @@ def env_get(suffix: str, default: str) -> str: ...
 
 
 def env_get(suffix: str, default: str | None = None) -> str | None:
-    new = os.environ.get(brand.ENV_PREFIX + suffix)
-    if new:
-        return new
-    old = os.environ.get(brand.ENV_PREFIX_LEGACY + suffix)
-    if old:
-        return old
+    value = os.environ.get(brand.ENV_PREFIX + suffix)
+    if value:
+        return value
     return default
 
 
@@ -39,7 +36,7 @@ N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
 VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-haiplane"))
-# Vast.ai is opt-in. Disabled by default — set OPENCLAW_VAST_ENABLED=1 to turn on.
+# Vast.ai is opt-in. Disabled by default — set HAIPLANE_VAST_ENABLED=1 to turn on.
 VAST_ENABLED = env_get("VAST_ENABLED", "0") == "1"
 
 TRANSCRIPTS_DIR = Path(
@@ -245,7 +242,7 @@ PAIR_BASE_BRANCH = env_get("PAIR_BASE_BRANCH", "develop")
 # ---------------------------------------------------------------------------
 #
 # Tokens are configured as a comma-separated list of "name:token" pairs in
-# OPENCLAW_HUB_TOKENS, e.g.: "alice:s3cret,bob:hunter2".
+# HAIPLANE_HUB_TOKENS, e.g.: "alice:s3cret,bob:hunter2".
 #
 # Behaviour:
 # - If the list is empty, Hub runs in single-user open mode (no auth, identity
@@ -253,16 +250,14 @@ PAIR_BASE_BRANCH = env_get("PAIR_BASE_BRANCH", "develop")
 #   existing deploys and unit tests.
 # - If at least one token is configured, every /api/*, /tasks/*, /partials/*
 #   and /mcp/* request must authenticate via Bearer header or session cookie.
-# - OPENCLAW_HUB_AUTH_DISABLED=1 force-disables the gate even when tokens are
+# - HAIPLANE_HUB_AUTH_DISABLED=1 force-disables the gate even when tokens are
 #   configured. Useful for one-off debugging; never enable in production.
 HUB_TOKENS_RAW = env_get("HUB_TOKENS", "")
 HUB_AUTH_DISABLED = env_get("HUB_AUTH_DISABLED", "0") == "1"
 HUB_ALLOW_UNAUTH_NETWORK = env_get("HUB_ALLOW_UNAUTHENTICATED_NETWORK", "0") == "1"
 HUB_ALLOWED_HOSTS_RAW = env_get("HUB_ALLOWED_HOSTS", "")
-# Session cookie (Haiplane rebrand, Wave 3). An operator override via
-# HAIPLANE_HUB_COOKIE / OPENCLAW_HUB_COOKIE names the ONLY cookie the hub
-# reads; without one the default is the new name and hub/auth.py also accepts
-# the legacy openclaw_hub_session so live sessions survive the rename.
+# Session cookie. An operator override via HAIPLANE_HUB_COOKIE names the
+# ONLY cookie the hub reads; without one the default is brand.COOKIE_NAME.
 _cookie_explicit = env_get("HUB_COOKIE")
 HUB_COOKIE_NAME_EXPLICIT = bool(_cookie_explicit)
 HUB_COOKIE_NAME = _cookie_explicit or brand.COOKIE_NAME
@@ -369,7 +364,7 @@ VALID_ROLES = frozenset({"human", "agent", "admin"})
 
 
 def parse_tokens(raw: str) -> dict[str, TokenIdentity]:
-    """Parse OPENCLAW_HUB_TOKENS into a {token: TokenIdentity} mapping.
+    """Parse HAIPLANE_HUB_TOKENS into a {token: TokenIdentity} mapping.
 
     Format: "name:token[:role],name2:token2[:role2]"
     Role is optional — defaults to ``human``. Valid roles: human, agent, admin.
@@ -434,7 +429,6 @@ def validate_network_auth() -> None:
         return
     raise RuntimeError(
         f"Refusing to bind to {HUB_HOST!r} without authentication. "
-        f"Either set HAIPLANE_HUB_TOKENS (or the legacy OPENCLAW_HUB_TOKENS), "
-        f"bind to 127.0.0.1, or set HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 "
-        f"(legacy OPENCLAW_ prefix also accepted) to override."
+        f"Either set HAIPLANE_HUB_TOKENS, bind to 127.0.0.1, or set "
+        f"HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 to override."
     )

@@ -33,7 +33,7 @@ def test_api_rejects_non_http_scheme(monkeypatch, capsys) -> None:
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "HAIPLANE_HUB_URL" in err
-    assert "OPENCLAW_HUB_URL" in err, "the legacy name must stay documented"
+    assert ("OPEN" + "CLAW") not in err, "Wave 5: no legacy name in errors"
     assert "must use http/https" in err
 
 

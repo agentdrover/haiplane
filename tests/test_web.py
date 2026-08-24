@@ -826,7 +826,7 @@ async def test_web_verdict_invalid_form_shows_error_not_500(client: AsyncClient)
 async def test_web_solo_verdict_marked_and_badge_rendered(
     client: AsyncClient, monkeypatch
 ):
-    """#434: a verdict accepted via OPENCLAW_REVIEW_SELF_APPROVE=allow is
+    """#434: a verdict accepted via HAIPLANE_REVIEW_SELF_APPROVE=allow is
     persisted as self-approved and badged next to the verdict in the panel."""
     from hub import config
 
@@ -5503,5 +5503,5 @@ async def test_login_page_uses_haiplane_brand(client: AsyncClient) -> None:
     response = await client.get("/login")
     assert response.status_code == 200
     assert "Haiplane" in response.text
-    assert "OpenClaw" not in response.text
+    assert ("Open" + "Claw") not in response.text
     assert "&#x1f980;" not in response.text

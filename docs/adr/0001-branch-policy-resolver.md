@@ -12,7 +12,7 @@
 
 ## Context
 
-OpenClaw Hub already persists `branch` and `pr_number` on tasks and runs a
+Haiplane Hub already persists `branch` and `pr_number` on tasks and runs a
 post-done CI conveyor (`transition_after_agent_done`, poller). Branch names are
 created ad hoc in `git_ops` as `task-{id}/{slug}` with slug from title.
 
@@ -219,7 +219,7 @@ Add `branch_policy` to `STRUCTURED_TASK_FIELDS` / repository serialize path.
 | Policy on every task | Copy-paste returns; epic is natural owner |
 | Separate `branch_policies` table | Overkill for v1; JSON column matches `risks` |
 | Store computed `branch_name` on task | Duplicates template logic; stale on title edit |
-| Global config only (`OPENCLAW_PAIR_BASE_BRANCH`) | Cannot differ per epic/repo |
+| Global config only (`HAIPLANE_PAIR_BASE_BRANCH`) | Cannot differ per epic/repo |
 
 ## Implementation checklist (#237)
 

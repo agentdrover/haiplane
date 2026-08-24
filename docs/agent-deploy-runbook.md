@@ -16,14 +16,14 @@
 
 - HTTP UI: `http://agenthai.ru:8080/`
 - SSH-доступ: значения `DEPLOY_HOST` / `DEPLOY_USER` — в секретах CI и у оператора; в репозитории они не публикуются
-- systemd service: `openclaw-hub`
-- runtime user на сервере: `openclaw`
-- исходники сервиса: `/opt/openclaw-hub/src`
-- виртуальное окружение: `/opt/openclaw-hub/venv`
-- staging-каталог для rsync: `/home/user1/openclaw-hub-src-staging`
-- основной env-файл: `/etc/openclaw-hub/openclaw-hub.env`
-- опциональный secrets env-файл: `/etc/openclaw-hub/secrets.env`
-- логи: `/var/log/openclaw-hub/`
+- systemd service: `haiplane-hub`
+- runtime user на сервере: `haiplane`
+- исходники сервиса: `/opt/haiplane-hub/src`
+- виртуальное окружение: `/opt/haiplane-hub/venv`
+- staging-каталог для rsync: `/home/user1/haiplane-hub-src-staging`
+- основной env-файл: `/etc/haiplane-hub/haiplane-hub.env`
+- опциональный secrets env-файл: `/etc/haiplane-hub/secrets.env`
+- логи: `/var/log/haiplane-hub/`
 
 Важно: в репозитории нет приватных SSH-ключей, токенов, паролей или `.env` с
 реальными значениями. Не добавляйте их в git.
@@ -42,7 +42,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 <DEPLOY_USER>@<DEPLOY_HOST> 'echo ssh_
 
 ```bash
 # НЕ выполнять по умолчанию: выведет секреты в лог/чат
-sudo cat /etc/openclaw-hub/secrets.env
+sudo cat /etc/haiplane-hub/secrets.env
 ```
 
 Если нужно убедиться, что токены есть в env-файлах, проверяйте без вывода
@@ -50,11 +50,11 @@ sudo cat /etc/openclaw-hub/secrets.env
 
 ```bash
 ssh <DEPLOY_USER>@<DEPLOY_HOST> '
-  sudo test -s /etc/openclaw-hub/openclaw-hub.env && echo openclaw_env_present
-  sudo test -s /etc/openclaw-hub/secrets.env && echo secrets_env_present || true
-  sudo grep -q "^OPENCLAW_HUB_TOKENS=" /etc/openclaw-hub/openclaw-hub.env \
+  sudo test -s /etc/haiplane-hub/haiplane-hub.env && echo haiplane_env_present
+  sudo test -s /etc/haiplane-hub/secrets.env && echo secrets_env_present || true
+  sudo grep -q "^HAIPLANE_HUB_TOKENS=" /etc/haiplane-hub/haiplane-hub.env \
     && echo hub_tokens_configured || echo hub_tokens_missing
-  sudo grep -q "^OPENCLAW_HUB_URL=https://agenthai.ru$" /etc/openclaw-hub/openclaw-hub.env \
+  sudo grep -q "^HAIPLANE_HUB_URL=https://agenthai.ru$" /etc/haiplane-hub/haiplane-hub.env \
     && echo hub_public_url_ok || echo hub_public_url_missing
 '
 ```
@@ -69,7 +69,7 @@ ssh <DEPLOY_USER>@<DEPLOY_HOST> '
 Перед деплоем агент должен убедиться, что:
 
 - SSH доступ работает.
-- Серверный каталог `/opt/openclaw-hub/src` существует.
+- Серверный каталог `/opt/haiplane-hub/src` существует.
 - Локальные тесты для затронутой области прошли.
 - В рабочем дереве нет неожиданных секретов.
 
@@ -78,9 +78,9 @@ ssh <DEPLOY_USER>@<DEPLOY_HOST> '
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=15 <DEPLOY_USER>@<DEPLOY_HOST> '
   echo ssh_ok
-  sudo test -d /opt/openclaw-hub/src && echo src_ok
-  sudo test -f /etc/openclaw-hub/openclaw-hub.env && echo env_ok
-  systemctl is-active openclaw-hub
+  sudo test -d /opt/haiplane-hub/src && echo src_ok
+  sudo test -f /etc/haiplane-hub/haiplane-hub.env && echo env_ok
+  systemctl is-active haiplane-hub
 '
 ```
 
@@ -101,16 +101,16 @@ uv run ruff check hub tests
 ## 4. Стандартный деплой текущей рабочей копии
 
 Деплой выполняется через staging-каталог пользователя `user1`, затем `sudo rsync`
-в `/opt/openclaw-hub/src`. Это текущий рабочий процесс для этого сервера. Та же
+в `/opt/haiplane-hub/src`. Это текущий рабочий процесс для этого сервера. Та же
 логика серверной части версионируется в `deploy/remote-deploy.sh` и используется
 авто-деплоем; при желании после `rsync` в staging можно запустить именно её:
 `ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' < deploy/remote-deploy.sh`.
 
 > **Правка `deploy/remote-deploy.sh` требует ручного шага на сервере.** SSH-ключ
-> CI (`openclaw-hub-ci-deploy`) с 14.08.2026 ограничен форсированной командой
-> `/usr/local/sbin/openclaw-ci-deploy-guard`: она пропускает только `rsync` на
-> приём в `~/openclaw-hub-src-staging/` и `bash -s`, причём выполняет не
-> присланный скрипт, а закреплённую копию `/usr/local/sbin/openclaw-remote-deploy.sh`
+> CI (`haiplane-hub-ci-deploy`) с 14.08.2026 ограничен форсированной командой
+> `/usr/local/sbin/haiplane-ci-deploy-guard`: она пропускает только `rsync` на
+> приём в `~/haiplane-hub-src-staging/` и `bash -s`, причём выполняет не
+> присланный скрипт, а закреплённую копию `/usr/local/sbin/haiplane-remote-deploy.sh`
 > — и только если sha256 совпал. Смысл в том, что утечка секрета `DEPLOY_SSH_KEY`
 > больше не даёт произвольную команду на сервере: до этого ключ был обычным
 > шеллом под `user1`, у которого `NOPASSWD:ALL`.
@@ -119,13 +119,13 @@ uv run ruff check hub tests
 > пока копию на сервере не обновит человек:
 >
 > ```bash
-> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/openclaw-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh
-> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/openclaw-remote-deploy.sh'
+> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/haiplane-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh
+> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/haiplane-remote-deploy.sh'
 > ```
 >
 > Падение будет громким, а не тихим: job упадёт красным, а в логе будут оба
-> sha256 и эта же команда. Отказы guard пишет в syslog тегом `openclaw-ci-guard`
-> (`journalctl -t openclaw-ci-guard`).
+> sha256 и эта же команда. Отказы guard пишет в syslog тегом `haiplane-ci-guard`
+> (`journalctl -t haiplane-ci-guard`).
 >
 > Ручной деплой ниже ограничения не касается: он идёт под личным ключом
 > администратора, а форсированная команда висит только на ключе CI.
@@ -139,27 +139,27 @@ rsync -az --delete \
   --exclude '.pytest_cache' \
   --exclude '*.pyc' \
   --exclude '.git' \
-  /Users/<user>/openclaw-hub-standalone/ \
-  <DEPLOY_USER>@<DEPLOY_HOST>:~/openclaw-hub-src-staging/
+  /Users/<user>/haiplane/ \
+  <DEPLOY_USER>@<DEPLOY_HOST>:~/haiplane-hub-src-staging/
 
 ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' <<'REMOTE'
 set -euo pipefail
-STAGING="$HOME/openclaw-hub-src-staging"
-DEST=/opt/openclaw-hub/src
+STAGING="$HOME/haiplane-hub-src-staging"
+DEST=/opt/haiplane-hub/src
 
 sudo rsync -a --delete "$STAGING/" "$DEST/"
-sudo chown -R openclaw:openclaw "$DEST"
-sudo -u openclaw /opt/openclaw-hub/venv/bin/pip install -e "$DEST" -q
-sudo systemctl restart openclaw-hub
+sudo chown -R haiplane:haiplane "$DEST"
+sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+sudo systemctl restart haiplane-hub
 sleep 2
-sudo systemctl is-active openclaw-hub
+sudo systemctl is-active haiplane-hub
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/healthz
 REMOTE
 ```
 
 Критерии успеха:
 
-- `systemctl is-active openclaw-hub` возвращает `active`.
+- `systemctl is-active haiplane-hub` возвращает `active`.
 - `/healthz` возвращает `200`.
 
 ## 5. Проверка после деплоя
@@ -168,7 +168,7 @@ REMOTE
 
 ```bash
 ssh <DEPLOY_USER>@<DEPLOY_HOST> '
-  echo "service=$(systemctl is-active openclaw-hub)"
+  echo "service=$(systemctl is-active haiplane-hub)"
   curl -sf http://127.0.0.1:8080/healthz
 '
 ```
@@ -177,9 +177,9 @@ ssh <DEPLOY_USER>@<DEPLOY_HOST> '
 
 ```bash
 ssh <DEPLOY_USER>@<DEPLOY_HOST> '
-  sudo journalctl -u openclaw-hub -n 80 --no-pager
+  sudo journalctl -u haiplane-hub -n 80 --no-pager
   echo "--- service.err ---"
-  sudo tail -80 /var/log/openclaw-hub/service.err 2>/dev/null || true
+  sudo tail -80 /var/log/haiplane-hub/service.err 2>/dev/null || true
 '
 ```
 
@@ -189,15 +189,15 @@ ssh <DEPLOY_USER>@<DEPLOY_HOST> '
 ## 6. Где лежат важные файлы на сервере
 
 ```text
-/opt/openclaw-hub/src/                 код приложения
-/opt/openclaw-hub/venv/                Python venv
-/usr/local/sbin/openclaw-ci-deploy-guard      форсированная команда для ключа CI (см. раздел 4)
-/usr/local/sbin/openclaw-remote-deploy.sh     закреплённая копия deploy/remote-deploy.sh
-/etc/openclaw-hub/openclaw-hub.env     несекретная и частично чувствительная конфигурация
-/etc/openclaw-hub/secrets.env          секреты интеграций, если есть
-/var/lib/openclaw-hub/hub.db           SQLite база
-/var/log/openclaw-hub/service.log      stdout сервиса
-/var/log/openclaw-hub/service.err      stderr сервиса
+/opt/haiplane-hub/src/                 код приложения
+/opt/haiplane-hub/venv/                Python venv
+/usr/local/sbin/haiplane-ci-deploy-guard      форсированная команда для ключа CI (см. раздел 4)
+/usr/local/sbin/haiplane-remote-deploy.sh     закреплённая копия deploy/remote-deploy.sh
+/etc/haiplane-hub/haiplane-hub.env     несекретная и частично чувствительная конфигурация
+/etc/haiplane-hub/secrets.env          секреты интеграций, если есть
+/var/lib/haiplane-hub/hub.db           SQLite база
+/var/log/haiplane-hub/service.log      stdout сервиса
+/var/log/haiplane-hub/service.err      stderr сервиса
 ```
 
 ## 7. Когда использовать полный deployment guide
@@ -226,10 +226,10 @@ ssh <DEPLOY_USER>@<DEPLOY_HOST> '
 Типичный `.env.local` (файл в `.gitignore`):
 
 ```bash
-OPENCLAW_HUB_DB=/absolute/path/.local/state/hub.db
-OPENCLAW_HUB_TOKENS=name:token:human,cursor:token:agent,cursor-reviewer:token2:agent
-OPENCLAW_WORKSPACE_REPO=/absolute/path/to/workspace-clone
-OPENCLAW_HUB_REPO=org/repo-name
+HAIPLANE_HUB_DB=/absolute/path/.local/state/hub.db
+HAIPLANE_HUB_TOKENS=name:token:human,cursor:token:agent,cursor-reviewer:token2:agent
+HAIPLANE_WORKSPACE_REPO=/absolute/path/to/workspace-clone
+HAIPLANE_HUB_REPO=org/repo-name
 ```
 
 ### Reviewer-токен (Universal Review Gate, #432)
@@ -240,24 +240,24 @@ OPENCLAW_HUB_REPO=org/repo-name
 блокируется gate'ом (`self_review_forbidden`) и цикл ревью стопорится.
 
 - Генерация секрета: `openssl rand -hex 32` (в чат/git не выводить).
-- На production токен добавляется в `OPENCLAW_HUB_TOKENS` в
-  `/etc/openclaw-hub/openclaw-hub.env` (проверять наличие через `grep -q`,
-  как в разделе 2, без вывода значений) + restart `openclaw-hub`.
+- На production токен добавляется в `HAIPLANE_HUB_TOKENS` в
+  `/etc/haiplane-hub/haiplane-hub.env` (проверять наличие через `grep -q`,
+  как в разделе 2, без вывода значений) + restart `haiplane-hub`.
 - Reviewer-сессия (агент/subagent, который вызывает `hub_submit_review`)
-  запускается с `OPENCLAW_HUB_TOKEN=<reviewer-token>`; исполнитель — со своим
+  запускается с `HAIPLANE_HUB_TOKEN=<reviewer-token>`; исполнитель — со своим
   токеном. Детали: `docs/agent-onboarding.md`, раздел про reviewer-идентичность.
 
-### `OPENCLAW_WORKSPACE_REPO` и pair mode
+### `HAIPLANE_WORKSPACE_REPO` и pair mode
 
 | Переменная | Назначение |
 |------------|------------|
-| `OPENCLAW_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при `hub_start_task` и **`hub_pair_start`** |
-| `OPENCLAW_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
-| `OPENCLAW_WORKTREE_PER_TASK` | `1` включает изоляцию pair-задач через `git worktree` (#459): каждая задача получает своё дерево `.<repo>-worktrees/task-<id>`, основной клон остаётся на base. По умолчанию выкл — поведение как раньше. Требует git ≥ 2.15 и место под несколько деревьев. Подробнее: [workspace-safety-policy.md](workspace-safety-policy.md#worktree-per-task-opt-in-459) |
+| `HAIPLANE_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при `hub_start_task` и **`hub_pair_start`** |
+| `HAIPLANE_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
+| `HAIPLANE_WORKTREE_PER_TASK` | `1` включает изоляцию pair-задач через `git worktree` (#459): каждая задача получает своё дерево `.<repo>-worktrees/task-<id>`, основной клон остаётся на base. По умолчанию выкл — поведение как раньше. Требует git ≥ 2.15 и место под несколько деревьев. Подробнее: [workspace-safety-policy.md](workspace-safety-policy.md#worktree-per-task-opt-in-459) |
 
-**Production (agenthai.ru):** `OPENCLAW_WORKSPACE_REPO` обычно указывает на server clone (`/opt/openclaw-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**. В `/etc/openclaw-hub/openclaw-hub.env` обязателен `OPENCLAW_HUB_URL=https://agenthai.ru` — без него MCP echo `instance: local` и `base_url: http://127.0.0.1:8080` (#174, #452).
+**Production (agenthai.ru):** `HAIPLANE_WORKSPACE_REPO` обычно указывает на server clone (`/opt/haiplane-hub/src` или продуктовый repo на сервере). Pair-start создаёт branch **там**. В `/etc/haiplane-hub/haiplane-hub.env` обязателен `HAIPLANE_HUB_URL=https://agenthai.ru` — без него MCP echo `instance: local` и `base_url: http://127.0.0.1:8080` (#174, #452).
 
-**Local dev:** часто `OPENCLAW_WORKSPACE_REPO` = тот же каталог, что открыт в Cursor. Тогда pair-start **переключает и чистит этот clone** — см. [Pair mode: git policy](../software-development-workflow.md#pair-mode-git-policy).
+**Local dev:** часто `HAIPLANE_WORKSPACE_REPO` = тот же каталог, что открыт в Cursor. Тогда pair-start **переключает и чистит этот clone** — см. [Pair mode: git policy](../software-development-workflow.md#pair-mode-git-policy).
 
 Ожидания для pair path B:
 
@@ -275,45 +275,45 @@ OPENCLAW_HUB_REPO=org/repo-name
 
 ### Git-доступ сервисного пользователя (deploy key, #455)
 
-Сервисный пользователь `openclaw` на agenthai должен уметь `git fetch origin` в
-workspace хаба (`/var/lib/openclaw-hub/workspaces/_default`). Если доступа нет,
+Сервисный пользователь `haiplane` на agenthai должен уметь `git fetch origin` в
+workspace хаба (`/var/lib/haiplane-hub/workspaces/_default`). Если доступа нет,
 `pair_prepare_branch` тихо делает `pull --ff-only` с `check=False` и создаёт
 pair-ветки от **устаревшего** develop.
 
 **Настройка (человек/админ, один раз):**
 
-1. Сгенерировать read-only deploy key (без passphrase) от имени `openclaw`:
+1. Сгенерировать read-only deploy key (без passphrase) от имени `haiplane`:
 
    ```sh
-   sudo -u openclaw ssh-keygen -t ed25519 -N '' \
-     -f /home/openclaw/.ssh/id_ed25519 -C 'openclaw@agenthai deploy'
-   sudo -u openclaw cat /home/openclaw/.ssh/id_ed25519.pub
+   sudo -u haiplane ssh-keygen -t ed25519 -N '' \
+     -f /home/haiplane/.ssh/id_ed25519 -C 'haiplane@agenthai deploy'
+   sudo -u haiplane cat /home/haiplane/.ssh/id_ed25519.pub
    ```
 
-2. Добавить публичный ключ в GitHub: репозиторий `mrPDA/openclaw-hub-standalone`
+2. Добавить публичный ключ в GitHub: репозиторий `agentdrover/haiplane`
    → Settings → Deploy keys → Add deploy key → **Allow write access ВЫКЛ**
    (read-only достаточно; push идёт с машины разработчика).
 
-3. Прописать хост в `~openclaw/.ssh/config` (или задать `GIT_SSH_COMMAND` в
+3. Прописать хост в `~haiplane/.ssh/config` (или задать `GIT_SSH_COMMAND` в
    unit-файле сервиса):
 
    ```
    Host github.com
-     IdentityFile /home/openclaw/.ssh/id_ed25519
+     IdentityFile /home/haiplane/.ssh/id_ed25519
      IdentitiesOnly yes
    ```
 
 4. Убедиться, что `origin` использует ssh, а не https:
-   `sudo -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default remote set-url origin git@github.com:mrPDA/openclaw-hub-standalone.git`
+   `sudo -u haiplane git -C /var/lib/haiplane-hub/workspaces/_default remote set-url origin git@github.com:agentdrover/haiplane.git`
 
 **Проверка (AC-1):**
 
 ```sh
-ssh agenthai "sudo -n -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default fetch origin --prune \
-  && sudo -n -u openclaw git -C /var/lib/openclaw-hub/workspaces/_default remote -v"
+ssh agenthai "sudo -n -u haiplane git -C /var/lib/haiplane-hub/workspaces/_default fetch origin --prune \
+  && sudo -n -u haiplane git -C /var/lib/haiplane-hub/workspaces/_default remote -v"
 ```
 
-**Health-check в хабе (#455):** при `OPENCLAW_WORKSPACE_HEALTHCHECK=1` хаб на
+**Health-check в хабе (#455):** при `HAIPLANE_WORKSPACE_HEALTHCHECK=1` хаб на
 старте пробует `git ls-remote origin` в default workspace и пишет `WARNING` в
 лог, если origin недоступен (вместо тихого устаревания базы). Диагностика также
 доступна в `hub_admin_my_identity` (ветка workspace) и `GET

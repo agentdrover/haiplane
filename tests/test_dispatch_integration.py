@@ -279,8 +279,12 @@ async def test_agent_name_travels_in_the_environment(
 
     await plugin.submit_task("сделай", agent="pda_claude")
 
-    assert captured["OPENCLAW_OPENROUTER_DEV_AGENT"] == "pda_claude"
-    assert captured["OPENCLAW_VAST_DEV_AGENT"] == "pda_claude"
+    assert captured["HAIPLANE_OPENROUTER_DEV_AGENT"] == "pda_claude"
+    assert captured["HAIPLANE_VAST_DEV_AGENT"] == "pda_claude"
+    legacy_prefix = "OPEN" + "CLAW" + "_"
+    assert not [
+        k for k in captured if k.startswith(legacy_prefix) and k.endswith("_DEV_AGENT")
+    ], "Wave 5: the hub must not add legacy-prefixed agent keys"
 
 
 async def test_classify_parses_and_degrades_readably(

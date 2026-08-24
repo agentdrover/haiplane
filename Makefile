@@ -24,11 +24,11 @@ setup:
 # Arm the pre-push hook in REPO (default: this clone). Split out so the
 # bootstrap step itself can be exercised by a test rather than trusted.
 hooks:
-	uv run oc-git-policy activate $(REPO)
+	uv run hp-git-policy activate $(REPO)
 
 # Is a push from this clone actually checked? Non-zero when it is not.
 doctor:
-	uv run oc-git-policy doctor $(REPO)
+	uv run hp-git-policy doctor $(REPO)
 
 test:
 	uv run pytest -q

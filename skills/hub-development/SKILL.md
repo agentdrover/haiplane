@@ -30,7 +30,7 @@ description: Use when implementing or modifying code in the standalone Haiplane 
 - `uv run ruff check hub tests`
 - `uv run ruff format hub tests`
 - `uv run pytest -q`
-- `uv run openclaw-hub`
+- `uv run haiplane-hub`
 
 ## File Map
 

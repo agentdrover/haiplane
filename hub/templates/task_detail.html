@@ -888,7 +888,7 @@
                     for submission #{{ task.latest_review.submission_generation }}
                     ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
                     {% if task.latest_review.self_approved %}
-                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via HAIPLANE_REVIEW_SELF_APPROVE=allow (legacy OPENCLAW_REVIEW_SELF_APPROVE also accepted) — not an independent review">self-approved</span>
+                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via HAIPLANE_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
                     {% endif %}
                     {% if task.latest_review.findings %}
                     <ul class="task-review-findings">

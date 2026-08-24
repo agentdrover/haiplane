@@ -1,7 +1,5 @@
 # Haiplane Hub
 
-Formerly OpenClaw Hub.
-
 The public home is https://github.com/agentdrover/haiplane.
 
 Task orchestration server for AI agent pipelines. Manages task lifecycle, dispatches work to agents, runs automated code review cycles, and provides a web dashboard.
@@ -35,7 +33,7 @@ cd haiplane
 make setup
 
 # Run
-haiplane-hub          # legacy alias: openclaw-hub
+haiplane-hub
 # → http://localhost:8080
 ```
 
@@ -68,23 +66,20 @@ Minimum MCP tools for daily work:
 
 ## Configuration
 
-All configuration via environment variables. `HAIPLANE_*` names are canonical;
-every variable is also accepted under the legacy `OPENCLAW_*` prefix (the
-canonical name wins when both are set). Default filesystem paths still use the
-legacy `openclaw` family until the Wave 4 cutover.
+All configuration via environment variables, under the `HAIPLANE_*` prefix.
 
 | Variable | Default | Description |
 |---|---|---|
 | `HAIPLANE_HUB_REPO` | `""` | GitHub repo (e.g. `owner/repo`) for PR/commit integration |
-| `HAIPLANE_WORKSPACE_REPO` | `~/.openclaw/workspace/repo` | Path to the workspace git repo |
-| `HAIPLANE_DISPATCH_BIN` | `~/.local/bin/oc-dev-dispatch` | Path to dispatch binary |
-| `HAIPLANE_HUB_DB` | `~/.local/state/openclaw-hub/hub.db` | SQLite database path |
+| `HAIPLANE_WORKSPACE_REPO` | `~/.haiplane/workspace/repo` | Path to the workspace git repo |
+| `HAIPLANE_DISPATCH_BIN` | `~/.local/bin/hp-dev-dispatch` | Path to dispatch binary |
+| `HAIPLANE_HUB_DB` | `~/.local/state/haiplane-hub/hub.db` | SQLite database path |
 | `HAIPLANE_HUB_HOST` | `0.0.0.0` | Server bind host |
 | `HAIPLANE_HUB_PORT` | `8080` | Server bind port |
-| `HAIPLANE_TRANSCRIPTS_DIR` | `~/.openclaw/transcripts` | Agent transcript directory |
+| `HAIPLANE_TRANSCRIPTS_DIR` | `~/.haiplane/transcripts` | Agent transcript directory |
 | `HAIPLANE_N4L_BIN` | `~/.local/bin/n4l` | notesforllm CLI path |
 | `HAIPLANE_N4L_SPACE` | `""` | notesforllm space ID |
-| `HAIPLANE_VAST_JOB_BIN` | `~/.local/bin/vast-openclaw` | Vast.ai CLI path |
+| `HAIPLANE_VAST_JOB_BIN` | `~/.local/bin/vast-haiplane` | Vast.ai CLI path |
 | `GH_BIN` | `gh` | GitHub CLI binary |
 | `HAIPLANE_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
 | `HAIPLANE_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
@@ -265,7 +260,7 @@ Hub uses a plugin architecture for external integrations. Each integration imple
 - `GitOpsPlugin` — git branch/PR/merge via local git + `gh` CLI
 - `GitHubPlugin` — commits/PRs via `gh` CLI
 - `NotesPlugin` — decisions via `n4l` CLI
-- `VastPlugin` — GPU instance management via `vast-openclaw`
+- `VastPlugin` — GPU instance management via `vast-haiplane`
 - `TranscriptsPlugin` — agent transcript viewer
 
 **Without plugins**: Hub starts with noop implementations — all features work, integrations gracefully return empty data.

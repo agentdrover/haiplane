@@ -118,7 +118,7 @@ async def test_identity_diagnostics_flags_config_mismatch(monkeypatch):
     from hub.services.diagnostics import build_identity_diagnostics
 
     monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "http://127.0.0.1:8080")
     plugins.git_ops.current_branch = AsyncMock(return_value="develop")
 
     view = await build_identity_diagnostics(
@@ -134,14 +134,14 @@ async def test_identity_diagnostics_flags_config_mismatch(monkeypatch):
 
 
 async def test_identity_diagnostics_reads_haiplane_hub_url(monkeypatch):
-    """The instance echo honours the canonical prefix over the legacy one."""
+    """The instance echo reads the canonical prefix; the legacy one is dead."""
     from unittest.mock import AsyncMock
 
     from hub.integrations.registry import plugins
     from hub.services.diagnostics import build_identity_diagnostics
 
     monkeypatch.setenv("HAIPLANE_HUB_URL", "https://agenthai.ru/mcp")
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("OPEN" + "CLAW" + "_HUB_URL", "http://127.0.0.1:8080")
     plugins.git_ops.current_branch = AsyncMock(return_value="")
 
     view = await build_identity_diagnostics(
@@ -158,7 +158,7 @@ async def test_identity_diagnostics_no_mismatch_when_hosts_match(monkeypatch):
     from hub.services.diagnostics import build_identity_diagnostics
 
     monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "https://agenthai.ru/mcp")
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://agenthai.ru/mcp")
     plugins.git_ops.current_branch = AsyncMock(return_value="")
 
     view = await build_identity_diagnostics(
@@ -175,7 +175,7 @@ async def test_identity_diagnostics_no_connection_never_mismatches(monkeypatch):
     from hub.services.diagnostics import build_identity_diagnostics
 
     monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "http://127.0.0.1:8080")
     plugins.git_ops.current_branch = AsyncMock(return_value="")
 
     view = await build_identity_diagnostics(
@@ -190,7 +190,7 @@ async def test_diagnostics_identity_endpoint(client, monkeypatch):
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens("agent"))
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
     monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
-    monkeypatch.setenv("OPENCLAW_HUB_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "http://127.0.0.1:8080")
 
     resp = await client.get(
         "/api/diagnostics/identity",

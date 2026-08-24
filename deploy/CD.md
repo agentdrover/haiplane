@@ -14,9 +14,9 @@ Workflow: `.github/workflows/ci.yml`, job `deploy`.
    - событие — это `push` в `main` (на `pull_request` деплой не запускается).
 3. Шаги деплоя:
    - кладёт приватный SSH-ключ из секрета в раннер;
-   - `rsync` рабочего дерева в `~/openclaw-hub-src-staging` на сервере;
+   - `rsync` рабочего дерева в `~/haiplane-hub-src-staging` на сервере;
    - `ssh ... 'bash -s' < deploy/remote-deploy.sh` — промоут staging в
-     `/opt/openclaw-hub/src`, `pip install -e`, `systemctl restart openclaw-hub`,
+     `/opt/haiplane-hub/src`, `pip install -e`, `systemctl restart haiplane-hub`,
      проверка `systemctl is-active` и `GET /healthz`.
 
 `concurrency.group: deploy-production` гарантирует, что два деплоя не пойдут
@@ -41,14 +41,14 @@ Environment `production`):
 
 - публичная часть ключа добавлена в `~/.ssh/authorized_keys` пользователя `DEPLOY_USER`;
 - `DEPLOY_USER` может без пароля выполнять `sudo rsync`, `sudo chown`,
-  `sudo -u openclaw ... pip`, `sudo systemctl restart openclaw-hub`,
-  `sudo journalctl -u openclaw-hub`;
+  `sudo -u haiplane ... pip`, `sudo systemctl restart haiplane-hub`,
+  `sudo journalctl -u haiplane-hub`;
 - ключ хранится только в секретах GitHub. В git его класть нельзя.
 
 ## Что НЕ коммитим
 
 Приватные ключи, токены, реальные `.env`. Секреты живут только в GitHub Actions
-secrets и в `/etc/openclaw-hub/*.env` на сервере (см. runbook).
+secrets и в `/etc/haiplane-hub/*.env` на сервере (см. runbook).
 
 ## Ручной деплой / откат
 
@@ -61,7 +61,7 @@ secrets и в `/etc/openclaw-hub/*.env` на сервере (см. runbook).
 
 ```bash
 ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-  echo "service=$(systemctl is-active openclaw-hub)"
+  echo "service=$(systemctl is-active haiplane-hub)"
   curl -sf http://127.0.0.1:8080/healthz
 '
 ```
@@ -79,7 +79,7 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
 читать красное как «опять гонка», и следующий настоящий сбой будет пропущен.
 
 Три исхода различимы в логе джобы: сервис не поднялся / поднялся, но не отвечает /
-отвечает. На обеих ветках отказа печатается `journalctl -u openclaw-hub -n 40`.
+отвечает. На обеих ветках отказа печатается `journalctl -u haiplane-hub -n 40`.
 Раньше лог тянулся только когда сервис лежал — то есть ровно тогда, когда причина и
 так очевидна.
 
@@ -93,7 +93,7 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
 долгосрочным решением. Но своими силами systemd этого не сделает: `Type=notify`
 требует, чтобы **само приложение** отправило `READY=1` в `$NOTIFY_SOCKET` после
 того, как ASGI-сервер начал слушать. uvicorn такого из коробки не умеет — нужна
-доработка точки входа `openclaw-hub` (вызов sd_notify в хуке готовности FastAPI).
+доработка точки входа `haiplane-hub` (вызов sd_notify в хуке готовности FastAPI).
 
 Это изменение приложения, а не деплоя, поэтому в #547 не вошло. Возвращаться к
 вопросу имеет смысл, если время до первого 200 начнёт расти — тогда бюджет перестанет
@@ -153,7 +153,7 @@ workspace path) → провижининг стартует автоматиче
 Provision) → привязать эпик (`project` при создании эпика, #346) — задачи
 проекта едут по его репозиторию и веткам.
 
-### OPENCLAW_WORKSPACE_REPO (#378)
+### HAIPLANE_WORKSPACE_REPO (#378)
 
 Нужен ТОЛЬКО для pair-конвейера задач default-проекта (подготовка веток на
 сервере). Провижининг проектов и git-операции проектных workspace работают

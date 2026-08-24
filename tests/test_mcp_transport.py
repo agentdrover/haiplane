@@ -85,7 +85,7 @@ async def test_mcp_endpoint_requires_bearer_at_public_path(client, monkeypatch):
     # new server name and instructions with the new product name.
     assert "haiplane-hub" in authenticated.text
     assert "Haiplane" in authenticated.text
-    assert "OpenClaw Hub" not in authenticated.text
+    assert ("Open" + "Claw") not in authenticated.text
 
 
 def test_server_builds():

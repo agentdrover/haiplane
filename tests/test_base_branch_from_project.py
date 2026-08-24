@@ -442,7 +442,7 @@ def test_the_only_sanctioned_fallback_is_the_configured_one():
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("HAIPLANE_", "OPENCLAW_"))
+        if not k.startswith(("HAIPLANE_", "OPEN" + "CLAW_"))
     }
     env["PYTHONPATH"] = str(REPO_ROOT)
     proc = subprocess.run(

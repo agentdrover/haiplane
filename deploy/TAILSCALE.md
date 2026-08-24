@@ -1,9 +1,9 @@
 # Multi-user Hub on a fresh VM via Tailscale
 
-Operations guide for running Haiplane Hub (formerly OpenClaw Hub) for a small team. The combination is:
+Operations guide for running Haiplane Hub for a small team. The combination is:
 
 1. **Tailscale** for the network — every developer's machine and the VM join the same private tailnet, no public ports, no certificates.
-2. **Bearer-token auth** built into the Hub (`OPENCLAW_HUB_TOKENS`) — every request is attributed to a real user.
+2. **Bearer-token auth** built into the Hub (`HAIPLANE_HUB_TOKENS`) — every request is attributed to a real user.
 3. **Streamable-HTTP MCP** mounted at `/mcp` — Cursor connects via `https://hub.tailnet/mcp` (or `http://` over Tailscale) using the same token.
 
 This guide assumes Ubuntu 22.04 / 24.04. Other distros are similar.
@@ -20,8 +20,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Create the runtime user (avoid running as `root`):
 
 ```bash
-sudo useradd -m -s /bin/bash openclaw
-sudo -u openclaw -i
+sudo useradd -m -s /bin/bash haiplane
+sudo -u haiplane -i
 ```
 
 ## 2. Tailscale
@@ -30,17 +30,17 @@ On the VM:
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --ssh --hostname=openclaw-hub
+sudo tailscale up --ssh --hostname=haiplane-hub
 ```
 
 Approve the device in the [Tailscale admin console](https://login.tailscale.com/admin/machines).
-Note the assigned MagicDNS name (e.g. `openclaw-hub.tailXXXX.ts.net`) — that is the URL the team will use.
+Note the assigned MagicDNS name (e.g. `haiplane-hub.tailXXXX.ts.net`) — that is the URL the team will use.
 
 On every developer machine: install Tailscale, sign in to the same tailnet,
 verify reachability:
 
 ```bash
-ping openclaw-hub
+ping haiplane-hub
 ```
 
 > No firewall ports need to be opened on the VM — Tailscale uses NAT
@@ -50,8 +50,8 @@ ping openclaw-hub
 ## 3. Install the Hub
 
 ```bash
-git clone git@github.com:mrPDA/openclaw-hub.git ~/openclaw-hub
-cd ~/openclaw-hub
+git clone git@github.com:agentdrover/haiplane.git ~/haiplane-hub
+cd ~/haiplane-hub
 uv sync
 ```
 
@@ -60,16 +60,16 @@ uv sync
 Pick a random token per developer (`openssl rand -hex 24`), build the env:
 
 ```bash
-cat > ~/.openclaw-hub.env <<'EOF'
-OPENCLAW_HUB_TOKENS=denis:dXX...,alice:aYY...,bob:bZZ...
-OPENCLAW_HUB_ALLOWED_HOSTS=openclaw-hub:8080,openclaw-hub.tailXXXX.ts.net
-OPENCLAW_HUB_DB=/home/openclaw/hub.db
-OPENCLAW_HUB_PORT=8080
+cat > ~/.haiplane-hub.env <<'EOF'
+HAIPLANE_HUB_TOKENS=denis:dXX...,alice:aYY...,bob:bZZ...
+HAIPLANE_HUB_ALLOWED_HOSTS=haiplane-hub:8080,haiplane-hub.tailXXXX.ts.net
+HAIPLANE_HUB_DB=/home/haiplane/hub.db
+HAIPLANE_HUB_PORT=8080
 EOF
-chmod 600 ~/.openclaw-hub.env
+chmod 600 ~/.haiplane-hub.env
 ```
 
-Every `OPENCLAW_*` key above is also accepted under the canonical
+Every `HAIPLANE_*` key above is also accepted under the canonical
 `HAIPLANE_*` prefix (e.g. `HAIPLANE_HUB_DB`); the hub reads the new name
 first and falls back to the legacy one.
 
@@ -77,13 +77,13 @@ Tokens are environment-driven on purpose for the MVP — to add or revoke a
 user, edit the file and restart the service. A future task will move this
 into the database.
 
-`OPENCLAW_HUB_ALLOWED_HOSTS` is the Host header allowlist. Include every name
+`HAIPLANE_HUB_ALLOWED_HOSTS` is the Host header allowlist. Include every name
 developers will use for the Hub, with ports when they must match exactly.
 
 ## 5. systemd service
 
 ```ini
-# /etc/systemd/system/openclaw-hub.service
+# /etc/systemd/system/haiplane-hub.service
 [Unit]
 Description=Haiplane Hub
 After=network-online.target tailscaled.service
@@ -91,10 +91,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=openclaw
-WorkingDirectory=/home/openclaw/openclaw-hub
-EnvironmentFile=/home/openclaw/.openclaw-hub.env
-ExecStart=/home/openclaw/openclaw-hub/.venv/bin/openclaw-hub
+User=haiplane
+WorkingDirectory=/home/haiplane/haiplane-hub
+EnvironmentFile=/home/haiplane/.haiplane-hub.env
+ExecStart=/home/haiplane/haiplane-hub/.venv/bin/haiplane-hub
 Restart=on-failure
 RestartSec=3
 
@@ -104,9 +104,9 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now openclaw-hub
-sudo systemctl status openclaw-hub
-journalctl -u openclaw-hub -f
+sudo systemctl enable --now haiplane-hub
+sudo systemctl status haiplane-hub
+journalctl -u haiplane-hub -f
 ```
 
 Look for `Hub auth ENABLED (N token(s) configured)` in the log — that
@@ -118,7 +118,7 @@ From a developer machine:
 
 ```bash
 TOKEN=dXX...
-HUB=http://openclaw-hub:8080
+HUB=http://haiplane-hub:8080
 
 # Public probe — must work without a token
 curl -fsS $HUB/healthz
@@ -130,7 +130,7 @@ curl -i $HUB/api/tasks | head -1   # → HTTP/1.1 401 Unauthorized
 curl -fsS -H "Authorization: Bearer $TOKEN" $HUB/api/tasks | head
 ```
 
-In the browser, visit `http://openclaw-hub:8080/`. You will be bounced to
+In the browser, visit `http://haiplane-hub:8080/`. You will be bounced to
 `/login`; paste the same token, and the dashboard opens.
 
 ## 7. Connect Cursor (MCP over Streamable-HTTP)
@@ -140,8 +140,8 @@ In each developer's `.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "openclaw-hub": {
-      "url": "http://openclaw-hub:8080/mcp",
+    "haiplane-hub": {
+      "url": "http://haiplane-hub:8080/mcp",
       "headers": {
         "Authorization": "Bearer dXX..."
       }
@@ -161,12 +161,12 @@ to their token via `request.state.user`.
 
 | Task | Command |
 |------|---------|
-| Add / rotate a token | edit `~/.openclaw-hub.env`, then `sudo systemctl restart openclaw-hub` |
-| Tail logs | `journalctl -u openclaw-hub -f` |
-| Health check | `curl http://openclaw-hub:8080/healthz` |
-| Backup DB | `cp /home/openclaw/hub.db /home/openclaw/hub.db.$(date +%F)` |
-| Disable auth temporarily | set `OPENCLAW_HUB_AUTH_DISABLED=1`, restart — never leave on |
-| Remove a developer | drop their pair from `OPENCLAW_HUB_TOKENS`, restart, ask them to clear cookies |
+| Add / rotate a token | edit `~/.haiplane-hub.env`, then `sudo systemctl restart haiplane-hub` |
+| Tail logs | `journalctl -u haiplane-hub -f` |
+| Health check | `curl http://haiplane-hub:8080/healthz` |
+| Backup DB | `cp /home/haiplane/hub.db /home/haiplane/hub.db.$(date +%F)` |
+| Disable auth temporarily | set `HAIPLANE_HUB_AUTH_DISABLED=1`, restart — never leave on |
+| Remove a developer | drop their pair from `HAIPLANE_HUB_TOKENS`, restart, ask them to clear cookies |
 
 ## 9. When to graduate to production-grade auth
 
