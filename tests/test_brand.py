@@ -22,6 +22,7 @@ def test_product_title() -> None:
     assert brand.CSRF_COOKIE_NAME == "haiplane_csrf"
     assert brand.CSRF_COOKIE_NAME_LEGACY == "openclaw_csrf"
     assert brand.GITHUB_REPO == "haiplane"
+    assert brand.GITHUB_OWNER == "agentdrover"
     assert brand.GITHUB_SLUG_LEGACY == "mrPDA/openclaw-hub-standalone"
     assert brand.CI_REPORT_ACTION_LEGACY == (
         "mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main"
@@ -135,10 +136,40 @@ def _module_attr(module: str, attr: str, env: dict[str, str]) -> str:
     return proc.stdout.strip()
 
 
-def test_config_db_default_stays_openclaw_family() -> None:
-    path = _module_attr("hub.config", "HUB_DB_PATH", {})
-    assert "openclaw-hub" in path
-    assert "haiplane-hub" not in path
+def test_config_defaults_are_haiplane_family() -> None:
+    """Wave 4-code: hub state / workspace / transcripts defaults are Haiplane.
+
+    Dispatch and vast defaults are deliberately asserted as STILL legacy —
+    they move only in Wave 4-dispatch (Task 9), after the external producer
+    writes the new catalog or the new binary names resolve.
+    """
+    code = (
+        "import hub.config as c\n"
+        "print(c.HUB_DB_PATH)\n"
+        "print(c.WORKSPACE_REPO_LINK)\n"
+        "print(c.TRANSCRIPTS_DIR)\n"
+        "print(c.DISPATCH_BIN)\n"
+        "print(c.VAST_JOB_BIN)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=_clean_env({}),
+        cwd=str(_REPO_ROOT),
+        check=True,
+    )
+    db, workspace, transcripts, dispatch_bin, vast_bin = (
+        proc.stdout.strip().splitlines()
+    )
+    assert "haiplane-hub" in db
+    assert "openclaw-hub" not in db
+    assert workspace.endswith(os.path.join(".haiplane", "workspace", "repo"))
+    assert ".openclaw" not in workspace
+    assert transcripts.endswith(os.path.join(".haiplane", "transcripts"))
+    assert ".openclaw" not in transcripts
+    assert "oc-dev-dispatch" in dispatch_bin, "dispatch binary moves in Task 9 only"
+    assert "vast-openclaw" in vast_bin, "vast binary moves in Task 9 only"
 
 
 def test_cli_prefers_haiplane_url() -> None:

@@ -19,7 +19,10 @@
    одно право `tasks.ci_report`. Он не может двигать задачу и не может писать
    вердикт; это не токен исполнителей и не человеческий токен.
 2. Два секрета в GitHub сателлитного репозитория:
-   `OPENCLAW_HUB_URL` и `OPENCLAW_HUB_CI_TOKEN`.
+   `HAIPLANE_HUB_URL` и `HAIPLANE_HUB_CI_TOKEN`. Шаг ниже читает их через
+   fallback-выражение `secrets.HAIPLANE_* || secrets.OPENCLAW_*`, поэтому
+   репозиторий, где до ребрендинга были заведены `OPENCLAW_HUB_URL` /
+   `OPENCLAW_HUB_CI_TOKEN`, продолжает отчитываться без правок секретов.
 
 ## Если workflow ещё нет
 
@@ -54,10 +57,10 @@ jobs:
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
-        uses: mrPDA/openclaw-hub-standalone/.github/actions/hub-ci-report@main
+        uses: agentdrover/haiplane/.github/actions/hub-ci-report@main
         with:
-          hub-url: ${{ secrets.OPENCLAW_HUB_URL }}
-          hub-token: ${{ secrets.OPENCLAW_HUB_CI_TOKEN }}
+          hub-url: ${{ secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL }}
+          hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: pytest
 ```
