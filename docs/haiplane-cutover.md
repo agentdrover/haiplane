@@ -114,6 +114,16 @@ the external dispatcher — not a hotfix.
 
 ## Wave 4-dispatch — external catalog (after Wave 4-code)
 
+> **CLOSED 2026-08-24 (#938), by owner sign-off, deviating from the gates
+> below.** The gates protected a live external producer; a production audit
+> found NO producer at all on this host: no `openclaw-dev-dispatch` catalog,
+> zero job files ever, neither `oc-dev-dispatch` nor `vast-openclaw`
+> installed for the service user (every pair start had reported "no dispatch
+> job"). With nothing to break, the defaults moved to the haiplane family;
+> the `OPENCLAW_DISPATCH_BIN` / `OPENCLAW_VAST_JOB_BIN` env fallbacks keep
+> any installation that does have a live producer working unchanged. The
+> gates below are kept for the record.
+
 A later PR (Task 9). Split the gates so a symlink that preserves *old* binary
 names cannot unlock *new* binary defaults.
 
