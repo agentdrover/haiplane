@@ -30,15 +30,15 @@ WORKSPACE_REPO_LINK = Path(
     env_get("WORKSPACE_REPO", str(HOME / ".haiplane" / "workspace" / "repo"))
 )
 
-DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "jobs"
-DISPATCH_LOGS_DIR = HOME / ".local" / "state" / "openclaw-dev-dispatch" / "logs"
-DISPATCH_BIN = env_get("DISPATCH_BIN", str(HOME / ".local" / "bin" / "oc-dev-dispatch"))
+DISPATCH_JOBS_DIR = HOME / ".local" / "state" / "haiplane-dev-dispatch" / "jobs"
+DISPATCH_LOGS_DIR = HOME / ".local" / "state" / "haiplane-dev-dispatch" / "logs"
+DISPATCH_BIN = env_get("DISPATCH_BIN", str(HOME / ".local" / "bin" / "hp-dev-dispatch"))
 
 N4L_BIN = env_get("N4L_BIN", str(HOME / ".local" / "bin" / "n4l"))
 N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
-VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-openclaw"))
+VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-haiplane"))
 # Vast.ai is opt-in. Disabled by default — set OPENCLAW_VAST_ENABLED=1 to turn on.
 VAST_ENABLED = env_get("VAST_ENABLED", "0") == "1"
 
