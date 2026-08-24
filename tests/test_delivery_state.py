@@ -279,3 +279,99 @@ async def test_recording_a_deploy_fetches_its_commit(
 
     assert await ensure_commit_available(db, released, "main") is True
     assert await real.commit_exists(workspace, released) is True
+
+
+# ---- #937: сетевые вызовы не живут в цикле рендера ----------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_fetch_miss_cache():
+    from hub.services import delivery_state as ds
+
+    ds._fetch_misses.clear()
+    yield
+    ds._fetch_misses.clear()
+
+
+async def test_foreign_project_skips_network(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    # AC-1 (#937): задача проекта с чужим repo — ранний unknown, ноль сети.
+    from hub import config
+    from hub import app as hub_app
+
+    context = AsyncMock(
+        return_value={"repo": str(tmp_path), "gh_repo": "agentdrover/Spike_bo"}
+    )
+    monkeypatch.setattr(hub_app.services, "project_git_context", context)
+    monkeypatch.setattr(config, "REPO_NAME", "agentdrover/haiplane")
+    exists = AsyncMock(return_value=False)
+    fetch = AsyncMock(return_value=(False, "должен остаться невызванным"))
+    monkeypatch.setattr(plugins.git_ops, "commit_exists", exists, raising=False)
+    monkeypatch.setattr(plugins.git_ops, "fetch_commit", fetch, raising=False)
+
+    task_id = await _task_merged_at(client, db, "a" * 40)
+    await repo.record_release(db, deployed_sha="b" * 40, ref="main", source="ci")
+
+    answer = await delivery_state(db, task_id)
+    assert answer["state"] == UNKNOWN
+    assert "не применим" in answer["reason"]
+    exists.assert_not_awaited()
+    fetch.assert_not_awaited()
+
+
+async def test_negative_cache_suppresses_refetch(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path, monkeypatch
+):
+    # AC-2 (#937): промах fetch_commit не повторяется в пределах TTL.
+    from hub import config
+    from hub import app as hub_app
+
+    context = AsyncMock(return_value={"repo": str(tmp_path)})
+    monkeypatch.setattr(hub_app.services, "project_git_context", context)
+    monkeypatch.setattr(config, "REPO_NAME", "agentdrover/haiplane")
+    exists = AsyncMock(return_value=False)
+    fetch = AsyncMock(return_value=(False, "нет такого коммита нигде"))
+    monkeypatch.setattr(plugins.git_ops, "commit_exists", exists, raising=False)
+    monkeypatch.setattr(plugins.git_ops, "fetch_commit", fetch, raising=False)
+
+    task_id = await _task_merged_at(client, db, "a" * 40)
+    await repo.record_release(db, deployed_sha="b" * 40, ref="main", source="ci")
+
+    first = await delivery_state(db, task_id)
+    second = await delivery_state(db, task_id)
+    assert first["state"] == UNKNOWN
+    assert second["state"] == UNKNOWN
+    assert fetch.await_count == 1, "повторный рендер не должен ходить в сеть"
+    assert "промах" in second["reason"] or "отложена" in second["reason"]
+
+
+async def test_local_commits_unchanged_semantics(
+    client: AsyncClient, db: aiosqlite.Connection, history, monkeypatch
+):
+    # AC-3 (#937): для локально присутствующих коммитов семантика прежняя,
+    # включая проект хаба с СОВПАДАЮЩИМ gh_repo (ранний выход не трогает своих).
+    from hub import config
+    from hub import app as hub_app
+
+    real = GitOpsIntegration()
+    context = AsyncMock(
+        return_value={
+            "repo": history["repo"],
+            "base_branch": "main",
+            "gh_repo": "agentdrover/haiplane",
+        }
+    )
+    monkeypatch.setattr(hub_app.services, "project_git_context", context)
+    monkeypatch.setattr(config, "REPO_NAME", "agentdrover/haiplane")
+    monkeypatch.setattr(plugins.git_ops, "is_ancestor", real.is_ancestor, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops, "commit_exists", real.commit_exists, raising=False
+    )
+
+    task_id = await _task_merged_at(client, db, history["shipped"])
+    await repo.record_release(
+        db, deployed_sha=history["released"], ref="main", source="ci"
+    )
+    answer = await delivery_state(db, task_id)
+    assert answer["state"] == IN_PROD
