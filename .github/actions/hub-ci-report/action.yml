@@ -1,4 +1,4 @@
-name: Report AC tests and validation to OpenClaw Hub
+name: Report AC tests and validation to Haiplane Hub
 description: >-
   Run a task's bound AC tests and validation commands and report the result to
   the hub as evidence about ONE commit. Never fails the job, never reports a
@@ -50,17 +50,11 @@ runs:
     - name: Report to hub
       shell: bash
       env:
-        # Rebrand soak: export both prefixes so the reporter works whichever
-        # name it reads (HAIPLANE_ is canonical, OPENCLAW_ is the fallback).
         HAIPLANE_HUB_URL: ${{ inputs.hub-url }}
-        OPENCLAW_HUB_URL: ${{ inputs.hub-url }}
         HAIPLANE_HUB_CI_TOKEN: ${{ inputs.hub-token }}
-        OPENCLAW_HUB_CI_TOKEN: ${{ inputs.hub-token }}
         HEAD_SHA: ${{ inputs.head-sha }}
         HAIPLANE_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
-        OPENCLAW_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
         HAIPLANE_HUB_CI_CHECKS: ${{ inputs.checks }}
-        OPENCLAW_HUB_CI_CHECKS: ${{ inputs.checks }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter

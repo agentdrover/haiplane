@@ -1,5 +1,5 @@
 {
-  "_comment": "HAIPLANE_HUB_URL / HAIPLANE_HUB_MCP_TOKEN are the canonical env names; the legacy OPENCLAW_HUB_URL / OPENCLAW_HUB_MCP_TOKEN still work (the hub reads the new name first, then the legacy fallback).",
+  "_comment": "HAIPLANE_HUB_URL / HAIPLANE_HUB_MCP_TOKEN are the canonical env names.",
   "mcpServers": {
     "haiplane-hub-local": {
       "command": "uv",

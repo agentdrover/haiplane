@@ -38,16 +38,12 @@ TASK_SOURCE = "agent"
 
 
 def env_get(suffix: str) -> str:
-    """HAIPLANE_ first, legacy OPENCLAW_ fallback; empty counts as unset.
+    """HAIPLANE_-prefixed env value; empty counts as unset.
 
     Standalone twin of ``hub.config.env_get`` — this script runs in CI
     without the hub package installed.
     """
-    return (
-        os.environ.get(f"HAIPLANE_{suffix}")
-        or os.environ.get(f"OPENCLAW_{suffix}")
-        or ""
-    )
+    return os.environ.get(f"HAIPLANE_{suffix}") or ""
 
 
 def log(msg: str) -> None:
@@ -167,7 +163,7 @@ def main() -> int:
     if not base or not token:
         log(
             f"{len(found)} vulnerability(ies) found but HAIPLANE_HUB_URL / "
-            "HAIPLANE_HUB_CI_TOKEN (or legacy OPENCLAW_*) are not configured — "
+            "HAIPLANE_HUB_CI_TOKEN are not configured — "
             "printing them here and "
             "filing nothing: " + ", ".join(f["id"] for f in found)
         )
