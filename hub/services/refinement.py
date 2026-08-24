@@ -92,6 +92,14 @@ BOOKKEEPING_FIELDS = frozenset(
         "human_reviewer",
         "prepared_by",
         "prepared_at",
+        # Defect passport (#910). Bookkeeping, not statement: recording WHERE a
+        # defect was caught or WHICH change introduced it does not change what
+        # the task asks for, so it must not restamp the statement date and make
+        # a delivery look stale (#616).
+        "found_in",
+        "caused_by_task_id",
+        "detected_at",
+        "clear_caused_by",
     }
 )
 
@@ -128,6 +136,16 @@ def stamp_statement_date(payload: TaskRefine) -> TaskRefine:
     if not (payload.model_fields_set & STATEMENT_FIELDS):
         return payload
     return payload.model_copy(update={"prepared_at": _statement_stamp()})
+
+
+# Refine keys that mean "write the defect passport" (#910). Kept next to the
+# service that dispatches them rather than derived from the model: adding a
+# field to TaskRefine and forgetting it here writes nothing, which is loud,
+# while the reverse — a stale name here — is caught by the model_fields_set
+# intersection returning nothing.
+_PASSPORT_FIELDS = frozenset(
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+)
 
 
 class TaskNotFoundError(LookupError):
@@ -333,6 +351,23 @@ async def _apply_refine_writes(
     payload = stamp_statement_date(payload)
 
     updated_columns = await repo.update_task_structured(db, task_id, payload)
+
+    # Defect passport (#910). Written apart from the plain column PATCH so the
+    # causal link is resolved before it lands (#909); ``DefectPassportError``
+    # propagates and the surrounding SAVEPOINT rolls the whole refine back, so
+    # a refused link cannot leave a half-written passport behind.
+    passport_fields = _PASSPORT_FIELDS & payload.model_fields_set
+    if passport_fields:
+        found_in = payload.found_in.value if payload.found_in is not None else None
+        applied = await repo.set_defect_passport(
+            db,
+            task_id,
+            found_in=found_in,
+            caused_by_task_id=payload.caused_by_task_id,
+            detected_at=payload.detected_at,
+            clear_caused_by=payload.clear_caused_by,
+        )
+        updated_columns.update(applied)
 
     if (
         old_row

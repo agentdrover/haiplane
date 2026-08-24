@@ -628,6 +628,10 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("tech_hints", "technical_hints"),
     ("human_owner", "human_owner"),
     ("human_reviewer", "human_reviewer"),
+    # Defect passport (#910, epic #900).
+    ("found_in", "found_in"),
+    ("caused_by", "caused_by_task_id"),
+    ("detected_at", "detected_at"),
 )
 _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("scope_in", "scope_in"),
@@ -673,6 +677,11 @@ def _build_refine_payload(args: argparse.Namespace) -> dict[str, Any]:
 
     if getattr(args, "clear_acs", False):
         payload["acceptance_criteria"] = []
+
+    if getattr(args, "clear_caused_by", False):
+        # Removing an attribution is a verb, not an empty value: --caused-by
+        # with nothing to pass would be indistinguishable from not passing it.
+        payload["clear_caused_by"] = True
 
     return payload
 
@@ -1720,6 +1729,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Kanban class of service",
     )
     p_refine.add_argument("--size", choices=["XS", "S", "M", "L", "XL"], default=None)
+    p_refine.add_argument(
+        "--found-in",
+        dest="found_in",
+        choices=["unknown", "review", "ci", "test", "staging", "prod"],
+        default=None,
+        help="Defect passport: stage the defect was caught at",
+    )
+    p_refine.add_argument(
+        "--caused-by",
+        dest="caused_by",
+        type=int,
+        default=None,
+        help="Defect passport: task whose change introduced this defect",
+    )
+    p_refine.add_argument(
+        "--detected-at",
+        dest="detected_at",
+        default=None,
+        help="Defect passport: when the defect was noticed",
+    )
+    p_refine.add_argument(
+        "--clear-caused-by",
+        dest="clear_caused_by",
+        action="store_true",
+        help="Defect passport: drop the existing attribution",
+    )
     p_refine.add_argument(
         "--wip-tag",
         dest="wip_tag",
