@@ -242,7 +242,7 @@ async def test_pair_prepare_branch_readable_error_without_workspace(
 
     with pytest.raises(PairBranchConflictError) as exc:
         await GitOpsIntegration().pair_prepare_branch(1, "Test task")
-    assert "OPENCLAW_WORKSPACE_REPO" in str(exc.value)
+    assert "HAIPLANE_WORKSPACE_REPO" in str(exc.value)
 
 
 async def test_create_branch_readable_error_without_workspace(monkeypatch, tmp_path):
@@ -1734,7 +1734,7 @@ async def test_ci_probe_falls_back_to_workflow_runs(git_ops: GitOpsIntegration):
             runs=(0, _runs_json(("completed", "success")), ""),
         ),
     ):
-        result = await git_ops.check_pr_ci(240, gh_repo="mrPDA/openclaw-hub-standalone")
+        result = await git_ops.check_pr_ci(240, gh_repo="agentdrover/haiplane")
 
     assert result.outcome == CIProbeOutcome.passed
     assert "workflow_runs" in result.reason, (

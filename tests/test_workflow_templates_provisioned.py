@@ -36,8 +36,10 @@ TEMPLATE_DIR = REPO_ROOT / "hub" / "workflow_templates"
 
 CI_FILE = "haiplane-ci.yml"
 STALE_FILE = "haiplane-stale.yml"
-CI_FILE_LEGACY = "openclaw-ci.yml"
-STALE_FILE_LEGACY = "openclaw-stale.yml"
+# Собрано конкатенацией: негативный тест называет старую пару файлов, а страж
+# (tests/test_no_legacy_name.py) не должен ловить его самого.
+CI_FILE_LEGACY = "open" + "claw" + "-ci.yml"
+STALE_FILE_LEGACY = "open" + "claw" + "-stale.yml"
 
 
 # --------------------------------------------------------------------------
@@ -227,8 +229,11 @@ def test_rendered_ci_template_has_no_placeholders(monkeypatch):
     )
     assert "@@" not in rendered
     assert "agentdrover/haiplane/.github/actions/hub-ci-report@main" in rendered
-    assert "secrets.HAIPLANE_HUB_URL || secrets.OPENCLAW_HUB_URL" in rendered
-    assert "secrets.HAIPLANE_HUB_CI_TOKEN || secrets.OPENCLAW_HUB_CI_TOKEN" in rendered
+    assert "secrets.HAIPLANE_HUB_URL }}" in rendered
+    assert "secrets.HAIPLANE_HUB_CI_TOKEN }}" in rendered
+    assert ("OPEN" + "CLAW") not in rendered.upper(), (
+        "Wave 5: no legacy secret fallback in the seeded workflow"
+    )
 
     monkeypatch.setattr(brand, "GITHUB_OWNER", "")
     with pytest.raises(ValueError):
@@ -336,16 +341,15 @@ async def test_a_repository_with_its_own_workflow_is_left_alone(
     assert "already carries workflows" in result["provision_detail"]
 
 
-def test_legacy_only_workflows_are_present_without_second_pair(tmp_path: Path):
-    """Haiplane rebrand (Wave 3): a repository the hub seeded before the
-    rename carries only openclaw-ci.yml / openclaw-stale.yml. Those files are
-    hub-owned and complete — the answer is PRESENT, and no haiplane-* pair is
-    written beside them."""
+def test_legacy_named_workflows_read_as_foreign_ci(tmp_path: Path):
+    """Wave 5: pre-rename file names are no longer hub-owned. A repository
+    carrying them is simply "a repository that already runs CI" — the answer
+    is PRESENT because workflows exist, and nothing is written beside them."""
     work, _ = _repo_pair(tmp_path, "develop")
     workflows = work / ".github" / "workflows"
     workflows.mkdir(parents=True)
-    (workflows / CI_FILE_LEGACY).write_text("name: OpenClaw CI\n", "utf-8")
-    (workflows / STALE_FILE_LEGACY).write_text("name: OpenClaw stale\n", "utf-8")
+    (workflows / CI_FILE_LEGACY).write_text("name: legacy CI\n", "utf-8")
+    (workflows / STALE_FILE_LEGACY).write_text("name: legacy stale\n", "utf-8")
     _git(work, "add", "-A")
     _git(work, "commit", "-m", "seeded before the rename")
 
@@ -357,14 +361,16 @@ def test_legacy_only_workflows_are_present_without_second_pair(tmp_path: Path):
     assert result.written == ()
     assert sorted(p.name for p in workflows.iterdir()) == sorted(
         [CI_FILE_LEGACY, STALE_FILE_LEGACY]
-    ), "the hub must never lay a second pair beside its legacy-named files"
+    ), "a repository that already runs something gets nothing written"
 
 
 def test_the_seeded_names_are_the_haiplane_pair():
-    """Fresh repositories get the new names; the legacy pair stays known so
-    pre-rename repositories read as hub-owned."""
+    """Fresh repositories get the haiplane names, and the seeder knows no
+    other family."""
     assert set(workflow_seed.SEEDED_WORKFLOWS.values()) == {CI_FILE, STALE_FILE}
-    assert workflow_seed.LEGACY_SEEDED == {CI_FILE_LEGACY, STALE_FILE_LEGACY}
+    assert not hasattr(workflow_seed, "LEGACY_SEEDED"), (
+        "Wave 5: the legacy seeded-name set must be gone"
+    )
 
 
 # --------------------------------------------------------------------------

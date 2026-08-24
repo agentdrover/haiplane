@@ -118,7 +118,7 @@ async def test_rearming_is_idempotent_and_leaves_other_keys_alone(db, tmp_path) 
     nothing about branches."""
     work, git, _ = _seed_clone(tmp_path, ["master"])
     git("config", "user.name", "Someone Else")
-    git("config", "openclaw.somethingElse", "keep me")
+    git("config", "unrelated.somethingElse", "keep me")
     pid = await _provisioned(db, work, branch="master", slug="idem")
     row = await repo.get_project(db, pid)
 
@@ -129,7 +129,7 @@ async def test_rearming_is_idempotent_and_leaves_other_keys_alone(db, tmp_path) 
     assert first.state == second.state
     assert _recorded(git, git_policy.BASE_BRANCH_KEY) == "master"
     assert _recorded(git, "user.name") == "Someone Else"
-    assert _recorded(git, "openclaw.somethingElse") == "keep me"
+    assert _recorded(git, "unrelated.somethingElse") == "keep me"
 
 
 async def test_an_edit_that_touches_no_branch_touches_no_clone(

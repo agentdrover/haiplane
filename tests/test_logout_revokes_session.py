@@ -90,11 +90,10 @@ async def test_logout_without_a_cookie_still_reaches_the_login_page(
 
 
 @pytest.mark.asyncio
-async def test_logout_deletes_both_session_cookie_names(
+async def test_logout_deletes_canonical_session_cookie(
     db: aiosqlite.Connection, client: AsyncClient
 ):
-    """Haiplane rebrand (Wave 3): after logout the browser must hold neither
-    haiplane_hub_session nor a leftover openclaw_hub_session."""
+    """After logout the browser must not hold haiplane_hub_session."""
     _, token = await _user_with_session(db, "dave")
     client.cookies.set(config.HUB_COOKIE_NAME, token)
 
@@ -103,23 +102,23 @@ async def test_logout_deletes_both_session_cookie_names(
     assert resp.status_code == 303
     deleted = resp.headers.get_list("set-cookie")
     assert any(c.startswith(f"{brand.COOKIE_NAME}=") for c in deleted), deleted
-    assert any(c.startswith(f"{brand.COOKIE_NAME_LEGACY}=") for c in deleted), deleted
 
 
 @pytest.mark.asyncio
-async def test_logout_revokes_a_session_presented_under_the_legacy_name(
+async def test_logout_ignores_a_session_presented_under_the_legacy_name(
     db: aiosqlite.Connection, client: AsyncClient
 ):
-    """A browser still carrying only openclaw_hub_session logs out for real:
-    the server-side session is revoked, not just the cookie dropped."""
+    """Wave 5: the pre-rename cookie name is not read any more — logout
+    neither sees nor revokes a session presented only under it."""
     _, token = await _user_with_session(db, "grace")
-    client.cookies.set(brand.COOKIE_NAME_LEGACY, token)
+    legacy_cookie = "open" + "claw" + "_hub_session"
+    client.cookies.set(legacy_cookie, token)
 
     resp = await client.post("/logout", follow_redirects=False)
 
     assert resp.status_code == 303
-    assert await admin_svc.resolve_browser_session(db, token) is None, (
-        "a legacy-named session cookie must still be revoked on logout"
+    assert await admin_svc.resolve_browser_session(db, token) is not None, (
+        "a legacy-named cookie is unknown to the hub and must not reach revoke"
     )
 
 

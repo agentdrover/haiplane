@@ -76,12 +76,12 @@ async def test_run_validation_skipped_without_commands(db):
 
 def test_safe_env_strips_secrets(monkeypatch):
     # AC-2 (#509): secret-looking env vars never reach the child environment.
-    monkeypatch.setenv("OPENCLAW_HUB_TOKENS", "s3cret")
+    monkeypatch.setenv("HAIPLANE_HUB_TOKENS", "s3cret")
     monkeypatch.setenv("MY_API_KEY", "k")
     monkeypatch.setenv("DB_PASSWORD", "p")
     monkeypatch.setenv("SAFE_VAR", "ok")
     env = _safe_env()
-    assert "OPENCLAW_HUB_TOKENS" not in env
+    assert "HAIPLANE_HUB_TOKENS" not in env
     assert "MY_API_KEY" not in env
     assert "DB_PASSWORD" not in env
     assert env.get("SAFE_VAR") == "ok"
