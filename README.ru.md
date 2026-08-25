@@ -7,7 +7,7 @@
 
 ![Дашборд](docs/assets/dashboard.png)
 
-*(English version: [README.md](README.md).)*
+*(English summary: [README.md](README.md). Интерфейс и документация — на русском.)*
 
 ## Заявлено ≠ доставлено
 
