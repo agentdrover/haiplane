@@ -682,3 +682,94 @@ async def test_the_terminal_refusal_hint_names_reachable_actions_only(db):
     assert "rework" in alert["content"] and "accept" in alert["content"], (
         "оба исхода решения названы — читатель выбирает осознанно"
     )
+
+
+# ---- #959: "нет такого PR" и "спросить не удалось" — разные ответы ----
+#
+# Оба сегодня схлопывались в "" и вели к одному решению: номер остаётся.
+# Для сетевой икоты это верно, для номера из чужого репозитория — нет: после
+# переезда проекта записанные до него номера не найдутся НИКОГДА, а гейт
+# продолжал ждать по ним зелёного CI. Поймано на #880 25.08.2026 — вердикт
+# APPROVED, PR открыт, CI зелёный, и всё равно не доставлено.
+
+
+async def test_an_absent_recorded_pr_is_replaced_by_the_live_one(db):
+    g = _git_with_state("absent", found=29)
+    task_id = await _approved_pair_task(db, pr_number=472)
+    await repo.update_task(db, task_id, branch="task-880/incremental-review-delta")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 29, "живой PR ветки записывается на задачу"
+    assert g.merge_pr.await_args.args[0] == 29, "и доставляется именно он"
+    assert task["status"] == "completed"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#472" in feed and "#29" in feed, "оба номера названы в ленте"
+
+
+async def test_an_unreachable_lookup_keeps_the_recorded_pr(db):
+    # Регрессия к сегодняшнему поведению: "спросить не удалось" — не факт об
+    # отсутствии. Сеть моргнула — номер обязан остаться на месте, иначе первый
+    # же сбой сети переписал бы задаче PR.
+    g = _git_with_state("", found=29)
+    task_id = await _approved_pair_task(db, pr_number=472)
+    await repo.update_task(db, task_id, branch="task-880/incremental-review-delta")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 472, "непрочитанное состояние не меняет номер"
+    g.pr_for_branch.assert_not_awaited(), "и не запускает поиск замены"
+
+
+async def test_an_absent_pr_without_replacement_calls_a_human(db):
+    _git_with_state("absent", found=None)
+    task_id = await _approved_pair_task(db, pr_number=472)
+    await repo.update_task(db, task_id, branch="task-880/incremental-review-delta")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "менять номер не на что — это решение человека, а не ожидание"
+    )
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#472" in feed
+    assert "CI станет зелёным" not in feed, (
+        "обещать зелёный CI по PR, которого нет, — отправлять в тупик"
+    )
+
+
+async def test_a_deferral_on_an_unestablished_pr_does_not_promise_green_ci(db):
+    # Состояние PR прочитать не удалось, и CI по нему тоже не читается. Ждать
+    # тут по-прежнему правильно, но называть причиной жёлтый CI — нет: гейт не
+    # установил даже, о каком PR речь.
+    g = _git_with_state("")
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.unavailable, "gh_error")
+    )
+    task_id = await _approved_pair_task(db, pr_number=472)
+    await repo.update_task(db, task_id, branch="task-880/incremental-review-delta")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "непрочитанное состояние — всё ещё ожидание"
+    alert = next(
+        dict(u)["content"]
+        for u in reversed(await repo.get_task_updates(db, task_id))
+        if "отложена" in (dict(u)["content"] or "")
+    )
+    assert "CI станет зелёным" not in alert, (
+        "причина отсрочки — недоступный PR, а не жёлтый CI"
+    )
+    assert "#472" in alert and "состояние" in alert.lower()
