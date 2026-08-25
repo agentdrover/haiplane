@@ -1874,3 +1874,196 @@ async def test_a_job_still_running_is_left_alone(db):
     await _run_poll_once(db)
 
     assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+# ---- Адресные тесты на свипы после разреза (#850) ----
+#
+# Главная выгода разреза видна прямо здесь: свип зовётся напрямую, без запуска
+# цикла, без _sleep_once и без прохода всех остальных свипов. До разреза каждый
+# из этих тестов был бы «прогнать весь поллер и молиться, что сработала нужная
+# из двенадцати веток».
+
+from hub.poller import (  # noqa: E402 - тесты дописаны после разреза
+    _extract_review_from_log,
+    _record_merge_and_tidy,
+    _request_review_fixes,
+    _seconds_since,
+    _sweep_autopilot_digests,
+    _sweep_delivery_discrepancies,
+    _sweep_events_retention,
+    _sweep_mcp_retention,
+    _sweep_messages_retention,
+    _sweep_review,
+    _sweep_review_dispatches,
+    _sweep_sessions_retention,
+)
+
+
+async def test_review_job_without_a_verdict_calls_a_human(db):
+    """Дочитанный ревью-джоб без вердикта — не успех и не провал, а вопрос."""
+    task_id = await _make_review_task(db)
+    plugins.dispatch = _dispatch_with({"status": "completed", "exit_code": 0})
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _sweep_review(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("no clear verdict" in (u["content"] or "") for u in updates)
+
+
+async def test_a_review_job_that_came_back_clears_the_missing_mark(db):
+    """Джоб нашёлся после отметки о пропаже — отметка снимается, паника отменяется."""
+    task_id = await _make_review_task(db)
+    await repo.mark_job_missing(db, task_id)
+    await db.commit()
+    plugins.dispatch = _dispatch_with({"status": "running"})
+
+    await _sweep_review(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert not task.get("job_missing_since")
+    assert task["status"] == "review", "живой джоб дорабатывает, задачу не трогаем"
+
+
+async def test_review_fix_text_is_recovered_from_the_job_log(db):
+    """Замечания ревьюера достаются из лога джоба, когда апдейта с ними нет."""
+    task_id = await _make_review_task(db)
+    task = dict(await repo.get_task(db, task_id))
+    long_note = "Замените голый except на конкретное исключение в poller.py"
+    plugins.dispatch = _dispatch_with(
+        {"status": "completed"}, log_text=f'"text": "{long_note}",'
+    )
+    plugins.git_ops = NoopGitOps()
+    plugins.git_ops.checkout = AsyncMock(return_value=True)
+
+    with patch(
+        "hub.poller.services.dispatch_fix", new_callable=AsyncMock
+    ) as dispatch_fix:
+        await _request_review_fixes(db, task, updates_list=[])
+
+    assert long_note in dispatch_fix.await_args.args[2]
+
+
+async def test_exhausted_review_budget_dispatches_the_arbiter(db):
+    """Когда лимит кругов ревью выбран, следующий шаг — арбитр, а не ещё круг."""
+    task_id = await _make_review_task(db)
+    await repo.update_task(db, task_id, review_cycle=99)
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+    plugins.dispatch = _dispatch_with({"status": "completed"}, log_text="")
+
+    with patch(
+        "hub.poller.services.dispatch_arbiter", new_callable=AsyncMock
+    ) as arbiter:
+        await _request_review_fixes(db, task, updates_list=[])
+
+    arbiter.assert_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["review_cycle"] == 100, "круг посчитан до передачи арбитру"
+
+
+async def test_an_unreadable_merge_commit_does_not_lose_the_merge_record(db):
+    """merge_commit_sha упал — мерж всё равно записан, пусть и без sha (#534)."""
+    task_id = await _make_review_task(db)
+    task = dict(await repo.get_task(db, task_id))
+    git = NoopGitOps()
+    git.merge_commit_sha = AsyncMock(side_effect=RuntimeError("gh молчит"))
+    git.pull_main = AsyncMock(return_value=True)
+    git.delete_branch = AsyncMock(return_value=True)
+    plugins.git_ops = git
+
+    await _record_merge_and_tidy(db, task, 77, {"repo": None, "gh_repo": None})
+
+    assert await repo.pipeline_merge_recorded(db, task_id, 77), (
+        "запись о мерже не должна зависеть от читаемости его sha"
+    )
+
+
+async def test_untidy_workspace_is_reported_not_fatal(db):
+    """Workspace не вернулся на базу после мержа — алерт, а не падение задачи (#552)."""
+    from hub.integrations.git_ops import WorkspaceNotReadyError
+
+    task_id = await _make_review_task(db)
+    await repo.update_task(db, task_id, branch="task-x/y")
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+    git = NoopGitOps()
+    git.merge_commit_sha = AsyncMock(return_value="abc123")
+    git.pull_main = AsyncMock(side_effect=WorkspaceNotReadyError("клон занят"))
+    plugins.git_ops = git
+
+    await _record_merge_and_tidy(db, task, 78, {"repo": None, "gh_repo": None})
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("не возвращён" in (u["content"] or "") for u in updates)
+
+
+async def test_delivery_scan_findings_reach_the_log(db, caplog):
+    """Сработавший delivery-скан называет задачи с открытыми PR, а не молчит."""
+    with (
+        patch("hub.poller._due_for_delivery_scan", return_value=True),
+        patch(
+            "hub.services.delivery_state.scan_completed_deliveries",
+            new_callable=AsyncMock,
+            return_value=[{"task_id": 42}],
+        ),
+    ):
+        await _sweep_delivery_discrepancies(db)
+
+    assert any("#42" in r.getMessage() for r in caplog.records)
+
+
+async def test_background_sweep_failures_do_not_kill_the_pass(db):
+    """Дайджесты и review-dispatch падают — свип переживает и идёт дальше."""
+    with patch(
+        "hub.services.digest.generate_due_digests",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("digest упал"),
+    ):
+        await _sweep_autopilot_digests(db)
+    with patch(
+        "hub.services.review_dispatch.sweep_review_dispatches",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("dispatch упал"),
+    ):
+        await _sweep_review_dispatches(db)
+
+
+async def test_retention_sweeps_commit_only_when_something_was_pruned(db):
+    """Каждая чистка коммитит и пишет в лог только когда реально что-то удалила."""
+    with (
+        patch("hub.poller.repo.prune_events", new_callable=AsyncMock, return_value=3),
+        patch(
+            "hub.poller.repo.prune_agent_sessions",
+            new_callable=AsyncMock,
+            return_value=2,
+        ),
+        patch(
+            "hub.poller.repo.prune_agent_messages",
+            new_callable=AsyncMock,
+            return_value=1,
+        ),
+        patch(
+            "hub.poller.repo.prune_mcp_call_events",
+            new_callable=AsyncMock,
+            return_value=4,
+        ),
+    ):
+        await _sweep_events_retention(db)
+        await _sweep_sessions_retention(db)
+        await _sweep_messages_retention(db)
+        await _sweep_mcp_retention(db)
+
+
+def test_review_text_survives_json_log_format():
+    log_text = '"text": "Короткая",\n"text": "Достаточно длинное замечание ревьюера",'
+    assert "Достаточно длинное" in _extract_review_from_log(log_text)
+    assert _extract_review_from_log('"text": не-json') == ""
+
+
+def test_seconds_since_rejects_garbage_timestamps():
+    assert _seconds_since("не дата") is None
+    assert _seconds_since("") is None
+    assert _seconds_since("2026-01-01 00:00:00") > 0
