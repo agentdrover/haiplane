@@ -628,6 +628,45 @@ async def record_pipeline_merge(
     await db.commit()
 
 
+async def mark_merges_released(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int | None,
+    release_pr: int,
+    release_sha: str,
+) -> int:
+    """Stamp every unreleased merge of this project with the release that took it.
+
+    Called at release-merge time (#950). A release carries the base branch
+    whole (#812), so the set is exact: everything merged before this moment
+    and not yet released went out with this release. The stamp survives what
+    git history does not — squashes and recreated branches both cut ancestry,
+    and this row is then the only fact tying a merge to a deploy.
+    """
+    cur = await db.execute(
+        "UPDATE pipeline_merges SET released_pr = ?, released_sha = ? "
+        "WHERE (released_sha IS NULL OR released_sha = '') "
+        "AND ((? IS NULL AND project_id IS NULL) OR project_id = ?)",
+        (int(release_pr), release_sha.strip(), project_id, project_id),
+    )
+    await db.commit()
+    return int(cur.rowcount or 0)
+
+
+async def release_fact_for_task(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, Any] | None:
+    """The recorded release that carried this task's merge, or None (#950)."""
+    rows = await fetchall(
+        db,
+        "SELECT released_pr, released_sha FROM pipeline_merges "
+        "WHERE task_id = ? AND released_sha IS NOT NULL AND released_sha != '' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return dict(rows[0]) if rows else None
+
+
 async def pipeline_merge_recorded(
     db: aiosqlite.Connection, task_id: int, pr_number: int
 ) -> bool:

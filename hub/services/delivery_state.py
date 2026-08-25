@@ -298,6 +298,44 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
                 + (f" (выкат {deployed_at})" if deployed_at else ""),
                 **known,
             )
+    # #950: ancestry is cut twice in this flow — the release squashes, and the
+    # base branch can be recreated from the release branch afterwards. The
+    # twin above survives the first cut but not the second: a merge left on
+    # the abandoned line belongs to no reachable history at all, and the
+    # answer below would say "waiting for a release" about running code (the
+    # exact refusal #949's live check hit, update #3496). The release itself
+    # recorded which merges it carried; that stamp lives on the RELEASE
+    # branch's own line, which nothing rewrites.
+    fact = await repo.release_fact_for_task(db, task_id)
+    if fact and str(fact.get("released_sha") or ""):
+        release_sha = str(fact["released_sha"])
+        release_pr = fact.get("released_pr")
+        carried_out = await plugins.git_ops.is_ancestor(
+            workspace, release_sha, deployed_sha
+        )
+        if carried_out is None:
+            return _answer(
+                UNKNOWN,
+                f"мерж увезён релизом PR #{release_pr} ({release_sha[:12]}), но "
+                f"git не смог ответить, входит ли этот релиз в раскатанный "
+                f"{deployed_sha[:12]}. Это не «не раскатано»",
+                **known,
+            )
+        if carried_out or release_sha == deployed_sha:
+            return _answer(
+                IN_PROD,
+                f"родословная мержа {merge_sha[:12]} оборвана, но релиз "
+                f"PR #{release_pr} записал, что увёз его: {release_sha[:12]} "
+                f"входит в раскатанный {deployed_sha[:12]}"
+                + (f" (выкат {deployed_at})" if deployed_at else ""),
+                **known,
+            )
+        return _answer(
+            NOT_IN_PROD,
+            f"мерж увезён релизом PR #{release_pr} ({release_sha[:12]}), но "
+            f"этот релиз ещё не раскатан: в проде {deployed_sha[:12]}",
+            **known,
+        )
     return _answer(
         NOT_IN_PROD,
         f"мерж {merge_sha[:12]} не входит в раскатанный {deployed_sha[:12]}: "

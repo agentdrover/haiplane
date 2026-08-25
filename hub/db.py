@@ -746,6 +746,21 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE pipeline_merges ADD COLUMN merge_sha TEXT",
     ),
     (
+        # #950: which release carried this merge out. Written at release-merge
+        # time, because that is the only moment the fact is cheap and certain:
+        # a release takes the base branch whole (#812), so every unreleased
+        # merge of the project is carried by it. Read when ancestry cannot
+        # answer — a squash release and a recreated base branch both cut the
+        # line, and delivery_state was left saying "waiting for a release"
+        # about code that was running (#949's live check, refused at #3496).
+        "add_pipeline_merges_released_pr",
+        "ALTER TABLE pipeline_merges ADD COLUMN released_pr INTEGER",
+    ),
+    (
+        "add_pipeline_merges_released_sha",
+        "ALTER TABLE pipeline_merges ADD COLUMN released_sha TEXT",
+    ),
+    (
         "create_base_branch_drift",
         """CREATE TABLE IF NOT EXISTS base_branch_drift (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
