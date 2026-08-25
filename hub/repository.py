@@ -3459,6 +3459,172 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
     return str(dict(rows[0])["merge_sha"]) if rows else ""
 
 
+# --- Completed, but is the work actually delivered? (#897) ------------------
+
+
+async def completed_tasks_awaiting_delivery(
+    db: aiosqlite.Connection, *, lookback_days: int = 30, limit: int = 100
+) -> list[Any]:
+    """Completed tasks whose pinned PR the hub has no merge for — candidates only.
+
+    Cheap by construction, the way #885 made ``merged_into_base`` cheap: a task
+    the gate merged is delivered by definition and never reaches here, and a
+    task already answered ``delivered`` or ``pr_closed`` is never asked twice —
+    both are terminal (code in the base branch stays there, and a closed PR is
+    a decision, not a transient). What is left is the small set that can still
+    be a discrepancy, so a sweep normally costs zero network calls.
+
+    ``pr_number IS NOT NULL`` is a deliberate boundary: a completed task with
+    no PR at all is work that never started delivery, which is #498's warning,
+    not this list. Mixing them would make "the discrepancy list" mean two
+    different things and stop being trustworthy as either.
+    """
+    return list(
+        await fetchall(
+            db,
+            """
+            SELECT t.* FROM tasks t
+            WHERE t.status = 'completed'
+              AND t.archived = 0
+              AND t.pr_number IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM pipeline_merges m WHERE m.task_id = t.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_discrepancies d
+                    WHERE d.task_id = t.id
+                      AND d.state IN ('delivered', 'pr_closed')
+              )
+              AND (
+                    COALESCE(NULLIF(t.completed_at, ''), t.updated_at)
+                    >= datetime('now', ?)
+              )
+            ORDER BY COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
+            LIMIT ?
+            """,
+            (f"-{max(int(lookback_days), 1)} days", max(int(limit), 1)),
+        )
+    )
+
+
+async def record_delivery_discrepancy(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    state: str,
+    reason: str,
+    pr_number: int | None = None,
+    delivery_path: str = "",
+    disposition: str | None = None,
+    accepted_via: str | None = None,
+    alerted_state: str | None = None,
+) -> None:
+    """Store the latest answer about one task's delivery.
+
+    ``first_seen_at`` survives updates on purpose — it is the age of the
+    discrepancy, and re-checking a row every quarter of an hour must not keep
+    resetting the clock that tells the owner how long this has been true.
+
+    ``disposition``/``accepted_via``/``alerted_state`` are ``None`` for "leave
+    what is there": the sweep refreshes the facts without erasing what the
+    owner declared at acceptance, and the acceptance path records a
+    declaration without pretending to have re-run the alert.
+    """
+    await db.execute(
+        """
+        INSERT INTO delivery_discrepancies
+            (task_id, pr_number, state, reason, delivery_path,
+             disposition, accepted_via, alerted_state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id) DO UPDATE SET
+            pr_number     = excluded.pr_number,
+            state         = excluded.state,
+            reason        = excluded.reason,
+            delivery_path = excluded.delivery_path,
+            disposition   = COALESCE(?, delivery_discrepancies.disposition),
+            accepted_via  = COALESCE(?, delivery_discrepancies.accepted_via),
+            alerted_state = COALESCE(?, delivery_discrepancies.alerted_state),
+            checked_at    = datetime('now')
+        """,
+        (
+            task_id,
+            pr_number,
+            state,
+            reason,
+            delivery_path,
+            disposition or "",
+            accepted_via or "",
+            alerted_state or "",
+            disposition,
+            accepted_via,
+            alerted_state,
+        ),
+    )
+    await db.commit()
+
+
+async def get_delivery_discrepancy(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, Any] | None:
+    """The stored answer for one task, or ``None`` if it was never checked."""
+    rows = list(
+        await fetchall(
+            db,
+            "SELECT * FROM delivery_discrepancies WHERE task_id = ?",
+            (task_id,),
+        )
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def list_delivery_discrepancies(
+    db: aiosqlite.Connection,
+    *,
+    states: tuple[str, ...] = ("pr_open",),
+    project_id: int | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """The discrepancy list: reads stored answers, never asks a provider (#897).
+
+    Defaults to ``pr_open`` — the completed tasks whose PR is neither merged
+    nor closed, which is the one class AC-2 names. ``unknown`` is available by
+    asking for it and is reported apart: an answer the hub could not get is
+    not evidence of a discrepancy, and folding it in would make the list cry
+    wolf every time GitHub is unreachable.
+    """
+    if not states:
+        return []
+    placeholders = ",".join("?" for _ in states)
+    params: list[Any] = list(states)
+    project_clause = ""
+    if project_id is not None:
+        project_clause = "AND t.project_id = ? "
+        params.append(project_id)
+    params.append(max(int(limit), 1))
+    # The two interpolations are a run of "?" and a fixed clause — every value
+    # travels as a bound parameter, the same shape as the task queries above.
+    query = f"""
+        SELECT
+            d.task_id, d.pr_number, d.state, d.reason, d.delivery_path,
+            d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
+            t.title, t.status, t.completed_at, t.human_owner, t.assigned_agent,
+            CAST(
+                (julianday('now') - julianday(
+                    COALESCE(NULLIF(t.completed_at, ''), d.first_seen_at)
+                )) * 24 AS INTEGER
+            ) AS age_hours
+        FROM delivery_discrepancies d
+        JOIN tasks t ON t.id = d.task_id
+        WHERE d.state IN ({placeholders})
+          AND t.archived = 0
+          {project_clause}
+        ORDER BY age_hours DESC, d.task_id ASC
+        LIMIT ?
+    """  # nosec B608 - placeholders only, values are params
+    rows = await fetchall(db, query, tuple(params))
+    return [dict(r) for r in rows]
+
+
 # --- Releases: what is actually running in production (#839) ----------------
 
 RELEASE_SUCCESS = "success"

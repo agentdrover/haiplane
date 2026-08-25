@@ -1,4 +1,5 @@
-{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length %}
+{% set undelivered = undelivered if undelivered is defined else [] %}
+{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered|length %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
 <div class="inbox-filter-bar">
@@ -261,6 +262,29 @@
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
                     hx-prompt="Reason for force-completing #{{ t.id }} (recorded in audit trail):">Force Complete</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if undelivered %}
+<section class="inbox-group inbox-undelivered">
+    <h3 class="inbox-group-title">
+        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ undelivered|length }}</span>
+    </h3>
+    {% for d in undelivered %}
+    <article class="inbox-item" id="inbox-undelivered-{{ d.task_id }}">
+        <div class="inbox-item-header">
+            <a href="/tasks/{{ d.task_id }}" class="inbox-item-link">#{{ d.task_id }} {{ d.title[:60] }}{% if d.title|length > 60 %}…{% endif %}</a>
+            <span class="badge badge-failed">PR #{{ d.pr_number }} открыт</span>
+        </div>
+        <div class="inbox-item-meta">
+            расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}
+        </div>
+        <div class="inbox-item-desc">{{ d.reason }}</div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ d.task_id }}" class="btn btn-warning btn-xs">Разобрать</a>
         </div>
     </article>
     {% endfor %}

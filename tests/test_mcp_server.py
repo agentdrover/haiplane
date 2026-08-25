@@ -457,7 +457,9 @@ async def test_hub_force_complete_task_with_comment(
     ]
     await hub_force_complete_task(9, comment="reviewed manually")
     mock_api_post.assert_awaited_once_with(
-        "/api/tasks/9/force-complete", {"comment": "reviewed manually"}
+        "/api/tasks/9/force-complete",
+        # The owner's word about the PR travels with the override (#897).
+        {"comment": "reviewed manually", "pr_disposition": ""},
     )
 
 
@@ -1344,6 +1346,8 @@ async def test_hub_decide_task_sends_all_params(
             "instructions": "",
             "decision_summary": "Accepted after manual review.",
             "record_decision": True,
+            # #897: the owner's choice about the PR travels with the decision.
+            "pr_disposition": "",
         },
     )
 
@@ -1368,6 +1372,7 @@ async def test_hub_decide_task_rework_without_summary(
             "instructions": "Fix X",
             "decision_summary": "",
             "record_decision": False,
+            "pr_disposition": "",
         },
     )
 

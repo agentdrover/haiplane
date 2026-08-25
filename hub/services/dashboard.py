@@ -222,7 +222,15 @@ async def get_inbox_data(
         d["updates"] = [dict(u) for u in update_rows]
         questions.append(d)
 
+    # #897: completed tasks whose PR is still open. Read from stored answers,
+    # so this costs one indexed SELECT — the inbox renders constantly and a
+    # provider call per render would make the whole board hostage to GitHub.
+    undelivered = await repo.list_delivery_discrepancies(
+        db, states=("pr_open",), project_id=project_id, limit=20
+    )
+
     return {
+        "undelivered": undelivered,
         "drafts": [row_to_task(r) for r in draft_rows],
         "questions": questions,
         "decisions": [row_to_task(r) for r in needs_decision_rows],

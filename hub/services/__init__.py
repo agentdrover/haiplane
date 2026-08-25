@@ -11,6 +11,11 @@ from hub.services.dashboard import (
     list_activity,
     list_tasks,
 )
+from hub.services.delivery_state import (
+    scan_completed_deliveries,
+    task_delivery,
+    undelivered_completed_tasks,
+)
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
@@ -225,6 +230,9 @@ __all__ = [
     "answer_outcome",
     "outcome_debt",
     "practice_metrics",
+    "scan_completed_deliveries",
+    "task_delivery",
+    "undelivered_completed_tasks",
     "project_git_context",
     "provision_project",
     "record_review_verdict",

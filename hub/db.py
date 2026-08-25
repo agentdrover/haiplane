@@ -1284,6 +1284,45 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_tasks_caused_by",
         "CREATE INDEX IF NOT EXISTS idx_tasks_caused_by ON tasks(caused_by_task_id)",
     ),
+    (
+        # Where a completed task's work actually stands (#897). On 21.08.2026
+        # #878 and #885 sat ``completed`` for two hours with their PRs open:
+        # the gate refused to deliver (CI still running), a human accepted the
+        # task — a legitimate way out — and after that nobody owned the PR.
+        # It was found by hand, comparing open PRs against the board.
+        #
+        # Answers are STORED, not recomputed on read, and that is the point:
+        # the question costs a call to GitHub, and a card that pays it on every
+        # render pays it hundreds of times for a fact that changes twice a day
+        # (the same trade #883 made for deploys). The periodic sweep writes
+        # here; every reader — inbox, REST, MCP — reads only this table.
+        #
+        # ``state`` is one of delivered | pr_open | pr_closed | unknown, and
+        # ``reason`` is never empty for ``unknown``: "could not look" is an
+        # answer with a cause, never a quiet "no" (#546, #572, #725).
+        # ``disposition`` is what the owner said should happen to the PR when
+        # they accepted the task by hand — a declaration, not a fact, and it
+        # never removes a row: the list is driven by what the PR IS doing.
+        "create_delivery_discrepancies",
+        # ON DELETE CASCADE, not a bare reference: ``delete_task_subtree``
+        # clears ``task_updates`` by hand and knows nothing about this table,
+        # so a plain foreign key would have made deleting a task with an open
+        # discrepancy fail outright. A note about a task that no longer exists
+        # has nothing to say anyway.
+        """CREATE TABLE IF NOT EXISTS delivery_discrepancies (
+            task_id       INTEGER PRIMARY KEY REFERENCES tasks(id)
+                          ON DELETE CASCADE,
+            pr_number     INTEGER,
+            state         TEXT    NOT NULL,
+            reason        TEXT    NOT NULL DEFAULT '',
+            delivery_path TEXT    NOT NULL DEFAULT '',
+            disposition   TEXT    NOT NULL DEFAULT '',
+            accepted_via  TEXT    NOT NULL DEFAULT '',
+            alerted_state TEXT    NOT NULL DEFAULT '',
+            first_seen_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
 ]
 
 

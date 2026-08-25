@@ -40,6 +40,7 @@ from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.ci_report import adopt_ci_run_report
+from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -2693,6 +2694,15 @@ async def decide_task(
             },
         )
         await db.commit()
+        # #897: the acceptance is done and stays done — this only refuses to
+        # let it be silent. On 21.08.2026 exactly this transition left #878 and
+        # #885 completed with their PRs open, and nothing in the task said so.
+        await note_completion_without_delivery(
+            db,
+            task_id,
+            via="decide_accept",
+            disposition=getattr(body, "pr_disposition", "") or "",
+        )
         await maybe_rollup_parent(db, task_id)
         await log_activity(
             db,
@@ -2970,6 +2980,17 @@ async def add_update(
 
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
+        # #897, the third door: a ``pending_report`` task with auto_review off
+        # completes right here, without the delivery gate ever running. The
+        # gate's own path arrives here too and answers "delivered" for free
+        # (the merge it recorded is the first thing checked), so this is one
+        # call for both — and the entrance that has no gate is not left out
+        # because the two obvious ones were closed.
+        after = await repo.get_task(db, task_id)
+        if after is not None and dict(after)["status"] == "completed":
+            await note_completion_without_delivery(
+                db, task_id, via="report_done", actor=body.agent or "agent"
+            )
 
     if undelivered:
         await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
@@ -3199,6 +3220,15 @@ async def force_complete_task(
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
+    # Outside the write lock: this asks git and possibly GitHub, and holding a
+    # database lock across a network call is how a slow provider becomes an
+    # outage. The completion is already committed — this is a note about it.
+    await note_completion_without_delivery(
+        db,
+        task_id,
+        via="force_complete",
+        disposition=((body.pr_disposition if body else "") or ""),
+    )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]

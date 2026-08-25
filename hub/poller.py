@@ -7,6 +7,7 @@ import contextlib
 from collections.abc import Iterator
 from typing import Any
 import logging
+import time
 from datetime import UTC, datetime
 
 from fastapi import FastAPI
@@ -30,6 +31,21 @@ POLL_INTERVAL = 30  # seconds
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
 
 MAX_CI_NO_PR_ATTEMPTS = 3  # give up creating a PR after this many polls
+
+# When the delivery discrepancy sweep last ran (#897). In memory for the same
+# reason as _release_notices: it schedules work, it is not a fact about the
+# world, and a restart running one sweep early costs nothing.
+_last_delivery_scan: float = 0.0
+
+
+def _due_for_delivery_scan() -> bool:
+    """True at most once per ``DELIVERY_SCAN_MINUTES``, and marks the run."""
+    global _last_delivery_scan
+    now = time.monotonic()
+    if now - _last_delivery_scan < config.DELIVERY_SCAN_MINUTES * 60:
+        return False
+    _last_delivery_scan = now
+    return True
 
 
 def _seconds_since(iso_ts: str | None) -> float | None:
@@ -878,6 +894,29 @@ async def _poll_running_tasks(app: FastAPI) -> None:
                 await generate_due_digests(db)
             except Exception:  # noqa: BLE001 - oversight must not stop polling
                 log.exception("autopilot digest generation failed")
+
+            # Completed, but is the work delivered? (#897) On a timer rather
+            # than on every pass: the question costs a call to GitHub per
+            # candidate, and the answer changes at the speed of merges, not of
+            # polls. Alerts are damped inside the sweep — once per state, not
+            # once per cycle — the same discipline the stale sweeps above use.
+            if _due_for_delivery_scan():
+                try:
+                    from hub.services.delivery_state import (
+                        scan_completed_deliveries,
+                    )
+
+                    found = await scan_completed_deliveries(
+                        db, lookback_days=config.DELIVERY_SCAN_LOOKBACK_DAYS
+                    )
+                    if found:
+                        log.warning(
+                            "Poll: %d completed task(s) with an open PR: %s",
+                            len(found),
+                            ", ".join(f"#{f['task_id']}" for f in found),
+                        )
+                except Exception:  # noqa: BLE001 - oversight must not stop polling
+                    log.exception("delivery discrepancy sweep failed")
 
             # Cross-model review dispatches (#757): settle finished cloud
             # reviewer runs — reports get their usage cross-check, silent
