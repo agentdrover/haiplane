@@ -711,6 +711,13 @@ async def _project_filter_ctx(
 
 @router.get("/", response_class=HTMLResponse)
 async def web_dashboard(request: Request, project: str | None = Query(None)):
+    # #955: аноним (токены настроены, сессии нет) видит визитку продукта.
+    # Открытый режим и живая сессия получают дашборд как прежде — их
+    # идентичность не анонимная. Ветка стоит до первого обращения к БД:
+    # публичная страница не читает ни одной задачи.
+    if current_identity(request).auth_source == "anonymous":
+        return TEMPLATES.TemplateResponse(request, "landing.html", {})
+
     db = _db(request)
     allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     # #627: both aggregates narrow inside their own queries now. Every list they

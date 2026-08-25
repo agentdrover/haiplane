@@ -5558,3 +5558,72 @@ async def test_login_page_uses_haiplane_brand(client: AsyncClient) -> None:
     assert "Haiplane" in response.text
     assert ("Open" + "Claw") not in response.text
     assert "&#x1f980;" not in response.text
+
+
+# ---- #955: аноним на корне видит продукт, а не форму логина ----------------
+
+
+async def test_anonymous_root_shows_landing(client: AsyncClient, monkeypatch) -> None:
+    # AC-1: с настроенными токенами аноним получает визитку, а не 303 на /login.
+    from hub import config
+    from hub.auth import TokenIdentity
+
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"secret-token": TokenIdentity("alice", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    response = await client.get("/", headers={"Accept": "text/html"})
+
+    assert response.status_code == 200, response.text
+    body = response.text
+    assert "Haiplane" in body
+    assert "agentdrover/haiplane" in body, "нет ссылки на репозиторий"
+    assert "docker compose up" in body, "нет команды быстрого старта"
+    assert 'href="/login"' in body, "нет ссылки «Войти»"
+    # Визитка публична: ни одной задачи из базы на ней быть не должно.
+    assert "Inbox" not in body
+
+
+async def test_session_root_still_shows_dashboard(
+    client: AsyncClient, monkeypatch
+) -> None:
+    # AC-2: аутентифицированный и open-mode получают прежний дашборд.
+    from hub import config
+    from hub.auth import TokenIdentity
+
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"secret-token": TokenIdentity("alice", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    authed = await client.get(
+        "/",
+        headers={"Accept": "text/html", "Authorization": "Bearer secret-token"},
+    )
+    assert authed.status_code == 200, authed.text
+    assert "docker compose up" not in authed.text, "дашборд подменён визиткой"
+
+    monkeypatch.setattr(config, "HUB_TOKENS", {})
+    open_mode = await client.get("/", headers={"Accept": "text/html"})
+    assert open_mode.status_code == 200, open_mode.text
+    assert "docker compose up" not in open_mode.text, "open-mode подменён визиткой"
+
+
+async def test_landing_renders_on_empty_db(client: AsyncClient, monkeypatch) -> None:
+    # AC-3: свежая установка — визитка не трогает данные задач.
+    from hub import config
+    from hub.auth import TokenIdentity
+
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"secret-token": TokenIdentity("alice", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    def _explode(*args, **kwargs):  # pragma: no cover - вызов означает провал
+        raise AssertionError("визитка не должна читать задачи")
+
+    monkeypatch.setattr("hub.services.get_dashboard_data", _explode, raising=False)
+
+    response = await client.get("/", headers={"Accept": "text/html"})
+    assert response.status_code == 200, response.text
+    assert "Haiplane" in response.text

@@ -280,6 +280,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
             resolved = await _resolve_identity(request)
             if not resolved:
+                # #955: корень для анонима — визитка продукта, а не редирект на
+                # форму входа: ссылка из статьи или каталога обязана объяснять,
+                # куда человек попал. Пропускаем с анонимной идентичностью —
+                # обработчик по ней отдаёт статическую страницу и к данным
+                # задач не обращается. Все прочие пути защищены как прежде.
+                if path == "/" and request.method in {"GET", "HEAD"}:
+                    request.state.user = ANONYMOUS_USER
+                    request.state.identity = ANONYMOUS_IDENTITY
+                    return await call_next(request)
                 return _unauthorized(request)
             identity = resolved
             request.state.user = identity.username

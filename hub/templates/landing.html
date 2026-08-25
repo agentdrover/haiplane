@@ -1,0 +1,53 @@
+{# #955: публичная визитка. Намеренно НЕ наследует base.html — там сайдбар и
+   данные задач, а эта страница видна анониму и обязана рендериться на пустой
+   базе. #}
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ product_title }} — оркестратор задач для разработки с AI-агентами</title>
+    <meta name="description" content="{{ product_title }}: гейты, которые отличают «агент сказал готово» от «код доехал до прода».">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><polygon points='18,12 88,50 18,88' fill='%236c5ce7'/></svg>">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="landing-page">
+<main class="landing">
+    <header class="landing-hero">
+        <svg class="landing-mark" viewBox="0 0 100 100" aria-hidden="true">
+            <polygon points="18,12 88,50 18,88" fill="currentColor"/>
+        </svg>
+        <h1><span class="landing-logo-main">{{ product_name }}</span> <span class="landing-logo-sub">Hub</span></h1>
+        <p class="landing-lede">Оркестратор задач для разработки с AI-агентами. Отвечает на вопрос, который агент о себе не отвечает: <strong>доехал ли код до прода</strong>.</p>
+    </header>
+
+    <section class="landing-block">
+        <h2>Заявлено — не значит доставлено</h2>
+        <p>Агент рапортует «готово», а ветка не смержена, PR открыт, прод живёт прошлой версией. Хаб не верит отчёту на слово: он ведёт задачу через гейты и сверяет заявленное с фактом по git.</p>
+        <ul class="landing-list">
+            <li><strong>Definition of Ready как контракт</strong> — критерии приёмки называют тест или команду проверки, иначе задача не уходит в работу.</li>
+            <li><strong>Ревью-цикл перед завершением</strong> — вердикт привязан к текущей сдаче: пересдал работу, прежний апрув сгорел.</li>
+            <li><strong>Учёт доставки до SHA</strong> — хаб помнит мерж-коммит задачи и коммит выката и отвечает, что из завершённого реально работает.</li>
+            <li><strong>MCP-интерфейс для агентов</strong> — тот же контур доступен Cursor, Claude Code и любому MCP-клиенту.</li>
+        </ul>
+    </section>
+
+    <section class="landing-block">
+        <h2>Попробовать</h2>
+        <pre class="landing-code"><code>git clone https://github.com/agentdrover/haiplane.git
+cd haiplane
+docker compose up</code></pre>
+        <p class="landing-muted">Поднимается с демо-данными на <code>localhost:8080</code>. SQLite, self-hosted, без внешних сервисов.</p>
+    </section>
+
+    <nav class="landing-links">
+        <a class="landing-cta" href="https://github.com/agentdrover/haiplane">Код на GitHub</a>
+        <a class="landing-secondary" href="/login">Войти в хаб</a>
+    </nav>
+
+    <footer class="landing-foot">
+        <p>Проект молодой и заточен под разработку с агентами. Вопросы и PR — в репозиторий.</p>
+    </footer>
+</main>
+</body>
+</html>
