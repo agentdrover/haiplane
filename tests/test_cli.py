@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-from io import StringIO
+import sys
+import urllib.error
+from io import BytesIO, StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hub import cli
+
+
+# Выдуманный sha в ответе prod-state: detect-secrets читает hex-строку как
+# высокоэнтропийный секрет, поэтому значение живёт одной именованной константой
+# с одной пометкой, а не пометкой на каждой строке, где оно встречается.
+DEPLOYED_SHA = "abc123def456"  # pragma: allowlist secret
 
 
 class _FakeResponse:
@@ -1188,3 +1197,863 @@ def test_dep_list_says_so_when_there_are_no_edges(capsys) -> None:
         assert cli.cmd_dep(_dep_args("list", 1, 0)) == 0
 
     assert "no dependencies" in capsys.readouterr().out
+
+
+# --- main() dispatch (#851) ---------------------------------------------------
+#
+# Coverage of build_parser only matters as a side effect of invoking a real
+# command. These tests go through main() and assert return codes, operator
+# messages, or the API call that would change Hub state.
+
+
+def _run_main(
+    argv: list[str],
+    *,
+    api_result: Any = None,
+    api_side_effect: Any = None,
+) -> tuple[int, MagicMock]:
+    mock_api = MagicMock()
+    if api_side_effect is not None:
+        mock_api.side_effect = api_side_effect
+    else:
+        mock_api.return_value = {} if api_result is None else api_result
+    with (
+        patch.object(sys, "argv", ["oc-hub", *argv]),
+        patch.object(cli, "_api", mock_api),
+    ):
+        try:
+            rc = cli.main()
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+    return int(rc), mock_api
+
+
+def _assert_no_traceback(capsys) -> tuple[str, str]:
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "Traceback" not in combined
+    return captured.out, captured.err
+
+
+def test_main_missing_required_flag_exits_2_without_traceback(capsys) -> None:
+    rc, api = _run_main(["task"])
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "title" in err.lower() or "required" in err.lower()
+
+
+def test_main_unknown_command_exits_2_without_traceback(capsys) -> None:
+    rc, api = _run_main(["not-a-command"])
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "invalid choice" in err.lower() or "not-a-command" in err
+
+
+def test_main_refine_with_no_fields_exits_2_without_calling_api(capsys) -> None:
+    rc, api = _run_main(["refine", "4"])
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "Nothing to refine" in err
+
+
+def test_main_review_verdict_rejects_bad_findings_json(capsys) -> None:
+    rc, api = _run_main(
+        ["review-verdict", "9", "approved", "--findings-json", "{not-json"]
+    )
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "invalid --findings-json" in err
+
+
+def test_main_task_create_sends_request_id_and_prints_created_task(capsys) -> None:
+    created = {"id": 44, "title": "Idempotent", "status": "open"}
+    rc, api = _run_main(
+        [
+            "task",
+            "--title",
+            "Idempotent",
+            "--request-id",
+            "req-44",
+            "--owner",
+            "alice",
+        ],
+        api_result=created,
+    )
+    assert rc == 0
+    method, path, body = api.call_args.args[:3]
+    assert method == "POST"
+    assert path == "/api/tasks"
+    assert body["client_request_id"] == "req-44"
+    assert body["human_owner"] == "alice"
+    assert api.call_args.kwargs["extra_headers"] == {"X-Client-Request-Id": "req-44"}
+    assert json.loads(capsys.readouterr().out) == created
+
+
+@pytest.mark.parametrize(
+    "argv, task_type, extra",
+    [
+        (
+            ["epic", "--title", "E", "--project", "hub", "--owner", "ada"],
+            "epic",
+            {"project": "hub"},
+        ),
+        (
+            ["feature", "--title", "F", "--parent", "1", "--reviewer", "bob"],
+            "feature",
+            {"parent_id": 1},
+        ),
+        (["subtask", "--title", "S", "--parent", "2"], "subtask", {"parent_id": 2}),
+    ],
+)
+def test_main_typed_create_posts_task_type(
+    argv: list[str], task_type: str, extra: dict[str, Any], capsys
+) -> None:
+    created = {"id": 3, "title": argv[2], "status": "open", "task_type": task_type}
+    rc, api = _run_main(argv, api_result=created)
+    assert rc == 0
+    body = api.call_args.args[2]
+    assert body["task_type"] == task_type
+    assert body["source"] == "human"
+    for key, value in extra.items():
+        assert body[key] == value
+    assert json.loads(capsys.readouterr().out)["task_type"] == task_type
+
+
+def test_main_claim_and_release_send_session_id(capsys) -> None:
+    claimed = {"id": 12, "status": "claimed", "claimed_by": "cursor"}
+    rc, api = _run_main(
+        ["claim", "12", "--agent", "cursor", "--session-id", "sid-1"],
+        api_result=claimed,
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/12/claim",
+        {"agent": "cursor", "session_id": "sid-1"},
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "claimed"
+
+    rc, api = _run_main(
+        ["release", "12", "--agent", "cursor", "--session-id", "sid-1"],
+        api_result={"id": 12, "status": "open"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/12/release",
+        {"agent": "cursor", "session_id": "sid-1"},
+    )
+
+
+def test_main_pair_start_forwards_branch_and_session() -> None:
+    rc, api = _run_main(
+        [
+            "pair-start",
+            "37",
+            "--plan",
+            "Plan: pair",
+            "--agent",
+            "cursor",
+            "--branch-slug",
+            "task-37/cli-coverage",
+            "--session-id",
+            "sid-37",
+        ],
+        api_result={"id": 37, "status": "running"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/37/pair-start",
+        {
+            "plan": "Plan: pair",
+            "assigned_agent": "cursor",
+            "branch_slug": "task-37/cli-coverage",
+            "session_id": "sid-37",
+        },
+    )
+
+
+def test_main_reject_archive_withdraw_unarchive_delete(capsys) -> None:
+    rc, api = _run_main(
+        ["reject", "5", "--comment", "no"],
+        api_result={"id": 5, "status": "rejected"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/5/reject",
+        {"comment": "no"},
+    )
+
+    rc, api = _run_main(["archive", "5", "--no-cascade"], api_result={"id": 5})
+    assert rc == 0
+    assert api.call_args.args == ("POST", "/api/tasks/5/archive", {"cascade": False})
+
+    rc, api = _run_main(["withdraw", "5"], api_result={"id": 5, "archived": True})
+    assert rc == 0
+    assert api.call_args.args[:2] == ("POST", "/api/tasks/5/withdraw")
+
+    rc, api = _run_main(["unarchive", "5"], api_result={"id": 5})
+    assert rc == 0
+    assert api.call_args.args == ("POST", "/api/tasks/5/unarchive", {"cascade": True})
+
+    rc, api = _run_main(["delete", "5"], api_result=None)
+    assert rc == 0
+    assert api.call_args.args[:2] == ("DELETE", "/api/tasks/5")
+    assert "Task #5 deleted." in capsys.readouterr().out
+
+
+def test_main_question_answer_propose_and_updates(capsys) -> None:
+    rc, api = _run_main(
+        ["question", "8", "--message", "blocked?", "--agent", "cursor"],
+        api_result={"id": 8, "status": "needs_info"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/8/question",
+        {"agent": "cursor", "question": "blocked?"},
+    )
+
+    rc, api = _run_main(
+        ["answer", "8", "--message", "go", "--no-resume"],
+        api_result={"id": 8, "status": "running"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/8/answer",
+        {"answer": "go", "resume": False},
+    )
+
+    rc, api = _run_main(
+        [
+            "propose",
+            "--title",
+            "Draft",
+            "--agent",
+            "cursor",
+            "--rationale",
+            "need it",
+            "--parent",
+            "1",
+        ],
+        api_result={"id": 9, "status": "draft", "source": "agent"},
+    )
+    assert rc == 0
+    body = api.call_args.args[2]
+    assert body["source"] == "agent"
+    assert body["parent_id"] == 1
+
+    rc, api = _run_main(
+        ["updates", "8"],
+        api_result=[
+            {
+                "created_at": "2026-08-22T00:00:00Z",
+                "kind": "status",
+                "agent": "cursor",
+                "content": "working",
+            }
+        ],
+    )
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/tasks/8/updates")
+    assert "working" in capsys.readouterr().out
+
+
+def test_main_list_filters_and_proposals_and_context(capsys) -> None:
+    tasks = [
+        {
+            "id": 1,
+            "title": "Mine",
+            "status": "open",
+            "task_type": "feature",
+            "runtime": "auto",
+            "source": "agent",
+            "human_owner": "ada",
+            "human_reviewer": "bob",
+            "parent_id": 10,
+            "archived": True,
+        }
+    ]
+    rc, api = _run_main(
+        [
+            "list",
+            "--status",
+            "open",
+            "--type",
+            "feature",
+            "--parent",
+            "10",
+            "--owner",
+            "ada",
+            "--reviewer",
+            "bob",
+            "--claimed-by",
+            "cursor",
+            "--mine",
+            "ada",
+            "--include-archived",
+        ],
+        api_result=tasks,
+    )
+    assert rc == 0
+    path = api.call_args.args[1]
+    assert path.startswith("/api/tasks?")
+    assert "type=feature" in path
+    assert "parent_id=10" in path
+    assert "human_owner=ada" in path
+    assert "claimed_by=cursor" in path
+    assert "mine=ada" in path
+    assert "include_archived=true" in path
+    out = capsys.readouterr().out
+    assert "[archived]" in out
+    assert "[owner:ada]" in out
+
+    rc, api = _run_main(["proposals", "--status", "pending"], api_result=tasks)
+    assert rc == 0
+    assert api.call_args.args[1] == "/api/tasks?status=draft&limit=50"
+    assert "Mine" in capsys.readouterr().out
+
+    rc, api = _run_main(
+        ["context", "1", "--max-chars", "80", "--mode", "summary"],
+        api_result={"context_text": "do this next"},
+    )
+    assert rc == 0
+    path = api.call_args.args[1]
+    assert path.startswith("/api/tasks/1/context?")
+    assert "max_chars=80" in path
+    assert "mode=summary" in path
+    assert "do this next" in capsys.readouterr().out
+
+
+def test_main_tree_forwards_caps_and_dep_json_unblocks(capsys) -> None:
+    rc, api = _run_main(
+        ["tree", "1", "--depth", "2", "--max-nodes", "9", "--mode", "summary"],
+        api_result={
+            "id": 1,
+            "title": "Root",
+            "task_type": "epic",
+            "status": "open",
+            "children": [],
+        },
+    )
+    assert rc == 0
+    path = api.call_args.args[1]
+    assert "depth=2" in path
+    assert "max_nodes=9" in path
+    assert "mode=summary" in path
+
+    edges = {
+        "blocked_by": [],
+        "unblocks": [{"task_id": 3, "title": "Next", "status": "open"}],
+    }
+    capsys.readouterr()
+    rc, api = _run_main(["dep", "list", "1", "--json"], api_result=edges)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == edges
+
+    rc, api = _run_main(["dep", "list", "1"], api_result=edges)
+    assert rc == 0
+    assert "unblocks   #3 Next" in capsys.readouterr().out
+
+
+def test_main_outcome_and_projects_and_dashboard(capsys) -> None:
+    rc, api = _run_main(
+        ["outcome-debt"],
+        api_result={"overdue": []},
+    )
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/outcome-debt")
+
+    rc, api = _run_main(
+        [
+            "answer-outcome",
+            "20",
+            "--verdict",
+            "moved",
+            "--measured-value",
+            "12%",
+            "--note",
+            "ok",
+        ],
+        api_result={"task_id": 20, "verdict": "moved"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/20/outcome-answers",
+        {"verdict": "moved", "measured_value": "12%", "note": "ok"},
+    )
+
+    rc, api = _run_main(
+        ["projects", "list", "--include-archived"],
+        api_result=[{"slug": "hub"}],
+    )
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/projects?include_archived=true")
+
+    capsys.readouterr()
+    rc, api = _run_main(["dashboard"], api_result={"open": 1})
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/dashboard")
+    assert json.loads(capsys.readouterr().out) == {"open": 1}
+
+
+def test_main_subtasks_bulk_and_ac_list_and_risk_list(tmp_path: Path, capsys) -> None:
+    payload_path = tmp_path / "kids.json"
+    payload_path.write_text(json.dumps({"items": [{"title": "Child"}]}))
+    created = [
+        {
+            "id": 21,
+            "title": "Child",
+            "status": "draft",
+            "task_type": "subtask",
+            "runtime": "auto",
+            "source": "agent",
+        }
+    ]
+    rc, api = _run_main(
+        [
+            "subtasks-bulk",
+            "7",
+            "--from-file",
+            str(payload_path),
+            "--task-type",
+            "subtask",
+            "--source",
+            "agent",
+            "--agent",
+            "cursor",
+        ],
+        api_result=created,
+    )
+    assert rc == 0
+    method, path, body = api.call_args.args[:3]
+    assert method == "POST"
+    assert path == "/api/tasks/7/subtasks"
+    assert body["task_type"] == "subtask"
+    assert body["source"] == "agent"
+    assert body["agent"] == "cursor"
+    assert "Child" in capsys.readouterr().out
+
+    rc, api = _run_main(["ac", "list", "7"], api_result=[])
+    assert rc == 0
+    assert "(no acceptance criteria)" in capsys.readouterr().out
+
+    acs = [
+        {
+            "id": "AC-1",
+            "verifiable_by": "log_check",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "test_ref": "tests/test_cli.py",
+        }
+    ]
+    rc, api = _run_main(["ac", "list", "7"], api_result=acs)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "AC-1" in out
+    assert "tests/test_cli.py" in out
+
+    rc, api = _run_main(["ac", "list", "7", "--json"], api_result=acs)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == acs
+
+    rc, api = _run_main(["risk", "list", "7"], api_result={"risks": []})
+    assert rc == 0
+    assert "(no risks)" in capsys.readouterr().out
+
+    risks = [
+        {
+            "kind": "security",
+            "severity": "high",
+            "description": "token leak",
+            "mitigation": "rotate",
+        }
+    ]
+    rc, api = _run_main(["risk", "list", "7"], api_result={"risks": risks})
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "token leak" in out
+    assert "rotate" in out
+
+    rc, api = _run_main(["risk", "list", "7", "--json"], api_result={"risks": risks})
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == risks
+
+
+def test_main_subtasks_bulk_rejects_non_object_file(tmp_path: Path, capsys) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"title": "x"}]))
+    rc, api = _run_main(["subtasks-bulk", "7", "--from-file", str(bad)])
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "JSON/YAML object" in err
+
+
+def test_main_subtasks_bulk_defaults_task_type_and_source(tmp_path: Path) -> None:
+    payload_path = tmp_path / "kids.json"
+    payload_path.write_text(json.dumps({"items": [{"title": "Child"}]}))
+    rc, api = _run_main(
+        ["subtasks-bulk", "7", "--from-file", str(payload_path)],
+        api_result=[],
+    )
+    assert rc == 0
+    body = api.call_args.args[2]
+    assert body["task_type"] == "subtask"
+    assert body["source"] == "agent"
+
+
+def test_main_subtasks_bulk_rejects_missing_items(tmp_path: Path, capsys) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"title": "x"}))
+    rc, api = _run_main(["subtasks-bulk", "7", "--from-file", str(bad)])
+    assert rc == 2
+    api.assert_not_called()
+    assert "items array" in capsys.readouterr().err
+
+
+def test_main_refine_from_file_rejects_array(tmp_path: Path, capsys) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"work_type": "bug"}]))
+    with pytest.raises(SystemExit) as exc:
+        with patch.object(
+            sys, "argv", ["oc-hub", "refine", "1", "--from-file", str(bad)]
+        ):
+            cli.main()
+    assert exc.value.code == 2
+    _, err = _assert_no_traceback(capsys)
+    assert "JSON/YAML object" in err
+
+
+def test_main_refine_bulk_rejects_non_object(tmp_path: Path, capsys) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([]))
+    rc, api = _run_main(["refine-bulk", "--from-file", str(bad)])
+    assert rc == 2
+    api.assert_not_called()
+    assert "JSON/YAML object" in capsys.readouterr().err
+
+
+def test_main_ac_upsert_with_test_ref() -> None:
+    rc, api = _run_main(
+        [
+            "ac",
+            "upsert",
+            "7",
+            "--id",
+            "AC-2",
+            "--given",
+            "g",
+            "--when",
+            "w",
+            "--then",
+            "t",
+            "--by",
+            "test",
+            "--test-ref",
+            "tests/test_cli.py",
+        ],
+        api_result={"id": "AC-2"},
+    )
+    assert rc == 0
+    body = api.call_args.args[2]
+    assert body["test_ref"] == "tests/test_cli.py"
+
+
+def test_main_whoami_health_prod_state_and_readiness(capsys) -> None:
+    who = {
+        "username": "cursor",
+        "role": "agent",
+        "auth_source": "db",
+        "api_key_id": 3,
+        "principal_id": 4,
+        "permissions_count": 2,
+        "permissions_summary": ["tasks.read", "tasks.update"],
+        "app_version": "0.1.0",
+    }
+    rc, api = _run_main(["whoami"], api_result=who)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cursor" in out
+    assert "API key id: 3" in out
+
+    rc, api = _run_main(["whoami", "--json"], api_result=who)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["username"] == "cursor"
+
+    health = {
+        "status": "ok",
+        "app_version": "0.1.0",
+        "bind_host": "127.0.0.1",
+        "bind_port": 8080,
+        "auth_required": True,
+        "auth_disabled": False,
+        "env_tokens_configured": True,
+        "vast_enabled": False,
+    }
+    rc, api = _run_main(["health"], api_result=health)
+    assert rc == 0
+    assert "Status: ok" in capsys.readouterr().out
+
+    rc, api = _run_main(["health", "--json"], api_result=health)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+    prod = {
+        "deployed": {"sha": DEPLOYED_SHA, "ref": "main", "at": "2026-08-22"},
+        "in_prod": [{"task_id": 1, "title": "A"}],
+        "not_in_prod": [],
+        "unknown": [],
+        "note": "ok",
+    }
+    rc, api = _run_main(["prod-state", "--limit", "5"], api_result=prod)
+    assert rc == 0
+    assert api.call_args.args[1] == "/api/prod-state?limit=5"
+    assert "Раскатано: abc123def456" in capsys.readouterr().out
+
+    rc, api = _run_main(["prod-state", "--json"], api_result=prod)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["deployed"]["sha"] == DEPLOYED_SHA
+
+    readiness = {
+        "score": 40,
+        "dor_passed": False,
+        "missing_required": ["has_problem_statement"],
+        "risks": [{"kind": "security", "severity": "high"}],
+        "recommendations": [
+            {"severity": "info", "field": "size", "message": "set size"},
+        ],
+    }
+    rc, api = _run_main(["readiness", "3"], api_result=readiness)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "score=40" in out
+    assert "security:high" in out
+    assert "non-blocking suggestions" in out
+
+    blocking = {
+        **readiness,
+        "recommendations": [
+            {"severity": "blocking", "field": "problem_statement", "message": "fill"}
+        ],
+    }
+    rc, api = _run_main(["readiness", "3"], api_result=blocking)
+    assert rc == 0
+    assert "Blocking recommendations" in capsys.readouterr().out
+
+
+def test_main_admin_commands(capsys) -> None:
+    rc, api = _run_main(["admin", "bootstrap", "--username", "root"])
+    assert rc == 1
+    api.assert_not_called()
+    assert "Password is required" in capsys.readouterr().err
+
+    with patch("getpass.getpass", return_value="secret"):
+        rc, api = _run_main(
+            [
+                "admin",
+                "bootstrap",
+                "--username",
+                "root",
+                "--password-prompt",
+                "--display-name",
+                "Root",
+            ],
+            api_result={"id": 1},
+        )
+    assert rc == 0
+    assert api.call_args.args[2]["password"] == "secret"  # pragma: allowlist secret
+    assert "Admin user 'root' created" in capsys.readouterr().out
+
+    rc, api = _run_main(
+        ["admin", "users", "list"],
+        api_result=[
+            {
+                "id": 2,
+                "status": "active",
+                "username": "ada",
+                "display_name": "Ada",
+                "roles": ["operator"],
+            }
+        ],
+    )
+    assert rc == 0
+    assert "ada" in capsys.readouterr().out
+
+    with patch("getpass.getpass", return_value="pw"):
+        rc, api = _run_main(
+            [
+                "admin",
+                "users",
+                "create",
+                "--username",
+                "ada",
+                "--password-prompt",
+                "--role",
+                "operator",
+            ],
+            api_result={"id": 2},
+        )
+    assert rc == 0
+    assert api.call_args.args[2]["password"] == "pw"  # pragma: allowlist secret
+
+    rc, api = _run_main(
+        ["admin", "users", "disable", "missing"],
+        api_result=[{"id": 2, "username": "ada"}],
+    )
+    assert rc == 1
+    assert "not found" in capsys.readouterr().err
+
+    rc, api = _run_main(
+        ["admin", "users", "disable", "ada"],
+        api_side_effect=[[{"id": 2, "username": "ada"}], {}],
+    )
+    assert rc == 0
+    assert api.call_args_list[1].args[:2] == ("POST", "/api/admin/principals/2/disable")
+
+    rc, api = _run_main(
+        ["admin", "agents", "create", "--name", "bot"],
+        api_result={"id": 9},
+    )
+    assert rc == 0
+    assert api.call_args.args[2]["kind"] == "agent"
+
+    rc, api = _run_main(
+        ["admin", "keys", "create", "--principal", "missing", "--name", "k"],
+        api_result=[],
+    )
+    assert rc == 1
+    assert "not found" in capsys.readouterr().err
+
+    rc, api = _run_main(
+        [
+            "admin",
+            "keys",
+            "create",
+            "--principal",
+            "ada",
+            "--name",
+            "ci",
+            "--expires-days",
+            "7",
+        ],
+        api_side_effect=[
+            [{"id": 2, "username": "ada"}],
+            {"id": 4, "key_prefix": "och_", "plaintext_key": "secret-key"},
+        ],
+    )
+    assert rc == 0
+    assert "secret-key" in capsys.readouterr().out
+
+    rc, api = _run_main(["admin", "keys", "revoke", "4"], api_result={})
+    assert rc == 0
+    assert api.call_args.args[:2] == ("POST", "/api/admin/api-keys/4/revoke")
+
+    rc, api = _run_main(
+        ["admin", "roles", "list"],
+        api_result=[
+            {
+                "slug": "agent",
+                "name": "Agent",
+                "system": True,
+                "permissions": ["tasks.read"],
+            }
+        ],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[system]" in out
+    assert "tasks.read" in out
+
+    rc, api = _run_main(
+        ["admin", "audit", "--limit", "3"],
+        api_result=[
+            {
+                "created_at": "t",
+                "actor_username": "ada",
+                "action": "disable",
+                "target_type": "principal",
+                "target_id": "2",
+                "summary": "disabled",
+            }
+        ],
+    )
+    assert rc == 0
+    assert api.call_args.args[1] == "/api/admin/audit?limit=3"
+    assert "disabled" in capsys.readouterr().out
+
+
+def test_api_sends_bearer_token(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "HUB_URL", "https://hub.example.test")
+    monkeypatch.setattr(cli, "HUB_TOKEN", "tok-1")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b'{"ok": true}'))
+    with patch("urllib.request.urlopen", mock_urlopen):
+        cli._api(
+            "POST",
+            "/api/tasks",
+            {"title": "x"},
+            extra_headers={"X-Client-Request-Id": "req-1"},
+        )
+    request = mock_urlopen.call_args.args[0]
+    assert request.get_header("Authorization") == "Bearer tok-1"
+    assert request.get_header("Content-type") == "application/json"
+    assert request.get_header("X-client-request-id") == "req-1"
+
+
+def test_api_http_error_exits_1_without_traceback(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "HUB_URL", "https://hub.example.test")
+    monkeypatch.setattr(cli, "HUB_TOKEN", "")
+
+    def _boom(req, timeout=30):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            409,
+            "Conflict",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=BytesIO(b'{"reason":"already_claimed"}'),
+        )
+
+    with patch("urllib.request.urlopen", _boom), pytest.raises(SystemExit) as exc:
+        cli._api("POST", "/api/tasks/1/claim", {"agent": "x"})
+    assert exc.value.code == 1
+    _, err = _assert_no_traceback(capsys)
+    assert "HTTP 409" in err
+    assert "already_claimed" in err
+
+
+def test_api_connection_error_exits_1_without_traceback(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "HUB_URL", "https://hub.example.test")
+    monkeypatch.setattr(cli, "HUB_TOKEN", "")
+
+    def _boom(req, timeout=30):
+        raise urllib.error.URLError("refused")
+
+    with patch("urllib.request.urlopen", _boom), pytest.raises(SystemExit) as exc:
+        cli._api("GET", "/api/tasks")
+    assert exc.value.code == 1
+    _, err = _assert_no_traceback(capsys)
+    assert "Connection error" in err
+
+
+def test_print_http_error_plain_and_generic_json(capsys) -> None:
+    cli._print_http_error(500, "plain boom")
+    assert "HTTP 500: plain boom" in capsys.readouterr().err
+    cli._print_http_error(409, '{"reason":"busy"}')
+    assert "HTTP 409" in capsys.readouterr().err
+
+
+def test_cmd_template_list_when_none_installed(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_list_templates", lambda: [])
+    args = argparse.Namespace(work_type="list", out=None, force=False, list=False)
+    rc = cli.cmd_template(args)
+    assert rc == 1
+    assert "No templates installed." in capsys.readouterr().err
