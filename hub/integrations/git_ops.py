@@ -2235,12 +2235,19 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> str:
-        """Where this pull request stands: "open", "merged", "closed", or "".
+        """Where this PR stands: "open", "merged", "closed", "absent", or "".
 
         Empty means the question could not be asked — no gh, no network, an
-        unknown number. The caller treats that as a cause to report, never as
-        an answer: "could not look" and "closed" lead to opposite decisions
+        unreadable answer. The caller treats that as a cause to report, never
+        as an answer: "could not look" and "closed" lead to opposite decisions
         about delivery (#802, the rule #725 wrote down).
+
+        "absent" is the fourth answer (#959), and it is an ANSWER: the number
+        is not in the project's repository. Until it had a name it arrived as
+        "" — the same value a blinking network produces — so the gate kept
+        waiting for CI on a PR that cannot exist. That is not hypothetical: a
+        project that moved between repositories carries numbers from the old
+        one, and on #880 the gate offered to wait for a green CI forever.
         """
         # One field, and it is the whole answer: gh reports MERGED as a STATE,
         # and there is no `merged` flag to ask for. Asking for one made the
@@ -2259,12 +2266,44 @@ class GitOpsIntegration:
             check=False,
         )
         if rc != 0 or not out:
-            return ""
+            return await self._pr_absent_or_unknown(pr_number, repo, gh_repo)
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
             return ""
         return str(data.get("state") or "").lower()
+
+    async def _pr_absent_or_unknown(
+        self, pr_number: int, repo: str | None, gh_repo: str | None
+    ) -> str:
+        """Tell "no such PR here" from "could not ask", or "" (#959).
+
+        Asked ONLY after ``gh pr view`` has already failed, so the working path
+        pays nothing for it. Deliberately a second question rather than a
+        different first one: the comment above remembers #803, where changing
+        what pr_state asks broke the reading of MERGED for every PR. The cheap
+        answer keeps its transport; only the failure gets a follow-up.
+
+        The signal is the REST status in the response body, not a substring of
+        gh's prose — error text drifts between versions, a 404 does not. A
+        missing repository answers 404 too, and that is correct: "not reachable
+        as this project's PR" is the same decision either way.
+        """
+        rc, out, _ = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/pulls/{pr_number}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            # The REST call answered where the GraphQL one did not. Nothing is
+            # claimed from that: the state is read by the caller's next pass.
+            return ""
+        try:
+            body = json.loads(out or "{}")
+        except json.JSONDecodeError:
+            return ""
+        return "absent" if str(body.get("status") or "") == "404" else ""
 
     async def merge_commit_sha(
         self,
