@@ -987,9 +987,55 @@ class GitOpsIntegration:
                 "unavailable",
                 f"не нашёл, от чего восстанавливать: ни origin/{source}, ни {source}",
             )
-        rc, _, err = await _git(
-            "push", "origin", f"{sha}:refs/heads/{branch}", repo=repo, check=False
+        # #949: the restore used to push ``<sha>:refs/heads/<branch>``. The
+        # pre-push hook reads the LOCAL ref of every push line, and a bare sha
+        # matches none of the allowed branch names — so in any armed clone
+        # (which is every workspace clone, the hub arms them itself, #532) the
+        # restore was refused. Production record #4612 shows exactly that:
+        # "Blocked push from branch 'c12ed99…'". The #947 test missed it by
+        # running on bare repositories with no hook.
+        #
+        # The fix is to push a real local branch under the restored name, so
+        # the hook sees ``refs/heads/<branch>`` — the same control any push
+        # passes, no bypass. Which is possible depends on where the clone
+        # stands:
+        #   * branch not checked out → ``git branch -f`` and push it;
+        #   * branch checked out, tree clean → ``reset --hard`` — this also
+        #     realigns the clone with the branch it is about to publish;
+        #   * branch checked out, tree dirty → refuse honestly. A reset here
+        #     would destroy someone's uncommitted work for a branch fix.
+        rc, current, _ = await _git(
+            "rev-parse", "--abbrev-ref", "HEAD", repo=repo, check=False
         )
+        current = current.strip() if rc == 0 else ""
+        if current == branch:
+            # Untracked files survive a reset --hard, so they must not block
+            # the restore: every workspace clone carries stray untracked files
+            # (agent worktrees, wait files), and counting them as dirt would
+            # make the refusal the common case. Only tracked modifications are
+            # what a reset would actually destroy.
+            rc, dirty, _ = await _git(
+                "status", "--porcelain", "--untracked-files=no", repo=repo, check=False
+            )
+            if rc != 0:
+                return ("unavailable", "не смог прочитать состояние рабочего дерева")
+            if dirty.strip():
+                return (
+                    "unavailable",
+                    f"ветка {branch} выгружена в рабочее дерево клона, и дерево "
+                    "грязное — reset уничтожил бы незакоммиченное. Восстановите "
+                    "вручную или очистите дерево",
+                )
+            rc, _, err = await _git("reset", "--hard", sha, repo=repo, check=False)
+        else:
+            rc, _, err = await _git("branch", "-f", branch, sha, repo=repo, check=False)
+        if rc != 0:
+            return (
+                "unavailable",
+                f"не смог поставить локальную ветку {branch} на {sha[:12]}: "
+                f"{err[:150] or 'git молчит'}",
+            )
+        rc, _, err = await _git("push", "origin", branch, repo=repo, check=False)
         if rc != 0:
             return ("unavailable", f"push не прошёл: {err[:200] or 'git молчит'}")
         return ("restored", sha)
@@ -2265,12 +2311,23 @@ class GitOpsIntegration:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        delete_branch: bool = True,
     ) -> bool:
+        """Merge one PR; ``delete_branch`` says what happens to its head (#949).
+
+        Deleting the head is right for a task PR — short-lived branches, the
+        repository's own rule. But this one call served the RELEASE PR too,
+        whose head is the project's integration branch: every auto-release of
+        24–25.08 deleted develop, three times in two days, and the repo's
+        delete_branch_on_merge=false proves it was us, not GitHub. The default
+        stays True so the task path is untouched; the release path passes
+        False, because a release must not remove the branch work lands on.
+        """
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
         subject = f"{ctype}(task): {slug} (#{task_id})"
 
-        rc, _, err = await _gh(
+        args = [
             "pr",
             "merge",
             str(pr_number),
@@ -2278,9 +2335,12 @@ class GitOpsIntegration:
             gh_repo or REPO_NAME,
             "--squash",
             "--admin",
-            "--delete-branch",
-            "--subject",
-            subject,
+        ]
+        if delete_branch:
+            args.append("--delete-branch")
+        args += ["--subject", subject]
+        rc, _, err = await _gh(
+            *args,
             repo=repo,
             check=False,
             timeout=30,

@@ -306,6 +306,7 @@ class GitOpsPlugin(Protocol):
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        delete_branch: bool = True,
     ) -> bool: ...
     async def delete_branch(
         self,

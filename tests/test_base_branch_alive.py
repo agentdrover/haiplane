@@ -448,3 +448,139 @@ async def test_an_unverifiable_branch_is_not_reported_as_fine(db) -> None:
     assert "не проверено" in reason
     activity = [dict(r) for r in await hub_repo.list_activity(db, limit=10)]
     assert any("неизвестно" in (a.get("summary") or "") for a in activity), activity
+
+
+# ---------------------------------------------------------------------------
+# #949 — релиз не удаляет свою head-ветку, а восстановление проходит через хук
+# ---------------------------------------------------------------------------
+
+
+def _arm_the_hook(clone: Path, branch: str) -> None:
+    """Вооружить в клоне НАСТОЯЩИЙ pre-push хук репозитория.
+
+    Тесты #947 гоняли восстановление на голых репозиториях без хука — и
+    пропустили в прод восстановление, которое хук блокирует (запись #4612).
+    Клон без хука проверяет не тот мир: в workspace-клонах хаба хук вооружён
+    всегда, это делает сам хаб (#532).
+    """
+    hooks = clone / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-push"
+    repo_root = Path(__file__).resolve().parents[1]
+    hook.write_text((repo_root / ".githooks" / "pre-push").read_text())
+    hook.chmod(0o755)
+    # Хук закоммичен, как в настоящем репозитории: иначе он сам лежит
+    # untracked-файлом, и его собственная проверка чистого дерева блокирует
+    # любой push — тест мерил бы артефакт фикстуры, а не поведение.
+    _git(clone, "add", ".githooks/pre-push")
+    _git(clone, "commit", "-qm", "chore: carry the pre-push hook")
+    git_policy.activate_quietly(str(clone), base_branch=branch)
+    assert git_policy.inspect(str(clone)).enforced, "хук обязан быть вооружён"
+
+
+@pytest.mark.asyncio
+async def test_the_restore_walks_through_an_armed_hook(tmp_path: Path) -> None:
+    """AC-2, ровно прод: ветка выгружена в клоне, хук вооружён, remote её потерял."""
+    remote, clone = _remote_with_clone(tmp_path, "develop")
+    _arm_the_hook(clone, "develop")
+    _release_takes_the_branch(remote, clone, "develop")
+
+    state, detail = await GitOpsIntegration().ensure_remote_branch(
+        "develop", "main", repo=str(clone)
+    )
+
+    assert state == "restored", detail
+    assert "develop" in _git(remote, "branch", "--list", "develop").stdout
+    assert _sha(remote, "develop") == _sha(remote, "main")
+
+
+@pytest.mark.asyncio
+async def test_the_restore_from_a_sideways_checkout_uses_a_real_branch_name(
+    tmp_path: Path,
+) -> None:
+    """Клон стоит на другой ветке — восстановление идёт через branch -f, не через sha."""
+    remote, clone = _remote_with_clone(tmp_path, "develop")
+    _arm_the_hook(clone, "develop")
+    _release_takes_the_branch(remote, clone, "develop")
+    _git(clone, "checkout", "-q", "-b", "task-1/elsewhere")
+
+    state, detail = await GitOpsIntegration().ensure_remote_branch(
+        "develop", "main", repo=str(clone)
+    )
+
+    assert state == "restored", detail
+    assert "develop" in _git(remote, "branch", "--list", "develop").stdout
+    # Рабочее дерево не тронуто: клон так и стоит на своей ветке.
+    assert (
+        _git(clone, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "task-1/elsewhere"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dirty_checked_out_branch_is_refused_not_reset(
+    tmp_path: Path,
+) -> None:
+    """Незакоммиченная работа дороже ветки: честный отказ вместо reset --hard."""
+    remote, clone = _remote_with_clone(tmp_path, "develop")
+    _arm_the_hook(clone, "develop")
+    _release_takes_the_branch(remote, clone, "develop")
+    # Правка ОТСЛЕЖИВАЕМОГО файла: только её reset --hard и уничтожил бы.
+    # Untracked-файлы (в клонах хаба их полно) грязью не считаются — они
+    # переживают reset, и отказ из-за них был бы ложным.
+    (clone / "README").write_text("незакоммиченная правка")
+
+    state, detail = await GitOpsIntegration().ensure_remote_branch(
+        "develop", "main", repo=str(clone)
+    )
+
+    assert state == "unavailable"
+    assert "грязное" in detail
+    assert (clone / "README").read_text() == "незакоммиченная правка", (
+        "дерево не тронуто"
+    )
+    assert "develop" not in _git(remote, "branch", "--list", "develop").stdout
+
+
+@pytest.mark.asyncio
+async def test_the_release_merge_keeps_its_head_branch(monkeypatch) -> None:
+    """AC-1: релизный вызов мержа не несёт --delete-branch, task-вызов несёт."""
+    from hub.integrations import git_ops as git_ops_mod
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_gh(*args, **kwargs):
+        calls.append(args)
+        return (0, "", "")
+
+    monkeypatch.setattr(git_ops_mod, "_gh", fake_gh)
+    ops = GitOpsIntegration()
+
+    assert await ops.merge_pr(7, 7, "some task")
+    assert "--delete-branch" in calls[-1], "task-PR: ветка удаляется, как раньше"
+
+    assert await ops.merge_pr(8, 0, "release develop → main", delete_branch=False)
+    assert "--delete-branch" not in calls[-1], (
+        "релизный PR: head — интеграционная ветка, удалять её нельзя"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_release_flow_actually_passes_the_flag(db) -> None:
+    """Не только возможность, но и использование: merge_ready_release шлёт False."""
+    from hub import repository as hub_repo
+    from hub.services.release import merge_ready_release
+    from tests.test_release_policy import _git as _git_plugin
+    from tests.test_release_policy import _release_project
+
+    g = _git_plugin(existing_pr=777)
+    g.ensure_remote_branch = AsyncMock(return_value=("present", "abc"))
+    pid = await _release_project(db, "auto")
+    project = await hub_repo.get_project(db, pid)
+
+    merged, _ = await merge_ready_release(db, project)
+
+    assert merged is True
+    assert g.merge_pr.await_args.kwargs.get("delete_branch") is False, (
+        "релизный путь обязан явно запретить удаление head-ветки"
+    )
