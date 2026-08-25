@@ -80,7 +80,7 @@ async def build_call_sites_section(
         return CallSiteSection(status=call_sites.UNKNOWN, reason="task has no branch")
 
     diff_base = diff_base or {}
-    if diff_base.get("state") == review_evidence.BASE_UNRESOLVED:
+    if review_evidence.base_blocks_diff(str(diff_base.get("state") or "")):
         return CallSiteSection(
             status=call_sites.UNKNOWN,
             reason=review_evidence.DISABLED_BY_BASE + str(diff_base.get("reason", "")),

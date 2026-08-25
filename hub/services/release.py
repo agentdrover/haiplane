@@ -32,7 +32,9 @@ from typing import Any
 import aiosqlite
 
 from hub import config
+from hub import git_policy
 from hub import repository as repo
+from hub.db import log_activity
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 from hub.services.project_policy import (
@@ -196,4 +198,65 @@ async def merge_ready_release(
         return False, f"релиз не удалось провести: {exc}"
     if not merged:
         return False, f"релизный PR #{pr_number} не смержен: GitHub отказал"
-    return True, f"релиз PR #{pr_number} смержен в {base}"
+    note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
+    return True, f"релиз PR #{pr_number} смержен в {base}{note}"
+
+
+async def _keep_the_integration_branch(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    head: str,
+    base: str,
+    ctx: dict[str, Any],
+) -> str:
+    """A release must not leave the project without a branch to deliver into (#947).
+
+    24.08.2026 the release of this very hub merged develop into main and ended
+    with develop gone from the repository. Nothing was broken in a way anything
+    reported: the merge succeeded, the deploy ran, the project card said the
+    clone agreed with the project. For a day no pull request could be opened
+    (GitHub refuses a missing base) and no task could be pair-started.
+
+    Restoring is safe by construction at exactly this moment: the merge just
+    put the integration branch's content into the release branch, so the two
+    agree, and the branch comes back pointing at the same tree it had. It is
+    recorded in the activity feed either way, because a branch resurrected in
+    silence is how the next deletion goes unexamined — and deletion may well
+    have been deliberate.
+    """
+    try:
+        state, detail = await plugins.git_ops.ensure_remote_branch(
+            head, base, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning("release: could not check branch %s: %s", head, exc)
+        return f"; жива ли ветка {head}, проверить не удалось: {exc}"
+
+    if state == "present":
+        return ""
+    slug = dict(project_row).get("slug") or "?"
+    if state == "restored":
+        # The clone check caches its answers for a minute (#947); the hub knows
+        # better than its own cache here, so it drops it rather than letting a
+        # card show a branch as missing right after restoring it.
+        git_policy.forget_remote_presence(
+            (dict(project_row).get("workspace_path") or "").strip(), head
+        )
+        summary = (
+            f"{slug}: ветка {head} исчезла при релизе в {base} и восстановлена "
+            f"от {base}"
+        )
+        await log_activity(
+            db,
+            "release",
+            summary,
+            f"restored {head} at {detail[:12]} from {base}",
+        )
+        return f"; {summary}"
+    await log_activity(
+        db,
+        "release",
+        f"{slug}: жива ли ветка {head} после релиза — неизвестно",
+        detail,
+    )
+    return f"; состояние ветки {head} после релиза не проверено: {detail}"

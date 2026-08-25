@@ -772,11 +772,16 @@ class PrepassState(BaseModel):
 class DiffBaseState(BaseModel):
     """Which base the diff is taken against, and whether it exists (#725).
 
-    ``state`` is ``resolved`` | ``unresolved`` | ``unverified``. The last two
-    are never collapsed: "we looked and it is not there" and "there was nothing
-    to look in" call for different actions, and a brief that merges them ends
-    up asserting a fact it never checked. ``source`` names where the base came
-    from, so a wrong one can be fixed at its origin.
+    ``state`` is ``resolved`` | ``unresolved`` | ``unverified`` | ``stale``.
+    They are never collapsed: "we looked and it is not there" and "there was
+    nothing to look in" call for different actions, and a brief that merges
+    them ends up asserting a fact it never checked. ``source`` names where the
+    base came from, so a wrong one can be fixed at its origin.
+
+    ``stale`` is #947: the ref resolved inside the workspace and names a commit
+    the remote branch does not carry. Everything downstream would run and
+    compare against a world that is gone — the empty diff a reviewer read as
+    "nothing changed" while the branch held 864 new lines.
     """
 
     base: str = ""
@@ -2222,6 +2227,11 @@ class CloneBranchState(BaseModel):
     reason: str = "сверка клона с проектом не выполнялась"
     project_branch: str = ""
     clone_branch: str = ""
+    # #947 added a fourth: ``missing`` — the clone records the declared name,
+    # and that branch no longer exists in the project's remote. It is not a
+    # shade of ``diverged`` (which is about the clone protecting the WRONG
+    # branch) and least of all of ``match``: nothing can be delivered into a
+    # branch that is gone.
 
 
 class ProjectView(BaseModel):

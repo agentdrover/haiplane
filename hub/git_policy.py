@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import time
 
 # Synchronous by design: this runs as a CLI (doctor/activate) and standalone
 # on servers. argv is always a fixed list — no shell ever sees these strings.
@@ -249,9 +250,100 @@ def record_branch_policy(
 # its own answer with its own cause, the rule CIRunReportState (#546) and
 # sha_check (#572) already carry. A clone the hub cannot read is not a clone in
 # agreement — it is a clone nobody checked, and the two call for different acts.
+#
+# The fourth state is #947, and it exists because the three above answered a
+# narrower question than the one their readers were asking. They compare NAMES:
+# the branch the project declares against the branch the clone's config
+# records. On 2026-08-24 a squash release merged develop into main and left the
+# repository without develop at all — and this check kept answering "match",
+# truthfully and uselessly, because the clone did record the name of a branch
+# that no longer existed anywhere. For a day nothing could be delivered on that
+# project (GitHub refuses a pull request into a missing base) and no surface
+# said why. A name that matches a branch nobody can push to is not agreement.
 BRANCH_IN_SYNC = "match"
 BRANCH_DIVERGED = "diverged"
 BRANCH_UNCHECKED = "unknown"
+BRANCH_MISSING = "missing"
+
+# ls-remote is a network round trip, and this check sits on the project card,
+# which renders one per project. The ANSWER is cached, not the question: for a
+# minute a repeated render reuses what the last look found. Only observed
+# answers are cached — "could not check" is never stored, so a blip does not
+# freeze into a verdict for the next minute (#937 caches the same way, and for
+# the same reason: the dashboard that took 53 seconds).
+REMOTE_PRESENCE_TTL_SECONDS = 60.0
+_REMOTE_PRESENCE_CAP = 512
+_remote_presence: dict[tuple[str, str], tuple[float, bool]] = {}
+
+
+def _cached_presence(repo: str, branch: str) -> bool | None:
+    at_answer = _remote_presence.get((repo, branch))
+    if at_answer is None:
+        return None
+    at, answer = at_answer
+    if time.monotonic() - at >= REMOTE_PRESENCE_TTL_SECONDS:
+        _remote_presence.pop((repo, branch), None)
+        return None
+    return answer
+
+
+def _record_presence(repo: str, branch: str, answer: bool) -> None:
+    if len(_remote_presence) >= _REMOTE_PRESENCE_CAP:
+        now = time.monotonic()
+        for key, (at, _) in list(_remote_presence.items()):
+            if now - at >= REMOTE_PRESENCE_TTL_SECONDS:
+                _remote_presence.pop(key, None)
+        if len(_remote_presence) >= _REMOTE_PRESENCE_CAP:
+            _remote_presence.clear()
+    _remote_presence[(repo, branch)] = (time.monotonic(), answer)
+
+
+def forget_remote_presence(repo: str = "", branch: str = "") -> None:
+    """Drop cached answers — for one branch, one clone, or all of them.
+
+    Called wherever the hub itself changes what the remote holds (restoring a
+    base branch after a release), so the very next reader sees the world as it
+    is now instead of waiting out a TTL for news the hub already has.
+    """
+    if not repo:
+        _remote_presence.clear()
+        return
+    if branch:
+        _remote_presence.pop((repo, branch), None)
+        return
+    for key in [k for k in _remote_presence if k[0] == repo]:
+        _remote_presence.pop(key, None)
+
+
+def remote_has_branch(repo: str, branch: str) -> tuple[bool | None, str]:
+    """Does ``branch`` exist in the remote this clone pushes to (#947)?
+
+    ``(True|False|None, reason)`` — and None is the load-bearing one. Asking a
+    remote is a network act that fails for reasons having nothing to do with
+    the branch: no origin configured, credentials expired, the host down. None
+    of those are evidence that the branch is gone, and reporting them as such
+    would send an owner recreating a branch that was there all along.
+
+    Deliberately asks the REMOTE rather than reading ``refs/remotes/origin/*``
+    in the clone. Those refs are as old as the last fetch, and a branch deleted
+    upstream keeps its stale ref until someone prunes — exactly the window this
+    check exists to close.
+    """
+    branch = (branch or "").strip()
+    if not branch:
+        return None, "ветка не названа — спрашивать remote не о чем"
+    cached = _cached_presence(repo, branch)
+    if cached is not None:
+        return cached, ""
+    rc, out = _git(repo, "remote", "get-url", "origin")
+    if rc != 0:
+        return None, f"у клона нет remote origin — спросить некого: {out[:200]}"
+    rc, out = _git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    if rc != 0:
+        return None, f"ls-remote не ответил: {out[:200] or 'git молчит'}"
+    answer = bool(out.strip())
+    _record_presence(repo, branch, answer)
+    return answer, ""
 
 
 @dataclass
@@ -316,10 +408,32 @@ def branch_sync(repo: str, project_branch: str) -> BranchSyncState:
             _recorded_base(path),
         )
     recorded = _recorded_base(path)
+    # #947: before comparing names, ask whether the declared branch is still
+    # there to be protected. A missing base outranks a naming disagreement as
+    # an answer — it stops delivery outright, while a wrong key only weakens
+    # the hook — so it is reported first and carries both names anyway.
+    present, unchecked_because = remote_has_branch(path, declared)
+    if present is False:
+        return BranchSyncState(
+            BRANCH_MISSING,
+            f"ветки {declared} нет в remote проекта: клон защищает имя, "
+            "которого в репозитории больше нет. PR в неё открыть нельзя, и "
+            "любая задача проекта встанет на pair-start",
+            declared,
+            recorded,
+        )
     if recorded == declared:
+        agrees = f"клон защищает ветку проекта: {declared}"
+        # An unchecked remote never rides along as agreement: the state answers
+        # the hook's question, and the reason must not let it be read as an
+        # answer to the branch's.
+        if present is None:
+            agrees += (
+                f". Существование ветки в remote не проверено: {unchecked_because}"
+            )
         return BranchSyncState(
             BRANCH_IN_SYNC,
-            f"клон защищает ветку проекта: {declared}",
+            agrees,
             declared,
             recorded,
         )
