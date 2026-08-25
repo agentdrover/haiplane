@@ -100,6 +100,20 @@
     .card h3{margin:0 0 .4rem;font-size:1.05rem}
     .card p{margin:0;color:var(--text-2);font-size:.92rem}
 
+    /* --- кейсы --- */
+    .cases{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1.4rem}
+    @media(max-width:820px){.cases{grid-template-columns:1fr}}
+    .case{border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.35rem;background:var(--surface);
+      display:flex;flex-direction:column;gap:.45rem}
+    .case .num{font-family:var(--mono);font-size:1.65rem;font-weight:600;letter-spacing:-.02em;
+      color:var(--accent-light)}
+    .case .num em{font-style:normal;color:var(--green)}
+    .case h3{margin:0;font-size:1rem}
+    .case p{margin:0;color:var(--text-2);font-size:.9rem;line-height:1.55}
+    .meta-note{margin-top:1.3rem;border:1px dashed var(--border);border-radius:12px;padding:.85rem 1.1rem;
+      color:var(--text-2);font-size:.92rem}
+    .meta-note code{font-family:var(--mono);color:var(--accent-light);font-size:.86em}
+
     /* --- терминал --- */
     .term{border:1px solid var(--border);border-radius:14px;background:#0a0c11;overflow:hidden;margin-top:1.4rem}
     .term-bar{display:flex;gap:.45rem;padding:.7rem .9rem;border-bottom:1px solid var(--border)}
@@ -213,6 +227,30 @@
                 <p>Весь контур доступен по MCP: агент ставит задачи, сдаёт работу, ждёт вердикта и просыпается по кнопке человека.</p>
             </div>
         </div>
+    </section>
+
+    <section class="section">
+        <p class="kicker">Проверено на себе</p>
+        <h2>Хаб ведёт собственную разработку — вот журнал</h2>
+        <p class="sub">Все примеры — реальные записи из учёта доставки этого инстанса, не маркетинговые сценарии.</p>
+        <div class="cases">
+            <div class="case">
+                <span class="num">48 часов</span>
+                <h3>Ребрендинг живого продукта</h3>
+                <p>Репозиторий, аккаунт, домен и прод переименованы агентом — шесть задач, каждая через DoR и ревью. Суммарный простой прода: 4 минуты.</p>
+            </div>
+            <div class="case">
+                <span class="num">53с → <em>2.6с</em></span>
+                <h3>Инцидент на дашборде</h3>
+                <p>Сетевые вызовы в цикле рендера. Диагностика по слоям, конфигурационный фикс — и кодовый, отдельной задачей через тот же гейт.</p>
+            </div>
+            <div class="case">
+                <span class="num">0 <em>сюрпризов</em></span>
+                <h3>«Completed» без доставки — виден сразу</h3>
+                <p>Задача закрыта, а PR не смержен? Хаб говорит об этом в момент отчёта и показывает в панели доставки — а не через неделю на проде.</p>
+            </div>
+        </div>
+        <p class="meta-note">Мета-пример: эта страница — задача <code>#955</code> в этом же хабе. Она прошла Definition of Ready, машинное ревью и учёт доставки, прежде чем вы её увидели.</p>
     </section>
 
     <section class="section" id="try">
