@@ -938,6 +938,129 @@ class GitOpsIntegration:
             return ("resolved", sha)
         return ("missing", f"neither {name} nor origin/{name} exists in {repo}")
 
+    async def ensure_remote_branch(
+        self,
+        branch: str,
+        source: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """Make sure ``branch`` still exists in the remote, from ``source`` (#947).
+
+        ``(present|restored|unavailable, detail)``. Called after a release
+        merge, because that is the act that removed it: merging the
+        integration branch into the release branch can end with the
+        integration branch deleted — GitHub offers it, automation takes the
+        offer — and the project is then left with no branch for anything to be
+        delivered into. Nobody notices, because a release that just succeeded
+        looks like the opposite of an outage.
+
+        Restores from the release branch rather than from any local ref: after
+        the merge those two carry the same content by construction, and a
+        local ref is whatever some earlier checkout left behind. Never forces:
+        if the branch is there, it is left exactly as it is.
+        """
+        if not repo:
+            return ("unavailable", "у проекта нет рабочего клона — пушить неоткуда")
+        rc, out, err = await _git(
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return ("unavailable", f"ls-remote не ответил: {err[:150] or 'git молчит'}")
+        if out.strip():
+            return ("present", out.split()[0][:12])
+
+        rc, _, err = await _git("fetch", "origin", source, repo=repo, check=False)
+        if rc != 0:
+            log.warning(
+                "release branch restore: fetch %s failed: %s", source, err[:200]
+            )
+        sha = await _resolve_ref_remote_first(source, repo)
+        if not sha:
+            return (
+                "unavailable",
+                f"не нашёл, от чего восстанавливать: ни origin/{source}, ни {source}",
+            )
+        rc, _, err = await _git(
+            "push", "origin", f"{sha}:refs/heads/{branch}", repo=repo, check=False
+        )
+        if rc != 0:
+            return ("unavailable", f"push не прошёл: {err[:200] or 'git молчит'}")
+        return ("restored", sha)
+
+    async def base_freshness(self, repo: str, base: str, sha: str) -> tuple[str, str]:
+        """Is the base this diff stands on still the one the remote carries (#947)?
+
+        ``(current|stale|unverified, detail)``. The middle state is the point:
+        a base can resolve perfectly well inside the workspace and name a
+        commit the remote branch does not carry — a squash release rewrote the
+        line, or the branch was deleted and the clone kept its copy. Every
+        check that reads the diff then compares against a world that no longer
+        exists, and produces the most dangerous of answers: an empty one.
+
+        Never guesses. When the remote-tracking ref is absent the remote itself
+        is asked, so "the branch is gone upstream" is separated from "this
+        clone has not fetched it" instead of the two sharing a verdict.
+        """
+        rc, remote_sha, _ = await _git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"origin/{base}^{{commit}}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0 and remote_sha.strip():
+            remote_sha = remote_sha.strip()
+            if remote_sha == sha:
+                return ("current", remote_sha)
+            rc, _, _ = await _git(
+                "merge-base", "--is-ancestor", sha, remote_sha, repo=repo, check=False
+            )
+            if rc == 0:
+                return ("current", remote_sha)
+            return (
+                "stale",
+                f"origin/{base} стоит на {remote_sha[:12]}, а база сравнения — "
+                f"{sha[:12]}, которого в этой ветке нет",
+            )
+
+        rc, _, err = await _git("remote", "get-url", "origin", repo=repo, check=False)
+        if rc != 0:
+            return (
+                "unverified",
+                f"у клона нет origin, сверять базу не с чем: {err[:150]}",
+            )
+        rc, out, err = await _git(
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{base}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return ("unverified", f"ls-remote не ответил: {err[:150] or 'git молчит'}")
+        if not out.strip():
+            return (
+                "stale",
+                f"ветки {base} нет в remote проекта — база сравнения указывает на "
+                f"{sha[:12]} из ветки, которой больше не существует",
+            )
+        return (
+            "unverified",
+            f"ветка {base} в remote есть, но клон её не забирал: "
+            "origin/{base} в нём отсутствует, свежесть базы не проверить".format(
+                base=base
+            ),
+        )
+
     async def head_sha(self, repo: str, base: str) -> str:
         """Current tip of origin/<base>, or "" when it cannot be read (#534)."""
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
@@ -1027,6 +1150,43 @@ class GitOpsIntegration:
             "merge-base", "--is-ancestor", ancestor, descendant, repo=repo, check=False
         )
         return rc == 0
+
+    async def commit_with_same_tree(
+        self, repo: str, sha: str, branch: str
+    ) -> str | None:
+        """The newest commit on ``branch`` whose content equals ``sha``'s (#946).
+
+        Three answers, like every other question asked here. A commit id means
+        the branch held exactly this content at that point; ``""`` means git
+        looked through the branch and it never did; ``None`` means the question
+        could not be asked — an unreadable repository, an unknown commit, a
+        branch this checkout does not carry.
+
+        Exists because a squash release keeps the CONTENT and drops the
+        ancestry: main gets a brand-new commit whose tree equals develop's, so
+        ``is_ancestor`` answers "no" about work that is demonstrably running.
+        Trees are how git already states "the same content", so this asks git
+        rather than storing a second copy of the fact in the hub, which would
+        be one more thing to go stale (#497).
+        """
+        rc, tree, _ = await _git("rev-parse", f"{sha}^{{tree}}", repo=repo, check=False)
+        want = (tree or "").strip()
+        if rc != 0 or not want:
+            return None
+        # origin/<branch> first: the shared clone sits on the base branch but
+        # the question is about what upstream held, not about this checkout.
+        for ref in (f"origin/{branch}", branch):
+            rc, out, _ = await _git(
+                "log", "--format=%T %H", ref, repo=repo, check=False
+            )
+            if rc != 0:
+                continue
+            for line in (out or "").splitlines():
+                found_tree, _, commit = line.partition(" ")
+                if found_tree == want:
+                    return commit.strip()
+            return ""
+        return None
 
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str

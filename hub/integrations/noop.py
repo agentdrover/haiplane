@@ -115,6 +115,21 @@ class NoopGitOps:
         """No git here — "could not look", never "the ref is missing" (#725)."""
         return ("unavailable", "git integration is not configured")
 
+    async def base_freshness(self, repo: str, base: str, sha: str) -> tuple[str, str]:
+        """Same rule one level down (#947): unverified, never "stale"."""
+        return ("unverified", "git integration is not configured")
+
+    async def ensure_remote_branch(
+        self,
+        branch: str,
+        source: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """No git here, so nothing is claimed about the branch (#947)."""
+        return ("unavailable", "git integration is not configured")
+
     async def pr_for_branch(
         self,
         branch: str,
@@ -189,6 +204,17 @@ class NoopGitOps:
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None:
         """No git here — "could not look", never "nothing changed" (#825)."""
+        return None
+
+    async def commit_with_same_tree(
+        self, repo: str, sha: str, branch: str
+    ) -> str | None:
+        """No git here — "could not look", never "no such content" (#946).
+
+        The empty string is a real answer ("looked, the branch never held this
+        content"); None is the absence of one, and delivery state must keep
+        them apart or a squash release starts reading as a failed one.
+        """
         return None
 
     async def fetch_commit(
