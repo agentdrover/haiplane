@@ -179,7 +179,7 @@ async def seed_demo(db: aiosqlite.Connection, *, enabled: bool | None = None) ->
         project_id=project_id,
         position=3,
     )
-    await _create_demo_task(
+    delivered_id = await _create_demo_task(
         db,
         title="Справка: страница частых вопросов",
         description="Собрать страницу FAQ из вопросов первой недели.",
@@ -189,9 +189,51 @@ async def seed_demo(db: aiosqlite.Connection, *, enabled: bool | None = None) ->
         project_id=project_id,
         position=4,
     )
+    await _seed_delivery(db, project_id=project_id, task_id=delivered_id)
 
     await db.commit()
     return True
+
+
+#: Демонстрационный мерж-коммит. Не похож на настоящий sha случайно: он
+#: собран из слова, чтобы читатель демо-стенда сразу видел, что это данные
+#: сида, а не история чьего-то репозитория.
+_DEMO_MERGE_SHA = "de3a0c" + "0" * 34
+_DEMO_PR_NUMBER = 128
+
+
+async def _seed_delivery(
+    db: aiosqlite.Connection, *, project_id: int, task_id: int
+) -> None:
+    """Довезти демо-задачу до прода — с фактами, а не с галочкой (#953).
+
+    Главный довод продукта — «заявлено ≠ доставлено», и панель доставки на
+    демо-стенде была пуста: статус ``completed`` стоял, а сказать, доехала ли
+    работа, хабу было не из чего. Здесь появляются ровно те два факта, из
+    которых он это считает: мерж, который хаб сделал сам
+    (``pipeline_merges``), и успешный выкат, который CI записал (``releases``).
+
+    Выкат намеренно указывает на тот же коммит, что и мерж: релиз раскатал
+    сам мерж-коммит. Это единственный сценарий, в котором достижимость не
+    надо проверять в git — коммит входит в свою же историю, — а рабочей копии
+    у демо-проекта нет и быть не может. Любой другой набор чисел заставил бы
+    панель честно ответить «проверить негде», то есть снова ничего не сказать.
+    """
+    await repository.update_task(db, task_id, pr_number=_DEMO_PR_NUMBER)
+    await repository.record_pipeline_merge(
+        db,
+        pr_number=_DEMO_PR_NUMBER,
+        merge_sha=_DEMO_MERGE_SHA,
+        project_id=project_id,
+        task_id=task_id,
+    )
+    await repository.record_release(
+        db,
+        deployed_sha=_DEMO_MERGE_SHA,
+        project_id=project_id,
+        ref="main",
+        source="ci",
+    )
 
 
 async def _amain() -> int:
