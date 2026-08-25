@@ -202,8 +202,50 @@ async def merge_ready_release(
         return False, f"релиз не удалось провести: {exc}"
     if not merged:
         return False, f"релизный PR #{pr_number} не смержен: GitHub отказал"
+    await _stamp_released_merges(db, project_row, pr_number, ctx)
     note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
     return True, f"релиз PR #{pr_number} смержен в {base}{note}"
+
+
+async def _stamp_released_merges(
+    db: aiosqlite.Connection, project_row: Any, pr_number: int, ctx: dict[str, Any]
+) -> None:
+    """Tie every merge this release carried to the release's own commit (#950).
+
+    Ancestry does not survive this flow: the release is a squash, and the
+    integration branch may later be recreated from the release branch — both
+    cut the line between a task's merge and what production runs. The stamp
+    written here is the fact delivery_state falls back to when git can no
+    longer answer, and this is the one moment it is certain: a release takes
+    the base branch whole (#812), so everything unreleased goes with it.
+
+    Best effort by contract: a release that shipped must not read as failed
+    because its bookkeeping did not.
+    """
+    try:
+        release_sha = await plugins.git_ops.merge_commit_sha(
+            pr_number, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+        if not release_sha:
+            log.warning(
+                "release #%s: merge commit unknown, merges left unstamped", pr_number
+            )
+            return
+        stamped = await repo.mark_merges_released(
+            db,
+            project_id=int(dict(project_row)["id"]),
+            release_pr=pr_number,
+            release_sha=release_sha,
+        )
+        if stamped:
+            log.info(
+                "release #%s: stamped %d merge(s) as released at %s",
+                pr_number,
+                stamped,
+                release_sha[:12],
+            )
+    except Exception:  # noqa: BLE001 - bookkeeping must not fail the release
+        log.exception("release #%s: could not stamp released merges", pr_number)
 
 
 async def _keep_the_integration_branch(

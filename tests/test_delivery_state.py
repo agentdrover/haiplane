@@ -455,3 +455,170 @@ async def test_unanswerable_squash_lookup_is_unknown_not_denial(
 
     assert answer["state"] == UNKNOWN, answer
     assert "не «не раскатано»" in answer["reason"]
+
+
+# #950: ancestry is cut TWICE in the real flow — the release squashes, and the
+# base branch is then recreated from the release branch. The twin (#946)
+# survives the first cut but not the second: a merge left on the abandoned
+# line belongs to no reachable history, and delivery_state answered "waiting
+# for a release" about running code. That answer fed hub_record_live_check,
+# which then refused the strongest kind of evidence the brief knows — a live
+# observation of the fix behaving (task #949, refusal recorded in update
+# #3496). The fact that survives both cuts is written by the release itself:
+# which merges it carried, stamped at release-merge time.
+
+
+from tests.conftest import _git_in  # noqa: E402 - harness of #497/#946
+
+
+@pytest.fixture
+def recreated_base(tmp_path: Path) -> dict[str, str]:
+    """The 25.08 shape: task merged, squash-released, base recreated from main.
+
+    The task's merge ends up on an ABANDONED line: not an ancestor of main
+    (squash) and not an ancestor of the recreated develop either — the twin
+    lookup of #946 finds a develop state matching the deploy, but the merge
+    does not belong to its history.
+    """
+    root = tmp_path / "recreated"
+    root.mkdir()
+    _git_in(root, "init", "-b", "develop")
+    (root / "a.py").write_text("a = 1\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "seed")
+    (root / "fix.py").write_text("fix = True\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): the fix (#949)")
+    task_merge = _git_in(root, "rev-parse", "HEAD")
+    # Release: squash develop into main — a NEW commit with the same tree.
+    _git_in(root, "checkout", "-q", "--orphan", "main")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "release: develop → main (#0)")
+    released = _git_in(root, "rev-parse", "HEAD")
+    # The base branch is recreated from the release branch: the old develop
+    # line — including task_merge — is abandoned.
+    _git_in(root, "branch", "-D", "develop")
+    _git_in(root, "checkout", "-q", "-b", "develop")
+    return {"repo": str(root), "task_merge": task_merge, "released": released}
+
+
+async def _stamp(db, task_id: int, release_pr: int, release_sha: str) -> None:
+    await db.execute(
+        "UPDATE pipeline_merges SET released_pr = ?, released_sha = ? "
+        "WHERE task_id = ?",
+        (release_pr, release_sha, task_id),
+    )
+    await db.commit()
+
+
+async def test_a_stamped_release_survives_a_recreated_base(
+    client: AsyncClient, db: aiosqlite.Connection, recreated_base, monkeypatch
+):
+    # AC-1 (#950): ancestry is gone twice over, the stamp still answers.
+    _use_real_git(monkeypatch, recreated_base["repo"], "develop")
+    task_id = await _task_merged_at(client, db, recreated_base["task_merge"])
+    await _stamp(db, task_id, 22, recreated_base["released"])
+    await repo.record_release(
+        db, deployed_sha=recreated_base["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == IN_PROD, answer
+    assert "PR #22" in answer["reason"], (
+        "ответ обязан назвать релиз, на записи которого он держится"
+    )
+
+
+async def test_an_unstamped_merge_on_an_abandoned_line_still_waits(
+    client: AsyncClient, db: aiosqlite.Connection, recreated_base, monkeypatch
+):
+    # AC-2 (#950): no stamp — no claim. The old answer stands, and on the base
+    # code THIS scenario is exactly what #949 hit: красная база для AC-1.
+    _use_real_git(monkeypatch, recreated_base["repo"], "develop")
+    task_id = await _task_merged_at(client, db, recreated_base["task_merge"])
+    await repo.record_release(
+        db, deployed_sha=recreated_base["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == NOT_IN_PROD, answer
+
+
+async def test_a_stamped_but_undeployed_release_does_not_pretend(
+    client: AsyncClient, db: aiosqlite.Connection, recreated_base, monkeypatch
+):
+    # The stamp must not turn "released but not yet deployed" into a deploy:
+    # production still runs an OLDER release than the one that took the merge.
+    _use_real_git(monkeypatch, recreated_base["repo"], "develop")
+    task_id = await _task_merged_at(client, db, recreated_base["task_merge"])
+    # The release that carried the merge is NOT what production runs — feed a
+    # sha production has never seen (any commit not in released's history).
+    await _stamp(db, task_id, 23, recreated_base["task_merge"])
+    await repo.record_release(
+        db, deployed_sha=recreated_base["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == NOT_IN_PROD, answer
+    assert "ещё не раскатан" in answer["reason"]
+
+
+async def test_the_release_flow_stamps_what_it_carried(db: aiosqlite.Connection):
+    # The write side (#950): merging a release stamps every unreleased merge
+    # of the project with the release PR and its commit.
+    from unittest.mock import AsyncMock
+
+    from hub.services.release import merge_ready_release
+    from tests.test_release_policy import _git as _git_plugin
+    from tests.test_release_policy import _release_project
+
+    g = _git_plugin(existing_pr=777)
+    g.ensure_remote_branch = AsyncMock(return_value=("present", "ok"))
+    g.merge_commit_sha = AsyncMock(return_value="release0commit0sha")
+    pid = await _release_project(db, "auto")
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (?, ?, ?, ?)",
+        (pid, 555, 42, "task0merge0sha"),
+    )
+    await db.commit()
+
+    merged, _ = await merge_ready_release(db, await repo.get_project(db, pid))
+
+    assert merged is True
+    fact = await repo.release_fact_for_task(db, 42)
+    assert fact is not None, "релиз обязан записать, какие мержи он увёз"
+    assert fact["released_pr"] == 777
+    assert fact["released_sha"] == "release0commit0sha"
+
+
+async def test_the_stamp_never_rewrites_an_earlier_release(db: aiosqlite.Connection):
+    # A merge already stamped by release N must not be re-stamped by N+1: the
+    # first release that carried it is the historical fact.
+    from unittest.mock import AsyncMock
+
+    from hub.services.release import merge_ready_release
+    from tests.test_release_policy import _git as _git_plugin
+    from tests.test_release_policy import _release_project
+
+    g = _git_plugin(existing_pr=888)
+    g.ensure_remote_branch = AsyncMock(return_value=("present", "ok"))
+    g.merge_commit_sha = AsyncMock(return_value="second0release0sha")
+    pid = await _release_project(db, "auto")
+    await db.execute(
+        "INSERT INTO pipeline_merges "
+        "(project_id, pr_number, task_id, merge_sha, released_pr, released_sha) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (pid, 556, 43, "old0merge0sha", 700, "first0release0sha"),
+    )
+    await db.commit()
+
+    merged, _ = await merge_ready_release(db, await repo.get_project(db, pid))
+
+    assert merged is True
+    fact = await repo.release_fact_for_task(db, 43)
+    assert fact["released_pr"] == 700, "первый увёзший релиз — исторический факт"
+    assert fact["released_sha"] == "first0release0sha"
