@@ -237,3 +237,28 @@ def test_a_long_blocker_line_is_cut_rather_than_dumped():
 
     assert len(note) < 250
     assert note.endswith("…")
+
+
+async def test_the_blocker_hold_hint_routes_through_the_decision(
+    db: aiosqlite.Connection,
+):
+    """#952: увод по свежему блокеру тоже ведёт в needs_decision — и его
+    подсказка обязана вести через hub_decide_task, а не предлагать
+    «отчитайтесь снова», которое этот статус отвергает."""
+    task_id = await _pair_task_at_review(db)
+    await _submit_and_approve(db, task_id)
+    await _blocker(db, task_id, "Живое препятствие после сдачи")
+
+    await _done(db, task_id)
+
+    updates = await _updates(db, task_id)
+    alert = next(
+        u
+        for u in updates
+        if u["kind"] == "alert" and "не пошёл в доставку" in (u["content"] or "")
+    )
+    assert "hub_decide_task" in alert["content"]
+    assert "rework" in alert["content"]
+    assert "отчитайтесь снова либо" not in alert["content"], (
+        "старая формулировка предлагала недоступное действие как равный вариант"
+    )

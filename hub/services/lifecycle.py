@@ -2936,10 +2936,15 @@ async def add_update(
                             task_id,
                             "hub",
                             "alert",
+                            # #952: same rule as the merge-gate alert — the
+                            # task is entering needs_decision, where a fresh
+                            # done report is refused, so the hint must route
+                            # through the decision, not around it.
                             f"Отчёт о готовности не пошёл в доставку: после "
-                            f"последней сдачи записан блокер — {note}. Снимите "
-                            "препятствие и отчитайтесь снова либо решите задачу "
-                            "вручную.",
+                            f"последней сдачи записан блокер — {note}. Решение "
+                            "за человеком (hub_decide_task): rework вернёт "
+                            "задачу в running — снимите препятствие и "
+                            "пересдайте done; accept завершит без доставки.",
                         )
                         await log_activity(
                             db,
