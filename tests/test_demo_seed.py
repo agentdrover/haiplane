@@ -82,3 +82,51 @@ async def test_seed_is_opt_in_and_idempotent(db, monkeypatch):
     # 3. Повторный вызов — no-op: счётчики не растут.
     assert await demo_seed.seed_demo(db) is False
     assert await _counts(db) == (after_tasks, after_projects)
+
+
+async def test_seed_shows_delivery_and_no_dispatch_badge(
+    db, client, monkeypatch, tmp_path
+):
+    """#953: the demo stand must show the product's own argument, not blanks.
+
+    "Claimed ≠ delivered" is what the hub is for, and on the demo stand the
+    delivery panel was empty — the one screen a visitor comes for said nothing.
+    The seed now carries the facts that answer it: a merge the hub performed
+    and the deploy that took it out. And the board no longer advertises the
+    absence of a dispatcher nobody configured.
+    """
+    from hub import brand, config
+    from hub import repository as repo
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+    from hub.services.delivery_state import IN_PROD, UNKNOWN, delivery_state
+    from hub.services.prod_state import prod_state
+
+    demo_seed = _load()
+    monkeypatch.setenv("HAIPLANE_DEMO_SEED", "1")
+    assert await demo_seed.seed_demo(db) is True
+
+    merges = list(
+        await db.execute_fetchall(
+            "SELECT task_id, merge_sha FROM pipeline_merges WHERE merge_sha != ''"
+        )
+    )
+    assert merges, "хотя бы одна завершённая задача должна нести запись мержа"
+    release = await repo.latest_successful_release(db)
+    assert release and release["deployed_sha"], "нужен записанный успешный выкат"
+
+    task_id = int(merges[0]["task_id"])
+    answer = await delivery_state(db, task_id)
+    assert answer["state"] != UNKNOWN, answer["reason"]
+    assert answer["state"] == IN_PROD, answer
+
+    snapshot = await prod_state(db)
+    assert snapshot["deployed"]["sha"] == release["deployed_sha"]
+    assert snapshot["in_prod"], "панель доставки на демо-стенде не должна быть пустой"
+
+    plugins.dispatch = NoopDispatch()
+    monkeypatch.delenv(brand.ENV_PREFIX + "DISPATCH_BIN", raising=False)
+    monkeypatch.setattr(config, "DISPATCH_JOBS_DIR", tmp_path / "never-dispatched")
+    page = await client.get("/")
+    assert page.status_code == 200
+    assert "Dispatch unavailable" not in page.text
