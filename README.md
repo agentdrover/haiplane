@@ -1,26 +1,52 @@
 # Haiplane Hub
 
-The public home is https://github.com/agentdrover/haiplane.
+Task orchestration for AI-agent development, with the gates a human actually
+needs: a task is not ready until its acceptance criteria are written down, and
+not done until the hub can name the commit that carries it.
 
-Task orchestration server for AI agent pipelines. Manages task lifecycle, dispatches work to agents, runs automated code review cycles, and provides a web dashboard.
+![Dashboard](docs/assets/dashboard.png)
+
+*(Русская версия: [README.ru.md](README.ru.md).)*
+
+## Claimed is not delivered
+
+An agent reporting "done" is a claim, not a fact. The work behind it may sit on
+a branch nobody merged, in a PR that CI never turned green, or in a merge that
+no release has taken to production yet. Every one of those looks identical in a
+tracker whose last column is called Done — and each of them has cost someone a
+morning of reading CI logs to discover.
+
+Haiplane Hub keeps the claim and the fact apart, and makes the gap visible:
+
+- a task cannot leave `draft` until the Definition of Ready passes — acceptance
+  criteria in Given/When/Then, a way to validate, a stated scope;
+- a task cannot reach `completed` without a current review verdict, and the
+  agent that implemented it cannot be the one who approves it;
+- a task that is `completed` still answers a further question — *is the work
+  in production?* — from recorded facts: the merge the hub performed and the
+  deploy CI reported. When it cannot tell, it says so, and never mistakes
+  silence for a denial.
+
+![Delivery panel](docs/assets/delivery.png)
 
 ## Features
 
-- **Task hierarchy**: Epic → Feature → Task → Subtask
-- **Full lifecycle**: draft → open → running → review → completed (with CI checks, arbiter, Q&A)
-- **Structured task form**: Kanban-style fields (work_type, scope, acceptance criteria, risks, validation), deterministic Definition of Ready gate, readiness score and recommendations — see [Structured task form & readiness](#structured-task-form--readiness)
-- **Plugin architecture**: integrations (dispatch, git_ops, GitHub, Vast.ai, notes) are pluggable
-- **Web dashboard**: HTMX-powered UI with inbox, kanban, task detail, log viewer
-- **MCP server**: Model Context Protocol tools for Cursor/remote agents
-- **CLI**: `hp-hub` command for agents and humans (legacy alias: `oc-hub`)
-- **Background poller**: auto-sync with dispatch jobs, stale detection, review dispatch
+- **DoR gate with executable acceptance criteria** — Given/When/Then criteria
+  that can name the test that proves them, a deterministic readiness score, and
+  an approval that refuses a draft the criteria do not cover.
+- **Review gate** — no `completed` without a current APPROVED verdict; verdicts
+  from the implementing agent are refused by default and audited when allowed.
+- **Delivery tracking down to the SHA** — merged, released, deployed, or
+  unknown, each with the reason behind it.
+- **MCP server for agents** — the same task surface over Model Context Protocol,
+  for Cursor, Claude Code and any streamable-HTTP MCP client.
+- **Web dashboard** — HTMX board, inbox, task detail, log viewer; no build step.
+- **CLI** — `hp-hub` for humans and scripts.
+- **Hierarchy and lifecycle** — Epic → Feature → Task → Subtask, moving through
+  draft → open → running → review → completed with CI checks, questions and
+  human decisions on the way.
 
-For the recommended human + AI-agent software delivery flow, see
-[docs/software-development-workflow.md](docs/software-development-workflow.md).
-For repository branching, commit, validation, and review rules, see
-[docs/repository-rules.md](docs/repository-rules.md).
-For the planned admin section covering users, AI agents, roles, keys, and
-passwords, see [docs/admin-section-design.md](docs/admin-section-design.md).
+![Task board](docs/assets/board.png)
 
 ## Quick Start
 
@@ -34,11 +60,13 @@ docker compose up -d --build
 ```
 
 The container starts with demo data (project `demo`: an epic, a feature and
-tasks across the whole lifecycle) so the dashboard is alive on first open.
-To start empty, set `HAIPLANE_DEMO_SEED: "0"` in `docker-compose.yml`.
-The SQLite database persists in `./data` on the host.
+tasks across the whole lifecycle, one of them delivered to production) so the
+dashboard is alive on first open. To start empty, set `HAIPLANE_DEMO_SEED: "0"`
+in `docker-compose.yml`. The SQLite database persists in `./data` on the host.
 
-### From source (dev)
+### From source
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/agentdrover/haiplane.git
@@ -52,291 +80,95 @@ haiplane-hub
 # → http://localhost:8080
 ```
 
-## Cursor + Hub Workflow
+![Task card](docs/assets/task-card.png)
 
-Run the hub, connect Cursor to its MCP endpoint, and treat Haiplane Hub as the
-task state source. Step-by-step MCP setup (streamable URL, headers, stdio vs
-HTTP, troubleshooting) is in
-[docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).
-The delivery process is documented in
-[docs/software-development-workflow.md](docs/software-development-workflow.md);
-the staged rollout lives in
-[docs/software-development-workflow-implementation-plan.md](docs/software-development-workflow-implementation-plan.md).
-Cursor-specific rules are in
-[docs/cursor-agent-rules.md](docs/cursor-agent-rules.md), with an installable
-template at
-[docs/templates/cursor/haiplane-hub.mdc](docs/templates/cursor/haiplane-hub.mdc).
+## Connect an agent (MCP)
 
-Branch and workspace safety invariants for multi-agent work are in
-[docs/workspace-safety-policy.md](docs/workspace-safety-policy.md).
+The MCP server runs inside the same process as the web UI. The endpoint is
+`/mcp` — a streamable HTTP transport, authenticated with a Bearer token from
+`HAIPLANE_HUB_TOKENS`:
 
-Minimum MCP tools for daily work:
-
-- `hub_project_status`, `hub_list_tasks`, `hub_task_status`
-- `hub_my_context`, `hub_refine_task`, `hub_get_readiness`
-- `hub_add_acceptance_criterion`, `hub_replace_acceptance_criteria`, `hub_add_risk`
-- `hub_approve_task`, `hub_reject_task`, `hub_start_task`
-- `hub_task_update`, `hub_ask_question`, `hub_report_done`
-- `hub_force_complete_task`, `hub_decide_task`
-
-## Configuration
-
-All configuration via environment variables, under the `HAIPLANE_*` prefix.
-
-| Variable | Default | Description |
-|---|---|---|
-| `HAIPLANE_HUB_REPO` | `""` | GitHub repo (e.g. `owner/repo`) for PR/commit integration |
-| `HAIPLANE_WORKSPACE_REPO` | `~/.haiplane/workspace/repo` | Path to the workspace git repo |
-| `HAIPLANE_DISPATCH_BIN` | `~/.local/bin/hp-dev-dispatch` | Path to dispatch binary |
-| `HAIPLANE_HUB_DB` | `~/.local/state/haiplane-hub/hub.db` | SQLite database path |
-| `HAIPLANE_HUB_HOST` | `0.0.0.0` | Server bind host |
-| `HAIPLANE_HUB_PORT` | `8080` | Server bind port |
-| `HAIPLANE_TRANSCRIPTS_DIR` | `~/.haiplane/transcripts` | Agent transcript directory |
-| `HAIPLANE_N4L_BIN` | `~/.local/bin/n4l` | notesforllm CLI path |
-| `HAIPLANE_N4L_SPACE` | `""` | notesforllm space ID |
-| `HAIPLANE_VAST_JOB_BIN` | `~/.local/bin/vast-haiplane` | Vast.ai CLI path |
-| `GH_BIN` | `gh` | GitHub CLI binary |
-| `HAIPLANE_MAX_REVIEW_CYCLES` | `3` | Max automated review cycles |
-| `HAIPLANE_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own review verdict (solo mode); such verdicts are audited: marked `self_approved`, logged as a warning, and badged in Web/MCP |
-| `HAIPLANE_MAX_CI_FIX_CYCLES` | `3` | Max CI fix attempts |
-| `HAIPLANE_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
-| `HAIPLANE_STALE_REVIEW_MINUTES` | `120` | Minutes before a client-driven review without a verdict is flagged stale |
-| `HAIPLANE_STALE_CLAIMED_MINUTES` | `240` | Minutes before a claim without pair start is flagged stale |
-| `HAIPLANE_STALE_NEEDS_INFO_MINUTES` | `480` | Minutes before an unanswered question is flagged stale |
-
-## Structured task form & readiness
-
-Hub treats each task as a Kanban work item with a structured form, a
-deterministic **Definition of Ready** gate, and a numeric readiness
-score that drives recommendations. The goal: by the time a task moves
-from `draft` to `open`, an Analyst (human or agent) can hand it to a
-Developer-agent without follow-up Q&A round-trips.
-
-All structured fields live on the same `tasks` row (no extra entity for
-the form itself). Acceptance criteria live in a separate
-`acceptance_criteria` table; risks are stored as JSON on the task row.
-
-### Work types and DoR profiles
-
-`work_type` selects which DoR checks are required. Optional checks are
-still computed and shown, but they don't block approval.
-
-The Discovery checks (`has_outcome_hypothesis`, `has_redesign_decision`,
-`has_agent_fit`) are advisory: they appear in the table and earn a
-suggestion on `feature` tasks, but they never block and never move the
-readiness score.
-
-| work_type   | required DoR checks                                                                                                                  | typical class_of_service |
-|-------------|---------------------------------------------------------------------------------------------------------------------------------------|--------------------------|
-| `feature`   | user_story, problem_statement, business_value, scope_in, AC, validation, size, wip_tag                                                | standard                 |
-| `bug`       | problem_statement, business_value, scope_in, AC, validation, size, wip_tag                                                            | standard / expedite      |
-| `refactor`  | problem_statement, scope_in, AC, validation, size, wip_tag (`tech_debt`)                                                              | standard                 |
-| `chore`     | scope_in, validation, size                                                                                                            | standard                 |
-| `docs`      | scope_in, size                                                                                                                        | standard                 |
-| `spike`     | problem_statement, AC, size (AC = "we have a documented answer to <Q>")                                                               | standard                 |
-| `incident`  | problem_statement, AC, validation                                                                                                     | expedite                 |
-
-Source of truth: `hub/services/dor.py` (`DOR_REQUIRED_BY_WORK_TYPE`).
-Unknown work types fall back to the strict `feature` profile.
-
-### Task fields
-
-Set on `POST /api/tasks` (creation) or via `POST /api/tasks/{id}/refine`
-(PATCH semantics — only sent fields change):
-
-- **Classification**: `work_type`, `class_of_service`
-  (`standard | expedite | fixed_date | intangible`), `size` (`XS|S|M|L|XL`),
-  `wip_tag` (`feature_work | bugfix | tech_debt | support`), `due_date`.
-- **Why & what**: `user_story`, `problem_statement`, `business_value`.
-- **Discovery** (all optional): `outcome_metric` — which number should move
-  and from what to what; `outcome_indicator` — what moves before it does;
-  `outcome_deadline` — when we check; `outcome_revisit_condition` — what
-  would reopen the question; `redesign_decision`
-  (`adapt | redesign`) + `redesign_rationale` — whether the work fits the
-  current process or reshapes it; `agent_fit`
-  (`deterministic | assistant | sdd_native | agentic`) — how much agency the
-  work wants. These make `business_value` checkable instead of merely
-  arguable. They are suggested on `feature` tasks and never block or cost
-  readiness points.
-- **Scope**: `scope_in[]`, `scope_out[]`, `affected_areas[]`.
-- **How we'll know it works**: `validation_commands[]`, `acceptance_criteria[]`
-  (each AC has Given/When/Then + `verifiable_by` and optional `test_ref`).
-- **Constraints / hints**: `constraints[]`, `assumptions[]`,
-  `technical_hints`, `out_of_scope_for_review[]`.
-- **Risks**: `risks[]` — each entry has `kind`, `severity`, `description`,
-  `mitigation`. The `risks` payload is fed back into the readiness
-  recommender.
-
-Full Pydantic schema in `hub/models.py` (`TaskCreate`, `TaskRefine`,
-`AcceptanceCriterion`, `TaskRisk`).
-
-### Readiness score and recommendations
-
-`GET /api/tasks/{id}/readiness` (and `hp-hub readiness <id>`) returns a
-deterministic 0–100 score:
-
-- start at 100;
-- subtract `penalty_required` per missing required DoR check (default 10);
-- subtract `penalty_optional` per missing optional DoR check (default 2);
-- subtract per-risk penalty by severity (low=1, medium=4, high=8 by default).
-
-The same endpoint also returns a list of `recommendations` — actionable
-hints with severity (`blocking | high | medium | low`), generated by
-`hub/services/recommendations.py` from the failed checks and risks. Use
-`--explain` to get the score breakdown.
-
-### Approval gate
-
-`POST /api/tasks/{id}/approve` evaluates the DoR for the task's
-`work_type`. If any required check fails, the response is **422
-Unprocessable Entity** with a structured detail:
-
-```json
+```jsonc
+// ~/.cursor/mcp.json — or any streamable-HTTP MCP client
 {
-  "detail": {
-    "error": "dor_failed",
-    "task_id": 17,
-    "score": 62,
-    "missing_required": ["has_acceptance_criteria", "has_validation_commands"],
-    "recommendations": [
-      {"severity": "blocking", "field": "acceptance_criteria",
-       "message": "Add at least one Given/When/Then acceptance criterion."}
-    ],
-    "hint": "Pass force=true to override (audited)."
+  "mcpServers": {
+    "haiplane-hub": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": { "Authorization": "Bearer <TOKEN>" }
+    }
   }
 }
 ```
 
-Approval also uses an atomic `UPDATE ... WHERE status='draft'` to avoid
-double-processing on concurrent calls; a losing caller gets **409
-Conflict**.
+For a local agent there is also a stdio transport — `haiplane-hub-mcp`, which
+proxies to the hub's REST API using `HAIPLANE_HUB_URL` and `HAIPLANE_HUB_TOKEN`.
 
-`force=true` bypasses the gate but **always** logs an audit entry (an
-`alert` task update + activity-log suffix) — even when DoR happens to
-pass — so explicit human overrides are never invisible.
+Full setup, a curl smoke test and the troubleshooting table (401, 406, 421,
+missing session) are in
+[docs/agent-mcp-operator-guide.md](docs/agent-mcp-operator-guide.md).
 
-### CLI cheatsheet
+The tools an agent needs for daily work:
 
-```bash
-# 1. Pick a template for the work type and write it to a file
-hp-hub template list
-hp-hub template feature --out task-17.yaml
+- `hub_my_context`, `hub_project_status`, `hub_list_tasks`, `hub_task_status`
+- `hub_refine_task`, `hub_get_readiness`, `hub_add_acceptance_criterion`,
+  `hub_replace_acceptance_criteria`, `hub_add_risk`
+- `hub_claim_task`, `hub_pair_start`, `hub_task_update`, `hub_ask_question`
+- `hub_submit_for_review`, `hub_submit_review`, `hub_report_done`
 
-# 2. Edit task-17.yaml, then push it onto an existing draft (PATCH semantics)
-hp-hub refine 17 --from-file task-17.yaml
+Human-only gates (`hub_approve_task`, `hub_reject_task`, `hub_start_task`,
+`hub_decide_task`, `hub_force_complete_task`) require a human token — an agent
+cannot walk itself through them, which is the point.
 
-# 3. Add or replace acceptance criteria
-hp-hub ac add 17 --id AC-1 --given "..." --when "..." --then "..." --by test
-hp-hub ac list 17
-hp-hub ac replace 17 --from-file acs.yaml         # atomic replace
-hp-hub ac delete 17 AC-1
+## Configuration
 
-# 4. Add risks (read-modify-write)
-hp-hub risk add 17 --kind security --severity high \
-                    --description "auth bypass" --mitigation "add audit + 2FA"
+Everything is configured through environment variables under the `HAIPLANE_*`
+prefix. The defaults below are the ones in `hub/config.py`; that file is the
+source of truth and carries the full list.
 
-# 5. Check readiness before approving
-hp-hub readiness 17                # human summary
-hp-hub readiness 17 --explain      # full JSON with score breakdown
+| Variable | Default | Description |
+|---|---|---|
+| `HAIPLANE_HUB_HOST` | `127.0.0.1` | Bind address. Binding a non-loopback address with no tokens configured is refused at startup |
+| `HAIPLANE_HUB_PORT` | `8080` | Bind port |
+| `HAIPLANE_HUB_DB` | `~/.local/state/haiplane-hub/hub.db` | SQLite database path |
+| `HAIPLANE_HUB_TOKENS` | `""` | `name:token[:role]`, comma-separated; roles are `human`, `agent`, `admin`. Empty means single-user open mode |
+| `HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK` | `0` | `1` allows a network bind without tokens (the docker demo does this; unsafe on a shared host) |
+| `HAIPLANE_DEMO_SEED` | `0` | `1` seeds the `demo` project on an empty database. Idempotent |
+| `HAIPLANE_HUB_REPO` | `""` | GitHub repo (`owner/repo`) for PR and commit integration |
+| `HAIPLANE_WORKSPACE_REPO` | `~/.haiplane/workspace/repo` | Path to the workspace git repo |
+| `HAIPLANE_PAIR_BASE_BRANCH` | `develop` | Branch task branches are cut from and merged back into |
+| `HAIPLANE_RELEASE_BRANCH` | `main` | Branch a release carries the base branch to |
+| `HAIPLANE_REVIEW_SELF_APPROVE` | `forbid` | `allow` lets the implementing agent submit its own verdict (solo mode); such verdicts are marked `self_approved`, logged and badged |
+| `HAIPLANE_MACHINE_REVIEW` | `warn` | `require` blocks the human verdict until a current machine-review report exists |
+| `HAIPLANE_SDD_AC_LOCATOR` | `off` | `require` rejects a `verifiable_by=test` acceptance criterion without a resolvable pytest locator |
+| `HAIPLANE_SDD_AC_TESTS` | `warn` | `require` blocks an APPROVED verdict while any AC test is red or absent |
+| `HAIPLANE_SDD_VALIDATION` | `warn` | `require` blocks completion until the current validation run is green |
+| `HAIPLANE_MAX_REVIEW_CYCLES` | `3` | Maximum automated review cycles per task |
+| `HAIPLANE_STALE_MINUTES` | `30` | Minutes before a running task is flagged stale |
+| `HAIPLANE_DISPATCH_BIN` | `~/.local/bin/hp-dev-dispatch` | Optional developer-agent dispatcher. Absent is normal — the hub runs its gates without one |
+| `GH_BIN` | `gh` | GitHub CLI binary |
 
-# 6. Approve (or force-approve, audited)
-hp-hub approve 17 --comment "ready"
-hp-hub approve 17 --force --comment "deploy now, will fix gaps in PR"
-```
+## Status / Support
 
-`--from-file` accepts JSON or YAML (`.json`, `.yaml`, `.yml`). YAML
-support requires `pyyaml`, which ships with the package.
+Solo-maintained. Support is best-effort: issues and questions are read, answers
+may take a while, and there is no SLA. PRs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-### MCP tools
+MIT licensed.
 
-The same surface is exposed to LLM agents via FastMCP
-(`hub/mcp_server.py`):
+## Documentation
 
-| Tool                              | Maps to                                                  |
-|-----------------------------------|----------------------------------------------------------|
-| `hub_refine_task`                 | `POST /api/tasks/{id}/refine`                            |
-| `hub_list_acceptance_criteria`    | `GET  /api/tasks/{id}/acceptance_criteria`               |
-| `hub_add_acceptance_criterion`    | `POST /api/tasks/{id}/acceptance_criteria`               |
-| `hub_replace_acceptance_criteria` | `PUT  /api/tasks/{id}/acceptance_criteria`               |
-| `hub_delete_acceptance_criterion` | `DELETE /api/tasks/{id}/acceptance_criteria/{ac_id}`     |
-| `hub_add_risk`                    | read-modify-write via `/refine`                          |
-| `hub_get_readiness`               | `GET  /api/tasks/{id}/readiness` (compact text by default; `explain=True` for full JSON) |
-
-Tools take explicit, optional fields rather than free-form payloads —
-that way the contract is visible in the MCP descriptor an Analyst-agent
-sees, and only provided fields hit the API.
-
-## Plugin System
-
-Hub uses a plugin architecture for external integrations. Each integration implements a `typing.Protocol` and is registered at startup.
-
-**Bundled plugins** (auto-registered when binaries exist):
-- `DispatchPlugin` — task dispatch via `oc-dev-dispatch`
-- `GitOpsPlugin` — git branch/PR/merge via local git + `gh` CLI
-- `GitHubPlugin` — commits/PRs via `gh` CLI
-- `NotesPlugin` — decisions via `n4l` CLI
-- `VastPlugin` — GPU instance management via `vast-haiplane`
-- `TranscriptsPlugin` — agent transcript viewer
-
-**Without plugins**: Hub starts with noop implementations — all features work, integrations gracefully return empty data.
-
-**Custom plugins**: implement the protocol from `hub/integrations/protocols.py` and register in `app.py` lifespan.
-
-## Development
-
-```bash
-# Install with dev dependencies
-uv pip install -e . && uv pip install pytest pytest-asyncio pytest-cov ruff
-
-# Tests
-.venv/bin/pytest tests/ -q
-
-# Lint
-.venv/bin/ruff check hub/ tests/
-.venv/bin/ruff format hub/ tests/
-```
-
-## Use as Submodule
-
-```bash
-# In your project
-git submodule add git@github.com:agentdrover/haiplane.git hub
-git submodule update --init --recursive
-
-# Install
-cd hub && make setup
-```
-
-## Architecture
-
-```
-hub/
-├── app.py              # FastAPI app, lifespan, REST API routes
-├── web.py              # HTMX/HTML web routes
-├── services/           # Business logic (lifecycle, orchestration, dashboard)
-├── repository.py       # SQL data access layer
-├── db.py               # Schema, migrations, hierarchy helpers
-├── models.py           # Pydantic models and enums
-├── poller.py           # Background task sync
-├── config.py           # Environment-based configuration
-├── cli.py              # hp-hub CLI
-├── mcp_server.py       # MCP tools for agents
-├── integrations/
-│   ├── protocols.py    # Plugin protocol definitions
-│   ├── noop.py         # No-op (null) implementations
-│   ├── registry.py     # Central plugin registry
-│   ├── dispatch.py     # oc-dev-dispatch integration
-│   ├── git_ops.py      # Git + GitHub operations
-│   ├── github.py       # GitHub API (commits, PRs)
-│   ├── notes.py        # notesforllm bridge
-│   ├── vast.py         # Vast.ai management
-│   └── transcripts.py  # Agent transcript reader
-├── templates/          # Jinja2 templates
-├── static/             # CSS
-├── cli_templates/      # YAML work_type templates shipped as package data
-└── tests/              # pytest test suite (304 tests)
-```
-
-## License
-
-MIT
+- [Software development workflow](docs/software-development-workflow.md) — the
+  human + agent delivery flow the hub implements.
+- [Structured task form & readiness](docs/task-form-and-readiness.md) — DoR
+  profiles per work type, the readiness score, the CLI and MCP surface.
+- [MCP operator guide](docs/agent-mcp-operator-guide.md) — transports, headers,
+  curl checks, troubleshooting.
+- [Agent onboarding](docs/agent-onboarding.md) and
+  [Cursor agent rules](docs/cursor-agent-rules.md) — what an agent needs to know
+  before it touches a task.
+- [Architecture and plugins](docs/architecture.md) — module map, the plugin
+  protocols, using the hub as a submodule.
+- [Repository rules](docs/repository-rules.md) — branches, commits, reviews.
+- [Workspace safety policy](docs/workspace-safety-policy.md) — the invariants
+  that keep parallel agents out of each other's checkouts.
