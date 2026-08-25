@@ -1214,6 +1214,26 @@ async def _second_generation(
     return task_id
 
 
+async def test_submit_records_the_generation_in_the_ledger(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # The delta rests entirely on this row, and it is written by the real
+    # submission path — not by the tests that reason about it. Asserted here
+    # on purpose: every fallback in generation_delta is SAFE, so if the write
+    # disappeared nothing would go red. Reviews would quietly go back to
+    # reading the whole branch every round, and the only trace would be a
+    # reason line saying the previous submission was never recorded.
+    task_id = await _submitted(client, db, "spike-ledger")
+
+    row = await repo.previous_submission(db, task_id, generation=2)
+
+    assert row is not None, "submit_for_review must write the submission it pinned"
+    recorded = dict(row)
+    assert recorded["generation"] == 1
+    assert recorded["sha"] == _TIP, "the ledger pins the tip the submission pinned"
+    assert recorded["base_branch"], "the base travels with the sha or the delta lies"
+
+
 async def test_resubmission_reviews_generation_delta(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
