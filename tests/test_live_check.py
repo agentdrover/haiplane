@@ -487,3 +487,32 @@ async def test_unknown_deploy_state_does_not_block(
     )
     page = (await client.get(f"/tasks/{task_id}", headers=auth["human"])).text
     assert "не сверено с выкатом" in page
+
+
+async def test_done_is_allowed_after_a_squash_release(
+    client: AsyncClient, db: aiosqlite.Connection, squash_release, monkeypatch
+):
+    # AC-4 (#946): the gate must refuse work that is waiting, not work whose
+    # release happened to be squashed. Before the fix this refusal fired on
+    # every task the release policy shipped — the agent could not record a
+    # check about code it had just watched go out (#927).
+    auth = _auth(monkeypatch)
+    _use_real_git(monkeypatch, squash_release["repo"], "develop")
+    task_id = await _merged_task(client, auth, db, squash_release["task_merge"])
+    await repo.record_release(
+        db, deployed_sha=squash_release["released"], ref="main", source="ci"
+    )
+
+    resp = await _post_check(
+        client,
+        auth,
+        task_id,
+        outcome="done",
+        probe="hub_prod_state после релиза",
+        observation="задача значится «в проде» с SHA раскатки",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deploy_state"] == "in_prod", (
+        "a squash-released task is in production, and the record must say so"
+    )

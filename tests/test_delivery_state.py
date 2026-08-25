@@ -37,16 +37,29 @@ async def _task_merged_at(client: AsyncClient, db, merge_sha: str) -> int:
     return task_id
 
 
-def _use_real_git(monkeypatch, workspace: str) -> None:
+def _use_real_git(monkeypatch, workspace: str, base_branch: str = "main") -> None:
+    """Answer delivery questions from a real repository, all of them.
+
+    Both git questions are wired, not just ancestry: since #946 the state also
+    asks which base-branch commit holds what is deployed, and a helper that
+    wires half of them would make every squash-released case read as "could
+    not tell" for a reason that lives in the test harness.
+    """
     from hub import app as hub_app
 
     real = GitOpsIntegration()
-    context = AsyncMock(return_value={"repo": workspace, "base_branch": "main"})
+    context = AsyncMock(return_value={"repo": workspace, "base_branch": base_branch})
     monkeypatch.setattr(hub_app.services, "project_git_context", context)
     monkeypatch.setattr(
         "hub.services.orchestration.project_git_context", context, raising=False
     )
     monkeypatch.setattr(plugins.git_ops, "is_ancestor", real.is_ancestor, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "commit_with_same_tree",
+        real.commit_with_same_tree,
+        raising=False,
+    )
 
 
 async def test_merge_reachable_from_deploy_is_in_prod(
@@ -375,3 +388,70 @@ async def test_local_commits_unchanged_semantics(
     )
     answer = await delivery_state(db, task_id)
     assert answer["state"] == IN_PROD
+
+
+# ---- #946: a squash release keeps the content and drops the ancestry ----
+#
+# Observed on prod 24.08.2026, on the first release the policy made by itself
+# (#927): the gate merged #910 into develop at f0d1e4e3, the hub opened release
+# PR #12 and merged it into main SQUASH-ed at bddb322e, the deploy job shipped
+# it — and the card then said "merged, waiting for a release" about code that
+# was already running. git diff develop main was empty; only the ancestry was
+# gone, because a squash writes a NEW commit instead of carrying the history.
+#
+# The rule these tests hold: what production runs is a question about content,
+# not about the shape of the history that produced it.
+
+
+async def test_squash_released_work_is_in_prod(
+    client: AsyncClient, db: aiosqlite.Connection, squash_release, monkeypatch
+):
+    # AC-1 (#946): the merge is not an ancestor of the deployed commit — a
+    # squash guarantees that — and the work is in production all the same.
+    _use_real_git(monkeypatch, squash_release["repo"], "develop")
+    task_id = await _task_merged_at(client, db, squash_release["task_merge"])
+    await repo.record_release(
+        db, deployed_sha=squash_release["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == IN_PROD, answer
+    assert answer["deployed_sha"] == squash_release["released"]
+    # The reason must say WHY, or the next reader re-derives the squash.
+    assert "squash" in answer["reason"].lower()
+
+
+async def test_work_merged_after_the_release_still_waits(
+    client: AsyncClient, db: aiosqlite.Connection, squash_release, monkeypatch
+):
+    # AC-2 (#946): the fix must not turn "waiting for a release" into a
+    # pretend deploy — that would trade one false answer for another.
+    _use_real_git(monkeypatch, squash_release["repo"], "develop")
+    task_id = await _task_merged_at(client, db, squash_release["after_release"])
+    await repo.record_release(
+        db, deployed_sha=squash_release["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == NOT_IN_PROD, answer
+    assert "ждёт релиза" in answer["reason"]
+
+
+async def test_unanswerable_squash_lookup_is_unknown_not_denial(
+    client: AsyncClient, db: aiosqlite.Connection, squash_release, monkeypatch
+):
+    # AC-3 (#946): git that cannot answer stays "we do not know" (#725). The
+    # released commit is present, the base branch is not — so the twin cannot
+    # be looked for, and the card must not print that as "not deployed".
+    _use_real_git(monkeypatch, squash_release["repo"], "no-such-branch")
+    task_id = await _task_merged_at(client, db, squash_release["task_merge"])
+    await repo.record_release(
+        db, deployed_sha=squash_release["released"], ref="main", source="ci"
+    )
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == UNKNOWN, answer
+    assert "не «не раскатано»" in answer["reason"]

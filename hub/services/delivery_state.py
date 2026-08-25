@@ -75,6 +75,35 @@ def _record_fetch_miss(workspace: str, sha: str) -> None:
     _fetch_misses[(workspace, sha)] = time.monotonic()
 
 
+# #946: a squash release keeps the content and drops the ancestry, so the
+# ancestry question alone answers "not deployed" about running code. The twin
+# — the base-branch commit holding exactly what is deployed — is asked of git,
+# not stored, for the same reason the state itself is computed: a release
+# changes it, and a stored copy would go stale. Cached per deployed commit
+# because a dashboard renders many cards against ONE release, and the answer
+# cannot differ between them.
+_TWIN_CAP = 64
+_release_twins: dict[tuple[str, str, str], str] = {}
+
+
+async def _release_twin(workspace: str, deployed_sha: str, base: str) -> str | None:
+    """The base-branch commit whose content is what production runs (#946)."""
+    key = (workspace, deployed_sha, base)
+    cached = _release_twins.get(key)
+    if cached is not None:
+        return cached
+    twin = await plugins.git_ops.commit_with_same_tree(workspace, deployed_sha, base)
+    # Only an ANSWER is cached. A failure to look may be transient (a fetch
+    # away, a branch not yet in this clone), and caching it would freeze "we
+    # could not tell" until the process restarts.
+    if twin is None:
+        return None
+    if len(_release_twins) >= _TWIN_CAP:
+        _release_twins.clear()
+    _release_twins[key] = twin
+    return twin
+
+
 def _answer(state: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {
         "state": state,
@@ -226,6 +255,41 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             + (f" от {deployed_at}" if deployed_at else ""),
             **known,
         )
+
+    # Not an ancestor is not yet an answer (#946). A release merged by squash
+    # writes a NEW commit on the release branch, so nothing merged into the
+    # base branch is ever an ancestor of it — including work that is provably
+    # running. Ask git the question that survives a squash: which state of the
+    # base branch holds exactly what is deployed, and does the merge belong to
+    # it. Observed on prod 24.08.2026 on the first policy-made release (#927).
+    base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    twin = await _release_twin(workspace, deployed_sha, base)
+    if twin is None:
+        return _answer(
+            UNKNOWN,
+            f"git не смог сказать, какое состояние {base} раскатано в "
+            f"{deployed_sha[:12]} — сверить squash-релиз не с чем. "
+            "Это не «не раскатано»",
+            **known,
+        )
+    if twin:
+        carried = await plugins.git_ops.is_ancestor(workspace, merge_sha, twin)
+        if carried is None:
+            return _answer(
+                UNKNOWN,
+                f"git не смог ответить, входит ли {merge_sha[:12]} в "
+                f"раскатанное состояние {twin[:12]}. Это не «не раскатано»",
+                **known,
+            )
+        if carried:
+            return _answer(
+                IN_PROD,
+                f"релиз собран squash-ом, поэтому {merge_sha[:12]} не предок "
+                f"{deployed_sha[:12]}; раскатано содержимое {base} на "
+                f"{twin[:12]}, и мерж в него входит"
+                + (f" (выкат {deployed_at})" if deployed_at else ""),
+                **known,
+            )
     return _answer(
         NOT_IN_PROD,
         f"мерж {merge_sha[:12]} не входит в раскатанный {deployed_sha[:12]}: "

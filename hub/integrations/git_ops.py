@@ -1028,6 +1028,43 @@ class GitOpsIntegration:
         )
         return rc == 0
 
+    async def commit_with_same_tree(
+        self, repo: str, sha: str, branch: str
+    ) -> str | None:
+        """The newest commit on ``branch`` whose content equals ``sha``'s (#946).
+
+        Three answers, like every other question asked here. A commit id means
+        the branch held exactly this content at that point; ``""`` means git
+        looked through the branch and it never did; ``None`` means the question
+        could not be asked — an unreadable repository, an unknown commit, a
+        branch this checkout does not carry.
+
+        Exists because a squash release keeps the CONTENT and drops the
+        ancestry: main gets a brand-new commit whose tree equals develop's, so
+        ``is_ancestor`` answers "no" about work that is demonstrably running.
+        Trees are how git already states "the same content", so this asks git
+        rather than storing a second copy of the fact in the hub, which would
+        be one more thing to go stale (#497).
+        """
+        rc, tree, _ = await _git("rev-parse", f"{sha}^{{tree}}", repo=repo, check=False)
+        want = (tree or "").strip()
+        if rc != 0 or not want:
+            return None
+        # origin/<branch> first: the shared clone sits on the base branch but
+        # the question is about what upstream held, not about this checkout.
+        for ref in (f"origin/{branch}", branch):
+            rc, out, _ = await _git(
+                "log", "--format=%T %H", ref, repo=repo, check=False
+            )
+            if rc != 0:
+                continue
+            for line in (out or "").splitlines():
+                found_tree, _, commit = line.partition(" ")
+                if found_tree == want:
+                    return commit.strip()
+            return ""
+        return None
+
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None:
