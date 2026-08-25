@@ -1005,8 +1005,8 @@ async def _human_gate_metrics(
     submit_rows = await fetchall(
         db,
         "SELECT task_id, created_at FROM task_updates "
-        "WHERE kind = 'status' "
-        "AND content LIKE 'Submitted for review (submission #%'",
+        "WHERE kind = 'status' AND content LIKE ?",
+        (f"{repo.SUBMISSION_UPDATE_PREFIX}%",),
     )
     submits: dict[int, list[Any]] = {}
     for row in submit_rows:
