@@ -85,28 +85,74 @@ async def test_report_done_merges_an_approved_pair_pr_before_completing(db):
     )
 
 
-# ---- AC-2: anything but a green CI refuses to merge or complete ----
+# ---- AC-2 (#605), narrowed by #951: only TERMINAL CI outcomes call a human ----
+#
+# This test used to parametrize failed|pending|unavailable into one behaviour.
+# #951 split them on purpose: a red CI is a decision, a CI that is still
+# running (or unreadable this minute) is a wait — the poller already treated
+# it that way, and the needs_decision here cost a human rework on 25.08.2026
+# for a CI that went green four minutes later (#949).
+
+
+async def test_red_ci_blocks_pair_completion(db):
+    g = _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", "CI=failed must not read as deliverable"
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("ci_fail" in (u.get("content") or "") for u in updates), (
+        "the refusal must name the CI outcome, not just say something went wrong"
+    )
 
 
 @pytest.mark.parametrize(
     "outcome",
-    [CIProbeOutcome.failed, CIProbeOutcome.pending, CIProbeOutcome.unavailable],
+    [CIProbeOutcome.pending, CIProbeOutcome.unavailable],
 )
-async def test_red_ci_blocks_pair_completion(db, outcome):
+async def test_a_transient_ci_state_waits_instead_of_calling_a_human(db, outcome):
+    # #951 AC-1: время — не решение. Задача остаётся в running, события
+    # needs_decision нет, алерт называет исход CI и говорит пересдать после
+    # зелёного. На базовом коде этот тест красный: задача уходила к человеку.
     g = _git(outcome, merged=True)
     task_id = await _approved_pair_task(db)
 
     await _report_done(db, task_id)
 
     task = dict(await repo.get_task(db, task_id))
-    assert task["status"] == "needs_decision", (
-        f"CI={outcome.value} must not read as deliverable"
+    assert task["status"] == "running", (
+        f"CI={outcome.value} — временное состояние, а не повод звать человека"
     )
     g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "временное состояние не должно рождать событие решения"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert any(f"ci_{outcome.value}" in (u.get("content") or "") for u in updates), (
-        "the refusal must name the CI outcome, not just say something went wrong"
+        "алерт обязан назвать исход CI"
     )
+
+
+async def test_the_wait_resolves_into_delivery_on_the_next_done(db):
+    # Путь целиком: жёлтый CI → running, CI позеленел → повторный done
+    # доставляет. Ровно сценарий #949, каким он должен был быть.
+    g = _git(CIProbeOutcome.pending, merged=True)
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    g.merge_pr.assert_awaited()
 
 
 # ---- AC-3: a refused merge never completes the task ----
