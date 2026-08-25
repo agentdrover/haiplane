@@ -14,6 +14,12 @@ import pytest
 from hub import cli
 
 
+# Выдуманный sha в ответе prod-state: detect-secrets читает hex-строку как
+# высокоэнтропийный секрет, поэтому значение живёт одной именованной константой
+# с одной пометкой, а не пометкой на каждой строке, где оно встречается.
+DEPLOYED_SHA = "abc123def456"  # pragma: allowlist secret
+
+
 class _FakeResponse:
     def __init__(self, body: bytes) -> None:
         self._body = body
@@ -1803,7 +1809,7 @@ def test_main_whoami_health_prod_state_and_readiness(capsys) -> None:
     assert json.loads(capsys.readouterr().out)["status"] == "ok"
 
     prod = {
-        "deployed": {"sha": "abc123def456", "ref": "main", "at": "2026-08-22"},
+        "deployed": {"sha": DEPLOYED_SHA, "ref": "main", "at": "2026-08-22"},
         "in_prod": [{"task_id": 1, "title": "A"}],
         "not_in_prod": [],
         "unknown": [],
@@ -1816,7 +1822,7 @@ def test_main_whoami_health_prod_state_and_readiness(capsys) -> None:
 
     rc, api = _run_main(["prod-state", "--json"], api_result=prod)
     assert rc == 0
-    assert json.loads(capsys.readouterr().out)["deployed"]["sha"] == "abc123def456"
+    assert json.loads(capsys.readouterr().out)["deployed"]["sha"] == DEPLOYED_SHA
 
     readiness = {
         "score": 40,
@@ -1865,7 +1871,7 @@ def test_main_admin_commands(capsys) -> None:
             api_result={"id": 1},
         )
     assert rc == 0
-    assert api.call_args.args[2]["password"] == "secret"
+    assert api.call_args.args[2]["password"] == "secret"  # pragma: allowlist secret
     assert "Admin user 'root' created" in capsys.readouterr().out
 
     rc, api = _run_main(
@@ -1898,7 +1904,7 @@ def test_main_admin_commands(capsys) -> None:
             api_result={"id": 2},
         )
     assert rc == 0
-    assert api.call_args.args[2]["password"] == "pw"
+    assert api.call_args.args[2]["password"] == "pw"  # pragma: allowlist secret
 
     rc, api = _run_main(
         ["admin", "users", "disable", "missing"],
