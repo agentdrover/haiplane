@@ -737,6 +737,10 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["ci_check_tasks"])
         + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
+        # #897: a completed task with an open PR belongs in the count the owner
+        # glances at. Left out of it, the section would be a thing you only see
+        # if you already scrolled to where you were not looking.
+        + len(inbox["undelivered"])
     )
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session

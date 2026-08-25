@@ -1645,6 +1645,31 @@ async def api_prod_state(request: Request, limit: int = 50):
     return ProdStateView(**await prod_state(_db(request), limit=limit))
 
 
+@app.get("/api/delivery/discrepancies")
+async def api_delivery_discrepancies(
+    request: Request,
+    project: str | None = None,
+    limit: int = 50,
+):
+    """Completed tasks whose pinned PR is neither merged nor closed (#897).
+
+    Reads the answers the periodic sweep stored — no call to GitHub happens
+    here, so this stays affordable to poll and to render beside a board.
+    ``unknown`` rows come back in their own field: a question that could not
+    be asked is not a task somebody failed to deliver.
+    """
+    db = _db(request)
+    project_id = None
+    if project:
+        row = await repo.get_project_by_slug(db, project.strip())
+        if row is None:
+            raise HTTPException(404, "project not found")
+        project_id = dict(row)["id"]
+    return await services.undelivered_completed_tasks(
+        db, project_id=project_id, limit=max(1, min(limit, 200))
+    )
+
+
 @app.post("/api/deploys", response_model=DeployView)
 async def api_record_deploy(
     body: DeployCallback,

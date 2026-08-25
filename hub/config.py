@@ -169,6 +169,12 @@ STALE_REVIEW_MINUTES = int(env_get("STALE_REVIEW_MINUTES", "120"))
 # mechanically fails (422 dor_failed), and until this watchdog the author
 # learned that only when the owner hit the button.
 UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
+# Delivery reconciliation (#897): how often the poller compares "completed"
+# against "the PR is still open", and how far back it looks. On a timer because
+# every candidate costs a call to GitHub; bounded in time because history from
+# before the delivery gate existed was merged by hand and is not news.
+DELIVERY_SCAN_MINUTES = int(env_get("DELIVERY_SCAN_MINUTES", "15"))
+DELIVERY_SCAN_LOOKBACK_DAYS = int(env_get("DELIVERY_SCAN_LOOKBACK_DAYS", "30"))
 STALE_CLAIMED_MINUTES = int(env_get("STALE_CLAIMED_MINUTES", "240"))
 STALE_NEEDS_INFO_MINUTES = int(env_get("STALE_NEEDS_INFO_MINUTES", "480"))
 # Machine-owned dead-end statuses (#393): visible via stale alerts until the

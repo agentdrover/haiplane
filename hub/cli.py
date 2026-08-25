@@ -974,6 +974,33 @@ def cmd_prod_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_undelivered(args: argparse.Namespace) -> int:
+    """Completed tasks whose PR is neither merged nor closed (#897)."""
+    result = _api("GET", f"/api/delivery/discrepancies?limit={int(args.limit)}")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    rows = result.get("undelivered") or []
+    if not rows:
+        print("No completed task is waiting on an open PR.")
+    for row in rows:
+        print(
+            f"#{row['task_id']} {row.get('title', '')} — PR #{row.get('pr_number')} "
+            f"open for {row.get('age_hours', '?')}h"
+        )
+        print(f"    {row.get('reason', '')}")
+        if row.get("accepted_via"):
+            print(
+                f"    completed via {row['accepted_via']}; owner said: "
+                f"{row.get('disposition') or 'nothing about the PR'}"
+            )
+    # Printed apart, and printed even when the list above is empty: an answer
+    # the hub could not get is not a discrepancy, but it is also not nothing.
+    for row in result.get("unknown") or []:
+        print(f"#{row['task_id']} — не проверено: {row.get('reason', '')}")
+    return 0
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     result = _api("GET", "/health")
     if args.json:
@@ -1999,6 +2026,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_prod.add_argument("--json", action="store_true", help="Print raw JSON")
     p_prod.set_defaults(func=cmd_prod_state)
+
+    p_undelivered = sub.add_parser(
+        "undelivered", help="Completed tasks whose PR is still open"
+    )
+    p_undelivered.add_argument(
+        "--limit", type=int, default=50, help="How many rows to print"
+    )
+    p_undelivered.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_undelivered.set_defaults(func=cmd_undelivered)
 
     p_health = sub.add_parser(
         "health", help="Show Hub bind/auth/vast configuration (no secrets)"
