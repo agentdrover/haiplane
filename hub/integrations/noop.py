@@ -115,6 +115,21 @@ class NoopGitOps:
         """No git here — "could not look", never "the ref is missing" (#725)."""
         return ("unavailable", "git integration is not configured")
 
+    async def base_freshness(self, repo: str, base: str, sha: str) -> tuple[str, str]:
+        """Same rule one level down (#947): unverified, never "stale"."""
+        return ("unverified", "git integration is not configured")
+
+    async def ensure_remote_branch(
+        self,
+        branch: str,
+        source: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """No git here, so nothing is claimed about the branch (#947)."""
+        return ("unavailable", "git integration is not configured")
+
     async def pr_for_branch(
         self,
         branch: str,

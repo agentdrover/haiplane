@@ -49,6 +49,25 @@ log = logging.getLogger("hub")
 BASE_RESOLVED = "resolved"
 BASE_UNRESOLVED = "unresolved"
 BASE_UNVERIFIED = "unverified"
+# #947: the base resolved to a commit the remote branch does not carry. The
+# name is there, git answers with a sha, every check downstream runs happily —
+# and compares the branch against a base that no longer exists upstream. On
+# 2026-08-24 that produced a brief with an empty diff next to sha_check=match:
+# two green-looking facts, neither of them about the code. "Resolved to
+# something stale" is not a shade of "resolved"; it is closer to "unresolved",
+# and it is reported as its own answer because the fix is different — nobody
+# needs to name a different base, somebody needs to fetch.
+BASE_STALE = "stale"
+
+
+def base_blocks_diff(state: str) -> bool:
+    """Would a diff taken against this base mislead the reader (#947)?
+
+    One predicate for the two states that must not silently produce sections,
+    so a third state added later cannot be forgotten at one of the call sites.
+    """
+    return state in (BASE_UNRESOLVED, BASE_STALE)
+
 
 # Prefix every block that went silent because the diff base did not resolve.
 # A downstream block saying "unknown" on its own invites the reviewer to look
@@ -120,6 +139,30 @@ async def resolve_diff_base(
 
     if state == "resolved":
         out["state"], out["sha"] = BASE_RESOLVED, detail
+        # Resolved is not the end of the question (#947). The ref exists here;
+        # whether it still stands for anything upstream is a second fact, and
+        # the brief that skipped it showed an empty diff as agreement.
+        try:
+            freshness, why = await plugins.git_ops.base_freshness(
+                workspace, out["base"], detail
+            )
+        except Exception as exc:  # noqa: BLE001 - degradation is the contract
+            log.warning("diff base for #%s: freshness failed: %s", task_id, exc)
+            out["reason"] = f"свежесть базы {out['base']} не проверена: {exc}"
+            return out
+        if freshness == "stale":
+            out["state"] = BASE_STALE
+            out["reason"] = (
+                f"база сравнения протухла: {why}. Дифф против неё не берётся — "
+                "пустой дифф здесь означал бы не «изменений нет», а «сравнивали "
+                "не с тем». Клон проекта нужно сверить с remote, после чего "
+                "пересобрать бриф"
+            )
+            return out
+        if freshness != "current":
+            out["reason"] = (
+                f"база {out['base']} разрешена, но не сверена с remote: {why}"
+            )
         return out
     if state == "missing":
         out["state"] = BASE_UNRESOLVED
@@ -142,7 +185,7 @@ def diff_command_for(diff_base: dict[str, Any], branch: str) -> str:
     """
     if not (branch or "").strip():
         return ""
-    if diff_base.get("state") == BASE_UNRESOLVED:
+    if base_blocks_diff(str(diff_base.get("state") or "")):
         return ""
     return f"git diff {diff_base.get('base', '')}...{branch}"
 
@@ -281,7 +324,7 @@ def evidence_coverage(
         call_sites_status == "analysed",
         (
             DISABLED_BY_BASE + str(diff_base.get("reason") or "")
-            if base_state == BASE_UNRESOLVED
+            if base_blocks_diff(str(base_state or ""))
             else "the call-site analysis produced no signal"
         ),
         applicable=has_branch,
@@ -357,10 +400,20 @@ def evidence_coverage(
             f"{len(missing)} of {len(ran) + len(missing)} evidence blocks "
             "produced no signal. Their subjects are unverified, not clean"
         )
-    if state != COVERAGE_COMPLETE and base_state == BASE_UNRESOLVED and has_branch:
+    if (
+        state != COVERAGE_COMPLETE
+        and base_blocks_diff(str(base_state or ""))
+        and (has_branch)
+    ):
         headline += (
             "; the diff base did not resolve, which disabled the checks "
             "that read the diff"
+            if base_state == BASE_UNRESOLVED
+            else (
+                "; the diff base is stale — it names a commit the remote base "
+                "branch does not carry, so the diff was not taken and an empty "
+                "one must not be read as agreement"
+            )
         )
     if sha_check == "match":
         headline += (

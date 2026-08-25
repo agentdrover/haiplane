@@ -244,6 +244,21 @@ class GitOpsPlugin(Protocol):
     # есть подменить плагин по этому протоколу было можно только угадав, что
     # ещё требуется сверх объявленного (#847).
     async def head_sha(self, repo: str, base: str) -> str: ...
+    # #947: two questions the hub started asking after a release deleted the
+    # branch everything is delivered into — is the base this diff stands on
+    # still the one the remote carries, and does the integration branch still
+    # exist after a release merge.
+    async def base_freshness(
+        self, repo: str, base: str, sha: str
+    ) -> tuple[str, str]: ...
+    async def ensure_remote_branch(
+        self,
+        branch: str,
+        source: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]: ...
     async def branch_diff(self, repo: str, base: str, branch: str) -> str | None: ...
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None: ...
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]: ...

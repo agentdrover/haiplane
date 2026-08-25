@@ -119,11 +119,14 @@
                 <dt>repo</dt><dd>{{ c.project.repo or '—' }}</dd>
                 <dt>ветка</dt><dd>{{ c.project.default_branch }}</dd>
                 {# #887: что клон РЕАЛЬНО защищает, рядом с тем, что объявлено.
-                   Три состояния, и третье не сливается с первым: клон, который
-                   не смогли прочитать, — не клон, который согласен. #}
+                   Состояния не сливаются: клон, который не смогли прочитать, —
+                   не клон, который согласен, а ветка, которой нет в remote
+                   (#947), — не «сходится», сколько бы имён ни совпало. #}
                 <dt>клон</dt><dd>
                     {% if c.clone_branch.state == 'match' %}
                     <span class="badge badge-completed" title="{{ c.clone_branch.reason }}">сходится: {{ c.clone_branch.project_branch }}</span>
+                    {% elif c.clone_branch.state == 'missing' %}
+                    <span class="badge badge-failed" title="{{ c.clone_branch.reason }}">ветки нет в remote: {{ c.clone_branch.project_branch }}</span>
                     {% elif c.clone_branch.state == 'diverged' %}
                     <span class="badge badge-needs_decision" title="{{ c.clone_branch.reason }}">расходится: проект {{ c.clone_branch.project_branch }}, клон {{ c.clone_branch.clone_branch or 'ключ не записан' }}</span>
                     {% else %}
