@@ -1588,6 +1588,15 @@ async def _approved_code_check(
     return "", ""
 
 
+# #951: the two gate refusals that mean "ask again in a minute", not "ask a
+# human". Built from the same enum merge_before_completion prints, so the
+# prefix contract between the two spots of this file cannot silently drift.
+_TRANSIENT_GATE_PREFIXES = (
+    f"ci_{CIProbeOutcome.pending.value}",
+    f"ci_{CIProbeOutcome.unavailable.value}",
+)
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -1874,6 +1883,31 @@ async def transition_after_agent_done(
             else:
                 ok, detail = await merge_before_completion(db, task)
             if not ok:
+                # #951: a temporary state is not a decision. CI still running
+                # (or unreadable this minute) resolves itself — the poller in
+                # the same situation just retries next pass, and on 25.08.2026
+                # the done-flow's needs_decision here cost a human rework for
+                # a CI that went green four minutes later (#949). The task
+                # stays in running: the existing stale watches and the #418
+                # deadline backstop keep it from waiting forever. Terminal
+                # refusals — a red CI, a merge GitHub refused, a closed PR —
+                # still call a human below: those need an actual decision.
+                if detail.startswith(_TRANSIENT_GATE_PREFIXES):
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "alert",
+                        f"Доставка отложена: PR #{task['pr_number']} — {detail}. "
+                        "Это временное состояние, решение человека не требуется: "
+                        "отчитайтесь о готовности снова, когда CI станет зелёным.",
+                    )
+                    log.info(
+                        "Task #%d stays running: merge gate waiting on CI (%s)",
+                        task_id,
+                        detail,
+                    )
+                    return "running"
                 await repo.update_task(db, task_id, status="needs_decision")
                 await repo.add_task_update(
                     db,
