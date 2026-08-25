@@ -1989,3 +1989,67 @@ async def test_pr_state_says_it_could_not_look(
             "an unanswerable question stays unanswered — 'could not look' and "
             "'closed' lead to opposite delivery decisions"
         )
+
+
+# ---- #959: 404 от gh — это ответ, а не молчание ----
+#
+# pr_state сваливала любой ненулевой код в "" и выбрасывала stderr, где gh как
+# раз и говорит, что такого PR нет. Разница дорогая: "не смогли спросить" велит
+# оставить номер, "такого PR тут нет" — искать замену. Различаем по коду в теле
+# ответа REST, а не по подстроке в прозе gh: текст меняется между версиями,
+# статус — нет.
+
+
+def _pr_probe(*, view, api=None):
+    """A _gh double for pr_state: `pr view` first, `api` only on its failure."""
+    seen: dict[str, int] = {"api": 0}
+
+    async def route(*args, **kwargs):
+        if args[0] == "pr" and args[1] == "view":
+            return view
+        if args[0] == "api":
+            seen["api"] += 1
+            return api if api is not None else (1, "", "no api stub")
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    return route, seen
+
+
+_NOT_FOUND_BODY = (
+    '{"message":"Not Found","documentation_url":"https://docs.github.com/rest",'
+    '"status":"404"}'
+)
+
+
+async def test_pr_state_reports_a_pr_absent_from_the_repository(
+    git_ops: GitOpsIntegration,
+) -> None:
+    route, _ = _pr_probe(
+        view=(1, "", "GraphQL: Could not resolve to a PullRequest with the number"),
+        api=(1, _NOT_FOUND_BODY, "gh: Not Found (HTTP 404)"),
+    )
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+        assert await git_ops.pr_state(472, gh_repo="agentdrover/haiplane") == "absent"
+
+
+async def test_pr_state_keeps_could_not_look_when_the_cause_is_not_a_404(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Сеть, авторизация, отсутствующий gh — всё это по-прежнему "" и по-прежнему
+    # оставляет записанный номер в покое. Ошибиться сюда дороже, чем не ответить.
+    route, _ = _pr_probe(
+        view=(1, "", "dial tcp: connect: connection refused"),
+        api=(1, "", "dial tcp: connect: connection refused"),
+    )
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+        assert await git_ops.pr_state(472, gh_repo="agentdrover/haiplane") == ""
+
+
+async def test_pr_state_does_not_pay_for_a_second_question_when_the_first_answers(
+    git_ops: GitOpsIntegration,
+) -> None:
+    route, seen = _pr_probe(view=(0, '{"state":"OPEN"}', ""))
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+        assert await git_ops.pr_state(360, gh_repo="owner/repo") == "open"
+
+    assert seen["api"] == 0, "уточняющий вопрос задаётся только на пути отказа"

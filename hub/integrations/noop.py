@@ -144,7 +144,11 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> str:
-        """No git here — "could not look", not "closed" (#802)."""
+        """No git here — "could not look" (#802).
+
+        Never "closed" and never "absent" (#959): both are answers, and this
+        double has none. Silence is the only honest reply from a stub.
+        """
         return ""
 
     async def release_range(

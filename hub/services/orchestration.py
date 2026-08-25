@@ -1720,6 +1720,11 @@ class DeliveryPR:
     number: int | None = None
     reason: str = ""
     unusable: bool = False
+    # #959: whether the gate managed to establish WHICH PR this is. False only
+    # when the recorded number could not be looked up at all. The waiting
+    # branch reads it: telling somebody to wait for a green CI is a promise
+    # about a PR, and it must not be made when the PR itself is unknown.
+    established: bool = True
 
 
 async def _recorded_pr_state(
@@ -1793,29 +1798,40 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
         # is merged and deleted, which is exactly what stranded #774 with a
         # live branch, a green PR, and a closed number on the task.
         state, note = await _recorded_pr_state(db, task, recorded)
-        if state == "closed":
+        # #959: "closed" and "absent" are different facts with one consequence
+        # — the recorded number cannot carry this delivery, so look for the one
+        # that can. They are NOT merged into a single state: the feed has to
+        # say which of the two happened, or the next reader debugging a stuck
+        # task learns nothing from the line that explained it.
+        if state in ("closed", "absent"):
+            gone = (
+                f"записанный PR #{recorded} закрыт и не слит"
+                if state == "closed"
+                else f"записанного PR #{recorded} нет в репозитории проекта"
+            )
             replacement, find_note = (
                 await _live_pr_for_branch(db, task, branch) if branch else (None, "")
             )
             if replacement and replacement != recorded:
                 return DeliveryPR(
                     replacement,
-                    f"записанный PR #{recorded} закрыт и не слит — "
-                    f"доставка идёт открытым PR #{replacement} той же ветки",
+                    f"{gone} — доставка идёт открытым PR #{replacement} той же ветки",
                 )
             return DeliveryPR(
                 recorded,
                 find_note
                 or (
-                    f"записанный PR #{recorded} закрыт и не слит, а открытого "
-                    f"PR у ветки {branch or '(ветки нет)'} не нашлось"
+                    f"{gone}, а открытого PR у ветки "
+                    f"{branch or '(ветки нет)'} не нашлось"
                 ),
                 unusable=True,
             )
         # merged, open, or unknown: the number stands. "Merged" must never be
         # replaced — a second merge is not extra safety, and #605 already had
-        # to guard that. "Unknown" keeps today's behaviour with a named cause.
-        return DeliveryPR(recorded, note)
+        # to guard that. "Unknown" keeps today's behaviour with a named cause,
+        # and carries that it is unknown so the waiting branch does not promise
+        # a green CI for a PR nobody could reach (#959).
+        return DeliveryPR(recorded, note, established=bool(state))
     if not branch:
         return DeliveryPR()
     try:
@@ -1893,14 +1909,28 @@ async def transition_after_agent_done(
                 # refusals — a red CI, a merge GitHub refused, a closed PR —
                 # still call a human below: those need an actual decision.
                 if detail.startswith(_TRANSIENT_GATE_PREFIXES):
+                    # #959: waiting is still right, but the reason has to be
+                    # the true one. When the PR itself could not be read, "wait
+                    # for a green CI" names a check that never ran and points
+                    # at a PR the gate never established — the shape of hint
+                    # #952 removed from the terminal branch, here in the
+                    # patient one.
+                    cause = (
+                        "Это временное состояние, решение человека не требуется: "
+                        "отчитайтесь о готовности снова, когда CI станет зелёным."
+                        if delivery_pr.established
+                        else "Состояние самого PR прочитать не удалось, поэтому "
+                        "про CI тут сказать нечего: отчитайтесь о готовности "
+                        "снова, когда PR станет доступен. Если он недоступен "
+                        "не временно — это вопрос к человеку."
+                    )
                     await repo.add_task_update(
                         db,
                         task_id,
                         "hub",
                         "alert",
-                        f"Доставка отложена: PR #{task['pr_number']} — {detail}. "
-                        "Это временное состояние, решение человека не требуется: "
-                        "отчитайтесь о готовности снова, когда CI станет зелёным.",
+                        f"Доставка отложена: PR #{task['pr_number']} — "
+                        f"{detail}. {cause}",
                     )
                     log.info(
                         "Task #%d stays running: merge gate waiting on CI (%s)",
