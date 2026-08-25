@@ -65,7 +65,8 @@
                         hx-post="/tasks/{{ t.id }}/web-start"
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Start</button>
-                {% else %}
+                {% elif dispatch_configured %}
+                {# #953: a fault, not the normal state of a hub without a dispatcher. #}
                 <span class="task-table-action u-text-muted">Dispatch unavailable</span>
                 {% endif %}
                 {% elif t.status.value == 'needs_info' %}

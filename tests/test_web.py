@@ -5627,3 +5627,55 @@ async def test_landing_renders_on_empty_db(client: AsyncClient, monkeypatch) -> 
     response = await client.get("/", headers={"Accept": "text/html"})
     assert response.status_code == 200, response.text
     assert "Haiplane" in response.text
+
+async def test_board_hides_dispatch_note_when_no_dispatcher_is_configured(
+    client: AsyncClient, monkeypatch, tmp_path
+):
+    """#953: an absent dispatcher is not a fault, so the board says nothing.
+
+    A hub that never had a dispatcher — the docker demo, a laptop, anyone
+    evaluating the product — showed "Dispatch unavailable" on every open card.
+    The note reads as breakage; nothing is broken.
+    """
+    from hub import brand, config
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+
+    plugins.dispatch = NoopDispatch()
+    monkeypatch.delenv(brand.ENV_PREFIX + "DISPATCH_BIN", raising=False)
+    monkeypatch.setattr(config, "DISPATCH_JOBS_DIR", tmp_path / "never-dispatched")
+
+    await client.post("/api/tasks", json={"title": "Open card on a plain hub"})
+
+    resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert "Open card on a plain hub" in resp.text
+    assert "Dispatch unavailable" not in resp.text
+
+
+async def test_board_shows_dispatch_note_when_a_configured_dispatcher_is_down(
+    client: AsyncClient, monkeypatch, tmp_path
+):
+    """#953: the other half — a dispatcher this host DOES have, not answering.
+
+    That is a fault, and hiding it would trade one lie for another. The signal
+    is what the installation left behind: the dispatcher's own state directory.
+    """
+    from hub import brand, config
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+
+    plugins.dispatch = NoopDispatch()
+    monkeypatch.delenv(brand.ENV_PREFIX + "DISPATCH_BIN", raising=False)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    monkeypatch.setattr(config, "DISPATCH_JOBS_DIR", jobs)
+
+    await client.post("/api/tasks", json={"title": "Open card on a dispatch host"})
+
+    resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert "Open card on a dispatch host" in resp.text
+    assert "Dispatch unavailable" in resp.text

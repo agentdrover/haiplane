@@ -622,3 +622,31 @@ async def test_the_stamp_never_rewrites_an_earlier_release(db: aiosqlite.Connect
     fact = await repo.release_fact_for_task(db, 43)
     assert fact["released_pr"] == 700, "первый увёзший релиз — исторический факт"
     assert fact["released_sha"] == "first0release0sha"
+
+
+async def test_deployed_commit_is_the_merge_itself(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#953: identity needs no repository — the deploy IS this merge.
+
+    Every other path here asks git about reachability, and a project without a
+    working copy on this host therefore gets "could not check". When the
+    deployed sha and the merge sha are the same string, there is nothing left
+    to look up: a commit is part of its own history. Refusing to answer that
+    left the demo stand — and any hub whose project is not cloned locally —
+    with an empty delivery panel next to facts that fully answer the question.
+    """
+    from hub import app as hub_app
+
+    sha = "c0ffee" + "0" * 34
+    task_id = await _task_merged_at(client, db, sha)
+    await repo.record_release(db, deployed_sha=sha, ref="main", source="ci")
+    no_workspace = AsyncMock(return_value={"repo": "", "base_branch": "main"})
+    monkeypatch.setattr(hub_app.services, "project_git_context", no_workspace)
+
+    answer = await delivery_state(db, task_id)
+
+    assert answer["state"] == IN_PROD, answer
+    assert answer["merge_sha"] == sha
+    assert answer["deployed_sha"] == sha
+    assert answer["reason"]

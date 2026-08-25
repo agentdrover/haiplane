@@ -48,7 +48,9 @@
                 hx-post="/tasks/{{ t.id }}/web-start"
                 hx-target="#kanban-card-{{ t.id }}"
                 hx-swap="outerHTML">Start</button>
-        {% else %}
+        {% elif dispatch_configured %}
+        {# #953: named only where a dispatcher exists and is not answering.
+           A hub that never had one is not broken, and said so on every card. #}
         <span class="card-action-note">Dispatch unavailable</span>
         {% endif %}
     </div>
