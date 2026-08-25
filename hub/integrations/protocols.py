@@ -186,6 +186,9 @@ class GitOpsPlugin(Protocol):
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
     ) -> bool | None: ...
+    async def commit_with_same_tree(
+        self, repo: str, sha: str, branch: str
+    ) -> str | None: ...
     async def fetch_commit(
         self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
     ) -> tuple[bool, str]: ...

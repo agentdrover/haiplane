@@ -163,3 +163,45 @@ def history(tmp_path: Path) -> dict[str, str]:
         "released": released,
         "pending": pending,
     }
+
+
+@pytest.fixture
+def squash_release(tmp_path: Path) -> dict[str, str]:
+    """develop released into main by squash, plus work merged after it."""
+    root = tmp_path / "squashed"
+    root.mkdir()
+    _git_in(root, "init", "-b", "main")
+    (root / "a.py").write_text("a = 1\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "base")
+
+    _git_in(root, "checkout", "-q", "-b", "develop")
+    (root / "b.py").write_text("b = 2\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "gate merges the task into develop")
+    task_merge = _git_in(root, "rev-parse", "HEAD")
+    (root / "c.py").write_text("c = 3\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "another task rides the same release")
+    develop_tip = _git_in(root, "rev-parse", "HEAD")
+
+    # The release itself: exactly what the poller does — squash, not merge.
+    _git_in(root, "checkout", "-q", "main")
+    _git_in(root, "merge", "--squash", "develop")
+    _git_in(root, "commit", "-m", "release: develop -> main")
+    released = _git_in(root, "rev-parse", "HEAD")
+
+    # Work that landed in develop AFTER the release went out.
+    _git_in(root, "checkout", "-q", "develop")
+    (root / "d.py").write_text("d = 4\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "merged after the release")
+    after_release = _git_in(root, "rev-parse", "HEAD")
+
+    return {
+        "repo": str(root),
+        "task_merge": task_merge,
+        "develop_tip": develop_tip,
+        "released": released,
+        "after_release": after_release,
+    }

@@ -191,6 +191,17 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def commit_with_same_tree(
+        self, repo: str, sha: str, branch: str
+    ) -> str | None:
+        """No git here — "could not look", never "no such content" (#946).
+
+        The empty string is a real answer ("looked, the branch never held this
+        content"); None is the absence of one, and delivery state must keep
+        them apart or a squash release starts reading as a failed one.
+        """
+        return None
+
     async def fetch_commit(
         self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
     ) -> tuple[bool, str]:
