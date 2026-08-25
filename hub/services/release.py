@@ -193,6 +193,10 @@ async def merge_ready_release(
             f"release {head} → {base}",
             repo=ctx["repo"],
             gh_repo=ctx["gh_repo"],
+            # #949: the head of a release PR IS the integration branch. The
+            # default deletes the head — right for task branches, and the very
+            # act that removed develop on every auto-release of 24–25.08.
+            delete_branch=False,
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         return False, f"релиз не удалось провести: {exc}"
