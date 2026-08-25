@@ -1914,9 +1914,17 @@ async def transition_after_agent_done(
                     task_id,
                     "hub",
                     "alert",
+                    # #952: this line is written TOGETHER with the transition
+                    # to needs_decision, and is read AFTER it — so it may only
+                    # name actions that status accepts. "Report done again"
+                    # is not one of them: the hub itself refuses it there
+                    # (human_decision_required), which on 25.08.2026 sent an
+                    # agent down a dead end the hint had pointed to (#949).
                     f"Done report NOT completed: PR #{task['pr_number']} is not "
-                    f"delivered — {detail}. Fix the cause and report done "
-                    "again, or decide the task by hand.",
+                    f"delivered — {detail}. Решение за человеком "
+                    "(hub_decide_task): rework вернёт задачу в running — "
+                    "устраните причину и пересдайте done; accept завершит "
+                    "задачу БЕЗ доставки PR.",
                 )
                 await repo.insert_event(
                     db,

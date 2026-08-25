@@ -647,3 +647,38 @@ async def test_pr_state_failure_is_a_reason_not_an_exception(db):
         dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
     )
     assert "gh is not installed" in feed
+
+
+# ---- #952: подсказка называет только действия, доступные в достигнутом статусе ----
+
+
+async def test_the_terminal_refusal_hint_names_reachable_actions_only(db):
+    """Алерт пишется вместе с переходом в needs_decision и читается после него.
+
+    Из needs_decision hub_report_done отвергается самим хабом
+    (human_decision_required) — 25.08 подсказка «report done again» отправила
+    исполнителя ровно в этот отказ (#949). Текст обязан вести через решение:
+    hub_decide_task, и объяснять, что даёт каждый исход.
+    """
+    _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alert = next(
+        u
+        for u in updates
+        if u["kind"] == "alert" and "NOT completed" in (u["content"] or "")
+    )
+    assert "report done again" not in alert["content"], (
+        "подсказка не должна предлагать вызов, который этот статус отвергает"
+    )
+    assert "hub_decide_task" in alert["content"], (
+        "подсказка обязана назвать доступное действие"
+    )
+    assert "rework" in alert["content"] and "accept" in alert["content"], (
+        "оба исхода решения названы — читатель выбирает осознанно"
+    )
