@@ -5628,6 +5628,7 @@ async def test_landing_renders_on_empty_db(client: AsyncClient, monkeypatch) -> 
     assert response.status_code == 200, response.text
     assert "Haiplane" in response.text
 
+
 async def test_board_hides_dispatch_note_when_no_dispatcher_is_configured(
     client: AsyncClient, monkeypatch, tmp_path
 ):
