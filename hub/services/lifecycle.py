@@ -122,6 +122,56 @@ def _existing_task(row: aiosqlite.Row | None, task_id: int) -> aiosqlite.Row:
     return row
 
 
+def blocker_holding_the_done_report(updates: list[dict[str, Any]]) -> dict | None:
+    """Блокер, из-за которого сдачу нельзя вести в доставку, или None (#948).
+
+    Значим не факт, что блокер когда-то был, а то, что он записан ПОСЛЕ
+    последней сдачи на ревью. Сдача — это утверждение «работа готова», и всё,
+    что было до неё, ревьюер видел вместе с ней: либо препятствие снято, либо
+    оно и есть находка ревью. Блокер после сдачи — другое дело: он про
+    состояние работы, которое ревью уже не смотрело.
+
+    До этого правила проверка читала всю историю и не знала слова «снят». Один
+    блокер за жизнь задачи навсегда уводил её done-отчёт мимо гейта доставки к
+    человеку — 25.08 так ушли #851 и #947, обе с APPROVED и зелёным CI, обе с
+    блокером, написанным и снятым за часы до сдачи. Хуже прямого убытка был
+    стимул: единственный способ не попасть под правило — не писать блокеров,
+    то есть молчать ровно о том, ради чего они существуют.
+
+    Задача, которая ни разу не сдавалась, границы не имеет — там значим любой
+    блокер, как и раньше. Это не послабление: без сдачи никто на препятствие
+    и не смотрел.
+    """
+    boundary = 0
+    for update in updates:
+        content = str(update.get("content") or "")
+        if update.get("kind") == "status" and content.startswith(
+            repo.SUBMISSION_UPDATE_PREFIX
+        ):
+            boundary = max(boundary, int(update.get("id") or 0))
+    for update in reversed(updates):
+        if update.get("kind") != "blocker":
+            continue
+        if int(update.get("id") or 0) > boundary:
+            return update
+    return None
+
+
+def blocker_note(blocker: dict[str, Any]) -> str:
+    """Как назвать блокер тому, кто теперь должен принимать решение (#948).
+
+    Раньше и апдейт, и лента говорили «blocker in done flow» — читателю
+    сообщали, что причина есть, но не какая. На задаче с полусотней апдейтов
+    это отправляет человека искать её руками.
+    """
+    first_line = str(blocker.get("content") or "").strip().splitlines()
+    head = first_line[0] if first_line else "(без текста)"
+    if len(head) > 160:
+        head = head[:157] + "…"
+    when = str(blocker.get("created_at") or "").strip() or "время неизвестно"
+    return f"апдейт #{blocker.get('id')} от {when}: {head}"
+
+
 async def _try_restore_pair_workspace(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1801,7 +1851,7 @@ async def submit_for_review(
             await repo.update_task(db, task_id, **risk_fields)
         agent = (body.agent or "").strip() or task.get("assigned_agent", "")
         summary = (body.summary or "").strip()
-        content = f"Submitted for review (submission #{generation})."
+        content = f"{repo.SUBMISSION_UPDATE_PREFIX}{generation})."
         if discovered_pr:
             content += f" PR #{discovered_pr} recorded for delivery."
         if submission_sha:
@@ -2864,12 +2914,27 @@ async def add_update(
                     was_claimed = task["status"] == "claimed"
                     updates_rows = await repo.get_task_updates(db, task_id)
                     updates_list = [dict(r) for r in updates_rows]
-                    if any(u.get("kind") == "blocker" for u in updates_list):
+                    # #948: значим блокер, записанный ПОСЛЕ последней сдачи, а
+                    # не любой в истории. Снятое препятствие больше не уводит
+                    # сдачу мимо доставки, а живое — уводит, как и уводило.
+                    holding = blocker_holding_the_done_report(updates_list)
+                    if holding is not None:
+                        note = blocker_note(holding)
                         await repo.update_task(db, task_id, status="needs_decision")
+                        await repo.add_task_update(
+                            db,
+                            task_id,
+                            "hub",
+                            "alert",
+                            f"Отчёт о готовности не пошёл в доставку: после "
+                            f"последней сдачи записан блокер — {note}. Снимите "
+                            "препятствие и отчитайтесь снова либо решите задачу "
+                            "вручную.",
+                        )
                         await log_activity(
                             db,
                             "task_needs_decision",
-                            f"Task #{task_id} → needs_decision (blocker in done flow)",
+                            f"Task #{task_id} → needs_decision ({note})",
                             detail=mutation_activity_detail(),
                         )
                     else:
