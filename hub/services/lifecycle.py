@@ -2934,7 +2934,19 @@ async def add_update(
     task = dict(row)
 
     if body.kind == "done":
-        _validate_done_report(task)
+        # #971: the hub can now deliver approved pair work on its own, so an
+        # agent that went away and came back may find its task already
+        # complete. Refusing its report with "task_already_terminal" would be
+        # true and useless: nothing is wrong, the work shipped, and the only
+        # thing still missing is the account of it. The report is taken as
+        # what it now is — a record — and the terminal guard stays exactly as
+        # strict for every other way a task can end.
+        if task.get(
+            "status"
+        ) == "completed" and await repo.completed_by_poller_delivery(db, task_id):
+            body = body.model_copy(update={"kind": "status"})
+        else:
+            _validate_done_report(task)
 
     # #498: work that never started its way out, named while the report is
     # being written rather than found weeks later. Advisory by design: the

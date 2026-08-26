@@ -1605,7 +1605,7 @@ async def _approved_code_check(
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
 # human". Built from the same enum merge_before_completion prints, so the
 # prefix contract between the two spots of this file cannot silently drift.
-_TRANSIENT_GATE_PREFIXES = (
+TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
 )
@@ -2070,7 +2070,7 @@ async def transition_after_agent_done(
                 # deadline backstop keep it from waiting forever. Terminal
                 # refusals — a red CI, a merge GitHub refused, a closed PR —
                 # still call a human below: those need an actual decision.
-                if detail.startswith(_TRANSIENT_GATE_PREFIXES):
+                if detail.startswith(TRANSIENT_GATE_PREFIXES):
                     # #959: waiting is still right, but the reason has to be
                     # the true one. When the PR itself could not be read, "wait
                     # for a green CI" names a check that never ran and points
