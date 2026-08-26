@@ -305,7 +305,8 @@
         {% if t.assigned_agent %}
         <div class="inbox-item-meta">assigned to {{ t.assigned_agent }}</div>
         {% endif %}
-        <div class="inbox-item-desc">Running with no updates for 30+ minutes.</div>
+        {# #957: возраст и причина — факт, а не константа порога. #}
+        <div class="inbox-item-desc">{{ stale_meta.get(t.id, {}).get('line', 'Задача давно без записей.') }}</div>
         <div class="inbox-item-actions">
             <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Investigate</a>
         </div>

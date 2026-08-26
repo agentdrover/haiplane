@@ -18,8 +18,6 @@ from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
     TreeOutputOptions,
     render_task_tree,
-    truncate_text,
-    TRUNCATION_NOTICE,
 )
 from hub.hub_instance import instance_echo_fields, with_instance_echo
 from hub.mcp_envelope import (
@@ -42,6 +40,7 @@ from hub.mcp_structured import (
     HubRefineTasksStructured,
     HubTaskStatusResult,
     HubTaskStatusStructured,
+    fit_echo_result,
     structured_echo_result,
     structured_error_result,
     structured_tool_result,
@@ -1074,6 +1073,28 @@ def _normalize_context_mode(mode: str) -> str:
     return normalized
 
 
+# Cheapest loss first, once trimming the task list is not enough to fit the
+# declared limit (#834). ``context_text`` costs nothing to drop: it is already
+# the text part of this very response, so the payload copy is pure duplication.
+_CONTEXT_DROP_ORDER = (
+    "context.context_text",
+    "context.siblings",
+    "context.children",
+    "context.task",
+    "context.parent_goal",
+    "context.readiness",
+    "context.breadcrumb",
+    "context",
+)
+
+
+def _context_char_budget(max_chars: int | None, mode: str) -> int | None:
+    """The cap a call actually carries: explicit, or 4000 for summary."""
+    if max_chars is not None:
+        return max_chars
+    return 4000 if mode == "summary" else None
+
+
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
@@ -1082,6 +1103,7 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
     read when onboarding a session before any task is claimed.
     """
     instance = instance_echo_fields()
+    budget = _context_char_budget(max_chars, mode)
     identity: dict[str, Any] = {}
     my_tasks: list[dict[str, Any]] = []
     try:
@@ -1095,10 +1117,15 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             identity = {}
     username = (identity.get("username") or "").strip()
     if username:
+        # A capped call asks for compact cards at the source (#834): a full
+        # card of this hub weighs about 10 KB, and the digest below names only
+        # id, title and status. Fetching 50 full ones to then drop 47 would
+        # move the cost from the client to the server, not remove it.
+        query = f"/api/tasks?claimed_by={urllib.parse.quote(username)}&limit=50"
+        if budget is not None:
+            query += "&mode=summary"
         try:
-            my_tasks = await _api_get(
-                f"/api/tasks?claimed_by={urllib.parse.quote(username)}&limit=50"
-            )
+            my_tasks = await _api_get(query)
         except HubApiError:
             my_tasks = []
         if isinstance(my_tasks, dict):  # paginated envelope shape
@@ -1129,21 +1156,32 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             f"#{t.get('id')} {t.get('title', '')} ({t.get('status', '?')})"
             for t in my_tasks[:20]
         ]
-        lines.append("Your claimed tasks: " + "; ".join(task_strs))
+        # The digest has always stopped at 20 and never said so (#519/#810):
+        # a list that ends without a word reads as the whole list.
+        shown = (
+            f" ({len(task_strs)} of {len(my_tasks)} shown)"
+            if len(my_tasks) > len(task_strs)
+            else ""
+        )
+        lines.append(f"Your claimed tasks{shown}: " + "; ".join(task_strs))
     else:
         lines.append("Your claimed tasks: none")
     lines.append("")
     lines.extend(lifecycle_map_lines())
 
-    text = "\n".join(lines)
-    effective_max = max_chars
-    if mode == "summary" and effective_max is None:
-        effective_max = 4000
-    if effective_max is not None:
-        text, truncated = truncate_text(text, effective_max)
-        if truncated and TRUNCATION_NOTICE not in text:
-            text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
-    return structured_echo_result(text, identity=identity, my_tasks=my_tasks)
+    # my_tasks is what gives way, and deliberately so. The digest costs about
+    # 2.4k of the 4k default (the Workflow reference alone is 1.7k), and in the
+    # remainder a task is worth ~70 chars as a digest line against ~200 as a
+    # compact card that repeats the same id, title and status. So under the
+    # default the list survives as text and the payload keeps what is left —
+    # ~11 cards at max_chars=6000, ~22 at 8000, for a caller who needs them.
+    return fit_echo_result(
+        "\n".join(lines),
+        budget,
+        shrink="my_tasks",
+        identity=identity,
+        my_tasks=my_tasks,
+    )
 
 
 @mcp.tool()
@@ -1159,15 +1197,15 @@ async def hub_my_context(
     Workflow reference plus your own active tasks and the connected instance — which
     is what to read when you have no active task yet.
 
-    Without ``max_chars`` the full digest is returned (backward compatible).
-    ``mode=summary`` caps the digest to 4000 chars unless ``max_chars`` is set
-    explicitly. Truncated output ends with ``[truncated]``.
+    ``mode=summary`` or ``max_chars`` caps the WHOLE response — text and
+    structuredContent together — at 4000 chars by default, and names what did
+    not fit in ``bounds``. Without either, the full context is returned.
 
     Args:
         task_id: The task ID to get context for. Omit for general Hub context.
-        max_chars: Maximum UTF-8 character length of the digest
-        mode: ``full`` (default) or ``summary``. ``brief`` is accepted as an
-            alias of ``summary``; any other value is rejected with the allowed set.
+        max_chars: Cap on the whole response, in characters
+        mode: ``full`` (default) or ``summary``; ``brief`` is an alias of
+            ``summary``, anything else is rejected with the allowed set.
     """
     try:
         mode = _normalize_context_mode(mode)
@@ -1180,14 +1218,12 @@ async def hub_my_context(
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
-    effective_max = max_chars
-    if mode == "summary" and effective_max is None:
-        effective_max = 4000
-    if effective_max is not None:
-        text, truncated = truncate_text(text, effective_max)
-        if truncated and TRUNCATION_NOTICE not in text:
-            text = f"{text}\n{TRUNCATION_NOTICE}" if text else TRUNCATION_NOTICE
-    return structured_echo_result(text, context=ctx)
+    return fit_echo_result(
+        text,
+        _context_char_budget(max_chars, mode),
+        drop_order=_CONTEXT_DROP_ORDER,
+        context=ctx,
+    )
 
 
 @mcp.tool()
@@ -1696,6 +1732,57 @@ async def hub_claim_task(
         prior_status=prior_status,
         task=task,
         fallback_status=status,
+    )
+
+
+@mcp.tool()
+async def hub_declare_wait(
+    task_id: int,
+    waiting_for: str,
+    waiting_until: str = "",
+    agent: str = "",
+) -> str:
+    """Declare what a task is waiting for and until when — or clear it (#957).
+
+    A current declaration keeps the task out of the Stale list until the
+    deadline; past the deadline the watchdog escalates the LAPSE, louder
+    than plain silence. Deadline format: YYYY-MM-DD HH:MM:SS (UTC), and it
+    is required — an open-ended wait would be indistinguishable from an
+    abandoned task. Pass an empty waiting_for to clear the declaration.
+
+    Args:
+        task_id: The task that is waiting
+        waiting_for: The event awaited (empty clears the declaration)
+        waiting_until: Deadline, YYYY-MM-DD HH:MM:SS in UTC
+        agent: Declaring agent (defaults to caller identity)
+    """
+    try:
+        await _api_post(
+            f"/api/tasks/{task_id}/declare-wait",
+            {
+                "waiting_for": waiting_for,
+                "waiting_until": waiting_until,
+                "agent": agent,
+            },
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    cleared = not (waiting_for or "").strip()
+    message = (
+        f"Task #{task_id}: ожидание снято."
+        if cleared
+        else (
+            f"Task #{task_id}: объявлено ожидание «{waiting_for}» до "
+            f"{waiting_until} (UTC). До срока задача не считается зависшей; "
+            "после — вахта поднимет просрочку."
+        )
+    )
+    task = await _read_task(task_id)
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=(task or {}).get("status"),
+        task=task,
     )
 
 
