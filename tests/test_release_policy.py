@@ -43,6 +43,11 @@ def _git(*, ci: CIProbeOutcome = CIProbeOutcome.passed, existing_pr: int | None 
             "chore: bump nothing in particular",
         ]
     )
+    # #968: the release asks about CONTENT before it asks about commits, so a
+    # fake that answers only the range would make every case read as "could
+    # not compare". True here means what these tests assume: develop carries
+    # work main does not.
+    g.content_differs = AsyncMock(return_value=True)
     g.open_release_pr = AsyncMock(return_value=777)
     plugins.git_ops = g
     return g
@@ -308,6 +313,9 @@ async def test_empty_range_stays_silent(db: aiosqlite.Connection, caplog):
     # AC-3: develop and main agree — nothing to release. Silence, not a PR and
     # not a line per cycle: a line per cycle is how a real signal gets muted.
     g = _git(existing_pr=None)
+    # Both ways of saying "nothing to release": no differing content (#968)
+    # and, behind it, an empty range.
+    g.content_differs = AsyncMock(return_value=False)
     g.release_range = AsyncMock(return_value=[])
     await _release_project(db, "auto")
 

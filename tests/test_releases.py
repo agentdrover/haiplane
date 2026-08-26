@@ -190,3 +190,124 @@ async def test_failed_callback_is_stored_but_not_prod_state(client, db, monkeypa
 
     assert len(rows) == 2, "the failure is recorded, not dropped"
     assert latest is not None and latest["deployed_sha"] == "shipped-four"
+
+
+# ---- #968: a squash release leaves commits behind, and they are not work ----
+#
+# Observed on prod 26.08.2026, minutes after #931 shipped. The poller opened and
+# merged twenty release PRs in ninety minutes; one carried work, nineteen were
+# empty, and each one redeployed production. A squash release writes a NEW
+# commit on the release branch instead of carrying the originals, so the range
+# base..head never empties — and #931, which taught the poller to open a release
+# on a non-empty range, turned that leftover into a self-renewing reason.
+#
+# The rule these tests hold: "is there anything to release" is a question about
+# CONTENT, not about how many commits happen to sit in the range.
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from hub.integrations.git_ops import GitOpsIntegration  # noqa: E402
+from hub.integrations.registry import plugins  # noqa: E402
+from hub.services.release import open_release_for_range  # noqa: E402
+
+
+def _release_ctx(workspace: str) -> dict[str, str]:
+    return {"repo": workspace, "gh_repo": "agentdrover/haiplane"}
+
+
+async def test_squash_leftover_range_is_not_a_release(squash_release, monkeypatch):
+    # AC-1 (#968): commits in the range, no difference in content — silence.
+    # Not a reason, not a PR: the poller walks this every cycle, and a line per
+    # cycle is how a real signal gets muted (#534).
+    #
+    # The state right after a squash release: the release branch holds exactly
+    # what the base branch held, and the range still lists every commit that
+    # went into it. The fixture moves on past that point, so the moment is
+    # named here as its own ref rather than by rewinding a shared fixture.
+    from tests.conftest import _git_in
+
+    _git_in(
+        squash_release["repo"],
+        "branch",
+        "released-state",
+        squash_release["develop_tip"],
+    )
+    real = GitOpsIntegration()
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", real.content_differs, raising=False
+    )
+    opened = AsyncMock(return_value=999)
+    monkeypatch.setattr(plugins.git_ops, "open_release_pr", opened, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "release_range",
+        AsyncMock(return_value=["feat(task): whatever (#1)"]),
+        raising=False,
+    )
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(squash_release["repo"]), "main", "released-state"
+    )
+
+    assert pr is None, "an empty-by-content range must not open a release"
+    assert reason == "", f"nothing to release is silence, not a reason: {reason!r}"
+    assert not opened.called, "GitHub must not be asked to open an empty release"
+
+
+async def test_real_work_still_opens_a_release_without_new_delivery(
+    squash_release, monkeypatch
+):
+    # AC-2 (#968): the fix must not undo #931. Work that differs in content
+    # opens a release even though no task was delivered just now.
+    from tests.conftest import _git_in
+
+    root = squash_release["repo"]
+    _git_in(root, "checkout", "-q", "develop")
+    (__import__("pathlib").Path(root) / "e.py").write_text("e = 5\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): real work (#777)")
+
+    real = GitOpsIntegration()
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", real.content_differs, raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "release_range",
+        AsyncMock(return_value=["feat(task): real work (#777)"]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "open_release_pr", AsyncMock(return_value=321), raising=False
+    )
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(root), "main", "develop"
+    )
+
+    assert pr == 321, f"real work must still open a release (#931), got {reason!r}"
+    assert 777 in task_ids
+
+
+async def test_unreadable_diff_is_unknown_not_nothing_to_release(
+    squash_release, monkeypatch
+):
+    # AC-3 (#968): git that cannot answer is not "everything is delivered".
+    # The release is not opened, and the cause is named — the same line #725
+    # draws between silence and denial.
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "content_differs",
+        AsyncMock(return_value=None),
+        raising=False,
+    )
+    opened = AsyncMock(return_value=999)
+    monkeypatch.setattr(plugins.git_ops, "open_release_pr", opened, raising=False)
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(squash_release["repo"]), "main", "develop"
+    )
+
+    assert pr is None
+    assert reason, "an unanswerable question must be named, not swallowed"
+    assert not opened.called

@@ -210,6 +210,20 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def content_differs(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """No git here — "could not look", never "nothing to release" (#968).
+
+        The distinction is load-bearing: False would silently stop every
+        release, None makes the caller say why it did nothing.
+        """
+        return None
+
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None:
