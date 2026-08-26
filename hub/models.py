@@ -2502,6 +2502,9 @@ class HealthView(BaseModel):
     # Cursor Cloud Agents API (#756): whether the cross-model review
     # executor has a key configured.
     cursor_cloud_configured: bool = False
+    # Имена env-переменных с устаревшим префиксом (#964) — политики, которые
+    # оператор считает включёнными, а код не читает. Имена, не значения.
+    stale_env: list[str] = Field(default_factory=list)
 
 
 class IdentityDiagnosticsView(BaseModel):

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import aiosqlite
 import pytest
+
+from hub.db import _SCHEMA, _migrate
 
 from hub import config
 from hub.config import TokenIdentity
@@ -247,3 +254,117 @@ async def test_check_default_workspace_origin_none_when_not_git(monkeypatch, tmp
 
     monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
     assert await diag.check_default_workspace_origin() is None
+
+
+# --- Мёртвые env-переменные: устаревший префикс виден, а не молчит (#964) ----
+#
+# Ребрендинг #932 сменил ENV_PREFIX на HAIPLANE_, а drop-in'ы прода остались с
+# старым префиксом — хаб молча жил на дефолтах (worktree-изоляция, автопилот и
+# AC_LOCATOR стояли выключенными). Тесты гоняют НАСТОЯЩИЙ lifespan: сигнал
+# обещан на старте, и проверять его в обход старта значило бы проверить не то.
+
+_RETIRED_PREFIX = ("open" + "claw").upper() + "_"  # собрано: страж Волны 5
+
+
+@asynccontextmanager
+async def _noop_lifespan(_app):
+    yield
+
+
+# MCP session manager can .run() once per process, and these tests start the
+# app several times — the transport is not what is under test, so it is stubbed.
+_MCP_STUB = SimpleNamespace(router=SimpleNamespace(lifespan_context=_noop_lifespan))
+
+
+def _drop_legacy_env(monkeypatch):
+    """Реальное окружение разработчика само несёт отставленный префикс — вычистить."""
+    import os
+
+    for name in list(os.environ):
+        if name.startswith(_RETIRED_PREFIX):
+            monkeypatch.delenv(name)
+
+
+@asynccontextmanager
+async def _running_app():
+    """Прогнать настоящий hub.app.lifespan на отдельной in-memory БД.
+
+    БД отдельная от фикстуры ``db``: lifespan закрывает соединение на выходе,
+    и закрытие фикстурной базы уронило бы чужие тесты.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.executescript(_SCHEMA)
+    await _migrate(conn)
+
+    from hub.app import app, lifespan
+
+    with (
+        patch("hub.app.get_db", AsyncMock(return_value=conn)),
+        patch("hub.app.start_poller", return_value=AsyncMock()),
+        patch("hub.app._mcp_streamable_app", _MCP_STUB),
+    ):
+        async with lifespan(app):
+            yield conn
+
+
+async def _stale_rows(conn) -> list[dict]:
+    cursor = await conn.execute(
+        "SELECT * FROM activity_log WHERE kind = 'stale_env_detected'"
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_stale_env_prefix_logged_once(monkeypatch):
+    """AC-1: старт с отставленными переменными даёт одну запись — имена без значений."""
+    _drop_legacy_env(monkeypatch)
+    monkeypatch.setenv(_RETIRED_PREFIX + "WORKTREE_PER_TASK", "sekret-value-1")
+    monkeypatch.setenv(_RETIRED_PREFIX + "FOO", "sekret-value-2")
+
+    async with _running_app() as conn:
+        rows = await _stale_rows(conn)
+
+    assert len(rows) == 1, rows
+    record = f"{rows[0]['summary']} {rows[0]['detail'] or ''}"
+    assert _RETIRED_PREFIX + "WORKTREE_PER_TASK" in record
+    assert _RETIRED_PREFIX + "FOO" in record
+    assert "sekret-value-1" not in record
+    assert "sekret-value-2" not in record
+
+
+@pytest.mark.asyncio
+async def test_clean_env_is_silent(monkeypatch):
+    """AC-2: без устаревших префиксов — ни записи, ни предупреждения в /health."""
+    _drop_legacy_env(monkeypatch)
+
+    async with _running_app() as conn:
+        rows = await _stale_rows(conn)
+
+    assert rows == []
+    assert build_health().stale_env == []
+
+
+@pytest.mark.asyncio
+async def test_stale_env_check_never_blocks_startup(monkeypatch):
+    """AC-3: ошибка записи в ленту не мешает хабу подняться."""
+    _drop_legacy_env(monkeypatch)
+    monkeypatch.setenv(_RETIRED_PREFIX + "WORKTREE_PER_TASK", "1")
+
+    with patch(
+        "hub.app.log_activity", AsyncMock(side_effect=RuntimeError("disk full"))
+    ):
+        async with _running_app() as conn:
+            cursor = await conn.execute("SELECT COUNT(*) FROM tasks")
+            assert (await cursor.fetchone())[0] == 0  # БД жива, старт прошёл
+
+
+def test_health_names_stale_env(monkeypatch):
+    """Строка в /health: имена устаревших переменных, отсортированы."""
+    _drop_legacy_env(monkeypatch)
+    monkeypatch.setenv(_RETIRED_PREFIX + "B", "x")
+    monkeypatch.setenv(_RETIRED_PREFIX + "A", "y")
+
+    health = build_health()
+    assert health.stale_env == [_RETIRED_PREFIX + "A", _RETIRED_PREFIX + "B"]

@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.db import fetchall, get_db
+from hub.db import fetchall, get_db, log_activity
 from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -208,6 +208,26 @@ async def lifespan(app: FastAPI):
     # (stdio against a remote hub), and there "nowhere to record" is a mode,
     # not a failure.
     set_telemetry_sink(app.state.db)
+
+    # Мёртвые env-переменные (#964): устаревший префикс — это политика, которую
+    # оператор включил, а код никогда не увидит. Одна запись в ленту на старт,
+    # только имена, и best effort — сигнал не имеет права уронить подъём.
+    stale = config.stale_env_names()
+    if stale:
+        log.warning(
+            "Stale env prefix detected, hub will NOT read: %s", ", ".join(stale)
+        )
+        try:
+            await log_activity(
+                app.state.db,
+                "stale_env_detected",
+                "Мёртвые env-переменные: хаб не читает "
+                + ", ".join(stale)
+                + " — политики стоят на дефолтах, мигрируйте префикс",
+            )
+        except Exception:
+            log.exception("stale env activity write failed")
+
     poll_task = start_poller(app)
 
     # Drive the MCP session manager lifespan inside ours so /mcp/* requests
