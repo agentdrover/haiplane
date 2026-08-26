@@ -36,6 +36,12 @@ _release_stalls: dict[str, tuple[str, int, bool]] = {}
 # refusal this many cycles in a row is a stall a human has to resolve.
 RELEASE_STALL_CYCLES = 3
 
+# Per task: the delivery-gate refusal already reported while waiting (#971).
+# In memory for the same reason as _release_notices — it exists to stop the
+# same line repeating every thirty seconds, and a restart repeating one line
+# is cheaper than a table nobody reads.
+_pair_delivery_waits: dict[int, str] = {}
+
 POLL_INTERVAL = 30  # seconds
 
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
@@ -1196,6 +1202,133 @@ async def _sweep_sessions_retention(db) -> None:
         )
 
 
+async def _sweep_pair_delivery(db) -> None:
+    """Deliver approved pair work whose agent is not coming back (#971).
+
+    The headless conveyor has had this since #363: an approved verdict is
+    merged and completed by the poller, with no agent involved. A pair task
+    could not reach it — ``_sweep_review`` selects on ``status='review'`` and a
+    ``review_job_id``, and a pair task has neither (client-driven review,
+    #307, returns it to ``running``). So its only merge trigger was the
+    agent's own done report (#605), which attached the merge to the one event
+    that existed at the time rather than to a decision that it should be an
+    agent's to make.
+
+    What that cost, on 26.08.2026: a session submitted #954, died six minutes
+    later, and the APPROVED verdict landed an hour after that against a green,
+    mergeable PR. Nothing moved. The work sat in ``running`` until a human
+    called force-complete — a route with no button in the UI.
+
+    Nothing is loosened here. The same ``merge_before_completion`` runs, with
+    the same refusals: a red CI still calls a human, a branch that moved after
+    the approval still refuses (#612), and a CI still running is still a wait
+    rather than a decision (#951). Only the trigger changes — a state instead
+    of a call. Delivery stays exactly-once because the gate opens with
+    ``pipeline_merge_recorded`` (#363), so an agent that comes back finds its
+    work delivered rather than a refusal.
+    """
+    try:
+        rows = await repo.list_pair_tasks_awaiting_delivery(db)
+    except Exception:
+        log.exception("Poll: pair delivery sweep could not list tasks")
+        return
+    for row in rows:
+        task = dict(row)
+        with _task_isolation("pair-delivery", task.get("id")):
+            await _deliver_pair_task(db, task)
+
+
+async def _deliver_pair_task(db, task: dict) -> None:
+    """One approved pair task through the delivery gate (#971)."""
+    task_id = task["id"]
+    pr_num = task.get("pr_number")
+    ok, detail = await services.merge_before_completion(db, task)
+    if not ok:
+        # #951: a temporary state is not a decision, and the poller is the
+        # place that has always known it — it simply comes back next pass.
+        # Said once, not once per cycle: a line every thirty seconds is how a
+        # real signal gets muted (#534).
+        if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
+            await _note_pair_delivery_wait(db, task_id, pr_num, detail)
+            return
+        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Ревью одобрено, но PR #{pr_num} не доставлен — {detail}. "
+            "Задача не может считаться выполненной, пока работа не в базовой "
+            "ветке. Решение за человеком (hub_decide_task).",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "merge_gate", "detail": detail, "via": "poller"},
+        )
+        await db.commit()
+        log.info(
+            "Poll: task #%d → needs_decision: merge gate refused (%s)", task_id, detail
+        )
+        return
+
+    _pair_delivery_waits.pop(task_id, None)
+    # #812: delivery grew the release range. Best effort, exactly as on the
+    # done path — a release that could not be prepared is a reason in the log,
+    # never a failure of work that is already in the base branch.
+    try:
+        from hub.services.release import open_release_for_task
+
+        await open_release_for_task(db, task_id)
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning("release PR not prepared for #%s: %s", task_id, exc)
+
+    # Said out loud, because a completed task with no done report otherwise
+    # reads as a lost record rather than as work the hub carried home (AC-5).
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Доставлено хабом без отчёта агента: PR #{pr_num} влит по одобренному "
+        "ревью. Условия доставки были выполнены целиком, ждать было нечего. "
+        "Отчёт агента, если он придёт, ляжет сюда же рассказом о работе.",
+    )
+    # Completion WITHOUT bumping the generation: no new work is being
+    # submitted, and a bump would invalidate the very approval that authorises
+    # this delivery (#306).
+    await repo.update_task(db, task_id, status="completed")
+    await repo.insert_event(
+        db,
+        kind="task_completed",
+        task_id=task_id,
+        actor="hub",
+        payload={"via": "poller_delivery"},
+    )
+    await db.commit()
+    log.info("Poll: task #%d delivered and completed without a done report", task_id)
+
+
+async def _note_pair_delivery_wait(db, task_id: int, pr_num, detail: str) -> None:
+    """Say once that delivery is waiting, and then be quiet (#534)."""
+    if _pair_delivery_waits.get(task_id) == detail:
+        return
+    _pair_delivery_waits[task_id] = detail
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Доставка отложена: PR #{pr_num} — {detail}. Это временное "
+        "состояние, решение человека не требуется — хаб вернётся к нему "
+        "следующим циклом.",
+    )
+    await db.commit()
+    log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
+
+
 async def _sweep_release_policy(db) -> None:
     # Release policy (#812): projects that release by policy get their
     # open develop→main PR merged as soon as CI is green. A red or
@@ -1301,6 +1434,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
 
             await _sweep_running_dispatch(db)
             await _sweep_review(db)
+            await _sweep_pair_delivery(db)
             await _sweep_ci_check(db)
             await _sweep_stale_running(db)
             await _sweep_stale_statuses(db)

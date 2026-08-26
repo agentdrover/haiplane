@@ -520,6 +520,64 @@ async def list_review_tasks(
     )
 
 
+async def list_pair_tasks_awaiting_delivery(
+    db: aiosqlite.Connection,
+) -> list[aiosqlite.Row]:
+    """Pair tasks whose delivery is due by state rather than by a call (#971).
+
+    Every condition here is something the hub can see for itself: the verdict
+    belongs to the current submission, a PR exists to deliver, and no dispatch
+    job owns the task. None of them asks whether some process is still alive —
+    which is the whole point. On 26.08.2026 a session submitted #954 and died
+    six minutes later; the APPROVED verdict arrived an hour after that, with a
+    green PR ready to merge, and nothing happened, because the only merge
+    trigger a pair task had was the agent's own done report.
+
+    Whether the approval is CURRENT is decided by the one predicate that owns
+    that question — ``review_approved_for_current_submission`` (#306) — not by
+    a copy of it in SQL. A verdict from an earlier submission approved
+    different code, and this path has no agent standing by to notice the
+    difference; two definitions of "current" would drift, and the drift would
+    show up as delivered work nobody approved.
+    """
+    from hub.services.orchestration import review_approved_for_current_submission
+
+    rows = await fetchall(
+        db,
+        "SELECT * FROM tasks WHERE archived=0 AND status='running' "
+        "AND review_verdict='approved' "
+        "AND COALESCE(pr_number, 0) != 0 "
+        "AND COALESCE(job_id, '') = '' AND COALESCE(review_job_id, '') = ''",
+    )
+    return [r for r in rows if review_approved_for_current_submission(dict(r))]
+
+
+async def completed_by_poller_delivery(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Did the hub finish this task itself, with no done report (#971)?
+
+    Asked when a done report arrives for a task that is already complete. The
+    answer decides between two very different things: an agent reporting on
+    work the hub carried home while it was away, and a report on a task that
+    finished some other way. Read from the completion event rather than from
+    the feed text, because the event is what the poller writes and a message
+    is what anyone can.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id = ? AND kind = 'task_completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    if not rows:
+        return False
+    raw = dict(rows[0]).get("payload") or ""
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return str(payload.get("via") or "") == "poller_delivery"
+
+
 async def list_ci_check_tasks(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
