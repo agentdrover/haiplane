@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import socket
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
@@ -689,8 +690,14 @@ class GitOpsIntegration:
         branch_slug: str = "",
         repo: str | None = None,
         base_branch: str | None = None,
+        notify: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
-        """Safe branch setup for pair mode: never git-clean a dirty worktree."""
+        """Safe branch setup for pair mode: never git-clean a dirty worktree.
+
+        ``notify`` получает человекочитаемое сообщение, когда подготовка сделала
+        что-то, что должно быть видно в ленте (#966: авто-push осиротевшей
+        ветки). Колбэк, а не запись напрямую: у git-слоя нет соединения с БД.
+        """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
@@ -720,19 +727,48 @@ class GitOpsIntegration:
         other_id = _task_id_from_branch(current)
         if other_id is not None and other_id != task_id:
             if not await _branch_is_fully_pushed(current, repo):
-                raise _pair_branch_conflict(
-                    f"Branch {current!r} has unpushed commits; "
-                    f"push before pair-start for #{task_id}",
-                    repo=repo,
-                    reason="pair_branch_unpushed",
-                    hint=(
-                        f"On {_hostname()}: cd {repo} && "
-                        f"git push -u origin {current}, then retry "
-                        f"hub_pair_start for #{task_id}."
-                    ),
-                    current_branch=current,
-                    task_id=task_id,
+                # #966: отказ «зайди на сервер и запушь» невыполним для
+                # вызывающего — доступа к общему клону у агентов нет, и #961
+                # часами ждал человека с root. Push обычной task-ветки в origin
+                # безопасен и обратим (потеря непушенных коммитов — нет), так
+                # что хаб выполняет эту часть remediation сам и отказывает
+                # только когда она не удалась. Только ветки task-<id>/* —
+                # произвольные ветки публиковать не наше решение.
+                rc, _, push_err = await _git(
+                    "push", "-u", "origin", current, repo=repo, check=False
                 )
+                if rc != 0:
+                    raise _pair_branch_conflict(
+                        f"Branch {current!r} has unpushed commits; "
+                        f"auto-push failed, push before pair-start for #{task_id}",
+                        repo=repo,
+                        reason="pair_branch_unpushed",
+                        hint=(
+                            f"Auto-push of {current!r} failed: "
+                            f"{(push_err or '').strip() or 'git push failed'}. "
+                            f"On {_hostname()}: cd {repo} && "
+                            f"git push -u origin {current}, then retry "
+                            f"hub_pair_start for #{task_id}."
+                        ),
+                        current_branch=current,
+                        task_id=task_id,
+                    )
+                log.info(
+                    "pair_prepare_branch: auto-pushed orphaned %s to unblock #%s",
+                    current,
+                    task_id,
+                )
+                if notify is not None:
+                    try:
+                        await notify(
+                            f"pair-start #{task_id}: опубликована осиротевшая "
+                            f"ветка {current} (была непушена в общем клоне)"
+                        )
+                    except Exception:
+                        log.warning(
+                            "pair_prepare_branch: auto-push notification failed",
+                            exc_info=True,
+                        )
             log.info(
                 "pair_prepare_branch: auto-switching from pushed %s to %s for task #%s",
                 current,
