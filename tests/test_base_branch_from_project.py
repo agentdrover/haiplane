@@ -313,6 +313,8 @@ async def test_the_release_pr_runs_between_the_projects_own_branches(db, monkeyp
 
     git = NoopGitOps()
     git.release_range = AsyncMock(return_value=["feat(task): x (#1)"])
+    # #968: content is asked first; this project has work to release.
+    git.content_differs = AsyncMock(return_value=True)
     git.open_release_pr = AsyncMock(return_value=901)
     monkeypatch.setattr(plugins, "git_ops", git)
 
@@ -339,6 +341,8 @@ async def test_a_project_that_integrates_on_its_release_branch_has_no_release(
 
     git = NoopGitOps()
     git.release_range = AsyncMock(return_value=["feat(task): x (#1)"])
+    # #968: content is asked first; this project has work to release.
+    git.content_differs = AsyncMock(return_value=True)
     git.open_release_pr = AsyncMock(return_value=902)
     git.pr_for_branch = AsyncMock(return_value=903)
     git.check_pr_ci = AsyncMock(
