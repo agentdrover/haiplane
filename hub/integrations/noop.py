@@ -226,6 +226,23 @@ class NoopGitOps:
         """
         return None
 
+    async def return_release_into_base(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """No git here — "could not ask", never "nothing to return" (#969).
+
+        The distinction is load-bearing the same way it is in
+        content_differs: "nothing" would let the divergence pile up in
+        silence, and a silent pipeline failure is found later than a noisy
+        one.
+        """
+        return ("unavailable", "git integration is not configured")
+
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None:

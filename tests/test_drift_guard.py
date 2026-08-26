@@ -146,6 +146,48 @@ async def test_a_merge_the_hub_performed_is_not_drift(db: aiosqlite.Connection, 
     assert [r.status for r in reports if r.project_slug == "p"] == ["clean"]
 
 
+async def test_release_back_merge_is_not_a_stranger(db: aiosqlite.Connection, git):
+    """AC-4 (#969). The release now pushes a merge into the integration branch
+    itself — returning the release branch so the two stop diverging. That
+    commit has the shape this guard was built to catch: a merge on the base
+    that no task delivered. It is expected for the same reason every other
+    pipeline merge is — the hub recorded producing it — and nothing else. An
+    alert on every release would mute the guard, which is exactly how the
+    real drift then goes unnoticed."""
+    project_id = await _project_with_baseline(db)
+    await repo.record_pipeline_merge(
+        db, pr_number=83, merge_sha="back999", project_id=project_id
+    )
+    git(
+        log=_log(
+            ("back999", "chore: return main into develop after the release", "hub"),
+            ("base000", "older history", "hub"),
+        )
+    )
+
+    reports = await drift_guard.check_all_projects(db)
+
+    assert [r.status for r in reports if r.project_slug == "p"] == ["clean"]
+
+
+async def test_an_unrecorded_return_is_still_drift(db: aiosqlite.Connection, git):
+    """The other side of AC-4: recognition comes from the record, not from the
+    words. A commit calling itself a release return, which the hub never
+    performed, stays drift — otherwise the subject line becomes the bypass
+    #534 spent two submissions closing."""
+    await _project_with_baseline(db)
+    git(
+        log=_log(
+            ("fake999", "chore: return main into develop after the release", "someone"),
+            ("base000", "older history", "hub"),
+        )
+    )
+
+    reports = await drift_guard.check_all_projects(db)
+
+    assert [r.status for r in reports if r.project_slug == "p"] == ["drift"]
+
+
 async def test_a_pull_request_number_in_the_subject_proves_nothing(
     db: aiosqlite.Connection, git
 ):

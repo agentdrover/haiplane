@@ -2231,6 +2231,115 @@ class GitOpsIntegration:
                 return True
         return None
 
+    async def return_release_into_base(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """Merge the release branch back into the integration branch (#969).
+
+        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
+        names rather than three, because a conflict and a git that could not
+        be asked need different hands: one is a merge somebody has to resolve,
+        the other is a question to ask again next cycle. Collapsing them is
+        how #725 gets repeated with new words.
+
+        Called the moment the release merge lands, and the moment matters. A
+        squash release writes a NEW commit on the release branch instead of
+        carrying the originals, so the branch it came from does not contain
+        it, and the two diverge by one commit per release. Right here that
+        commit holds EXACTLY the tree the integration branch already has and
+        the merge base is fresh, so the merge is trivial by construction.
+        Left to age it stops being trivial: on 26.08.2026 five releases'
+        worth of them collided in ``hub/db.py`` and release PR #83 stood
+        conflicted with 13 tasks undelivered.
+
+        Asks GitHub to do the merge rather than driving the workspace clone.
+        The clone is shared, may sit on someone else's branch with a dirty
+        tree, and carries an armed pre-push hook — three ways for a
+        bookkeeping merge to damage work in progress (#949 was one of them).
+        The merges endpoint has no such surface: it answers 201 with the new
+        commit, 204 when there is nothing to merge, 409 on a conflict.
+        """
+        if not gh_repo and not REPO_NAME:
+            return ("unavailable", "не названо, в каком репозитории возвращать")
+        rc, out, err = await _gh(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{gh_repo or REPO_NAME}/merges",
+            "-f",
+            f"base={head}",
+            "-f",
+            f"head={base}",
+            "-f",
+            f"commit_message=chore: return {base} into {head} after the release",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            # 204 — «уже содержит», и gh печатает пустоту. Это ответ, а не
+            # промах: возвращать нечего.
+            body = (out or "").strip()
+            if not body:
+                return ("nothing", f"{head} уже содержит {base}")
+            try:
+                sha = str(json.loads(body).get("sha") or "").strip()
+            except json.JSONDecodeError:
+                return ("unavailable", f"ответ GitHub не разобран: {body[:150]}")
+            if not sha:
+                return ("unavailable", "GitHub не назвал коммит возврата")
+            return ("returned", sha)
+
+        detail = (err or "").strip() or "gh молчит"
+        if "409" in detail or "conflict" in detail.lower():
+            files = await self._conflicting_files(base, head, repo=repo)
+            named = f": {', '.join(files)}" if files else ""
+            return ("conflict", f"{base} не сливается с {head} без конфликта{named}")
+        return ("unavailable", detail[:200])
+
+    async def _conflicting_files(
+        self, base: str, head: str, repo: str | None = None
+    ) -> list[str]:
+        """Which files a conflicting back-merge collides on, if git can say.
+
+        Best effort by contract: GitHub's 409 names nothing, and the local
+        clone may be absent, stale, or running a git too old for
+        ``merge-tree --write-tree``. Empty means "could not name them", never
+        "there were none" — the caller reports the conflict either way, since
+        a conflict without a file list is still a conflict somebody must go
+        and resolve.
+        """
+        if not repo:
+            return []
+        await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=repo,
+            check=False,
+        )
+        rc, out, _ = await _git(
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            f"origin/{head}",
+            f"origin/{base}",
+            repo=repo,
+            check=False,
+        )
+        # rc 1 is the conflicted case; the block after the tree oid lists the
+        # paths. rc 0 means it merged cleanly here — the clone is behind what
+        # GitHub just refused, so nothing is claimed.
+        if rc != 1:
+            return []
+        lines = [ln.strip() for ln in (out or "").splitlines()[1:] if ln.strip()]
+        return lines[:10]
+
     async def release_range(
         self,
         base: str,
