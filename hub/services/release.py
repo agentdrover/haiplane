@@ -35,7 +35,7 @@ from hub import config
 from hub import git_policy
 from hub import repository as repo
 from hub.db import log_activity
-from hub.integrations.protocols import CIProbeOutcome
+from hub.integrations.protocols import CIProbeOutcome, MergeabilityOutcome
 from hub.integrations.registry import plugins
 from hub.services.project_policy import (
     base_branch_of,
@@ -253,6 +253,24 @@ async def merge_ready_release(
             return False, (
                 f"релизный PR #{pr_number} не смержен: ci_{ci.outcome.value} "
                 f"({ci.reason})"
+            )
+        # #970: green CI is not permission to merge. PR #83 held both answers
+        # at once — checks passed, mergeable=CONFLICTING — and asking only the
+        # first one meant the poller learned the second by being refused, and
+        # could report it only as «GitHub отказал». That sentence names who
+        # said no; a conflict, a revoked token and a deleted base branch all
+        # produce it and none is fixed the same way.
+        state, why = await plugins.git_ops.check_pr_mergeable(
+            pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
+        )
+        if state != MergeabilityOutcome.mergeable:
+            # Never merged on anything but a definite yes. "Not computed yet"
+            # is the ordinary state of a release PR seconds after the poller
+            # opened it, so it is reported as itself and asked again next
+            # cycle — reading it as a conflict would cry wolf on every
+            # release, and a muted guard misses the real one (#725).
+            return False, (
+                f"релизный PR #{pr_number} не смержен: {state.value} ({why})"
             )
         merged = await plugins.git_ops.merge_pr(
             pr_number,
