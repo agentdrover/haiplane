@@ -139,6 +139,108 @@ def human_only_gate_detail(message: str | None = None) -> dict[str, Any]:
     )
 
 
+def chat_pair_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
+    """A chat-pair session reached a route outside its allowlist (#961).
+
+    Deny-by-default, so this refusal covers routes that do not exist yet as
+    well as the ones that do — including the branches where "not an agent"
+    silently means "a human" (review-verdict, pair-start, projects, threads).
+    """
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_gate_forbidden",
+            "actor_hint": "human",
+            "message": f"chat-pair sessions may not call {method} {path}",
+            "hint": (
+                "The chat-pair channel exists to post and sharpen tasks: read "
+                "tasks, create one, refine it, edit its acceptance criteria and "
+                "risks. Gates, decisions, admin and /mcp need the token on your "
+                "laptop, not the code from the chat."
+            ),
+            "required_role": "human",
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_invalid_detail() -> dict[str, Any]:
+    """One answer for unknown, spent and expired codes (#961).
+
+    Three distinguishable refusals would tell somebody guessing codes which
+    guesses were close, so the message says only what the operator needs.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_invalid",
+            "actor_hint": "human",
+            "message": "pairing code is not valid",
+            "hint": (
+                "A code works once and lives about five minutes; asking for a "
+                "new one also burns the previous. Take a fresh code in the hub "
+                "(Web UI or POST /api/auth/chat-pair/start) and paste that."
+            ),
+            "required_role": None,
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_rate_limited_detail() -> dict[str, Any]:
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_rate_limited",
+            "actor_hint": "human",
+            "message": "too many pairing attempts from this address",
+            "hint": (
+                "Wait for the window to pass, then redeem a fresh code. Web "
+                "login is not affected — this limiter is the pairing one."
+            ),
+            "required_role": None,
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_auth_required_detail() -> dict[str, Any]:
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_auth_required",
+            "actor_hint": "human",
+            "message": "chat pairing needs an authenticated hub",
+            "hint": (
+                "This hub runs in open mode (no principals or HAIPLANE_HUB_TOKENS), "
+                "so there is no identity a pairing code could carry. Configure "
+                "auth first; in open mode the REST API is already open."
+            ),
+            "required_role": None,
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_run_forbidden_detail(field: str) -> dict[str, Any]:
+    """Create is allowed, dispatching from it is not (#961).
+
+    A refusal rather than a silent reset of the field: quiet degradation would
+    read in the chat as "it started", and an opt-out of review is a decision
+    that must not be taken from a channel living in somebody else's transcript.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_run_forbidden",
+            "actor_hint": "human",
+            "message": f"chat-pair sessions may not set {field} on task creation",
+            "hint": (
+                "Post the task without run_immediately and without "
+                "auto_review=false; start it from the hub when you are back at "
+                "a machine that can watch the run."
+            ),
+            "required_role": "human",
+            "suggested_tool": None,
+        }
+    )
+
+
 def agent_create_forbidden_detail() -> dict[str, Any]:
     """Agents propose, humans create (#360).
 

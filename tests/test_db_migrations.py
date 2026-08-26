@@ -997,3 +997,82 @@ async def test_category_check_needs_a_named_check():
             )
     finally:
         await conn.close()
+
+
+# --- Chat-pair: код в чате → короткая сессия (#961) --------------------------
+
+
+async def test_chat_pair_tables_exist():
+    """AC-19 (#961): свежая БД и БД до миграции приходят к одной схеме.
+
+    Секрет здесь — свойство схемы, а не правило, которое надо помнить: колонок
+    под plaintext кода или токена нет, есть только ``code_hash`` / ``token_hash``,
+    и уникальность hash не даёт двум строкам жить под одним секретом.
+    """
+    fresh = await _make_db()
+    upgraded = await _make_db()
+    try:
+        for table in ("chat_pair_codes", "chat_pair_sessions"):
+            cols = await _table_columns(fresh, table)
+            assert cols, f"после миграции нет таблицы {table}"
+            assert not [c for c in cols if c in ("code", "token", "secret")]
+
+        codes = await _table_columns(fresh, "chat_pair_codes")
+        assert codes["code_hash"]["notnull"] == 1
+        assert codes["expires_at"]["notnull"] == 1
+        assert "redeemed_at" in codes
+        sessions = await _table_columns(fresh, "chat_pair_sessions")
+        assert sessions["token_hash"]["notnull"] == 1
+        assert sessions["expires_at"]["notnull"] == 1
+        assert "revoked_at" in sessions
+
+        # Хаб, поднятый до этой миграции: таблиц нет и записи о миграции нет.
+        await upgraded.execute("DROP TABLE chat_pair_codes")
+        await upgraded.execute("DROP TABLE chat_pair_sessions")
+        await upgraded.execute(
+            "DELETE FROM _migrations WHERE name LIKE 'create_chat_pair%' "
+            "OR name LIKE 'idx_chat_pair%'"
+        )
+        await upgraded.commit()
+
+        await _migrate(upgraded)
+        await _migrate(upgraded)  # второй прогон ничего не меняет
+
+        for table in ("chat_pair_codes", "chat_pair_sessions"):
+            assert await _table_columns(upgraded, table) == (
+                await _table_columns(fresh, table)
+            )
+    finally:
+        await fresh.close()
+        await upgraded.close()
+
+
+async def test_chat_pair_hash_is_unique():
+    """Один и тот же hash кода или токена не может жить в двух строках."""
+    conn = await _make_db()
+    try:
+        await conn.execute(
+            "INSERT INTO principals (id, kind, username) VALUES (1, 'human', 'alice')"
+        )
+        await conn.commit()
+        await conn.execute(
+            "INSERT INTO chat_pair_codes (principal_id, code_hash, expires_at) "
+            "VALUES (1, 'h', datetime('now', '+5 minutes'))"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO chat_pair_codes (principal_id, code_hash, expires_at) "
+                "VALUES (1, 'h', datetime('now', '+5 minutes'))"
+            )
+        await conn.rollback()
+        await conn.execute(
+            "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at) "
+            "VALUES (1, 't', datetime('now', '+2 hours'))"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at) "
+                "VALUES (1, 't', datetime('now', '+2 hours'))"
+            )
+    finally:
+        await conn.close()

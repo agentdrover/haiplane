@@ -1365,6 +1365,48 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, generation)
         )""",
     ),
+    (
+        # Chat-pair (#961): a one-time code pasted into a chat, exchanged for a
+        # short session. Deliberately NOT ``api_keys``: those live for days by
+        # design, and stretching them down to minutes would have made every
+        # other key's expiry a matter of interpretation.
+        #
+        # Only the hash is stored, and there is nowhere to put anything else —
+        # the secret's privacy is a property of the schema, not a rule someone
+        # has to remember. UNIQUE on the hash so one code cannot exist twice.
+        "create_chat_pair_codes",
+        """CREATE TABLE IF NOT EXISTS chat_pair_codes (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id)
+                         ON DELETE CASCADE,
+            code_hash    TEXT    NOT NULL UNIQUE,
+            expires_at   TEXT    NOT NULL,
+            redeemed_at  TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "create_chat_pair_sessions",
+        """CREATE TABLE IF NOT EXISTS chat_pair_sessions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id)
+                         ON DELETE CASCADE,
+            token_hash   TEXT    NOT NULL UNIQUE,
+            expires_at   TEXT    NOT NULL,
+            revoked_at   TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_chat_pair_codes_principal",
+        "CREATE INDEX IF NOT EXISTS idx_chat_pair_codes_principal "
+        "ON chat_pair_codes(principal_id)",
+    ),
+    (
+        "idx_chat_pair_sessions_principal",
+        "CREATE INDEX IF NOT EXISTS idx_chat_pair_sessions_principal "
+        "ON chat_pair_sessions(principal_id)",
+    ),
 ]
 
 

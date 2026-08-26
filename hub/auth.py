@@ -16,7 +16,9 @@ Agent tokens are restricted from human-only operations.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -28,6 +30,7 @@ from starlette.responses import Response
 
 from hub import brand, config
 from hub.actionable_errors import (
+    chat_pair_gate_forbidden_detail,
     human_only_gate_detail,
     permission_denied_detail,
     withdraw_agent_only_detail,
@@ -119,8 +122,82 @@ _PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
         "/favicon.ico",
         "/robots.txt",
         "/api/admin/bootstrap",
+        # Chat-pair redeem (#961): the caller has no identity yet — the code IS
+        # the credential. Guarded by its own per-IP limiter and by a code that
+        # works once and lives minutes.
+        "/api/auth/chat-pair/redeem",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Chat-pair route allowlist (#961)
+# ---------------------------------------------------------------------------
+#
+# Identity in the hub is binary — human or agent — and chat-pair is a third
+# state. Every branch shaped ``if identity.is_agent: ... else: <human path>``
+# hands such a session the human path by default, and several of those
+# branches have no gate at all (review-verdict, pair-start, project creation,
+# message threads). Listing them to close them would mean catching the next one
+# too, forever; so access is a positive list and everything else is refused,
+# including routes that do not exist yet.
+#
+# Method AND path, never a prefix: ``/api/tasks/`` as a prefix would have let
+# through ``approve`` and ``decide``.
+CHAT_PAIR_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/whoami"),
+    ("GET", "/api/diagnostics/identity"),
+    ("GET", "/api/tasks"),
+    ("GET", "/api/tasks/{task_id}"),
+    ("GET", "/api/tasks/{task_id}/tree"),
+    ("GET", "/api/tasks/{task_id}/context"),
+    ("GET", "/api/tasks/{task_id}/readiness"),
+    ("POST", "/api/tasks"),
+    ("POST", "/api/tasks/{task_id}/refine"),
+    ("GET", "/api/tasks/{task_id}/acceptance_criteria"),
+    ("POST", "/api/tasks/{task_id}/acceptance_criteria"),
+    # Replace-by-list and delete are here on purpose: this is the same
+    # acceptance-criteria authoring the channel exists for, and neither touches
+    # anything outside the draft of a task.
+    ("PUT", "/api/tasks/{task_id}/acceptance_criteria"),
+    ("PUT", "/api/tasks/{task_id}/acceptance_criteria/{ac_id}"),
+    ("DELETE", "/api/tasks/{task_id}/acceptance_criteria/{ac_id}"),
+    ("POST", "/api/tasks/{task_id}/risks"),
+    ("POST", "/api/auth/chat-pair/redeem"),
+    # The one route a session calls about itself: finishing the channel from
+    # the phone must not require going back to the laptop.
+    ("POST", "/api/auth/chat-pair/revoke"),
+)
+
+
+def _template_to_regex(template: str) -> re.Pattern[str]:
+    """``/api/tasks/{task_id}/refine`` → an anchored regex over path segments.
+
+    ``AuthMiddleware.dispatch`` runs before routing, so FastAPI's route
+    template is not known there — only the raw path. Compiling the templates
+    once at import keeps the check a match against a known shape rather than
+    string surgery on every request.
+    """
+    parts = [
+        "[^/]+" if seg.startswith("{") and seg.endswith("}") else re.escape(seg)
+        for seg in template.split("/")
+    ]
+    return re.compile("^" + "/".join(parts) + "$")
+
+
+_CHAT_PAIR_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in CHAT_PAIR_ALLOWLIST
+)
+
+
+def chat_pair_route_allowed(method: str, path: str) -> bool:
+    """Whether a chat-pair session may reach ``(method, path)``."""
+    probe = "GET" if method == "HEAD" else method
+    return any(
+        probe == allowed_method and pattern.match(path)
+        for allowed_method, pattern in _CHAT_PAIR_ALLOWED
+    )
+
 
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
@@ -149,6 +226,19 @@ def _with_auth_source(
         auth_source=auth_source,
         api_key_id=api_key_id,
     )
+
+
+def client_ip(request: Request) -> str:
+    """The address a per-IP limiter counts against.
+
+    One reader for the proxy header: the web login, the pairing redeem and
+    anything added later must agree on who the caller is, or a limit measured
+    in one place will be spent in another.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _looks_public(path: str) -> bool:
@@ -224,13 +314,32 @@ async def _resolve_db_session(request: Request, token: str) -> TokenIdentity | N
         return None
 
 
+async def _resolve_chat_pair(request: Request, token: str) -> TokenIdentity | None:
+    """Try to resolve a bearer token as a chat-pair session (#961)."""
+    db_conn = getattr(getattr(getattr(request, "app", None), "state", None), "db", None)
+    if db_conn is None:
+        return None
+    try:
+        from hub.services.chat_pair import resolve_session
+
+        return await resolve_session(db_conn, token)
+    except Exception:
+        return None
+
+
 async def _resolve_identity(request: Request) -> TokenIdentity | None:
     """Resolve identity from bearer header or session cookie.
 
-    Priority: bearer DB key > bearer env token > cookie DB session > cookie env token.
+    Priority: bearer chat-pair session > bearer DB key > bearer env token >
+    cookie DB session > cookie env token. Chat-pair goes first because its
+    tokens carry their own prefix — the lookup is one indexed hash, and the
+    session must never be mistaken for the API key of the same principal.
     """
     bearer = _extract_bearer(request)
     if bearer:
+        identity = await _resolve_chat_pair(request, bearer)
+        if identity:
+            return identity
         identity = await _resolve_db_bearer(request, bearer)
         if identity:
             return identity
@@ -269,6 +378,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         try:
             if _looks_public(path):
                 identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+                if _chat_pair_refused(identity, request.method, path):
+                    return _chat_pair_forbidden(request.method, path)
                 request.state.user = identity.username
                 request.state.identity = identity
                 return await call_next(request)
@@ -291,6 +402,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     return await call_next(request)
                 return _unauthorized(request)
             identity = resolved
+            # The allowlist is checked HERE, before the route runs, so a branch
+            # that reads "not an agent" as "a human" never executes for a
+            # chat-pair session in the first place (#961).
+            if _chat_pair_refused(identity, request.method, path):
+                return _chat_pair_forbidden(request.method, path)
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):
@@ -332,6 +448,24 @@ def _unauthorized(request: Request) -> Response:
         content='{"detail":"authentication required"}',
         media_type="application/json",
         headers={"WWW-Authenticate": 'Bearer realm="haiplane-hub"'},
+    )
+
+
+def _chat_pair_refused(identity: TokenIdentity, method: str, path: str) -> bool:
+    return identity.auth_source == "chat_pair" and not chat_pair_route_allowed(
+        method, path
+    )
+
+
+def _chat_pair_forbidden(method: str, path: str) -> Response:
+    """403 with the same actionable payload the REST handlers raise (#961)."""
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {"detail": chat_pair_gate_forbidden_detail(method, path)},
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
     )
 
 
