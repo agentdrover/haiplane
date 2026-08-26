@@ -160,6 +160,28 @@ async def open_release_for_range(
     # a main→main PR is a failure, not a release.
     if head == base:
         return None, [], [], ""
+
+    # #968: the range is not the question. A squash release writes a NEW
+    # commit on the release branch instead of carrying the originals, so
+    # base..head keeps every commit ever released and never empties. Counting
+    # them read as undelivered work forever: on 26.08.2026 the poller opened
+    # twenty release PRs in ninety minutes, nineteen empty, each redeploying
+    # production. Ask about content instead, and keep the three answers apart —
+    # "could not compare" is named, never mistaken for "all delivered" (#725).
+    differs = await plugins.git_ops.content_differs(
+        base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+    )
+    if differs is None:
+        return (
+            None,
+            [],
+            [],
+            f"нечего ли релизить {head} → {base}, выяснить не удалось: "
+            "git не сравнил содержимое веток",
+        )
+    if not differs:
+        return None, [], [], ""
+
     try:
         subjects = await plugins.git_ops.release_range(
             base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")

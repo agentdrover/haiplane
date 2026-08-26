@@ -186,6 +186,13 @@ class GitOpsPlugin(Protocol):
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
     ) -> bool | None: ...
+    async def content_differs(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None: ...

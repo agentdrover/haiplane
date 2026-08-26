@@ -2149,6 +2149,52 @@ class GitOpsIntegration:
         """
         return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
 
+    async def content_differs(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """Does ``head`` hold content ``base`` does not? (#968)
+
+        Three answers, like every other question asked of git here. ``True`` —
+        the branches differ and there is something to release. ``False`` — the
+        content is identical, whatever the commit graph says. ``None`` — the
+        question could not be asked, and the caller must not read that as
+        "nothing to release".
+
+        Exists because counting commits stopped answering this question. A
+        squash release writes a new commit on the release branch instead of
+        carrying the originals, so ``base..head`` never empties and every
+        cycle looked like undelivered work. On 26.08.2026 that opened twenty
+        release PRs in ninety minutes, nineteen of them empty, each one
+        redeploying production. Trees are how git states "the same content",
+        so this compares them directly rather than counting what the graph
+        happens to contain.
+        """
+        # The clone may be behind, and the question is about upstream, not
+        # about this checkout — so refresh the two ends first. A fetch that
+        # fails is not fatal: the local refs may still answer, and only a
+        # failure to COMPARE is "could not ask".
+        await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=repo,
+            check=False,
+        )
+        for left, right in ((f"origin/{base}", f"origin/{head}"), (base, head)):
+            rc, _, _ = await _git(
+                "diff", "--quiet", left, right, repo=repo, check=False
+            )
+            if rc == 0:
+                return False
+            if rc == 1:
+                return True
+        return None
+
     async def release_range(
         self,
         base: str,
