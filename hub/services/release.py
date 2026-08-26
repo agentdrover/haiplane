@@ -271,7 +271,12 @@ async def merge_ready_release(
         return False, f"релизный PR #{pr_number} не смержен: GitHub отказал"
     await _stamp_released_merges(db, project_row, pr_number, ctx)
     note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
-    return True, f"релиз PR #{pr_number} смержен в {base}{note}"
+    # After the stamp, never before: #950 marks every UNRELEASED merge as
+    # carried by this release, and the return commit was not — it rides out
+    # with the next one. Recording it earlier would stamp it with a release
+    # that did not contain it.
+    back = await _return_the_release(db, project_row, head, base, ctx, pr_number)
+    return True, f"релиз PR #{pr_number} смержен в {base}{note}{back}"
 
 
 async def _open_release_for_tail(
@@ -402,6 +407,74 @@ async def _stamp_released_merges(
             )
     except Exception:  # noqa: BLE001 - bookkeeping must not fail the release
         log.exception("release #%s: could not stamp released merges", pr_number)
+
+
+async def _return_the_release(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    head: str,
+    base: str,
+    ctx: dict[str, Any],
+    pr_number: int,
+) -> str:
+    """Give the release branch back to the branch it came from (#969).
+
+    A squash release writes a new commit on the release branch that the
+    integration branch does not contain, so the two drift apart by one commit
+    per release — and nothing ever closed the gap. On 26.08.2026 five of them
+    collided: release PR #83 stood conflicted in ``hub/db.py`` at green CI
+    with 13 tasks undelivered, and the same manual repair had already been
+    done twenty hours earlier (PR #36, then PR #85). Two identical hand
+    operations in a day are a missing conveyor step.
+
+    Reported next to the release, never instead of it. The release happened —
+    the code is in production — and a failure here is a separate named cause,
+    because letting it read as a failed release would send a task whose code
+    is already deployed back for fixes.
+    """
+    try:
+        state, detail = await plugins.git_ops.return_release_into_base(
+            base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning("release: could not return %s into %s: %s", base, head, exc)
+        return f"; возврат {base} в {head} не выполнен: {exc}"
+
+    if state == "nothing":
+        # The common case once this works: the poller walks here every cycle,
+        # and a line per cycle is how a real signal gets muted (#534).
+        return ""
+    slug = dict(project_row).get("slug") or "?"
+    if state == "returned":
+        # Drift-guard judges by SHA: a commit on the base branch is expected
+        # only when the hub recorded producing it (#534). An unrecorded return
+        # would raise an alert about the hub's own merge on every release —
+        # trading a hand-made rule violation for an automated one.
+        try:
+            await repo.record_pipeline_merge(
+                db,
+                pr_number=pr_number,
+                merge_sha=detail,
+                project_id=int(dict(project_row)["id"]),
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must not fail a release
+            log.exception("release: return %s recorded nowhere", detail[:12])
+        await log_activity(
+            db,
+            "release",
+            f"{slug}: {base} возвращён в {head} после релиза",
+            f"merge {detail[:12]}; расхождение закрыто в тот же момент, "
+            "пока слияние тривиально",
+        )
+        return f"; {base} возвращён в {head} ({detail[:12]})"
+
+    summary = (
+        f"{slug}: возврат {base} в {head} не прошёл — конфликт"
+        if state == "conflict"
+        else f"{slug}: возврат {base} в {head} не проверен"
+    )
+    await log_activity(db, "release", summary, detail)
+    return f"; возврат {base} в {head} не выполнен: {detail}"
 
 
 async def _keep_the_integration_branch(

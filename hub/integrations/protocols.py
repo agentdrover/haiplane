@@ -196,6 +196,14 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool | None: ...
+    async def return_release_into_base(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None: ...
