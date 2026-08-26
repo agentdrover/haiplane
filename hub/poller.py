@@ -1255,9 +1255,19 @@ async def _session_reaper(app: FastAPI) -> None:
             if deleted:
                 log.info("Session reaper: removed %d expired/revoked sessions", deleted)
 
+            # Chat-pair rows die on the same hourly cycle (#961): the channel
+            # is minutes-to-hours long, so a table that only ever grew would be
+            # an archive of dead secrets' hashes.
+            from hub.services.chat_pair import chat_pair_limiter, purge_expired
+
+            purged = await purge_expired(db)
+            if purged:
+                log.info("Session reaper: removed %d chat-pair rows", purged)
+
             from hub.auth import login_limiter
 
             login_limiter._cleanup()
+            chat_pair_limiter._cleanup()
         except Exception:
             log.exception("Session reaper error")
 

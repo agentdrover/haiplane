@@ -16,6 +16,7 @@
 2. [Два транспорта: stdio и streamable HTTP](#2-два-транспорта-stdio-и-streamable-http)
 3. [Быстрый старт с нуля (streamable)](#3-быстрый-старт-с-нуля-streamable)
 4. [Подключение Cursor](#4-подключение-cursor)
+4a. [Cloud / iOS: чат без MCP](#4a-cloud--ios-чат-без-mcp)
 5. [Проверка curl](#5-проверка-curl)
 6. [Диагностика identity и health](#6-диагностика-identity-и-health)
 7. [Troubleshooting](#7-troubleshooting)
@@ -202,6 +203,67 @@ curl -sS \
   }
 }
 ```
+
+---
+
+## 4a. Cloud / iOS: чат без MCP
+
+Cursor for iOS и `cursor.com/agents` не дают добавить свой MCP: облачная сессия
+не видит `.cursor/mcp.json`, и агент в таком чате без личности получает 401,
+либо `403 agent_create_forbidden`. Для этого случая есть **chat-pair** —
+одноразовый код, который обменивается на короткую сессию с правами только на
+постановку и уточнение задач (#961).
+
+**Никогда не вставляйте в чат ноутбучный `HAIPLANE_HUB_MCP_TOKEN`**: он живёт
+днями и останется в транскрипте Cursor навсегда. В чат идёт только код с кнопки.
+
+### Как оператору
+
+1. Откройте хаб в браузере (в том числе на телефоне) → **«Подключить чат»**
+   (`/chat-pair`) → кнопка **«Получить код»**.
+2. Код вида `AH-7K2M9QRS` живёт ~5 минут, работает один раз, и запрос нового
+   кода сжигает предыдущий.
+3. В чате Cursor напишите агенту: `хаб: AH-7K2M9QRS`.
+4. Закончили — кнопка **«Отозвать чат-сессии»** на той же странице. Вход в
+   браузере и API-ключи она не трогает.
+
+### Как агенту в облачном чате
+
+```bash
+# 1. Обменять код на сессию (публичный маршрут, Authorization не нужен)
+curl -sS -X POST https://<hub>/api/auth/chat-pair/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"AH-7K2M9QRS"}'
+# → { "token": "...", "expires_at": "...", "username": "...",
+#     "role": "human", "base_url": "...", "permissions": [...] }
+
+# 2. Проверить, что это действительно chat-pair сессия
+curl -sS https://<hub>/api/whoami -H "Authorization: Bearer $TOKEN"
+# → auth_source=chat_pair, permissions: tasks.read/create/refine/update
+
+# 3. Поставить задачу
+curl -sS -X POST https://<hub>/api/tasks -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"title":"...","description":"..."}'
+```
+
+Правила для агента:
+
+1. **Токен не эхом.** Не печатать его в чат, в task updates, в описание PR.
+2. Задача создаётся в `open`. `run_immediately` и `auto_review=false` этот канал
+   отклоняет с 422 `chat_pair_run_forbidden` — запуск исполнения делается из
+   хаба, а не из чужого транскрипта.
+3. Всё, кроме постановки и уточнения задачи, закрыто: approve, review-verdict,
+   pair-start, проекты, треды, `/api/admin/*` и сам `/mcp` отвечают 403
+   `chat_pair_gate_forbidden`. Это не баг канала, а его граница.
+4. Повторный код — 401 `chat_pair_invalid`; неизвестный и просроченный отвечают
+   ровно так же.
+
+Настройки на сервере (drop-in, все с разумными дефолтами):
+`HAIPLANE_CHAT_PAIR_CODE_SECONDS` (300), `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200),
+`HAIPLANE_CHAT_PAIR_REDEEM_MAX` / `HAIPLANE_CHAT_PAIR_REDEEM_WINDOW_SECONDS`
+(10 / 300). В open mode (хаб без принципалов и `HAIPLANE_HUB_TOKENS`) канал
+отвечает 503 `chat_pair_auth_required`: без auth нет и личности, которую мог бы
+нести код.
 
 ---
 

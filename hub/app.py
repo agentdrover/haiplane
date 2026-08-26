@@ -34,6 +34,10 @@ from hub.models import (
     DeployCallback,
     DeployView,
     ProdStateView,
+    ChatPairRedeem,
+    ChatPairRedeemed,
+    ChatPairRevoked,
+    ChatPairStartView,
     CIRunReportResult,
     CIRunReportSubmit,
     BulkChildTasksCreate,
@@ -97,13 +101,26 @@ from hub.models import (
     TaskView,
     WhoamiView,
 )
-from hub.actionable_errors import agent_create_forbidden_detail
+from hub.actionable_errors import (
+    agent_create_forbidden_detail,
+    chat_pair_auth_required_detail,
+    chat_pair_invalid_detail,
+    chat_pair_rate_limited_detail,
+    chat_pair_run_forbidden_detail,
+    human_only_gate_detail,
+)
 from hub.auth import (
     AuthMiddleware,
+    CSRF_COOKIE_NAME,
+    CSRF_FIELD_NAME,
+    CSRF_HEADER_NAME,
+    _extract_bearer,
+    client_ip,
     current_identity,
     require_agent_caller,
     require_human_or_admin,
     require_permission,
+    verify_csrf,
 )
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
@@ -114,6 +131,9 @@ from hub.mcp_catalog import (
     load_budget,
     load_measured,
 )
+from hub.hub_instance import hub_base_url
+from hub.services import admin as admin_svc
+from hub.services import chat_pair
 from hub.services import project_policy
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -315,6 +335,133 @@ async def api_whoami(request: Request) -> WhoamiView:
     return build_whoami(current_identity(request))
 
 
+# ---------------------------------------------------------------------------
+# REST API — Chat pairing (#961)
+# ---------------------------------------------------------------------------
+
+
+def _guard_chat_pair_enabled() -> None:
+    """Open mode has no identity a code could carry, so pairing is refused."""
+    if _is_open_mode():
+        raise HTTPException(503, detail=chat_pair_auth_required_detail())
+
+
+async def _chat_pair_issuer(request: Request) -> int:
+    """The principal allowed to issue or revoke pairing codes.
+
+    Two ways in and no third: a human Bearer token, or a cookie session with a
+    valid CSRF token. Without the CSRF check any page on the internet could
+    make the operator's browser burn their live code.
+    """
+    identity = current_identity(request)
+    if identity.is_agent:
+        raise HTTPException(403, detail=human_only_gate_detail())
+
+    if _extract_bearer(request) is None:
+        presented = request.headers.get(CSRF_HEADER_NAME)
+        if presented is None and "form" in (request.headers.get("content-type") or ""):
+            form = await request.form()
+            value = form.get(CSRF_FIELD_NAME)
+            presented = value if isinstance(value, str) else None
+        if not verify_csrf(presented, request.cookies.get(CSRF_COOKIE_NAME, "")):
+            raise HTTPException(
+                403,
+                detail=human_only_gate_detail(
+                    "cookie-authenticated pairing requires a valid CSRF token"
+                ),
+            )
+
+    if identity.principal_id is None:
+        # An env-token identity has no principal to attribute the session to,
+        # and a session without an owner could not be revoked by anyone.
+        raise HTTPException(503, detail=chat_pair_auth_required_detail())
+    return identity.principal_id
+
+
+@app.post("/api/auth/chat-pair/start", response_model=ChatPairStartView)
+async def api_chat_pair_start(request: Request) -> ChatPairStartView:
+    """Issue a one-time pairing code for the calling human (#961)."""
+    _guard_chat_pair_enabled()
+    principal_id = await _chat_pair_issuer(request)
+
+    code, ttl = await chat_pair.issue_code(_db(request), principal_id)
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=principal_id,
+        action="chat_pair_start",
+        target_type="chat_pair",
+        target_id=str(principal_id),
+        summary=f"pairing code issued, valid {ttl}s",
+    )
+    return ChatPairStartView(code=code, expires_in_sec=ttl)
+
+
+@app.post("/api/auth/chat-pair/redeem", response_model=ChatPairRedeemed)
+async def api_chat_pair_redeem(
+    body: ChatPairRedeem, request: Request
+) -> ChatPairRedeemed:
+    """Public: exchange a code for a short session with fixed narrow rights.
+
+    The only unauthenticated write in the hub, and every guard here exists
+    because of that: a limiter of its own (not the login one — a shared bucket
+    would lock the operator out of /login), one indistinguishable refusal for
+    unknown/spent/expired, and a code that is gone the moment it is spent.
+    """
+    _guard_chat_pair_enabled()
+    caller = client_ip(request)
+    if chat_pair.redeem_limit_reached(caller):
+        raise HTTPException(429, detail=chat_pair_rate_limited_detail())
+
+    session = await chat_pair.redeem_code(_db(request), body.code)
+    if session is None:
+        chat_pair.record_redeem_attempt(caller)
+        raise HTTPException(401, detail=chat_pair_invalid_detail())
+
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=session["principal_id"],
+        action="chat_pair_redeem",
+        target_type="chat_pair",
+        target_id=str(session["principal_id"]),
+        summary="pairing code redeemed for a chat session",
+    )
+    return ChatPairRedeemed(
+        token=session["token"],
+        expires_at=session["expires_at"],
+        username=session["username"],
+        role="human",
+        base_url=hub_base_url(),
+        permissions=sorted(config.CHAT_PAIR_PERMS),
+    )
+
+
+@app.post("/api/auth/chat-pair/revoke", response_model=ChatPairRevoked)
+async def api_chat_pair_revoke(request: Request) -> ChatPairRevoked:
+    """Close every chat-pair session of the caller — including its own.
+
+    A session may revoke itself: "done on the train, channel closed" must not
+    require going back to the laptop. Browser sessions and API keys are other
+    channels and are left alone.
+    """
+    _guard_chat_pair_enabled()
+    identity = current_identity(request)
+    if identity.auth_source == "chat_pair" and identity.principal_id is not None:
+        principal_id = identity.principal_id
+    else:
+        principal_id = await _chat_pair_issuer(request)
+
+    revoked = await chat_pair.revoke_sessions(_db(request), principal_id)
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=principal_id,
+        action="chat_pair_revoke",
+        target_type="chat_pair",
+        target_id=str(principal_id),
+        summary=f"revoked {revoked} chat-pair session(s)",
+    )
+    return ChatPairRevoked(revoked=revoked)
+
+
 @app.get("/api/diagnostics/identity", response_model=IdentityDiagnosticsView)
 async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
     """Caller identity plus honest instance and workspace state (#452).
@@ -335,9 +482,35 @@ async def api_diagnostics_identity(request: Request) -> IdentityDiagnosticsView:
 # ---------------------------------------------------------------------------
 
 
+def _reject_chat_pair_dispatch(request: Request, body: TaskCreate) -> None:
+    """Creating a task is allowed from a chat; starting one is not (#961).
+
+    ``POST /api/tasks`` is on the chat-pair allowlist, but ``TaskCreate``
+    carries ``run_immediately``, and ``create_task`` dispatches non-agent
+    sources immediately — so the allowlist alone would have let a leaked code
+    start a headless run. ``auto_review=false`` is refused for the same reason:
+    opting out of review is a decision, and this channel lives in somebody
+    else's transcript.
+
+    A refusal, not a silent reset: quiet degradation reads in the chat as "it
+    started" and as "review is off" — both false.
+    """
+    if current_identity(request).auth_source != "chat_pair":
+        return
+    if body.run_immediately:
+        raise HTTPException(
+            422, detail=chat_pair_run_forbidden_detail("run_immediately")
+        )
+    if not body.auto_review:
+        raise HTTPException(
+            422, detail=chat_pair_run_forbidden_detail("auto_review=false")
+        )
+
+
 @app.post("/api/tasks", response_model=TaskView)
 async def api_create_task(body: TaskCreate, request: Request, response: Response):
     _reject_agent_authored_source(request, body.source)
+    _reject_chat_pair_dispatch(request, body)
     idem_key = resolve_client_request_id(
         request.headers.get("X-Client-Request-Id"),
         body.client_request_id,
