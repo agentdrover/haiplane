@@ -84,6 +84,7 @@ from hub.models import (
     SkillCreate,
     SkillView,
     TaskDecide,
+    TaskDeclareWait,
     TaskForceComplete,
     TaskQuestion,
     TaskRefine,
@@ -2099,6 +2100,28 @@ async def api_claim_task(
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
     )
+
+
+@app.post("/api/tasks/{task_id}/declare-wait", response_model=TaskView)
+async def api_declare_wait(
+    task_id: int,
+    body: TaskDeclareWait,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Declare or clear what a task is waiting for (#957).
+
+    A current declaration silences the stale watchdog until its deadline; a
+    lapsed one escalates louder than plain silence. The deadline is required
+    for a declaration and validated in the service.
+    """
+    if not (body.agent or "").strip():
+        body = TaskDeclareWait(
+            waiting_for=body.waiting_for,
+            waiting_until=body.waiting_until,
+            agent=identity.username,
+        )
+    return await services.declare_task_wait(_db(request), task_id, body)
 
 
 @app.post("/api/tasks/{task_id}/release", response_model=TaskView)

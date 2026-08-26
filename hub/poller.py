@@ -752,32 +752,125 @@ async def _sweep_ci_check(db) -> None:
                     await services.maybe_destroy_vast(db, task)
 
 
+# #957: the escalation ladder. Silence is not one fact but a growing one, so
+# the watchdog answers it with RUNGS: the status's own threshold first, then a
+# day, three days, a week. A rung, once raised for a task+status, is never
+# raised again — an honest feed entry must not reopen the first rung (#927
+# collected an alert per report exactly that way), and a task that stays
+# silent climbs to the next rung instead of hiding behind its only alert
+# (#443 lay quiet for a week that way). Labels are embedded in the alert text
+# next to the parseable "stale in {status}" key.
+_STALE_LADDER_MINUTES = ((1440, "24h"), (4320, "72h"), (10080, "7d"))
+
+
+def _silence_minutes(last_at: str) -> float | None:
+    seconds = _seconds_since(last_at)
+    return seconds / 60 if seconds is not None else None
+
+
+def _age_phrase(minutes: float) -> str:
+    if minutes >= 1440:
+        return f"{minutes / 1440:.0f} сут"
+    if minutes >= 60:
+        return f"{minutes / 60:.0f} ч"
+    return f"{int(minutes)} мин"
+
+
+async def _stale_task_tick(
+    db, task: dict, status: str, threshold: int, action: str
+) -> None:
+    """One task against the watchdog: a lapsed wait or the silence ladder (#957)."""
+    task_id = task["id"]
+    waiting_for = str(task.get("waiting_for") or "")
+    waiting_until = str(task.get("waiting_until") or "")
+
+    if waiting_for and waiting_until:
+        # The declared wait has lapsed (a current one never reaches this
+        # sweep — the SQL filters it out). Escalate from the DEADLINE, not
+        # from the feed: the task said "judge me by this date", so it is.
+        overdue = _silence_minutes(waiting_until)
+        if overdue is None:
+            overdue = 0.0
+        rungs = ((0, "просрочка"), *_STALE_LADDER_MINUTES)
+        due = [label for gate, label in rungs if overdue >= gate]
+        if not due:
+            return
+        rung = due[-1]
+        if await repo.stale_rung_raised(db, task_id, status, rung):
+            return
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Ожидание просрочено (stale in {status}) [рубеж {rung}]: ждали "
+            f"«{waiting_for}» до {waiting_until}, срок вышел "
+            f"{_age_phrase(overdue)} назад. {action}",
+        )
+        await db.commit()
+        await log_activity(
+            db,
+            "task_stale",
+            f"Task #{task_id}: объявленное ожидание просрочено на "
+            f"{_age_phrase(overdue)} — ждали «{waiting_for}»"[:200],
+        )
+        log.warning(
+            "Poll: task #%d declared wait lapsed %s ago (%s)",
+            task_id,
+            _age_phrase(overdue),
+            rung,
+        )
+        return
+
+    last_at = await repo.last_activity_at(db, task_id)
+    silence = _silence_minutes(last_at)
+    if silence is None:
+        # No parseable activity at all — fall back to the entry threshold so
+        # a task with an empty feed is not invisible to the watchdog.
+        silence = float(threshold)
+    rungs = ((threshold, f"{threshold}m"), *_STALE_LADDER_MINUTES)
+    due = [label for gate, label in rungs if silence >= gate]
+    if not due:
+        return
+    rung = due[-1]
+    if await repo.stale_rung_raised(db, task_id, status, rung):
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Task stale in {status} [рубеж {rung}]: тишина уже "
+        f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'}). "
+        f"{action}",
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "task_stale",
+        f"Task #{task_id} stale in {status}: тишина {_age_phrase(silence)}",
+    )
+    log.warning(
+        "Poll: task #%d stale in %s for %s (%s)",
+        task_id,
+        status,
+        _age_phrase(silence),
+        rung,
+    )
+
+
 async def _sweep_stale_running(db) -> None:
-    """Running tasks with no updates: one stale alert each."""
+    """Running tasks: lapsed waits and the silence ladder, one rung at a time."""
     stale_rows = await repo.list_stale_running(db, config.STALE_THRESHOLD_MINUTES)
     for row in stale_rows:
         with _task_isolation("stale review", dict(row).get("id")):
-            task = dict(row)
-            if await repo.has_stale_alert(db, task["id"], "running"):
-                continue
-            await repo.add_task_update(
+            await _stale_task_tick(
                 db,
-                task["id"],
-                "hub",
-                "alert",
-                "Task stale in running: no updates for "
-                f"{config.STALE_THRESHOLD_MINUTES}+ minutes.",
-            )
-            await db.commit()
-            await log_activity(
-                db,
-                "task_stale",
-                f"Task #{task['id']} has no updates for {config.STALE_THRESHOLD_MINUTES}+ min",
-            )
-            log.warning(
-                "Poll: task #%d is stale (no updates for %d+ min)",
-                task["id"],
+                dict(row),
+                "running",
                 config.STALE_THRESHOLD_MINUTES,
+                "Разберитесь, что с задачей: живое ожидание объявляется с "
+                "событием и сроком, брошенное — решается человеком.",
             )
 
     # Stale watchdog for silent dead-end statuses (#319, #393). Only
@@ -839,29 +932,7 @@ async def _sweep_stale_statuses(db) -> None:
         )
         for row in rows:
             with _task_isolation("stale sweep", dict(row).get("id")):
-                task = dict(row)
-                if await repo.has_stale_alert(db, task["id"], status_name):
-                    continue
-                await repo.add_task_update(
-                    db,
-                    task["id"],
-                    "hub",
-                    "alert",
-                    f"Task stale in {status_name}: no updates for "
-                    f"{threshold}+ minutes. {action}",
-                )
-                await db.commit()
-                await log_activity(
-                    db,
-                    "task_stale",
-                    f"Task #{task['id']} stale in {status_name} for {threshold}+ min",
-                )
-                log.warning(
-                    "Poll: task #%d is stale in %s (no updates for %d+ min)",
-                    task["id"],
-                    status_name,
-                    threshold,
-                )
+                await _stale_task_tick(db, dict(row), status_name, threshold, action)
 
     # Unrefined drafts (#751): a draft the DoR gate would refuse is a
     # quiet dead end — approval 422s, batch approve silently skips it,

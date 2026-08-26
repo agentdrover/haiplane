@@ -541,6 +541,11 @@ async def list_stale_running(
         "archived=0",
         "status='running'",
         "updated_at < datetime('now', ?)",
+        # #957: a declared, still-current wait is not staleness — the task
+        # said what it waits for and until when. Past the deadline it is
+        # back on the list: a wait never buys silence forever.
+        "(waiting_for='' OR waiting_until IS NULL OR waiting_until=''"
+        " OR waiting_until < datetime('now'))",
     ]
     params: list[Any] = [f"-{threshold_minutes} minutes"]
     _append_person_filters(
@@ -1295,6 +1300,9 @@ async def list_stale_tasks(
         "archived=0",
         "status=?",
         "updated_at < datetime('now', ?)",
+        # #957: same rule as list_stale_running — see the comment there.
+        "(waiting_for='' OR waiting_until IS NULL OR waiting_until=''"
+        " OR waiting_until < datetime('now'))",
     ]
     params: list[Any] = [status, f"-{threshold_minutes} minutes"]
     if require_null_review_job:
@@ -2777,6 +2785,80 @@ async def has_plan_updates(
         "SELECT id FROM task_updates WHERE task_id=? "
         "AND kind='status' AND content LIKE 'Plan:%'",
         (task_id,),
+    )
+    return bool(rows)
+
+
+async def declare_wait(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    waiting_for: str,
+    waiting_until: str,
+    agent: str,
+) -> None:
+    """Record what this task is waiting for, until when, and who says so (#957).
+
+    A declared wait silences the stale watchdog UNTIL its deadline and never
+    past it — that asymmetry is the whole design. Both the claim and its
+    author land in the feed too, so "declare a wait and vanish" is a visible
+    act with a name on it, not a quiet toggle. An empty ``waiting_for``
+    clears the declaration.
+    """
+    waiting_for = (waiting_for or "").strip()
+    waiting_until = (waiting_until or "").strip()
+    await db.execute(
+        "UPDATE tasks SET waiting_for=?, waiting_until=?, waiting_declared_by=? "
+        "WHERE id=?",
+        (
+            waiting_for,
+            waiting_until if waiting_for else "",
+            (agent or "").strip() if waiting_for else "",
+            task_id,
+        ),
+    )
+    feed_line = (
+        f"Объявлено ожидание: {waiting_for} — до {waiting_until} (объявил {agent})."
+        if waiting_for
+        else f"Ожидание снято ({agent})."
+    )
+    await add_task_update(db, task_id, agent or "hub", "status", feed_line)
+    await db.commit()
+
+
+async def last_activity_at(db: aiosqlite.Connection, task_id: int) -> str:
+    """When the task last saw a real update — stale alerts do not count (#957).
+
+    The watchdog's own alerts bump ``updated_at``, so measuring silence by
+    that column would let the alarm feed itself. Silence is the age of the
+    last entry a PERSON or an agent wrote.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(MAX(created_at), '') AS at FROM task_updates "
+        "WHERE task_id=? AND NOT (kind='alert' AND content LIKE '%stale in %')",
+        (task_id,),
+    )
+    return str(rows[0]["at"]) if rows else ""
+
+
+async def stale_rung_raised(
+    db: aiosqlite.Connection, task_id: int, status: str, rung: str
+) -> bool:
+    """Was the escalation rung ``rung`` already alerted for this task+status (#957)?
+
+    The ladder is monotonic on purpose: a rung, once raised, is never raised
+    again — an honest feed entry must not reopen the first rung (that is how
+    #927 collected an alert per report), and a task that stays silent climbs
+    to the NEXT rung instead of hiding behind the only alert it ever got
+    (that is how #443 lay quiet for a week). The rung label is embedded in
+    the alert text next to the parseable ``stale in {status}`` key.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? AND content LIKE ? LIMIT 1",
+        (task_id, f"%stale in {status}%", f"%[рубеж {rung}]%"),
     )
     return bool(rows)
 
