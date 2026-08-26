@@ -9,11 +9,15 @@ this on is a project decision, so manual stays the default.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import pytest
 
+from hub import poller
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
@@ -214,3 +218,137 @@ async def test_release_pr_creation_is_idempotent(db: aiosqlite.Connection):
         "one range, one release — a second PR would split one release into two "
         "stories about the same commits"
     )
+
+
+# ---- #931: the release is a state of the project, not an event of delivery ----
+#
+# On 22.08.2026, minutes after release=auto was switched on, develop was two
+# tasks ahead of main (#929 and #879, both delivered before the policy) and
+# nothing moved them: the release PR was only ever opened at the end of a
+# successful delivery, and the poller, finding no open PR, returned an empty
+# reason — no PR and no word about why. The same dead end followed any failed
+# open. These tests pin the poller's own pass: unshipped tail — release PR.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sweep_state():
+    """The dedup memory of the sweep is per process; tests must not share it."""
+    poller._release_notices.clear()
+    poller._release_stalls.clear()
+    yield
+    poller._release_notices.clear()
+    poller._release_stalls.clear()
+
+
+async def _release_activity(db: aiosqlite.Connection) -> list[dict]:
+    cur = await db.execute(
+        "SELECT summary, detail FROM activity_log WHERE kind='release' ORDER BY id"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_poller_opens_release_for_an_unshipped_tail(db: aiosqlite.Connection):
+    # AC-1: develop ahead of main, no open release PR, no new delivery — one
+    # poller cycle opens the PR and its body names everything the range carries.
+    g = _git(existing_pr=None)
+    pid = await _release_project(db, "auto")
+    tail = await _delivered_task(db, pid)  # merged into develop, never released
+    g.release_range = AsyncMock(
+        return_value=[
+            f"feat(task): the tail nobody shipped (#{tail})",
+            "feat(task): another session's work (#879)",
+        ]
+    )
+
+    await poller._sweep_release_policy(db)
+
+    assert g.open_release_pr.await_count == 1, (
+        "the tail must not wait for the next delivery to carry it out"
+    )
+    body = g.open_release_pr.await_args.args[3]
+    assert f"#{tail}" in body and "#879" in body, "the body names the whole range"
+    # A PR opened this second has no CI to judge; the next cycle does that.
+    g.merge_pr.assert_not_awaited()
+
+    feed = " ".join(dict(u)["content"] for u in await repo.get_task_updates(db, tail))
+    assert "#777" in feed, "a release with no trigger task still reaches the feeds"
+    entries = await _release_activity(db)
+    assert len(entries) == 1 and "#777" in entries[0]["summary"], (
+        "opened by the poller and visible in the hub, not only in server logs"
+    )
+
+
+async def test_poller_and_delivery_do_not_open_two_release_prs(
+    db: aiosqlite.Connection,
+):
+    # AC-2: the poller's pass and a delivery finishing at the same moment are
+    # the race this opens up. Both must land on one PR over one range — a
+    # second one would split a single release into two stories about the same
+    # commits.
+    g = _git(existing_pr=None)
+    pid = await _release_project(db, "auto")
+    task_id = await _delivered_task(db, pid)
+
+    await asyncio.gather(
+        poller._sweep_release_policy(db),
+        _report_done(db, task_id),
+    )
+
+    assert g.open_release_pr.await_count == 2, "both paths asked; neither was skipped"
+    bases = {call.args[0] for call in g.open_release_pr.await_args_list}
+    heads = {call.args[1] for call in g.open_release_pr.await_args_list}
+    assert len(bases) == 1 and len(heads) == 1, (
+        "one range — the upsert behind both calls then yields one PR"
+    )
+    numbers = {call.args[0] for call in g.merge_pr.await_args_list}
+    assert numbers <= {77}, "the release PR itself is not merged on the cycle it opens"
+
+
+async def test_empty_range_stays_silent(db: aiosqlite.Connection, caplog):
+    # AC-3: develop and main agree — nothing to release. Silence, not a PR and
+    # not a line per cycle: a line per cycle is how a real signal gets muted.
+    g = _git(existing_pr=None)
+    g.release_range = AsyncMock(return_value=[])
+    await _release_project(db, "auto")
+
+    with caplog.at_level(logging.INFO, logger="hub"):
+        for _ in range(3):
+            await poller._sweep_release_policy(db)
+
+    g.open_release_pr.assert_not_awaited()
+    assert await _release_activity(db) == []
+    assert [r.getMessage() for r in caplog.records if "релиз" in r.getMessage()] == []
+
+
+async def test_manual_tail_is_untouched(db: aiosqlite.Connection):
+    # AC-4: a project that releases by hand is not even asked what its range
+    # is — the policy check comes before any question to git.
+    g = _git(existing_pr=None)
+    await _release_project(db, "manual")
+
+    await poller._sweep_release_policy(db)
+
+    g.pr_for_branch.assert_not_awaited()
+    g.release_range.assert_not_awaited()
+    g.open_release_pr.assert_not_awaited()
+
+
+async def test_failed_open_is_reported_once(db: aiosqlite.Connection, caplog):
+    # AC-5: GitHub refusing the pull request is a cause, named once per
+    # project the way a red CI is — and a refusal that holds reaches the feed
+    # once, so the tail does not sit unshipped in silence again (#962).
+    g = _git(existing_pr=None)
+    g.open_release_pr = AsyncMock(return_value=None)
+    await _release_project(db, "auto")
+
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        for _ in range(poller.RELEASE_STALL_CYCLES + 2):
+            await poller._sweep_release_policy(db)
+
+    assert g.open_release_pr.await_count == poller.RELEASE_STALL_CYCLES + 2, (
+        "the policy keeps retrying; what is deduplicated is the reporting"
+    )
+    said = [r.getMessage() for r in caplog.records if "не открыт" in r.getMessage()]
+    assert len(said) == 1, f"one line per reason, not per cycle: {said}"
+    entries = await _release_activity(db)
+    assert len(entries) == 1 and "не открыт" in entries[0]["summary"]

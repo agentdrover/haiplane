@@ -104,24 +104,70 @@ async def open_release_for_task(db: aiosqlite.Connection, task_id: int) -> int |
         return None
 
     ctx = await _git_context(db, task_id)
+    base = release_base_of(project)
+    head = ctx.get("base_branch") or base_branch_of(project)
+    pr_number, subjects, task_ids, reason = await open_release_for_range(
+        ctx, base, head
+    )
+    if reason:
+        # A cause, not a failure: the done report that called this must not
+        # fail because the release could not be prepared.
+        log.warning("release for #%s: %s", task_id, reason)
+        return None
+    if pr_number:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            _release_note(pr_number, head, base, subjects, task_ids),
+        )
+        await db.commit()
+    return pr_number
+
+
+def _release_note(
+    pr_number: int, head: str, base: str, subjects: list[str], task_ids: list[int]
+) -> str:
+    """What a task's feed says when the release carrying it is opened."""
+    return (
+        f"Релиз готовится: PR #{pr_number} ({head} → {base}) несёт "
+        f"{len(subjects)} коммит(ов), задачи: "
+        + (", ".join(f"#{t}" for t in task_ids) or "номера не распознаны")
+    )
+
+
+async def open_release_for_range(
+    ctx: dict[str, Any], base: str, head: str
+) -> tuple[int | None, list[str], list[int], str]:
+    """Open or refresh the release PR carrying ``head`` over ``base``.
+
+    Returns ``(pr_number, subjects, task_ids, reason)``. Nothing to release —
+    the two ends coincide, or the range is empty — is ``(None, [], [], "")``:
+    silence, because the poller walks this every cycle and a line per cycle is
+    how a real signal gets muted (#534). A non-empty ``reason`` is a failure
+    to name once: the range could not be read, or GitHub refused the PR.
+
+    No task id enters here on purpose (#931). "The base branch is ahead of the
+    release branch" is a state of the project, not an event of a task, and the
+    poller reaches this path with no task to blame — while delivery, which
+    does have one, keeps writing the record to it.
+    """
     # #475: both ends of the release come from the project. head is the branch
     # work lands on (default_branch), base is where releases land
     # (default_branch_policy.release_base). A project whose two ends coincide —
     # spike-bo delivers straight to main — has nothing to release, and opening
     # a main→main PR is a failure, not a release.
-    base = release_base_of(project)
-    head = ctx.get("base_branch") or base_branch_of(project)
     if head == base:
-        return None
+        return None, [], [], ""
     try:
         subjects = await plugins.git_ops.release_range(
             base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
-        log.warning("release range unavailable for #%s: %s", task_id, exc)
-        return None
+        return None, [], [], f"диапазон релиза {head} → {base} не прочитан: {exc}"
     if not subjects:
-        return None
+        return None, [], [], ""
 
     body, task_ids = release_body(subjects, head, base)
     title = f"release: {len(task_ids) or len(subjects)} задач(и) из {head} в {base}"
@@ -134,21 +180,16 @@ async def open_release_for_task(db: aiosqlite.Connection, task_id: int) -> int |
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
         )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("release PR not opened for #%s: %s", task_id, exc)
-        return None
-    if pr_number:
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "status",
-            f"Релиз готовится: PR #{pr_number} ({head} → {base}) несёт "
-            f"{len(subjects)} коммит(ов), задачи: "
-            + (", ".join(f"#{t}" for t in task_ids) or "номера не распознаны"),
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        return None, subjects, task_ids, f"релизный PR {head} → {base} не открыт: {exc}"
+    if not pr_number:
+        return (
+            None,
+            subjects,
+            task_ids,
+            f"релизный PR {head} → {base} не открыт: GitHub отказал",
         )
-        await db.commit()
-    return pr_number
+    return pr_number, subjects, task_ids, ""
 
 
 async def merge_ready_release(
@@ -159,6 +200,10 @@ async def merge_ready_release(
     Returns ``(merged, reason)``. A red or missing CI is a reason, reported
     once — the poller walks this every cycle, and a line per cycle is how a
     real signal gets muted (#534).
+
+    When there is no open release PR and the base branch is ahead, this opens
+    one (#931): the release is a state of the project, not an event of some
+    task's delivery.
     """
     project = dict(project_row)
     if not release_auto_enabled(gate_policy_of(project_row)):
@@ -178,7 +223,7 @@ async def merge_ready_release(
             head, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
         )
         if not pr_number:
-            return False, ""
+            return await _open_release_for_tail(db, project_row, ctx, base, head)
         ci = await plugins.git_ops.check_pr_ci(
             pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
         )
@@ -205,6 +250,95 @@ async def merge_ready_release(
     await _stamp_released_merges(db, project_row, pr_number, ctx)
     note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
     return True, f"релиз PR #{pr_number} смержен в {base}{note}"
+
+
+async def _open_release_for_tail(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    ctx: dict[str, Any],
+    base: str,
+    head: str,
+) -> tuple[bool, str]:
+    """Open the release PR for what already lies in the base branch (#931).
+
+    Until this, a release was an event of delivery: only the end of a
+    successful done report opened the pull request. Everything that landed in
+    the base branch without a delivery after it waited for the next task to be
+    delivered and rode out with it, unmentioned — the tail that existed the
+    moment release=auto was switched on (#927: #929 and #879 sat there), and
+    anything left behind by an open that failed once. The poller walks every
+    project every cycle anyway; here it makes the promise the owner switched
+    auto on for: there is something unshipped — there is a release PR.
+
+    Never merges in the same pass. The PR was created seconds ago and its CI
+    has not started; the next cycle judges it like any other release.
+    """
+    pr_number, subjects, task_ids, reason = await open_release_for_range(
+        ctx, base, head
+    )
+    if reason:
+        return False, reason
+    if not pr_number:
+        return False, ""
+    slug = dict(project_row).get("slug") or "?"
+    log.info(
+        "release: %s — PR #%s открыт обходом поллера (%s → %s), %d коммит(ов), "
+        "задачи: %s",
+        slug,
+        pr_number,
+        head,
+        base,
+        len(subjects),
+        ", ".join(f"#{t}" for t in task_ids) or "номера не распознаны",
+    )
+    await _note_release_opened(
+        db, project_row, pr_number, head, base, subjects, task_ids
+    )
+    return False, ""
+
+
+async def _note_release_opened(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    pr_number: int,
+    head: str,
+    base: str,
+    subjects: list[str],
+    task_ids: list[int],
+) -> None:
+    """Record a release nobody's delivery triggered (#931).
+
+    Opening by delivery has a task to write to — the one that triggered it.
+    Here there is no trigger, so the note goes to every task the range names,
+    and to the activity feed, which is where #962 put the release policy so it
+    stops being visible only to whoever reads server logs. A number that is not
+    this project's task — a commit carrying a number from another repository —
+    is skipped rather than annotated with someone else's release.
+
+    Best effort by contract: the PR is open either way, and a release must not
+    read as failed because its bookkeeping did not land.
+    """
+    note = _release_note(pr_number, head, base, subjects, task_ids)
+    project = dict(project_row)
+    slug = project.get("slug") or "?"
+    written = 0
+    try:
+        for task_id in task_ids:
+            row = await repo.get_task(db, task_id)
+            if row is None or dict(row).get("project_id") != project.get("id"):
+                continue
+            await repo.add_task_update(db, task_id, "hub", "status", note)
+            written += 1
+        await log_activity(
+            db,
+            "release",
+            f"{slug}: релизный PR #{pr_number} открыт обходом ({head} → {base})",
+            f"{len(subjects)} коммит(ов) без новой доставки; задачи в ленте: "
+            f"{written} из {len(task_ids)}",
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 - bookkeeping must not fail the release
+        log.exception("release PR #%s opened, but not recorded", pr_number)
 
 
 async def _stamp_released_merges(
