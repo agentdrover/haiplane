@@ -240,8 +240,13 @@ async def test_submission_discovers_the_pr_for_the_branch(db):
 
 
 async def test_a_branch_with_no_pr_submits_and_completes_as_before(db):
-    """Config tasks own a branch but no PR (#602 was one). Discovery finding
-    nothing — or blowing up — must not change their path by a byte."""
+    """A branch with no OBSERVABLE commits keeps today's path byte for byte.
+
+    Narrowed by #967: it used to say "config tasks with a branch", but a
+    branch whose diff positively shows commits now gets its PR opened by the
+    hub. What this test pins is the ignorance half — branch_diff_paths
+    answers None here (Noop), and discovery finding nothing, or blowing up,
+    must not change the path of work nobody can accuse of stranding code."""
     g = _git(CIProbeOutcome.failed, merged=False)  # would refuse if consulted
     g.pr_for_branch = AsyncMock(side_effect=RuntimeError("gh melted"))
 
@@ -773,3 +778,192 @@ async def test_a_deferral_on_an_unestablished_pr_does_not_promise_green_ci(db):
         "причина отсрочки — недоступный PR, а не жёлтый CI"
     )
     assert "#472" in alert and "состояние" in alert.lower()
+
+
+# ---------------------------------------------------------------------------
+# #967: ветка с подтверждёнными коммитами не завершается без PR — хаб сам
+# открывает его вместо предупреждения постфактум.
+#
+# Живой случай #961: сдача без PR, APPROVED, done — completed, а 17 изменённых
+# файлов остались висеть на ветке. PR #45 открыли руками через 25 секунд ПОСЛЕ
+# того, как гейт уже прошёл мимо. Предупреждение #498 сработало и никого не
+# остановило. Та же неделя: #963, #965, #966.
+#
+# Блок взводится ТОЛЬКО положительным знанием: branch_diff_paths вернул
+# непустой список. None («не смог посмотреть») и [] («ничего не меняет»)
+# сохраняют сегодняшний путь байт в байт — линия #498/#767 «обвинение по
+# незнанию хуже молчания». NoopGitOps возвращает None, поэтому все тесты выше
+# этой секции идут без правок.
+# ---------------------------------------------------------------------------
+
+
+async def _running_pair_task(db) -> int:
+    """A pair task at the moment of submission: start, plan, no verdict yet."""
+    tv = await services.create_task(db, TaskCreate(title="Open my PR"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: build")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    return tv.id
+
+
+async def test_submission_opens_a_pr_for_a_branch_with_commits(db):
+    """AC-1 (#967). Ветка проверяемо меняет файлы, PR нет — сдача сама пушит
+    и открывает его, чтобы CI шёл параллельно с ревью, а не стартовал после
+    done."""
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=512)
+    task_id = await _running_pair_task(db)
+
+    await services.submit_for_review(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 512, "созданный PR записан, а не просто открыт"
+    assert g.push_branch.await_count == 1, (
+        "gh pr create на незапушенной ветке отказывает — сначала push"
+    )
+    assert g.push_branch.await_args.args[0] == task["branch"]
+    assert g.create_pr.await_count == 1
+
+
+async def test_a_failed_pr_creation_warns_and_the_submission_proceeds(db):
+    """AC-1 (#967), половина про отказ: GitHub сказал «нет». Ревью в хабе всё
+    ещё валидно — сдача проходит, но читателю названо, что PR не открыт:
+    молчание здесь воспроизводит #961 на done."""
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=None)
+    task_id = await _running_pair_task(db)
+
+    await services.submit_for_review(db, task_id)  # не должен упасть
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "review", "сдача сама по себе обязана пройти"
+    assert task["pr_number"] is None
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "не удалось" in feed and task["branch"] in feed, (
+        "отказ создания — предупреждение с именем ветки, не тишина"
+    )
+
+
+async def test_done_without_pr_creates_one_and_delivers_through_the_gate(db):
+    """AC-2 (#967). Точная последовательность #961 — сдача без PR, APPROVED,
+    done — теперь заканчивается доставкой, а не completed с брошенной
+    веткой."""
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    # Коммиты становятся видимыми только теперь: None у Noop держал настройку
+    # на сегодняшнем пути — тот же приём, что у тестов #767 с pr_for_branch.
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py", "tests/test_a.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=513)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 513
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1, "гейт доставил PR, который сам же открыл"
+    assert g.merge_pr.await_args.args[0] == 513
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall("SELECT pr_number FROM pipeline_merges")
+    ]
+    assert rows and rows[0]["pr_number"] == 513, (
+        "доставка записана — сторож дрейфа может за неё поручиться"
+    )
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "открыт хабом" in feed, "кто открыл PR — факт для ленты, не для логов"
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [None, RuntimeError("gh: rate limited")],
+    ids=["returned_none", "raised"],
+)
+async def test_confirmed_commits_without_a_creatable_pr_block_completion(db, refusal):
+    """AC-3 (#967). git подтвердил коммиты, так что completed заведомо бросил
+    бы их на ветке. Это положительное знание — противоположность тишине
+    #498 — и единственный случай, который останавливает завершение."""
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = (
+        AsyncMock(return_value=None)
+        if refusal is None
+        else AsyncMock(side_effect=refusal)
+    )
+
+    await _report_done(db, task_id)  # не должен упасть (AC-5 из #605)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "коммиты есть, PR открыть нельзя — это решение человека, не completed"
+    )
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alert = next(
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert" and "NOT completed" in (u["content"] or "")
+    )
+    assert task["branch"] in alert, "отказ называет ветку, которую не смог доставить"
+    assert "hub_decide_task" in alert, "подсказка ведёт через доступное действие (#952)"
+
+
+@pytest.mark.parametrize("diff", [None, []], ids=["could_not_look", "empty_diff"])
+async def test_ignorance_still_completes_as_today(db, diff):
+    """AC-4 (#967). None — «не смог посмотреть», [] — «ничего не меняет»:
+    ни то ни другое не знание о брошенных коммитах, а обвинение по незнанию
+    хуже молчания (#498). Оба сохраняют сегодняшнее завершение, и create_pr
+    не вызывается вовсе."""
+    g = _git(CIProbeOutcome.failed, merged=False)  # would refuse if consulted
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.branch_diff_paths = AsyncMock(return_value=diff)
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(side_effect=RuntimeError("must not be consulted"))
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "сегодняшнее правило решает завершение"
+    g.create_pr.assert_not_awaited()
+    g.merge_pr.assert_not_awaited()
+
+
+async def test_a_freshly_created_pr_with_running_ci_keeps_the_task_running(db):
+    """AC-5 (#967), сторож #951. У PR, созданного секунды назад, CI бежит по
+    построению. Это временное состояние, а не решение — задача ждёт в
+    running ровно как установил #951, и тест, уводящий это в needs_decision,
+    сломал бы ту починку."""
+    g = _git(CIProbeOutcome.pending, merged=False)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=514)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "бегущий CI — ожидание, а не решение человека"
+    assert task["pr_number"] == 514
+    g.merge_pr.assert_not_awaited()
+    alert = next(
+        dict(u)["content"]
+        for u in reversed(await repo.get_task_updates(db, task_id))
+        if "отложена" in (dict(u)["content"] or "")
+    )
+    assert "#514" in alert

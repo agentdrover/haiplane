@@ -36,7 +36,12 @@ async def _running_task_with_areas(
 
 
 class _DiffGitOps(NoopGitOps):
-    """Stands in for the branch diff; None means "could not be determined"."""
+    """Stands in for the branch diff; None means "could not be determined".
+
+    Opens a PR when asked: since #967 a submission with a confirmed diff gets
+    one from the hub, and a fake that refused would add a "PR could not be
+    opened" alert to tests that only want to talk about areas.
+    """
 
     def __init__(self, paths: list[str] | None) -> None:
         self._paths = paths
@@ -45,6 +50,21 @@ class _DiffGitOps(NoopGitOps):
     async def branch_diff_paths(self, branch, base_branch=None, repo=None):
         self.calls.append(branch)
         return self._paths
+
+    async def push_branch(self, branch, repo=None, force=False):
+        return True
+
+    async def create_pr(
+        self,
+        task_id,
+        title,
+        description,
+        branch,
+        repo=None,
+        gh_repo=None,
+        base_branch=None,
+    ):
+        return 41
 
 
 async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
