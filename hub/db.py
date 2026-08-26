@@ -1426,6 +1426,18 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_waiting_declared_by",
         "ALTER TABLE tasks ADD COLUMN waiting_declared_by TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # Did the report's author review their own work (#728)? Decided from
+        # the AUTHENTICATED identity at submission, never from submitted_by —
+        # that field is written as `body.agent or identity.username`, i.e. the
+        # caller names itself. Rows written before this column say 0, which
+        # means "never established", not "independent": the question was not
+        # asked then, and back-filling a verdict onto them would be inventing
+        # evidence.
+        "add_machine_reviews_self_reviewed",
+        "ALTER TABLE machine_reviews ADD COLUMN self_reviewed INTEGER NOT NULL "
+        "DEFAULT 0",
+    ),
 ]
 
 

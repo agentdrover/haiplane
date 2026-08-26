@@ -2180,6 +2180,11 @@ class MachineReviewView(BaseModel):
     # was never asked or did not answer — not that the run was free.
     provider_tokens: int | None = None
     submitted_by: str = ""
+    # Did the author review their own work (#728)? Taken from the token at
+    # submission, not from ``submitted_by`` above, which the caller writes
+    # about itself. False on rows written before the column existed — there
+    # the question was never asked, which is not the same as "independent".
+    self_reviewed: bool = False
     created_at: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.

@@ -941,14 +941,15 @@ async def insert_machine_review(
     unresolved: str = "[]",
     lost_dimensions: str = "[]",
     profile: str = "",
+    self_reviewed: bool = False,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "lost_dimensions, profile, self_reviewed) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -967,6 +968,7 @@ async def insert_machine_review(
             unresolved,
             lost_dimensions,
             profile,
+            int(self_reviewed),
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
