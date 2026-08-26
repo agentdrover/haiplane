@@ -2053,3 +2053,110 @@ async def test_pr_state_does_not_pay_for_a_second_question_when_the_first_answer
         assert await git_ops.pr_state(360, gh_repo="owner/repo") == "open"
 
     assert seen["api"] == 0, "уточняющий вопрос задаётся только на пути отказа"
+
+
+# ---- #963: релиз перечисляет коммиты, а не строки их сообщений ----
+#
+# release_range просил у jq целое сообщение и резал ответ по строкам. jq
+# печатает многострочную строку как НЕСКОЛЬКО строк вывода, поэтому один
+# коммит с телом становился столько «коммитов», сколько в нём строк: релизный
+# PR #40 перечислил 25 пунктов, включая Co-authored-by, при одном коммите в
+# диапазоне, а PR #44 назвал четыре задачи при трёх — номер #880 встретился в
+# теле дважды и был посчитан дважды.
+#
+# Сообщения здесь МНОГОСТРОЧНЫЕ: на однострочных дефект невидим, и ровно
+# поэтому он дожил до прода, не уронив ничего.
+
+_COMMIT_MESSAGES = [
+    "feat(task): vtoraya-zadacha (#902)\n\nЕщё одно тело в несколько строк.\n",
+    (
+        "feat(task): pervaya-zadacha (#901)\n"
+        "\n"
+        # Squash-мерж вкладывает в тело заголовок исходного коммита ветки, и он
+        # тоже кончается на «(#NNN)». Именно так #880 попала в список PR #44
+        # дважды: _TASK_NUMBER требует номер в скобках В КОНЦЕ строки, и таких
+        # строк у squash-коммита две.
+        "* feat(task): pervaya-zadacha (#901)\n"
+        "\n"
+        "Co-authored-by: Claude Opus 5 <noreply@anthropic.com>\n"
+    ),
+]
+
+
+def _gh_compare_double():
+    """A _gh double that answers the way gh answers the jq it was GIVEN.
+
+    Not a fixed payload: the defect is in WHAT release_range asks for, so a
+    double that always returned one line per commit would go green with the
+    broken query and prove nothing. jq prints a multi-line string as multiple
+    output lines — that mechanism is modelled here instead of assumed, which
+    is the same reason #803's tests stub _gh rather than the method above it.
+    """
+
+    async def route(*args, **kwargs):
+        jq = args[args.index("--jq") + 1]
+        if jq.rstrip().endswith('split("\n")[0]'):
+            payload = [m.split("\n", 1)[0] for m in _COMMIT_MESSAGES]
+        else:
+            payload = _COMMIT_MESSAGES
+        return 0, "\n".join(m.rstrip("\n") for m in payload) + "\n", ""
+
+    return route
+
+
+async def test_release_range_returns_one_subject_per_commit(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Два коммита в диапазоне — два элемента. До починки их было пять: строки
+    # тела и Co-authored-by считались коммитами.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new=AsyncMock(side_effect=_gh_compare_double()),
+    ):
+        subjects = await git_ops.release_range(
+            "main", "develop", gh_repo="agentdrover/haiplane"
+        )
+
+    assert subjects == [
+        "feat(task): pervaya-zadacha (#901)",
+        "feat(task): vtoraya-zadacha (#902)",
+    ], f"один элемент на коммит, старшие сначала; получено: {subjects}"
+
+
+async def test_release_body_gets_one_task_id_per_commit(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-3, проверяется на СВЯЗКЕ release_range → release_body: врал именно
+    # стык. Номер, упомянутый в теле второй раз, приезжал вторым элементом
+    # списка задач — так PR #44 насчитал четыре задачи при трёх реальных.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new=AsyncMock(side_effect=_gh_compare_double()),
+    ):
+        subjects = await git_ops.release_range("main", "develop")
+
+    from hub.services.release import release_body
+
+    body, task_ids = release_body(subjects, "develop", "main")
+    assert task_ids == [901, 902], f"по одному номеру на коммит; получено {task_ids}"
+    assert body.count("\n- ") == 2, "и по одному пункту на коммит"
+    assert "Co-authored-by" not in body
+
+
+async def test_release_range_is_empty_on_refusal_or_empty_range(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Регрессия: оба случая и сегодня дают пустой список, и трактуются
+    # одинаково — «нечего релизить» и «не смогли спросить» здесь ведут к
+    # одному действию: не открывать релиз.
+    async def refused(*args, **kwargs):
+        return 1, "", "gh: could not compare"
+
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=refused)):
+        assert await git_ops.release_range("main", "develop") == []
+
+    async def empty(*args, **kwargs):
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=empty)):
+        assert await git_ops.release_range("main", "develop") == []

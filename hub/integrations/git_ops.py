@@ -2163,19 +2163,31 @@ class GitOpsIntegration:
         read back out. Empty means nothing to release — or that git could not
         answer, and the caller treats those the same way it treats an empty
         range: by doing nothing.
+
+        The subject is cut by JQ, not here (#963). Asking for the whole
+        message and splitting the reply by lines counts LINES, not commits:
+        jq prints a multi-line string as multiple output lines, so one commit
+        with a body arrived as as many "commits" as it had lines. Release PR
+        #40 listed 25 items — Co-authored-by among them — for a single commit,
+        and #44 claimed four tasks for three: a squash message repeats the
+        branch commit's subject, which also ends in «(#NNN)», so the number
+        was counted twice.
+
+        One output line = one commit is a contract, and it holds only while
+        the cut happens in the query: commit boundaries cannot be recovered
+        from concatenated text by anything but guessing.
         """
         rc, out, _ = await _gh(
             "api",
             f"repos/{gh_repo or REPO_NAME}/compare/{base}...{head}",
             "--jq",
-            ".commits[].commit.message",
+            '.commits[].commit.message | split("\n")[0]',
             repo=repo,
             check=False,
         )
         if rc != 0 or not out:
             return []
-        subjects = [line.split("\n", 1)[0].strip() for line in out.splitlines()]
-        return [s for s in reversed(subjects) if s]
+        return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
 
     async def open_release_pr(
         self,
