@@ -224,13 +224,133 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
-def diff_plan(diff: str | None, base: str, branch: str) -> tuple[str, str]:
+async def previous_findings(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> list[str]:
+    """What the previous submission's reviewers confirmed (#880).
+
+    Travels with the delta so the new run can check whether the fixes landed,
+    instead of rediscovering the same defects from scratch — or, worse, not
+    looking at them because their files are the ones it was told to skip.
+    """
+    previous = await repo.previous_submission(db, task_id, generation)
+    if previous is None:
+        return []
+    titles: list[str] = []
+    for row in await repo.machine_reviews_of_generation(
+        db, task_id, int(dict(previous).get("generation") or 0)
+    ):
+        try:
+            findings = json.loads(dict(row).get("findings_confirmed") or "[]")
+        except ValueError:
+            continue
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict):
+                continue
+            title = str(finding.get("title") or "").strip()
+            where = str(finding.get("file") or "").strip()
+            if title:
+                titles.append(f"{where}: {title}" if where else title)
+    return titles
+
+
+async def generation_delta(
+    db: aiosqlite.Connection, task: dict, base: str
+) -> tuple[list[str], str]:
+    """Files touched since the previous submission, and why, or (empty, reason).
+
+    Returns ``(paths, note)``. A non-empty ``paths`` narrows the review to the
+    files this round of fixes touched; an empty one means the whole diff is the
+    subject, and ``note`` always says which of those it is and on what grounds.
+
+    Three facts have to hold, and each is checked rather than assumed:
+
+    1. the previous submission was recorded — before #880 nothing kept it;
+    2. its commit is an ANCESTOR of the current one. That is the rebase and
+       force-push test: after either, "what changed since last time" compares
+       commits that no longer share a history;
+    3. the base branch has not moved. A project that repointed its default
+       branch is asking a different question about the same two commits.
+
+    Anything unproven means the full diff. Reviewing a delta we cannot justify
+    would be the one failure this feature must not have — silently reading less
+    than the report claims.
+    """
+    task_id = int(task.get("id") or 0)
+    generation = int(task.get("submission_generation") or 0)
+    current = (task.get("submission_sha") or "").strip()
+    if generation <= 1 or not current:
+        return [], "первая сдача — предмет ревью весь дифф"
+
+    previous = await repo.previous_submission(db, task_id, generation)
+    if previous is None:
+        return [], "предыдущая сдача не записана — читается весь дифф"
+    prev = dict(previous)
+    prev_sha = (prev.get("sha") or "").strip()
+    if not prev_sha:
+        return [], "у предыдущей сдачи не закреплён коммит — читается весь дифф"
+    if (prev.get("base_branch") or "") != base:
+        return [], (
+            f"базовая ветка сменилась ({prev.get('base_branch') or '—'} → {base}) "
+            "— дельта невалидна, читается весь дифф"
+        )
+
+    ctx = await _git_context(db, task_id)
+    if ctx is None:
+        return [], "воркспейс недоступен — читается весь дифф"
+    workspace, _ = ctx
+    try:
+        ancestor = await plugins.git_ops.is_ancestor(workspace, prev_sha, current)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("ancestry check failed for task #%s: %s", task_id, exc)
+        ancestor = None
+    if ancestor is None:
+        return [], "историю проверить не удалось — читается весь дифф"
+    if not ancestor:
+        return [], (
+            f"коммит {prev_sha[:12]} не предок текущего — ветку перебазировали "
+            "или переписали, читается весь дифф"
+        )
+
+    try:
+        delta = await plugins.git_ops.branch_diff(workspace, prev_sha, current)
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("delta diff failed for task #%s: %s", task_id, exc)
+        delta = None
+    if delta is None:
+        return [], "дельту прочитать не удалось — читается весь дифф"
+    paths = [p for p in changed_paths(delta) if not is_generated(p)]
+    if not paths:
+        return [], (
+            f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф"
+        )
+    return paths, (
+        f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]}): "
+        f"{len(paths)} файл(ов)"
+    )
+
+
+def diff_plan(
+    diff: str | None,
+    base: str,
+    branch: str,
+    delta_paths: list[str] | None = None,
+    delta_note: str = "",
+    prior_findings: list[str] | None = None,
+) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
     Returns ``(block, note)``. The block carries a ready ``git diff`` command
     with ``:(exclude)`` pathspecs, the names of the generated files left out,
     and the files whose size will not fit a single pass. Nothing disappears
     quietly: every exclusion is named where the reviewer reads it.
+
+    ``delta_paths`` narrows the command to the files a resubmission touched
+    (#880). The command still diffs against the BASE, not against the previous
+    commit: a defect born from the new edit meeting old code in the same file
+    stays visible, which bare changed lines would have hidden. The coverage is
+    stated in the block, because "read the delta" and "read the whole diff"
+    are different claims about the same report (#549).
     """
     if diff is None:
         return (
@@ -241,10 +361,29 @@ def diff_plan(diff: str | None, base: str, branch: str) -> tuple[str, str]:
         )
     kept, dropped = split_generated(diff)
     excludes = "".join(f" ':(exclude){path}'" for path in dropped)
+    scope = "".join(f" '{path}'" for path in (delta_paths or []))
     lines = [
         f"ПРЕДМЕТ РЕВЬЮ — команда диффа (выполни ЕЁ, а не свою):\n"
-        f"  git diff {base}...{branch} --{excludes}"
+        f"  git diff {base}...{branch} --{excludes}{scope}"
     ]
+    if delta_paths:
+        lines.append(
+            f"ОХВАТ: прочитана ДЕЛЬТА, а не весь дифф — {delta_note}. "
+            "Файлы взяты ЦЕЛИКОМ и против базовой ветки, поэтому старый код "
+            "рядом с новой правкой виден. Остальные файлы ветки уже читались "
+            "на прошлом поколении и сейчас НЕ пересматриваются — если "
+            "найдёшь причину усомниться в этом, скажи об этом в отчёте."
+        )
+    elif delta_note:
+        lines.append(f"ОХВАТ: прочитан ВЕСЬ дифф ветки — {delta_note}.")
+    if prior_findings:
+        listed = "; ".join(prior_findings[:20])
+        lines.append(
+            "НА ПРОШЛОМ ПОКОЛЕНИИ БЫЛИ ПОДТВЕРЖДЕНЫ: "
+            f"{listed}. Проверь, что правки их действительно закрыли — это "
+            "первое, что надо посмотреть, и не считай их закрытыми по факту "
+            "того, что файл изменился."
+        )
     if dropped:
         lines.append(
             "Исключены как сгенерированные (их никто не писал и не будет "
@@ -265,6 +404,8 @@ def diff_plan(diff: str | None, base: str, branch: str) -> tuple[str, str]:
             "имеет права съесть бюджет, которого ждали остальные."
         )
     note_bits = []
+    if delta_note:
+        note_bits.append(delta_note)
     if dropped:
         note_bits.append(f"исключено сгенерированных: {len(dropped)}")
     if oversized:
@@ -820,7 +961,14 @@ async def maybe_dispatch_review(
     # run would send it back to inventing its own, which is what we are fixing.
     ctx = await _git_context(db, task_id)
     base = ctx[1] if ctx else config.PAIR_BASE_BRANCH
-    diff_block, diff_note = diff_plan(diff, base, branch)
+    # #880: a resubmission reads what changed since the previous generation,
+    # not the whole branch again. Every reason the delta cannot be trusted
+    # falls back to the full diff and says so.
+    delta_paths, delta_note = await generation_delta(db, task, base)
+    prior = await previous_findings(db, task_id, generation)
+    diff_block, diff_note = diff_plan(
+        diff, base, branch, delta_paths, delta_note, prior
+    )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
     # Imported here, not at module level: review_evidence reaches back into

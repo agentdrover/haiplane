@@ -1834,6 +1834,20 @@ async def submit_for_review(
             submission_sha=submission_sha,
             submission_model=declared_model,
         )
+        # #880: the ledger of what each generation pinned. Written here, in the
+        # same transaction that pins the sha, because tasks.submission_sha is
+        # overwritten by the next submission and the previous commit would
+        # otherwise survive only as prose in an update.
+        from hub.services.orchestration import project_git_context as _git_ctx
+
+        ledger_ctx = await _git_ctx(db, task_id)
+        await repo.record_submission(
+            db,
+            task_id=task_id,
+            generation=generation,
+            sha=submission_sha,
+            base_branch=(ledger_ctx.get("base_branch") or config.PAIR_BASE_BRANCH),
+        )
         # #546: CI normally runs when the PR opens — before this submission
         # existed, when the generation was still 0 — so its evidence is stored
         # per commit and adopted here, the moment that commit becomes the one

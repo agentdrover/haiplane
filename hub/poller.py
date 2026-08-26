@@ -26,6 +26,16 @@ log = logging.getLogger("hub")
 # restart repeating one line is cheaper than a table nobody reads.
 _release_notices: dict[str, str] = {}
 
+# Per project: the current refusal, how many consecutive cycles it has held,
+# and whether it already reached the activity feed (#962). In memory like
+# _release_notices — a restart re-counting the threshold costs ~3 cycles,
+# while the silent alternative cost a day of reading server logs on 26.08.
+_release_stalls: dict[str, tuple[str, int, bool]] = {}
+
+# One refused cycle is a flicker (a network hiccup, a race with CI); the same
+# refusal this many cycles in a row is a stall a human has to resolve.
+RELEASE_STALL_CYCLES = 3
+
 POLL_INTERVAL = 30  # seconds
 
 CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
@@ -1116,11 +1126,46 @@ async def _sweep_release_policy(db) -> None:
             if merged:
                 log.info("Poll: %s — %s", slug, reason)
                 _release_notices.pop(slug, None)
-            elif reason and _release_notices.get(slug) != reason:
+                _release_stalls.pop(slug, None)
+                continue
+            if not reason:
+                _release_stalls.pop(slug, None)
+                continue
+            if _release_notices.get(slug) != reason:
                 _release_notices[slug] = reason
                 log.warning("Poll: %s — %s", slug, reason)
+            await _note_release_stall(db, slug, reason)
     except Exception:
         log.exception("Poll: release policy sweep failed")
+
+
+async def _note_release_stall(db, slug: str, reason: str) -> None:
+    """Raise a persistent release refusal into the activity feed (#962).
+
+    On 26.08.2026 GitHub refused the release merge three cycles in a row —
+    develop and main had diverged after a squash release — and the only trace
+    was the deduplicated warning above: the stalled policy was discovered by
+    a human reading server logs, and resolved by a manual sync. The feed gets
+    one entry per stall; a failed write is retried next cycle instead of
+    breaking the sweep for the remaining projects.
+    """
+    prev_reason, streak, noted = _release_stalls.get(slug, ("", 0, False))
+    if prev_reason != reason:
+        streak, noted = 0, False
+    streak += 1
+    if streak >= RELEASE_STALL_CYCLES and not noted:
+        try:
+            await log_activity(
+                db,
+                "release",
+                f"{slug}: релиз стоит — {reason}",
+                f"{streak} цикл(ов) поллера подряд; политика ретраит сама, "
+                "но расшивка причины — за человеком",
+            )
+            noted = True
+        except Exception:
+            log.exception("Poll: release stall of %s not written to activity", slug)
+    _release_stalls[slug] = (reason, streak, noted)
 
 
 async def _sweep_messages_retention(db) -> None:
