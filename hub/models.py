@@ -1111,6 +1111,20 @@ class TaskAnswer(BaseModel):
     resume: bool = True
 
 
+class TaskDeclareWait(BaseModel):
+    """Declare (or clear) what a task is waiting for (#957).
+
+    ``waiting_for`` empty clears the declaration. A non-empty declaration
+    REQUIRES a deadline: an open-ended wait is indistinguishable from
+    abandonment, which is the exact confusion the stale watchdog is being
+    cured of.
+    """
+
+    waiting_for: str = Field("", max_length=300)
+    waiting_until: str = Field("", max_length=32)
+    agent: str = Field("", max_length=120)
+
+
 class TaskDecide(BaseModel):
     action: str = Field(..., pattern="^(accept|rework)$")
     instructions: str = Field("", max_length=10000)
@@ -1678,6 +1692,14 @@ class TaskView(BaseModel):
     # move only when a verdict lands on the CURRENT generation, snapshotted at
     # submission time. Absent means "not computed on this path".
     wait_baseline: dict[str, Any] | None = None
+    # #957: the declared wait — what the task says it waits for, until when,
+    # and who declared it. Not the same thing as wait_baseline (that one is
+    # about the verdict on the current submission generation); this one feeds
+    # the stale watchdog: a current declaration silences it, a lapsed one
+    # escalates louder than plain silence.
+    waiting_for: str = ""
+    waiting_until: str = ""
+    waiting_declared_by: str = ""
     # #615: what was delivered in these areas since the statement was written.
     # Computed, never stored: the answer changes as work lands, and a stored copy
     # would be one more thing to go stale — which is the very defect this

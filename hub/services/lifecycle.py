@@ -37,7 +37,7 @@ from hub.db import (
 from hub.integrations.registry import plugins
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
-from hub.models import RiskClass
+from hub.models import RiskClass, TaskDeclareWait
 from hub.mcp_envelope import enrich_error_payload
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
@@ -569,6 +569,9 @@ def row_to_task(
         review_verdict_generation=d.get("review_verdict_generation"),
         review_approved_current=review_approved_for_current_submission(d),
         latest_review=latest_review_projection(d),
+        waiting_for=d.get("waiting_for") or "",
+        waiting_until=d.get("waiting_until") or "",
+        waiting_declared_by=d.get("waiting_declared_by") or "",
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
         claimed_by=d.get("claimed_by"),
@@ -2677,6 +2680,76 @@ async def answer_question(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def declare_task_wait(
+    db: aiosqlite.Connection, task_id: int, body: "TaskDeclareWait"
+) -> TaskView:
+    """Declare or clear a task's wait, with the deadline made non-optional (#957).
+
+    The deadline is the entire safety of the feature: a wait without one is
+    just silence with better manners, and the risk register names it first —
+    "declare a wait and vanish". So a declaration is refused without a
+    parseable future deadline, while clearing needs nothing at all.
+    """
+    row = await repo.get_task(db, task_id)
+    task = dict(_existing_task(row, task_id))
+    if bool(task.get("archived")):
+        raise HTTPException(400, "cannot declare a wait on an archived task")
+
+    waiting_for = (body.waiting_for or "").strip()
+    waiting_until = (body.waiting_until or "").strip()
+    agent = (body.agent or "").strip() or "agent"
+    if waiting_for:
+        try:
+            deadline = datetime.strptime(waiting_until, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=UTC
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                422,
+                detail=enrich_error_payload(
+                    {
+                        "reason": "wait_needs_deadline",
+                        "actor_hint": "agent",
+                        "message": (
+                            "объявленное ожидание требует срока в формате "
+                            "YYYY-MM-DD HH:MM:SS (UTC); получено: "
+                            f"'{waiting_until or 'пусто'}'"
+                        ),
+                        "hint": (
+                            "Бессрочное «жду» неотличимо от брошенной задачи — "
+                            "ровно та путаница, от которой лечится вахта. "
+                            "Назовите момент, после которого молчание станет "
+                            "просрочкой."
+                        ),
+                    }
+                ),
+            ) from exc
+        if deadline <= datetime.now(UTC):
+            raise HTTPException(
+                422,
+                detail=enrich_error_payload(
+                    {
+                        "reason": "wait_deadline_in_past",
+                        "actor_hint": "agent",
+                        "message": f"срок ожидания уже прошёл: {waiting_until}",
+                        "hint": (
+                            "Ожидание объявляют вперёд. Прошедший срок — это "
+                            "уже просрочка, и вахта скажет об этом сама."
+                        ),
+                    }
+                ),
+            )
+    await repo.declare_wait(
+        db,
+        task_id,
+        waiting_for=waiting_for,
+        waiting_until=waiting_until if waiting_for else "",
+        agent=agent,
+    )
+    fresh = await repo.get_task(db, task_id)
+    return row_to_task(_existing_task(fresh, task_id))
 
 
 async def decide_task(

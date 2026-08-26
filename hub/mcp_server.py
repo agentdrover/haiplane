@@ -1700,6 +1700,57 @@ async def hub_claim_task(
 
 
 @mcp.tool()
+async def hub_declare_wait(
+    task_id: int,
+    waiting_for: str,
+    waiting_until: str = "",
+    agent: str = "",
+) -> str:
+    """Declare what a task is waiting for and until when — or clear it (#957).
+
+    A current declaration keeps the task out of the Stale list until the
+    deadline; past the deadline the watchdog escalates the LAPSE, louder
+    than plain silence. Deadline format: YYYY-MM-DD HH:MM:SS (UTC), and it
+    is required — an open-ended wait would be indistinguishable from an
+    abandoned task. Pass an empty waiting_for to clear the declaration.
+
+    Args:
+        task_id: The task that is waiting
+        waiting_for: The event awaited (empty clears the declaration)
+        waiting_until: Deadline, YYYY-MM-DD HH:MM:SS in UTC
+        agent: Declaring agent (defaults to caller identity)
+    """
+    try:
+        await _api_post(
+            f"/api/tasks/{task_id}/declare-wait",
+            {
+                "waiting_for": waiting_for,
+                "waiting_until": waiting_until,
+                "agent": agent,
+            },
+        )
+    except HubApiError as exc:
+        return _format_hub_api_error(exc)
+    cleared = not (waiting_for or "").strip()
+    message = (
+        f"Task #{task_id}: ожидание снято."
+        if cleared
+        else (
+            f"Task #{task_id}: объявлено ожидание «{waiting_for}» до "
+            f"{waiting_until} (UTC). До срока задача не считается зависшей; "
+            "после — вахта поднимет просрочку."
+        )
+    )
+    task = await _read_task(task_id)
+    return await _task_mutation_response(
+        task_id,
+        message,
+        prior_status=(task or {}).get("status"),
+        task=task,
+    )
+
+
+@mcp.tool()
 async def hub_release_task(
     task_id: int,
     agent: str,

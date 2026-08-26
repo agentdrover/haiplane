@@ -1407,6 +1407,25 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_chat_pair_sessions_principal "
         "ON chat_pair_sessions(principal_id)",
     ),
+    (
+        # #957: a declared wait — WHAT the task is waiting for and UNTIL when.
+        # The stale watchdog measured silence (the age of updated_at) and so
+        # could not tell a task honestly waiting a day for its outcome check
+        # (#927) from one abandoned for a week (#443). A wait is a claim, so
+        # it is declared with a deadline and with a name on it: an open-ended
+        # "waiting" would just be a legal way to go silent. The three columns
+        # ship together.
+        "add_tasks_waiting_for",
+        "ALTER TABLE tasks ADD COLUMN waiting_for TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_tasks_waiting_until",
+        "ALTER TABLE tasks ADD COLUMN waiting_until TEXT",
+    ),
+    (
+        "add_tasks_waiting_declared_by",
+        "ALTER TABLE tasks ADD COLUMN waiting_declared_by TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

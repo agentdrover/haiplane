@@ -214,6 +214,36 @@ async def get_inbox_data(
         allowed = await repo.list_task_ids_for_project(db, project_id)
         stale_rows = [r for r in stale_rows if r["id"] in allowed]
 
+    # #957: the row must say what is actually known — the real age of the
+    # silence, or the lapsed wait by name — instead of the constant
+    # "30+ minutes" that was false for a task alerting for a week and
+    # insulting for one that reported an hour ago. One query per stale row;
+    # the section is short by construction (it is the list a human reads).
+    stale_meta: dict[int, dict[str, str]] = {}
+    for r in stale_rows:
+        d = dict(r)
+        waiting_for = str(d.get("waiting_for") or "")
+        waiting_until = str(d.get("waiting_until") or "")
+        if waiting_for and waiting_until:
+            stale_meta[d["id"]] = {
+                "line": (
+                    f"Ожидание просрочено: ждали «{waiting_for}» "
+                    f"до {waiting_until} (UTC)."
+                ),
+                "kind": "lapsed_wait",
+            }
+            continue
+        last_at = await repo.last_activity_at(db, d["id"])
+        stale_meta[d["id"]] = {
+            "line": (
+                f"Тишина с {last_at} (UTC) — ни одной записи от людей "
+                "или агентов с тех пор."
+                if last_at
+                else "В ленте задачи нет ни одной записи."
+            ),
+            "kind": "silence",
+        }
+
     questions: list[dict[str, Any]] = []
     for r in needs_info_rows:
         tv = row_to_task(r)
@@ -238,6 +268,7 @@ async def get_inbox_data(
         "ci_check_tasks": [row_to_task(r) for r in ci_check_rows],
         "fix_requested_tasks": [row_to_task(r) for r in fix_requested_rows],
         "stale_tasks": [row_to_task(r) for r in stale_rows],
+        "stale_meta": stale_meta,
         "filter_human_owner": human_owner or "",
         "filter_claimed_by": claimed_by or "",
         "filter_mine": mine or "",
