@@ -1803,8 +1803,10 @@ async def submit_for_review(
     # a task that genuinely has no PR (config work) must submit exactly as
     # before — the gate then completes it untouched.
     discovered_pr: int | None = None
+    pr_opened_by_hub = False
+    pr_ensure_note = ""
     if not task.get("pr_number") and canonical:
-        from hub.services.orchestration import project_git_context
+        from hub.services.orchestration import ensure_delivery_pr, project_git_context
 
         try:
             ctx = await project_git_context(db, task_id)
@@ -1813,6 +1815,18 @@ async def submit_for_review(
             )
         except Exception as exc:  # noqa: BLE001 - best effort by contract
             log.warning("PR discovery failed for #%s (%s): %s", task_id, canonical, exc)
+        # #967: discovery finding nothing used to end the question — and four
+        # tasks in one week ended completed with commits stranded on a branch.
+        # When THIS submission's diff (#583, resolved once above) positively
+        # shows changes, the hub opens the PR itself: CI then runs in parallel
+        # with the review instead of starting after done. A refusal is a
+        # warning, never a failed submission — the review in the hub is valid
+        # without a PR; the done gate is where the missing PR becomes a block.
+        if not discovered_pr and diff_paths:
+            discovered_pr, pr_ensure_note = await ensure_delivery_pr(
+                db, task, canonical, diff_paths
+            )
+            pr_opened_by_hub = bool(discovered_pr)
 
     async with get_write_lock(db):
         if not await repo.transition_status_if(
@@ -1867,7 +1881,9 @@ async def submit_for_review(
         agent = (body.agent or "").strip() or task.get("assigned_agent", "")
         summary = (body.summary or "").strip()
         content = f"{repo.SUBMISSION_UPDATE_PREFIX}{generation})."
-        if discovered_pr:
+        if pr_opened_by_hub:
+            content += f" PR #{discovered_pr} открыт хабом для доставки (#967)."
+        elif discovered_pr:
             content += f" PR #{discovered_pr} recorded for delivery."
         if submission_sha:
             content += f" Branch tip at submission: {submission_sha[:12]}."
@@ -1938,6 +1954,18 @@ async def submit_for_review(
             header = f"Отчёт проверок на сдаче (режим правил: {rules_mode})."
             await repo.add_task_update(
                 db, task_id, "hub", "alert", header + "\n— " + "\n— ".join(report_lines)
+            )
+        if pr_ensure_note:
+            # #967: the refusal half of AC-1 — the reader learns the PR is
+            # missing NOW, at submission, not from the done gate later.
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"{pr_ensure_note}. Сдача принята — ревью валидно и без PR, "
+                "но done без него не завершится: гейт откроет PR сам или "
+                "спросит человека (#967).",
             )
         if risk_alert:
             await repo.add_task_update(db, task_id, "hub", "alert", risk_alert)
@@ -3011,6 +3039,19 @@ async def add_update(
                 db, task_id, via="report_done", actor=body.agent or "agent"
             )
 
+    if undelivered:
+        # #967 (review finding): the snapshot above predates the transition,
+        # and the transition can now ANSWER it — the hub opens the PR itself
+        # (and may merge it within the same done report), and a refusal
+        # writes its own, louder needs_decision alert. "Хаб не знает ни PR"
+        # over a freshly recorded PR, or "задача завершена" next to
+        # needs_decision, is the lie that teaches readers to skip the
+        # warning — the exact failure AC-2 of #498 names. The review-routing
+        # path is untouched: there the snapshot is still true.
+        fresh_row = await repo.get_task(db, task_id)
+        fresh = dict(fresh_row) if fresh_row is not None else {}
+        if fresh.get("pr_number") or fresh.get("status") == "needs_decision":
+            undelivered = ""
     if undelivered:
         await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
         await db.commit()

@@ -3784,11 +3784,28 @@ from hub.integrations.noop import NoopGitOps  # noqa: E402
 
 
 class _RulesDiff(NoopGitOps):
+    # push/create succeed: since #967 a confirmed diff gets its PR opened at
+    # submission, and a refusal would add its own alert to tests about rules.
     def __init__(self, paths):
         self._paths = paths
 
     async def branch_diff_paths(self, branch, base_branch=None, repo=None):
         return self._paths
+
+    async def push_branch(self, branch, repo=None, force=False):
+        return True
+
+    async def create_pr(
+        self,
+        task_id,
+        title,
+        description,
+        branch,
+        repo=None,
+        gh_repo=None,
+        base_branch=None,
+    ):
+        return 41
 
 
 async def _rule_alerts(db, task_id):
