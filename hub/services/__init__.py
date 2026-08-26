@@ -117,6 +117,7 @@ from hub.services.lifecycle import (
     withdraw_own_draft,
 )
 from hub.services.orchestration import (
+    TRANSIENT_GATE_PREFIXES,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_arbiter,
@@ -127,6 +128,7 @@ from hub.services.orchestration import (
     extract_review_verdict,
     get_breadcrumb_str,
     maybe_destroy_vast,
+    merge_before_completion,
     practice_metrics,
     prepare_pair_branch,
     project_git_context,
@@ -147,6 +149,7 @@ __all__ = [
     "LimitExceededError",
     "MESSAGE_EVENT_KIND",
     "ProjectBindError",
+    "TRANSIENT_GATE_PREFIXES",
     "ReadinessConfig",
     "SEVERITY_ORDER",
     "ScoreComponent",
@@ -222,6 +225,7 @@ __all__ = [
     "list_activity",
     "list_tasks",
     "maybe_destroy_vast",
+    "merge_before_completion",
     "reorder_task",
     "latest_review_projection",
     "out_of_scope_draft_marker",

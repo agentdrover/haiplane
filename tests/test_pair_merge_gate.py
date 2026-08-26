@@ -1034,3 +1034,155 @@ async def test_the_stale_snapshot_is_not_written_over_a_refusal(db, monkeypatch)
     assert "Задача завершена" not in feed, (
         "рядом с needs_decision снимок #498 утверждал бы неправду о статусе"
     )
+
+
+# ---------------------------------------------------------------------------
+# #971 — доставка следует из состояния, а не из вызова агента
+# ---------------------------------------------------------------------------
+#
+# 26.08.2026 сессия сдала #954 на ревью в 20:34:28Z и умерла (последний
+# heartbeat 20:28:08Z). APPROVED пришёл в 21:36:16Z — через час. PR #84 был
+# открыт, MERGEABLE/CLEAN, CI зелёный, вердикт по текущей генерации. Доставки
+# не произошло: у pair-задачи мерж запускает ТОЛЬКО done-отчёт, а звать его
+# было некому. Задача осталась в running, и снять её оттуда мог лишь человек
+# роутом force-complete, кнопки на который в вебе нет.
+#
+# Автоматика для этого написана давно — _deliver_approved_review, — но живёт
+# за _sweep_review, который требует статус review И review_job_id. У pair-задачи
+# нет ни того, ни другого: ревью клиентское (#307), а APPROVED возвращает её в
+# running. Здесь тот же гейт запускается по состоянию.
+
+
+async def _drain_pair_delivery(db) -> None:
+    from hub import poller
+
+    await poller._sweep_pair_delivery(db)
+
+
+async def test_approved_pair_task_delivers_without_the_agent(db):
+    # AC-1: агент не сделал НИ ОДНОГО вызова после апрува — работа всё равно
+    # доехала. Это вся суть задачи: условия доставки наблюдаемы хабом целиком,
+    # и ни одно из них не про то, жив ли какой-то процесс.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "одобренная работа обязана доехать сама"
+    assert g.merge_pr.await_count == 1, "доставка ровно один раз"
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT pr_number, merge_sha, task_id FROM pipeline_merges"
+        )
+    ]
+    assert rows and rows[0]["pr_number"] == 77
+    assert rows[0]["merge_sha"] == "gate0merge0sha", (
+        "SHA записан тот же, что и на done-пути, иначе drift-guard не поручится"
+    )
+
+
+async def test_auto_delivery_obeys_every_existing_gate(db):
+    # AC-2: меняется ТРИГГЕР проверки, а не проверка. Красный CI на этом пути
+    # обязан вести себя ровно так же, как на done-пути: не мержить, не
+    # завершать, позвать человека (#363).
+    g = _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("ci_fail" in (u.get("content") or "") for u in updates), updates
+
+
+async def test_transient_ci_waits_instead_of_calling_a_human(db):
+    # AC-2, вторая половина (#951): жёлтый CI — это «спросить снова через
+    # минуту», а не решение. Задача остаётся в running, человека не зовут, и в
+    # лог на каждом цикле ничего не сыплется (#534): свип проходит здесь
+    # постоянно, а строка на цикл — это способ заглушить настоящий сигнал.
+    g = _git(CIProbeOutcome.pending, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "ожидание CI — не повод звать человека"
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    waiting = [u for u in updates if "ci_pending" in (u.get("content") or "")]
+    assert len(waiting) <= 1, (
+        f"два цикла ожидания не должны давать две записи: {waiting}"
+    )
+
+
+async def test_stale_approval_never_auto_delivers(db):
+    # AC-3: апрув прошлой генерации не доставляет. После апрува была пересдача
+    # — значит одобрен другой код, и вердикт к нынешнему отношения не имеет
+    # (#306). Автопуть обязан быть здесь строже, а не мягче: агента, который
+    # объяснил бы разницу, тут нет.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    await services.submit_for_review(db, task_id)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed", "устаревший апрув не доставляет"
+    g.merge_pr.assert_not_awaited()
+
+
+async def test_late_done_report_lands_as_a_record(db):
+    # AC-4: агент вернулся к жизни после автодоставки. Его отчёт — рассказ, а
+    # не вторая попытка доставки: второго мержа нет, отказа нет, текст лежит в
+    # фиде. Иначе вернувшийся агент упирался бы в собственную доставленную
+    # работу — и это худший способ узнать, что всё хорошо.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    await _drain_pair_delivery(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1, "мерж ровно один на обе дороги (#363)"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("done, delivered" in (u.get("content") or "") for u in updates), (
+        f"рассказ вернувшегося агента обязан лечь в фид: {updates}"
+    )
+
+
+async def test_poller_delivery_says_who_delivered(db):
+    # AC-5: завершённая задача без отчёта агента не должна читаться как
+    # потерянная запись. В фиде прямо сказано, что доставил хаб.
+    _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any(
+        "хаб" in (u.get("content") or "").lower()
+        and "достав" in (u.get("content") or "").lower()
+        for u in updates
+    ), f"кто доставил — должно быть видно, а не выводиться: {updates}"
+
+
+async def test_a_task_with_a_dispatch_job_is_left_to_its_own_conveyor(db):
+    # Граница: headless-задача судится своим свипом (_sweep_review) по своей
+    # джобе. Забрать её сюда значило бы завести второго хозяина у одной
+    # задачи — и два конвейера, спорящих за один PR.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, job_id="job-1")
+    await db.commit()
+
+    await _drain_pair_delivery(db)
+
+    g.merge_pr.assert_not_awaited()
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
