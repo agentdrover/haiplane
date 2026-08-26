@@ -84,6 +84,19 @@ def compute_next_action(
             "Hand the verdict to an independent reviewer: another agent "
             "principal or a human token must call hub_submit_review."
         )
+    if reason == "chat_pair_gate_forbidden":
+        return (
+            "This route is outside the chat-pair allowlist — post or sharpen "
+            "the task from the chat, and use your laptop token for anything else."
+        )
+    if reason == "chat_pair_invalid":
+        return "Take a fresh pairing code in the hub and redeem that one."
+    if reason == "chat_pair_rate_limited":
+        return "Wait out the pairing window, then redeem a fresh code."
+    if reason == "chat_pair_auth_required":
+        return "Configure hub auth (principals or HAIPLANE_HUB_TOKENS); open mode has no identity to pair."
+    if reason == "chat_pair_run_forbidden":
+        return "Create the task without run_immediately / auto_review=false, then start it from the hub."
     if reason == "forbidden":
         return "This operation is forbidden for the current token; use a human or admin token."
     if reason == "invalid_hierarchy":

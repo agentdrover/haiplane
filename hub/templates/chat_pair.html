@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% set active = "chat_pair" %}
+{% block title %}Подключить чат — {{ product_title }}{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Подключить чат Cursor</h1>
+</header>
+
+{% if error %}
+<div class="task-action-note task-action-note--warning">{{ error }}</div>
+{% endif %}
+
+<p>
+    Код одноразовый и живёт около {{ code_ttl_minutes }} мин. Вставьте его в чат
+    приложения: агент обменяет код на короткую сессию, которой хватает только на
+    постановку и уточнение задач. Гейты, решения, админка и MCP ей недоступны.
+</p>
+
+{% if code %}
+<div class="task-action-stack">
+    <p class="chat-pair-code" style="font-size:1.7rem;letter-spacing:.14em"><strong>{{ code }}</strong></p>
+    <p class="muted">Показывается один раз, действует {{ code_ttl_minutes }} мин.</p>
+</div>
+{% endif %}
+
+<form method="post" action="/chat-pair/web-start" class="task-action-stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="btn btn-primary task-action-btn" type="submit">
+        {% if code %}Выдать новый код{% else %}Получить код{% endif %}
+    </button>
+</form>
+
+<form method="post" action="/chat-pair/web-revoke" class="task-action-stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="btn task-action-btn" type="submit">Отозвать чат-сессии</button>
+</form>
+
+{% if revoked is not none %}
+<p class="muted">Отозвано сессий: {{ revoked }}. Вход в браузере и API-ключи не затронуты.</p>
+{% endif %}
+
+<p class="muted">
+    Живых чат-сессий сейчас: {{ live_sessions }}. Новый код сжигает предыдущий
+    невыданный, поэтому подсмотренный через плечо код умирает вместе с запросом
+    следующего.
+</p>
+{% endblock %}

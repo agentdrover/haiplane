@@ -992,6 +992,20 @@ async def _sweep_expired_claims(db) -> None:
                 payload={"reason": "claim_lease_expired"},
             )
             await db.commit()
+            # #966: в legacy-режиме общий клон мог остаться на ветке этой
+            # задачи и заблокировать следующий pair-start reason'ом
+            # pair_branch_unpushed. Возврат на базу best effort: реставрация
+            # не имеет права ронять sweep — остальные истёкшие claim'ы важнее.
+            try:
+                from hub.services import orchestration
+
+                await orchestration.restore_pair_workspace_base(db, task["id"])
+            except Exception:
+                log.warning(
+                    "Poll: workspace restore after claim expiry of #%d failed",
+                    task["id"],
+                    exc_info=True,
+                )
             log.info("Poll: task #%d claim lease expired → open", task["id"])
 
 
@@ -1300,9 +1314,19 @@ async def _session_reaper(app: FastAPI) -> None:
             if deleted:
                 log.info("Session reaper: removed %d expired/revoked sessions", deleted)
 
+            # Chat-pair rows die on the same hourly cycle (#961): the channel
+            # is minutes-to-hours long, so a table that only ever grew would be
+            # an archive of dead secrets' hashes.
+            from hub.services.chat_pair import chat_pair_limiter, purge_expired
+
+            purged = await purge_expired(db)
+            if purged:
+                log.info("Session reaper: removed %d chat-pair rows", purged)
+
             from hub.auth import login_limiter
 
             login_limiter._cleanup()
+            chat_pair_limiter._cleanup()
         except Exception:
             log.exception("Session reaper error")
 

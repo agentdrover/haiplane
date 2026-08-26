@@ -28,6 +28,7 @@ from hub.actionable_errors import (
 )
 from hub.auth import (
     CSRF_COOKIE_NAME,
+    client_ip,
     current_user,
     current_identity,
     require_human_or_admin,
@@ -37,6 +38,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.integrations.registry import plugins
+from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
 from hub.version import get_app_version
 from hub.models import (
@@ -185,13 +187,6 @@ async def web_login_form(
     return response
 
 
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
 @router.post("/login")
 async def web_login_submit(
     request: Request,
@@ -215,8 +210,8 @@ async def web_login_submit(
         )
 
     # Rate limiting
-    client_ip = _client_ip(request)
-    if login_limiter.is_blocked(client_ip):
+    caller_ip = client_ip(request)
+    if login_limiter.is_blocked(caller_ip):
         return RedirectResponse(
             f"/login?error=Too%20many%20login%20attempts.%20Please%20wait%20a%20few%20minutes.&next={safe_next}",
             status_code=303,
@@ -226,9 +221,9 @@ async def web_login_submit(
     if username and password:
         from hub.services import admin as admin_svc
 
-        login_limiter.record(client_ip)
+        login_limiter.record(caller_ip)
         db = _db(request)
-        ip_hash = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
+        ip_hash = hashlib.sha256(caller_ip.encode()).hexdigest()[:16]
         principal_id = await admin_svc.authenticate_password(
             db, username.strip(), password
         )
@@ -310,6 +305,130 @@ def _require_human_web(request: Request) -> None:
     """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
     if current_identity(request).is_agent:
         raise HTTPException(403, detail=human_only_gate_detail())
+
+
+# ---------------------------------------------------------------------------
+# Chat pairing (#961)
+# ---------------------------------------------------------------------------
+
+
+async def _chat_pair_page(
+    request: Request,
+    *,
+    code: str = "",
+    error: str = "",
+    revoked: int | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    """Render the pairing page and hand out a fresh CSRF token with it.
+
+    The token is minted per render, exactly as the login form does: the POST
+    below is what burns the operator's live code, so a page from another site
+    must not be able to trigger it.
+    """
+    identity = current_identity(request)
+    live = 0
+    if identity.principal_id is not None:
+        rows = await db_module.fetchall(
+            _db(request),
+            "SELECT COUNT(*) AS n FROM chat_pair_sessions "
+            "WHERE principal_id = ? AND revoked_at IS NULL "
+            "AND expires_at > datetime('now')",
+            (identity.principal_id,),
+        )
+        live = int(dict(rows[0])["n"]) if rows else 0
+
+    csrf_token = generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
+        request,
+        "chat_pair.html",
+        {
+            "code": code,
+            "error": error,
+            "revoked": revoked,
+            "live_sessions": live,
+            "code_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
+            "csrf_token": csrf_token,
+        },
+        status_code=status_code,
+    )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
+def _check_web_csrf(request: Request, csrf_token: str) -> bool:
+    return verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, ""))
+
+
+@router.get("/chat-pair", response_class=HTMLResponse)
+async def web_chat_pair(request: Request):
+    """The button behind the whole channel: a code the operator can read aloud."""
+    _require_human_web(request)
+    return await _chat_pair_page(request)
+
+
+@router.post("/chat-pair/web-start", response_class=HTMLResponse)
+async def web_chat_pair_start(request: Request, csrf_token: str = Form(default="")):
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _chat_pair_page(
+            request,
+            error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _chat_pair_page(
+            request,
+            error="Код выдаётся принципалу хаба; вход по env-токену для этого не подходит.",
+        )
+
+    code, ttl = await chat_pair_svc.issue_code(_db(request), identity.principal_id)
+    from hub.services import admin as admin_svc
+
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="chat_pair_start",
+        target_type="chat_pair",
+        target_id=str(identity.principal_id),
+        summary=f"pairing code issued from web UI, valid {ttl}s",
+    )
+    return await _chat_pair_page(request, code=code)
+
+
+@router.post("/chat-pair/web-revoke", response_class=HTMLResponse)
+async def web_chat_pair_revoke(request: Request, csrf_token: str = Form(default="")):
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _chat_pair_page(
+            request,
+            error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _chat_pair_page(request, revoked=0)
+
+    revoked = await chat_pair_svc.revoke_sessions(_db(request), identity.principal_id)
+    from hub.services import admin as admin_svc
+
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="chat_pair_revoke",
+        target_type="chat_pair",
+        target_id=str(identity.principal_id),
+        summary=f"revoked {revoked} chat-pair session(s) from web UI",
+    )
+    return await _chat_pair_page(request, revoked=revoked)
 
 
 def _dispatch_available() -> bool:

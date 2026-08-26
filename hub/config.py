@@ -274,6 +274,35 @@ HUB_COOKIE_SECURE = env_get("HUB_COOKIE_SECURE", "0") == "1"
 
 HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")
 
+# ---------------------------------------------------------------------------
+# Chat-pair (#961): a code pasted into a chat, exchanged for a short session
+# ---------------------------------------------------------------------------
+#
+# The code lives in somebody else's transcript forever, so what it can buy is
+# bounded on every axis: minutes to spend it, hours to use what it bought, and
+# a permission set that is a constant here rather than a copy of the issuer's
+# rights — the same principal is often ``admin`` in production.
+CHAT_PAIR_CODE_SECONDS = int(env_get("CHAT_PAIR_CODE_SECONDS", "300"))
+CHAT_PAIR_TTL_SECONDS = int(env_get("CHAT_PAIR_TTL_SECONDS", "7200"))
+CHAT_PAIR_REDEEM_MAX = int(env_get("CHAT_PAIR_REDEEM_MAX", "10"))
+CHAT_PAIR_REDEEM_WINDOW_SECONDS = int(env_get("CHAT_PAIR_REDEEM_WINDOW_SECONDS", "300"))
+# How long a spent code stays in the table before the reaper drops it: long
+# enough to answer "was this code used?", short enough not to be an archive.
+CHAT_PAIR_SPENT_RETENTION_HOURS = int(env_get("CHAT_PAIR_SPENT_RETENTION_HOURS", "24"))
+
+# Fixed, not derived. Post a task, read it back, sharpen it — that is the whole
+# job of this channel. Notably absent: tasks.human_gate, tasks.decision,
+# tasks.archive, tasks.delete, admin.*, integrations.vast.manage and
+# tasks.agent_report.
+CHAT_PAIR_PERMS: frozenset[str] = frozenset(
+    {
+        "tasks.read",
+        "tasks.create",
+        "tasks.refine",
+        "tasks.update",
+    }
+)
+
 
 class TokenIdentity:
     """Authenticated identity resolved from a token or DB principal.

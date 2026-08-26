@@ -482,10 +482,18 @@ async def test_pair_prepare_branch_rejects_dirty_workspace(
     assert "hub_pair_start" in detail["hint"]
 
 
-async def test_pair_prepare_branch_rejects_unpushed_other_task_branch(
-    git_ops: GitOpsIntegration,
-) -> None:
+# --- pair_branch_unpushed: хаб расшивает сам (#966) --------------------------
+#
+# Инцидент 26.08: pair-start #961 часами стоял из-за непушенной ветки #962 в
+# общем клоне, а hint «зайди на сервер и запушь» был невыполним для агента.
+# Push обычной task-ветки безопасен и обратим; потеря чужих коммитов — нет.
+
+
+def _unpushed_workspace(calls: list[tuple[str, ...]], *, push_rc: int = 0):
+    """Общий клон стоит на чужой task-1/unpushed с непушенными коммитами."""
+
     async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
         if cmd[:2] == ("status", "--porcelain"):
             return 0, "", ""
         if cmd[:2] == ("branch", "--show-current"):
@@ -496,10 +504,48 @@ async def test_pair_prepare_branch_rejects_unpushed_other_task_branch(
             and cmd[2].startswith("origin/task-1/unpushed")
         ):
             return 1, "", ""
+        if cmd[:1] == ("push",):
+            return push_rc, "", "" if push_rc == 0 else "Permission denied (publickey)"
         return 0, "", ""
 
+    return fake_git
+
+
+async def test_pair_start_auto_pushes_orphaned_branch(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """AC-1: осиротевшая ветка публикуется хабом, pair-start проходит без отказа."""
+    calls: list[tuple[str, ...]] = []
+    notify = AsyncMock()
+
     with (
-        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._git", side_effect=_unpushed_workspace(calls)),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+        patch("hub.integrations.git_ops._hostname", return_value="prod"),
+    ):
+        branch = await git_ops.pair_prepare_branch(
+            2, "Next", branch_slug="next", notify=notify
+        )
+
+    assert branch == "task-2/next"
+    assert ("push", "-u", "origin", "task-1/unpushed") in calls
+    notify.assert_awaited_once()
+    message = notify.await_args.args[0]
+    assert "task-1/unpushed" in message
+    assert "#2" in message
+
+
+async def test_failed_auto_push_falls_back_to_refusal(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """AC-2: push не удался → сегодняшний отказ, причина неудачи в hint."""
+    calls: list[tuple[str, ...]] = []
+
+    with (
+        patch(
+            "hub.integrations.git_ops._git",
+            side_effect=_unpushed_workspace(calls, push_rc=1),
+        ),
         patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
         patch("hub.integrations.git_ops._hostname", return_value="prod"),
     ):
@@ -508,8 +554,45 @@ async def test_pair_prepare_branch_rejects_unpushed_other_task_branch(
 
     detail = exc.value.to_detail()
     assert detail["reason"] == "pair_branch_unpushed"
-    assert "git push" in detail["hint"]
+    assert "Permission denied" in detail["hint"]
     assert detail["workspace_path"] == "/srv/ws"
+    # Ни reset, ни clean, ни force: чужие коммиты нетронуты.
+    assert not [c for c in calls if c[0] in ("reset", "clean") or "--force" in c]
+
+
+async def test_non_task_branch_is_not_pushed(git_ops: GitOpsIntegration) -> None:
+    """AC-3: ветка не вида task-<id>/* — авто-push не выполняется."""
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*cmd: str, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "", ""
+        if cmd[:2] == ("branch", "--show-current"):
+            return 0, "experiment", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+    ):
+        await git_ops.pair_prepare_branch(2, "Next", branch_slug="next")
+
+    assert not [c for c in calls if c[:1] == ("push",)]
+
+
+async def test_pair_push_notifier_writes_activity(db) -> None:
+    """AC-1, вторая половина: уведомление об авто-пуше попадает в ленту."""
+    from hub.services.orchestration import _pair_push_notifier
+
+    await _pair_push_notifier(db)("опубликована task-1/unpushed ради #2")
+
+    cursor = await db.execute(
+        "SELECT summary FROM activity_log WHERE kind = 'pair_branch_auto_pushed'"
+    )
+    rows = await cursor.fetchall()
+    assert len(rows) == 1
+    assert "task-1/unpushed" in rows[0]["summary"]
 
 
 async def test_pair_restore_workspace_base_checks_out_develop(
@@ -2053,3 +2136,110 @@ async def test_pr_state_does_not_pay_for_a_second_question_when_the_first_answer
         assert await git_ops.pr_state(360, gh_repo="owner/repo") == "open"
 
     assert seen["api"] == 0, "уточняющий вопрос задаётся только на пути отказа"
+
+
+# ---- #963: релиз перечисляет коммиты, а не строки их сообщений ----
+#
+# release_range просил у jq целое сообщение и резал ответ по строкам. jq
+# печатает многострочную строку как НЕСКОЛЬКО строк вывода, поэтому один
+# коммит с телом становился столько «коммитов», сколько в нём строк: релизный
+# PR #40 перечислил 25 пунктов, включая Co-authored-by, при одном коммите в
+# диапазоне, а PR #44 назвал четыре задачи при трёх — номер #880 встретился в
+# теле дважды и был посчитан дважды.
+#
+# Сообщения здесь МНОГОСТРОЧНЫЕ: на однострочных дефект невидим, и ровно
+# поэтому он дожил до прода, не уронив ничего.
+
+_COMMIT_MESSAGES = [
+    "feat(task): vtoraya-zadacha (#902)\n\nЕщё одно тело в несколько строк.\n",
+    (
+        "feat(task): pervaya-zadacha (#901)\n"
+        "\n"
+        # Squash-мерж вкладывает в тело заголовок исходного коммита ветки, и он
+        # тоже кончается на «(#NNN)». Именно так #880 попала в список PR #44
+        # дважды: _TASK_NUMBER требует номер в скобках В КОНЦЕ строки, и таких
+        # строк у squash-коммита две.
+        "* feat(task): pervaya-zadacha (#901)\n"
+        "\n"
+        "Co-authored-by: Claude Opus 5 <noreply@anthropic.com>\n"
+    ),
+]
+
+
+def _gh_compare_double():
+    """A _gh double that answers the way gh answers the jq it was GIVEN.
+
+    Not a fixed payload: the defect is in WHAT release_range asks for, so a
+    double that always returned one line per commit would go green with the
+    broken query and prove nothing. jq prints a multi-line string as multiple
+    output lines — that mechanism is modelled here instead of assumed, which
+    is the same reason #803's tests stub _gh rather than the method above it.
+    """
+
+    async def route(*args, **kwargs):
+        jq = args[args.index("--jq") + 1]
+        if jq.rstrip().endswith('split("\n")[0]'):
+            payload = [m.split("\n", 1)[0] for m in _COMMIT_MESSAGES]
+        else:
+            payload = _COMMIT_MESSAGES
+        return 0, "\n".join(m.rstrip("\n") for m in payload) + "\n", ""
+
+    return route
+
+
+async def test_release_range_returns_one_subject_per_commit(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Два коммита в диапазоне — два элемента. До починки их было пять: строки
+    # тела и Co-authored-by считались коммитами.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new=AsyncMock(side_effect=_gh_compare_double()),
+    ):
+        subjects = await git_ops.release_range(
+            "main", "develop", gh_repo="agentdrover/haiplane"
+        )
+
+    assert subjects == [
+        "feat(task): pervaya-zadacha (#901)",
+        "feat(task): vtoraya-zadacha (#902)",
+    ], f"один элемент на коммит, старшие сначала; получено: {subjects}"
+
+
+async def test_release_body_gets_one_task_id_per_commit(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-3, проверяется на СВЯЗКЕ release_range → release_body: врал именно
+    # стык. Номер, упомянутый в теле второй раз, приезжал вторым элементом
+    # списка задач — так PR #44 насчитал четыре задачи при трёх реальных.
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new=AsyncMock(side_effect=_gh_compare_double()),
+    ):
+        subjects = await git_ops.release_range("main", "develop")
+
+    from hub.services.release import release_body
+
+    body, task_ids = release_body(subjects, "develop", "main")
+    assert task_ids == [901, 902], f"по одному номеру на коммит; получено {task_ids}"
+    assert body.count("\n- ") == 2, "и по одному пункту на коммит"
+    assert "Co-authored-by" not in body
+
+
+async def test_release_range_is_empty_on_refusal_or_empty_range(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # Регрессия: оба случая и сегодня дают пустой список, и трактуются
+    # одинаково — «нечего релизить» и «не смогли спросить» здесь ведут к
+    # одному действию: не открывать релиз.
+    async def refused(*args, **kwargs):
+        return 1, "", "gh: could not compare"
+
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=refused)):
+        assert await git_ops.release_range("main", "develop") == []
+
+    async def empty(*args, **kwargs):
+        return 0, "", ""
+
+    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=empty)):
+        assert await git_ops.release_range("main", "develop") == []

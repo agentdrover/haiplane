@@ -6,6 +6,8 @@ even when no real integrations are configured.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from typing import Any
 
 import aiosqlite
@@ -276,6 +278,7 @@ class NoopGitOps:
         branch_slug: str = "",
         repo: str | None = None,
         base_branch: str | None = None,
+        notify: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         from hub.integrations.git_ops import _slugify
 
