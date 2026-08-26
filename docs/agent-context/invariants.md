@@ -39,6 +39,18 @@ These are the rules most likely to be broken by “small” changes.
   `running` → fix → `hub_submit_for_review`). Never spawn parallel tasks for
   in-scope findings (incident #392). `out_of_scope` findings go to separate
   tasks referenced by `linked_task_id` and never block the verdict.
+- Delivery PR for confirmed commits (#967): a pair task whose branch
+  verifiably carries commits (`branch_diff_paths` → non-empty list) does not
+  submit or complete without a PR — the hub pushes the branch and opens one
+  itself (`ensure_delivery_pr`), at submission and at done. If commits are
+  confirmed and the PR cannot be opened, the done report goes to
+  `needs_decision`, not `completed`. The block arms ONLY on positive
+  knowledge: `None` ("could not look") and `[]` (empty diff) keep the old
+  path — the #498/#767 line that ignorance is not an accusation. Boundary:
+  the invariant sees only what the hub's clone and origin see; a branch that
+  exists solely in a foreign unpushed clone stays silent (#966's territory).
+  This deliberately RETIRES the old carve-out "a task with a branch and no
+  PR completes as before" for anything with observable commits.
 - Human overrides bypass the gate by design and stay audited: `hub_decide_task`
   accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last

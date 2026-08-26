@@ -17,6 +17,7 @@ from hub import config
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.ci_report import VALIDATION_PASS
@@ -42,7 +43,14 @@ _CLEAN_REVIEW = {
 
 
 class _PinnedGitOps(NoopGitOps):
-    """A branch whose tip and diff the test controls."""
+    """A branch whose tip and diff the test controls.
+
+    Since #967 a diff that positively shows commits gets its PR opened by the
+    hub at submission, and the done path delivers it through the merge gate —
+    so this fake must be able to push, open and merge a PR, or every test
+    here would end in warnings about a PR nobody could open (and the done
+    test in needs_decision instead of completed).
+    """
 
     def __init__(self, tip: str, paths: list[str]) -> None:
         self._tip = tip
@@ -56,6 +64,38 @@ class _PinnedGitOps(NoopGitOps):
 
     async def branch_diff_paths(self, branch, base_branch=None, repo=None):
         return self._paths
+
+    async def push_branch(self, branch, repo=None, force=False):
+        return True
+
+    async def create_pr(
+        self,
+        task_id,
+        title,
+        description,
+        branch,
+        repo=None,
+        gh_repo=None,
+        base_branch=None,
+    ):
+        return 41
+
+    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None):
+        return CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+
+    async def merge_pr(
+        self, pr_number, task_id, title, repo=None, gh_repo=None, delete_branch=True
+    ):
+        return True
+
+    async def merge_commit_sha(self, pr_number, repo=None, gh_repo=None):
+        return "b" * 40
+
+    async def pull_main(self, repo=None, base_branch=None):
+        return True
+
+    async def delete_branch(self, branch, repo=None, base_branch=None):
+        return True
 
 
 async def _node(
