@@ -2504,6 +2504,24 @@ class HealthView(BaseModel):
     cursor_cloud_configured: bool = False
 
 
+class EffectivePolicies(BaseModel):
+    """Чем хаб живёт после парсинга env (#965) — не что задумано в drop-in.
+
+    Белый список полей-режимов, и только он: дамп конфига целиком притащил бы
+    секреты. Появился из инцидента ребрендинга #932, когда три политики прода
+    молча стояли на дефолтах из-за мёртвого префикса, а доказать это одним
+    вызовом позволял только workspace_mode.
+    """
+
+    auto_approve_max_class: str
+    sdd_ac_locator: str
+    sdd_ac_tests: str
+    sdd_validation: str
+    submit_rules: str
+    machine_review: str
+    worktree_per_task: bool
+
+
 class IdentityDiagnosticsView(BaseModel):
     """One-call identity + environment truth for agents (#452).
 
@@ -2527,6 +2545,7 @@ class IdentityDiagnosticsView(BaseModel):
     workspace_path: str = ""
     workspace_branch: str = ""
     workspace_mode: str = "legacy"
+    effective_policies: EffectivePolicies | None = None
     app_version: str
 
 

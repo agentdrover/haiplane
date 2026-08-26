@@ -247,3 +247,63 @@ async def test_check_default_workspace_origin_none_when_not_git(monkeypatch, tmp
 
     monkeypatch.setattr(diag, "WORKSPACE_REPO_LINK", tmp_path)
     assert await diag.check_default_workspace_origin() is None
+
+
+# --- Эффективные политики в diagnostics (#965) -------------------------------
+#
+# После ребрендинга #932 три политики прода молча стояли на дефолтах: drop-in'ы
+# несли мёртвый префикс. Единственным полем, позволившим доказать это одним
+# вызовом, был workspace_mode. Эти тесты закрепляют то же зеркало за остальными
+# политиками: diagnostics показывает, чем хаб живёт, а не что задумано.
+
+
+@pytest.mark.asyncio
+async def test_effective_policies_reflect_config(client, monkeypatch):
+    """AC-1: значения в effective_policies совпадают с действующим конфигом."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "SDD_AC_LOCATOR", "require")
+    monkeypatch.setattr(config, "SUBMIT_RULES", "warn")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+
+    resp = await client.get(
+        "/api/diagnostics/identity",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 200, resp.text
+    policies = resp.json()["effective_policies"]
+    assert policies["worktree_per_task"] is True
+    assert policies["auto_approve_max_class"] == "r1"
+    assert policies["sdd_ac_locator"] == "require"
+    assert policies["submit_rules"] == "warn"
+    assert set(policies) == {
+        "auto_approve_max_class",
+        "sdd_ac_locator",
+        "sdd_ac_tests",
+        "sdd_validation",
+        "submit_rules",
+        "machine_review",
+        "worktree_per_task",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_identity_names_policies(monkeypatch):
+    """AC-2: текстовый вывод hub_admin_my_identity называет политики, без секретов."""
+    from hub.mcp_server import _format_identity_diagnostics
+    from hub.services.diagnostics import build_identity_diagnostics
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    monkeypatch.setattr(config, "SDD_AC_LOCATOR", "require")
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "sekret-cursor-key")
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+
+    view = await build_identity_diagnostics(TokenIdentity("alice", "human"))
+    text = _format_identity_diagnostics(view.model_dump())
+
+    assert "auto_approve_max_class=r1" in text
+    assert "sdd_ac_locator=require" in text
+    assert "worktree_per_task=on" in text
+    assert "sekret-cursor-key" not in text
+    assert "sekret-cursor-key" not in view.model_dump_json()
