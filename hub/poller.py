@@ -992,6 +992,20 @@ async def _sweep_expired_claims(db) -> None:
                 payload={"reason": "claim_lease_expired"},
             )
             await db.commit()
+            # #966: в legacy-режиме общий клон мог остаться на ветке этой
+            # задачи и заблокировать следующий pair-start reason'ом
+            # pair_branch_unpushed. Возврат на базу best effort: реставрация
+            # не имеет права ронять sweep — остальные истёкшие claim'ы важнее.
+            try:
+                from hub.services import orchestration
+
+                await orchestration.restore_pair_workspace_base(db, task["id"])
+            except Exception:
+                log.warning(
+                    "Poll: workspace restore after claim expiry of #%d failed",
+                    task["id"],
+                    exc_info=True,
+                )
             log.info("Poll: task #%d claim lease expired → open", task["id"])
 
 

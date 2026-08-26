@@ -1346,6 +1346,19 @@ def _slug_for_task(task_id: int, task: dict[str, Any], branch_slug: str) -> str:
     return ""
 
 
+def _pair_push_notifier(db: aiosqlite.Connection):
+    """Колбэк для git-слоя (#966): авто-push осиротевшей ветки виден в ленте.
+
+    Молчаливая публикация чужой ветки запрещена constraints задачи — каждая
+    такая операция оставляет запись, кто и ради чего её выполнил.
+    """
+
+    async def _notify(message: str) -> None:
+        await log_activity(db, "pair_branch_auto_pushed", message)
+
+    return _notify
+
+
 async def prepare_pair_branch(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1371,6 +1384,7 @@ async def prepare_pair_branch(
         task_id,
         task["title"],
         branch_slug=branch_slug,
+        notify=_pair_push_notifier(db),
         **local_kw,
     )
 

@@ -45,7 +45,14 @@ class MockGitOps(NoopGitOps):
         return f"task-{task_id}/{_slugify(title)}"
 
     async def pair_prepare_branch(
-        self, task_id, title, *, branch_slug="", repo=None, base_branch=None
+        self,
+        task_id,
+        title,
+        *,
+        branch_slug="",
+        repo=None,
+        base_branch=None,
+        notify=None,
     ):
         from hub.integrations.git_ops import _slugify
 
