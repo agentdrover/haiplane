@@ -967,3 +967,70 @@ async def test_a_freshly_created_pr_with_running_ci_keeps_the_task_running(db):
         if "отложена" in (dict(u)["content"] or "")
     )
     assert "#514" in alert
+
+
+# ---- находка ревью #967: снимок #498 берётся ДО перехода и писался ПОСЛЕ ----
+#
+# undelivered_warning вычисляется в add_update до transition_after_agent_done,
+# а пишется в ленту и warnings ответа после. Теперь переход сам отвечает на
+# вопрос снимка: открывает PR (и в AC-2 даже сливает его) или уходит в
+# needs_decision со своим, более громким алертом. Старый текст «хаб не знает
+# ни PR» поверх только что записанного PR — та самая ложь, от которой AC-2
+# #498 предостерегает: предупреждение, поймавшееся на вранье, перестают читать.
+
+
+def _project_ctx(monkeypatch) -> None:
+    """A project context with a workspace, so the #498 snapshot can look."""
+    from hub import services as services_module
+
+    ctx = AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"})
+    monkeypatch.setattr(services_module, "project_git_context", ctx)
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context", ctx, raising=False
+    )
+
+
+async def test_the_stale_snapshot_is_not_written_over_a_delivered_pr(db, monkeypatch):
+    _project_ctx(monkeypatch)
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=515)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed" and task["pr_number"] == 515
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "не начала доставляться" not in feed, (
+        "хаб сам открыл и слил PR — снимок, снятый до перехода, обязан умолкнуть"
+    )
+    assert "остались в ветке" not in feed
+
+
+async def test_the_stale_snapshot_is_not_written_over_a_refusal(db, monkeypatch):
+    # needs_decision пишет свой алерт («NOT completed», действия по #952);
+    # снимок #498 рядом с ним утверждал бы «Задача завершена» — неправду.
+    _project_ctx(monkeypatch)
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.pr_for_branch = AsyncMock(return_value=None)
+    task_id = await _approved_pair_task(db, pr_number=None)
+    g.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    g.push_branch = AsyncMock(return_value=True)
+    g.create_pr = AsyncMock(return_value=None)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "NOT completed" in feed, "отказ гейта говорит сам, громче и точнее"
+    assert "Задача завершена" not in feed, (
+        "рядом с needs_decision снимок #498 утверждал бы неправду о статусе"
+    )

@@ -3040,6 +3040,19 @@ async def add_update(
             )
 
     if undelivered:
+        # #967 (review finding): the snapshot above predates the transition,
+        # and the transition can now ANSWER it — the hub opens the PR itself
+        # (and may merge it within the same done report), and a refusal
+        # writes its own, louder needs_decision alert. "Хаб не знает ни PR"
+        # over a freshly recorded PR, or "задача завершена" next to
+        # needs_decision, is the lie that teaches readers to skip the
+        # warning — the exact failure AC-2 of #498 names. The review-routing
+        # path is untouched: there the snapshot is still true.
+        fresh_row = await repo.get_task(db, task_id)
+        fresh = dict(fresh_row) if fresh_row is not None else {}
+        if fresh.get("pr_number") or fresh.get("status") == "needs_decision":
+            undelivered = ""
+    if undelivered:
         await repo.add_task_update(db, task_id, "hub", "alert", undelivered)
         await db.commit()
 
