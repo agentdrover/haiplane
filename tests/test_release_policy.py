@@ -48,6 +48,12 @@ def _git(*, ci: CIProbeOutcome = CIProbeOutcome.passed, existing_pr: int | None 
     # not compare". True here means what these tests assume: develop carries
     # work main does not.
     g.content_differs = AsyncMock(return_value=True)
+    # #969: the release ends by returning the release branch into the
+    # integration branch. A fake that leaves this question to the noop makes
+    # every case here read as "could not ask" — the same half-substituted
+    # harness that cost #968 seven tests. These tests are about other things,
+    # so the answer is the quiet one: there was nothing to return.
+    g.return_release_into_base = AsyncMock(return_value=("nothing", "уже содержит"))
     g.open_release_pr = AsyncMock(return_value=777)
     plugins.git_ops = g
     return g
