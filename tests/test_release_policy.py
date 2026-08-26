@@ -21,7 +21,11 @@ from hub import poller
 from hub import repository as repo
 from hub import services
 from hub.integrations.noop import NoopGitOps
-from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    MergeabilityOutcome,
+)
 from hub.integrations.registry import plugins
 from hub.models import TaskCreate, TaskReviewVerdict, TaskUpdateCreate
 from hub.services.release import release_body
@@ -54,6 +58,12 @@ def _git(*, ci: CIProbeOutcome = CIProbeOutcome.passed, existing_pr: int | None 
     # harness that cost #968 seven tests. These tests are about other things,
     # so the answer is the quiet one: there was nothing to return.
     g.return_release_into_base = AsyncMock(return_value=("nothing", "уже содержит"))
+    # #970: зелёный CI больше не разрешение мержить — релиз отдельно
+    # спрашивает, сливается ли PR. Незаявленный метод ушёл бы в noop, и каждый
+    # тест здесь молча читался бы как «не смог спросить у GitHub».
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.mergeable, "clean")
+    )
     g.open_release_pr = AsyncMock(return_value=777)
     plugins.git_ops = g
     return g
@@ -366,3 +376,128 @@ async def test_failed_open_is_reported_once(db: aiosqlite.Connection, caplog):
     assert len(said) == 1, f"one line per reason, not per cycle: {said}"
     entries = await _release_activity(db)
     assert len(entries) == 1 and "не открыт" in entries[0]["summary"]
+
+
+# ---- #970: релиз спрашивает про mergeable, а не узнаёт по отказу ----------
+#
+# У PR #83 26.08.2026 CI был зелёным — «Ruff and pytest» pass 4m2s, — а
+# смержиться он не мог: mergeable=CONFLICTING, mergeStateStatus=DIRTY. Поллер
+# каждый цикл звал merge_pr, получал отказ и выдавал «GitHub отказал». Строка
+# называет исполнителя, а не причину: конфликт, отозванные права, снятая ветка
+# и временная ошибка GitHub лечатся по-разному, а звучат одинаково.
+
+
+async def test_conflicting_release_names_the_conflict(db: aiosqlite.Connection):
+    # AC-1: конфликт узнаётся ДО попытки. merge_pr не зовётся вовсе — стучаться
+    # в стену каждый цикл и пересказывать отказ GitHub не то же самое, что
+    # знать, что происходит.
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services.release import merge_ready_release
+
+    g = _git(existing_pr=777)
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.conflicting, "конфликт в hub/db.py")
+    )
+    pid = await _release_project(db, "auto")
+    project = await repo.get_project(db, pid)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    assert "hub/db.py" in reason, f"причина обязана вести к месту: {reason!r}"
+    assert "отказал" not in reason, (
+        f"«GitHub отказал» называет исполнителя, а не причину: {reason!r}"
+    )
+    g.merge_pr.assert_not_awaited()
+
+    # Тот же отказ на следующем цикле — та же строка, иначе поллер не узнает
+    # её как уже доложенную и начнёт писать в ленту заново (#534, #962).
+    _, again = await merge_ready_release(db, project)
+    assert again == reason
+
+
+async def test_mergeable_release_still_merges(db: aiosqlite.Connection):
+    # AC-2: новая проверка не должна стать ещё одним гейтом. Зелёный CI плюс
+    # MERGEABLE — релиз идёт, как шёл.
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services.release import merge_ready_release
+
+    g = _git(existing_pr=777)
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.mergeable, "clean")
+    )
+    pid = await _release_project(db, "auto")
+    project = await repo.get_project(db, pid)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is True, reason
+    g.merge_pr.assert_awaited()
+
+
+async def test_unknown_mergeability_is_not_a_conflict(db: aiosqlite.Connection):
+    # AC-3: GitHub считает mergeability асинхронно и на свежем PR несколько
+    # секунд честно отвечает UNKNOWN. Принять это за конфликт — завести ложную
+    # тревогу на КАЖДОМ только что открытом релизе; это класс #725 с другой
+    # стороны. Ответ переспрашивается следующим циклом, как уже устроено с CI.
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services.release import merge_ready_release
+
+    g = _git(existing_pr=777)
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.unknown, "GitHub ещё считает")
+    )
+    pid = await _release_project(db, "auto")
+    project = await repo.get_project(db, pid)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    assert "конфликт" not in reason.lower(), (
+        f"«ещё не посчитано» — это не диагноз: {reason!r}"
+    )
+    assert reason, "и не тишина: причина названа, чтобы стойло было видно"
+    g.merge_pr.assert_not_awaited()
+
+
+async def test_an_unaskable_github_is_not_a_conflict_either(
+    db: aiosqlite.Connection,
+):
+    # Граница того же: gh, который не ответил, — третий случай, а не конфликт
+    # и не разрешение мержить. Разные причины лечатся разными руками.
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services.release import merge_ready_release
+
+    g = _git(existing_pr=777)
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.unavailable, "gh молчит")
+    )
+    pid = await _release_project(db, "auto")
+    project = await repo.get_project(db, pid)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    assert "конфликт" not in reason.lower(), reason
+    assert "gh молчит" in reason
+    g.merge_pr.assert_not_awaited()
+
+
+async def test_a_red_ci_is_answered_before_mergeability_is_asked(
+    db: aiosqlite.Connection,
+):
+    # Порядок проверок: красный CI отвечает первым и один вопрос к GitHub
+    # экономится. Это не оптимизация ради оптимизации — причина стойла должна
+    # называть то, что случилось раньше, иначе владелец чинит не то.
+    from hub.services.release import merge_ready_release
+
+    g = _git(ci=CIProbeOutcome.failed, existing_pr=777)
+    g.check_pr_mergeable = AsyncMock()
+    pid = await _release_project(db, "auto")
+    project = await repo.get_project(db, pid)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    assert "ci_fail" in reason
+    g.check_pr_mergeable.assert_not_awaited()

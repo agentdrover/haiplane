@@ -12,7 +12,11 @@ from typing import Any
 
 import aiosqlite
 
-from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    MergeabilityOutcome,
+)
 
 
 class NoopDispatch:
@@ -225,6 +229,21 @@ class NoopGitOps:
         release, None makes the caller say why it did nothing.
         """
         return None
+
+    async def check_pr_mergeable(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[MergeabilityOutcome, str]:
+        """No GitHub here — "could not ask", never "mergeable" (#970).
+
+        Answering ``mergeable`` would let a release walk into a merge nobody
+        checked; answering ``conflicting`` would invent a conflict. Both are
+        claims about a repository this integration cannot see.
+        """
+        return (MergeabilityOutcome.unavailable, "git integration is not configured")
 
     async def return_release_into_base(
         self,

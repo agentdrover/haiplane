@@ -125,3 +125,43 @@ async def test_activity_failure_does_not_break_sweep(db):
     await _sweep(db, False, REFUSAL)
     entries = await _stall_entries(db)
     assert {e["summary"].split(":")[0] for e in entries} == {"default", "second"}
+
+
+# --- AC-4 (#970): в ленту едет диагноз, а не «GitHub отказал» ---------------
+
+
+async def test_stall_notice_names_the_conflict(db):
+    """Настоящий merge_ready_release, а не пересказ мока.
+
+    #962 построил дорогу от стойла до ленты и повёз по ней ту же непрозрачную
+    фразу, поэтому человек всё равно шёл смотреть в GitHub. Тест держит весь
+    путь целиком: конфликтный релизный PR → причина → запись в ленте, по
+    которой понятен следующий шаг.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from hub import repository as hub_repo
+    from hub.integrations.protocols import MergeabilityOutcome
+    from tests.test_release_policy import _git as _git_plugin
+
+    g = _git_plugin(existing_pr=83)
+    g.check_pr_mergeable = _AsyncMock(
+        return_value=(MergeabilityOutcome.conflicting, "конфликт в hub/db.py")
+    )
+    row = await _project(db)
+    await hub_repo.update_project(
+        db, dict(row)["id"], gate_policy='{"release": "auto"}'
+    )
+    await db.commit()
+
+    for _ in range(poller.RELEASE_STALL_CYCLES):
+        await poller._sweep_release_policy(db)
+
+    entries = await _stall_entries(db)
+    assert entries, "стойло обязано дойти до ленты"
+    text = " ".join((e["summary"] or "") + (e["detail"] or "") for e in entries)
+    assert "hub/db.py" in text, f"в ленте нет диагноза, только шум: {entries}"
+    assert "отказал" not in text, (
+        f"«GitHub отказал» — это не то, что человек может починить: {entries}"
+    )
+    g.merge_pr.assert_not_awaited()

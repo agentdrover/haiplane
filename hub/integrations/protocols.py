@@ -31,6 +31,30 @@ class CIProbeOutcome(str, Enum):
     unavailable = "unavailable"  # gh error / invalid JSON / unknown state
 
 
+class MergeabilityOutcome(str, Enum):
+    """Can this pull request be merged at all — and if not, why (#970).
+
+    The release used to learn this by trying: it checked CI, called
+    ``merge_pr``, and reported "GitHub отказал" when the call came back
+    false. That names the actor, not the cause — a conflict, a revoked
+    token, a deleted branch and a passing five-hundred all sound the same
+    and are fixed by different hands. On 26.08.2026 release PR #83 stood
+    conflicted at green CI, and the diagnosis a human got in one ``gh``
+    call the mechanism could not state at all.
+
+    ``unknown`` is not a diagnosis and must never be collapsed into
+    ``conflicting``: GitHub computes mergeability asynchronously and
+    answers UNKNOWN honestly for the first seconds of every new pull
+    request. Reading that as a conflict would raise a false alarm on every
+    release the moment it opens — #725 from the other side.
+    """
+
+    mergeable = "mergeable"
+    conflicting = "conflicting"
+    unknown = "unknown"  # GitHub has not computed it yet → ask again
+    unavailable = "unavailable"  # gh error / invalid JSON / no answer
+
+
 @dataclass(frozen=True)
 class CIProbeResult:
     """A CI probe outcome plus a stable, machine-usable reason (#419)."""
@@ -204,6 +228,13 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> tuple[str, str]: ...
+    async def check_pr_mergeable(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[MergeabilityOutcome, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None: ...
