@@ -2265,10 +2265,21 @@ async def hub_submit_machine_review(
     # task log. A task about trustworthy numbers cannot ship a receipt that
     # disagrees with the row it describes.
     stored_raw = result.get("raw_count", raw_count)
+    # #728: by the same rule, the receipt names it when the row says you
+    # reviewed your own work. The report is kept — its findings are real —
+    # but it does not count as an independent one, and the auto-verdict
+    # will send the task to a human rather than sign it off.
+    self_note = (
+        " Записано как САМОРЕВЬЮ: отчёт подан принципалом, выполнявшим "
+        "задачу. Он не заменяет независимое ревью — автовердикт по нему не "
+        "выносится, вердикт остаётся человеку."
+        if result.get("self_reviewed")
+        else ""
+    )
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
         f"#{result.get('submission_generation')}): {stored_raw} raw → "
-        f"{confirmed} confirmed / {rejected} rejected.",
+        f"{confirmed} confirmed / {rejected} rejected.{self_note}",
         machine_review=result,
     )
 

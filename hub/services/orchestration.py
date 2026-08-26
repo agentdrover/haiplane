@@ -194,6 +194,17 @@ async def machine_review_gap(
         return "machine-review отсутствует для текущего сабмишена"
     if mr["submission_generation"] != generation:
         return "machine-review устарел (работа пересдана) — прогоните харнесс заново"
+    if mr["self_reviewed"] and config.REVIEW_SELF_APPROVE != "allow":
+        # #728, and the same substitution as the line below: the requirement is
+        # that an INDEPENDENT review ran. This is the queue-passing use the
+        # statement quotes — "для аудита слабо, для пропуска в очередь — ок" —
+        # and it worked because nothing here asked who wrote the report. Solo
+        # mode is the one place that answer is allowed to be "the author".
+        return (
+            "machine-review подан тем же принципалом, который выполнял "
+            "задачу: отчёт о собственной работе не заменяет независимое "
+            "ревью — прогоните харнесс под другим принципалом"
+        )
     if not report_has_evidence(mr):
         # The requirement is that a review RAN, and this row is the record of
         # one that shows no sign of having run. Saying "satisfied" here is the

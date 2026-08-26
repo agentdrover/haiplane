@@ -323,6 +323,27 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         if order.index(diff_class) > order.index(RiskClass(stored_raw)):
             return False
 
+    # --- Reviewer independence (#728): not the author's own report --------
+    #
+    # The diversity rule below asks whether the reviewer's MODEL differs from
+    # the implementer's; nothing asked whether the PRINCIPAL did. So the
+    # implementer could report on their own work under another model
+    # declaration and the policy would sign it off as independent — the very
+    # bypass the human path closed in #318. Escalated, not refused in silence:
+    # this module keeps silence for absent data, and a self-review is a
+    # positive fact about the report in hand.
+    self_reviewed = bool(review.get("self_reviewed"))
+    solo = config.REVIEW_SELF_APPROVE == "allow"
+    if self_reviewed and not solo:
+        await _escalate(
+            db,
+            task_id,
+            "саморевью: machine-review подан тем же принципалом, который "
+            "выполнял задачу — разнородность моделей этого не ловит, "
+            "независимость проверяется по личности, а не по объявленной модели",
+        )
+        return False
+
     # --- Model diversity (#758): no monoculture reviews -------------------
     from hub.services.model_family import same_family
 
@@ -346,11 +367,14 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # --- All grounds clean: the policy issues the verdict -----------------
     from hub.services.lifecycle import record_review_verdict
 
+    # Solo mode is the only way past the check above, and it does not make a
+    # self-review independent — it makes it permitted. The verdict is stored
+    # as self-approved so the audit trail says which of the two it was (#434).
     await record_review_verdict(
         db,
         task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=_POLICY_ACTOR),
-        self_approved=False,
+        self_approved=self_reviewed,
     )
     await repo.add_task_update(
         db,

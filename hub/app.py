@@ -1642,11 +1642,33 @@ async def api_submit_machine_review(
     # audit signal (#828), where it belongs — beside the numbers, not
     # pretending to bound them.
     incomplete = body.incomplete
+    # #728: the twin of the human path's guard. hub_submit_review refuses a
+    # verdict from the implementer and the brief warns before the effort is
+    # spent, while this door had no check at all — so the rule was bypassable
+    # by choosing it, and the operator said what that bought: "для аудита
+    # слабо, для пропуска в очередь — ок".
+    #
+    # Recorded rather than refused: the statement rules out removing machine
+    # review as a queue mechanism, and a report of one's own work is still
+    # worth keeping — its findings are real. What must never happen is that it
+    # passes for an independent one, so the fact travels with it (and the
+    # auto-verdict acts on it). Same definition of "implementer" as the verdict
+    # gate — caller_implemented_task — not a second one that could drift.
+    #
+    # From the TOKEN, never from submitted_by: that field is written below as
+    # `body.agent or identity.username`, i.e. the caller names itself, and a
+    # guard reading the checked party's account of itself is not a guard (#893).
+    self_reviewed = services.caller_implemented_task(
+        task,
+        principal_id=identity.principal_id,
+        username=identity.username,
+    )
     await repo.insert_machine_review(
         db,
         task_id=task_id,
         submission_generation=generation,
         profile=profile,
+        self_reviewed=self_reviewed,
         harness_skill=body.harness_skill,
         harness_version=body.harness_version,
         agent_count=body.agent_count,
