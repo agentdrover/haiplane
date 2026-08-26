@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import socket
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
@@ -689,8 +690,14 @@ class GitOpsIntegration:
         branch_slug: str = "",
         repo: str | None = None,
         base_branch: str | None = None,
+        notify: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
-        """Safe branch setup for pair mode: never git-clean a dirty worktree."""
+        """Safe branch setup for pair mode: never git-clean a dirty worktree.
+
+        ``notify`` получает человекочитаемое сообщение, когда подготовка сделала
+        что-то, что должно быть видно в ленте (#966: авто-push осиротевшей
+        ветки). Колбэк, а не запись напрямую: у git-слоя нет соединения с БД.
+        """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
@@ -720,19 +727,48 @@ class GitOpsIntegration:
         other_id = _task_id_from_branch(current)
         if other_id is not None and other_id != task_id:
             if not await _branch_is_fully_pushed(current, repo):
-                raise _pair_branch_conflict(
-                    f"Branch {current!r} has unpushed commits; "
-                    f"push before pair-start for #{task_id}",
-                    repo=repo,
-                    reason="pair_branch_unpushed",
-                    hint=(
-                        f"On {_hostname()}: cd {repo} && "
-                        f"git push -u origin {current}, then retry "
-                        f"hub_pair_start for #{task_id}."
-                    ),
-                    current_branch=current,
-                    task_id=task_id,
+                # #966: отказ «зайди на сервер и запушь» невыполним для
+                # вызывающего — доступа к общему клону у агентов нет, и #961
+                # часами ждал человека с root. Push обычной task-ветки в origin
+                # безопасен и обратим (потеря непушенных коммитов — нет), так
+                # что хаб выполняет эту часть remediation сам и отказывает
+                # только когда она не удалась. Только ветки task-<id>/* —
+                # произвольные ветки публиковать не наше решение.
+                rc, _, push_err = await _git(
+                    "push", "-u", "origin", current, repo=repo, check=False
                 )
+                if rc != 0:
+                    raise _pair_branch_conflict(
+                        f"Branch {current!r} has unpushed commits; "
+                        f"auto-push failed, push before pair-start for #{task_id}",
+                        repo=repo,
+                        reason="pair_branch_unpushed",
+                        hint=(
+                            f"Auto-push of {current!r} failed: "
+                            f"{(push_err or '').strip() or 'git push failed'}. "
+                            f"On {_hostname()}: cd {repo} && "
+                            f"git push -u origin {current}, then retry "
+                            f"hub_pair_start for #{task_id}."
+                        ),
+                        current_branch=current,
+                        task_id=task_id,
+                    )
+                log.info(
+                    "pair_prepare_branch: auto-pushed orphaned %s to unblock #%s",
+                    current,
+                    task_id,
+                )
+                if notify is not None:
+                    try:
+                        await notify(
+                            f"pair-start #{task_id}: опубликована осиротевшая "
+                            f"ветка {current} (была непушена в общем клоне)"
+                        )
+                    except Exception:
+                        log.warning(
+                            "pair_prepare_branch: auto-push notification failed",
+                            exc_info=True,
+                        )
             log.info(
                 "pair_prepare_branch: auto-switching from pushed %s to %s for task #%s",
                 current,
@@ -2148,6 +2184,52 @@ class GitOpsIntegration:
         up itself instead of asking anyone to remember a number.
         """
         return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
+
+    async def content_differs(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """Does ``head`` hold content ``base`` does not? (#968)
+
+        Three answers, like every other question asked of git here. ``True`` —
+        the branches differ and there is something to release. ``False`` — the
+        content is identical, whatever the commit graph says. ``None`` — the
+        question could not be asked, and the caller must not read that as
+        "nothing to release".
+
+        Exists because counting commits stopped answering this question. A
+        squash release writes a new commit on the release branch instead of
+        carrying the originals, so ``base..head`` never empties and every
+        cycle looked like undelivered work. On 26.08.2026 that opened twenty
+        release PRs in ninety minutes, nineteen of them empty, each one
+        redeploying production. Trees are how git states "the same content",
+        so this compares them directly rather than counting what the graph
+        happens to contain.
+        """
+        # The clone may be behind, and the question is about upstream, not
+        # about this checkout — so refresh the two ends first. A fetch that
+        # fails is not fatal: the local refs may still answer, and only a
+        # failure to COMPARE is "could not ask".
+        await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=repo,
+            check=False,
+        )
+        for left, right in ((f"origin/{base}", f"origin/{head}"), (base, head)):
+            rc, _, _ = await _git(
+                "diff", "--quiet", left, right, repo=repo, check=False
+            )
+            if rc == 0:
+                return False
+            if rc == 1:
+                return True
+        return None
 
     async def release_range(
         self,

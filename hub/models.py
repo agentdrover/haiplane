@@ -2490,6 +2490,39 @@ class WhoamiView(BaseModel):
     app_version: str
 
 
+class ChatPairStartView(BaseModel):
+    """What the operator copies into the chat (#961).
+
+    ``expires_in_sec`` is read from config on every call rather than pinned at
+    300 here: a hub that shortened the window would otherwise print a promise
+    it does not keep.
+    """
+
+    code: str
+    expires_in_sec: int
+
+
+class ChatPairRedeem(BaseModel):
+    # Long enough for the display form with prefix and dash, short enough that
+    # a paste of the whole chat is refused by the contract, not by the hash.
+    code: str = Field(..., min_length=1, max_length=32)
+
+
+class ChatPairRedeemed(BaseModel):
+    """The one time the session token exists in plaintext."""
+
+    token: str
+    expires_at: str
+    username: str
+    role: str
+    base_url: str
+    permissions: list[str]
+
+
+class ChatPairRevoked(BaseModel):
+    revoked: int
+
+
 class HealthView(BaseModel):
     status: str = "ok"
     app_version: str
@@ -2502,6 +2535,9 @@ class HealthView(BaseModel):
     # Cursor Cloud Agents API (#756): whether the cross-model review
     # executor has a key configured.
     cursor_cloud_configured: bool = False
+    # Имена env-переменных с устаревшим префиксом (#964) — политики, которые
+    # оператор считает включёнными, а код не читает. Имена, не значения.
+    stale_env: list[str] = Field(default_factory=list)
 
 
 class EffectivePolicies(BaseModel):

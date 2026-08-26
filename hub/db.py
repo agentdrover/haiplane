@@ -1338,6 +1338,75 @@ _MIGRATIONS: list[tuple[str, str]] = [
             checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))
         )""",
     ),
+    (
+        # What each submission actually pinned (#880, feature #872).
+        # ``tasks.submission_sha`` is OVERWRITTEN on every resubmission, so the
+        # commit a previous generation was reviewed against existed nowhere
+        # queryable — only as prose in a task update ("Branch tip at
+        # submission: …"), which is not a source of truth. Without this ledger
+        # a second review has nothing to diff against and pays for the whole
+        # branch again, every round of fixes.
+        #
+        # base_branch travels with the sha because the delta is only valid
+        # while the base is the same one: a project that repointed its default
+        # branch makes "what changed since last time" a different question.
+        #
+        # UNIQUE(task_id, generation): one commit per submission. A resubmit
+        # that somehow reuses a generation corrects the row rather than leaving
+        # two answers to "what was reviewed then".
+        "create_submissions",
+        """CREATE TABLE IF NOT EXISTS submissions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation   INTEGER NOT NULL,
+            sha          TEXT    NOT NULL DEFAULT '',
+            base_branch  TEXT    NOT NULL DEFAULT '',
+            submitted_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation)
+        )""",
+    ),
+    (
+        # Chat-pair (#961): a one-time code pasted into a chat, exchanged for a
+        # short session. Deliberately NOT ``api_keys``: those live for days by
+        # design, and stretching them down to minutes would have made every
+        # other key's expiry a matter of interpretation.
+        #
+        # Only the hash is stored, and there is nowhere to put anything else —
+        # the secret's privacy is a property of the schema, not a rule someone
+        # has to remember. UNIQUE on the hash so one code cannot exist twice.
+        "create_chat_pair_codes",
+        """CREATE TABLE IF NOT EXISTS chat_pair_codes (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id)
+                         ON DELETE CASCADE,
+            code_hash    TEXT    NOT NULL UNIQUE,
+            expires_at   TEXT    NOT NULL,
+            redeemed_at  TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "create_chat_pair_sessions",
+        """CREATE TABLE IF NOT EXISTS chat_pair_sessions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id INTEGER NOT NULL REFERENCES principals(id)
+                         ON DELETE CASCADE,
+            token_hash   TEXT    NOT NULL UNIQUE,
+            expires_at   TEXT    NOT NULL,
+            revoked_at   TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_chat_pair_codes_principal",
+        "CREATE INDEX IF NOT EXISTS idx_chat_pair_codes_principal "
+        "ON chat_pair_codes(principal_id)",
+    ),
+    (
+        "idx_chat_pair_sessions_principal",
+        "CREATE INDEX IF NOT EXISTS idx_chat_pair_sessions_principal "
+        "ON chat_pair_sessions(principal_id)",
+    ),
 ]
 
 

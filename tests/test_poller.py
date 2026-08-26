@@ -2067,3 +2067,32 @@ def test_seconds_since_rejects_garbage_timestamps():
     assert _seconds_since("не дата") is None
     assert _seconds_since("") is None
     assert _seconds_since("2026-01-01 00:00:00") > 0
+
+
+# --- Истёкший claim отпускает общий клон (#966) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_restores_workspace_base(db):
+    """AC-4: авто-релиз claim возвращает legacy-клон на базу; ошибка не роняет sweep."""
+    from unittest.mock import AsyncMock, patch
+
+    from hub.poller import _sweep_expired_claims
+
+    for title in ("первая", "вторая"):
+        await db.execute(
+            "INSERT INTO tasks (title, description, status, claimed_by, "
+            "claim_session_id, claimed_at) VALUES (?, '', 'claimed', 'bot', 's1', "
+            "datetime('now', '-999 minutes'))",
+            (title,),
+        )
+    await db.commit()
+
+    restore = AsyncMock(side_effect=[RuntimeError("git down"), None])
+    with patch("hub.services.orchestration.restore_pair_workspace_base", restore):
+        await _sweep_expired_claims(db)
+
+    # Обе задачи вернулись в open, хотя первый restore упал.
+    cursor = await db.execute("SELECT status FROM tasks")
+    assert [r["status"] for r in await cursor.fetchall()] == ["open", "open"]
+    assert restore.await_count == 2

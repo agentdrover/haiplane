@@ -995,6 +995,23 @@ async def get_latest_machine_review(
     return rows[0] if rows else None
 
 
+async def machine_reviews_of_generation(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> list[aiosqlite.Row]:
+    """Every report written about one submission, oldest first (#880).
+
+    Plural because the ladder (#879) can produce two for one generation.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM machine_reviews WHERE task_id=? "
+            "AND submission_generation=? ORDER BY id",
+            (task_id, generation),
+        )
+    )
+
+
 async def list_machine_reviews(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
@@ -1871,6 +1888,43 @@ async def get_review_dispatch_for_generation(
             "ORDER BY id DESC LIMIT 1",
             (task_id, generation),
         )
+    )
+    return rows[0] if rows else None
+
+
+async def record_submission(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    sha: str,
+    base_branch: str,
+) -> None:
+    """Remember which commit a submission pinned (#880)."""
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(task_id, generation) DO UPDATE SET "
+        "sha=excluded.sha, base_branch=excluded.base_branch, "
+        "submitted_at=datetime('now')",
+        (task_id, generation, sha, base_branch),
+    )
+
+
+async def previous_submission(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The newest submission BEFORE this generation, or None (#880).
+
+    "Newest below", not "generation - 1": the ledger starts mid-history for
+    tasks that were already submitted before it existed, and skipping straight
+    to the previous number would silently claim a delta against a commit
+    nobody recorded.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM submissions WHERE task_id=? AND generation<? "
+        "ORDER BY generation DESC LIMIT 1",
+        (task_id, generation),
     )
     return rows[0] if rows else None
 

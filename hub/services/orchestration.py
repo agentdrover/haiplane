@@ -1346,6 +1346,19 @@ def _slug_for_task(task_id: int, task: dict[str, Any], branch_slug: str) -> str:
     return ""
 
 
+def _pair_push_notifier(db: aiosqlite.Connection):
+    """Колбэк для git-слоя (#966): авто-push осиротевшей ветки виден в ленте.
+
+    Молчаливая публикация чужой ветки запрещена constraints задачи — каждая
+    такая операция оставляет запись, кто и ради чего её выполнил.
+    """
+
+    async def _notify(message: str) -> None:
+        await log_activity(db, "pair_branch_auto_pushed", message)
+
+    return _notify
+
+
 async def prepare_pair_branch(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1371,6 +1384,7 @@ async def prepare_pair_branch(
         task_id,
         task["title"],
         branch_slug=branch_slug,
+        notify=_pair_push_notifier(db),
         **local_kw,
     )
 
@@ -1772,6 +1786,93 @@ async def _live_pr_for_branch(
     return int(found), ""
 
 
+async def _confirmed_branch_diff(
+    db: aiosqlite.Connection, task: dict[str, Any], branch: str | None
+) -> list[str] | None:
+    """What the branch verifiably changes, or None when nobody can say (#967).
+
+    The same primitive and the same per-project base the #498 warning reads —
+    one rule, not two competing observations. None and [] stay distinct all
+    the way down: [] is "looked, the branch changes nothing", None is the
+    absence of an answer, and only a non-empty list is positive knowledge.
+    """
+    name = (branch or "").strip()
+    if not name:
+        return None
+    try:
+        ctx = await project_git_context(db, task["id"])
+        return await plugins.git_ops.branch_diff_paths(
+            name, base_branch=ctx.get("base_branch"), repo=ctx.get("repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - ignorance is not an accusation (#498)
+        log.warning("branch diff for #%s (%s) unavailable: %s", task["id"], name, exc)
+        return None
+
+
+async def ensure_delivery_pr(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    diff_paths: list[str] | None,
+) -> tuple[int | None, str]:
+    """Open the PR a commit-carrying branch needs, or say why it could not (#967).
+
+    The headless conveyor has always done this (push, then create_pr); the
+    pair flow only ever LOOKED for a PR, so four tasks in one week (#961,
+    #963, #965, #966) completed with their work stranded on a branch — the
+    PR was opened by hand seconds after the gate had already walked past.
+
+    Called with the diff the caller already resolved: at submission that is
+    the #583 resolution feeding the surface check, at done it is
+    :func:`_confirmed_branch_diff` — either way ONE observation decides both
+    the warning and this action. An empty or unknown diff returns ``(None,
+    "")``: nothing is insisted on without positive knowledge (#498).
+
+    Runs against the project clone, not the task's worktree: a worktree
+    shares the ref store and objects with the clone, and both operations
+    here — push and ``gh pr create`` — act on refs, never on a checkout.
+    push is best-effort by design: a branch pushed from another machine has
+    no local ref to push, and create_pr against origin still succeeds.
+
+    A filled reason means "commits are confirmed and no PR could be opened"
+    — the one caller-facing state that must not complete silently. Never
+    raises: a done report must not 500 because GitHub blinked.
+    """
+    if not branch or not diff_paths:
+        return None, ""
+    task_id = int(task["id"])
+    pushed = False
+    try:
+        ctx = await project_git_context(db, task_id)
+        pushed = await plugins.git_ops.push_branch(branch, repo=ctx.get("repo"))
+        if not pushed:
+            log.info(
+                "ensure_delivery_pr: push refused for #%s (%s) — "
+                "the branch may already live on origin",
+                task_id,
+                branch,
+            )
+        pr = await plugins.git_ops.create_pr(
+            task_id,
+            task.get("title") or f"task #{task_id}",
+            task.get("description") or "",
+            branch,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            base_branch=ctx.get("base_branch"),
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning("ensure_delivery_pr failed for #%s (%s): %s", task_id, branch, exc)
+        return None, f"PR для ветки {branch} открыть не удалось: {exc}"
+    if not pr:
+        return None, (
+            f"PR для ветки {branch} открыть не удалось"
+            + ("" if pushed else " (push тоже не прошёл)")
+        )
+    await repo.update_task(db, task_id, pr_number=int(pr))
+    return int(pr), ""
+
+
 async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> DeliveryPR:
     """The PR that carries this task's branch, looked up at done time (#767).
 
@@ -1885,6 +1986,67 @@ async def transition_after_agent_done(
             if delivery_pr.number:
                 task = {**task, "pr_number": delivery_pr.number}
             pr_note = delivery_pr.reason
+            if not task.get("pr_number"):
+                # #967: the lookup finding nothing is no longer the end of the
+                # question. When git positively confirms commits on the branch,
+                # completing without a PR knowingly strands them — the state
+                # #961/#963/#965/#966 all reached in one week, each fixed by a
+                # human opening the PR after the fact. The hub opens it here
+                # and hands it to the same gate below. Without that knowledge
+                # (no branch, empty diff, git silent) today's path stands
+                # untouched — #498's rule that ignorance is not an accusation.
+                diff = await _confirmed_branch_diff(db, task, branch)
+                created, create_reason = await ensure_delivery_pr(
+                    db, task, (branch or "").strip(), diff
+                )
+                if created:
+                    task = {**task, "pr_number": created}
+                    delivery_pr = DeliveryPR(created)
+                    # The lookup's "PR not found" note would now read as "the
+                    # delivery went unchecked" over a gate that IS checking it.
+                    pr_note = ""
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "status",
+                        f"PR #{created} открыт хабом для доставки ветки "
+                        f"{branch}: на ней {len(diff or [])} изменённых "
+                        "файл(ов), а открытого PR не было (#967).",
+                    )
+                elif create_reason:
+                    await repo.update_task(db, task_id, status="needs_decision")
+                    await repo.add_task_update(
+                        db,
+                        task_id,
+                        "hub",
+                        "alert",
+                        # #952: names only actions needs_decision accepts.
+                        f"Done report NOT completed: ветка {branch} меняет "
+                        f"{len(diff or [])} файл(ов), а {create_reason}. "
+                        "Решение за человеком (hub_decide_task): rework "
+                        "вернёт задачу в running — откройте PR руками или "
+                        "почините доступ к GitHub и пересдайте done; accept "
+                        "завершит задачу БЕЗ доставки ветки.",
+                    )
+                    await repo.insert_event(
+                        db,
+                        kind="needs_decision",
+                        task_id=task_id,
+                        actor=task.get("assigned_agent") or "agent",
+                        payload={
+                            "reason": "delivery_pr_missing",
+                            "detail": create_reason,
+                        },
+                    )
+                    log.info(
+                        "Task #%d → needs_decision: commits confirmed on %s "
+                        "and no PR could be opened (%s)",
+                        task_id,
+                        branch,
+                        create_reason,
+                    )
+                    return "needs_decision"
         if pr_note:
             # The gate could not look. Completion still follows today's rule,
             # but the reader is told which check did not run — an absent line

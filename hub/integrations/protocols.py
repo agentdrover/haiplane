@@ -6,6 +6,8 @@ Hub core depends only on these protocols, never on concrete implementations.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
@@ -136,6 +138,7 @@ class GitOpsPlugin(Protocol):
         branch_slug: str = "",
         repo: str | None = None,
         base_branch: str | None = None,
+        notify: Callable[[str], Awaitable[None]] | None = None,
     ) -> str: ...
     async def pair_restore_workspace_base(
         self,
@@ -185,6 +188,13 @@ class GitOpsPlugin(Protocol):
     ) -> list[tuple[int, int, str]] | None: ...
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
+    ) -> bool | None: ...
+    async def content_differs(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
     ) -> bool | None: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
