@@ -4074,6 +4074,14 @@ def _format_identity_diagnostics(data: dict[str, Any]) -> str:
         f"Workspace: {data.get('workspace_path') or '?'} "
         f"(branch: {data.get('workspace_branch') or '?'})"
     )
+    # Эффективные политики (#965): чем хаб живёт, а не что написано в drop-in.
+    policies = data.get("effective_policies") or {}
+    if policies:
+        rendered = ", ".join(
+            f"{key}={'on' if value is True else 'off' if value is False else value}"
+            for key, value in sorted(policies.items())
+        )
+        lines.append(f"Policies: {rendered}")
     lines.append(f"App version: {data['app_version']}")
     return "\n".join(lines)
 

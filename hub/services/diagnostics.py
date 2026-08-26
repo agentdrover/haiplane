@@ -11,7 +11,12 @@ from hub.config import TokenIdentity, _AGENT_DEFAULT_PERMS, _HUMAN_DEFAULT_PERMS
 from hub.config import WORKSPACE_REPO_LINK
 from hub.hub_instance import instance_echo_fields
 from hub.integrations.registry import plugins
-from hub.models import HealthView, IdentityDiagnosticsView, WhoamiView
+from hub.models import (
+    EffectivePolicies,
+    HealthView,
+    IdentityDiagnosticsView,
+    WhoamiView,
+)
 from hub.version import get_app_version
 
 log = logging.getLogger("hub")
@@ -119,6 +124,15 @@ async def build_identity_diagnostics(
         workspace_path=workspace,
         workspace_branch=branch,
         workspace_mode=workspace_mode,
+        effective_policies=EffectivePolicies(
+            auto_approve_max_class=config.AUTO_APPROVE_MAX_CLASS,
+            sdd_ac_locator=config.SDD_AC_LOCATOR,
+            sdd_ac_tests=config.SDD_AC_TESTS,
+            sdd_validation=config.SDD_VALIDATION,
+            submit_rules=config.SUBMIT_RULES,
+            machine_review=config.MACHINE_REVIEW_MODE,
+            worktree_per_task=worktree_per_task_enabled(),
+        ),
         app_version=whoami.app_version,
     )
 
