@@ -420,6 +420,21 @@ def _is_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def stale_env_names() -> list[str]:
+    """Имена (никогда не значения) переменных, которые хаб не прочитает (#964).
+
+    Переменная с устаревшим префиксом — это политика, которую оператор считает
+    включённой, а код никогда не увидит. Значения сюда не попадают: в окружении
+    сервиса лежат и секреты, а сигнал уходит в ленту и в публичный /health.
+    """
+    return sorted(
+        name
+        for name in os.environ
+        for prefix in brand.RETIRED_ENV_PREFIXES
+        if name.startswith(prefix)
+    )
+
+
 def validate_network_auth() -> None:
     """Reject non-loopback binds when auth is open, unless explicitly overridden.
 
