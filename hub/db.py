@@ -1338,6 +1338,33 @@ _MIGRATIONS: list[tuple[str, str]] = [
             checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))
         )""",
     ),
+    (
+        # What each submission actually pinned (#880, feature #872).
+        # ``tasks.submission_sha`` is OVERWRITTEN on every resubmission, so the
+        # commit a previous generation was reviewed against existed nowhere
+        # queryable — only as prose in a task update ("Branch tip at
+        # submission: …"), which is not a source of truth. Without this ledger
+        # a second review has nothing to diff against and pays for the whole
+        # branch again, every round of fixes.
+        #
+        # base_branch travels with the sha because the delta is only valid
+        # while the base is the same one: a project that repointed its default
+        # branch makes "what changed since last time" a different question.
+        #
+        # UNIQUE(task_id, generation): one commit per submission. A resubmit
+        # that somehow reuses a generation corrects the row rather than leaving
+        # two answers to "what was reviewed then".
+        "create_submissions",
+        """CREATE TABLE IF NOT EXISTS submissions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation   INTEGER NOT NULL,
+            sha          TEXT    NOT NULL DEFAULT '',
+            base_branch  TEXT    NOT NULL DEFAULT '',
+            submitted_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation)
+        )""",
+    ),
 ]
 
 
