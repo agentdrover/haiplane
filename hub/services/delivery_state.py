@@ -191,6 +191,20 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
         "deployed_at": deployed_at,
     }
 
+    # #953: identity is the one answer git is not needed for. When the deploy
+    # recorded exactly this merge commit, reachability is a tautology — a
+    # commit is in its own history — and every question below (workspace, fetch,
+    # ancestry) can only fail to confirm what is already known. Without this,
+    # an installation whose project has no working copy on this host answered
+    # "could not check" while holding both facts that settle it.
+    if merge_sha == deployed_sha:
+        return _answer(
+            IN_PROD,
+            f"раскатан ровно этот мерж: {deployed_sha[:12]}"
+            + (f" от {deployed_at}" if deployed_at else ""),
+            **known,
+        )
+
     try:
         ctx = await services.project_git_context(db, task_id)
         workspace = ctx.get("repo")

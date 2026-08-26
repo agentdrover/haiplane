@@ -125,7 +125,14 @@ async def test_html_get_redirects_to_login(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_root_html_get_redirects_to_clean_login_url(client, monkeypatch):
+async def test_root_html_get_shows_landing_not_login_redirect(client, monkeypatch):
+    """#955: корень для анонима — визитка продукта.
+
+    Раньше здесь был 303 на чистый /login (без ?next=/): проверялось, что
+    возврат на корень не тащит бессмысленный параметр. Теперь редиректа нет
+    вовсе — аноним получает публичную страницу со ссылкой на вход, а данные
+    задач ему по-прежнему недоступны (см. тест дашборда ниже).
+    """
     monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
     monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
 
@@ -134,8 +141,9 @@ async def test_root_html_get_redirects_to_clean_login_url(client, monkeypatch):
         headers={"Accept": "text/html"},
         follow_redirects=False,
     )
-    assert resp.status_code == 303
-    assert resp.headers["Location"] == "/login"
+    assert resp.status_code == 200
+    assert 'href="/login"' in resp.text
+    assert "docker compose up" in resp.text
 
 
 @pytest.mark.asyncio
@@ -253,8 +261,12 @@ async def test_legacy_session_cookie_no_longer_authenticates(client, monkeypatch
 
     legacy_cookie = "open" + "claw" + "_hub_session"
     client.cookies.set(legacy_cookie, "secret-token")
-    resp = await client.get("/", headers={"Accept": "text/html"})
+    # Корень с #955 публичен, поэтому проверяем защищённую страницу: важно не
+    # то, каким кодом отвечает витрина, а что легаси-кука никуда не пускает.
+    resp = await client.get("/tasks", headers={"Accept": "text/html"})
     assert resp.status_code in (303, 401), resp.status_code
+    root = await client.get("/", headers={"Accept": "text/html"})
+    assert "docker compose up" in root.text, "аноним должен видеть визитку"
 
 
 @pytest.mark.asyncio

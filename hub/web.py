@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -315,6 +316,26 @@ def _dispatch_available() -> bool:
     return plugins.dispatch.is_available()
 
 
+def _dispatch_configured() -> bool:
+    """Does this host have a developer-agent dispatcher at all (#953)?
+
+    A different question from availability, and the board needs both. "Not
+    available" is a fault worth naming; "never installed" is the normal state
+    of a hub someone just started — the docker demo, a laptop, an evaluation —
+    and printing a fault there made a working install look broken.
+
+    Configured means the installation left evidence of a dispatcher: the plugin
+    answers, the operator named a binary, or the dispatcher's own state
+    directory is on disk. Anything else is an install that simply does not
+    dispatch, and the board stays silent about it.
+    """
+    if plugins.dispatch.is_available():
+        return True
+    if os.environ.get(brand.ENV_PREFIX + "DISPATCH_BIN"):
+        return True
+    return config.DISPATCH_JOBS_DIR.is_dir()
+
+
 ANALYST_PREPARED_MARKER = "Analyst preparation complete"
 
 
@@ -543,6 +564,7 @@ async def web_partial_inbox(
         project=project,
     )
     inbox["dispatch_available"] = _dispatch_available()
+    inbox["dispatch_configured"] = _dispatch_configured()
     return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
 
 
@@ -585,6 +607,7 @@ async def web_partial_kanban(request: Request, project: str | None = Query(None)
         {
             "data": data,
             "dispatch_available": _dispatch_available(),
+            "dispatch_configured": _dispatch_configured(),
             "analyst_ready_by_id": await _analyst_ready_map(
                 _db(request), tasks_for_badges
             ),
@@ -654,6 +677,7 @@ async def web_tasks_list_partial(
                 "queue_groups": _queue_groups(tasks),
                 "current_project": (project or "").strip(),
                 "dispatch_available": _dispatch_available(),
+                "dispatch_configured": _dispatch_configured(),
                 "analyst_ready_by_id": ready_by_id,
             },
         )
@@ -663,6 +687,7 @@ async def web_tasks_list_partial(
         {
             "tasks": tasks,
             "dispatch_available": _dispatch_available(),
+            "dispatch_configured": _dispatch_configured(),
             "analyst_ready_by_id": ready_by_id,
         },
     )
@@ -711,6 +736,13 @@ async def _project_filter_ctx(
 
 @router.get("/", response_class=HTMLResponse)
 async def web_dashboard(request: Request, project: str | None = Query(None)):
+    # #955: аноним (токены настроены, сессии нет) видит визитку продукта.
+    # Открытый режим и живая сессия получают дашборд как прежде — их
+    # идентичность не анонимная. Ветка стоит до первого обращения к БД:
+    # публичная страница не читает ни одной задачи.
+    if current_identity(request).auth_source == "anonymous":
+        return TEMPLATES.TemplateResponse(request, "landing.html", {})
+
     db = _db(request)
     allowed, projects_list, current_project = await _project_filter_ctx(db, project)
     # #627: both aggregates narrow inside their own queries now. Every list they
@@ -757,6 +789,7 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         "board": board,
         "inbox_total": inbox_total,
         "dispatch_available": _dispatch_available(),
+        "dispatch_configured": _dispatch_configured(),
         "projects_list": projects_list,
         "current_project": current_project,
     }
@@ -1358,6 +1391,7 @@ async def web_tasks(
             "all_types": all_types,
             "all_priorities": all_priorities,
             "dispatch_available": _dispatch_available(),
+            "dispatch_configured": _dispatch_configured(),
             "analyst_ready_by_id": ready_by_id,
         },
     )
@@ -1525,6 +1559,7 @@ async def web_task_detail(
             "can_archive": identity.has_permission("tasks.archive"),
             "can_delete": identity.has_permission("tasks.delete"),
             "dispatch_available": _dispatch_available(),
+            "dispatch_configured": _dispatch_configured(),
             "approve_error": approve_error,
             "review_error": review_error,
         },
@@ -1832,6 +1867,7 @@ async def web_batch_approve_selected(
         # unscoped would widen the list under them right after they acted.
         inbox = await services.get_inbox_data(db, project=project or None)
         inbox["dispatch_available"] = _dispatch_available()
+        inbox["dispatch_configured"] = _dispatch_configured()
         inbox["batch_result"] = result
         return TEMPLATES.TemplateResponse(request, "partials/inbox.html", inbox)
     query = f"?project={quote(project)}" if project else ""

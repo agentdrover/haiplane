@@ -1,0 +1,166 @@
+# Structured task form & readiness
+
+Moved out of the README (#953) so the front page stays a tour and this stays a
+reference. Nothing below changed with the move.
+
+
+Hub treats each task as a Kanban work item with a structured form, a
+deterministic **Definition of Ready** gate, and a numeric readiness
+score that drives recommendations. The goal: by the time a task moves
+from `draft` to `open`, an Analyst (human or agent) can hand it to a
+Developer-agent without follow-up Q&A round-trips.
+
+All structured fields live on the same `tasks` row (no extra entity for
+the form itself). Acceptance criteria live in a separate
+`acceptance_criteria` table; risks are stored as JSON on the task row.
+
+## Work types and DoR profiles
+
+`work_type` selects which DoR checks are required. Optional checks are
+still computed and shown, but they don't block approval.
+
+The Discovery checks (`has_outcome_hypothesis`, `has_redesign_decision`,
+`has_agent_fit`) are advisory: they appear in the table and earn a
+suggestion on `feature` tasks, but they never block and never move the
+readiness score.
+
+| work_type   | required DoR checks                                                                                                                  | typical class_of_service |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------|--------------------------|
+| `feature`   | user_story, problem_statement, business_value, scope_in, AC, validation, size, wip_tag                                                | standard                 |
+| `bug`       | problem_statement, business_value, scope_in, AC, validation, size, wip_tag                                                            | standard / expedite      |
+| `refactor`  | problem_statement, scope_in, AC, validation, size, wip_tag (`tech_debt`)                                                              | standard                 |
+| `chore`     | scope_in, validation, size                                                                                                            | standard                 |
+| `docs`      | scope_in, size                                                                                                                        | standard                 |
+| `spike`     | problem_statement, AC, size (AC = "we have a documented answer to <Q>")                                                               | standard                 |
+| `incident`  | problem_statement, AC, validation                                                                                                     | expedite                 |
+
+Source of truth: `hub/services/dor.py` (`DOR_REQUIRED_BY_WORK_TYPE`).
+Unknown work types fall back to the strict `feature` profile.
+
+## Task fields
+
+Set on `POST /api/tasks` (creation) or via `POST /api/tasks/{id}/refine`
+(PATCH semantics — only sent fields change):
+
+- **Classification**: `work_type`, `class_of_service`
+  (`standard | expedite | fixed_date | intangible`), `size` (`XS|S|M|L|XL`),
+  `wip_tag` (`feature_work | bugfix | tech_debt | support`), `due_date`.
+- **Why & what**: `user_story`, `problem_statement`, `business_value`.
+- **Discovery** (all optional): `outcome_metric` — which number should move
+  and from what to what; `outcome_indicator` — what moves before it does;
+  `outcome_deadline` — when we check; `outcome_revisit_condition` — what
+  would reopen the question; `redesign_decision`
+  (`adapt | redesign`) + `redesign_rationale` — whether the work fits the
+  current process or reshapes it; `agent_fit`
+  (`deterministic | assistant | sdd_native | agentic`) — how much agency the
+  work wants. These make `business_value` checkable instead of merely
+  arguable. They are suggested on `feature` tasks and never block or cost
+  readiness points.
+- **Scope**: `scope_in[]`, `scope_out[]`, `affected_areas[]`.
+- **How we'll know it works**: `validation_commands[]`, `acceptance_criteria[]`
+  (each AC has Given/When/Then + `verifiable_by` and optional `test_ref`).
+- **Constraints / hints**: `constraints[]`, `assumptions[]`,
+  `technical_hints`, `out_of_scope_for_review[]`.
+- **Risks**: `risks[]` — each entry has `kind`, `severity`, `description`,
+  `mitigation`. The `risks` payload is fed back into the readiness
+  recommender.
+
+Full Pydantic schema in `hub/models.py` (`TaskCreate`, `TaskRefine`,
+`AcceptanceCriterion`, `TaskRisk`).
+
+## Readiness score and recommendations
+
+`GET /api/tasks/{id}/readiness` (and `hp-hub readiness <id>`) returns a
+deterministic 0–100 score:
+
+- start at 100;
+- subtract `penalty_required` per missing required DoR check (default 10);
+- subtract `penalty_optional` per missing optional DoR check (default 2);
+- subtract per-risk penalty by severity (low=1, medium=4, high=8 by default).
+
+The same endpoint also returns a list of `recommendations` — actionable
+hints with severity (`blocking | high | medium | low`), generated by
+`hub/services/recommendations.py` from the failed checks and risks. Use
+`--explain` to get the score breakdown.
+
+## Approval gate
+
+`POST /api/tasks/{id}/approve` evaluates the DoR for the task's
+`work_type`. If any required check fails, the response is **422
+Unprocessable Entity** with a structured detail:
+
+```json
+{
+  "detail": {
+    "error": "dor_failed",
+    "task_id": 17,
+    "score": 62,
+    "missing_required": ["has_acceptance_criteria", "has_validation_commands"],
+    "recommendations": [
+      {"severity": "blocking", "field": "acceptance_criteria",
+       "message": "Add at least one Given/When/Then acceptance criterion."}
+    ],
+    "hint": "Pass force=true to override (audited)."
+  }
+}
+```
+
+Approval also uses an atomic `UPDATE ... WHERE status='draft'` to avoid
+double-processing on concurrent calls; a losing caller gets **409
+Conflict**.
+
+`force=true` bypasses the gate but **always** logs an audit entry (an
+`alert` task update + activity-log suffix) — even when DoR happens to
+pass — so explicit human overrides are never invisible.
+
+## CLI cheatsheet
+
+```bash
+# 1. Pick a template for the work type and write it to a file
+hp-hub template list
+hp-hub template feature --out task-17.yaml
+
+# 2. Edit task-17.yaml, then push it onto an existing draft (PATCH semantics)
+hp-hub refine 17 --from-file task-17.yaml
+
+# 3. Add or replace acceptance criteria
+hp-hub ac add 17 --id AC-1 --given "..." --when "..." --then "..." --by test
+hp-hub ac list 17
+hp-hub ac replace 17 --from-file acs.yaml         # atomic replace
+hp-hub ac delete 17 AC-1
+
+# 4. Add risks (read-modify-write)
+hp-hub risk add 17 --kind security --severity high \
+                    --description "auth bypass" --mitigation "add audit + 2FA"
+
+# 5. Check readiness before approving
+hp-hub readiness 17                # human summary
+hp-hub readiness 17 --explain      # full JSON with score breakdown
+
+# 6. Approve (or force-approve, audited)
+hp-hub approve 17 --comment "ready"
+hp-hub approve 17 --force --comment "deploy now, will fix gaps in PR"
+```
+
+`--from-file` accepts JSON or YAML (`.json`, `.yaml`, `.yml`). YAML
+support requires `pyyaml`, which ships with the package.
+
+## MCP tools
+
+The same surface is exposed to LLM agents via FastMCP
+(`hub/mcp_server.py`):
+
+| Tool                              | Maps to                                                  |
+|-----------------------------------|----------------------------------------------------------|
+| `hub_refine_task`                 | `POST /api/tasks/{id}/refine`                            |
+| `hub_list_acceptance_criteria`    | `GET  /api/tasks/{id}/acceptance_criteria`               |
+| `hub_add_acceptance_criterion`    | `POST /api/tasks/{id}/acceptance_criteria`               |
+| `hub_replace_acceptance_criteria` | `PUT  /api/tasks/{id}/acceptance_criteria`               |
+| `hub_delete_acceptance_criterion` | `DELETE /api/tasks/{id}/acceptance_criteria/{ac_id}`     |
+| `hub_add_risk`                    | read-modify-write via `/refine`                          |
+| `hub_get_readiness`               | `GET  /api/tasks/{id}/readiness` (compact text by default; `explain=True` for full JSON) |
+
+Tools take explicit, optional fields rather than free-form payloads —
+that way the contract is visible in the MCP descriptor an Analyst-agent
+sees, and only provided fields hit the API.
+
