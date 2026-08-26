@@ -12,6 +12,7 @@ import logging
 import re
 import socket
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
@@ -147,30 +148,78 @@ def _pair_branch_conflict(
     )
 
 
-async def _branch_is_fully_pushed(branch: str, repo: str) -> bool:
-    """True when every local commit on HEAD is reachable from origin/branch."""
-    rc, _, _ = await _git(
-        "rev-parse",
-        "--verify",
-        f"origin/{branch}^{{commit}}",
-        repo=repo,
-        check=False,
-    )
+async def _count_commits(spec: str, repo: str) -> int:
+    """``git rev-list --count <spec>``, or 0 when git cannot answer."""
+    rc, count, _ = await _git("rev-list", "--count", spec, repo=repo, check=False)
     if rc != 0:
-        return False
-    rc, count, _ = await _git(
-        "rev-list",
-        "--count",
-        f"origin/{branch}..HEAD",
-        repo=repo,
-        check=False,
-    )
-    if rc != 0:
-        return False
+        return 0
     try:
-        return int(count.strip() or "0") == 0
+        return int(count.strip() or "0")
     except ValueError:
-        return False
+        return 0
+
+
+@dataclass(frozen=True)
+class BranchPushStatus:
+    """Where a branch's commits live — on the server, or only in this clone.
+
+    Two separate facts, kept separate (#954). The old check asked only whether
+    ``refs/remotes/origin/<branch>`` existed locally and reported its absence
+    as unpushed work, so a branch that was on the remote and simply never
+    fetched was indistinguishable from one that existed nowhere else. On 25.08
+    that read blocked the start of #953 with a warning about commits of #951
+    that did not exist; since #966 it instead makes the hub push a stranger's
+    branch on the same untrue premise.
+    """
+
+    on_remote: bool
+    # Against origin/<branch> when the remote has it; against the base branch
+    # when it does not, because then every commit on it is at stake.
+    commits_at_stake: int
+
+    @property
+    def needs_push(self) -> bool:
+        return not self.on_remote or self.commits_at_stake > 0
+
+
+async def _branch_push_status(branch: str, repo: str, base: str) -> BranchPushStatus:
+    """Ask the remote, not the local cache of it, where a branch stands.
+
+    A clone that never fetched a branch knows nothing about it, and "I have not
+    looked" must not be reported as "the work is not there" — the line #767 and
+    #498 drew for PR lookup, applied to refs. So a missing tracking ref is
+    refreshed with one targeted fetch before any verdict is formed. The refspec
+    is explicit: ``git fetch origin <branch>`` alone is not guaranteed to write
+    ``refs/remotes/origin/<branch>``, and this function's whole job is that ref.
+    """
+    ref = f"origin/{branch}"
+
+    async def _have_ref() -> bool:
+        rc, _, _ = await _git(
+            "rev-parse", "--verify", f"{ref}^{{commit}}", repo=repo, check=False
+        )
+        return rc == 0
+
+    if not await _have_ref():
+        await _git(
+            "fetch",
+            "origin",
+            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            repo=repo,
+            check=False,
+        )
+        if not await _have_ref():
+            # Genuinely unknown to the server: everything since the base is at
+            # stake, and that is a different sentence than "not fetched here".
+            return BranchPushStatus(
+                on_remote=False,
+                commits_at_stake=await _count_commits(f"{base}..HEAD", repo),
+            )
+
+    return BranchPushStatus(
+        on_remote=True,
+        commits_at_stake=await _count_commits(f"{ref}..HEAD", repo),
+    )
 
 
 async def _base_ahead_of_origin(base: str, repo: str) -> bool:
@@ -726,7 +775,11 @@ class GitOpsIntegration:
 
         other_id = _task_id_from_branch(current)
         if other_id is not None and other_id != task_id:
-            if not await _branch_is_fully_pushed(current, repo):
+            status = await _branch_push_status(current, repo, base)
+            # A branch already on origin with nothing of its own is not this
+            # start's business (#954): no work is at risk, so it is neither
+            # pushed nor allowed to hold up an unrelated task.
+            if status.needs_push:
                 # #966: отказ «зайди на сервер и запушь» невыполним для
                 # вызывающего — доступа к общему клону у агентов нет, и #961
                 # часами ждал человека с root. Push обычной task-ветки в origin
@@ -734,12 +787,21 @@ class GitOpsIntegration:
                 # что хаб выполняет эту часть remediation сам и отказывает
                 # только когда она не удалась. Только ветки task-<id>/* —
                 # произвольные ветки публиковать не наше решение.
+                whereabouts = (
+                    f"has {status.commits_at_stake} commit(s) not on origin/{current}"
+                    if status.on_remote
+                    else (
+                        f"does not exist on the remote; its "
+                        f"{status.commits_at_stake} commit(s) since {base} live "
+                        f"only in this clone"
+                    )
+                )
                 rc, _, push_err = await _git(
                     "push", "-u", "origin", current, repo=repo, check=False
                 )
                 if rc != 0:
                     raise _pair_branch_conflict(
-                        f"Branch {current!r} has unpushed commits; "
+                        f"Branch {current!r} {whereabouts}; "
                         f"auto-push failed, push before pair-start for #{task_id}",
                         repo=repo,
                         reason="pair_branch_unpushed",
@@ -754,15 +816,16 @@ class GitOpsIntegration:
                         task_id=task_id,
                     )
                 log.info(
-                    "pair_prepare_branch: auto-pushed orphaned %s to unblock #%s",
+                    "pair_prepare_branch: auto-pushed orphaned %s (%s) to unblock #%s",
                     current,
+                    whereabouts,
                     task_id,
                 )
                 if notify is not None:
                     try:
                         await notify(
                             f"pair-start #{task_id}: опубликована осиротевшая "
-                            f"ветка {current} (была непушена в общем клоне)"
+                            f"ветка {current} ({whereabouts})"
                         )
                     except Exception:
                         log.warning(
