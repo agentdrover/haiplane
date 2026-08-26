@@ -34,6 +34,7 @@ import pytest
 
 from hub import repository as repo
 from hub.integrations.noop import NoopGitOps
+from hub.integrations.protocols import MergeabilityOutcome
 from hub.integrations.registry import plugins
 from hub.services.release import merge_ready_release
 
@@ -55,6 +56,13 @@ def _git_after_a_release(back_merge: tuple[str, str]):
     g.merge_pr = AsyncMock(return_value=True)
     g.merge_commit_sha = AsyncMock(return_value="c" * 40)
     g.content_differs = AsyncMock(return_value=True)
+    # #970: зелёный CI перестал быть разрешением мержить — релиз отдельно
+    # спрашивает, сливается ли PR. Здесь релиз должен состояться, значит
+    # ответ утвердительный; оставить вопрос noop'у значило бы сделать все
+    # тесты этого файла проверкой отказа вместо проверки возврата.
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.mergeable, "clean")
+    )
     g.ensure_remote_branch = AsyncMock(return_value=("present", "b" * 12))
     g.return_release_into_base = AsyncMock(return_value=back_merge)
     plugins.git_ops = g

@@ -15,7 +15,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
-from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    MergeabilityOutcome,
+)
 from hub.mcp_envelope import enrich_error_payload
 
 from hub import git_policy
@@ -2230,6 +2234,107 @@ class GitOpsIntegration:
             if rc == 1:
                 return True
         return None
+
+    async def check_pr_mergeable(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[MergeabilityOutcome, str]:
+        """Can this PR be merged, and if not, why (#970).
+
+        The release asked GitHub one question before merging — is CI green —
+        and learned the rest by being refused. On 26.08.2026 PR #83 answered
+        both at once: «Ruff and pytest» pass 4m2s, and mergeable=CONFLICTING.
+        The poller called ``merge_pr`` every cycle, was refused every cycle,
+        and reported «GitHub отказал» — a sentence that names who said no.
+        A conflict, a revoked token and a deleted base branch all produce it,
+        and none of them is fixed the same way.
+
+        UNKNOWN is passed through as itself rather than folded into a
+        conflict. GitHub computes mergeability asynchronously and honestly
+        says UNKNOWN for the first seconds of a pull request's life — the
+        release PR the poller just opened is exactly that case, every time.
+        The next cycle asks again, the same way it already does for CI.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "mergeable,mergeStateStatus",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            detail = (err or "").strip() or "gh молчит"
+            return (MergeabilityOutcome.unavailable, detail[:200])
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return (MergeabilityOutcome.unavailable, "ответ gh не разобран")
+
+        mergeable = str(data.get("mergeable") or "").upper()
+        state = str(data.get("mergeStateStatus") or "").upper()
+        if mergeable == "MERGEABLE":
+            return (MergeabilityOutcome.mergeable, state.lower() or "mergeable")
+        if mergeable == "CONFLICTING":
+            # The 409 GitHub would answer names no files, and the reason has
+            # to lead somewhere. #969 already reads them out of the clone —
+            # the same question, so the same answer, not a second one.
+            files = await self._conflicting_files_of_pr(
+                pr_number, repo=repo, gh_repo=gh_repo
+            )
+            named = f": {', '.join(files)}" if files else ""
+            return (
+                MergeabilityOutcome.conflicting,
+                f"конфликт с базовой веткой{named}",
+            )
+        if mergeable == "UNKNOWN" or not mergeable:
+            return (
+                MergeabilityOutcome.unknown,
+                f"GitHub ещё не посчитал слияние ({state.lower() or 'без статуса'})",
+            )
+        return (MergeabilityOutcome.unavailable, f"нераспознанный ответ {mergeable}")
+
+    async def _conflicting_files_of_pr(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]:
+        """Files this PR collides with its base on, when git can name them.
+
+        Best effort by the same contract as ``_conflicting_files`` (#969):
+        empty means "could not name them", never "there were none". The
+        branch names come from the PR itself, so this works for a task PR as
+        well as for the release one.
+        """
+        rc, out, _ = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "baseRefName,headRefName",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return []
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        base = str(data.get("baseRefName") or "").strip()
+        head = str(data.get("headRefName") or "").strip()
+        if not base or not head:
+            return []
+        return await self._conflicting_files(head, base, repo=repo)
 
     async def return_release_into_base(
         self,
