@@ -17,6 +17,7 @@
 3. [Быстрый старт с нуля (streamable)](#3-быстрый-старт-с-нуля-streamable)
 4. [Подключение Cursor](#4-подключение-cursor)
 4a. [Cloud / iOS: чат без MCP](#4a-cloud--ios-чат-без-mcp)
+4b. [Cloud: исполнитель на одну open-задачу](#4b-cloud-исполнитель-на-одну-open-задачу)
 5. [Проверка curl](#5-проверка-curl)
 6. [Диагностика identity и health](#6-диагностика-identity-и-health)
 7. [Troubleshooting](#7-troubleshooting)
@@ -264,6 +265,78 @@ curl -sS -X POST https://<hub>/api/tasks -H "Authorization: Bearer $TOKEN" \
 (10 / 300). В open mode (хаб без принципалов и `HAIPLANE_HUB_TOKENS`) канал
 отвечает 503 `chat_pair_auth_required`: без auth нет и личности, которую мог бы
 нести код.
+
+---
+
+## 4b. Cloud: исполнитель на одну open-задачу
+
+Раздел 4a — постановка и уточнение (`kind=intake`, `role=human`). Этот раздел —
+исполнение **одной уже одобренной** open-задачи из облачного чата без MCP
+(`kind=implementer`, #980 / кнопка на карточке #981). Это соседний канал на той
+же машинерии кодов, не «включить агента» на intake.
+
+**Никогда не вставляйте в чат ноутбучный токен.** В чат идёт только код с
+карточки задачи. `/chat-pair` («Подключить чат») для этого **не** используйте:
+там по-прежнему intake.
+
+### Как оператору
+
+1. Задача должна быть `open` (черновик сначала апрувит человек). Кнопка есть
+   только на карточке в статусе `open`.
+2. Войдите принципалом хаба (не env-токеном) → карточка →
+   **«Передать в облачный чат»**. CSRF тот же, что у остальных POST на карточке.
+3. Код вида `AH-…` показывается **один раз**, вместе с номером задачи и TTL
+   (~5 минут, `HAIPLANE_CHAT_PAIR_CODE_SECONDS`). Обновите страницу — кода уже
+   нет. Новый POST на той же open-задаче сжигает неиспользованный код и выдаёт
+   свежий.
+4. В чате Cursor: `хаб: AH-…` и номер задачи. Агент обменивает код и работает
+   только с этой задачей.
+5. `claimed` / `running` / `review` / остальные статусы кнопку не показывают;
+   POST отвечает 409 и код не выдаёт. Нет активного агента
+   (`HAIPLANE_CHAT_PAIR_AGENT`, по умолчанию `cloud`) — 503.
+6. Кнопка «Отозвать чат-сессии» на `/chat-pair` закрывает **только intake**.
+   Implementer-сессию закрывает сам агент (`POST /api/auth/chat-pair/revoke`
+   своим токеном) либо оператор с laptop-токеном и `kind=implementer`. Kind
+   scoped: intake и implementer не убивают друг друга.
+
+### Как агенту в облачном чате
+
+```bash
+# 1. Обменять код (публичный маршрут, Authorization не нужен)
+curl -sS -X POST https://<hub>/api/auth/chat-pair/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"AH-7K2M9QRS"}'
+# → { "token": "...", "expires_at": "...", "username": "...",
+#     "role": "agent", "kind": "implementer", "bound_task_id": 982,
+#     "permissions": ["tasks.agent_report", "tasks.read", "tasks.update"],
+#     "base_url": "..." }
+
+# 2. Проверить сессию (kind/bound_task_id — в ответе redeem, не в whoami)
+curl -sS https://<hub>/api/whoami -H "Authorization: Bearer $TOKEN"
+# → auth_source=chat_pair, role=agent
+
+# 3. Зарегистрировать сессию, claim, pair-start на СВОЕЙ машине (clone),
+#    git_mode=remote — хаб не трогает git на своём хосте (#975)
+```
+
+Правила для агента:
+
+1. **Токен не эхом.** Не печатать его в чат, в task updates, в описание PR.
+2. Сессия привязана к `bound_task_id`. Запрос с другим `{task_id}` — 403
+   `chat_pair_gate_forbidden`. Создать новую задачу этот канал не может
+   (`tasks.create` нет в `CHAT_PAIR_IMPLEMENTER_PERMS`).
+3. `hub_pair_start` / `POST /api/tasks/{id}/pair-start` с `git_mode=remote`:
+   каноническое имя ветки `task-<id>/<slug>` записывается, git на хосте хаба
+   не выполняется. Push и PR — из clone агента. Чек-лист Cloud VM в
+   [`docs/software-development-workflow.md`](software-development-workflow.md)
+   сюда не копируем: это T-remote, не эта задача.
+4. Свой review-вердикт этот канал не ставит (`self_review_forbidden`). Сдача —
+   `hub_submit_for_review`, вердикт — другой принципал.
+5. Повторный / неизвестный / просроченный код — 401 `chat_pair_invalid`, как
+   у intake. Нет действующего агента-принципала — 503 на выдаче кода.
+
+TTL сессии тот же `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200), что у intake.
+Продление или release-on-expiry — отдельная задача (#983), не этот раздел.
 
 ---
 
