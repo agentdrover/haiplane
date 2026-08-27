@@ -39,3 +39,16 @@ def test_operator_guide_separates_intake_and_implementer_pairing():
     assert idx_4a < idx_4b
     intake = text[idx_4a:idx_4b]
     assert "Передать в облачный чат" not in intake
+
+
+def test_implementer_path_spec_freezes_intake_961():
+    # #984: path pack lives next to #961; intake SDD must point at it.
+    path_spec = REPO_ROOT / "docs" / "issues" / "chat-pair-implementer-path.md"
+    intake = REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md"
+    assert path_spec.is_file()
+    intake_text = intake.read_text(encoding="utf-8")
+    assert "Intake заморожен" in intake_text
+    assert "chat-pair-implementer-path.md" in intake_text
+    spec = path_spec.read_text(encoding="utf-8")
+    assert "kind=implementer" in spec
+    assert "#983" in spec
