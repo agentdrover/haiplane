@@ -80,6 +80,8 @@ async def test_task_detail_page(client: AsyncClient):
     assert "task-detail-layout" in resp.text
     assert "task-actions-card" in resp.text
     assert "task-meta-list" in resp.text
+    assert "Передать в облачный чат" in resp.text
+    assert f'action="/tasks/{task_id}/web-implementer-start"' in resp.text
 
 
 async def test_inbox_partial(client: AsyncClient):
@@ -577,6 +579,10 @@ async def test_web_start_dispatches_without_manual_plan(client: AsyncClient):
     assert task["status"] == "running"
     assert task["job_id"] == "test-job-1"
     assert task["assigned_agent"] == "developer-agent"
+
+    running_page = await client.get(f"/tasks/{task_id}")
+    assert running_page.status_code == 200
+    assert "Передать в облачный чат" not in running_page.text
 
 
 async def test_web_decide_task_with_summary(client: AsyncClient, db):
