@@ -85,6 +85,20 @@ async def test_tasks_archived_column_present():
         await conn.close()
 
 
+async def test_tasks_git_mode_column_present():
+    """#975: pair-start persists hub|remote so later host git can be skipped."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "git_mode" in cols
+        assert cols["git_mode"]["notnull"] == 1
+        default = cols["git_mode"]["dflt_value"]
+        assert default is not None
+        assert "hub" in str(default)
+    finally:
+        await conn.close()
+
+
 async def test_claim_columns_present():
     conn = await _make_db()
     try:

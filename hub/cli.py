@@ -356,6 +356,8 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["branch_slug"] = args.branch_slug
     if getattr(args, "session_id", None):
         body["session_id"] = args.session_id
+    if getattr(args, "git_mode", None):
+        body["git_mode"] = args.git_mode
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
     return 0
@@ -1411,6 +1413,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="session_id",
         default="",
         help="Session taking the task; required when the token is an agent (#852)",
+    )
+    p_pair_start.add_argument(
+        "--git-mode",
+        dest="git_mode",
+        choices=["hub", "remote"],
+        default="",
+        help="hub (default) prepares the branch on the hub host; remote skips host git",
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
 

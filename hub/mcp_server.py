@@ -1330,6 +1330,7 @@ async def hub_pair_start(
     assigned_agent: str = "",
     branch_slug: str = "",
     session_id: str = "",
+    git_mode: str = "",
 ) -> str:
     """Start pair mode: move an open task to running without headless dispatch.
 
@@ -1360,6 +1361,8 @@ async def hub_pair_start(
             id you registered with hub_session_register and used in
             hub_claim_task; another session of the same agent is refused with
             pair_start_session_mismatch.
+        git_mode: hub (default) prepares the branch on the hub host; remote
+            records the canonical name and skips host git (#975).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1372,6 +1375,8 @@ async def hub_pair_start(
         body["branch_slug"] = branch_slug
     if session_id:
         body["session_id"] = session_id
+    if git_mode:
+        body["git_mode"] = git_mode
     try:
         result = await _api_post(f"/api/tasks/{task_id}/pair-start", body or None)
     except HubApiError as exc:

@@ -276,6 +276,40 @@ async def test_hub_pair_start(
     )
 
 
+async def test_hub_pair_start_forwards_git_mode(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#975 AC-3: hub_pair_start passes git_mode through to REST."""
+    mock_api_post.return_value = {
+        "status": "running",
+        "branch": "task-41/remote",
+        "assigned_agent": "cloud",
+        "job_id": None,
+        "git_mode": "remote",
+    }
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {
+            "id": 41,
+            "status": "running",
+            "branch": "task-41/remote",
+            "assigned_agent": "cloud",
+            "git_mode": "remote",
+        },
+    ]
+    await hub_pair_start(
+        41, plan="Plan: remote", assigned_agent="cloud", git_mode="remote"
+    )
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/41/pair-start",
+        {
+            "plan": "Plan: remote",
+            "assigned_agent": "cloud",
+            "git_mode": "remote",
+        },
+    )
+
+
 async def test_hub_ask_question(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:

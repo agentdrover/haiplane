@@ -1426,7 +1426,11 @@ async def restore_pair_workspace_base(
 
     Worktree mode (#459): remove the task's worktree. Legacy mode: return the
     single working tree to its base branch. Either way the main clone ends on base.
+    Remote git_mode (#975): the hub host never held this workspace — skip.
     """
+    row = await repo.get_task(db, task_id)
+    if row and (dict(row).get("git_mode") or "hub") == "remote":
+        return
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
@@ -1444,9 +1448,12 @@ async def switch_pair_workspace_to_task(
     Worktree mode (#459): re-create the task's worktree (removed on submit) so
     fixes land there. Legacy mode (#457): switch the single working tree to the
     task branch instead of the local base restored by #451.
+    Remote git_mode (#975): the caller already has the branch in its clone.
     """
     row = await repo.get_task(db, task_id)
     task = dict(row) if row else {}
+    if (task.get("git_mode") or "hub") == "remote":
+        return
     branch = (task.get("branch") or "").strip()
     if not branch:
         return
