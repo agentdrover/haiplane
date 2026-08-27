@@ -501,3 +501,41 @@ async def test_a_red_ci_is_answered_before_mergeability_is_asked(
     assert merged is False
     assert "ci_fail" in reason
     g.check_pr_mergeable.assert_not_awaited()
+
+
+async def test_release_note_goes_only_to_undelivered_tasks(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#972): the poller note "Релиз готовится" lands only on tasks this
+    # release actually carries. The squash leftover must not be pinged again.
+    g = _git(existing_pr=None)
+    pid = await _release_project(db, "auto")
+    leftover = await _delivered_task(db, pid)
+    fresh = await _delivered_task(db, pid)
+    g.release_range = AsyncMock(
+        return_value=[
+            f"feat(task): leftover (#{leftover})",
+            f"feat(task): leftover again (#{leftover})",
+            f"feat(task): only this (#{fresh})",
+        ]
+    )
+    g.undelivered_release_range = AsyncMock(
+        return_value=[f"feat(task): only this (#{fresh})"]
+    )
+
+    await poller._sweep_release_policy(db)
+
+    leftover_notes = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, leftover)
+        if "Релиз готовится" in dict(u)["content"]
+    ]
+    fresh_notes = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, fresh)
+        if "Релиз готовится" in dict(u)["content"]
+    ]
+    assert leftover_notes == [], leftover_notes
+    assert len(fresh_notes) == 1, fresh_notes
+    assert f"#{fresh}" in fresh_notes[0]
+    assert f"#{leftover}" not in fresh_notes[0]

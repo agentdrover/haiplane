@@ -2548,6 +2548,64 @@ class GitOpsIntegration:
             return []
         return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
 
+    async def undelivered_release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str] | None:
+        """Subjects on ``head`` newer than the last commit whose tree matches ``base``.
+
+        Three answers, like ``content_differs``. A list — possibly empty — is
+        a successful cut: those subjects are what this release actually
+        carries. ``None`` — the cut could not be asked, and the caller must
+        not read that as "nothing to release" (#725).
+
+        Lives next to ``release_range`` rather than inside it because that
+        helper has a second consumer (``red_base._commits_between``) that
+        still needs the full ``base...head`` interval (#972 AC-6).
+        """
+        workspace = repo or _repo_root()
+        await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=workspace,
+            check=False,
+        )
+        base_sha = await _resolve_ref_remote_first(base, workspace)
+        head_sha = await _resolve_ref_remote_first(head, workspace)
+        if not base_sha or not head_sha:
+            return None
+        rc, tree_out, _ = await _git(
+            "rev-parse", f"{base_sha}^{{tree}}", repo=workspace, check=False
+        )
+        if rc != 0 or not tree_out.strip():
+            return None
+        base_tree = tree_out.strip()
+        rc, log_out, _ = await _git(
+            "log",
+            "--format=%H%x09%T%x09%s",
+            f"{base_sha}..{head_sha}",
+            repo=workspace,
+            check=False,
+        )
+        if rc != 0:
+            return None
+        undelivered: list[str] = []
+        for line in log_out.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            _sha, tree, subject = parts
+            if tree == base_tree:
+                break
+            if subject.strip():
+                undelivered.append(subject.strip())
+        return undelivered
+
     async def open_release_pr(
         self,
         base: str,

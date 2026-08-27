@@ -311,3 +311,171 @@ async def test_unreadable_diff_is_unknown_not_nothing_to_release(
     assert pr is None
     assert reason, "an unanswerable question must be named, not swallowed"
     assert not opened.called
+
+
+# ---- #972: composition of the release PR is the leftover of #968 AC-4 ----
+#
+# Detection now asks about content. The title, body and feed note still count
+# the squash leftover: every feat(task) subject that ever sat on develop.
+# These tests hold the second half of the same rule — name what this release
+# actually carries.
+
+
+def _inflated_leftover_range() -> list[str]:
+    return [
+        "feat(task): leftover (#880)",
+        "feat(task): leftover again (#880)",
+        "feat(task): old (#927)",
+        "feat(task): old (#931)",
+        "feat(task): old (#46)",
+        "feat(task): old (#962)",
+        "feat(task): only this one (#728)",
+    ]
+
+
+def _numbered_squash_trail(tmp_path) -> str:
+    """Squash leftover carries numbered tasks; one new task lands after it.
+
+    The leftover subjects are what a broken cut (no tree-match stop) would
+    still list. AC-1/AC-2 must fail if those numbers leak into the PR.
+    """
+    from pathlib import Path
+
+    from tests.conftest import _git_in
+
+    root = Path(tmp_path) / "numbered-trail"
+    root.mkdir()
+    _git_in(root, "init", "-b", "main")
+    (root / "a.py").write_text("a = 1\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "base")
+    _git_in(root, "checkout", "-q", "-b", "develop")
+    (root / "b.py").write_text("b = 2\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): leftover (#880)")
+    (root / "c.py").write_text("c = 3\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): leftover again (#880)")
+    (root / "d.py").write_text("d = 4\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): old (#927)")
+    _git_in(root, "checkout", "-q", "main")
+    _git_in(root, "merge", "--squash", "develop")
+    _git_in(root, "commit", "-m", "release: develop -> main")
+    _git_in(root, "checkout", "-q", "develop")
+    (root / "e.py").write_text("e = 5\n")
+    _git_in(root, "add", ".")
+    _git_in(root, "commit", "-m", "feat(task): only this one (#728)")
+    return str(root)
+
+
+def _wire_real_cut(monkeypatch, *, pr: int):
+    real = GitOpsIntegration()
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", real.content_differs, raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "undelivered_release_range",
+        real.undelivered_release_range,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "release_range",
+        AsyncMock(return_value=_inflated_leftover_range()),
+        raising=False,
+    )
+    opened = AsyncMock(return_value=pr)
+    monkeypatch.setattr(plugins.git_ops, "open_release_pr", opened, raising=False)
+    return opened
+
+
+async def test_undelivered_release_range_stops_at_matching_tree(squash_release):
+    # The cut itself: leftover whose tree equals main is not "new work";
+    # the one commit after the squash is. Without the tree-match break this
+    # returns the whole main..develop subject list.
+    ops = GitOpsIntegration()
+    root = squash_release["repo"]
+
+    leftover_only = await ops.undelivered_release_range(
+        "main", squash_release["develop_tip"], repo=root
+    )
+    assert leftover_only == [], leftover_only
+
+    after = await ops.undelivered_release_range("main", "develop", repo=root)
+    assert after == ["merged after the release"], after
+
+
+async def test_release_title_counts_only_undelivered_work(tmp_path, monkeypatch):
+    # AC-1: after several squash releases the range still lists the trail,
+    # and one real task is new. The title names 1, not the trail length.
+    root = _numbered_squash_trail(tmp_path)
+    opened = _wire_real_cut(monkeypatch, pr=95)
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(root), "main", "develop"
+    )
+
+    assert pr == 95, f"real work must open a release, got {reason!r}"
+    title = opened.await_args.args[2]
+    assert "1 задач(и)" in title, title
+    assert "880" not in title, title
+    assert task_ids == [728]
+    assert 880 not in task_ids
+    assert 927 not in task_ids
+
+
+async def test_release_body_lists_each_task_once(tmp_path, monkeypatch):
+    # AC-2: the body lists only the work this release carries, each number once.
+    root = _numbered_squash_trail(tmp_path)
+    opened = _wire_real_cut(monkeypatch, pr=95)
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(root), "main", "develop"
+    )
+
+    assert pr == 95, reason
+    body = opened.await_args.args[3]
+    assert "#728" in body
+    assert "#880" not in body, body
+    assert "#927" not in body, body
+    assert body.count("#728") == 1, body
+    assert task_ids == [728]
+
+
+async def test_narrowing_to_empty_never_silently_drops_a_release(
+    squash_release, monkeypatch
+):
+    # AC-4: content differs, but the cut came back empty. Opening by the full
+    # range (or naming why) — never the silent None that stalls the conveyor.
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "content_differs",
+        AsyncMock(return_value=True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "release_range",
+        AsyncMock(return_value=_inflated_leftover_range()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "undelivered_release_range",
+        AsyncMock(return_value=[]),
+        raising=False,
+    )
+    opened = AsyncMock(return_value=99)
+    monkeypatch.setattr(plugins.git_ops, "open_release_pr", opened, raising=False)
+
+    pr, subjects, task_ids, reason = await open_release_for_range(
+        _release_ctx(squash_release["repo"]), "main", "develop"
+    )
+
+    assert pr == 99, f"fallback must still open, got {reason!r}"
+    assert opened.called
+    title = opened.await_args.args[2]
+    assert "6 задач(и)" in title, title
+    assert 880 in task_ids and 728 in task_ids
