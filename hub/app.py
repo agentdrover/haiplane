@@ -2189,7 +2189,9 @@ async def api_session_heartbeat(
     identity=Depends(current_identity),
 ):
     """Record a sign of life for a registered session."""
-    return await services.heartbeat_session(_db(request), session_id)
+    return await services.heartbeat_session(
+        _db(request), session_id, principal_id=identity.principal_id
+    )
 
 
 # --- Live-check evidence (#813) ---
