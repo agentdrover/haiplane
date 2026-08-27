@@ -276,6 +276,40 @@ async def test_hub_pair_start(
     )
 
 
+async def test_hub_pair_start_forwards_git_mode(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#975 AC-3: hub_pair_start passes git_mode through to REST."""
+    mock_api_post.return_value = {
+        "status": "running",
+        "branch": "task-41/remote",
+        "assigned_agent": "cloud",
+        "job_id": None,
+        "git_mode": "remote",
+    }
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {
+            "id": 41,
+            "status": "running",
+            "branch": "task-41/remote",
+            "assigned_agent": "cloud",
+            "git_mode": "remote",
+        },
+    ]
+    await hub_pair_start(
+        41, plan="Plan: remote", assigned_agent="cloud", git_mode="remote"
+    )
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/41/pair-start",
+        {
+            "plan": "Plan: remote",
+            "assigned_agent": "cloud",
+            "git_mode": "remote",
+        },
+    )
+
+
 async def test_hub_ask_question(
     mock_api_post: AsyncMock, mock_api_get: AsyncMock
 ) -> None:
@@ -2037,6 +2071,27 @@ async def test_hub_submit_for_review(
     mock_api_post.assert_awaited_once_with(
         "/api/tasks/42/submit-review", {"agent": "dev", "summary": "pass 2"}
     )
+
+
+async def test_hub_submit_for_review_forwards_lifecycle_hint(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#975 AC-6: MCP must print the no-PR note, not a silent success."""
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 1,
+        "lifecycle_hint": (
+            "diff/PR для ветки task-42/x открыть не удалось: "
+            "у проекта нет origin/repo (placeholder workspace)."
+        ),
+    }
+    out = await hub_submit_for_review(42)
+    payload = json.loads(out)
+    assert "submitted for review" in payload["message"]
+    assert "diff/PR" in payload["message"]
+    assert "открыть не удалось" in payload["message"]
 
 
 async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
