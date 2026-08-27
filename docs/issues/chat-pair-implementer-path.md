@@ -13,6 +13,12 @@
 > про постановку задач из чата. Этот пакет — соседняя фича: облачный
 > исполнитель на уже одобренной задаче.
 >
+> Заведено в хабе (все `open`, DoR passed, source=human):
+> эпик **#973**; F-remote **#974** / T-remote **#975**; F-session **#976** /
+> T-session **#977**; F-pair **#978** / T-kind-spec **#979** / T-kind
+> **#980** / T-ui **#981** / T-docs **#982** / T-ttl **#983**; T-path
+> **#984**.
+>
 > Rev. 2 — правки по ревью спеки (C1–C6, I1–I12): схема кодов, persist
 > `git_mode`, выдача только из `open`, revoke по `kind`, не `_AGENT_DEFAULT_PERMS`.
 
@@ -242,18 +248,18 @@ T-kind **не** открывает pair-start в allowlist, пока T-remote н
 ### Иерархия в хабе
 
 ```text
-epic  Cloud-исполнитель без MCP          (новый, не #958)
-  feature  Remote pair-start
-    task   T-remote
-  feature  Владение session registry
-    task   T-session
-  feature  Implementer pairing
-    task   T-kind-spec
-    task   T-kind
-    task   T-ui
-    task   T-docs
-    task   T-ttl                         (не стартовать до живого прогона)
-  task     T-path                        (docs; этот PR)
+epic  #973 Cloud-исполнитель без MCP          (новый, не #958)
+  feature  #974 Remote pair-start
+    task   #975 T-remote
+  feature  #976 Владение session registry
+    task   #977 T-session
+  feature  #978 Implementer pairing
+    task   #979 T-kind-spec
+    task   #980 T-kind
+    task   #981 T-ui
+    task   #982 T-docs
+    task   #983 T-ttl                         (не стартовать до живого прогона)
+  task     #984 T-path                        (docs; этот PR)
 ```
 
 ### Минимальный allowlist implementer
