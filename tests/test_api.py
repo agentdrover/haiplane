@@ -204,6 +204,28 @@ async def test_pair_start_api(client: AsyncClient):
     assert data["job_id"] is None
     assert data["branch"] == f"task-{task_id}/pair-api-task"
     assert data["assigned_agent"] == "composer-analyst"
+    assert data.get("git_mode", "hub") == "hub"
+
+
+async def test_pair_start_api_remote_git_mode(client: AsyncClient):
+    """#975: REST pair-start accepts git_mode=remote and returns it."""
+    create_resp = await client.post("/api/tasks", json={"title": "Remote API pair"})
+    task_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "plan": "Plan: work in own clone",
+            "assigned_agent": "cloud",
+            "git_mode": "remote",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "running"
+    assert data["git_mode"] == "remote"
+    assert data["branch"] == f"task-{task_id}/remote-api-pair"
+    assert data["job_id"] is None
 
 
 async def test_claim_task_api(client: AsyncClient):

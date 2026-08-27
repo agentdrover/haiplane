@@ -1438,6 +1438,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN self_reviewed INTEGER NOT NULL "
         "DEFAULT 0",
     ),
+    (
+        # Pair-start git location (#975). ``hub`` (default) is today's laptop
+        # path: the hub host prepares and later restores the task branch.
+        # ``remote`` records the canonical name and never touches git on the
+        # hub host — the caller creates the branch in its own clone.
+        "add_tasks_git_mode",
+        "ALTER TABLE tasks ADD COLUMN git_mode TEXT NOT NULL DEFAULT 'hub'",
+    ),
 ]
 
 

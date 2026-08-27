@@ -1378,6 +1378,26 @@ def test_main_pair_start_forwards_branch_and_session() -> None:
     )
 
 
+def test_main_pair_start_forwards_git_mode() -> None:
+    rc, api = _run_main(
+        [
+            "pair-start",
+            "41",
+            "--plan",
+            "Plan: remote",
+            "--git-mode",
+            "remote",
+        ],
+        api_result={"id": 41, "status": "running", "git_mode": "remote"},
+    )
+    assert rc == 0
+    assert api.call_args.args == (
+        "POST",
+        "/api/tasks/41/pair-start",
+        {"plan": "Plan: remote", "git_mode": "remote"},
+    )
+
+
 def test_main_reject_archive_withdraw_unarchive_delete(capsys) -> None:
     rc, api = _run_main(
         ["reject", "5", "--comment", "no"],

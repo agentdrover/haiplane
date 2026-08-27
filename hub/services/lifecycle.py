@@ -58,6 +58,7 @@ from hub.models import (
     FINAL_STATUSES,
     FindingScope,
     LatestReview,
+    PairGitMode,
     ReviewFinding,
     SelfReviewWarning,
     TaskAnswer,
@@ -85,7 +86,7 @@ from hub.models import (
     TaskUpdateView,
     TaskView,
 )
-from hub.integrations.git_ops import PairBranchConflictError
+from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
     completion_requires_review,
     detect_branch_stacking,
@@ -108,6 +109,14 @@ from hub.services.refinement import (
 log = logging.getLogger("hub")
 
 _ROLLUP_PARENT_TYPES = frozenset({"feature", "epic"})
+
+
+def _git_mode_is_remote(task: dict[str, Any] | aiosqlite.Row | None) -> bool:
+    """True when pair-start asked the hub host not to touch git (#975)."""
+    if task is None:
+        return False
+    d = dict(task) if not isinstance(task, dict) else task
+    return (d.get("git_mode") or PairGitMode.hub.value) == PairGitMode.remote.value
 
 
 def _existing_task(row: aiosqlite.Row | None, task_id: int) -> aiosqlite.Row:
@@ -178,6 +187,9 @@ async def _try_restore_pair_workspace(
     task_id: int,
 ) -> None:
     """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
+    row = await repo.get_task(db, task_id)
+    if _git_mode_is_remote(row):
+        return
     try:
         await restore_pair_workspace_base(db, task_id)
     except Exception:
@@ -193,6 +205,9 @@ async def _try_switch_pair_workspace_to_task(
     task_id: int,
 ) -> None:
     """Best-effort workspace switch to the task branch for rework (#457)."""
+    row = await repo.get_task(db, task_id)
+    if _git_mode_is_remote(row):
+        return
     try:
         await switch_pair_workspace_to_task(db, task_id)
     except Exception:
@@ -574,6 +589,7 @@ def row_to_task(
         waiting_declared_by=d.get("waiting_declared_by") or "",
         branch=d.get("branch"),
         pr_number=d.get("pr_number"),
+        git_mode=d.get("git_mode") or PairGitMode.hub,
         claimed_by=d.get("claimed_by"),
         claim_session_id=d.get("claim_session_id"),
         claimed_at=d.get("claimed_at"),
@@ -1351,12 +1367,17 @@ async def pair_start_task(
             "with kind='status' and content starting with 'Plan:'.",
         )
 
-    try:
-        branch = await prepare_pair_branch(
-            db, task_id, task, branch_slug=(body.branch_slug or "").strip()
-        )
-    except PairBranchConflictError as exc:
-        raise HTTPException(422, detail=exc.to_detail()) from exc
+    git_mode = body.git_mode
+    slug = (body.branch_slug or "").strip()
+    if git_mode == PairGitMode.remote:
+        # Record the canonical name only. The caller creates this branch in
+        # its own clone; the hub host must not checkout, clean, or worktree.
+        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
+    else:
+        try:
+            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
+        except PairBranchConflictError as exc:
+            raise HTTPException(422, detail=exc.to_detail()) from exc
     if branch:
         task["branch"] = branch
 
@@ -1367,6 +1388,7 @@ async def pair_start_task(
     update_fields: dict[str, Any] = {
         "job_id": None,
         "assigned_agent": assigned_agent,
+        "git_mode": git_mode.value,
     }
     if implementer_principal_id is not None:
         update_fields["implementer_principal_id"] = implementer_principal_id
@@ -1414,7 +1436,9 @@ async def pair_start_task(
     updates = await repo.get_task_updates(db, task_id)
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     # Tell the agent where its isolated worktree is and the active mode (#530).
-    tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
+    # Remote pair-start has no hub-host worktree (#975).
+    if git_mode != PairGitMode.remote:
+        tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
     # #615: the statement may be older than the work that invalidated it. Told
     # HERE, on the server, so CLI and REST callers see it too — computing it in
     # the MCP tool would leave every other client blind.
@@ -1831,6 +1855,27 @@ async def submit_for_review(
             )
             pr_opened_by_hub = bool(discovered_pr)
 
+    # #975 AC-6: remote pair-start never has a hub-host diff, so None/[] is
+    # the normal observation — not the #498 "could not look, stay silent"
+    # case. A placeholder project (no gh_repo) cannot open a PR either.
+    # Name that on the submit response; do not look like empty success.
+    if (
+        _git_mode_is_remote(task)
+        and not task.get("pr_number")
+        and not discovered_pr
+        and not pr_ensure_note
+        and canonical
+    ):
+        from hub.services.orchestration import project_git_context as _git_ctx
+
+        remote_ctx = await _git_ctx(db, task_id)
+        if not (remote_ctx.get("gh_repo") or "").strip():
+            pr_ensure_note = (
+                f"diff/PR для ветки {canonical} открыть не удалось: "
+                "у проекта нет origin/repo (placeholder workspace). "
+                "git_mode=remote — хаб не читает clone на своём хосте."
+            )
+
     async with get_write_lock(db):
         if not await repo.transition_status_if(
             db, task_id, expected_from="running", new_status="review"
@@ -2018,6 +2063,14 @@ async def submit_for_review(
             f"{view.lifecycle_hint}\n{stacking['message']}"
             if view.lifecycle_hint
             else stacking["message"]
+        )
+    if pr_ensure_note:
+        # Agent-facing copy of the feed alert: MCP/REST must not look like
+        # a silent success when the PR could not be made (#975 AC-6, #967).
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{pr_ensure_note}"
+            if view.lifecycle_hint
+            else pr_ensure_note
         )
     # #836: hand back the baseline for waiting on THIS submission's verdict.
     # A snapshot of the current values, never of the desired ones: a baseline

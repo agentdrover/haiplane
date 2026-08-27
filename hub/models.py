@@ -554,6 +554,19 @@ class TaskStart(BaseModel):
     plan: str = Field("", max_length=10000)
 
 
+class PairGitMode(str, Enum):
+    """Where pair-mode git runs (#975).
+
+    ``hub`` is today's laptop/server-workspace path: the hub host prepares
+    and later restores the task branch. ``remote`` records the canonical
+    branch name and never touches git on the hub host — the caller creates
+    the branch in its own clone.
+    """
+
+    hub = "hub"
+    remote = "remote"
+
+
 class TaskPairStart(BaseModel):
     plan: str = Field("", max_length=10000)
     assigned_agent: str = Field("", max_length=100)
@@ -563,6 +576,7 @@ class TaskPairStart(BaseModel):
     # and everything addressable (registry #771, messages #773, wake-up #774)
     # routes by session. Required for agent callers; humans pair-start as before.
     session_id: str = Field("", max_length=200)
+    git_mode: PairGitMode = PairGitMode.hub
 
 
 class TaskSubmitReview(BaseModel):
@@ -1621,6 +1635,9 @@ class TaskView(BaseModel):
     latest_review: LatestReview | None = None
     branch: str | None = None
     pr_number: int | None = None
+    # Pair-start git location (#975): hub prepares/restores on the hub host;
+    # remote records the canonical branch name and skips host git.
+    git_mode: PairGitMode = PairGitMode.hub
     # Pair-start workspace signal (#530): set only on pair-start so an agent
     # learns where its isolated worktree is. "" elsewhere.
     workspace_mode: str = ""
