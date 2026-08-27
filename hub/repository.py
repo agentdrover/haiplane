@@ -3061,6 +3061,11 @@ async def upsert_agent_session(
     because it said hello twice — and keeps a previously declared model, host
     or workspace when the new call omits it: a heartbeat-shaped register must
     not quietly erase what the registry knows.
+
+    ON CONFLICT does not overwrite another principal's ``principal_id`` or
+    ``agent`` (#977). A WHERE miss leaves the existing row as-is so a raced
+    register cannot steal the address between the service's owner check and
+    this write.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
@@ -3076,7 +3081,9 @@ async def upsert_agent_session(
         "                 THEN agent_sessions.host ELSE excluded.host END, "
         "  workspace    = CASE WHEN excluded.workspace = '' "
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
-        "  last_seen_at = datetime('now')",
+        "  last_seen_at = datetime('now') "
+        "WHERE agent_sessions.principal_id IS NULL "
+        "   OR agent_sessions.principal_id = excluded.principal_id",
         (session_id, principal_id, agent, model, host, workspace),
     )
 

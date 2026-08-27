@@ -6,6 +6,7 @@ from hub.actionable_errors import (
     hierarchy_error_detail,
     normalize_api_error_detail,
     permission_denied_detail,
+    session_owned_by_other_detail,
 )
 
 
@@ -18,6 +19,16 @@ def test_permission_denied_archive_suggests_withdraw() -> None:
     assert payload["actor_hint"] == "human"
     assert payload["awaiting"] == "none"
     assert "next_action" in payload
+
+
+def test_session_owned_by_other_does_not_name_the_holder() -> None:
+    payload = session_owned_by_other_detail(session_id="s-owned")
+    assert payload["reason"] == "session_owned_by_other"
+    assert payload["session_id"] == "s-owned"
+    assert payload["suggested_tool"] == "hub_session_register"
+    assert payload["actor_hint"] == "agent"
+    assert "principal" in payload["message"]
+    assert "s-owned" in payload["message"]
 
 
 def test_hierarchy_parent_type_mismatch() -> None:

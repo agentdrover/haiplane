@@ -20,7 +20,9 @@ convenience:
    from the authenticated identity, never from the request body. A session that
    could name itself would let anyone claim another agent's address — and the
    drift between a body-supplied name and the token's principal is exactly what
-   made draft #741 unwithdrawable.
+   made draft #741 unwithdrawable. The row itself is bound to that principal
+   (#977): a later register or heartbeat from someone else must not take the
+   address or refresh its sign of life.
 
 The registry is optional by construction: nothing in the task lifecycle
 requires a session to be registered, and every write below is a no-op when it
@@ -37,7 +39,12 @@ from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
+from hub.actionable_errors import session_owned_by_other_detail
 from hub.models import SessionRegister, SessionView, UnaddressableTask
+
+_NOT_REGISTERED = (
+    "session {session_id} is not registered — call POST /api/sessions/register first"
+)
 
 ONLINE = "online"
 OFFLINE = "offline"
@@ -86,6 +93,19 @@ def session_view(row: aiosqlite.Row | dict, *, now: datetime | None = None) -> d
     }
 
 
+def _owned_by_other(row: aiosqlite.Row | dict, principal_id: int | None) -> bool:
+    """True when this row already belongs to a different principal (#977).
+
+    An unowned row (principal_id NULL, typically open-mode) is not a foreign
+    hold — the first attributed caller may take it. A row with an owner
+    refuses every other principal, including an anonymous one.
+    """
+    owner = dict(row).get("principal_id")
+    if owner is None:
+        return False
+    return principal_id != owner
+
+
 async def register_session(
     db: aiosqlite.Connection,
     body: SessionRegister,
@@ -97,11 +117,18 @@ async def register_session(
 
     Idempotent by ``session_id``: a second call from the same session updates
     what it declares and its sign of life, and keeps ``started_at`` — saying
-    hello twice does not make it a new session.
+    hello twice does not make it a new session. A ``session_id`` already
+    held by another principal is refused (409); the existing row is not
+    rewritten (#977).
     """
     session_id = body.session_id.strip()
     if not session_id:
         raise HTTPException(422, "session_id is required")
+    existing = await repo.get_agent_session(db, session_id)
+    if existing is not None and _owned_by_other(existing, principal_id):
+        raise HTTPException(
+            409, detail=session_owned_by_other_detail(session_id=session_id)
+        )
     await repo.upsert_agent_session(
         db,
         session_id=session_id,
@@ -113,21 +140,33 @@ async def register_session(
     )
     await db.commit()
     row = await repo.get_agent_session(db, session_id)
+    if row is not None and _owned_by_other(row, principal_id):
+        # Lost the insert race to another principal; the UPSERT WHERE left
+        # their row untouched. Refuse without returning it.
+        raise HTTPException(
+            409, detail=session_owned_by_other_detail(session_id=session_id)
+        )
     return SessionView(**session_view(row))  # type: ignore[arg-type]
 
 
 async def heartbeat_session(
     db: aiosqlite.Connection,
     session_id: str,
+    *,
+    principal_id: int | None = None,
 ) -> SessionView:
-    """Record a sign of life for an already registered session."""
-    known = await repo.touch_agent_session(db, session_id)
-    if not known:
-        raise HTTPException(
-            404,
-            f"session {session_id} is not registered — "
-            "call POST /api/sessions/register first",
-        )
+    """Record a sign of life for an already registered session.
+
+    A foreign ``session_id`` is indistinguishable from an unregistered one
+    (404, no ``last_seen_at`` bump): leaking that the id exists would be
+    the other half of the hijack #977 closes.
+    """
+    known = await repo.get_agent_session(db, session_id)
+    if known is None or _owned_by_other(known, principal_id):
+        raise HTTPException(404, _NOT_REGISTERED.format(session_id=session_id))
+    touched = await repo.touch_agent_session(db, session_id)
+    if not touched:
+        raise HTTPException(404, _NOT_REGISTERED.format(session_id=session_id))
     await db.commit()
     row = await repo.get_agent_session(db, session_id)
     return SessionView(**session_view(row))  # type: ignore[arg-type]

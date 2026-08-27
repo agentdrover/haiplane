@@ -429,6 +429,31 @@ def pair_start_session_mismatch_detail(
     )
 
 
+def session_owned_by_other_detail(*, session_id: str) -> dict[str, Any]:
+    """409 when register would overwrite another principal's session row (#977).
+
+    The other principal's name and id stay out of the payload: the caller
+    learns the id is taken, not who holds it. Heartbeat of a foreign id is
+    a 404 instead — that path must look like an unregistered session.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "session_owned_by_other",
+            "actor_hint": "agent",
+            "message": (
+                f"session '{session_id}' is already registered to another principal"
+            ),
+            "hint": (
+                "Pick a new session_id and register it with "
+                "hub_session_register(session_id=...) — do not reuse an id "
+                "another agent already holds."
+            ),
+            "session_id": session_id,
+            "suggested_tool": "hub_session_register",
+        }
+    )
+
+
 def hierarchy_error_detail(
     raw_message: str,
     *,

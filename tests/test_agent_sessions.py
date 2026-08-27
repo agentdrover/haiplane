@@ -388,3 +388,115 @@ async def test_running_without_session_is_visible(client: AsyncClient, monkeypat
     ids = [row["id"] for row in resp.json()]
     assert ids == [orphan.id], resp.json()
     assert resp.json()[0]["claimed_by"] == "bot"
+
+
+# ---- #977: a leaked token cannot steal another principal's session_id ----
+#
+# Register upserts principal_id on conflict and heartbeat has no owner check.
+# Harmless for trusted laptop tokens; fatal once a transcript token can call
+# these routes. Identity already comes from the token (#771); this is the
+# missing half: the row itself is not a public address to overwrite.
+
+
+def _two_agent_tokens(monkeypatch) -> tuple[dict[str, str], dict[str, str]]:
+    from hub import config
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "token-a": TokenIdentity("agent-a", "agent", principal_id=11),
+            "token-b": TokenIdentity("agent-b", "agent", principal_id=12),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return (
+        {"Authorization": "Bearer token-a"},
+        {"Authorization": "Bearer token-b"},
+    )
+
+
+async def _freeze_last_seen(db: aiosqlite.Connection, session_id: str) -> str:
+    """Pin last_seen_at so a refused write is observable, not lost in the same second."""
+    await db.execute(
+        "UPDATE agent_sessions SET last_seen_at = datetime('now', '-10 minutes') "
+        "WHERE session_id = ?",
+        (session_id,),
+    )
+    await db.commit()
+    return (await _rows(db, session_id))[0]["last_seen_at"]
+
+
+async def test_register_refuses_foreign_session_id(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-1: principal B cannot take a session_id already registered to A."""
+    headers_a, headers_b = _two_agent_tokens(monkeypatch)
+    created = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-owned", "model": "opus", "host": "mac-a"},
+        headers=headers_a,
+    )
+    assert created.status_code == 200, created.text
+    frozen = await _freeze_last_seen(db, "s-owned")
+    before = (await _rows(db, "s-owned"))[0]
+
+    stolen = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-owned", "model": "hijack", "host": "mac-b"},
+        headers=headers_b,
+    )
+    assert stolen.status_code == 409, stolen.text
+    detail = stolen.json()["detail"]
+    assert detail["reason"] == "session_owned_by_other"
+    assert "agent-a" not in stolen.text, "the holder must not be named to the loser"
+
+    after = (await _rows(db, "s-owned"))[0]
+    assert after["principal_id"] == 11
+    assert after["agent"] == "agent-a"
+    assert after["model"] == "opus"
+    assert after["host"] == "mac-a"
+    assert after["last_seen_at"] == frozen
+    assert after["principal_id"] == before["principal_id"]
+    assert after["agent"] == before["agent"]
+
+
+async def test_heartbeat_of_foreign_session_is_not_found(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-2: B's heartbeat does not bump A's last_seen_at and looks unregistered."""
+    headers_a, headers_b = _two_agent_tokens(monkeypatch)
+    await client.post(
+        "/api/sessions/register", json={"session_id": "s-owned"}, headers=headers_a
+    )
+    frozen = await _freeze_last_seen(db, "s-owned")
+
+    resp = await client.post("/api/sessions/s-owned/heartbeat", headers=headers_b)
+    assert resp.status_code == 404, resp.text
+    assert (await _rows(db, "s-owned"))[0]["last_seen_at"] == frozen
+    assert (await _rows(db, "s-owned"))[0]["principal_id"] == 11
+
+
+async def test_same_principal_register_refreshes_without_changing_owner(
+    client: AsyncClient, monkeypatch, db
+):
+    """AC-3: the owner can say hello again; principal_id stays put."""
+    headers_a, _headers_b = _two_agent_tokens(monkeypatch)
+    first = await client.post(
+        "/api/sessions/register", json={"session_id": "s-owned"}, headers=headers_a
+    )
+    assert first.status_code == 200, first.text
+    frozen = await _freeze_last_seen(db, "s-owned")
+
+    again = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-owned", "model": "fable"},
+        headers=headers_a,
+    )
+    assert again.status_code == 200, again.text
+    row = (await _rows(db, "s-owned"))[0]
+    assert again.json()["principal_id"] == 11
+    assert row["principal_id"] == 11
+    assert row["agent"] == "agent-a"
+    assert row["model"] == "fable"
+    assert row["last_seen_at"] > frozen
