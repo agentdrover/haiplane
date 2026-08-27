@@ -21,6 +21,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 | Dispatch / review orchestration | `hub/services/orchestration.py`, `hub/poller.py` | `hub/integrations/dispatch.py`, `hub/integrations/git_ops.py`, `hub/integrations/github.py` | `tests/test_poller.py`, `tests/test_services.py` |
 | Auth changes | `hub/auth.py`, `hub/app.py`, `hub/web.py` | templates if login/UI changes | `tests/test_auth.py`, `tests/test_web.py` |
 | Chat pairing (code → short session) | `hub/services/chat_pair.py`, `hub/auth.py` | `hub/app.py` (start/redeem/revoke, create guard), `hub/web.py` + `hub/templates/chat_pair.html`, `hub/config.py`, `hub/db.py`, `hub/poller.py` | `tests/test_chat_pair.py`, `tests/test_auth.py`, `tests/test_db_migrations.py` |
+| Chat-pair **implementer** (agent session on one task) | `docs/issues/chat-pair-implementer-path.md` (path + task pack; not implemented) | Same files as chat pairing **plus** `hub/services/lifecycle.py` pair-start, `hub/services/orchestration.py`, `hub/services/sessions.py`. Do **not** widen the #961 allowlist as a side effect of another task. Do **not** flip intake #961 to `role=agent`. | `tests/test_chat_pair.py` plus pair-start and session tests named in that doc |
 
 ## High-Risk Couplings
 
