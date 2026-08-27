@@ -62,14 +62,20 @@ def release_body(
 
     ``head``/``base`` are named rather than assumed (#475): the record must
     say which branches this release actually moved, and on a project that is
-    not the hub they are not develop and main.
+    not the hub they are not develop and main. A task number is listed once
+    (#972): the squash leftover used to name the same id twice.
     """
     task_ids: list[int] = []
+    seen: set[int] = set()
     lines: list[str] = []
     for subject in subjects:
         match = _TASK_NUMBER.search(subject)
         if match:
-            task_ids.append(int(match.group(1)))
+            tid = int(match.group(1))
+            if tid in seen:
+                continue
+            seen.add(tid)
+            task_ids.append(tid)
         lines.append(f"- {subject}")
     head = head or config.PAIR_BASE_BRANCH
     base = base or config.RELEASE_BRANCH
@@ -190,6 +196,36 @@ async def open_release_for_range(
         return None, [], [], f"диапазон релиза {head} → {base} не прочитан: {exc}"
     if not subjects:
         return None, [], [], ""
+
+    # #972: the range still lists every squash leftover. Detection (#968)
+    # already asked about content; composition still has to name what this
+    # release actually carries. The cut is a different method so
+    # release_range stays the full interval red_base asks for.
+    try:
+        narrowed = await plugins.git_ops.undelivered_release_range(
+            base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning(
+            "release composition %s → %s: cut failed (%s); using the full range",
+            head,
+            base,
+            exc,
+        )
+        narrowed = None
+    if narrowed:
+        subjects = narrowed
+    elif narrowed == []:
+        # Content differs, the cut named nothing. Swallowing the release
+        # here is class #725 and worse than the inflated title. Keep the
+        # full range and say so (#972 AC-4).
+        log.warning(
+            "release composition %s → %s: cut was empty while content "
+            "differs; falling back to the full range so the conveyor "
+            "does not stall",
+            head,
+            base,
+        )
 
     body, task_ids = release_body(subjects, head, base)
     title = f"release: {len(task_ids) or len(subjects)} задач(и) из {head} в {base}"

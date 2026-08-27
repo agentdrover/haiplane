@@ -167,6 +167,16 @@ class NoopGitOps:
         """No git here — an empty range means the release has nothing to say."""
         return []
 
+    async def undelivered_release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str] | None:
+        """No git here — "could not look", never "the cut is empty" (#725)."""
+        return None
+
     async def open_release_pr(
         self,
         base: str,
