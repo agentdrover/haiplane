@@ -4,6 +4,11 @@
 > Нумерация AC в хабе сплошная (`AC-1…AC-22`): суффиксные id вида `AC-7b`
 > контракт хаба не принимает, соответствие указано в описании задачи.
 >
+> **Intake заморожен.** Этот канал — постановка/уточнение задачи
+> (`role=human`, create → `open`). Не флипать сессию в агента и не
+> открывать claim/pair-start/done на этом allowlist. Соседний путь
+> облачного исполнителя: [`chat-pair-implementer-path.md`](chat-pair-implementer-path.md).
+>
 > Спека для задачи хаба (`work_type: feature`).  
 > Не реализация. Ветка/коммит не входят в этот документ.  
 > Контекст: Cursor web/agents не даёт добавить свой MCP; оператор ставит
@@ -791,6 +796,14 @@ assumptions:
 ```
 
 ---
+
+## Post-ship (не rev. 5)
+
+Intake не расширяем до исполнителя. Облачный `claim`/`pair-start` — соседний
+`kind=implementer` и remote pair-start, см.
+[`chat-pair-implementer-path.md`](chat-pair-implementer-path.md). Флип
+`role=agent` на этом канале отвергнут ревью: ломает create, revoke и git
+на хосте хаба.
 
 ## Changelog (rev. 4)
 
