@@ -2534,6 +2534,25 @@ class WhoamiView(BaseModel):
     app_version: str
 
 
+class ChatPairStartRequest(BaseModel):
+    """Optional body on POST /api/auth/chat-pair/start (#980).
+
+    Omitted or empty keeps today's intake issue. ``kind=implementer`` requires
+    ``task_id`` of an open task.
+    """
+
+    kind: str = "intake"
+    task_id: int | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _kind(cls, value: str) -> str:
+        kind = (value or "intake").strip().lower() or "intake"
+        if kind not in {"intake", "implementer"}:
+            raise ValueError("kind must be intake or implementer")
+        return kind
+
+
 class ChatPairStartView(BaseModel):
     """What the operator copies into the chat (#961).
 
@@ -2561,6 +2580,8 @@ class ChatPairRedeemed(BaseModel):
     role: str
     base_url: str
     permissions: list[str]
+    kind: str = "intake"
+    bound_task_id: int | None = None
 
 
 class ChatPairRevoked(BaseModel):

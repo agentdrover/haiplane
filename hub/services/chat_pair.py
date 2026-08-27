@@ -119,27 +119,44 @@ def _as_iso(stamp: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def issue_code(db: aiosqlite.Connection, principal_id: int) -> tuple[str, int]:
-    """Burn this principal's unspent codes, mint a new one.
+async def issue_code(
+    db: aiosqlite.Connection,
+    principal_id: int,
+    *,
+    kind: str = "intake",
+    bound_task_id: int | None = None,
+) -> tuple[str, int]:
+    """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
 
-    Returns ``(code_for_display, ttl_seconds)``. Burning first is what makes
-    "I lost the code, give me another" safe: at most one code of a principal is
-    ever live, so a code glimpsed over a shoulder dies the moment its owner
-    asks for a replacement.
+    Intake and implementer do not kill each other: burn is scoped to the
+    same kind (and, for implementer, the same bound task).
     """
-    await db.execute(
-        "DELETE FROM chat_pair_codes WHERE principal_id = ? AND redeemed_at IS NULL",
-        (principal_id,),
-    )
+    kind = (kind or "intake").strip().lower() or "intake"
+    if kind == "implementer":
+        await db.execute(
+            "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+            "AND bound_task_id = ? AND redeemed_at IS NULL",
+            (principal_id, kind, bound_task_id),
+        )
+    else:
+        await db.execute(
+            "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+            "AND redeemed_at IS NULL",
+            (principal_id, kind),
+        )
     ttl = config.CHAT_PAIR_CODE_SECONDS
     code = generate_pair_code()
-    # The TTL is bound, not interpolated: the value comes from config and is an
-    # int, but a security-sensitive module should not carry a query a scanner
-    # has to be argued with.
     await db.execute(
-        "INSERT INTO chat_pair_codes (principal_id, code_hash, expires_at) "
-        "VALUES (?, ?, datetime('now', ?))",
-        (principal_id, hash_pair_code(code), f"+{int(ttl)} seconds"),
+        "INSERT INTO chat_pair_codes "
+        "(principal_id, kind, bound_task_id, code_hash, expires_at) "
+        "VALUES (?, ?, ?, ?, datetime('now', ?))",
+        (
+            principal_id,
+            kind,
+            bound_task_id if kind == "implementer" else None,
+            hash_pair_code(code),
+            f"+{int(ttl)} seconds",
+        ),
     )
     await db.commit()
     return format_pair_code(code), ttl
@@ -163,7 +180,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
 
     rows = await fetchall(
         db,
-        "SELECT c.id, c.principal_id, p.username, p.status "
+        "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
+        "p.username, p.status "
         "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
         "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
         "AND c.expires_at > datetime('now')",
@@ -175,8 +193,24 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     if row["status"] != "active":
         return None
 
-    # Burn-after-read is a conditional UPDATE, not a read followed by a write:
-    # two redeems racing on one code must not both see it unspent.
+    kind = (row.get("kind") or "intake").strip().lower() or "intake"
+    bound_task_id = row.get("bound_task_id")
+    acting_id: int | None = None
+    acting_username = row["username"]
+    if kind == "implementer":
+        if bound_task_id is None:
+            return None
+        task_rows = await fetchall(
+            db, "SELECT status FROM tasks WHERE id = ?", (int(bound_task_id),)
+        )
+        if not task_rows or dict(task_rows[0]).get("status") != "open":
+            return None
+        acting = await get_acting_agent(db)
+        if acting is None:
+            return None
+        acting_id = int(acting["id"])
+        acting_username = str(acting["username"])
+
     cursor = await db.execute(
         "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "
         "WHERE id = ? AND redeemed_at IS NULL",
@@ -189,9 +223,18 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     token = generate_session_token()
     ttl = config.CHAT_PAIR_TTL_SECONDS
     await db.execute(
-        "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at) "
-        "VALUES (?, ?, datetime('now', ?))",
-        (row["principal_id"], hash_pair_code(token), f"+{int(ttl)} seconds"),
+        "INSERT INTO chat_pair_sessions "
+        "(principal_id, acting_principal_id, kind, bound_task_id, "
+        " token_hash, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        (
+            row["principal_id"],
+            acting_id,
+            kind,
+            bound_task_id if kind == "implementer" else None,
+            hash_pair_code(token),
+            f"+{int(ttl)} seconds",
+        ),
     )
     await db.commit()
 
@@ -203,25 +246,43 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     return {
         "token": token,
         "principal_id": row["principal_id"],
-        "username": row["username"],
+        "username": acting_username,
+        "kind": kind,
+        "bound_task_id": int(bound_task_id) if bound_task_id is not None else None,
         "expires_at": _as_iso(dict(stored[0])["expires_at"] if stored else None),
     }
+
+
+async def get_acting_agent(db: aiosqlite.Connection) -> dict[str, Any] | None:
+    """The implementer acting principal, or None if missing/inactive."""
+    username = (config.CHAT_PAIR_AGENT or "cloud").strip() or "cloud"
+    rows = await fetchall(
+        db,
+        "SELECT id, username, status FROM principals WHERE username = ?",
+        (username,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    if row["status"] != "active":
+        return None
+    return row
 
 
 async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity | None:
     """Identity behind a chat-pair bearer token, or ``None``.
 
-    ``role='human'`` is presentational — it names the issuer for whoami and for
-    attribution. No gate may decide by it: ``is_admin`` trusts the role string
-    and ``has_permission`` short-circuits to True for ``super_admin``, so the
-    role is forced to the harmless value and authority comes from
-    ``auth_source`` plus the route allowlist.
+    Intake keeps ``role='human'`` as presentational naming of the issuer.
+    Implementer walks as ``role='agent'`` under the acting principal's name,
+    while ``principal_id`` stays the issuer so revoke and audit still land
+    on the human who issued the code (#980).
     """
     if not token or not token.startswith(TOKEN_PREFIX):
         return None
     rows = await fetchall(
         db,
-        "SELECT s.principal_id, p.username, p.status "
+        "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
+        "p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
         "AND s.expires_at > datetime('now')",
@@ -230,28 +291,72 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
     if not rows:
         return None
     row = dict(rows[0])
-    if row["status"] != "active":
+    if row["issuer_status"] != "active":
         return None
+    kind = (row.get("kind") or "intake").strip().lower() or "intake"
+    bound = row.get("bound_task_id")
+    bound_id = int(bound) if bound is not None else None
+    if kind == "implementer":
+        acting_id = row.get("acting_principal_id")
+        if acting_id is None:
+            return None
+        acting_rows = await fetchall(
+            db,
+            "SELECT username, status FROM principals WHERE id = ?",
+            (int(acting_id),),
+        )
+        if not acting_rows:
+            return None
+        acting = dict(acting_rows[0])
+        if acting["status"] != "active":
+            return None
+        return TokenIdentity(
+            username=acting["username"],
+            role="agent",
+            principal_id=row["principal_id"],
+            permissions=config.CHAT_PAIR_IMPLEMENTER_PERMS,
+            auth_source="chat_pair",
+            chat_pair_kind="implementer",
+            chat_pair_task_id=bound_id,
+        )
     return TokenIdentity(
-        username=row["username"],
+        username=row["issuer_username"],
         role="human",
         principal_id=row["principal_id"],
         permissions=config.CHAT_PAIR_PERMS,
         auth_source="chat_pair",
+        chat_pair_kind="intake",
+        chat_pair_task_id=None,
     )
 
 
-async def revoke_sessions(db: aiosqlite.Connection, principal_id: int) -> int:
-    """Close every live chat-pair session of a principal. Returns how many.
+async def revoke_sessions(
+    db: aiosqlite.Connection,
+    principal_id: int,
+    *,
+    kind: str = "intake",
+    bound_task_id: int | None = None,
+) -> int:
+    """Close live chat-pair sessions of this principal, scoped by kind.
 
-    Deliberately narrow: browser sessions and API keys are other channels, and
-    "I am done with the phone" must not sign the laptop out.
+    Intake revoke must not kill a running implementer, and the other way
+    around (#980). ``bound_task_id`` further narrows implementer revoke when
+    the caller names a task.
     """
-    cursor = await db.execute(
-        "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
-        "WHERE principal_id = ? AND revoked_at IS NULL",
-        (principal_id,),
-    )
+    kind = (kind or "intake").strip().lower() or "intake"
+    if kind == "implementer" and bound_task_id is not None:
+        cursor = await db.execute(
+            "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+            "WHERE principal_id = ? AND kind = ? AND bound_task_id = ? "
+            "AND revoked_at IS NULL",
+            (principal_id, kind, bound_task_id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE chat_pair_sessions SET revoked_at = datetime('now') "
+            "WHERE principal_id = ? AND kind = ? AND revoked_at IS NULL",
+            (principal_id, kind),
+        )
     await db.commit()
     return int(cursor.rowcount or 0)
 

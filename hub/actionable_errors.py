@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from hub import config
 from hub.models import HIERARCHY_RULES, TaskType
 from hub.mcp_envelope import enrich_error_payload
 
@@ -158,6 +159,47 @@ def chat_pair_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
                 "laptop, not the code from the chat."
             ),
             "required_role": "human",
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_agent_missing_detail() -> dict[str, Any]:
+    """503 when implementer pairing has no acting principal (#980).
+
+    Raised on issue, not on redeem: a 503 after a code hash hit would tell
+    a guesser the code existed.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_agent_missing",
+            "actor_hint": "human",
+            "message": "implementer pairing has no acting agent principal",
+            "hint": (
+                "Create an active agent principal named "
+                f"{config.CHAT_PAIR_AGENT!r} (HAIPLANE_CHAT_PAIR_AGENT), "
+                "then issue the code again."
+            ),
+            "suggested_tool": None,
+        }
+    )
+
+
+def chat_pair_task_not_open_detail(*, task_id: int, status: str) -> dict[str, Any]:
+    """409: implementer codes are issued only for open tasks (#980)."""
+    return enrich_error_payload(
+        {
+            "reason": "chat_pair_task_not_open",
+            "actor_hint": "human",
+            "message": (
+                f"implementer pairing is issued only for open tasks; "
+                f"#{task_id} is {status}"
+            ),
+            "hint": (
+                "Approve or release the task to open, then issue a new "
+                "implementer code from its card."
+            ),
+            "task_id": task_id,
             "suggested_tool": None,
         }
     )
