@@ -169,6 +169,30 @@ CHAT_PAIR_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/auth/chat-pair/revoke"),
 )
 
+# Implementer allowlist is a sibling of intake, not a widening of it (#980).
+# {task_id} is captured and compared to the session's bound_task_id.
+CHAT_PAIR_IMPLEMENTER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/whoami"),
+    ("GET", "/api/diagnostics/identity"),
+    ("GET", "/api/tasks/{task_id}"),
+    ("GET", "/api/tasks/{task_id}/tree"),
+    ("GET", "/api/tasks/{task_id}/context"),
+    ("GET", "/api/tasks/{task_id}/readiness"),
+    ("GET", "/api/tasks/{task_id}/review-brief"),
+    ("GET", "/api/tasks/{task_id}/acceptance_criteria"),
+    ("GET", "/api/tasks/{task_id}/updates"),
+    ("POST", "/api/tasks/{task_id}/updates"),
+    ("POST", "/api/tasks/{task_id}/question"),
+    ("POST", "/api/tasks/{task_id}/claim"),
+    ("POST", "/api/tasks/{task_id}/pair-start"),
+    ("POST", "/api/tasks/{task_id}/submit-review"),
+    ("POST", "/api/tasks/{task_id}/declare-wait"),
+    ("POST", "/api/sessions/register"),
+    ("POST", "/api/sessions/{session_id}/heartbeat"),
+    ("POST", "/api/auth/chat-pair/redeem"),
+    ("POST", "/api/auth/chat-pair/revoke"),
+)
+
 
 def _template_to_regex(template: str) -> re.Pattern[str]:
     """``/api/tasks/{task_id}/refine`` → an anchored regex over path segments.
@@ -177,26 +201,68 @@ def _template_to_regex(template: str) -> re.Pattern[str]:
     template is not known there — only the raw path. Compiling the templates
     once at import keeps the check a match against a known shape rather than
     string surgery on every request.
+
+    ``{task_id}`` is a named group so implementer sessions can refuse a
+    different task without a second parse (#980). Other placeholders stay
+    anonymous — ``{session_id}`` is the caller's own UUID, not the bound task.
     """
-    parts = [
-        "[^/]+" if seg.startswith("{") and seg.endswith("}") else re.escape(seg)
-        for seg in template.split("/")
-    ]
+    parts: list[str] = []
+    for seg in template.split("/"):
+        if seg.startswith("{") and seg.endswith("}"):
+            name = seg[1:-1]
+            if name == "task_id":
+                parts.append("(?P<task_id>[^/]+)")
+            else:
+                parts.append("[^/]+")
+        else:
+            parts.append(re.escape(seg))
     return re.compile("^" + "/".join(parts) + "$")
 
 
 _CHAT_PAIR_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
     (method, _template_to_regex(template)) for method, template in CHAT_PAIR_ALLOWLIST
 )
+_CHAT_PAIR_IMPLEMENTER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template))
+    for method, template in CHAT_PAIR_IMPLEMENTER_ALLOWLIST
+)
 
 
-def chat_pair_route_allowed(method: str, path: str) -> bool:
-    """Whether a chat-pair session may reach ``(method, path)``."""
-    probe = "GET" if method == "HEAD" else method
-    return any(
-        probe == allowed_method and pattern.match(path)
-        for allowed_method, pattern in _CHAT_PAIR_ALLOWED
+def chat_pair_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a chat-pair session may reach ``(method, path)``.
+
+    Intake uses :data:`CHAT_PAIR_ALLOWLIST` unchanged. Implementer uses its
+    own list and, when the path carries ``{task_id}``, requires that segment
+    to equal the bound task. A non-numeric segment is a refusal, not a 500.
+    """
+    kind = (
+        (getattr(identity, "chat_pair_kind", None) or "intake")
+        if identity
+        else "intake"
     )
+    allow = (
+        _CHAT_PAIR_IMPLEMENTER_ALLOWED if kind == "implementer" else _CHAT_PAIR_ALLOWED
+    )
+    bound = getattr(identity, "chat_pair_task_id", None) if identity else None
+    probe = "GET" if method == "HEAD" else method
+    for allowed_method, pattern in allow:
+        if probe != allowed_method:
+            continue
+        matched = pattern.match(path)
+        if not matched:
+            continue
+        captured = matched.groupdict().get("task_id")
+        if kind == "implementer" and captured is not None:
+            try:
+                got = int(captured)
+            except ValueError:
+                return False
+            if bound is None or got != int(bound):
+                return False
+        return True
+    return False
 
 
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
@@ -225,6 +291,8 @@ def _with_auth_source(
         identity.permissions,
         auth_source=auth_source,
         api_key_id=api_key_id,
+        chat_pair_kind=identity.chat_pair_kind,
+        chat_pair_task_id=identity.chat_pair_task_id,
     )
 
 
@@ -453,7 +521,7 @@ def _unauthorized(request: Request) -> Response:
 
 def _chat_pair_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     return identity.auth_source == "chat_pair" and not chat_pair_route_allowed(
-        method, path
+        method, path, identity
     )
 
 

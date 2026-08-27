@@ -730,3 +730,134 @@ async def test_chat_pair_errors_are_actionable(hub, monkeypatch):
         assert detail["next_action"]
         assert detail["next_action"] != generic, f"{reason}: обвязка по умолчанию"
         assert detail.get("hint")
+
+
+# ---------------------------------------------------------------------------
+# #980 kind=implementer — sibling of intake, one open task
+# ---------------------------------------------------------------------------
+
+IMPLEMENTER_PERMS = {"tasks.read", "tasks.update", "tasks.agent_report"}
+
+
+async def _start_implementer(hub, task_id: int):
+    return await hub.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task_id},
+        headers={**hub.human_auth, **_ip()},
+    )
+
+
+async def _implementer_session(hub, task_id: int) -> dict[str, str]:
+    issued = await _start_implementer(hub, task_id)
+    assert issued.status_code == 200, issued.text
+    token = await _redeem(hub, issued.json()["code"])
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_implementer_cannot_reach_another_task(hub):
+    """AC-1: bound to N, a different {task_id} is 403 chat_pair_gate_forbidden."""
+    bound = await _make_task(hub, "bound")
+    other = await _make_task(hub, "other")
+    session = await _implementer_session(hub, bound)
+
+    resp = await hub.client.get(f"/api/tasks/{other}", headers=session)
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["reason"] == "chat_pair_gate_forbidden"
+
+    own = await hub.client.get(f"/api/tasks/{bound}", headers=session)
+    assert own.status_code == 200, own.text
+
+
+@pytest.mark.asyncio
+async def test_implementer_code_not_issued_unless_task_is_open(hub):
+    """AC-2: running/claimed task → 409, no code row."""
+    task_id = await _make_task(hub)
+    started = await hub.client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "plan": "Plan: go", "session_id": "s-980"},
+        headers=hub.agent_auth,
+    )
+    assert started.status_code == 200, started.text
+
+    before = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    resp = await _start_implementer(hub, task_id)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["reason"] == "chat_pair_task_not_open"
+    after = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_implementer_self_revoke_leaves_intake_alive(hub):
+    """AC-3: implementer self-revoke 401s itself; intake whoami stays 200."""
+    task_id = await _make_task(hub)
+    intake = await _session(hub)
+    implementer = await _implementer_session(hub, task_id)
+
+    revoked = await hub.client.post("/api/auth/chat-pair/revoke", headers=implementer)
+    assert revoked.status_code == 200, revoked.text
+
+    dead = await hub.client.get("/api/whoami", headers=implementer)
+    assert dead.status_code == 401, dead.text
+
+    live = await hub.client.get("/api/whoami", headers=intake)
+    assert live.status_code == 200, live.text
+    assert live.json()["role"] == "human"
+
+
+@pytest.mark.asyncio
+async def test_implementer_redeem_spent_code_is_indistinguishable(hub):
+    """AC-4: second redeem of the same code is 401 chat_pair_invalid."""
+    task_id = await _make_task(hub)
+    issued = await _start_implementer(hub, task_id)
+    assert issued.status_code == 200, issued.text
+    code = issued.json()["code"]
+    await _redeem(hub, code)
+
+    again = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert again.status_code == 401, again.text
+    assert again.json()["detail"]["reason"] == "chat_pair_invalid"
+    assert "token" not in again.json()
+
+
+@pytest.mark.asyncio
+async def test_implementer_start_without_cloud_is_503_guessed_redeem_401(hub):
+    """AC-5: missing/inactive cloud → 503 on issue; guessed redeem stays 401."""
+    await hub.db.execute(
+        "UPDATE principals SET status = 'disabled' WHERE username = ?",
+        (config.CHAT_PAIR_AGENT,),
+    )
+    await hub.db.commit()
+    task_id = await _make_task(hub)
+
+    issued = await _start_implementer(hub, task_id)
+    assert issued.status_code == 503, issued.text
+    assert issued.json()["detail"]["reason"] == "chat_pair_agent_missing"
+
+    guessed = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": "ZZZZZZZZ"}, headers=_ip()
+    )
+    assert guessed.status_code == 401, guessed.text
+    assert guessed.json()["detail"]["reason"] == "chat_pair_invalid"
+
+
+@pytest.mark.asyncio
+async def test_intake_start_redeem_unchanged_alongside_implementer(hub):
+    """AC-6: intake still human + CHAT_PAIR_PERMS + create."""
+    task_id = await _make_task(hub)
+    await _implementer_session(hub, task_id)
+    session = await _session(hub)
+
+    who = await hub.client.get("/api/whoami", headers=session)
+    assert who.status_code == 200, who.text
+    body = who.json()
+    assert body["role"] == "human"
+    assert set(body["permissions_summary"]) == CHAT_PAIR_PERMS
+
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "intake still creates"}, headers=session
+    )
+    assert created.status_code in (200, 201), created.text

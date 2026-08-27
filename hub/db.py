@@ -7,7 +7,7 @@ from typing import Any
 
 import aiosqlite
 
-from hub.config import HUB_DB_PATH
+from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
 
@@ -1446,6 +1446,31 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_git_mode",
         "ALTER TABLE tasks ADD COLUMN git_mode TEXT NOT NULL DEFAULT 'hub'",
     ),
+    (
+        # Chat-pair implementer (#980): sibling kind on the same code table.
+        # Intake rows stay kind=intake / bound_task_id NULL.
+        "add_chat_pair_codes_kind",
+        "ALTER TABLE chat_pair_codes ADD COLUMN kind TEXT NOT NULL DEFAULT 'intake'",
+    ),
+    (
+        "add_chat_pair_codes_bound_task_id",
+        "ALTER TABLE chat_pair_codes ADD COLUMN bound_task_id INTEGER "
+        "REFERENCES tasks(id)",
+    ),
+    (
+        "add_chat_pair_sessions_kind",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'intake'",
+    ),
+    (
+        "add_chat_pair_sessions_bound_task_id",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN bound_task_id INTEGER "
+        "REFERENCES tasks(id)",
+    ),
+    (
+        "add_chat_pair_sessions_acting_principal_id",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN acting_principal_id INTEGER "
+        "REFERENCES principals(id)",
+    ),
 ]
 
 
@@ -1783,6 +1808,8 @@ async def get_db() -> aiosqlite.Connection:
     await repair_stale_parent_completions(db)
     if await _table_exists(db, "roles"):
         await seed_system_roles(db)
+    if await _table_exists(db, "principals"):
+        await seed_chat_pair_agent(db)
     if await _table_exists(db, "projects"):
         await seed_default_project(db)
     if await _table_exists(db, "skills"):
@@ -2378,6 +2405,35 @@ async def seed_system_roles(db: aiosqlite.Connection) -> None:
                 "INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES (?, ?)",
                 (role_id, perm),
             )
+    await db.commit()
+
+
+async def seed_chat_pair_agent(db: aiosqlite.Connection) -> None:
+    """Ensure the acting principal for kind=implementer exists (#980).
+
+    Idempotent. Username comes from ``HAIPLANE_CHAT_PAIR_AGENT`` (default
+    ``cloud``). Issue refuses with 503 when this row is missing or not active;
+    seeding here means a stock hub can issue implementer codes.
+    """
+    username = (CHAT_PAIR_AGENT or "cloud").strip() or "cloud"
+    rows = await fetchall(
+        db, "SELECT id FROM principals WHERE username = ?", (username,)
+    )
+    if rows:
+        return
+    cursor = await db.execute(
+        "INSERT INTO principals (kind, username, display_name, notes) "
+        "VALUES ('agent', ?, ?, 'seeded chat-pair implementer')",
+        (username, username),
+    )
+    principal_id = inserted_id(cursor)
+    role_rows = await fetchall(db, "SELECT id FROM roles WHERE slug = 'agent'")
+    if role_rows:
+        await db.execute(
+            "INSERT OR IGNORE INTO principal_roles (principal_id, role_id) "
+            "VALUES (?, ?)",
+            (principal_id, role_rows[0][0]),
+        )
     await db.commit()
 
 
