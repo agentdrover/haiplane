@@ -37,6 +37,7 @@ from hub.models import (
     ChatPairRedeem,
     ChatPairRedeemed,
     ChatPairRevoked,
+    ChatPairStartRequest,
     ChatPairStartView,
     CIRunReportResult,
     CIRunReportSubmit,
@@ -104,10 +105,12 @@ from hub.models import (
 )
 from hub.actionable_errors import (
     agent_create_forbidden_detail,
+    chat_pair_agent_missing_detail,
     chat_pair_auth_required_detail,
     chat_pair_invalid_detail,
     chat_pair_rate_limited_detail,
     chat_pair_run_forbidden_detail,
+    chat_pair_task_not_open_detail,
     human_only_gate_detail,
 )
 from hub.auth import (
@@ -399,13 +402,51 @@ async def _chat_pair_issuer(request: Request) -> int:
     return identity.principal_id
 
 
+async def _chat_pair_start_payload(request: Request) -> ChatPairStartRequest:
+    """Intake stays a body-less POST; implementer sends ``{kind, task_id}``."""
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" not in ctype:
+        return ChatPairStartRequest()
+    try:
+        data = await request.json()
+    except Exception:
+        return ChatPairStartRequest()
+    if not data:
+        return ChatPairStartRequest()
+    return ChatPairStartRequest.model_validate(data)
+
+
 @app.post("/api/auth/chat-pair/start", response_model=ChatPairStartView)
 async def api_chat_pair_start(request: Request) -> ChatPairStartView:
-    """Issue a one-time pairing code for the calling human (#961)."""
+    """Issue a one-time pairing code for the calling human (#961, #980)."""
     _guard_chat_pair_enabled()
     principal_id = await _chat_pair_issuer(request)
+    payload = await _chat_pair_start_payload(request)
+    bound_task_id: int | None = None
+    if payload.kind == "implementer":
+        if payload.task_id is None:
+            raise HTTPException(422, "task_id is required for kind=implementer")
+        task = await repo.get_task(_db(request), payload.task_id)
+        if task is None:
+            raise HTTPException(404, f"Task #{payload.task_id} not found")
+        task_status = str(dict(task).get("status") or "")
+        if task_status != "open":
+            raise HTTPException(
+                409,
+                detail=chat_pair_task_not_open_detail(
+                    task_id=payload.task_id, status=task_status
+                ),
+            )
+        if await chat_pair.get_acting_agent(_db(request)) is None:
+            raise HTTPException(503, detail=chat_pair_agent_missing_detail())
+        bound_task_id = payload.task_id
 
-    code, ttl = await chat_pair.issue_code(_db(request), principal_id)
+    code, ttl = await chat_pair.issue_code(
+        _db(request),
+        principal_id,
+        kind=payload.kind,
+        bound_task_id=bound_task_id,
+    )
     await admin_svc.write_audit(
         _db(request),
         actor_id=principal_id,
@@ -450,9 +491,15 @@ async def api_chat_pair_redeem(
         token=session["token"],
         expires_at=session["expires_at"],
         username=session["username"],
-        role="human",
+        role="agent" if session.get("kind") == "implementer" else "human",
         base_url=hub_base_url(),
-        permissions=sorted(config.CHAT_PAIR_PERMS),
+        permissions=sorted(
+            config.CHAT_PAIR_IMPLEMENTER_PERMS
+            if session.get("kind") == "implementer"
+            else config.CHAT_PAIR_PERMS
+        ),
+        kind=session.get("kind") or "intake",
+        bound_task_id=session.get("bound_task_id"),
     )
 
 
@@ -466,12 +513,21 @@ async def api_chat_pair_revoke(request: Request) -> ChatPairRevoked:
     """
     _guard_chat_pair_enabled()
     identity = current_identity(request)
+    kind = "intake"
+    bound_task_id: int | None = None
     if identity.auth_source == "chat_pair" and identity.principal_id is not None:
         principal_id = identity.principal_id
+        kind = identity.chat_pair_kind or "intake"
+        bound_task_id = identity.chat_pair_task_id
     else:
         principal_id = await _chat_pair_issuer(request)
+        payload = await _chat_pair_start_payload(request)
+        kind = payload.kind
+        bound_task_id = payload.task_id if payload.kind == "implementer" else None
 
-    revoked = await chat_pair.revoke_sessions(_db(request), principal_id)
+    revoked = await chat_pair.revoke_sessions(
+        _db(request), principal_id, kind=kind, bound_task_id=bound_task_id
+    )
     await admin_svc.write_audit(
         _db(request),
         actor_id=principal_id,

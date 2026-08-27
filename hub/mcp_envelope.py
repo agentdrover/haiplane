@@ -97,6 +97,13 @@ def compute_next_action(
         return "Configure hub auth (principals or HAIPLANE_HUB_TOKENS); open mode has no identity to pair."
     if reason == "chat_pair_run_forbidden":
         return "Create the task without run_immediately / auto_review=false, then start it from the hub."
+    if reason == "chat_pair_agent_missing":
+        return (
+            "Create an active agent principal named by HAIPLANE_CHAT_PAIR_AGENT "
+            "(default cloud), then issue the implementer code again."
+        )
+    if reason == "chat_pair_task_not_open":
+        return "Release or approve the task to open, then issue a new implementer code."
     if reason == "forbidden":
         return "This operation is forbidden for the current token; use a human or admin token."
     if reason == "invalid_hierarchy":

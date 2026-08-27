@@ -1045,7 +1045,8 @@ async def test_chat_pair_tables_exist():
         await upgraded.execute("DROP TABLE chat_pair_sessions")
         await upgraded.execute(
             "DELETE FROM _migrations WHERE name LIKE 'create_chat_pair%' "
-            "OR name LIKE 'idx_chat_pair%'"
+            "OR name LIKE 'idx_chat_pair%' "
+            "OR name LIKE 'add_chat_pair%'"
         )
         await upgraded.commit()
 

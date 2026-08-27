@@ -303,6 +303,20 @@ CHAT_PAIR_PERMS: frozenset[str] = frozenset(
     }
 )
 
+# Acting principal for kind=implementer (#980). HAIPLANE_CHAT_PAIR_AGENT.
+CHAT_PAIR_AGENT = env_get("CHAT_PAIR_AGENT", "cloud")
+
+# Deliberately not _AGENT_DEFAULT_PERMS: that set includes tasks.create, which
+# would let a leaked implementer code post new work. No tasks.human_gate —
+# that flag makes is_human True and would reopen human-only routes.
+CHAT_PAIR_IMPLEMENTER_PERMS: frozenset[str] = frozenset(
+    {
+        "tasks.read",
+        "tasks.update",
+        "tasks.agent_report",
+    }
+)
+
 
 class TokenIdentity:
     """Authenticated identity resolved from a token or DB principal.
@@ -320,6 +334,8 @@ class TokenIdentity:
         "permissions",
         "auth_source",
         "api_key_id",
+        "chat_pair_kind",
+        "chat_pair_task_id",
     )
 
     def __init__(
@@ -330,6 +346,8 @@ class TokenIdentity:
         permissions: frozenset[str] | None = None,
         auth_source: str | None = None,
         api_key_id: int | None = None,
+        chat_pair_kind: str | None = None,
+        chat_pair_task_id: int | None = None,
     ) -> None:
         self.username = username
         self.role = role
@@ -337,6 +355,8 @@ class TokenIdentity:
         self.permissions = permissions or frozenset()
         self.auth_source = auth_source
         self.api_key_id = api_key_id
+        self.chat_pair_kind = chat_pair_kind
+        self.chat_pair_task_id = chat_pair_task_id
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"

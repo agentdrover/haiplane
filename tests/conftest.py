@@ -9,7 +9,13 @@ import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from hub.db import _SCHEMA, _migrate, seed_system_roles, _table_exists
+from hub.db import (
+    _SCHEMA,
+    _migrate,
+    seed_system_roles,
+    seed_chat_pair_agent,
+    _table_exists,
+)
 from hub.integrations.noop import (
     NoopDispatch,
     NoopGitHub,
@@ -105,6 +111,8 @@ async def db():
     await _migrate(conn)
     if await _table_exists(conn, "roles"):
         await seed_system_roles(conn)
+    if await _table_exists(conn, "principals"):
+        await seed_chat_pair_agent(conn)
     yield conn
     await conn.close()
 
