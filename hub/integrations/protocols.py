@@ -339,6 +339,13 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[str]: ...
+    async def undelivered_release_range(
+        self,
+        base: str,
+        head: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str] | None: ...
     async def open_release_pr(
         self,
         base: str,
