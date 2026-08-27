@@ -267,8 +267,9 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 |----------|---------------------------|--------------|------------------|
 | **Local clone** | тот же каталог, что открыт в Cursor на ноутбуке | человек/агент в Cursor | после `git push origin task-<id>/<slug>` |
 | **Server workspace** | clone на сервере (например `/opt/haiplane-hub/src`) | headless auto-commit после done **или** ручной push с ноутбука | remote branch после push с любой машины |
+| **Cloud VM** (`git_mode=remote`) | не используется: хаб **не** трогает git на хосте | агент в своём clone (cloud VM) | после `git push origin task-<id>/<slug>` с машины агента |
 
-В обоих случаях каноническое имя branch задачи: `task-<hub-task-id>/<slug>` (slug из title). Поле `branch` в задаче хаба — источник правды для **имени**, не для содержимого коммитов.
+В обоих случаях каноническое имя branch задачи: `task-<hub-task-id>/<slug>` (slug из title). Поле `branch` в задаче хаба — источник правды для **имени**, не для содержимого коммитов. `git_mode=remote` записывает то же имя, но **не** выполняет git на хосте хаба.
 
 ### Старт pair-сессии
 
@@ -302,6 +303,14 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 3. Push с ноутбука — единственный обязательный шаг, чтобы GitHub CI увидел код.
 4. Не полагайтесь на server auto-commit для pair mode, если код пишется только локально.
 
+### Checklist: Cloud VM (`git_mode=remote`)
+
+Когда агент работает в **своём** clone, а хаб не должен трогать git на своём хосте:
+
+1. `hub_pair_start(..., git_mode="remote")` (или CLI `--git-mode remote`) — статус → `running`, в задаче записано каноническое имя `task-<id>/<slug>`. Git на хосте хаба не вызывается ни на старте, ни на submit/done/release, ни на `changes_requested`.
+2. В clone агента создайте ту же ветку от актуального `develop`.
+3. Push с машины агента — единственный шаг, чтобы GitHub CI увидел код.
+
 ### Push / PR (общий порядок)
 
 1. `git fetch origin`
@@ -314,7 +323,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 
 ### MCP для path B
 
-- `hub_pair_start` — старт без dispatch;
+- `hub_pair_start` — старт без dispatch (`git_mode=remote` пропускает git на хосте хаба);
 - `hub_my_context`, `hub_task_update`, `hub_report_done` — работа и отчёт;
 - `hub_start_task` — только path A (headless).
 

@@ -249,6 +249,121 @@ async def test_pair_start_without_dispatch(db: aiosqlite.Connection):
     submit_mock.assert_not_called()
 
 
+async def test_pair_start_remote_skips_host_git(db: aiosqlite.Connection):
+    """#975 AC-1: git_mode=remote records the branch name without git_ops."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    prepare = AsyncMock(side_effect=AssertionError("host git must not run"))
+    checkout = AsyncMock(side_effect=AssertionError("host git must not run"))
+    worktree = AsyncMock(side_effect=AssertionError("host git must not run"))
+    plugins.git_ops.pair_prepare_branch = prepare
+    plugins.git_ops.checkout = checkout
+    plugins.git_ops.pair_prepare_worktree = worktree
+
+    tv = await services.create_task(db, TaskCreate(title="Remote pair"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work in own clone")
+    await db.commit()
+
+    started = await services.pair_start_task(
+        db,
+        tv.id,
+        TaskPairStart(assigned_agent="cloud", git_mode="remote"),
+        caller="cloud",
+    )
+
+    assert started.status.value == "running"
+    assert started.job_id is None
+    assert started.branch == f"task-{tv.id}/remote-pair"
+    assert started.git_mode == "remote"
+    prepare.assert_not_called()
+    checkout.assert_not_called()
+    worktree.assert_not_called()
+
+
+async def test_pair_start_omitted_git_mode_still_prepares_host_branch(
+    db: aiosqlite.Connection,
+):
+    """#975 AC-2: omitted git_mode keeps today's prepare_pair_branch path."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+
+    orig = plugins.git_ops.pair_prepare_branch
+    spy = AsyncMock(side_effect=orig)
+    plugins.git_ops.pair_prepare_branch = spy
+
+    tv = await services.create_task(db, TaskCreate(title="Hub pair"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: laptop clone")
+    await db.commit()
+
+    started = await services.pair_start_task(
+        db, tv.id, TaskPairStart(assigned_agent="dev"), caller="dev"
+    )
+
+    assert started.status.value == "running"
+    assert started.git_mode == "hub"
+    assert started.branch == f"task-{tv.id}/hub-pair"
+    spy.assert_awaited()
+
+
+async def test_remote_submit_done_and_changes_requested_skip_host_git(
+    db: aiosqlite.Connection,
+):
+    """#975 AC-4/AC-5: persisted git_mode=remote skips later host git points."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.models import ReviewVerdict, TaskReviewVerdict, TaskSubmitReview
+
+    tv = await services.create_task(
+        db, TaskCreate(title="Remote later git", auto_review=False)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: remote clone")
+    await db.commit()
+    started = await services.pair_start_task(
+        db,
+        tv.id,
+        TaskPairStart(assigned_agent="cloud", git_mode="remote", plan="Plan: go"),
+        caller="cloud",
+    )
+    assert started.git_mode == "remote"
+
+    restore = AsyncMock(return_value=False)
+    remove = AsyncMock(return_value=None)
+    switch = AsyncMock(return_value=None)
+    worktree = AsyncMock(return_value="")
+    plugins.git_ops.pair_restore_workspace_base = restore
+    plugins.git_ops.pair_remove_worktree = remove
+    plugins.git_ops.pair_switch_to_task_branch = switch
+    plugins.git_ops.pair_prepare_worktree = worktree
+
+    await services.submit_for_review(
+        db, tv.id, TaskSubmitReview(agent="cloud", summary="first pass")
+    )
+    restore.assert_not_called()
+    remove.assert_not_called()
+
+    await services.record_review_verdict(
+        db,
+        tv.id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="1. Fix tests",
+        ),
+    )
+    switch.assert_not_called()
+    worktree.assert_not_called()
+
+    await services.add_update(
+        db, tv.id, TaskUpdateCreate(agent="cloud", kind="done", content="done")
+    )
+    restore.assert_not_called()
+    remove.assert_not_called()
+
+
 async def test_pair_start_uses_caller_when_agent_unset(db: aiosqlite.Connection):
     body = TaskCreate(title="Pair caller")
     tv = await services.create_task(db, body)
