@@ -501,6 +501,16 @@
             <section class="task-sidebar-card task-actions-card">
                 <div class="task-sidebar-title">Task Controls</div>
 
+                {% if implementer_error %}
+                <div class="task-action-note task-action-note--warning">{{ implementer_error }}</div>
+                {% endif %}
+                {% if implementer_code %}
+                <div class="task-action-stack">
+                    <p class="chat-pair-code" style="font-size:1.7rem;letter-spacing:.14em"><strong>{{ implementer_code }}</strong></p>
+                    <p class="muted">Задача #{{ task.id }}. Показывается один раз, действует {{ implementer_ttl_minutes }} мин.</p>
+                </div>
+                {% endif %}
+
                 {% if task.status.value == 'draft' %}
                 <div class="task-action-state">Approval Required</div>
                 {% if approve_error == 'dor_failed' %}
@@ -542,6 +552,10 @@
                     {% else %}
                     <div class="task-action-note">Developer-agent dispatch is not configured on this Hub.</div>
                     {% endif %}
+                </form>
+                <form method="post" action="/tasks/{{ task.id }}/web-implementer-start" class="task-action-stack task-action-stack--separated">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
 
                 {% elif task.status.value == 'needs_info' %}

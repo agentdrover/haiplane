@@ -861,3 +861,96 @@ async def test_intake_start_redeem_unchanged_alongside_implementer(hub):
         "/api/tasks", json={"title": "intake still creates"}, headers=session
     )
     assert created.status_code in (200, 201), created.text
+
+
+# ---------------------------------------------------------------------------
+# #981 button on the open task card
+# ---------------------------------------------------------------------------
+
+
+async def _browser_human(hub) -> None:
+    session_token = await admin_svc.create_browser_session(hub.db, hub.human_id)
+    hub.client.cookies.set(config.HUB_COOKIE_NAME, session_token)
+
+
+@pytest.mark.asyncio
+async def test_open_task_card_issues_implementer_code(hub):
+    """#981 AC-1: Transfer to cloud chat on an open task shows AH- bound to that id."""
+    await _browser_human(hub)
+    task_id = await _make_task(hub)
+
+    page = await hub.client.get(f"/tasks/{task_id}", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    assert "Передать в облачный чат" in page.text
+    csrf = page.cookies.get(CSRF_COOKIE_NAME)
+    assert csrf
+
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    issued = await hub.client.post(
+        f"/tasks/{task_id}/web-implementer-start",
+        data={"csrf_token": csrf},
+        headers={"Accept": "text/html"},
+        follow_redirects=True,
+    )
+    assert issued.status_code == 200, issued.text
+    assert "AH-" in issued.text
+    assert f"#{task_id}" in issued.text or str(task_id) in issued.text
+    rows = await _rows(
+        hub.db,
+        "SELECT kind, bound_task_id FROM chat_pair_codes WHERE redeemed_at IS NULL",
+    )
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "implementer"
+    assert int(rows[0]["bound_task_id"]) == task_id
+
+    without_csrf = await hub.client.post(
+        f"/tasks/{task_id}/web-implementer-start",
+        data={"csrf_token": "wrong"},
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert without_csrf.status_code in (303, 403), without_csrf.text
+    assert "AH-" not in without_csrf.text or without_csrf.status_code != 200
+    assert len(await _rows(hub.db, "SELECT id FROM chat_pair_codes")) == 1
+
+
+@pytest.mark.asyncio
+async def test_running_task_card_does_not_issue_implementer_code(hub):
+    """#981 AC-2: running task — no button, POST is 409 and inserts nothing."""
+    await _browser_human(hub)
+    task_id = await _make_task(hub)
+    started = await hub.client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "plan": "Plan: go", "session_id": "s-981"},
+        headers=hub.agent_auth,
+    )
+    assert started.status_code == 200, started.text
+
+    page = await hub.client.get(f"/tasks/{task_id}", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    assert "Передать в облачный чат" not in page.text
+
+    csrf = page.cookies.get(CSRF_COOKIE_NAME) or "missing"
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    before = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    resp = await hub.client.post(
+        f"/tasks/{task_id}/web-implementer-start",
+        data={"csrf_token": csrf},
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 409, resp.text
+    assert "AH-" not in resp.text
+    after = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_chat_pair_page_copy_stays_intake(hub):
+    """#981 AC-3: /chat-pair still describes intake create/refine, not implementer."""
+    await _browser_human(hub)
+    page = await hub.client.get("/chat-pair", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    assert "постановку и уточнение" in page.text
+    assert "Передать в облачный чат" not in page.text
+    assert "implementer" not in page.text.lower()

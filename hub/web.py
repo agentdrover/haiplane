@@ -38,6 +38,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.integrations.registry import plugins
+from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
 from hub.version import get_app_version
@@ -332,7 +333,7 @@ async def _chat_pair_page(
         rows = await db_module.fetchall(
             _db(request),
             "SELECT COUNT(*) AS n FROM chat_pair_sessions "
-            "WHERE principal_id = ? AND revoked_at IS NULL "
+            "WHERE principal_id = ? AND kind = 'intake' AND revoked_at IS NULL "
             "AND expires_at > datetime('now')",
             (identity.principal_id,),
         )
@@ -391,7 +392,6 @@ async def web_chat_pair_start(request: Request, csrf_token: str = Form(default="
         )
 
     code, ttl = await chat_pair_svc.issue_code(_db(request), identity.principal_id)
-    from hub.services import admin as admin_svc
 
     await admin_svc.write_audit(
         _db(request),
@@ -418,7 +418,6 @@ async def web_chat_pair_revoke(request: Request, csrf_token: str = Form(default=
         return await _chat_pair_page(request, revoked=0)
 
     revoked = await chat_pair_svc.revoke_sessions(_db(request), identity.principal_id)
-    from hub.services import admin as admin_svc
 
     await admin_svc.write_audit(
         _db(request),
@@ -1516,13 +1515,16 @@ async def web_tasks(
     )
 
 
-@router.get("/tasks/{task_id}", response_class=HTMLResponse)
-async def web_task_detail(
-    task_id: int,
+async def _web_task_detail_page(
     request: Request,
-    approve_error: str = Query(""),
-    review_error: str = Query(""),
-):
+    task_id: int,
+    *,
+    approve_error: str = "",
+    review_error: str = "",
+    implementer_code: str = "",
+    implementer_error: str = "",
+    status_code: int = 200,
+) -> HTMLResponse:
     db = _db(request)
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1656,7 +1658,8 @@ async def web_task_detail(
         for row in await repo.list_live_checks(db, task_id)
     ]
 
-    return TEMPLATES.TemplateResponse(
+    csrf_token = generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
         {
@@ -1681,8 +1684,98 @@ async def web_task_detail(
             "dispatch_configured": _dispatch_configured(),
             "approve_error": approve_error,
             "review_error": review_error,
+            "csrf_token": csrf_token,
+            "implementer_code": implementer_code,
+            "implementer_error": implementer_error,
+            "implementer_ttl_minutes": max(1, config.CHAT_PAIR_CODE_SECONDS // 60),
         },
+        status_code=status_code,
     )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
+@router.get("/tasks/{task_id}", response_class=HTMLResponse)
+async def web_task_detail(
+    task_id: int,
+    request: Request,
+    approve_error: str = Query(""),
+    review_error: str = Query(""),
+):
+    return await _web_task_detail_page(
+        request,
+        task_id,
+        approve_error=approve_error,
+        review_error=review_error,
+    )
+
+
+@router.post("/tasks/{task_id}/web-implementer-start", response_class=HTMLResponse)
+async def web_implementer_start(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Issue an implementer pairing code from an open task card (#981)."""
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=(
+                "Код выдаётся принципалу хаба; вход по env-токену для этого не подходит."
+            ),
+        )
+
+    row = await repo.get_task(_db(request), task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task_status = str(dict(row).get("status") or "")
+    if task_status != "open":
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=(
+                f"Код для облачного чата выдаётся только open-задачам; #{task_id} — {task_status}."
+            ),
+            status_code=409,
+        )
+    if await chat_pair_svc.get_acting_agent(_db(request)) is None:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Нет активного агента cloud для implementer-сессии.",
+            status_code=503,
+        )
+
+    code, ttl = await chat_pair_svc.issue_code(
+        _db(request),
+        identity.principal_id,
+        kind="implementer",
+        bound_task_id=task_id,
+    )
+    await admin_svc.write_audit(
+        _db(request),
+        actor_id=identity.principal_id,
+        action="chat_pair_start",
+        target_type="chat_pair",
+        target_id=str(identity.principal_id),
+        summary=f"implementer pairing code issued from task #{task_id} card, valid {ttl}s",
+    )
+    return await _web_task_detail_page(request, task_id, implementer_code=code)
 
 
 @router.get("/tasks/{task_id}/diff", response_class=HTMLResponse)
