@@ -2073,6 +2073,27 @@ async def test_hub_submit_for_review(
     )
 
 
+async def test_hub_submit_for_review_forwards_lifecycle_hint(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#975 AC-6: MCP must print the no-PR note, not a silent success."""
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 1,
+        "lifecycle_hint": (
+            "diff/PR для ветки task-42/x открыть не удалось: "
+            "у проекта нет origin/repo (placeholder workspace)."
+        ),
+    }
+    out = await hub_submit_for_review(42)
+    payload = json.loads(out)
+    assert "submitted for review" in payload["message"]
+    assert "diff/PR" in payload["message"]
+    assert "открыть не удалось" in payload["message"]
+
+
 async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
     mock_api_get.return_value = {
         "task_id": 42,

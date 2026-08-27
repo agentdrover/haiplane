@@ -364,6 +364,62 @@ async def test_remote_submit_done_and_changes_requested_skip_host_git(
     remove.assert_not_called()
 
 
+async def test_remote_submit_names_missing_pr_on_placeholder_workspace(
+    db: aiosqlite.Connection,
+):
+    """#975 AC-6: remote submit must not look like silent success without repo/gh_repo."""
+    tv = await services.create_task(
+        db, TaskCreate(title="Remote placeholder", auto_review=False)
+    )
+    await repo.add_task_update(db, tv.id, "cloud", "status", "Plan: own clone")
+    await db.commit()
+    await services.pair_start_task(
+        db,
+        tv.id,
+        TaskPairStart(assigned_agent="cloud", git_mode="remote"),
+        caller="cloud",
+    )
+
+    view = await services.submit_for_review(
+        db, tv.id, TaskSubmitReview(agent="cloud", summary="pushed to origin")
+    )
+
+    assert view.status.value == "review"
+    hint = view.lifecycle_hint or ""
+    assert "diff/PR" in hint
+    assert "открыть не удалось" in hint
+    alerts = [
+        u["content"]
+        for u in await repo.get_task_updates(db, tv.id)
+        if u["kind"] == "alert"
+    ]
+    assert any(
+        "diff/PR" in (c or "") and "открыть не удалось" in (c or "") for c in alerts
+    )
+
+
+async def test_hub_submit_on_placeholder_stays_silent_about_missing_origin(
+    db: aiosqlite.Connection,
+):
+    """#498: laptop git_mode=hub still treats 'could not look' as not an accusation."""
+    tv = await services.create_task(
+        db, TaskCreate(title="Hub placeholder", auto_review=False)
+    )
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: laptop clone")
+    await db.commit()
+    await services.pair_start_task(
+        db, tv.id, TaskPairStart(assigned_agent="dev"), caller="dev"
+    )
+
+    view = await services.submit_for_review(
+        db, tv.id, TaskSubmitReview(agent="dev", summary="no gh_repo")
+    )
+
+    assert view.status.value == "review"
+    hint = view.lifecycle_hint or ""
+    assert "diff/PR" not in hint
+
+
 async def test_pair_start_uses_caller_when_agent_unset(db: aiosqlite.Connection):
     body = TaskCreate(title="Pair caller")
     tv = await services.create_task(db, body)

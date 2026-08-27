@@ -310,6 +310,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 1. `hub_pair_start(..., git_mode="remote")` (или CLI `--git-mode remote`) — статус → `running`, в задаче записано каноническое имя `task-<id>/<slug>`. Git на хосте хаба не вызывается ни на старте, ни на submit/done/release, ни на `changes_requested`.
 2. В clone агента создайте ту же ветку от актуального `develop`.
 3. Push с машины агента — единственный шаг, чтобы GitHub CI увидел код.
+4. Если у проекта нет `repo`/`gh_repo` (placeholder), `hub_submit_for_review` всё равно принимает сдачу, но в ответе явно пишет, что diff/PR открыть не удалось — не молчаливый успех.
 
 ### Push / PR (общий порядок)
 

@@ -1500,6 +1500,8 @@ async def hub_submit_for_review(
             "не сочиняйте свой — поле verdict несёт вердикт прошлой "
             f"генерации и на пересдачу не меняется): {json.dumps(baseline)}"
         )
+    if task.get("lifecycle_hint"):
+        message += f"\nLifecycle: {task['lifecycle_hint']}"
     return await _task_mutation_response(
         task_id,
         message,

@@ -1855,6 +1855,27 @@ async def submit_for_review(
             )
             pr_opened_by_hub = bool(discovered_pr)
 
+    # #975 AC-6: remote pair-start never has a hub-host diff, so None/[] is
+    # the normal observation — not the #498 "could not look, stay silent"
+    # case. A placeholder project (no gh_repo) cannot open a PR either.
+    # Name that on the submit response; do not look like empty success.
+    if (
+        _git_mode_is_remote(task)
+        and not task.get("pr_number")
+        and not discovered_pr
+        and not pr_ensure_note
+        and canonical
+    ):
+        from hub.services.orchestration import project_git_context as _git_ctx
+
+        remote_ctx = await _git_ctx(db, task_id)
+        if not (remote_ctx.get("gh_repo") or "").strip():
+            pr_ensure_note = (
+                f"diff/PR для ветки {canonical} открыть не удалось: "
+                "у проекта нет origin/repo (placeholder workspace). "
+                "git_mode=remote — хаб не читает clone на своём хосте."
+            )
+
     async with get_write_lock(db):
         if not await repo.transition_status_if(
             db, task_id, expected_from="running", new_status="review"
@@ -2042,6 +2063,14 @@ async def submit_for_review(
             f"{view.lifecycle_hint}\n{stacking['message']}"
             if view.lifecycle_hint
             else stacking["message"]
+        )
+    if pr_ensure_note:
+        # Agent-facing copy of the feed alert: MCP/REST must not look like
+        # a silent success when the PR could not be made (#975 AC-6, #967).
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{pr_ensure_note}"
+            if view.lifecycle_hint
+            else pr_ensure_note
         )
     # #836: hand back the baseline for waiting on THIS submission's verdict.
     # A snapshot of the current values, never of the desired ones: a baseline
