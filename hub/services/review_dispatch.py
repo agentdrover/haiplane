@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -39,11 +40,18 @@ log = logging.getLogger(__name__)
 
 # Real ids from GET /v1/models (checked live 2026-08-20). Order = preference;
 # the first whose family differs from the implementer's wins.
+#
+# Narrowed to the subscription on 2026-08-28 (#1036). Everything outside it
+# refuses at creation with HTTP 400 usage_limit_exceeded ("Background Agent
+# requires at least $2 remaining until your hard limit"), so gpt-5.3-codex,
+# gemini-3.1-pro and claude-sonnet-5 were not fallbacks at all — they were a
+# guaranteed failure the moment an implementer outside the claude family made
+# the diversity rule reach for the second entry. Checked live against
+# GET /v1/models and by launching each.
 _REVIEW_MODEL_PREFERENCES: tuple[str, ...] = (
     "grok-4.6",
-    "gpt-5.3-codex",
-    "gemini-3.1-pro",
-    "claude-sonnet-5",
+    "grok-4.5",
+    "composer-2.5",
 )
 
 _TERMINAL_RUN_STATUSES = {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}
@@ -701,6 +709,33 @@ async def collect_review_rules(
     return header + "".join(body), note
 
 
+# The text-delivery contract (#1036). Named fence, JSON inside, last block in
+# the answer wins — a model that quotes the format while explaining itself must
+# not be able to shadow its own report with the example.
+REPORT_FENCE = "haiplane-review"
+REPORT_BLOCK_INSTRUCTION = (
+    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+    "1) Если инструменты хаба тебе доступны — сдай hub_submit_machine_review, "
+    "это основной путь.\n"
+    "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
+    f"```{REPORT_FENCE}\n"
+    '{"raw_count": <число находок до проверки>, "incomplete": true|false, '
+    '"findings_confirmed": [{"title": "...", "severity": "high|medium|low", '
+    '"category": "...", "locator": "lines|file|none", "file": "путь", '
+    '"start_line": 1, "detail": "..."}], '
+    '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
+    '"unresolved": [{"title": "...", "why": "..."}], '
+    '"lost_dimensions": ["..."], "harness_skill": "...", '
+    '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
+    "```\n"
+    "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
+    "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
+    "никто не смог рассудить, идёт в unresolved, а НЕ в findings_rejected. "
+    "Если инструменты хаба недоступны — этот блок единственный способ "
+    "доставить работу, и без него прогон пропадёт целиком."
+)
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -723,6 +758,12 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1036: the report has to survive a run with no MCP. Since 22.08 the
+        # hub's MCP stopped reaching cloud runs at all — the reviewer works,
+        # finishes, and its findings die in the final text nobody parses. So
+        # the text becomes a second, weaker delivery: same fields, stated
+        # once, at the very end, where a machine can find them.
+        f"{REPORT_BLOCK_INSTRUCTION}\n\n"
     )
     if profile == LITE:
         # No token ceiling is stated (#893). It used to say "бюджет 40000
@@ -1203,6 +1244,106 @@ async def _stamp_dispatch_usage(
     return total
 
 
+def parse_report_block(text: str | None) -> Any | None:
+    """The report a run left in its own text, or None (#1036).
+
+    Returns a validated ``MachineReviewSubmit``. None means the text carried
+    no usable report — no fence, no JSON, or fields the contract refuses. The
+    caller must treat that as "no report", never as an empty one: inventing
+    structure out of prose is exactly how "could not read" turns into "read
+    and clean", which is the failure this whole area keeps circling.
+
+    The LAST block wins. A model explaining itself may quote the format on the
+    way, and the example must not be able to shadow the real answer.
+    """
+    if not text:
+        return None
+    from hub.models import MachineReviewSubmit
+
+    blocks = re.findall(
+        rf"```{re.escape(REPORT_FENCE)}\s*(.*?)```", text, flags=re.DOTALL
+    )
+    for raw in reversed(blocks):
+        try:
+            payload = json.loads(raw.strip())
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return MachineReviewSubmit(**payload)
+        except Exception:  # noqa: BLE001 - a refused report is simply not one
+            log.warning("run text carried a report the contract refused")
+            continue
+    return None
+
+
+async def _recover_report_from_run(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
+) -> bool:
+    """Record the report a finished run left in its text. True when stored.
+
+    The path exists because the contract path stopped working: Cursor no
+    longer delivers the hub's MCP into a cloud run, so since 22.08 reviewers
+    finish their work and leave it in ``result`` — measured, paid for, and
+    unread. The transcription is deliberately narrow.
+
+    * It runs only after the grace window, so a report still on its way
+      through MCP always wins (that path is checked first, above).
+    * The stored row belongs to the dispatch's OWN reviewer principal.
+      Anything else and the report would read as foreign to its own dispatch,
+      which is the defect #1025 closed.
+    * Its origin is recorded in the data, because a report typed into a text
+      field cannot be checked the way a submitted one can.
+    * No block, or a block the contract refuses, stores NOTHING. The text is
+      kept in the feed as prose and the dispatch fails as before.
+    """
+    report = parse_report_block(run.get("result"))
+    task_id = int(dispatch["task_id"])
+    if report is None:
+        tail = (run.get("result") or "").strip()
+        if tail:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                "Прогон ревью завершился без отчёта по контракту, а в тексте "
+                "рана нет разбираемого блока — структура НЕ восстанавливается "
+                "по прозе. Текст сохранён как есть, находки из него никем не "
+                f"подтверждены (#1036):\n\n{tail[:4000]}",
+            )
+        return False
+    from hub.services.machine_review_intake import (
+        ORIGIN_RUN_TEXT,
+        record_machine_review,
+    )
+
+    try:
+        await record_machine_review(
+            db,
+            task_id,
+            report,
+            principal_id=dispatch.get("reviewer_principal_id"),
+            username=(dispatch.get("model") or "cursor-cloud-reviewer"),
+            origin=ORIGIN_RUN_TEXT,
+        )
+    except Exception:  # noqa: BLE001 - the sweep must survive a bad report
+        log.exception("could not record the report recovered for task #%s", task_id)
+        return False
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Отчёт ревью восстановлен из текста прогона: MCP до рана не дошёл, и "
+        f"агент {dispatch['agent_id']} ({dispatch['model']}) оставил отчёт "
+        "блоком в ответе. Он записан с пометкой происхождения — это слабее "
+        "отчёта, сданного по контракту: прогон писал его о себе сам (#1036).",
+    )
+    return True
+
+
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     """Poller pass over active dispatches: settle finished runs.
 
@@ -1263,6 +1404,10 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         if not grace_rows:
             continue
         await _stamp_dispatch_usage(db, dispatch)
+        if await _recover_report_from_run(db, dispatch, run):
+            await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+            await db.commit()
+            continue
         await repo.add_task_update(
             db,
             task_id,
