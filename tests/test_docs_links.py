@@ -72,3 +72,39 @@ def test_no_links_to_removed_internal_docs():
         text = path.read_text(encoding="utf-8")
         for needle in removed:
             assert needle not in text, f"{path} still points at removed {needle}"
+
+
+def test_implementer_allowlist_stays_pinned():
+    """#1004: the deleted SDD used to hold this list; the test outlives it.
+
+    ``CHAT_PAIR_IMPLEMENTER_ALLOWLIST`` is what a restricted implementer
+    session may call, so a route arriving there silently is exactly the
+    change nobody should be able to make in passing. The per-task SDD that
+    used to pin it left the public repository with the rest of the working
+    papers, and for a few minutes this surface had no guard at all. Pinning
+    it here costs one deliberate edit per intended change and refuses the
+    accidental one.
+    """
+    from hub.auth import CHAT_PAIR_IMPLEMENTER_ALLOWLIST
+
+    assert set(CHAT_PAIR_IMPLEMENTER_ALLOWLIST) == {
+        ("GET", "/api/whoami"),
+        ("GET", "/api/diagnostics/identity"),
+        ("GET", "/api/tasks/{task_id}"),
+        ("GET", "/api/tasks/{task_id}/tree"),
+        ("GET", "/api/tasks/{task_id}/context"),
+        ("GET", "/api/tasks/{task_id}/readiness"),
+        ("GET", "/api/tasks/{task_id}/review-brief"),
+        ("GET", "/api/tasks/{task_id}/acceptance_criteria"),
+        ("GET", "/api/tasks/{task_id}/updates"),
+        ("POST", "/api/tasks/{task_id}/updates"),
+        ("POST", "/api/tasks/{task_id}/question"),
+        ("POST", "/api/tasks/{task_id}/claim"),
+        ("POST", "/api/tasks/{task_id}/pair-start"),
+        ("POST", "/api/tasks/{task_id}/submit-review"),
+        ("POST", "/api/tasks/{task_id}/declare-wait"),
+        ("POST", "/api/sessions/register"),
+        ("POST", "/api/sessions/{session_id}/heartbeat"),
+        ("POST", "/api/auth/chat-pair/redeem"),
+        ("POST", "/api/auth/chat-pair/revoke"),
+    }
