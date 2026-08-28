@@ -204,15 +204,37 @@ async def _sweep_running_dispatch(db) -> None:
                 await services.maybe_destroy_vast(db, task)
                 continue
             if not has_done and job_status == "completed":
+                # #1018: the log's last long passage is KEPT, because a person
+                # reading the inbox wants it — but it no longer counts as the
+                # agent saying "done". The passage is chosen by LENGTH, and
+                # length cannot tell a report of finished work from a thought
+                # about what to do next; an agent that died mid-task or hit a
+                # limit used to "report" its last reasoning, and that opened
+                # the whole git tail — commit, squash, push, create_pr — plus a
+                # reviewer run of up to 300k tokens over code nobody finished.
+                #
+                # has_done stays False on purpose: the task goes to
+                # pending_report, the status that exists for exactly this — a
+                # human decides whether the work is done.
                 summary = _extract_agent_summary(
                     plugins.dispatch.job_log_full(task["job_id"])
                 )
                 if summary:
-                    await repo.add_task_update(db, task["id"], "agent", "done", summary)
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "agent",
+                        "done",
+                        "Отчёт НЕ заявлен агентом — это последний длинный "
+                        "фрагмент лога прогона, сохранённый хабом. Прав "
+                        "отчёта у него нет: конвейер не открыт, решение за "
+                        "человеком (#1018).\n\n" + summary,
+                        agent_claimed=False,
+                    )
                     await db.commit()
-                    has_done = True
                     log.info(
-                        "Poll: task #%d — synthetic done from dispatch log",
+                        "Poll: task #%d — log passage kept, NOT taken as a done "
+                        "report (#1018)",
                         task["id"],
                     )
             next_status = await services.transition_after_agent_done(
