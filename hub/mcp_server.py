@@ -26,6 +26,7 @@ from hub.mcp_envelope import (
     format_echo_response,
     merge_mutation_response,
 )
+from hub.models import AWAITING_HUMAN_STATUSES, FINAL_STATUSES
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
@@ -1097,6 +1098,97 @@ def _context_char_budget(max_chars: int | None, mode: str) -> int | None:
     return 4000 if mode == "summary" else None
 
 
+# How far the claimed walk goes before it stops and says so (#987).
+#
+# The filter alone was not enough, and prod is why: `claimed_by` survives
+# completion, so the holder of this hub carried 151 completed rows against two
+# live ones, and a single 50-row window held 48 finals — bottoming out at an id
+# far above the oldest running task. Filtering that window turns a noisy digest
+# into an empty one, which reads as "nothing to do" instead of "I only looked
+# at the newest fifty". So the walk pages until the holder's non-final work is
+# actually found, and when it hits the cap it prints that rather than implying
+# it saw everything.
+_CLAIMED_PAGE_LIMIT = 50
+_CLAIMED_MAX_PAGES = 5
+
+_FINAL_STATUS_VALUES = frozenset(s.value for s in FINAL_STATUSES)
+_AWAITING_HUMAN_VALUES = frozenset(s.value for s in AWAITING_HUMAN_STATUSES)
+
+
+async def _claimed_non_final(username: str) -> tuple[list[dict[str, Any]], bool]:
+    """The holder's live claimed rows, and whether the walk hit its cap.
+
+    Compact cards on every page, never full ones: the digest names id, title
+    and status, and a full card of this hub weighs about 10 KB. Fetching those
+    only to drop the finals would move the cost to the server instead of
+    removing it (#834).
+    """
+    kept: list[dict[str, Any]] = []
+    cursor: int | None = 0
+    for _ in range(_CLAIMED_MAX_PAGES):
+        query = (
+            f"/api/tasks?claimed_by={urllib.parse.quote(username)}"
+            f"&limit={_CLAIMED_PAGE_LIMIT}&mode=summary&after_id={cursor}"
+        )
+        try:
+            page = await _api_get(query)
+        except HubApiError:
+            return kept, False
+        rows = page.get("tasks", []) if isinstance(page, dict) else (page or [])
+        kept.extend(r for r in rows if r.get("status") not in _FINAL_STATUS_VALUES)
+        cursor = page.get("next_cursor") if isinstance(page, dict) else None
+        if not cursor:
+            return kept, False
+    return kept, True
+
+
+async def _headless_review_ids(username: str, rows: list[dict[str, Any]]) -> set[int]:
+    """Ids among ``rows`` whose review is owned by the poller, not a person.
+
+    ``review`` is an awaiting-human status by membership, with the exclusion
+    living in the query: a review carrying ``review_job_id`` is headless and
+    the agent is still on the hook. The compact card does not carry that field,
+    so it is resolved with one extra status-filtered call — and only when the
+    slice actually holds a review row, which is usually never.
+    """
+    if not any(r.get("status") == "review" for r in rows):
+        return set()
+    try:
+        page = await _api_get(
+            f"/api/tasks?claimed_by={urllib.parse.quote(username)}"
+            f"&status=review&limit={_CLAIMED_PAGE_LIMIT}"
+        )
+    except HubApiError:
+        return set()
+    full = page.get("tasks", []) if isinstance(page, dict) else (page or [])
+    return {int(t["id"]) for t in full if t.get("review_job_id")}
+
+
+def _split_in_flight_and_waiting(
+    rows: list[dict[str, Any]], headless_review: set[int]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Mine vs theirs: what I move next against what a human moves next."""
+    in_flight: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    for row in rows:
+        status = row.get("status")
+        awaits_human = status in _AWAITING_HUMAN_VALUES and not (
+            status == "review" and int(row.get("id") or 0) in headless_review
+        )
+        (waiting if awaits_human else in_flight).append(row)
+    return in_flight, waiting
+
+
+def _claimed_line(label: str, rows: list[dict[str, Any]]) -> str:
+    """One digest line, saying out loud when it stopped short (#519/#810)."""
+    shown = [
+        f"#{r.get('id')} {r.get('title', '')} ({r.get('status', '?')})"
+        for r in rows[:20]
+    ]
+    more = f" ({len(shown)} of {len(rows)} shown)" if len(rows) > len(shown) else ""
+    return f"{label}{more}: " + "; ".join(shown)
+
+
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
@@ -1118,20 +1210,13 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         except HubApiError:
             identity = {}
     username = (identity.get("username") or "").strip()
+    in_flight: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    walk_capped = False
     if username:
-        # A capped call asks for compact cards at the source (#834): a full
-        # card of this hub weighs about 10 KB, and the digest below names only
-        # id, title and status. Fetching 50 full ones to then drop 47 would
-        # move the cost from the client to the server, not remove it.
-        query = f"/api/tasks?claimed_by={urllib.parse.quote(username)}&limit=50"
-        if budget is not None:
-            query += "&mode=summary"
-        try:
-            my_tasks = await _api_get(query)
-        except HubApiError:
-            my_tasks = []
-        if isinstance(my_tasks, dict):  # paginated envelope shape
-            my_tasks = my_tasks.get("tasks", [])
+        my_tasks, walk_capped = await _claimed_non_final(username)
+        headless = await _headless_review_ids(username, my_tasks)
+        in_flight, waiting = _split_in_flight_and_waiting(my_tasks, headless)
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
@@ -1153,21 +1238,30 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             else " — single shared working tree (branch switching)"
         )
     )
-    if my_tasks:
-        task_strs = [
-            f"#{t.get('id')} {t.get('title', '')} ({t.get('status', '?')})"
-            for t in my_tasks[:20]
-        ]
-        # The digest has always stopped at 20 and never said so (#519/#810):
-        # a list that ends without a word reads as the whole list.
-        shown = (
-            f" ({len(task_strs)} of {len(my_tasks)} shown)"
-            if len(my_tasks) > len(task_strs)
-            else ""
+    # Work to do, not a holder history. `claimed_by` survives completion, so
+    # the unfiltered list answered "what have I ever held" while calling itself
+    # "your claimed tasks" — and on this hub that is 151 completed rows against
+    # two live ones. In flight is what I move next; Waiting is what a human
+    # moves next (#987).
+    if in_flight:
+        lines.append(_claimed_line("In flight", in_flight))
+    if waiting:
+        lines.append(_claimed_line("Waiting on a human", waiting))
+    if not in_flight and not waiting:
+        lines.append(
+            "Your claimed tasks: none live"
+            + (
+                f" in the newest {_CLAIMED_PAGE_LIMIT * _CLAIMED_MAX_PAGES} claimed rows"
+                if walk_capped
+                else ""
+            )
+            + " (completed ones stay in hub_list_tasks with claimed_by + status)"
         )
-        lines.append(f"Your claimed tasks{shown}: " + "; ".join(task_strs))
-    else:
-        lines.append("Your claimed tasks: none")
+    elif walk_capped:
+        lines.append(
+            f"Note: stopped after {_CLAIMED_MAX_PAGES} pages of claimed rows — "
+            "older live work, if any, is not listed."
+        )
     lines.append("")
     lines.extend(lifecycle_map_lines())
 
