@@ -2211,13 +2211,23 @@ async def transition_after_agent_done(
         # gate is untouched either way: skipping it here would let anything
         # uncommitted complete itself, which is a worse defect than the one
         # being fixed.
+        # TWO sources decide this, not one. The tail below starts with
+        # auto_commit, which exists precisely because the work may still be
+        # sitting UNCOMMITTED in the working tree — asking only about commits
+        # would call that work "nothing to deliver" and skip the commit that
+        # would have delivered it. So: uncommitted changes count as work, and
+        # only when the tree is clean does the branch-vs-base comparison get
+        # to answer.
         # The base default belongs to git_ops (_resolve_base, #362 I4) — an
         # empty base is passed through, never recomputed here.
-        base_ref = (ctx.get("base_branch") or "").strip()
-        differs = await plugins.git_ops.content_differs(
-            base_ref, branch, repo=workspace, gh_repo=ctx.get("gh_repo")
-        )
-        nothing_to_deliver = differs is False
+        nothing_to_deliver = False
+        dirty_now = await plugins.git_ops.dirty_paths(repo=workspace)
+        if not dirty_now:
+            base_ref = (ctx.get("base_branch") or "").strip()
+            differs = await plugins.git_ops.content_differs(
+                base_ref, branch, repo=workspace, gh_repo=ctx.get("gh_repo")
+            )
+            nothing_to_deliver = differs is False
         if nothing_to_deliver:
             await repo.add_task_update(
                 db,

@@ -5501,3 +5501,39 @@ async def test_unreadable_diff_still_needs_a_human(
     assert row["status"] == "ci_check", (
         "an unanswerable question keeps the existing path, it does not skip the gate"
     )
+
+
+async def test_uncommitted_work_is_not_nothing_to_deliver(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # #991, caught while preparing the review harness: the check sits BEFORE
+    # auto_commit, and auto_commit is the step that exists for work still
+    # sitting uncommitted in the tree. Asking only about commits would call
+    # that "nothing to deliver" and skip the very commit that delivers it —
+    # the fix would then strand exactly the work the conveyor is built to
+    # carry. A dirty tree is work, whatever the commit graph says.
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "dirty_paths",
+        AsyncMock(return_value=["hub/services/thing.py"]),
+        raising=False,
+    )
+    differs = AsyncMock(return_value=False)
+    monkeypatch.setattr(plugins.git_ops, "content_differs", differs, raising=False)
+    task_id = await _pair_task_ready_for_done(db, "Uncommitted work")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Done, not committed"),
+    )
+
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check", (
+        "uncommitted work must still be committed and delivered, not skipped"
+    )
+    assert not differs.called, (
+        "a dirty tree settles the question — no need to ask git about commits"
+    )
