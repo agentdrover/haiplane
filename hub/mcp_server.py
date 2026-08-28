@@ -759,6 +759,8 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         f"Review: {'enabled' if task.get('auto_review', True) else 'disabled'}, cycle {task.get('review_cycle', 0)}",
         f"Created: {task['created_at']}",
     ]
+    if task.get("worktree_path"):
+        parts.append(f"Worktree: {task['worktree_path']}")
     parts.extend(_dependency_lines(task))
     if task.get("description"):
         parts.append(f"\nDescription:\n{task['description']}")
@@ -1209,12 +1211,34 @@ _WALK_NOTE = {
 
 def _claimed_line(label: str, rows: list[dict[str, Any]]) -> str:
     """One digest line, saying out loud when it stopped short (#519/#810)."""
-    shown = [
-        f"#{r.get('id')} {r.get('title', '')} ({r.get('status', '?')})"
-        for r in rows[:20]
-    ]
+    shown = []
+    for r in rows[:20]:
+        bit = f"#{r.get('id')} {r.get('title', '')} ({r.get('status', '?')})"
+        path = (r.get("worktree_path") or "").strip()
+        if path:
+            bit += f" @ {path}"
+        shown.append(bit)
     more = f" ({len(shown)} of {len(rows)} shown)" if len(rows) > len(shown) else ""
     return f"{label}{more}: " + "; ".join(shown)
+
+
+async def _attach_live_worktree_paths(rows: list[dict[str, Any]]) -> None:
+    """Name a live pair worktree next to a digest row without inventing one (#989).
+
+    Compact list cards do not carry ``worktree_path`` (and must not start).
+    One GET per live row is the cost of echoing a path that actually exists.
+    """
+    for row in rows:
+        tid = row.get("id")
+        if not tid:
+            continue
+        try:
+            full = await _api_get(f"/api/tasks/{tid}")
+        except HubApiError:
+            continue
+        path = (full or {}).get("worktree_path") or ""
+        if path:
+            row["worktree_path"] = path
 
 
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
@@ -1247,6 +1271,13 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         headless, headless_known = await _headless_review_ids(username, my_tasks)
         in_flight, waiting = _split_in_flight_and_waiting(my_tasks, headless)
 
+    workspace_mode = identity.get("workspace_mode") or "legacy"
+    if workspace_mode == "worktree" and (in_flight or waiting):
+        # Summary cards omit the path on purpose (#834/#989). Fetch the
+        # full GET only for the rows the digest will name (capped at 20).
+        await _attach_live_worktree_paths(in_flight[:20])
+        await _attach_live_worktree_paths(waiting[:20])
+
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
     if identity:
@@ -1257,7 +1288,6 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         )
     else:
         lines.append("Identity: unavailable")
-    workspace_mode = identity.get("workspace_mode") or "legacy"
     lines.append(
         f"Workspace mode: {workspace_mode}"
         + (
@@ -2549,6 +2579,13 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    rd = data.get("review_dispatches") or {}
+    lines.append(
+        "Wasted dispatch spend (no report): "
+        f"{rd.get('wasted_provider_tokens_total', 0)} tokens across "
+        f"{rd.get('wasted_dispatches', 0)} failed run(s); "
+        f"{rd.get('unknown_usage', 0)} closed run(s) with unknown usage"
+    )
     # #877: the rate travels with its sample, and an unjudged window says so
     # rather than printing a zero that reads as "nothing was real".
     disp = mr.get("dispositions") or {}

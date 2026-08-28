@@ -19,6 +19,7 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
+from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
 from hub.services.project_policy import (
     base_branch_of,
@@ -470,6 +471,10 @@ async def practice_metrics(
     90-day window that read "103 reviews" on 2026-08-21 keeps 103 as
     ``reports_total``, with at least the 60 rows of the v7 batch moving to
     ``no_data_reports``.
+
+    ``review_dispatches`` is a sibling (#1026): the provider bill of runs
+    that closed without a report. It is never folded into
+    ``tokens_per_confirmed`` / ``provider_tokens_per_confirmed``.
     """
     import statistics
 
@@ -727,10 +732,12 @@ async def practice_metrics(
 
     human_gates = await _human_gate_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
+    review_dispatches = await _review_dispatch_spend_metrics(db, since)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
+        "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,
         "by_reviewer_model": dispositions["by_model"],
@@ -741,6 +748,45 @@ async def practice_metrics(
         "human_gates": human_gates,
         "review_outcomes": review_outcomes,
     }
+
+
+async def _review_dispatch_spend_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """What dispatched runs billed, including those that never reported (#1026).
+
+    Wasted spend is the provider bill of *failed* dispatches — the channel
+    closed without a report of its own. It stays a sibling of
+    ``machine_reviews`` so it cannot inflate ``tokens_per_confirmed`` or
+    ``provider_tokens_per_confirmed`` (#516: numerator and denominator from
+    the same rows). NULL is "never asked or the API did not answer"; 0 is a
+    billed zero. Unknown rows are counted, never collapsed into the sum.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN provider_tokens ELSE 0 END), 0) "
+        "AS wasted_provider_tokens_total, "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) "
+        "AS wasted_dispatches, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "AND provider_tokens IS NULL THEN 1 ELSE 0 END), 0) "
+        "AS unknown_usage, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
+        "FROM review_dispatches WHERE created_at >= datetime('now', ?)",
+        (since,),
+    )
+    if not rows:
+        return {
+            "wasted_provider_tokens_total": 0,
+            "wasted_dispatches": 0,
+            "unknown_usage": 0,
+            "closed_dispatches": 0,
+        }
+    return dict(rows[0])
 
 
 async def _escaped_defect_metrics(
@@ -1416,6 +1462,63 @@ async def pair_worktree_info(
     local_kw, _ = _split_git_kwargs(ctx)
     path = plugins.git_ops.worktree_path(task_id, local_kw.get("repo"))
     return "worktree", path or ""
+
+
+async def live_pair_worktree_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> tuple[str, str]:
+    """(workspace_mode, worktree_path) only when the pair tree still exists (#989).
+
+    ``pair_worktree_info`` is deterministic and does not check git. GET
+    surfaces must not name a directory that ``submit_for_review`` already
+    removed, or one that headless ``start_task`` never created.
+    """
+    mode, path = await pair_worktree_info(db, task_id)
+    if not path:
+        return mode, ""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    if await plugins.git_ops.worktree_is_registered(path, local_kw.get("repo")):
+        return mode, path
+    return mode, ""
+
+
+async def apply_live_worktree(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> TaskView:
+    """Fill ``worktree_path`` on a GET view when the pair tree is registered."""
+    if task_view.git_mode == PairGitMode.remote:
+        return task_view
+    mode, path = await live_pair_worktree_info(db, task_view.id)
+    if path:
+        task_view.workspace_mode = mode
+        task_view.worktree_path = path
+    return task_view
+
+
+async def worktree_session_advisory(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> str:
+    """One digest line when claim session.workspace disagrees with the tree.
+
+    Advisory only — never a 409. Empty workspace or a matching path is silence.
+    """
+    path = (task_view.worktree_path or "").strip()
+    session_id = (task_view.claim_session_id or "").strip()
+    if not path or not session_id:
+        return ""
+    row = await repo.get_agent_session(db, session_id)
+    if row is None:
+        return ""
+    declared = (dict(row).get("workspace") or "").strip()
+    if not declared:
+        return ""
+    if os.path.normpath(declared) == os.path.normpath(path):
+        return ""
+    return f"Advisory: session workspace {declared} differs from pair worktree {path}"
 
 
 async def restore_pair_workspace_base(

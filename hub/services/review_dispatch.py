@@ -1154,6 +1154,27 @@ async def _dispatch_report(
     return own[-1] if own else None
 
 
+def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
+    """The billed total, or None when the provider did not answer (#1026)."""
+    total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+    if isinstance(total, int) and total >= 0:
+        return total
+    return None
+
+
+async def _stamp_dispatch_usage(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> int | None:
+    """Ask the provider what this run billed; leave NULL when unknown (#1026)."""
+    usage = await cursor_cloud.get_usage(
+        dispatch["agent_id"], dispatch["run_id"] or None
+    )
+    total = _provider_token_total(usage)
+    if total is not None:
+        await repo.set_review_dispatch_provider_tokens(db, dispatch["id"], total)
+    return total
+
+
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     """Poller pass over active dispatches: settle finished runs.
 
@@ -1169,16 +1190,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             db, task_id, dispatch["submission_generation"], dispatch
         )
         if review is not None:
-            usage = await cursor_cloud.get_usage(
-                dispatch["agent_id"], dispatch["run_id"] or None
-            )
-            total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+            total = await _stamp_dispatch_usage(db, dispatch)
             reported = review.get("tokens_spent")
-            if isinstance(total, int) and total >= 0:
-                # #828: keep the number, not just the complaint about it. The
-                # economics of the practice were being computed from the
-                # harness's own claim; the billed figure was fetched here and
-                # dropped on the floor.
+            if total is not None:
+                # #828: keep the number on the report too so existing
+                # practice metrics over machine_reviews stay honest.
                 await repo.set_machine_review_provider_tokens(
                     db, task_id, dispatch["submission_generation"], total
                 )
@@ -1214,6 +1230,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         )
         if not grace_rows:
             continue
+        await _stamp_dispatch_usage(db, dispatch)
         await repo.add_task_update(
             db,
             task_id,

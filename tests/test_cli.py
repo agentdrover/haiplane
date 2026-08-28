@@ -206,6 +206,26 @@ def test_cmd_show() -> None:
     assert json.loads(out.getvalue()) == task
 
 
+def test_cmd_status_json_includes_worktree_path_key() -> None:
+    """AC-6 (#989): oc-hub status dumps GET JSON, including worktree_path."""
+    task = {
+        "id": 7,
+        "title": "Show me",
+        "status": "running",
+        "worktree_path": "/srv/.ws-worktrees/task-7",
+    }
+    mock_api = MagicMock(return_value=task)
+    args = argparse.Namespace(task_id=7)
+    with (
+        patch.object(cli, "_api", mock_api),
+        patch("sys.stdout", new=StringIO()) as out,
+    ):
+        rc = cli.cmd_status(args)
+    assert rc == 0
+    dumped = json.loads(out.getvalue())
+    assert dumped["worktree_path"] == "/srv/.ws-worktrees/task-7"
+
+
 def test_cmd_tree() -> None:
     tree = {
         "id": 1,

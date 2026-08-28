@@ -338,3 +338,72 @@ async def test_latest_review_marked_stale_after_resubmission(client: AsyncClient
     assert body["review_approved_current"] is False
     resp = await client.get(f"/api/tasks/{task_id}/context")
     assert "stale — work resubmitted" in resp.json()["context_text"]
+
+
+def _enable_live_worktree(monkeypatch, *, path: str, registered: bool = True):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+    plugins.git_ops.pair_prepare_worktree = AsyncMock(return_value="task-wt")
+    plugins.git_ops.worktree_path = MagicMock(return_value=path)
+    plugins.git_ops.worktree_is_registered = AsyncMock(return_value=registered)
+
+
+async def test_context_echoes_live_worktree_on_text_and_task(
+    client: AsyncClient, monkeypatch
+):
+    """AC-2/AC-9 (#989): /context names the live tree in text and on task."""
+    create_resp = await client.post("/api/tasks", json={"title": "Context WT"})
+    task_id = create_resp.json()["id"]
+    path = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=path)
+    started = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: pair", "assigned_agent": "dev"},
+    )
+    assert started.json()["worktree_path"] == path
+
+    ctx = await client.get(f"/api/tasks/{task_id}/context")
+    assert ctx.status_code == 200
+    body = ctx.json()
+    assert body["task"]["worktree_path"] == path
+    assert f"Worktree: {path}" in body["context_text"]
+
+
+async def test_context_advisory_when_session_workspace_mismatches(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-5 (#989): mismatch is an advisory line, never 409."""
+    from hub import repository as repo
+
+    create_resp = await client.post("/api/tasks", json={"title": "WT mismatch"})
+    task_id = create_resp.json()["id"]
+    path = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=path)
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: pair", "assigned_agent": "dev"},
+    )
+    await repo.upsert_agent_session(
+        db,
+        session_id="s-mismatch",
+        principal_id=None,
+        agent="dev",
+        model="",
+        host="",
+        workspace="/tmp/main-clone",
+    )
+    await repo.update_task(db, task_id, claim_session_id="s-mismatch")
+    await db.commit()
+
+    ctx = await client.get(f"/api/tasks/{task_id}/context")
+    assert ctx.status_code == 200
+    text = ctx.json()["context_text"]
+    assert "Advisory:" in text
+    assert "/tmp/main-clone" in text
+    assert path in text
+    got = await client.get(f"/api/tasks/{task_id}")
+    assert got.status_code == 200
+    assert got.json()["worktree_path"] == path

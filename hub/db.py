@@ -1494,6 +1494,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_dispatches_reviewer_principal_id",
         "ALTER TABLE review_dispatches ADD COLUMN reviewer_principal_id INTEGER",
     ),
+    (
+        # #1026: what the PROVIDER billed for this dispatched run, including
+        # runs that never produced a report. machine_reviews.provider_tokens
+        # still holds the bill for the report path; a failed dispatch has no
+        # report row to stamp. NULL is "never asked or the API did not
+        # answer"; 0 is "answered zero". Never collapsed (#549).
+        "add_review_dispatches_provider_tokens",
+        "ALTER TABLE review_dispatches ADD COLUMN provider_tokens INTEGER",
+    ),
 ]
 
 
