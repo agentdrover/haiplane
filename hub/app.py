@@ -1766,27 +1766,6 @@ async def api_submit_machine_review(
         # matches on this and on nothing self-reported.
         principal_id=identity.principal_id,
     )
-    # #1025: a foreign report at an active dispatch is recorded loudly ONCE,
-    # here at intake — the sweep would repeat it every pass. The dispatch
-    # keeps waiting for its own run's report; before this note the collision
-    # was invisible until the usage cross-check misread it as a 36x token
-    # discrepancy (#1011 gen 1).
-    if (
-        dispatch is not None
-        and (dispatch["status"] or "") == "active"
-        and dispatch["reviewer_principal_id"] is not None
-        and identity.principal_id != dispatch["reviewer_principal_id"]
-    ):
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            "Отчёт machine-review принят от другого принципала: по этой сдаче "
-            "уже вызвано диспетчерское ревью, и его прогон ещё не отчитался. "
-            "Диспетч продолжает ждать СВОЙ отчёт, сверка расходов по чужому "
-            "отчёту не выполняется (#1025).",
-        )
     await repo.insert_event(
         db,
         kind="machine_review_completed",
@@ -1832,15 +1811,32 @@ async def api_submit_machine_review(
                     "«чисто» не подтверждено (#750)."
                 ),
             )
-    # #1012: the hub may already have called a reviewer for this very
+    # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one
     # generation is a real shape (#879) — but it must not arrive silently:
-    # the spend reconciliation (#757) matches a report's declared tokens
-    # against the provider's usage for the dispatched run, and on 2026-08-28
-    # a hand-run report of 71296 tokens was compared with a dispatch that had
-    # spent 2574930, raising an audit alert about nobody's dishonesty.
+    # on 2026-08-28 a hand-run report of 71296 tokens was compared with a
+    # dispatch that had spent 2574930, raising an audit alert about nobody's
+    # dishonesty (#1011 gen 1). With a pinned reviewer principal the hub now
+    # KNOWS whose report arrived: the dispatched run's own report passes
+    # without ceremony, a foreign one is named once and stays out of the
+    # spend reconciliation. Without a pin nobody can tell, and the old
+    # warning by agent name stands.
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
-    if dispatch is not None and (dispatch["agent_id"] or "").strip() not in (
+    if dispatch is not None and dispatch["reviewer_principal_id"] is not None:
+        if (dispatch["status"] or "") == "active" and identity.principal_id != dispatch[
+            "reviewer_principal_id"
+        ]:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                "Отчёт machine-review принят от другого принципала: по этой "
+                "сдаче уже вызвано диспетчерское ревью, и его прогон ещё не "
+                "отчитался. Диспетч продолжает ждать СВОЙ отчёт, сверка "
+                "расходов по чужому отчёту не выполняется (#1012, #1025).",
+            )
+    elif dispatch is not None and (dispatch["agent_id"] or "").strip() not in (
         "",
         (body.agent or identity.username or "").strip(),
     ):
