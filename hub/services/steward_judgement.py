@@ -1,4 +1,4 @@
-"""Record a steward judgement. No transition, no events (#1022)."""
+"""Record a steward judgement. No transition (#1022); events are the audit (#1023)."""
 
 from __future__ import annotations
 
@@ -26,6 +26,11 @@ from hub.models import (
     StewardJudgementView,
 )
 from hub.services.finding_identity import finding_uids
+from hub.services.gate_events import (
+    STEWARD_APPLIED,
+    STEWARD_ESCALATED,
+    STEWARD_JUDGEMENT,
+)
 
 
 def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
@@ -116,6 +121,37 @@ async def record_steward_judgement(
             409,
             detail=steward_judgement_exists_detail(task_id, body.generation, body.kind),
         )
+    await repo.add_task_update(
+        db,
+        task_id,
+        identity.username,
+        "status",
+        f"Steward judgement recorded: {body.kind} {effective_verdict}.",
+        principal_id=identity.principal_id,
+        author_kind="steward",
+    )
+    payload = {
+        "kind": body.kind,
+        "verdict": effective_verdict,
+        "generation": body.generation,
+    }
+    await repo.insert_event(
+        db,
+        kind=STEWARD_JUDGEMENT,
+        task_id=task_id,
+        actor="steward",
+        payload=payload,
+    )
+    follow_up = (
+        STEWARD_ESCALATED if effective_verdict == "escalate" else STEWARD_APPLIED
+    )
+    await repo.insert_event(
+        db,
+        kind=follow_up,
+        task_id=task_id,
+        actor="steward",
+        payload=payload,
+    )
     await db.commit()
     saved = await repo.get_steward_judgement_by_id(db, inserted)
     if saved is None:

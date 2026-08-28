@@ -2708,6 +2708,21 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
             else "— (no deliveries in window)"
         )
     )
+    steward_rows = [
+        g for g in (data.get("human_gates") or []) if g.get("gate") == "steward"
+    ]
+    if steward_rows:
+        lines.append(
+            "Steward gate: "
+            + "; ".join(
+                f"{row.get('project', 'default')} applied {row.get('applied', 0)} "
+                f"escalated {row.get('escalated', 0)} overridden_by_human "
+                f"{row.get('overridden_by_human', 0)}"
+                for row in steward_rows
+            )
+        )
+    else:
+        lines.append("Steward gate: — (no steward judgements in window)")
     outcomes = data.get("review_outcomes", {})
     first_pass = outcomes.get("first_pass_acceptance_rate")
     cr_rate = outcomes.get("changes_requested_rate")

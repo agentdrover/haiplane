@@ -1,9 +1,9 @@
 """Slices of practice_metrics that must not flatter the practice.
 
 Human gates (#737): how often the human click changes the outcome and how long
-work queues for it. Only human decisions count — 'hub' and 'policy' actors are
-excluded on both sides of the ratio; unmeasurable waits are reported, never
-zeroed.
+work queues for it. Only human decisions count — 'hub', 'policy', and 'steward'
+actors are excluded on both sides of the ratio; unmeasurable waits are reported,
+never zeroed. Steward judgements get their own gate=steward row (#1023).
 
 Review economics (#828) and escaped defects (#528) follow the same rule from
 opposite ends: what a run cost, and what the gate failed to stop. Across all
@@ -21,7 +21,9 @@ from httpx import AsyncClient
 
 from hub import repository as repo
 from hub import services
-from hub.models import TaskDecide
+from hub.config import TokenIdentity
+from hub.models import StewardGround, StewardJudgementSubmit, TaskDecide
+from hub.services.steward_judgement import record_steward_judgement
 from hub.db import _MIGRATIONS, _SCHEMA, _migrate  # noqa: F401
 from hub.services.orchestration import practice_metrics
 
@@ -1232,6 +1234,9 @@ def test_gate_event_vocabulary_is_single_source():
             "task_decided",
             "audit_result",
             "disposition_recorded",
+            "steward_judgement",
+            "steward_applied",
+            "steward_escalated",
         }
     )
     assert "unknown" not in HUMAN_GATE_EVENT_KINDS
@@ -1245,3 +1250,150 @@ def test_gate_event_vocabulary_is_single_source():
     assert "NON_HUMAN_GATE_ACTORS" in touch_src
     assert "task_approved', 'task_rejected'" not in gate_src
     assert "task_approved', 'task_rejected'" not in touch_src
+
+
+# ---------------------------------------------------------------------------
+# Steward audit: events, author_kind, own metric row (#1023)
+# ---------------------------------------------------------------------------
+
+
+async def test_steward_records_are_never_human(db: aiosqlite.Connection):
+    # AC-1 (#1023): a recorded judgement is steward in the feed and the
+    # timeline. Neither the event nor the update looks like a human click
+    # or a hub write (#559).
+    task_id = await _task(db, title="steward judgement feed")
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="approve",
+            confidence="high",
+            grounds=[StewardGround(source="ci_pinned_sha")],
+        ),
+        TokenIdentity("steward-bot", "steward"),
+    )
+
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    on_task = [e for e in events if e["task_id"] == task_id]
+    kinds = {e["kind"] for e in on_task}
+    assert "steward_judgement" in kinds
+    assert "steward_applied" in kinds
+    for event in on_task:
+        if event["kind"].startswith("steward_"):
+            assert event["actor"] == "steward"
+            assert event["actor"] not in {"human", "hub"}
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    steward_updates = [u for u in updates if u["author_kind"] == "steward"]
+    assert steward_updates, f"expected author_kind=steward, got {updates}"
+    assert all(u["author_kind"] not in {"human", "hub"} for u in steward_updates)
+
+
+async def test_steward_excluded_from_human_gates(db: aiosqlite.Connection):
+    # AC-2 (#1023): steward judgements do not enter the numerator or the
+    # denominator of human gates — same exclusion as hub and policy.
+    human = await _task(db, title="human dor")
+    await repo.insert_event(db, kind="task_approved", task_id=human, actor="human")
+    await repo.insert_event(db, kind="task_rejected", task_id=human, actor="human")
+    await db.commit()
+
+    before = [
+        r for r in (await practice_metrics(db))["human_gates"] if r["gate"] != "steward"
+    ]
+
+    judged = await _task(db, title="steward beside human")
+    await repo.insert_event(
+        db, kind="steward_judgement", task_id=judged, actor="steward"
+    )
+    await repo.insert_event(db, kind="steward_applied", task_id=judged, actor="steward")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=judged,
+        actor="steward",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
+    after_all = (await practice_metrics(db))["human_gates"]
+    after = [r for r in after_all if r["gate"] != "steward"]
+    assert after == before, "steward must not move human-gate counts"
+    dor = _gate(after_all, "dor", "default")
+    assert dor["approvals"] == 1
+    assert dor["overrides"] == 1
+
+
+async def test_steward_gate_row_exists(client: AsyncClient, db: aiosqlite.Connection):
+    # AC-3 (#1023): applied, escalated, and a human change of outcome land
+    # on gate=steward — not on a human gate.
+    applied = await _task(db, title="steward applied")
+    escalated = await _task(db, title="steward escalated")
+    overridden = await _task(db, title="steward then human reject")
+    await repo.insert_event(
+        db, kind="steward_applied", task_id=applied, actor="steward"
+    )
+    await repo.insert_event(
+        db, kind="steward_escalated", task_id=escalated, actor="steward"
+    )
+    applied_id = await repo.insert_event(
+        db, kind="steward_applied", task_id=overridden, actor="steward"
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(2.0), applied_id),
+    )
+    await repo.insert_event(db, kind="task_rejected", task_id=overridden, actor="human")
+    await db.commit()
+
+    gates = (await practice_metrics(db))["human_gates"]
+    row = _gate(gates, "steward", "default")
+    assert row["applied"] == 2
+    assert row["escalated"] == 1
+    assert row["overridden_by_human"] == 1
+
+    page = (await client.get("/metrics")).text
+    assert "gate=steward" in page or "Стюард" in page
+    assert str(row["applied"]) in page
+
+
+async def test_override_window_is_seven_days(db: aiosqlite.Connection):
+    # AC-4 (#1023): a human change six days after steward_applied counts;
+    # eight days later does not. The window is the denominator in time.
+    inside = await _task(db, title="overridden inside window")
+    outside = await _task(db, title="overridden outside window")
+    applied_in = await repo.insert_event(
+        db, kind="steward_applied", task_id=inside, actor="steward"
+    )
+    applied_out = await repo.insert_event(
+        db, kind="steward_applied", task_id=outside, actor="steward"
+    )
+    reject_in = await repo.insert_event(
+        db, kind="task_rejected", task_id=inside, actor="human"
+    )
+    reject_out = await repo.insert_event(
+        db, kind="task_rejected", task_id=outside, actor="human"
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(6 * 24 + 1), applied_in),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(1.0), reject_in),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(8 * 24 + 1), applied_out),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(1.0), reject_out),
+    )
+    await db.commit()
+
+    row = _gate((await practice_metrics(db))["human_gates"], "steward", "default")
+    assert row["applied"] == 2
+    assert row["overridden_by_human"] == 1
+    assert row["escalated"] == 0
