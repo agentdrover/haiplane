@@ -1658,7 +1658,10 @@ async def _web_task_detail_page(
         for row in await repo.list_live_checks(db, task_id)
     ]
 
-    csrf_token = generate_csrf_token()
+    # #990: reuse the shared cookie. Minting on every card GET (including the
+    # 15s HTMX poller) 403s an open form in another tab. verify_csrf stays
+    # strict equality; we only skip minting when the cookie already exists.
+    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
     response = TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
