@@ -1333,7 +1333,13 @@ async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypa
     task_id = await _task_in_review(client, "Independent review ok", impl)
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
-        json={"verdict": "changes_requested", "agent": "reviewer-bot"},
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer-bot",
+            # #1010: the subject is reviewer independence, but a verdict that
+            # sends work back has to say what to redo.
+            "comments": "rework the branch handling",
+        },
         headers=reviewer,
     )
     assert resp.status_code == 200
