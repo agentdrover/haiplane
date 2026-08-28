@@ -176,9 +176,19 @@ async def test_the_queue_records_through_the_same_path(client: AsyncClient):
     assert page.status_code == 200
     assert "утечка" in page.text
 
+    # Форма обязана НАЗЫВАТЬ отчёт. Без этой проверки поле можно убрать из
+    # шаблона, и тест останется зелёным: при единственном отчёте сервис
+    # свалится на «новейший» и попадёт в него случайно.
+    assert 'name="review_id"' in page.text
+    review_id = int(page.text.split('name="review_id" value="')[1].split('"')[0])
+
     posted = await client.post(
         f"/tasks/{task_id}/web-finding-dispositions",
-        data={"disposition-0": "fixed", "return_to": "queue"},
+        data={
+            "disposition-0": "fixed",
+            "return_to": "queue",
+            "review_id": str(review_id),
+        },
         follow_redirects=False,
     )
     assert posted.status_code == 303
@@ -186,6 +196,92 @@ async def test_the_queue_records_through_the_same_path(client: AsyncClient):
         "разметка из очереди возвращает в очередь, иначе цена навигации остаётся"
     )
     assert (await client.get("/findings")).text.count("утечка") == 0
+
+
+async def test_an_out_of_range_review_id_is_refused_not_crashed(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Отказ говорит, что запрос неверен, а не что сломался хаб.
+
+    id шире SQLite INTEGER доходит до bind и поднимает OverflowError — не
+    ValueError и не LookupError, — то есть 500 вместо 400.
+    """
+    await _task(db, 51, "completed", 1)
+    await _report(db, 90, 51, 1, [_finding("A")])
+    await db.commit()
+
+    resp = await client.post(
+        "/tasks/51/web-finding-dispositions",
+        data={"disposition-0": "fixed", "review_id": str(2**63)},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_the_queue_keeps_the_project_it_was_opened_with(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Счёт в инбоксе сужен по проекту — страница обязана отвечать на тот же вопрос.
+
+    Иначе человек жмёт «1» и попадает в список, где двадцать одна чужая
+    находка: то же расхождение двух чисел об одном (#518), которое эта задача
+    и чинит в метрике.
+    """
+    await db.execute("INSERT INTO projects (id, slug, name) VALUES (1, 'alpha', 'A')")
+    await db.execute("INSERT INTO projects (id, slug, name) VALUES (2, 'beta', 'B')")
+    await _task(db, 61, "completed", 1)
+    await _task(db, 62, "completed", 1)
+    await db.execute("UPDATE tasks SET project_id=1 WHERE id=61")
+    await db.execute("UPDATE tasks SET project_id=2 WHERE id=62")
+    await _report(db, 100, 61, 1, [_finding("альфа-1")])
+    await _report(db, 101, 62, 1, [_finding("бета-1"), _finding("бета-2")])
+    await db.commit()
+
+    # Ссылка, по которой человек попадает в очередь, несёт тот же проект, что
+    # и счёт рядом с ней. Иначе клик по «1» открывает двадцать одну находку.
+    board = (await client.get("/?project=alpha")).text
+    assert "/findings?project=alpha" in board
+
+    scoped = (await client.get("/findings?project=alpha")).text
+    assert "альфа-1" in scoped
+    assert "бета-1" not in scoped, "клик по счёту проекта не расширяет выборку"
+    # И возврат после сохранения остаётся в том же проекте.
+    assert 'name="return_project" value="alpha"' in scoped
+
+    posted = await client.post(
+        "/tasks/61/web-finding-dispositions",
+        data={
+            "disposition-0": "fixed",
+            "return_to": "queue",
+            "return_project": "alpha",
+            "review_id": "100",
+        },
+        follow_redirects=False,
+    )
+    assert posted.headers["location"] == "/findings?project=alpha"
+
+
+async def test_the_top_bar_counts_waiting_findings(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Верхняя плашка не должна писать «Inbox 0» при непустой секции ниже.
+
+    Находки живут не в статусном списке, а в своём счёте, и inbox_total
+    складывался только из статусных. Получалось, что раздел есть, а числа,
+    на которое смотрят, нет — ровно та невидимость, которую задача убирает.
+    """
+    await _task(db, 71, "completed", 1)
+    await _report(db, 110, 71, 1, [_finding("ждёт")])
+    await db.commit()
+
+    page = (await client.get("/")).text
+    assert "Находки ждут суждения" in page, "секция есть"
+    # А число, на которое смотрят с плашки, её видит: класс is-zero ставится
+    # ровно при inbox_total == 0, поэтому его отсутствие и есть проверка.
+    assert "topbar-stat--inbox is-zero" not in page, (
+        "верхняя плашка показывала бы Inbox 0 при непустой секции ниже"
+    )
+    assert '<span class="topbar-stat-value">1</span>' in page
 
 
 async def test_finding_text_is_escaped_on_the_queue(client: AsyncClient):

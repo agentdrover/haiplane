@@ -888,6 +888,10 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["ci_check_tasks"])
         + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
+        # #1038: находки живут не в статусном списке, а в своём счёте, и без
+        # этой строки верхняя плашка показывала бы «Inbox 0» при непустой
+        # секции ниже — ровно та невидимость, которую задача и убирает.
+        + (1 if inbox.get("unjudged_findings", {}).get("findings") else 0)
         # #897: a completed task with an open PR belongs in the count the owner
         # glances at. Left out of it, the section would be a thing you only see
         # if you already scrolled to where you were not looking.
@@ -1244,11 +1248,17 @@ async def web_finding_dispositions(task_id: int, request: Request):
     # make them navigate back for each one, which is the cost this page exists
     # to remove. The value is not a URL from the form: only the two pages that
     # carry this form may be named, so the field cannot become an open redirect.
-    back = (
-        "/findings"
-        if str(form.get("return_to") or "") == "queue"
-        else f"/tasks/{task_id}"
-    )
+    if str(form.get("return_to") or "") == "queue":
+        # Обратно в очередь — и в ТУ ЖЕ очередь: проект, по которому её
+        # отфильтровали, обязан пережить сохранение, иначе после первого же
+        # отчёта человек оказывается в общем списке. Слаг не берётся как URL:
+        # он подставляется в один известный путь и экранируется.
+        back_project = str(form.get("return_project") or "").strip()
+        back = (
+            f"/findings?project={quote(back_project)}" if back_project else "/findings"
+        )
+    else:
+        back = f"/tasks/{task_id}"
     # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
     # поле не шлёт; очередь показывает и ранний отчёт лестницы (#879), у которого
     # та же генерация, и обязана назвать его — иначе ответ ляжет на новейший.
@@ -1257,6 +1267,11 @@ async def web_finding_dispositions(task_id: int, request: Request):
         review_id = int(raw_review) if raw_review else None
     except ValueError:
         raise HTTPException(400, "review_id must be a number") from None
+    # Ограничение диапазона — не педантизм: id вне ширины SQLite INTEGER
+    # доходит до bind и даёт OverflowError, то есть 500 вместо 400. Отказ
+    # должен говорить, что запрос неверен, а не что сломался хаб.
+    if review_id is not None and not 0 < review_id <= 2**63 - 1:
+        raise HTTPException(400, f"review_id {review_id} is out of range")
     if not items:
         # Nothing chosen is not an error and not a judgement: the gate looked
         # and marked nothing, which must leave the report exactly as it was.

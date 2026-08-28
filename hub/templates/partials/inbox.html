@@ -308,7 +308,11 @@
             чего, а цена находки известна без цены пользы.
         </div>
         <div class="inbox-item-actions">
-            <a href="/findings" class="btn btn-primary btn-xs">Разобрать</a>
+            {# Фильтр проекта переживает клик: счёт в заголовке уже сужен, и
+               страница обязана отвечать на тот же вопрос, иначе человек жмёт
+               «1» и попадает в список из двадцати одной чужой находки. #}
+            <a href="/findings{% if filter_project %}?project={{ filter_project | urlencode }}{% endif %}"
+               class="btn btn-primary btn-xs">Разобрать</a>
         </div>
     </article>
 </section>
