@@ -179,6 +179,31 @@ async def test_hub_task_detail(
     mock_api_get.assert_awaited_once_with("/api/tasks/42")
 
 
+async def test_hub_task_status_names_worktree_path(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-2 (#989): hub_task_status names the live path from GET."""
+    mock_api_get.return_value = {
+        "id": 42,
+        "title": "Inspect me",
+        "status": "running",
+        "source": "human",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "worktree_path": "/srv/.ws-worktrees/task-42",
+        "updates": [],
+        "result_text": "",
+        "log_tail": [],
+    }
+    text = _mcp_text(await hub_task_status(42))
+    assert "Worktree: /srv/.ws-worktrees/task-42" in text
+
+
 async def test_hub_propose(mock_api_post: AsyncMock) -> None:
     mock_api_post.return_value = {"id": 100}
     msg = await hub_propose_task(
@@ -2868,6 +2893,22 @@ async def test_hub_pair_start_legacy_no_worktree_note(
     assert "pair-started" in text
 
 
+async def test_hub_my_context_task_includes_worktree_from_context(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-2 (#989): hub_my_context(task_id) proxies /context including the path."""
+    mock_api_get.return_value = {
+        "context_text": "Worktree: /srv/.ws-worktrees/task-5",
+        "task": {"id": 5, "worktree_path": "/srv/.ws-worktrees/task-5"},
+    }
+    out = await hub_my_context(5)
+    assert "/srv/.ws-worktrees/task-5" in _mcp_text(out)
+    assert (
+        _mcp_structured(out)["context"]["task"]["worktree_path"]
+        == "/srv/.ws-worktrees/task-5"
+    )
+
+
 async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> None:
     # AC-3 (#530): general context reports the active workspace mode.
     mock_api_get.side_effect = [
@@ -3351,3 +3392,64 @@ async def test_my_context_says_when_review_bucketing_is_a_guess(
     text = _mcp_text(await hub_my_context())
     assert "#610" in text
     assert "could not tell headless review" in text
+
+
+async def test_my_context_digest_names_live_worktree(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-3 (#989): general digest lists the path next to an in-flight row."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 452, "title": "Live one", "status": "running"}]),
+        {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "In flight" in text
+    assert "#452" in text
+    assert "/srv/.ws-worktrees/task-452" in text
+
+
+async def test_my_context_digest_does_not_invent_worktree_for_claimed_only(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-4 (#989): claimed without a live tree does not invent a directory."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
+        {"id": 10, "worktree_path": ""},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#10" in text
+    assert "worktrees" not in text
+    assert "/srv/" not in text
+
+
+async def test_my_context_digest_does_not_name_removed_review_worktree(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-7 (#989): a review row must not name the directory submit removed."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+        [{"id": 910, "status": "review", "review_job_id": None}],
+        {"id": 910, "worktree_path": ""},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#910" in text
+    assert "task-910" not in text
+    assert "worktrees" not in text

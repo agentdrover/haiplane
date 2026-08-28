@@ -133,6 +133,8 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     project_git_context,
     provision_project,
+    apply_live_worktree,
+    worktree_session_advisory,
     restore_pair_workspace_base,
     review_budget_exhausted,
     scan_text_for_verdict,
@@ -158,6 +160,7 @@ __all__ = [
     "add_risk",
     "add_update",
     "addressable_refs",
+    "apply_live_worktree",
     "delete_acceptance_criterion",
     "get_agent_sessions_panel",
     "get_message_threads_panel",
@@ -257,4 +260,5 @@ __all__ = [
     "transition_after_agent_done",
     "unarchive_task",
     "withdraw_own_draft",
+    "worktree_session_advisory",
 ]

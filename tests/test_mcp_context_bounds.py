@@ -126,6 +126,17 @@ def _fake_api(tasks: list[dict[str, Any]], ctx: dict[str, Any] | None = None):
         if "/context" in path:
             assert ctx is not None, f"no context fixture for {path}"
             return ctx
+        # #989: general digest may GET a live card just for worktree_path.
+        # Compact list cards do not carry that field.
+        if path.startswith("/api/tasks/") and "?" not in path:
+            tid = int(path.rsplit("/", 1)[-1])
+            match = next((t for t in tasks if t.get("id") == tid), None)
+            if match is None:
+                raise AssertionError(f"unexpected API call: {path}")
+            return {
+                "id": tid,
+                "worktree_path": match.get("worktree_path") or "",
+            }
         raise AssertionError(f"unexpected API call: {path}")
 
     _get.calls = calls  # type: ignore[attr-defined]

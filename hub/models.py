@@ -1638,8 +1638,10 @@ class TaskView(BaseModel):
     # Pair-start git location (#975): hub prepares/restores on the hub host;
     # remote records the canonical branch name and skips host git.
     git_mode: PairGitMode = PairGitMode.hub
-    # Pair-start workspace signal (#530): set only on pair-start so an agent
-    # learns where its isolated worktree is. "" elsewhere.
+    # Pair workspace signal (#530/#989): pair-start always fills these in
+    # worktree mode. Later GET/context fill worktree_path only when that
+    # tree is still registered — not by status, and never after submit
+    # removes it or for a headless start_task that never created one.
     workspace_mode: str = ""
     worktree_path: str = ""
     claimed_by: str | None = None

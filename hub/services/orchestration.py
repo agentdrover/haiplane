@@ -19,6 +19,7 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
+from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
 from hub.services.project_policy import (
     base_branch_of,
@@ -1416,6 +1417,63 @@ async def pair_worktree_info(
     local_kw, _ = _split_git_kwargs(ctx)
     path = plugins.git_ops.worktree_path(task_id, local_kw.get("repo"))
     return "worktree", path or ""
+
+
+async def live_pair_worktree_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> tuple[str, str]:
+    """(workspace_mode, worktree_path) only when the pair tree still exists (#989).
+
+    ``pair_worktree_info`` is deterministic and does not check git. GET
+    surfaces must not name a directory that ``submit_for_review`` already
+    removed, or one that headless ``start_task`` never created.
+    """
+    mode, path = await pair_worktree_info(db, task_id)
+    if not path:
+        return mode, ""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    if await plugins.git_ops.worktree_is_registered(path, local_kw.get("repo")):
+        return mode, path
+    return mode, ""
+
+
+async def apply_live_worktree(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> TaskView:
+    """Fill ``worktree_path`` on a GET view when the pair tree is registered."""
+    if task_view.git_mode == PairGitMode.remote:
+        return task_view
+    mode, path = await live_pair_worktree_info(db, task_view.id)
+    if path:
+        task_view.workspace_mode = mode
+        task_view.worktree_path = path
+    return task_view
+
+
+async def worktree_session_advisory(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> str:
+    """One digest line when claim session.workspace disagrees with the tree.
+
+    Advisory only — never a 409. Empty workspace or a matching path is silence.
+    """
+    path = (task_view.worktree_path or "").strip()
+    session_id = (task_view.claim_session_id or "").strip()
+    if not path or not session_id:
+        return ""
+    row = await repo.get_agent_session(db, session_id)
+    if row is None:
+        return ""
+    declared = (dict(row).get("workspace") or "").strip()
+    if not declared:
+        return ""
+    if os.path.normpath(declared) == os.path.normpath(path):
+        return ""
+    return f"Advisory: session workspace {declared} differs from pair worktree {path}"
 
 
 async def restore_pair_workspace_base(
