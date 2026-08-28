@@ -21,6 +21,11 @@ from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
+from hub.services.gate_events import (
+    HUMAN_GATE_EVENT_KINDS,
+    NON_HUMAN_GATE_ACTORS,
+    sql_in,
+)
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
@@ -732,6 +737,7 @@ async def practice_metrics(
 
     model_declarations = await _model_declaration_metrics(db, since)
     human_gates = await _human_gate_metrics(db, since)
+    human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
 
@@ -748,6 +754,7 @@ async def practice_metrics(
         "escaped_defects": escaped,
         "model_declarations": model_declarations,
         "human_gates": human_gates,
+        "human_touches": human_touches,
         "review_outcomes": review_outcomes,
     }
 
@@ -1073,6 +1080,41 @@ async def _model_declaration_metrics(
     }
 
 
+async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Touches per delivered task (#1009, spec §13).
+
+    Denominator is tasks the hub merged in the window (``pipeline_merges``).
+    Numerator is human-gate events on THAT set only. One query, so the two
+    numbers cannot come from different slices (#518). Undelivered work with
+    events does not enter either side. Hub/policy/steward actors use the
+    same exclusion as :func:`_human_gate_metrics`.
+    """
+    kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
+    actor_ph, actors = sql_in(NON_HUMAN_GATE_ACTORS)
+    rows = await fetchall(
+        db,
+        "WITH delivered AS ("
+        " SELECT DISTINCT task_id FROM pipeline_merges"
+        " WHERE task_id IS NOT NULL"
+        " AND merged_at >= datetime('now', ?)"
+        ") SELECT"
+        " (SELECT COUNT(*) FROM delivered) AS delivered_tasks,"
+        " (SELECT COUNT(*) FROM events e"
+        "  WHERE e.task_id IN (SELECT task_id FROM delivered)"
+        f" AND e.kind IN ({kind_ph})"
+        f" AND e.actor NOT IN ({actor_ph})"
+        ") AS touches",  # nosec B608 - placeholders from module constants
+        (since, *kinds, *actors),
+    )
+    delivered = int(rows[0]["delivered_tasks"] or 0)
+    touches = int(rows[0]["touches"] or 0)
+    return {
+        "delivered_tasks": delivered,
+        "touches": touches,
+        "touches_per_delivered": (round(touches / delivered, 3) if delivered else None),
+    }
+
+
 async def _human_gate_metrics(
     db: aiosqlite.Connection, since: str
 ) -> list[dict[str, Any]]:
@@ -1080,23 +1122,23 @@ async def _human_gate_metrics(
 
     A gate whose override-rate sits at ~0% over the window is a candidate
     for the autopilot (#738); a gate where the human actually changes
-    outcomes stays human. Only human decisions count: actor 'hub' (service
-    writes, #584) and 'policy' (autopilot, #738) are excluded from both
+    outcomes stays human. Only human decisions count: actors in
+    ``NON_HUMAN_GATE_ACTORS`` (hub, policy, steward) are excluded from both
     the numerator and the denominator. Waits that cannot be measured are
     reported as ``wait_unaccounted`` — never as zeros (the #518 lesson).
     """
     import json as _json
     import statistics
 
+    kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
     event_rows = await fetchall(
         db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
         "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
-        "('task_approved', 'task_rejected', 'review_verdict_recorded', "
-        "'task_decided', 'audit_result') ORDER BY e.created_at ASC",
-        (since,),
+        f"({kind_ph}) ORDER BY e.created_at ASC",  # nosec B608 - closed vocabulary
+        (since, *kinds),
     )
 
     # Project attribution (#747): project_id lives on epics only — children
@@ -1161,10 +1203,10 @@ async def _human_gate_metrics(
             # These carry an explicit human/non-human actor.
             if actor != "human":
                 continue
-        elif actor in {"hub", "policy"}:
+        elif actor in NON_HUMAN_GATE_ACTORS:
             # Verdicts name the reviewer; today every client-driven verdict
             # is the human gate, and the autopilot (#738) will stamp its
-            # own actor — excluded here by name.
+            # own actor — excluded here by name. steward is the same class.
             continue
 
         if kind == "task_approved":

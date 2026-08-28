@@ -2626,6 +2626,16 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         )
         + f"; {disp.get('confirmed_unjudged', 0)} confirmed finding(s) unanswered"
     )
+    touches = data.get("human_touches") or {}
+    rate = touches.get("touches_per_delivered")
+    lines.append(
+        "Human touches per delivered task: "
+        + (
+            f"{rate} ({touches.get('touches', 0)}/{touches.get('delivered_tasks', 0)})"
+            if rate is not None
+            else "— (no deliveries in window)"
+        )
+    )
     outcomes = data.get("review_outcomes", {})
     first_pass = outcomes.get("first_pass_acceptance_rate")
     cr_rate = outcomes.get("changes_requested_rate")
