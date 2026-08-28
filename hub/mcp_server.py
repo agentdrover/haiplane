@@ -3745,6 +3745,9 @@ async def hub_prepare_developer_task(
 async def hub_refine_task(
     task_id: int,
     title: str | None = None,
+    # #1013: the statement text was the one field refine could not touch, so a
+    # corrected premise lived on in the description the reviewer actually reads.
+    description: str | None = None,
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -3789,6 +3792,7 @@ async def hub_refine_task(
     Args:
         task_id: Task to refine.
         title: New title (1–500 chars).
+        description: New statement text (≤10000); "" clears it.
         work_type: feature | bug | refactor | chore | docs | spike | incident
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
@@ -3806,16 +3810,15 @@ async def hub_refine_task(
         redesign_rationale: Why that choice.
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
-        caused_by_task_id: Task that introduced the defect; refused if it does
-            not resolve or is the defect itself.
+        caused_by_task_id: Task that introduced the defect; must resolve.
         detected_at: When the defect was noticed.
         technical_hints: Hints, references, suggested approach.
-        scope_in: In-scope items.
-        scope_out: Out-of-scope items.
+        scope_in: In scope.
+        scope_out: Out of scope.
+        constraints: Hard limits.
+        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
-        constraints: Hard constraints.
-        assumptions: Assumptions made.
         out_of_scope_for_review: What the reviewer should ignore.
         review_checklist: What the reviewer verifies in the diff.
         human_owner: Who is accountable for this task.
@@ -3826,6 +3829,10 @@ async def hub_refine_task(
     body: dict[str, Any] = {}
     for key, val in (
         ("title", title),
+        # #1013: this list, not the signature, is what actually reaches the
+        # PATCH — a parameter present above and absent here is the #609 defect
+        # verbatim, and it fails silently.
+        ("description", description),
         ("work_type", work_type),
         ("class_of_service", class_of_service),
         ("size", size),

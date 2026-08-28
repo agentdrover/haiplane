@@ -1545,6 +1545,12 @@ async def _web_task_detail_page(
     mr_row = await repo.get_latest_machine_review(db, task_id)
     review_report = await _review_report(db, dict(row), mr_row)
     machine_review = review_report.machine_review
+    # #1012: how much of that report nobody answered — computed by the same
+    # helper the verdict itself uses, so the sentence beside the button and
+    # the sentence written into the record cannot disagree.
+    from hub.services.review_evidence import undisposed_confirmed
+
+    mr_confirmed, mr_undisposed = undisposed_confirmed(machine_review)
 
     # #823: the evidence the reviewing agent has always had — per-AC test
     # results, CI against the pinned sha, statement freshness, call sites and
@@ -1675,6 +1681,8 @@ async def _web_task_detail_page(
             "evidence": evidence,
             "change_map": change_map,
             "machine_review": machine_review,
+            "mr_confirmed": mr_confirmed,
+            "mr_undisposed": mr_undisposed,
             "review_runs": review_runs,
             "review_runs_cost": review_runs_cost,
             "review_report": review_report,

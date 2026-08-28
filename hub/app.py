@@ -1794,6 +1794,34 @@ async def api_submit_machine_review(
                     "«чисто» не подтверждено (#750)."
                 ),
             )
+    # #1012: the hub may already have called a reviewer for this very
+    # submission. A second report is not refused — two profiles on one
+    # generation is a real shape (#879) — but it must not arrive silently:
+    # the spend reconciliation (#757) matches a report's declared tokens
+    # against the provider's usage for the dispatched run, and on 2026-08-28
+    # a hand-run report of 71296 tokens was compared with a dispatch that had
+    # spent 2574930, raising an audit alert about nobody's dishonesty.
+    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if dispatch is not None and (dispatch["agent_id"] or "").strip() not in (
+        "",
+        (body.agent or identity.username or "").strip(),
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            (
+                "Второй отчёт по этой сдаче: хаб уже вызвал ревьюера "
+                f"{dispatch['model'] or 'неизвестной модели'} "
+                f"(агент {dispatch['agent_id']}, статус {dispatch['status']}). "
+                "Отчёт принят и не заменяет первый, но сверка расходов "
+                "сопоставляет задекларированные токены с расходом "
+                "ДИСПЕТЧЕРСКОГО прогона — расхождение в алерте аудита будет "
+                "означать столкновение двух прогонов, а не чью-то нечестность "
+                "(#757, #1012)."
+            ),
+        )
     await db.commit()
     await db_module.log_activity(
         db,
