@@ -1047,9 +1047,61 @@ async def approve_task(
         detail=mutation_activity_detail(),
     )
 
+    await _warn_on_dead_locators(db, task_id, task.get("task_type"))
+
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+# Which levels get the warning (#1032). The locator gate lives on submission,
+# and an epic or a feature never submits — it folds up when its children are
+# done. So their acceptance criteria were the one place a test_ref could name
+# a test that does not exist and nobody would ever look: #985 closed with
+# AC-3 pointing at tests/test_api.py::test_worktree_path_only_when_tree_exists,
+# which collects zero tests, under a project policy of sdd_ac_locator=require.
+_LOCATOR_WARNED_TYPES = frozenset({"epic", "feature"})
+
+
+async def _warn_on_dead_locators(
+    db: aiosqlite.Connection, task_id: int, task_type: str | None
+) -> None:
+    """Name AC whose test does not exist, once, at approval (#1032).
+
+    A WARNING and never a gate: at the moment an epic is approved its children
+    do not exist yet, so the tests their criteria will be verified by usually
+    do not either. Blocking there would either stop the normal order of work
+    or teach people to invent test names in advance — both worse than the
+    silence being fixed.
+
+    Best-effort in the strict sense: any failure leaves the approval exactly as
+    it was. The one thing this must never do is turn "could not check" into
+    "checked and clean", so a collection that could not run says nothing at all
+    rather than reporting an empty list of dead locators.
+    """
+    if (task_type or "") not in _LOCATOR_WARNED_TYPES:
+        return
+    try:
+        from hub.services.ac_tests import unresolved_locators
+
+        dead, checked = await unresolved_locators(db, task_id)
+    except Exception:  # noqa: BLE001 - the approval must not depend on this
+        log.warning("locator check failed for task #%s", task_id, exc_info=True)
+        return
+    if not checked or not dead:
+        return
+    named = "; ".join(f"{ac_id} → {nodeid}" for ac_id, nodeid in sorted(dead.items()))
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        "Критерии приёмки ссылаются на несуществующие тесты: "
+        f"{named}. Апрув не заблокирован — на верхнем уровне теста может ещё "
+        "не быть. Но пока локатор не разрешается, критерий проверить нечем, и "
+        "узнать об этом иначе можно только вручную (#1032).",
+    )
+    await db.commit()
 
 
 async def batch_approve_tasks(
