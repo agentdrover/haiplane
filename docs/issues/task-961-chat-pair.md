@@ -177,6 +177,9 @@ force-complete / admin.
   атрибуции). Ни один гейт не имеет права принимать решение по нему:
   основание — `auth_source` и allowlist. `role="admin"` в сессии не
   появляется никогда, иначе `is_admin` пройдёт по роли.
+  **Intake-only:** `"human"` на этом канале не означает «можно flip в
+  агента». Соседний `kind=implementer` несёт `role="agent"` и другой
+  allowlist — см. [`task-979-chat-pair-implementer.md`](task-979-chat-pair-implementer.md).
 - Permission set сессии фиксирован (см. Technical hints). Не копировать
   `permissions` / `role` admin-принципала.
 - Новые `reason` (`chat_pair_gate_forbidden`, `chat_pair_invalid`,
@@ -804,6 +807,12 @@ Intake не расширяем до исполнителя. Облачный `cl
 [`chat-pair-implementer-path.md`](chat-pair-implementer-path.md). Флип
 `role=agent` на этом канале отвергнут ревью: ломает create, revoke и git
 на хосте хаба.
+
+## Changelog (implementer spec #979)
+
+| Что | Зачем |
+|---|---|
+| Constraints: `role=human` — только intake | Презентационная роль #961 не лицензия на агентский канал. Sibling kind=implementer описан в `task-979-chat-pair-implementer.md`. |
 
 ## Changelog (rev. 4)
 
