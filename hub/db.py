@@ -2115,6 +2115,11 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     "deploys.record",
     "integrations.vast.manage",
     "system.settings.write",
+    # #1021: the steward principal's two verbs. Asked by the two allowed
+    # routes; the rest of the surface is refused by the allowlist, not by
+    # omitting these from some other role.
+    "steward.evidence.read",
+    "steward.judgement.write",
 )
 
 # #614: which of the permissions above actually decide anything.
@@ -2152,6 +2157,8 @@ ENFORCED_PERMISSIONS: tuple[str, ...] = (
     # Consulted indirectly: config.py reads it to answer is_human, and
     # require_human_or_admin is built on that — so it does gate, via one hop.
     "tasks.human_gate",
+    "steward.evidence.read",
+    "steward.judgement.write",
 )
 
 DECLARED_ONLY_PERMISSIONS: tuple[str, ...] = (
@@ -2269,6 +2276,14 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "CI Runner",
         "Read tasks and report run results; cannot change task state",
         ("tasks.read", "tasks.ci_report", "deploys.record"),
+    ),
+    (
+        # #1021: judgement, not action. Two verbs only; chat-pair's four would
+        # let this principal write the statement it then judges.
+        "steward",
+        "Steward",
+        "Read the evidence pack and write a judgement; cannot change task state",
+        ("steward.evidence.read", "steward.judgement.write"),
     ),
 )
 

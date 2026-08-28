@@ -303,8 +303,8 @@ def _is_htmx(request: Request) -> bool:
 
 
 def _require_human_web(request: Request) -> None:
-    """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
-    if current_identity(request).is_agent:
+    """Reject anyone who is not a human on human-only web mutations."""
+    if not current_identity(request).is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
 
 
@@ -1871,7 +1871,7 @@ async def web_create_task(
     # alternative, so it must point at hub_propose_task exactly as the REST
     # endpoints do. The other web routes keep human_only_gate, because for
     # approve/reject/decide "a human must do this" really is the whole answer.
-    if current_identity(request).is_agent:
+    if not current_identity(request).is_human:
         raise HTTPException(403, detail=agent_create_forbidden_detail())
     user = current_user(request)
     # scope_in arrives as a textarea, one item per line
@@ -2077,7 +2077,7 @@ async def web_batch_approve_selected(
     """
     db = _db(request)
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
     result = None
     if task_ids:

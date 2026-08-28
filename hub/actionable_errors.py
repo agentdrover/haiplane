@@ -164,6 +164,24 @@ def chat_pair_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     )
 
 
+def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
+    """A steward token reached a route outside its two-op allowlist (#1021)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_gate_forbidden",
+            "actor_hint": "none",
+            "message": f"steward principals may not call {method} {path}",
+            "hint": (
+                "The steward principal may read the evidence pack and write a "
+                "judgement. Everything else is refused by default, including "
+                "routes that do not exist yet."
+            ),
+            "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )
+
+
 def chat_pair_agent_missing_detail() -> dict[str, Any]:
     """503 when implementer pairing has no acting principal (#980).
 

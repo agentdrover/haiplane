@@ -33,6 +33,7 @@ from hub.actionable_errors import (
     chat_pair_gate_forbidden_detail,
     human_only_gate_detail,
     permission_denied_detail,
+    steward_gate_forbidden_detail,
     withdraw_agent_only_detail,
 )
 from hub.config import TokenIdentity
@@ -194,6 +195,22 @@ CHAT_PAIR_IMPLEMENTER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Steward route allowlist (#1021)
+# ---------------------------------------------------------------------------
+#
+# Same shape as chat-pair: identity is otherwise binary (human or agent), and
+# several branches read "not an agent" as "a human". Listing those branches
+# forever is how #961 arrived. Access is a positive list of two operations;
+# everything else is refused, including routes that do not exist yet.
+#
+# Method AND path, never a prefix.
+STEWARD_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/tasks/{task_id}/steward-evidence"),
+    ("POST", "/api/tasks/{task_id}/steward-judgement"),
+)
+
+
 def _template_to_regex(template: str) -> re.Pattern[str]:
     """``/api/tasks/{task_id}/refine`` → an anchored regex over path segments.
 
@@ -225,6 +242,9 @@ _CHAT_PAIR_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
 _CHAT_PAIR_IMPLEMENTER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
     (method, _template_to_regex(template))
     for method, template in CHAT_PAIR_IMPLEMENTER_ALLOWLIST
+)
+_STEWARD_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in STEWARD_ALLOWLIST
 )
 
 
@@ -262,6 +282,19 @@ def chat_pair_route_allowed(
             if bound is None or got != int(bound):
                 return False
         return True
+    return False
+
+
+def steward_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a steward principal may reach ``(method, path)`` (#1021)."""
+    if identity is not None and not identity.is_steward:
+        return False
+    probe = "GET" if method == "HEAD" else method
+    for allowed_method, pattern in _STEWARD_ALLOWED:
+        if probe == allowed_method and pattern.match(path):
+            return True
     return False
 
 
@@ -448,6 +481,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
                 if _chat_pair_refused(identity, request.method, path):
                     return _chat_pair_forbidden(request.method, path)
+                if _steward_refused(identity, request.method, path):
+                    return _steward_forbidden(request.method, path)
                 request.state.user = identity.username
                 request.state.identity = identity
                 return await call_next(request)
@@ -475,6 +510,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # chat-pair session in the first place (#961).
             if _chat_pair_refused(identity, request.method, path):
                 return _chat_pair_forbidden(request.method, path)
+            if _steward_refused(identity, request.method, path):
+                return _steward_forbidden(request.method, path)
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):
@@ -525,12 +562,28 @@ def _chat_pair_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     )
 
 
+def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
+    return identity.is_steward and not steward_route_allowed(method, path, identity)
+
+
 def _chat_pair_forbidden(method: str, path: str) -> Response:
     """403 with the same actionable payload the REST handlers raise (#961)."""
     return Response(
         status_code=status.HTTP_403_FORBIDDEN,
         content=json.dumps(
             {"detail": chat_pair_gate_forbidden_detail(method, path)},
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
+def _steward_forbidden(method: str, path: str) -> Response:
+    """403 with the same actionable payload the REST handlers raise (#1021)."""
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {"detail": steward_gate_forbidden_detail(method, path)},
             ensure_ascii=False,
         ),
         media_type="application/json",
@@ -571,9 +624,9 @@ def current_identity(request: Request) -> TokenIdentity:
 
 
 def require_human_or_admin(request: Request) -> TokenIdentity:
-    """Rejects agent tokens with 403."""
+    """Rejects anyone who is not a human (agents, steward, other third states)."""
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail=human_only_gate_detail(),
