@@ -1290,6 +1290,28 @@ async def test_steward_records_are_never_human(db: aiosqlite.Connection):
     assert steward_updates, f"expected author_kind=steward, got {updates}"
     assert all(u["author_kind"] not in {"human", "hub"} for u in steward_updates)
 
+    escalated_id = await _task(db, title="steward escalate feed")
+    await record_steward_judgement(
+        db,
+        escalated_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="approve",
+            confidence="low",
+            grounds=[StewardGround(source="ci_pinned_sha")],
+        ),
+        TokenIdentity("steward-bot", "steward"),
+    )
+    esc_kinds = {
+        e["kind"]
+        for e in await repo.list_events(db, since=0)
+        if e["task_id"] == escalated_id
+    }
+    assert "steward_judgement" in esc_kinds
+    assert "steward_escalated" in esc_kinds
+    assert "steward_applied" not in esc_kinds
+
 
 async def test_steward_excluded_from_human_gates(db: aiosqlite.Connection):
     # AC-2 (#1023): steward judgements do not enter the numerator or the
