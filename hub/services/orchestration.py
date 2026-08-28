@@ -2196,6 +2196,46 @@ async def transition_after_agent_done(
     ):
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
+        # #991: the CI gate asks for a PR where it means "is there anything to
+        # deliver". For a task whose work is not code — a policy turned on, a
+        # mechanism watched, a decision recorded — the branch exists (pair_start
+        # always makes one) and carries nothing the base does not have. There is
+        # no PR to open, so the poller retried and escalated: #927 sat in
+        # needs_decision with "Cannot create PR: no commits on branch or push
+        # failed" while its work was finished and evidenced by three live checks.
+        #
+        # Ask about substance instead, with the method the release path already
+        # uses (#968). Three answers, and only one skips: content that does not
+        # differ means the CI gate has no subject. "Could not compare" keeps the
+        # old path — ignorance must not close a task quietly (#725). The REVIEW
+        # gate is untouched either way: skipping it here would let anything
+        # uncommitted complete itself, which is a worse defect than the one
+        # being fixed.
+        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
+        # empty base is passed through, never recomputed here.
+        base_ref = (ctx.get("base_branch") or "").strip()
+        differs = await plugins.git_ops.content_differs(
+            base_ref, branch, repo=workspace, gh_repo=ctx.get("gh_repo")
+        )
+        nothing_to_deliver = differs is False
+        if nothing_to_deliver:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлять нечего: ветка {branch} не отличается по "
+                "содержимому от базовой ветки проекта, PR открывать не из "
+                "чего. "
+                "Гейт CI пропущен как беспредметный — ревью задача проходит "
+                "обычным порядком (#991). Если работа должна была быть в "
+                "коде, значит она не закоммичена.",
+            )
+            log.info(
+                "Task #%d: nothing to deliver on %s — CI gate skipped",
+                task_id,
+                branch,
+            )
         # Worktree mode (#459): a PAIR task's branch is checked out in its own
         # worktree while the main clone stays on base; targeting the main clone
         # would silently fail checkout and let squash_branch reset the base
@@ -2362,36 +2402,40 @@ async def transition_after_agent_done(
             )
             log.error("Task #%d → needs_decision: %s", task_id, exc)
             return "needs_decision"
-        squashed = await plugins.git_ops.squash_branch(
-            task_id,
-            task.get("title", ""),
-            branch,
-            repo=git_repo,
-            base_branch=ctx.get("base_branch"),
-        )
-        await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
-        if not task.get("pr_number"):
-            pr_num = await plugins.git_ops.create_pr(
+        # Fall through to the review gate when there is nothing to deliver:
+        # commit, squash, push and PR all have no subject, and the task
+        # still owes a verdict — it just owes no pull request (#991).
+        if not nothing_to_deliver:
+            squashed = await plugins.git_ops.squash_branch(
                 task_id,
-                task["title"],
-                task.get("description", ""),
+                task.get("title", ""),
                 branch,
                 repo=git_repo,
-                gh_repo=ctx.get("gh_repo"),
                 base_branch=ctx.get("base_branch"),
             )
-            if pr_num:
-                await repo.update_task(db, task_id, pr_number=pr_num)
-                task["pr_number"] = pr_num
-        await repo.update_task(
-            db,
-            task_id,
-            status="ci_check",
-            exit_code=exit_code,
-            result_text=result_text,
-        )
-        log.info("Task #%d → ci_check after done report", task_id)
-        return "ci_check"
+            await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
+            if not task.get("pr_number"):
+                pr_num = await plugins.git_ops.create_pr(
+                    task_id,
+                    task["title"],
+                    task.get("description", ""),
+                    branch,
+                    repo=git_repo,
+                    gh_repo=ctx.get("gh_repo"),
+                    base_branch=ctx.get("base_branch"),
+                )
+                if pr_num:
+                    await repo.update_task(db, task_id, pr_number=pr_num)
+                    task["pr_number"] = pr_num
+            await repo.update_task(
+                db,
+                task_id,
+                status="ci_check",
+                exit_code=exit_code,
+                result_text=result_text,
+            )
+            log.info("Task #%d → ci_check after done report", task_id)
+            return "ci_check"
 
     if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human

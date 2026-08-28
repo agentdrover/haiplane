@@ -5365,3 +5365,139 @@ async def test_repair_closes_parent_stuck_by_rejected_child(
 
     assert repaired >= 1
     assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+
+
+from unittest.mock import AsyncMock as _AsyncMock991  # noqa: E402
+
+AsyncMock = _AsyncMock991
+
+
+# ---- #991: a task with nothing to deliver must not wait for a PR ----
+#
+# Observed on #927 (26.08.2026): an operational task — turning a policy on and
+# watching it for a day — reported done, entered ci_check, and stalled. There
+# was no PR because there was no code: the branch existed (pair_start always
+# makes one) but carried nothing the base branch did not already have. The
+# poller retried, then escalated to needs_decision with "Cannot create PR: no
+# commits on branch or push failed", and a human had to close work that was
+# already finished and evidenced by three live checks.
+#
+# The gate asks "is there a PR" where it means "is there anything to deliver".
+# The two differ exactly when the work is not code — and that is not a defect
+# in the work, it is its nature. Same shape as #968: a question about form
+# standing in for a question about substance.
+
+
+async def _pair_task_ready_for_done(db: aiosqlite.Connection, title: str) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/empty")
+    await db.commit()
+    return task_id
+
+
+async def test_task_without_undelivered_changes_completes(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#991): nothing to deliver — the CI gate does not apply, and the
+    # task moves on instead of waiting for a PR that cannot exist.
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", AsyncMock(return_value=False), raising=False
+    )
+    task_id = await _pair_task_ready_for_done(db, "Operational, no code")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Policy switched on"),
+    )
+
+    row = await repo.get_task(db, task_id)
+    assert row["status"] != "ci_check", (
+        "a task with nothing to deliver must not wait for a PR it cannot have"
+    )
+
+
+async def test_empty_delivery_is_stated_in_the_feed(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#991): the skip is said out loud. Silence here would let work an
+    # agent forgot to commit close as if it had been delivered — the one way
+    # this fix could become a hole.
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", AsyncMock(return_value=False), raising=False
+    )
+    task_id = await _pair_task_ready_for_done(db, "Operational, feed")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Nothing to ship"),
+    )
+
+    updates = await repo.get_task_updates(db, task_id)
+    rendered = [(dict(u).get("content") or "").lower() for u in updates]
+    said = [c for c in rendered if "доставлять нечего" in c]
+    assert said, "the reader must see that no delivery happened, and why"
+
+
+async def test_task_with_changes_still_goes_through_ci_gate(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#991): the ordinary path is untouched. A branch that carries work
+    # still owes a PR and a green CI.
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", AsyncMock(return_value=True), raising=False
+    )
+    task_id = await _pair_task_ready_for_done(db, "Has code")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Ready for CI"),
+    )
+
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check"
+
+
+async def test_unreadable_diff_still_needs_a_human(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#991): git that could not answer is not "nothing to deliver".
+    # Ignorance must not close a task quietly (#725) — the old path stands.
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.git_ops, "content_differs", AsyncMock(return_value=None), raising=False
+    )
+    task_id = await _pair_task_ready_for_done(db, "Git silent")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Unclear"),
+    )
+
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check", (
+        "an unanswerable question keeps the existing path, it does not skip the gate"
+    )

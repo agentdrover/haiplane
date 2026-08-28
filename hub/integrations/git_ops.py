@@ -2276,6 +2276,7 @@ class GitOpsIntegration:
         so this compares them directly rather than counting what the graph
         happens to contain.
         """
+        base = _resolve_base(base)
         # The clone may be behind, and the question is about upstream, not
         # about this checkout — so refresh the two ends first. A fetch that
         # fails is not fatal: the local refs may still answer, and only a
