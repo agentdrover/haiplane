@@ -2196,56 +2196,6 @@ async def transition_after_agent_done(
     ):
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
-        # #991: the CI gate asks for a PR where it means "is there anything to
-        # deliver". For a task whose work is not code — a policy turned on, a
-        # mechanism watched, a decision recorded — the branch exists (pair_start
-        # always makes one) and carries nothing the base does not have. There is
-        # no PR to open, so the poller retried and escalated: #927 sat in
-        # needs_decision with "Cannot create PR: no commits on branch or push
-        # failed" while its work was finished and evidenced by three live checks.
-        #
-        # Ask about substance instead, with the method the release path already
-        # uses (#968). Three answers, and only one skips: content that does not
-        # differ means the CI gate has no subject. "Could not compare" keeps the
-        # old path — ignorance must not close a task quietly (#725). The REVIEW
-        # gate is untouched either way: skipping it here would let anything
-        # uncommitted complete itself, which is a worse defect than the one
-        # being fixed.
-        # TWO sources decide this, not one. The tail below starts with
-        # auto_commit, which exists precisely because the work may still be
-        # sitting UNCOMMITTED in the working tree — asking only about commits
-        # would call that work "nothing to deliver" and skip the commit that
-        # would have delivered it. So: uncommitted changes count as work, and
-        # only when the tree is clean does the branch-vs-base comparison get
-        # to answer.
-        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
-        # empty base is passed through, never recomputed here.
-        nothing_to_deliver = False
-        dirty_now = await plugins.git_ops.dirty_paths(repo=workspace)
-        if not dirty_now:
-            base_ref = (ctx.get("base_branch") or "").strip()
-            differs = await plugins.git_ops.content_differs(
-                base_ref, branch, repo=workspace, gh_repo=ctx.get("gh_repo")
-            )
-            nothing_to_deliver = differs is False
-        if nothing_to_deliver:
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "status",
-                f"Доставлять нечего: ветка {branch} не отличается по "
-                "содержимому от базовой ветки проекта, PR открывать не из "
-                "чего. "
-                "Гейт CI пропущен как беспредметный — ревью задача проходит "
-                "обычным порядком (#991). Если работа должна была быть в "
-                "коде, значит она не закоммичена.",
-            )
-            log.info(
-                "Task #%d: nothing to deliver on %s — CI gate skipped",
-                task_id,
-                branch,
-            )
         # Worktree mode (#459): a PAIR task's branch is checked out in its own
         # worktree while the main clone stays on base; targeting the main clone
         # would silently fail checkout and let squash_branch reset the base
@@ -2412,9 +2362,60 @@ async def transition_after_agent_done(
             )
             log.error("Task #%d → needs_decision: %s", task_id, exc)
             return "needs_decision"
+        # #991: the CI gate asks for a PR where it means "is there anything to
+        # deliver". For a task whose work is not code — a policy turned on, a
+        # mechanism watched, a decision recorded — the branch exists (pair_start
+        # always makes one) and carries nothing the base does not have. There is
+        # no PR to open, so the poller retried and escalated: #927 sat in
+        # needs_decision with "Cannot create PR: no commits on branch or push
+        # failed" while its work was finished and evidenced by three live checks.
+        #
+        # The question is asked HERE and not earlier, and against git_repo and
+        # not the clone — both learned from the review of the first attempt:
+        #
+        #   * after auto_commit, because auto_commit is what turns a dirty tree
+        #     into commits. Asking before it called work-in-progress "nothing to
+        #     deliver" and skipped the very commit that delivers it.
+        #   * against git_repo, because for a pair task in worktree mode the
+        #     work lives in the worktree while the clone stays on base. Deciding
+        #     from the clone and acting on the worktree is how a decision comes
+        #     out right by accident.
+        #
+        # Three answers, and only one skips: content that does not differ means
+        # the CI gate has no subject. "Could not compare" keeps the old path —
+        # ignorance must not close a task quietly (#725). The REVIEW gate is
+        # untouched either way: skipping it would let anything uncommitted
+        # complete itself, a worse defect than the one being fixed.
+        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
+        # empty base is passed through, never recomputed here.
+        differs = await plugins.git_ops.content_differs(
+            (ctx.get("base_branch") or "").strip(),
+            branch,
+            repo=git_repo,
+            gh_repo=ctx.get("gh_repo"),
+        )
+        nothing_to_deliver = differs is False
+        if nothing_to_deliver:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлять нечего: ветка {branch} после коммита не "
+                "отличается по содержимому от базовой ветки проекта, PR "
+                "открывать не из чего. Гейт CI пропущен как беспредметный — "
+                "ревью задача проходит обычным порядком (#991). Если работа "
+                "должна была быть в коде, значит она не закоммичена.",
+            )
+            log.info(
+                "Task #%d: nothing to deliver on %s — CI gate skipped",
+                task_id,
+                branch,
+            )
+
         # Fall through to the review gate when there is nothing to deliver:
-        # commit, squash, push and PR all have no subject, and the task
-        # still owes a verdict — it just owes no pull request (#991).
+        # squash, push and PR all have no subject, and the task still owes a
+        # verdict — it just owes no pull request (#991).
         if not nothing_to_deliver:
             squashed = await plugins.git_ops.squash_branch(
                 task_id,

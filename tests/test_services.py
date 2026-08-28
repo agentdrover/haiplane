@@ -5375,17 +5375,31 @@ AsyncMock = _AsyncMock991
 # ---- #991: a task with nothing to deliver must not wait for a PR ----
 #
 # Observed on #927 (26.08.2026): an operational task — turning a policy on and
-# watching it for a day — reported done, entered ci_check, and stalled. There
-# was no PR because there was no code: the branch existed (pair_start always
-# makes one) but carried nothing the base branch did not already have. The
-# poller retried, then escalated to needs_decision with "Cannot create PR: no
-# commits on branch or push failed", and a human had to close work that was
-# already finished and evidenced by three live checks.
+# watching it for a day — reported done, entered ci_check and stalled. There was
+# no PR because there was no code: the branch existed (pair_start always makes
+# one) but carried nothing the base did not already have. The poller retried,
+# escalated to needs_decision with "Cannot create PR: no commits on branch or
+# push failed", and a human had to close work that was already finished.
 #
-# The gate asks "is there a PR" where it means "is there anything to deliver".
-# The two differ exactly when the work is not code — and that is not a defect
-# in the work, it is its nature. Same shape as #968: a question about form
-# standing in for a question about substance.
+# Every assertion below is written to FAIL on the pre-fix code. The first round
+# of these tests did not: three of five stayed green without the fix, because
+# they asserted "status != ci_check" and never looked at whether the delivery
+# calls were made. A test that passes before the fix proves nothing, and the
+# review said so.
+
+
+def _delivery_spies(monkeypatch):
+    """Watch the three calls that DELIVER, so their absence can be asserted."""
+    from hub.integrations.registry import plugins
+
+    spies = {
+        "squash_branch": AsyncMock(return_value=False),
+        "push_branch": AsyncMock(return_value=True),
+        "create_pr": AsyncMock(return_value=4242),
+    }
+    for name, spy in spies.items():
+        monkeypatch.setattr(plugins.git_ops, name, spy, raising=False)
+    return spies
 
 
 async def _pair_task_ready_for_done(db: aiosqlite.Connection, title: str) -> int:
@@ -5411,13 +5425,15 @@ async def _pair_task_ready_for_done(db: aiosqlite.Connection, title: str) -> int
 async def test_task_without_undelivered_changes_completes(
     db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-1 (#991): nothing to deliver — the CI gate does not apply, and the
-    # task moves on instead of waiting for a PR that cannot exist.
+    # AC-1 (#991): nothing to deliver — no PR is opened, no branch is pushed,
+    # and the task goes to review instead of waiting for CI. Naming the exact
+    # status matters: "not ci_check" would also accept running or failed.
     from hub.integrations.registry import plugins
 
     monkeypatch.setattr(
         plugins.git_ops, "content_differs", AsyncMock(return_value=False), raising=False
     )
+    spies = _delivery_spies(monkeypatch)
     task_id = await _pair_task_ready_for_done(db, "Operational, no code")
 
     await services.add_update(
@@ -5427,22 +5443,26 @@ async def test_task_without_undelivered_changes_completes(
     )
 
     row = await repo.get_task(db, task_id)
-    assert row["status"] != "ci_check", (
-        "a task with nothing to deliver must not wait for a PR it cannot have"
+    assert row["status"] == "review", (
+        "a task with nothing to deliver owes a verdict, not a pull request"
     )
+    assert not spies["create_pr"].called, "no PR may be opened for an empty branch"
+    assert not spies["push_branch"].called
+    assert not spies["squash_branch"].called
+    assert row["pr_number"] is None
 
 
 async def test_empty_delivery_is_stated_in_the_feed(
     db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-2 (#991): the skip is said out loud. Silence here would let work an
-    # agent forgot to commit close as if it had been delivered — the one way
-    # this fix could become a hole.
+    # AC-2 (#991): the skip is said out loud. Silence would let work an agent
+    # forgot to commit close as if delivered — the one way this becomes a hole.
     from hub.integrations.registry import plugins
 
     monkeypatch.setattr(
         plugins.git_ops, "content_differs", AsyncMock(return_value=False), raising=False
     )
+    _delivery_spies(monkeypatch)
     task_id = await _pair_task_ready_for_done(db, "Operational, feed")
 
     await services.add_update(
@@ -5451,22 +5471,33 @@ async def test_empty_delivery_is_stated_in_the_feed(
         TaskUpdateCreate(agent="dev", kind="done", content="Nothing to ship"),
     )
 
-    updates = await repo.get_task_updates(db, task_id)
-    rendered = [(dict(u).get("content") or "").lower() for u in updates]
+    rendered = [
+        (dict(u).get("content") or "").lower()
+        for u in await repo.get_task_updates(db, task_id)
+    ]
     said = [c for c in rendered if "доставлять нечего" in c]
-    assert said, "the reader must see that no delivery happened, and why"
+    assert said, "the reader must see that no delivery happened"
+    assert any("не закоммичена" in c for c in said), (
+        "and must be told what it means if the work SHOULD have been code"
+    )
 
 
 async def test_task_with_changes_still_goes_through_ci_gate(
     db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-3 (#991): the ordinary path is untouched. A branch that carries work
-    # still owes a PR and a green CI.
+    # AC-3 (#991): the ordinary path is untouched — a branch that carries work
+    # is squashed, pushed and gets its PR.
+    #
+    # This test is a REGRESSION guard, not proof of the new behaviour: it is
+    # green before the fix as well, and must be, because it asserts that
+    # nothing changed here. Only the tests above (AC-1, AC-2 and the ordering
+    # one) fail on pre-fix code, and only they demonstrate the fix works.
     from hub.integrations.registry import plugins
 
     monkeypatch.setattr(
         plugins.git_ops, "content_differs", AsyncMock(return_value=True), raising=False
     )
+    spies = _delivery_spies(monkeypatch)
     task_id = await _pair_task_ready_for_done(db, "Has code")
 
     await services.add_update(
@@ -5477,18 +5508,26 @@ async def test_task_with_changes_still_goes_through_ci_gate(
 
     row = await repo.get_task(db, task_id)
     assert row["status"] == "ci_check"
+    assert spies["squash_branch"].called and spies["push_branch"].called
+    assert spies["create_pr"].called
+    assert row["pr_number"] == 4242
 
 
 async def test_unreadable_diff_still_needs_a_human(
     db: aiosqlite.Connection, monkeypatch
 ):
     # AC-4 (#991): git that could not answer is not "nothing to deliver".
-    # Ignorance must not close a task quietly (#725) — the old path stands.
+    # Ignorance keeps the old path, PR and all (#725).
+    #
+    # Also a regression guard by nature — "unchanged behaviour" cannot fail on
+    # the code that had that behaviour already. Named so nobody counts it as
+    # evidence that the new branch of the logic works.
     from hub.integrations.registry import plugins
 
     monkeypatch.setattr(
         plugins.git_ops, "content_differs", AsyncMock(return_value=None), raising=False
     )
+    spies = _delivery_spies(monkeypatch)
     task_id = await _pair_task_ready_for_done(db, "Git silent")
 
     await services.add_update(
@@ -5498,42 +5537,51 @@ async def test_unreadable_diff_still_needs_a_human(
     )
 
     row = await repo.get_task(db, task_id)
-    assert row["status"] == "ci_check", (
-        "an unanswerable question keeps the existing path, it does not skip the gate"
-    )
+    assert row["status"] == "ci_check"
+    assert spies["create_pr"].called, "an unanswerable question must not skip delivery"
 
 
-async def test_uncommitted_work_is_not_nothing_to_deliver(
+async def test_the_question_is_asked_after_the_commit_and_of_the_worktree(
     db: aiosqlite.Connection, monkeypatch
 ):
-    # #991, caught while preparing the review harness: the check sits BEFORE
-    # auto_commit, and auto_commit is the step that exists for work still
-    # sitting uncommitted in the tree. Asking only about commits would call
-    # that "nothing to deliver" and skip the very commit that delivers it —
-    # the fix would then strand exactly the work the conveyor is built to
-    # carry. A dirty tree is work, whatever the commit graph says.
+    # #991, both lessons of the review in one test. The first attempt asked
+    # BEFORE auto_commit and asked the CLONE: work sitting uncommitted in a
+    # pair task's worktree then read as "nothing to deliver", and the commit
+    # that would have delivered it was skipped.
     from hub.integrations.registry import plugins
 
-    monkeypatch.setattr(
-        plugins.git_ops,
-        "dirty_paths",
-        AsyncMock(return_value=["hub/services/thing.py"]),
-        raising=False,
-    )
-    differs = AsyncMock(return_value=False)
-    monkeypatch.setattr(plugins.git_ops, "content_differs", differs, raising=False)
-    task_id = await _pair_task_ready_for_done(db, "Uncommitted work")
+    order: list[str] = []
+    asked_repo: list[str | None] = []
+
+    async def _commit(*args, **kwargs):
+        order.append("auto_commit")
+        return True
+
+    async def _differs(base, head, repo=None, gh_repo=None):
+        order.append("content_differs")
+        asked_repo.append(repo)
+        return True
+
+    monkeypatch.setattr(plugins.git_ops, "auto_commit", _commit, raising=False)
+    monkeypatch.setattr(plugins.git_ops, "content_differs", _differs, raising=False)
+    spies = _delivery_spies(monkeypatch)
+    task_id = await _pair_task_ready_for_done(db, "Order matters")
 
     await services.add_update(
         db,
         task_id,
-        TaskUpdateCreate(agent="dev", kind="done", content="Done, not committed"),
+        TaskUpdateCreate(agent="dev", kind="done", content="Committed by the tail"),
     )
 
-    row = await repo.get_task(db, task_id)
-    assert row["status"] == "ci_check", (
-        "uncommitted work must still be committed and delivered, not skipped"
+    assert order == ["auto_commit", "content_differs"], (
+        "the tree must be committed before it is asked whether anything changed"
     )
-    assert not differs.called, (
-        "a dirty tree settles the question — no need to ask git about commits"
+    # The tail squashes and pushes in ONE repository; the question must have
+    # been put to that same one. Deciding from the clone while acting on the
+    # worktree is how an answer comes out right only by accident — which is
+    # exactly what the review found in the first attempt.
+    assert spies["squash_branch"].called
+    worked_in = spies["squash_branch"].call_args.kwargs.get("repo")
+    assert asked_repo == [worked_in], (
+        "the question goes to the repository the tail actually works in"
     )
