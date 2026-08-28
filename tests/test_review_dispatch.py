@@ -21,7 +21,9 @@ from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
+from hub.services.model_family import family
 from hub.services.review_dispatch import (
+    _REVIEW_MODEL_PREFERENCES,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
     diff_plan,
@@ -179,7 +181,10 @@ async def _submitted(
 def test_pick_review_model_prefers_another_family(monkeypatch):
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "")
     assert pick_review_model("claude-fable-5") == "grok-4.6"
-    assert pick_review_model("grok-4.5") == "gpt-5.3-codex"
+    # #1036: the preference list is now the subscription's, so a grok
+    # implementer lands on composer — still another family, and unlike
+    # gpt-5.3-codex it is a model this account can actually launch.
+    assert pick_review_model("grok-4.5") == "composer-2.5"
     assert pick_review_model("") == "grok-4.6"
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "gemini-3.1-pro")
     assert pick_review_model("claude-fable-5") == "gemini-3.1-pro"
@@ -1681,3 +1686,179 @@ async def test_open_mode_pins_nothing(
     assert not [u for u in updates if "другого принципала" in u["content"]], (
         "an unpinned dispatch must not accuse anyone of being foreign"
     )
+
+
+# --- Report delivered in the run's own text (#1036) --------------------------
+#
+# Since 22.08 Cursor stops delivering the hub's MCP into cloud runs: verified
+# on grok-4.6, grok-4.5, composer-2.5 and default, and through GetDynamicTools,
+# whose catalog does not list the server at all. The reviewers still work — the
+# findings just die in the final text. So the text becomes a second, weaker
+# delivery path, and its weakness is recorded rather than smoothed over.
+
+
+def _report_block(**over) -> str:
+    payload = {
+        "raw_count": 2,
+        "incomplete": False,
+        "findings_confirmed": [
+            {
+                "title": "race on retry",
+                "severity": "medium",
+                "category": "correctness",
+                "locator": "lines",
+                "file": "hub/a.py",
+                "start_line": 10,
+            }
+        ],
+        "findings_rejected": [],
+        "unresolved": [],
+        "lost_dimensions": [],
+        "harness_skill": "lite-diff-review",
+        "tokens_spent": 40000,
+        "model": "grok-4.6",
+        "orchestrator": "cursor-cloud",
+    }
+    payload.update(over)
+    return (
+        "Прочитал дифф, ревью выполнено.\n\n"
+        "```haiplane-review\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+    )
+
+
+async def _finished_run_with(monkeypatch, text: str) -> None:
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED", "result": text}
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 900_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+
+async def _expire_grace(db) -> None:
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+
+async def test_report_recovered_from_run_result(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1036): a finished run with no contract report, but a valid block
+    # in its text — the report is stored, marked as transcribed, and the
+    # dispatch settles instead of failing.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r1"}, "run": {"id": "run-r1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-rec", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["raw_count"] == 2
+    assert saved["principal_id"] == reviewer_pid, "owner is the dispatch's reviewer"
+    assert saved["orchestrator"].startswith("cursor-cloud-result"), (
+        "origin must live in the data, not only in a feed line"
+    )
+    assert not await repo.list_active_review_dispatches(db), "dispatch settles"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "восстановлен из текста" in u["content"]]
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+
+
+async def test_unparsable_result_is_kept_as_text_not_invented(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1036): prose without a block stores NOTHING. The text survives in
+    # the feed and the dispatch fails exactly as before — "could not read" must
+    # never become "read and clean".
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r2"}, "run": {"id": "run-r2"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-prose", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(
+        monkeypatch,
+        "Нашёл две проблемы: гонка в ретраях и незакрытый файл. Отчёт сдать "
+        "не смог, MCP не примонтирован.",
+    )
+
+    await sweep_review_dispatches(db)
+
+    assert await repo.get_latest_machine_review(db, task_id) is None, (
+        "findings must never be invented out of prose"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "нет разбираемого блока" in u["content"]]
+    assert [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+    assert not await repo.list_active_review_dispatches(db), (
+        "the dispatch still fails — nothing was recovered"
+    )
+
+
+async def test_mcp_report_wins_over_result_fallback(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1036): when the contract path worked, the text is not read at all
+    # — one submission must not end up with two reports.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r3"}, "run": {"id": "run-r3"}})
+    _wire(monkeypatch, recorder)
+    _, reviewer_token, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-both", policy={"review": "dispatch"})
+
+    own = dict(_FOREIGN_REPORT, agent="cloud-reviewer", model="grok-4.6")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=own,
+        headers={"Authorization": f"Bearer {reviewer_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block(raw_count=99))
+
+    await sweep_review_dispatches(db)
+
+    rows = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert len(rows) == 1, "the contract report stands alone"
+    assert dict(rows[0])["raw_count"] != 99
+
+
+async def test_recovered_report_settles_its_own_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1036): the transcribed report must read as the dispatch's OWN on
+    # the next pass too — a foreign-looking one would raise the false "report
+    # not submitted" alert this area already fixed once (#1025).
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r4"}, "run": {"id": "run-r4"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-own2", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+    await sweep_review_dispatches(db)  # second pass must find nothing to do
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+    assert not [u for u in updates if "другого принципала" in u["content"]]
+    assert len([u for u in updates if "восстановлен из текста" in u["content"]]) == 1
+
+
+def test_pick_review_model_stays_within_available_models(monkeypatch):
+    # AC-5 (#1036): every preference must be a model the account can actually
+    # launch. Before this, a grok implementer sent the diversity rule to
+    # gpt-5.3-codex, which refuses at creation with usage_limit_exceeded.
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "")
+    available = {"grok-4.6", "grok-4.5", "composer-2.5"}
+
+    assert set(_REVIEW_MODEL_PREFERENCES) <= available
+    assert pick_review_model("claude-opus-5") in available
+    grok_reviewer = pick_review_model("grok-4.6")
+    assert grok_reviewer in available
+    assert family(grok_reviewer) != family("grok-4.6"), "diversity still holds"
