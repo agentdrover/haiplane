@@ -1070,9 +1070,17 @@ async def maybe_dispatch_review(
 
 
 def instance_base_url() -> str:
+    """This hub's own public base URL, as this installation is configured.
+
+    #1005: the vendor's host used to sit here as a fallback, and it could
+    never fire — ``hub_base_url`` falls back to ``http://HOST:PORT`` and so
+    always answers. A dead constant naming the authors' server is the kind of
+    default that turns somebody else's installation into a client of ours the
+    moment the code around it changes; the empty answer is the honest one.
+    """
     from hub.hub_instance import instance_echo_fields
 
-    return instance_echo_fields().get("base_url") or "https://agenthai.ru"
+    return instance_echo_fields().get("base_url", "")
 
 
 async def _current_review(

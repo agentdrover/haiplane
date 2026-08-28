@@ -6,7 +6,7 @@ description: >-
 
 inputs:
   hub-url:
-    description: Base URL of the hub (e.g. https://agenthai.ru). Absent ⇒ report nothing and say so.
+    description: Base URL of the hub (e.g. https://hub.example.com). Absent ⇒ report nothing and say so.
     required: false
     default: ""
   hub-token:

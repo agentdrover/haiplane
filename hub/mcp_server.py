@@ -49,7 +49,7 @@ from hub.mcp_structured import (
 
 # FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
 # The hub mounts streamable HTTP under the main FastAPI app, so clients send the
-# public Host (e.g. agenthai.ru) — the SDK default rejects them with 421. Disable
+# public Host (any non-loopback name) — the SDK default rejects them with 421. Disable
 # MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
 class InstrumentedFastMCP(FastMCP):
     """FastMCP that records what each tool call cost (#780, epic #776).
