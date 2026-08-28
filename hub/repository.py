@@ -2050,6 +2050,20 @@ async def set_review_dispatch_status(
     )
 
 
+async def set_review_dispatch_provider_tokens(
+    db: aiosqlite.Connection, dispatch_id: int, tokens: int
+) -> None:
+    """Record what the provider billed for this dispatched run (#1026).
+
+    Lives on the dispatch because a failed run has no machine_review row.
+    NULL on the column (never written) is "unknown"; 0 is a real zero.
+    """
+    await db.execute(
+        "UPDATE review_dispatches SET provider_tokens = ? WHERE id = ?",
+        (tokens, dispatch_id),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task dependencies (#483, epic #478)
 # ---------------------------------------------------------------------------

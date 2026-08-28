@@ -108,6 +108,22 @@ def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
     monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
     monkeypatch.setattr(cursor_cloud, "create_review_agent", recorder)
 
+    async def _no_usage(agent_id, run_id=None):
+        # Default: the API did not answer. Sweep must not hit the network
+        # just because _wire set a fake key (#1026 stamps usage on every
+        # terminal close). Tests that care override this.
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+
+
+async def _any_dispatch_row(db: aiosqlite.Connection, task_id: int) -> dict:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    assert rows, "no dispatch recorded for the task"
+    return dict(rows[-1])
+
 
 async def _submitted(
     client: AsyncClient,
@@ -221,15 +237,47 @@ async def test_finished_run_without_report_alerts_once(
 
     monkeypatch.setattr(cursor_cloud, "get_run", _finished)
 
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 2_500_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
     await sweep_review_dispatches(db)
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     alerts = [u for u in updates if "отчёт НЕ сдан" in u["content"]]
     assert len(alerts) == 1
     assert not await repo.list_active_review_dispatches(db)
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "failed"
+    assert closed["provider_tokens"] == 2_500_000
 
     await sweep_review_dispatches(db)
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert len([u for u in updates if "отчёт НЕ сдан" in u["content"]]) == 1
+
+
+async def test_missing_usage_leaves_dispatch_tokens_null(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1026): the API did not answer → NULL on the dispatch, not 0.
+    # A missing bill is unknown, never a free run (#549).
+    recorder = _DispatchRecorder({"agent": {"id": "bc-unk"}, "run": {"id": "run-unk"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-unknown-bill")
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+
+    await sweep_review_dispatches(db)
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "failed"
+    assert closed["provider_tokens"] is None
 
 
 async def test_usage_mismatch_is_flagged(
@@ -826,6 +874,11 @@ async def test_provider_usage_is_stored_on_the_report(
     saved = dict(await repo.get_latest_machine_review(db, task_id))
     assert saved["provider_tokens"] == 6_013_569
     assert saved["tokens_spent"] == 175_000, "the self-report is not overwritten"
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "done"
+    assert closed["provider_tokens"] == 6_013_569, (
+        "the bill lives on the dispatch too — a failed run has no report row"
+    )
 
 
 # --- Repository review rules in the prompt (#873) ---------------------------

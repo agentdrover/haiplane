@@ -2725,6 +2725,12 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
             "tokens_total": 1428876,
             "tokens_per_confirmed": 357219,
         },
+        "review_dispatches": {
+            "wasted_provider_tokens_total": 2_500_000,
+            "wasted_dispatches": 2,
+            "unknown_usage": 1,
+            "closed_dispatches": 4,
+        },
         "by_harness": [],
         "recurring_categories": [
             {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
@@ -2734,6 +2740,12 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     out = await hub_practice_metrics(since_days=90)
     structured = _mcp_structured(out)
     assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
+    text = _mcp_text(out)
+    assert (
+        "Wasted dispatch spend (no report): 2500000 tokens across 2 failed run(s)"
+        in (text)
+    )
+    assert "1 closed run(s) with unknown usage" in text
     mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")
 
 

@@ -806,6 +806,29 @@ async def test_provider_tokens_migration_is_additive():
         assert rows and rows[0]["provider_tokens"] is None
 
 
+async def test_review_dispatch_provider_tokens_migration_is_additive():
+    # #1026: a dispatch closed before the column existed reads as unknown,
+    # never as a free run (#549).
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        await db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, run_id, model, status) "
+            "VALUES (1, 1, 'bc-legacy', 'run-legacy', 'grok-4.6', 'failed')"
+        )
+        await db.commit()
+
+        rows = list(
+            await db.execute_fetchall(
+                "SELECT provider_tokens FROM review_dispatches WHERE agent_id = "
+                "'bc-legacy'"
+            )
+        )
+        assert rows and rows[0]["provider_tokens"] is None
+
+
 # --- First-class task dependencies (#482, epic #478) -------------------------
 #
 # The order of work has lived outside the hub since the beginning: in a chat,

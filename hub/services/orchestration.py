@@ -471,6 +471,10 @@ async def practice_metrics(
     90-day window that read "103 reviews" on 2026-08-21 keeps 103 as
     ``reports_total``, with at least the 60 rows of the v7 batch moving to
     ``no_data_reports``.
+
+    ``review_dispatches`` is a sibling (#1026): the provider bill of runs
+    that closed without a report. It is never folded into
+    ``tokens_per_confirmed`` / ``provider_tokens_per_confirmed``.
     """
     import statistics
 
@@ -728,10 +732,12 @@ async def practice_metrics(
 
     human_gates = await _human_gate_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
+    review_dispatches = await _review_dispatch_spend_metrics(db, since)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
+        "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,
         "by_reviewer_model": dispositions["by_model"],
@@ -742,6 +748,45 @@ async def practice_metrics(
         "human_gates": human_gates,
         "review_outcomes": review_outcomes,
     }
+
+
+async def _review_dispatch_spend_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """What dispatched runs billed, including those that never reported (#1026).
+
+    Wasted spend is the provider bill of *failed* dispatches — the channel
+    closed without a report of its own. It stays a sibling of
+    ``machine_reviews`` so it cannot inflate ``tokens_per_confirmed`` or
+    ``provider_tokens_per_confirmed`` (#516: numerator and denominator from
+    the same rows). NULL is "never asked or the API did not answer"; 0 is a
+    billed zero. Unknown rows are counted, never collapsed into the sum.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN provider_tokens ELSE 0 END), 0) "
+        "AS wasted_provider_tokens_total, "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) "
+        "AS wasted_dispatches, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "AND provider_tokens IS NULL THEN 1 ELSE 0 END), 0) "
+        "AS unknown_usage, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
+        "FROM review_dispatches WHERE created_at >= datetime('now', ?)",
+        (since,),
+    )
+    if not rows:
+        return {
+            "wasted_provider_tokens_total": 0,
+            "wasted_dispatches": 0,
+            "unknown_usage": 0,
+            "closed_dispatches": 0,
+        }
+    return dict(rows[0])
 
 
 async def _escaped_defect_metrics(
