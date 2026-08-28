@@ -1753,7 +1753,32 @@ async def api_submit_machine_review(
             ensure_ascii=False,
         ),
         lost_dimensions=_json.dumps(body.lost_dimensions, ensure_ascii=False),
+        # #1025: the report's owner as the TOKEN says, beside submitted_by
+        # which stays the caller's self-description. The dispatch sweep
+        # matches on this and on nothing self-reported.
+        principal_id=identity.principal_id,
     )
+    # #1025: a foreign report at an active dispatch is recorded loudly ONCE,
+    # here at intake — the sweep would repeat it every pass. The dispatch
+    # keeps waiting for its own run's report; before this note the collision
+    # was invisible until the usage cross-check misread it as a 36x token
+    # discrepancy (#1011 gen 1).
+    if (
+        dispatch is not None
+        and (dispatch["status"] or "") == "active"
+        and dispatch["reviewer_principal_id"] is not None
+        and identity.principal_id != dispatch["reviewer_principal_id"]
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Отчёт machine-review принят от другого принципала: по этой сдаче "
+            "уже вызвано диспетчерское ревью, и его прогон ещё не отчитался. "
+            "Диспетч продолжает ждать СВОЙ отчёт, сверка расходов по чужому "
+            "отчёту не выполняется (#1025).",
+        )
     await repo.insert_event(
         db,
         kind="machine_review_completed",

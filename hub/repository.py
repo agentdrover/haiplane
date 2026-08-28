@@ -1000,14 +1000,15 @@ async def insert_machine_review(
     lost_dimensions: str = "[]",
     profile: str = "",
     self_reviewed: bool = False,
+    principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1027,6 +1028,7 @@ async def insert_machine_review(
             lost_dimensions,
             profile,
             int(self_reviewed),
+            principal_id,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1915,12 +1917,22 @@ async def create_review_dispatch(
     run_id: str,
     model: str,
     profile: str = "",
+    reviewer_principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches "
-        "(task_id, submission_generation, agent_id, run_id, model, profile) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, submission_generation, agent_id, run_id, model, profile),
+        "(task_id, submission_generation, agent_id, run_id, model, profile, "
+        "reviewer_principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            agent_id,
+            run_id,
+            model,
+            profile,
+            reviewer_principal_id,
+        ),
     )
     return inserted_id(cur)
 
