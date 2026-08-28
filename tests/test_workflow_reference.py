@@ -9,11 +9,37 @@ from hub.models import HIERARCHY_RULES, TaskType
 from hub.workflow_reference import (
     AGENT_COMPLETION_TOOL,
     LIFECYCLE_MAP_HEADER,
+    LIFECYCLE_TRANSITIONS,
     build_mcp_instructions,
     hierarchy_edges,
     lifecycle_map_lines,
     workflow_reference_dict,
 )
+
+# The transition table as it stands on develop before #988 (AC-7).
+FROZEN_TRANSITIONS = [
+    ("draft", "open", "hub_approve_task", "human"),
+    ("draft", "rejected", "hub_reject_task", "human"),
+    ("open", "claimed", "hub_claim_task", "agent"),
+    ("open", "running", "hub_start_task", "human"),
+    ("open", "running", "hub_pair_start", "agent"),
+    ("claimed", "running", "hub_pair_start", "agent"),
+    ("claimed", "open", "hub_release_task", "agent"),
+    ("running", "review", "hub_submit_for_review", "agent"),
+    ("review", "running", "hub_submit_review", "agent"),
+    ("running", "completed", "hub_report_done", "agent"),
+    ("running", "review", "hub_report_done", "agent"),
+    ("running", "ci_check", "hub_report_done", "agent"),
+    ("running", "needs_decision", "hub_report_done", "agent"),
+    ("running", "needs_info", "hub_ask_question", "agent"),
+    ("needs_info", "open", "hub_answer_question", "human"),
+    ("running", "pending_report", "hub_report_done", "agent"),
+    ("pending_report", "review", "hub_report_done", "agent"),
+    ("ci_check", "review", "ci_poller", "ci"),
+    ("needs_decision", "completed", "hub_decide_task", "human"),
+    ("needs_decision", "fix_requested", "hub_decide_task", "human"),
+    ("pending_report", "completed", "hub_report_done", "agent"),
+]
 
 
 def test_hierarchy_edges_match_models() -> None:
@@ -37,15 +63,76 @@ def test_workflow_reference_includes_gates_and_human_tools() -> None:
     assert any(t["from"] == "draft" and t["to"] == "open" for t in ref["transitions"])
 
 
-def test_mcp_instructions_document_hierarchy_and_lifecycle() -> None:
+def test_instructions_point_at_the_map_instead_of_copying_it() -> None:
+    """#988 AC-1: the instruction stopped being a second copy of the map.
+
+    It used to enumerate the hierarchy, the gates and ten ``from→to via tool``
+    transitions that ``hub_my_context(mode=full)`` already prints, so every
+    session paid for the same text twice. What must survive is the part a
+    caller cannot look up without knowing where to look: identity, the
+    canonical completion tool, the human-only list, the envelope, and a
+    pointer.
+    """
     text = build_mcp_instructions()
-    assert "HIERARCHY_RULES" in text
-    assert "epic" in text and "feature" in text and "subtask" in text
-    assert "hub_approve_task" in text
-    assert "hub_decide_task" in text
-    assert "ci_check" in text
+
+    # Still there: what only the instruction can say.
     assert "hub_report_done" in text
+    assert "Human-only tools:" in text
+    assert "hub_approve_task" in text and "hub_decide_task" in text
+    assert "hub_my_context(mode=full)" in text
+    assert "Workflow reference" in text
+
+    # Gone: the enumeration that hub_my_context already carries.
+    assert "HIERARCHY_RULES" not in text
+    assert "Key transitions" not in text
+    for transition in LIFECYCLE_TRANSITIONS:
+        arrow = f"{transition['from']}→{transition['to']} via {transition['tool']}"
+        assert arrow not in text, arrow
+
     assert len(text.encode("utf-8")) < 4096
+
+
+def test_map_splits_author_and_reviewer() -> None:
+    """#988 AC-5: two actors, not one four-step chain for the author.
+
+    The gate line used to read ``hub_submit_for_review → hub_get_review_brief
+    → hub_submit_review``, which describes a self-review: it hands the brief
+    and the verdict to the agent that just submitted.
+    """
+    joined = "\n".join(lifecycle_map_lines())
+
+    assert "hub_submit_for_review → hub_get_review_brief" not in joined
+
+    author = next(ln for ln in lifecycle_map_lines() if ln.startswith("Author lane:"))
+    reviewer = next(
+        ln for ln in lifecycle_map_lines() if ln.startswith("Reviewer lane")
+    )
+    assert author is not reviewer
+    assert "hub_get_review_brief" not in author
+    assert "hub_submit_review" not in author
+    assert "hub_get_review_brief" in reviewer and "hub_submit_review" in reviewer
+    assert "NOT the assigned agent" in reviewer
+
+
+def test_submit_for_review_docstring_names_the_other_actor() -> None:
+    """#988 AC-6: the published description says who writes the verdict."""
+    from hub.mcp_server import hub_submit_for_review
+
+    doc = hub_submit_for_review.__doc__ or ""
+    assert "does NOT complete the task" in doc
+    assert "different actor" in doc
+    assert "hub_submit_review" in doc
+
+
+def test_lifecycle_transitions_unchanged() -> None:
+    """#988 AC-7: the prose was rewritten, the table was not.
+
+    Pinned as literals rather than compared to another branch: a test on a
+    branch cannot measure ``develop``.
+    """
+    assert [
+        (t["from"], t["to"], t["tool"], t["actor"]) for t in LIFECYCLE_TRANSITIONS
+    ] == FROZEN_TRANSITIONS
 
 
 def test_lifecycle_map_lines_header_and_transitions() -> None:
