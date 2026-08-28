@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% set active = "findings" %}
+{% block title %}Находки ждут суждения — {{ product_title }}{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Находки ждут суждения
+        <span class="badge badge-review">{{ total }}</span></h1>
+</header>
+
+{# #1038: судьбу находке называет ЧЕЛОВЕК (#876, правило 1). Значения по
+   умолчанию здесь нет и быть не должно: находка, оставленная неотмеченной,
+   остаётся неразмеченной, а не считается разобранной. #}
+<p class="muted">
+    Ложняк — описанного дефекта в коде НЕТ. Неважно — дефект есть, править не
+    будем. Оставленное «не размечено» так и остаётся неразмеченным: значения по
+    умолчанию нет.
+</p>
+
+{% if not groups %}
+<p>Неразмеченных находок нет. Это значит, что каждая подтверждённая находка
+   текущих сдач получила ответ — precision и resolution rate есть из чего
+   считать.</p>
+{% endif %}
+
+{% for g in groups %}
+<section class="inbox-group">
+    <h2 class="inbox-group-title">
+        <a href="/tasks/{{ g.task_id }}">#{{ g.task_id }} {{ g.task_title }}</a>
+        <span class="inbox-count">{{ g.findings|length }}</span>
+    </h2>
+    <div class="inbox-item-meta">
+        сдача {{ g.generation }} · {{ g.task_status }}{% if g.model %} · {{ g.model }}{% endif %}{% if g.reported_at %} · отчёт от {{ g.reported_at }}{% endif %}
+    </div>
+    <form method="post" action="/tasks/{{ g.task_id }}/web-finding-dispositions">
+        {# Возврат в очередь, а не в карточку: иначе разметка второго отчёта
+           требует навигации назад, то есть ровно той цены, которую эта
+           страница снимает. #}
+        <input type="hidden" name="return_to" value="queue">
+        <ul class="task-review-findings">
+            {% for item in g.findings %}
+            <li>[{{ item.f.severity }}{% if item.f.category %}/{{ item.f.category }}{% endif %}]
+                {% if item.f.file %}{{ item.f.file }}{% if item.f.start_line %}:{{ item.f.start_line }}{% elif item.f.line %}:{{ item.f.line }}{% endif %} — {% endif %}
+                {{ item.f.title }}
+                {% if item.f.detail %}
+                <div class="inbox-item-desc">{{ item.f.detail }}</div>
+                {% endif %}
+                <label><input type="radio" name="disposition-{{ item.index }}"
+                    value="fixed"> исправлено</label>
+                <label><input type="radio" name="disposition-{{ item.index }}"
+                    value="false_positive"> ложняк</label>
+                <label><input type="radio" name="disposition-{{ item.index }}"
+                    value="wont_fix"> неважно</label>
+            </li>
+            {% endfor %}
+        </ul>
+        <button class="btn btn-ghost" type="submit">Сохранить диспозиции</button>
+    </form>
+</section>
+{% endfor %}
+{% endblock %}

@@ -259,8 +259,18 @@ async def get_inbox_data(
         db, states=("pr_open",), project_id=project_id, limit=20
     )
 
+    # #1038: the one section here that is NOT keyed on task status, and that is
+    # the whole point. A machine-review finding is written while the task is in
+    # review; by the time anyone would judge it the task is ``completed`` and
+    # appears in no status-driven section at all. Over seven days that left 47
+    # confirmed findings unanswered and precision uncomputable — not because
+    # judging is expensive (the form has existed since #876) but because
+    # nothing led to it.
+    unjudged = await repo.count_unjudged_findings(db)
+
     return {
         "undelivered": undelivered,
+        "unjudged_findings": unjudged,
         "drafts": [row_to_task(r) for r in draft_rows],
         "questions": questions,
         "decisions": [row_to_task(r) for r in needs_decision_rows],

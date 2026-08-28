@@ -1279,6 +1279,94 @@ async def list_finding_dispositions(
     )
 
 
+# --- The queue of unjudged findings (#1038) --------------------------------
+
+#: Where an unjudged finding LIVES, written once and shared by the list and the
+#: count. Two queries spelling the same set separately is how a page and a
+#: metric come to disagree about one number (#518), so the answer is one
+#: fragment, not two careful copies of it.
+#:
+#: ``t.submission_generation = mr.submission_generation`` is what makes the
+#: report CURRENT. A resubmitted task leaves its earlier reports behind, and
+#: those findings describe code that no longer exists — asking a person to
+#: judge them is asking about a defect in a file as it used to be.
+#:
+#: The disposition is matched per FINDING, not per report. Subtracting one
+#: total from another (what ``confirmed_unjudged`` did before) treats a
+#: judgement on a stale report as an answer about a live one.
+_UNJUDGED_FINDINGS_FROM = (
+    "FROM machine_reviews mr "
+    "JOIN tasks t ON t.id = mr.task_id "
+    "AND t.submission_generation = mr.submission_generation "
+    "JOIN json_each(mr.findings_confirmed) f "
+    "LEFT JOIN finding_dispositions d "
+    "ON d.review_id = mr.id AND d.finding_index = f.key "
+    "WHERE d.id IS NULL"
+)
+
+
+async def list_unjudged_findings(
+    db: aiosqlite.Connection, *, since: str | None = None, limit: int | None = None
+) -> list[aiosqlite.Row]:
+    """Confirmed findings of CURRENT reports that nobody has answered yet.
+
+    Deliberately keyed on nothing about the task's status. Every other inbox
+    section is built from ``list_tasks_by_status``, and that is exactly why
+    these findings were unreachable: a report is written while the task is in
+    review, and by the time anyone would judge it the task is ``completed`` and
+    appears in no section at all. The findings outlive the status, so the query
+    that finds them must not depend on it (#1038).
+
+    ``since`` takes the same relative form as the metrics window
+    ('-90 days'); omitted, the whole history answers.
+    """
+    where = _UNJUDGED_FINDINGS_FROM
+    params: list[Any] = []
+    if since is not None:
+        where += " AND mr.created_at >= datetime('now', ?)"
+        params.append(since)
+    sql = (
+        "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
+        "t.status AS task_status, mr.id AS review_id, "
+        "mr.submission_generation AS submission_generation, "
+        "mr.created_at AS reported_at, mr.model AS model, "
+        "f.key AS finding_index, f.value AS finding "
+        f"{where} ORDER BY mr.created_at ASC, mr.id ASC, f.key ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return await fetchall(db, sql, tuple(params))
+
+
+async def count_unjudged_findings(
+    db: aiosqlite.Connection, *, since: str | None = None
+) -> dict[str, int]:
+    """How many findings wait, and across how many reports.
+
+    Same FROM as :func:`list_unjudged_findings` by construction. The count a
+    person sees on the metrics page and the length of the queue they open from
+    it are the same question, and answering it twice is how the two start
+    disagreeing.
+    """
+    where = _UNJUDGED_FINDINGS_FROM
+    params: list[Any] = []
+    if since is not None:
+        where += " AND mr.created_at >= datetime('now', ?)"
+        params.append(since)
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS findings, "  # nosec B608 - constant fragment
+        f"COUNT(DISTINCT mr.id) AS reports {where}",
+        tuple(params),
+    )
+    row = dict(rows[0]) if rows else {}
+    return {
+        "findings": int(row.get("findings") or 0),
+        "reports": int(row.get("reports") or 0),
+    }
+
+
 # --- Category checks (#878) ------------------------------------------------
 
 

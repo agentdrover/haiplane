@@ -1239,10 +1239,20 @@ async def web_finding_dispositions(task_id: int, request: Request):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    # Where to land afterwards. Judging from the queue (#1038) has to return to
+    # the queue — sending a person to the task card after every report would
+    # make them navigate back for each one, which is the cost this page exists
+    # to remove. The value is not a URL from the form: only the two pages that
+    # carry this form may be named, so the field cannot become an open redirect.
+    back = (
+        "/findings"
+        if str(form.get("return_to") or "") == "queue"
+        else f"/tasks/{task_id}"
+    )
     if not items:
         # Nothing chosen is not an error and not a judgement: the gate looked
         # and marked nothing, which must leave the report exactly as it was.
-        return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+        return RedirectResponse(back, status_code=303)
     try:
         await services.record_finding_dispositions(
             db, task_id, items, decided_by=identity.username
@@ -1251,7 +1261,59 @@ async def web_finding_dispositions(task_id: int, request: Request):
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+    return RedirectResponse(back, status_code=303)
+
+
+@router.get("/findings", response_class=HTMLResponse)
+async def web_findings_queue(request: Request):
+    """Every confirmed finding nobody has answered yet (#1038).
+
+    The page exists because the JUDGEMENT was never the expensive part — the
+    form has been in the task card since #876. What was missing is a way to
+    reach it: reports are written while a task is in review, and every inbox
+    section is built from ``list_tasks_by_status``, so once the task completes
+    its findings appear nowhere. Judging them meant remembering which of
+    twenty-eight tasks had reports.
+
+    Grouped by task so a person answers a whole report in one pass, and posting
+    through the same route the task card uses — a second way to record a
+    judgement would be a second thing to keep honest.
+    """
+    db = _db(request)
+    rows = await repo.list_unjudged_findings(db)
+    groups: list[dict[str, Any]] = []
+    by_review: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        r = dict(row)
+        review_id = int(r["review_id"])
+        group = by_review.get(review_id)
+        if group is None:
+            group = {
+                "task_id": int(r["task_id"]),
+                "task_title": str(r["task_title"] or ""),
+                "task_status": str(r["task_status"] or ""),
+                "review_id": review_id,
+                "generation": int(r["submission_generation"] or 0),
+                "model": str(r["model"] or ""),
+                "reported_at": str(r["reported_at"] or ""),
+                "findings": [],
+            }
+            by_review[review_id] = group
+            groups.append(group)
+        try:
+            finding = json.loads(str(r["finding"]))
+        except ValueError:
+            # A report whose JSON we cannot read is still a row a person should
+            # see: dropping it here would shrink the queue below the count on
+            # the metrics page and make the two disagree.
+            finding = {}
+        group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    total = sum(len(g["findings"]) for g in groups)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "findings_queue.html",
+        {"groups": groups, "total": total},
+    )
 
 
 @router.get("/metrics", response_class=HTMLResponse)

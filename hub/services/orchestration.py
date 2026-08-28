@@ -301,9 +301,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     coverage_rows = await fetchall(
         db,
         "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
-        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
-        "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
-        "COALESCE(SUM(judged.n), 0) AS judged "
+        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged "
         "FROM machine_reviews mr LEFT JOIN ("
         "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
@@ -318,9 +316,19 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
     result["reports_unjudged"] = reports - reports_judged
-    result["confirmed_unjudged"] = max(
-        int(cov.get("confirmed") or 0) - int(cov.get("judged") or 0), 0
-    )
+    # What is actually WAITING, from the same query the queue page reads
+    # (#1038). This used to subtract one sum from another — all confirmed
+    # findings in the window minus all dispositions in it — and that answered a
+    # different question in two ways at once. It counted the findings of
+    # SUPERSEDED reports, which describe code a resubmission has already
+    # replaced and which nobody should be asked to judge; and it let a
+    # judgement filed against a stale report cancel out a live finding, because
+    # totals do not know which finding they came from. The number will read
+    # LOWER than before on the same data. That is the correction, not a
+    # regression: it stopped counting work that does not exist.
+    unjudged = await repo.count_unjudged_findings(db, since=since)
+    result["confirmed_unjudged"] = unjudged["findings"]
+    result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
         dict(_rates(counts), profile=name)
         for name, counts in sorted(by_profile.items())
