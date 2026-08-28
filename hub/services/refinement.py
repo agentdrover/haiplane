@@ -57,6 +57,11 @@ _DOR_RELEVANT_STATUSES = frozenset({"draft", "open", "needs_info"})
 STATEMENT_FIELDS = frozenset(
     {
         "title",
+        # #1013: the statement text is a premise like any other — arguably the
+        # premise, since it is what the review brief shows the reviewer. An
+        # edit to it re-stamps the statement date for the same reason an edit
+        # to problem_statement does: what the task rests on has changed.
+        "description",
         "user_story",
         "problem_statement",
         "business_value",
@@ -381,6 +386,30 @@ async def _apply_refine_writes(
             "",
             "status",
             f"Title refined: {old_row['title']!r} → {updated_columns['title']!r}",
+        )
+
+    # #1013: the same audit for the statement text, on the same condition — a
+    # resend of identical text is not an edit and must not fill the feed. What
+    # is recorded is the FACT and the size of the change, not the two texts:
+    # a description runs to 10000 characters, and pasting both versions into
+    # the feed would bury every other entry on the task. The text itself is on
+    # the card, one click away, which is where a reader compares versions.
+    if (
+        old_row
+        and payload.description is not None
+        and "description" in updated_columns
+        and old_row["description"] != updated_columns["description"]
+    ):
+        before = len(old_row["description"] or "")
+        after = len(updated_columns["description"] or "")
+        await repo.add_task_update(
+            db,
+            task_id,
+            "",
+            "status",
+            f"Statement refined: текст задачи изменён ({before} → {after} симв.). "
+            "Прежняя версия не сохраняется — сравнивать по этой записи как по "
+            "отметке времени.",
         )
 
     ac_count: int | None = None

@@ -1242,3 +1242,106 @@ async def test_refine_cannot_declare_risk_class(client: AsyncClient):
     assert resp.status_code == 200, resp.text
     resp = await client.get(f"/api/tasks/{task['id']}")
     assert resp.json()["risk_class"] is None
+
+
+# ---------------------------------------------------------------------------
+# The statement text itself is refinable (#1013)
+# ---------------------------------------------------------------------------
+#
+# It was not, and that was an omission rather than a decision: the title beside
+# it could be edited AND was audited in the feed, while the description was
+# writable only at INSERT. Every refine that corrected a premise left the text
+# asserting the old one — and the review brief hands that text to the reviewer.
+# Observed on #1010, whose statement had to be corrected by a note saying "do
+# not read the text above".
+
+
+async def test_refine_updates_description(client: AsyncClient):
+    task = await _create_task(client, description="старая постановка")
+
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine",
+        json={"description": "новая постановка"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Asserted on the STORED value, not on the response echo: #370 is the case
+    # where a field was reported as applied while the column stayed untouched.
+    stored = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert stored["description"] == "новая постановка"
+    assert stored["title"] == task["title"], "a text edit must not touch siblings"
+
+
+async def test_refine_without_description_keeps_it(client: AsyncClient):
+    """PATCH semantics: an omitted field is untouched, not blanked."""
+    task = await _create_task(client, description="постановка на месте")
+
+    resp = await client.post(f"/api/tasks/{task['id']}/refine", json={"size": "S"})
+    assert resp.status_code == 200, resp.text
+
+    stored = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert stored["description"] == "постановка на месте"
+
+
+async def test_refine_can_clear_description(client: AsyncClient):
+    """An explicit empty string is a value, not an omission."""
+    task = await _create_task(client, description="было")
+
+    resp = await client.post(
+        f"/api/tasks/{task['id']}/refine", json={"description": ""}
+    )
+    assert resp.status_code == 200, resp.text
+
+    stored = (await client.get(f"/api/tasks/{task['id']}")).json()
+    assert stored["description"] == ""
+
+
+async def test_description_change_is_recorded_once(client: AsyncClient):
+    """The fact is audited; resending identical text is not an edit.
+
+    Agents commonly resend a whole field set, so a feed entry per refine call
+    would bury every other entry on the task. The entry also carries sizes
+    rather than both texts: a description runs to 10000 characters.
+    """
+    before, after = "коротко", "заметно длиннее прежнего"
+    task = await _create_task(client, description=before)
+
+    await client.post(f"/api/tasks/{task['id']}/refine", json={"description": after})
+    await client.post(f"/api/tasks/{task['id']}/refine", json={"description": after})
+
+    updates = (await client.get(f"/api/tasks/{task['id']}")).json()["updates"]
+    recorded = [u for u in updates if "Statement refined" in u["content"]]
+    assert len(recorded) == 1, (
+        f"one real edit, one entry — got {len(recorded)}: "
+        f"{[u['content'] for u in recorded]}"
+    )
+    # Both sizes, so the entry says which way the text moved. Lengths differ on
+    # purpose: equal ones would let a bug that prints one number twice pass.
+    assert str(len(before)) in recorded[0]["content"], recorded[0]["content"]
+    assert str(len(after)) in recorded[0]["content"], recorded[0]["content"]
+
+
+async def test_bulk_refine_updates_description(client: AsyncClient):
+    """Single and bulk must not drift: both write the text and audit it."""
+    first = await _create_task(client, description="a")
+    second = await _create_task(client, description="b")
+
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {"task_id": first["id"], "description": "a2"},
+                {"task_id": second["id"], "description": "b2"},
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    for outcome in resp.json()["results"]:
+        assert "description" in outcome["fields_set"], outcome
+
+    for task, expected in ((first, "a2"), (second, "b2")):
+        stored = (await client.get(f"/api/tasks/{task['id']}")).json()
+        assert stored["description"] == expected
+        assert any("Statement refined" in u["content"] for u in stored["updates"]), (
+            "the bulk path must audit the edit too"
+        )
