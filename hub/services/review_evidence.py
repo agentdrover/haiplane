@@ -555,6 +555,41 @@ async def attach_dispositions(db, view) -> None:
     ]
 
 
+def undisposed_confirmed(machine_review) -> tuple[int, int]:
+    """How many confirmed findings the report carries, and how many nobody judged.
+
+    Only a CURRENT report counts. A report of an earlier submission says
+    nothing about the code being approved now, and counting it would put a
+    warning on a verdict it does not describe (#1012).
+
+    ``finding_index`` indexes ``findings_confirmed`` — the same contract
+    record_finding_dispositions enforces when it refuses an index outside the
+    report. Zero dispositions means nobody judged them, never that they were
+    all fine (#549).
+    """
+    if machine_review is None or not getattr(machine_review, "is_current", False):
+        return 0, 0
+    confirmed = len(machine_review.findings_confirmed)
+    judged = {d.finding_index for d in machine_review.dispositions}
+    return confirmed, sum(1 for i in range(confirmed) if i not in judged)
+
+
+def undisposed_note(confirmed: int, undisposed: int) -> str:
+    """The sentence a verdict carries when it overrode findings nobody answered.
+
+    Written for the RECORD, not the screen: the screen is read once and the
+    record is what someone reads a week later asking why this shipped.
+    """
+    if not undisposed:
+        return ""
+    return (
+        f"ОДОБРЕНО ПРИ НЕРАЗМЕЧЕННЫХ НАХОДКАХ: текущий отчёт ревью несёт "
+        f"{confirmed} подтверждённых, из них {undisposed} без диспозиции — "
+        "никто не сказал, чем они оказались. Вердикт записан; находки "
+        "остаются неотвеченными."
+    )
+
+
 async def review_report(
     db: Any, task_row: dict[str, Any], mr_row: Any = None
 ) -> "ReviewReport":
