@@ -2388,12 +2388,22 @@ async def transition_after_agent_done(
         # complete itself, a worse defect than the one being fixed.
         # The base default belongs to git_ops (_resolve_base, #362 I4) — an
         # empty base is passed through, never recomputed here.
-        differs = await plugins.git_ops.content_differs(
-            (ctx.get("base_branch") or "").strip(),
-            branch,
-            repo=git_repo,
-            gh_repo=ctx.get("gh_repo"),
-        )
+        try:
+            differs = await plugins.git_ops.content_differs(
+                (ctx.get("base_branch") or "").strip(),
+                branch,
+                repo=git_repo,
+                gh_repo=ctx.get("gh_repo"),
+            )
+        except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+            # A done report must not 500 because git blinked. An unanswered
+            # question keeps the old path, exactly like an explicit None.
+            log.warning("delivery check for #%s failed: %s", task_id, exc)
+            differs = None
+        # ONLY an explicit False skips. None means "could not compare", and it
+        # deliberately keeps the ordinary path — PR, CI and the gate — because
+        # the risk to guard against is silently closing a task, not opening a
+        # pull request that the CI gate will judge anyway (#725).
         nothing_to_deliver = differs is False
         if nothing_to_deliver:
             await repo.add_task_update(

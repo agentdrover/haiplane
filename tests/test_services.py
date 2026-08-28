@@ -5565,6 +5565,22 @@ async def test_the_question_is_asked_after_the_commit_and_of_the_worktree(
     monkeypatch.setattr(plugins.git_ops, "auto_commit", _commit, raising=False)
     monkeypatch.setattr(plugins.git_ops, "content_differs", _differs, raising=False)
     spies = _delivery_spies(monkeypatch)
+    # A NAMED repository, not the empty context the other tests run with: with
+    # an empty one both sides of the comparison below are None and the
+    # assertion passes no matter which repository was asked. Review round 2
+    # caught exactly that — the test asserted None == None and proved nothing.
+    from hub import app as hub_app
+
+    monkeypatch.setattr(
+        hub_app.services,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/clone", "base_branch": "develop"}),
+    )
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context",
+        AsyncMock(return_value={"repo": "/clone", "base_branch": "develop"}),
+        raising=False,
+    )
     task_id = await _pair_task_ready_for_done(db, "Order matters")
 
     await services.add_update(
@@ -5582,6 +5598,34 @@ async def test_the_question_is_asked_after_the_commit_and_of_the_worktree(
     # exactly what the review found in the first attempt.
     assert spies["squash_branch"].called
     worked_in = spies["squash_branch"].call_args.kwargs.get("repo")
+    assert worked_in, "the tail must name the repository it works in"
     assert asked_repo == [worked_in], (
         "the question goes to the repository the tail actually works in"
     )
+
+
+async def test_delivery_check_survives_a_git_failure(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # #991 round 2: the call was unguarded while its twin in the release path
+    # is wrapped. A done report must not 500 because git blinked, and an
+    # unanswered question must keep the ordinary path — PR, CI, gate — rather
+    # than close the task quietly (#725).
+    from hub.integrations.registry import plugins
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("git went away")
+
+    monkeypatch.setattr(plugins.git_ops, "content_differs", _boom, raising=False)
+    spies = _delivery_spies(monkeypatch)
+    task_id = await _pair_task_ready_for_done(db, "Git exploded")
+
+    await services.add_update(
+        db,
+        task_id,
+        TaskUpdateCreate(agent="dev", kind="done", content="Reported anyway"),
+    )
+
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "ci_check", "a git failure keeps the ordinary path"
+    assert spies["create_pr"].called
