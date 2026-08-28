@@ -1115,8 +1115,14 @@ _FINAL_STATUS_VALUES = frozenset(s.value for s in FINAL_STATUSES)
 _AWAITING_HUMAN_VALUES = frozenset(s.value for s in AWAITING_HUMAN_STATUSES)
 
 
-async def _claimed_non_final(username: str) -> tuple[list[dict[str, Any]], bool]:
-    """The holder's live claimed rows, and whether the walk hit its cap.
+async def _claimed_non_final(username: str) -> tuple[list[dict[str, Any]], str]:
+    """The holder's live claimed rows, and why the walk is incomplete if it is.
+
+    Second element is "" when the walk saw everything, "capped" when it ran
+    out of pages, and "unreadable" when a page could not be fetched. Those are
+    three different sentences and the digest says whichever is true: a walk
+    that stopped early must not answer "none live" in the same voice it uses
+    when it really looked at everything.
 
     Compact cards on every page, never full ones: the digest names id, title
     and status, and a full card of this hub weighs about 10 KB. Fetching those
@@ -1133,16 +1139,18 @@ async def _claimed_non_final(username: str) -> tuple[list[dict[str, Any]], bool]
         try:
             page = await _api_get(query)
         except HubApiError:
-            return kept, False
+            return kept, "unreadable"
         rows = page.get("tasks", []) if isinstance(page, dict) else (page or [])
         kept.extend(r for r in rows if r.get("status") not in _FINAL_STATUS_VALUES)
         cursor = page.get("next_cursor") if isinstance(page, dict) else None
         if not cursor:
-            return kept, False
-    return kept, True
+            return kept, ""
+    return kept, "capped"
 
 
-async def _headless_review_ids(username: str, rows: list[dict[str, Any]]) -> set[int]:
+async def _headless_review_ids(
+    username: str, rows: list[dict[str, Any]]
+) -> tuple[set[int], bool]:
     """Ids among ``rows`` whose review is owned by the poller, not a person.
 
     ``review`` is an awaiting-human status by membership, with the exclusion
@@ -1152,16 +1160,19 @@ async def _headless_review_ids(username: str, rows: list[dict[str, Any]]) -> set
     slice actually holds a review row, which is usually never.
     """
     if not any(r.get("status") == "review" for r in rows):
-        return set()
+        return set(), True
     try:
         page = await _api_get(
             f"/api/tasks?claimed_by={urllib.parse.quote(username)}"
             f"&status=review&limit={_CLAIMED_PAGE_LIMIT}"
         )
     except HubApiError:
-        return set()
+        # Unresolved, not resolved-as-human: every review row falls into
+        # Waiting below, and an agent idling on work that is still its own is
+        # exactly what that would cost. Say it instead of guessing quietly.
+        return set(), False
     full = page.get("tasks", []) if isinstance(page, dict) else (page or [])
-    return {int(t["id"]) for t in full if t.get("review_job_id")}
+    return {int(t["id"]) for t in full if t.get("review_job_id")}, True
 
 
 def _split_in_flight_and_waiting(
@@ -1177,6 +1188,23 @@ def _split_in_flight_and_waiting(
         )
         (waiting if awaits_human else in_flight).append(row)
     return in_flight, waiting
+
+
+# Three different sentences for three different amounts of ignorance (#987).
+_WALK_QUALIFIER = {
+    "capped": f" in the newest {_CLAIMED_PAGE_LIMIT * _CLAIMED_MAX_PAGES} claimed rows",
+    "unreadable": " in the rows that could be read — a page of claimed tasks failed",
+}
+_WALK_NOTE = {
+    "capped": (
+        f"Note: stopped after {_CLAIMED_MAX_PAGES} pages of claimed rows — "
+        "older live work, if any, is not listed."
+    ),
+    "unreadable": (
+        "Note: a page of claimed rows could not be read — this list may be "
+        "missing live work."
+    ),
+}
 
 
 def _claimed_line(label: str, rows: list[dict[str, Any]]) -> str:
@@ -1212,10 +1240,11 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
     username = (identity.get("username") or "").strip()
     in_flight: list[dict[str, Any]] = []
     waiting: list[dict[str, Any]] = []
-    walk_capped = False
+    walk_incomplete = ""
+    headless_known = True
     if username:
-        my_tasks, walk_capped = await _claimed_non_final(username)
-        headless = await _headless_review_ids(username, my_tasks)
+        my_tasks, walk_incomplete = await _claimed_non_final(username)
+        headless, headless_known = await _headless_review_ids(username, my_tasks)
         in_flight, waiting = _split_in_flight_and_waiting(my_tasks, headless)
 
     lines = ["## Hub Context (no task)"]
@@ -1250,17 +1279,15 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
     if not in_flight and not waiting:
         lines.append(
             "Your claimed tasks: none live"
-            + (
-                f" in the newest {_CLAIMED_PAGE_LIMIT * _CLAIMED_MAX_PAGES} claimed rows"
-                if walk_capped
-                else ""
-            )
+            + _WALK_QUALIFIER.get(walk_incomplete, "")
             + " (completed ones stay in hub_list_tasks with claimed_by + status)"
         )
-    elif walk_capped:
+    elif walk_incomplete:
+        lines.append(_WALK_NOTE[walk_incomplete])
+    if not headless_known:
         lines.append(
-            f"Note: stopped after {_CLAIMED_MAX_PAGES} pages of claimed rows — "
-            "older live work, if any, is not listed."
+            "Note: could not tell headless review from a client-driven one "
+            "(the review lookup failed) — rows in review are listed as Waiting."
         )
     lines.append("")
     lines.extend(lifecycle_map_lines())
