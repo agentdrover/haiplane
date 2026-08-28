@@ -1471,6 +1471,18 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE chat_pair_sessions ADD COLUMN acting_principal_id INTEGER "
         "REFERENCES principals(id)",
     ),
+    # #1025: who a review report and a dispatched run belong to, as facts from
+    # the TOKEN — submitted_by is the caller naming itself and stays what it
+    # was. Both nullable, no backfill: a NULL means "recorded before this
+    # existed" and every reader falls back to the old rule on it.
+    (
+        "add_machine_reviews_principal_id",
+        "ALTER TABLE machine_reviews ADD COLUMN principal_id INTEGER",
+    ),
+    (
+        "add_review_dispatches_reviewer_principal_id",
+        "ALTER TABLE review_dispatches ADD COLUMN reviewer_principal_id INTEGER",
+    ),
 ]
 
 
