@@ -954,3 +954,135 @@ async def test_chat_pair_page_copy_stays_intake(hub):
     assert "постановку и уточнение" in page.text
     assert "Передать в облачный чат" not in page.text
     assert "implementer" not in page.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# #983 TTL: refuse renew; release bound pair task when implementer session dies
+# ---------------------------------------------------------------------------
+
+
+async def _pair_start_implementer(hub, task_id: int, session: dict[str, str]) -> None:
+    started = await hub.client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "assigned_agent": config.CHAT_PAIR_AGENT,
+            "plan": "Plan: go",
+            "session_id": "s-983",
+            "git_mode": "remote",
+        },
+        headers=session,
+    )
+    assert started.status_code == 200, started.text
+
+
+async def _expire_kind(hub, kind: str) -> None:
+    await hub.db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 second') "
+        "WHERE kind = ?",
+        (kind,),
+    )
+    await hub.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_expired_implementer_session_releases_running_task(hub):
+    """#983 AC-1: dead implementer session returns the bound running task to open."""
+    task_id = await _make_task(hub)
+    session = await _implementer_session(hub, task_id)
+    await _pair_start_implementer(hub, task_id, session)
+    await _expire_kind(hub, "implementer")
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "open"
+    updates = await _rows(
+        hub.db,
+        "SELECT kind, content FROM task_updates WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    )
+    assert any(
+        u["kind"] == "status" and "pairing session expired" in u["content"]
+        for u in updates
+    )
+    who = await hub.client.get("/api/whoami", headers=session)
+    assert who.status_code == 401, who.text
+
+
+@pytest.mark.asyncio
+async def test_expired_implementer_session_releases_claimed_task(hub):
+    """#983: claim without pair-start is also unstuck when the session dies."""
+    task_id = await _make_task(hub)
+    session = await _implementer_session(hub, task_id)
+    claimed = await hub.client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": config.CHAT_PAIR_AGENT, "session_id": "s-983-claim"},
+        headers=session,
+    )
+    assert claimed.status_code == 200, claimed.text
+    await _expire_kind(hub, "implementer")
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_expired_implementer_session_leaves_review_task(hub):
+    """#983: work already in review is not yanked back to open."""
+    task_id = await _make_task(hub)
+    session = await _implementer_session(hub, task_id)
+    await _pair_start_implementer(hub, task_id, session)
+    await hub.db.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+    await hub.db.commit()
+    await _expire_kind(hub, "implementer")
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "review"
+
+
+@pytest.mark.asyncio
+async def test_expired_intake_session_does_not_release_running_task(hub):
+    """#983 out of scope: intake TTL does not move a running pair task."""
+    task_id = await _make_task(hub)
+    started = await hub.client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"assigned_agent": "bot", "plan": "Plan: go", "session_id": "s-intake"},
+        headers=hub.agent_auth,
+    )
+    assert started.status_code == 200, started.text
+    await _session(hub)
+    await _expire_kind(hub, "intake")
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_live_implementer_session_does_not_release_running_task(hub):
+    """#983: a still-valid implementer token must not trip the reaper."""
+    task_id = await _make_task(hub)
+    session = await _implementer_session(hub, task_id)
+    await _pair_start_implementer(hub, task_id, session)
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "running"
+    who = await hub.client.get("/api/whoami", headers=session)
+    assert who.status_code == 200, who.text

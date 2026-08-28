@@ -39,6 +39,10 @@ def test_operator_guide_separates_intake_and_implementer_pairing():
     assert idx_4a < idx_4b
     intake = text[idx_4a:idx_4b]
     assert "Передать в облачный чат" not in intake
+    section_4b = text[idx_4b:]
+    assert "отдельная задача (#983)" not in section_4b
+    assert "Продления нет" in section_4b
+    assert "возвращает её в `open`" in section_4b
 
 
 def test_implementer_path_spec_freezes_intake_961():

@@ -26,6 +26,18 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
     {"from": "claimed", "to": "running", "tool": "hub_pair_start", "actor": "agent"},
     {"from": "claimed", "to": "open", "tool": "hub_release_task", "actor": "agent"},
     {
+        "from": "claimed",
+        "to": "open",
+        "tool": "chat_pair_reaper",
+        "actor": "ci",
+    },
+    {
+        "from": "running",
+        "to": "open",
+        "tool": "chat_pair_reaper",
+        "actor": "ci",
+    },
+    {
         "from": "running",
         "to": "review",
         "tool": "hub_submit_for_review",

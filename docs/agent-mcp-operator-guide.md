@@ -336,7 +336,10 @@ curl -sS https://<hub>/api/whoami -H "Authorization: Bearer $TOKEN"
    у intake. Нет действующего агента-принципала — 503 на выдаче кода.
 
 TTL сессии тот же `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200), что у intake.
-Продление или release-on-expiry — отдельная задача (#983), не этот раздел.
+**Продления нет:** новый маршрут не добавляется в implementer allowlist.
+Если сессия истекла или отозвана, пока bound-задача ещё `running` или
+`claimed`, reaper хаба возвращает её в `open` и пишет status-update
+(release-on-expiry, #983). Задача в `review` / `completed` не трогается.
 
 ---
 

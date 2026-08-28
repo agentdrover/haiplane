@@ -147,7 +147,7 @@ force-complete**. Этот канал их не вызывает и не пол�
 | Claim / pair-start / updates / submit-review / done | 403 | только `bound_task_id`, и только пока вызывающий — holder (`claim_session_id` / `implementer_principal_id`) |
 | Approve / decide / review-verdict / admin / `/mcp` / refine AC | 403 | 403 |
 | Permissions | `CHAT_PAIR_PERMS` | `CHAT_PAIR_IMPLEMENTER_PERMS` = `{tasks.read, tasks.update, tasks.agent_report}`. **Не** `_AGENT_DEFAULT_PERMS` (там `tasks.create`). `tasks.human_gate` запрещён — иначе `is_human` True |
-| TTL | 300 с / 7200 с | код 300 с; сессия 7200 с до T-ttl |
+| TTL | 300 с / 7200 с | код 300 с; сессия 7200 с; **без renew**. Истекшая implementer-сессия возвращает bound `running`/`claimed` в `open` (#983) |
 | Revoke | только `kind=intake` | только `kind=implementer` (+ `bound_task_id` с карточки). Self-revoke не гасит intake |
 
 `env_get("CHAT_PAIR_AGENT")` → переменная **`HAIPLANE_CHAT_PAIR_AGENT`**.
@@ -335,8 +335,8 @@ id → 409, строка A не меняется. Heartbeat чужой → **404
 **F-pair** → T-kind-spec `docs`; T-kind `feature` L (полный DoR, AC на
 чужой task_id, выдачу не из open, self-revoke по kind, повторный redeem
 401, missing `cloud` → 503 на start / 401 на redeem); T-ui `feature` S
-(кнопка только на `open`); T-docs `docs`; T-ttl `feature` M — не
-стартовать до первого живого прогона.
+(кнопка только на `open`); T-docs `docs`; T-ttl `feature` M — нет
+renew, истёкшая implementer-сессия возвращает bound pair-задачу в `open`.
 
 T-kind `affected_areas` включает `hub/models.py`,
 `hub/actionable_errors.py`, `hub/db.py`.

@@ -29,6 +29,7 @@ from typing import Any, Final
 import aiosqlite
 
 from hub import config
+from hub import repository as repo
 from hub.auth import LoginRateLimiter
 from hub.config import TokenIdentity
 from hub.db import fetchall
@@ -361,12 +362,78 @@ async def revoke_sessions(
     return int(cursor.rowcount or 0)
 
 
+async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[int]:
+    """Return bound pair tasks to open when their implementer session is dead.
+
+    Intake TTL is unchanged (#983 out of scope). A live token must not trip
+    this. Review/completed stay: the work already left the pairing window.
+    Headless ``job_id`` rows are not pairing sessions and are left alone.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT s.bound_task_id AS task_id, t.status AS status, t.job_id AS job_id "
+        "FROM chat_pair_sessions s "
+        "JOIN tasks t ON t.id = s.bound_task_id "
+        "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
+        "AND (s.expires_at < datetime('now') OR s.revoked_at IS NOT NULL) "
+        "AND t.status IN ('running', 'claimed')",
+    )
+    released: list[int] = []
+    seen: set[int] = set()
+    for raw in rows:
+        row = dict(raw)
+        if row.get("job_id"):
+            continue
+        task_id = int(row["task_id"])
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        from_status = str(row["status"])
+        if not await repo.transition_status_if(
+            db, task_id, expected_from=from_status, new_status="open"
+        ):
+            continue
+        await repo.update_task(
+            db,
+            task_id,
+            claimed_by=None,
+            claim_session_id=None,
+            claimed_at=None,
+            implementer_principal_id=None,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            "Implementer pairing session expired; task returned to open.",
+        )
+        await repo.insert_event(
+            db,
+            kind="chat_pair_implementer_expired",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "chat_pair_implementer_expired", "from": from_status},
+        )
+        released.append(task_id)
+    if released:
+        await db.commit()
+        log.info(
+            "Chat-pair reaper: released %d implementer-bound task(s) to open",
+            len(released),
+        )
+    return released
+
+
 async def purge_expired(db: aiosqlite.Connection) -> int:
     """Drop what can no longer be used: the reaper's half of the channel.
 
     Spent codes linger for a retention window so "was this code used?" has an
     answer for a while; everything expired or revoked goes immediately.
+    Dead implementer sessions unstick their bound pair task first (#983),
+    otherwise purge would delete the only row that still named the task.
     """
+    await release_expired_implementer_tasks(db)
     hours = int(config.CHAT_PAIR_SPENT_RETENTION_HOURS)
     codes = await db.execute(
         "DELETE FROM chat_pair_codes WHERE expires_at < datetime('now') "
