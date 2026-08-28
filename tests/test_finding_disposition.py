@@ -8,6 +8,7 @@ way must keep reading — they were filed under the only scheme that existed.
 
 from __future__ import annotations
 
+import json
 
 import pytest
 from httpx import AsyncClient
@@ -261,3 +262,34 @@ async def test_uid_identifies_the_same_defect_in_the_next_report(
     old_rows = await _stored(db, first_review)
     assert len(old_rows) == 1
     assert old_rows[0]["finding_index"] == 0
+
+
+async def test_disposition_emits_event(client: AsyncClient, db):
+    # AC-1 (#1009): a human disposition is a gate event, not only a status
+    # line. The feed names the actor and how many findings this call judged.
+    from hub.db import fetchall
+    from hub.services.gate_events import DISPOSITION_RECORDED
+
+    task_id, _ = await _task_with_report(client, db)
+    uid = finding_uids(_FINDINGS)[0]
+    await record_finding_dispositions(
+        db,
+        task_id,
+        [FindingDispositionItem(finding_uid=uid, disposition=FindingDisposition.fixed)],
+        decided_by="denis",
+    )
+
+    rows = [
+        dict(r)
+        for r in await fetchall(
+            db,
+            "SELECT actor, payload FROM events WHERE task_id=? AND kind=?",
+            (task_id, DISPOSITION_RECORDED),
+        )
+    ]
+    assert len(rows) == 1, (
+        "the disposition must leave a typed event, not only a status line"
+    )
+    assert rows[0]["actor"] == "denis"
+    payload = json.loads(rows[0]["payload"])
+    assert payload["judged"] == 1

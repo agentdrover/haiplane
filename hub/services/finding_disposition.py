@@ -38,6 +38,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.models import FindingDispositionItem
 from hub.services.finding_identity import finding_uids
+from hub.services.gate_events import DISPOSITION_RECORDED
 
 
 async def record_finding_dispositions(
@@ -113,6 +114,16 @@ async def record_finding_dispositions(
             decided_by=decided_by,
         )
     judged = len(await repo.list_finding_dispositions(db, int(review["id"])))
+    await repo.insert_event(
+        db,
+        kind=DISPOSITION_RECORDED,
+        task_id=task_id,
+        actor=decided_by,
+        payload={
+            "judged": judged,
+            "confirmed_total": len(confirmed),
+        },
+    )
     await repo.add_task_update(
         db,
         task_id,
