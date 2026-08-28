@@ -3533,7 +3533,7 @@ async def test_unknown_refine_argument_is_named_beside_no_op() -> None:
     """
     from hub.mcp_server import mcp
 
-    secret = "sk-live-do-not-echo-1015"
+    secret = "sentinel-value-must-not-echo-1015"
     result = await mcp.call_tool(
         "hub_refine_task",
         {"task_id": 42, "descriptoin": secret},

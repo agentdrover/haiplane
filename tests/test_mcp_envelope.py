@@ -81,7 +81,6 @@ def test_discarded_argument_names_empty_when_all_declared() -> None:
 
 
 def test_attach_unknown_arguments_names_json_text_and_skips_values() -> None:
-    secret = "sk-live-do-not-echo"
     result = CallToolResult(
         content=[
             TextContent(
@@ -95,7 +94,6 @@ def test_attach_unknown_arguments_names_json_text_and_skips_values() -> None:
     assert isinstance(attached, CallToolResult)
     text = attached.content[0].text
     assert "descriptoin" in text
-    assert secret not in text
     payload = json.loads(text)
     assert payload[UNKNOWN_ARGUMENTS_KEY] == ["descriptoin"]
     assert attached.structuredContent[UNKNOWN_ARGUMENTS_KEY] == ["descriptoin"]
