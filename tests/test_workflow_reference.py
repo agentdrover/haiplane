@@ -16,30 +16,57 @@ from hub.workflow_reference import (
     workflow_reference_dict,
 )
 
-# The transition table as it stands on develop before #988 (AC-7).
-FROZEN_TRANSITIONS = [
-    ("draft", "open", "hub_approve_task", "human"),
-    ("draft", "rejected", "hub_reject_task", "human"),
-    ("open", "claimed", "hub_claim_task", "agent"),
-    ("open", "running", "hub_start_task", "human"),
-    ("open", "running", "hub_pair_start", "agent"),
-    ("claimed", "running", "hub_pair_start", "agent"),
-    ("claimed", "open", "hub_release_task", "agent"),
-    ("running", "review", "hub_submit_for_review", "agent"),
-    ("review", "running", "hub_submit_review", "agent"),
-    ("running", "completed", "hub_report_done", "agent"),
-    ("running", "review", "hub_report_done", "agent"),
-    ("running", "ci_check", "hub_report_done", "agent"),
-    ("running", "needs_decision", "hub_report_done", "agent"),
-    ("running", "needs_info", "hub_ask_question", "agent"),
-    ("needs_info", "open", "hub_answer_question", "human"),
-    ("running", "pending_report", "hub_report_done", "agent"),
-    ("pending_report", "review", "hub_report_done", "agent"),
-    ("ci_check", "review", "ci_poller", "ci"),
-    ("needs_decision", "completed", "hub_decide_task", "human"),
-    ("needs_decision", "fix_requested", "hub_decide_task", "human"),
-    ("pending_report", "completed", "hub_report_done", "agent"),
-]
+# Every transition that exists today, pinned as a SUBSET requirement (#1003).
+#
+# #988 compared the table to this list exactly, so #983 adding two legitimate
+# chat_pair_reaper rows turned it red — two green branches, red together
+# (#921), and every future transition had to edit this file: the same
+# serialization point #829 removed from the catalog budget.
+#
+# Subset, not equality, is the whole fix. Adding a row is free. Changing or
+# removing one of these still fails, which keeps the coverage the snapshot had
+# — nothing else in the repo guards this table, and a wrong row here is a map
+# an agent follows into a refusal.
+FROZEN_ROWS = {
+    ("draft", "open", "hub_approve_task"): "human",
+    ("draft", "rejected", "hub_reject_task"): "human",
+    ("open", "claimed", "hub_claim_task"): "agent",
+    ("open", "running", "hub_start_task"): "human",
+    ("open", "running", "hub_pair_start"): "agent",
+    ("claimed", "running", "hub_pair_start"): "agent",
+    ("claimed", "open", "hub_release_task"): "agent",
+    ("claimed", "open", "chat_pair_reaper"): "ci",
+    ("running", "open", "chat_pair_reaper"): "ci",
+    ("running", "review", "hub_submit_for_review"): "agent",
+    ("review", "running", "hub_submit_review"): "agent",
+    ("running", "completed", "hub_report_done"): "agent",
+    ("running", "review", "hub_report_done"): "agent",
+    ("running", "ci_check", "hub_report_done"): "agent",
+    ("running", "needs_decision", "hub_report_done"): "agent",
+    ("running", "needs_info", "hub_ask_question"): "agent",
+    ("needs_info", "open", "hub_answer_question"): "human",
+    ("running", "pending_report", "hub_report_done"): "agent",
+    ("pending_report", "review", "hub_report_done"): "agent",
+    ("ci_check", "review", "ci_poller"): "ci",
+    ("needs_decision", "completed", "hub_decide_task"): "human",
+    ("needs_decision", "fix_requested", "hub_decide_task"): "human",
+    ("pending_report", "completed", "hub_report_done"): "agent",
+}
+KNOWN_ACTORS = frozenset({"agent", "human", "ci"})
+
+
+def _assert_frozen_rows_intact(transitions) -> None:
+    rows = {(t["from"], t["to"], t["tool"]): t["actor"] for t in transitions}
+    for key, actor in FROZEN_ROWS.items():
+        assert key in rows, f"transition disappeared: {key}"
+        assert rows[key] == actor, f"actor changed on {key}: {rows[key]} != {actor}"
+
+
+def _assert_well_formed(transitions) -> None:
+    keys = [(t["from"], t["to"], t["tool"]) for t in transitions]
+    assert len(keys) == len(set(keys)), "duplicate from/to/tool rows"
+    for t in transitions:
+        assert t["actor"] in KNOWN_ACTORS, f"unknown actor: {t['actor']}"
 
 
 def test_hierarchy_edges_match_models() -> None:
@@ -124,15 +151,27 @@ def test_submit_for_review_docstring_names_the_other_actor() -> None:
     assert "hub_submit_review" in doc
 
 
-def test_lifecycle_transitions_unchanged() -> None:
-    """#988 AC-7: the prose was rewritten, the table was not.
+def test_review_lane_rows_are_pinned() -> None:
+    """#988 AC-7, re-pinned: the prose was rewritten, no transition moved."""
+    _assert_frozen_rows_intact(LIFECYCLE_TRANSITIONS)
 
-    Pinned as literals rather than compared to another branch: a test on a
-    branch cannot measure ``develop``.
+
+def test_transition_table_is_well_formed() -> None:
+    """A row nobody can act on, or two rows claiming the same move, is a bug."""
+    _assert_well_formed(LIFECYCLE_TRANSITIONS)
+
+
+def test_a_new_transition_needs_no_test_edit() -> None:
+    """#1003: adding a legitimate transition must not turn this file red.
+
+    That is what broke: #983 added two chat_pair_reaper rows and a literal
+    snapshot of the table failed, though nothing it cared about had moved.
     """
-    assert [
-        (t["from"], t["to"], t["tool"], t["actor"]) for t in LIFECYCLE_TRANSITIONS
-    ] == FROZEN_TRANSITIONS
+    extended = list(LIFECYCLE_TRANSITIONS) + [
+        {"from": "running", "to": "open", "tool": "some_future_reaper", "actor": "ci"}
+    ]
+    _assert_frozen_rows_intact(extended)
+    _assert_well_formed(extended)
 
 
 def test_lifecycle_map_lines_header_and_transitions() -> None:
