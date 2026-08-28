@@ -3161,6 +3161,14 @@ async def test_my_context_drops_completed_claimed(mock_api_get: AsyncMock) -> No
         assert dead not in text
     ids = {t["id"] for t in _mcp_structured(out)["my_tasks"]}
     assert ids == {901}, "text and structured payload must name the same tasks"
+    # The third state — a walk that actually finished — needs pinning too, and
+    # only a negative assertion can do it. Cross-model review of #1011 mutated
+    # the clean-finish return to "capped" and all 365 tests stayed green: every
+    # digest, even this one-page one, would carry a false "stopped after 5
+    # pages" note, which is the same wrong-voice defect the three states exist
+    # to prevent.
+    assert "claimed rows" not in text, "a finished walk must not claim it was cut short"
+    assert "could not be read" not in text
 
 
 async def test_my_context_waiting_is_client_driven_review(
