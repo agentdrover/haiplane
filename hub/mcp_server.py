@@ -2006,8 +2006,9 @@ async def hub_force_complete_task(
     Args:
         task_id: Task or subtask to complete
         comment: Audit-trail reason; required for most active lifecycle states
-        pr_disposition: The PR's fate — 'deliver'|'abandon'|''. Recorded,
-            never acted on (#897).
+        pr_disposition: The PR's fate — 'deliver'|'abandon'|''. 'deliver'
+            merges under the gate's conditions, else refuses with the reason
+            (#1037).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2229,9 +2230,7 @@ async def hub_decide_task(
     and can persist it as a reusable record through notes.
 
     decision_summary is always written to the task log, so the reasoning
-    survives without a notes backend. record_decision also saves it through
-    the notes plugin when configured; if notes are unavailable, the core flow
-    is unaffected.
+    survives without a notes backend; notes are optional and never block.
 
     Args:
         task_id: The needs_decision task ID
@@ -2239,9 +2238,9 @@ async def hub_decide_task(
         instructions: When action='rework', what needs to be fixed
         decision_summary: Short reason (recorded in task updates)
         record_decision: Also persist through the notes integration
-        pr_disposition: On accept, the PR's fate — 'deliver'|'abandon'|''.
-            Recorded, never acted on: the task stays in
-            hub_undelivered_completed until the PR itself moves (#897).
+        pr_disposition: On accept — 'deliver'|'abandon'|''. 'deliver' merges
+            under the gate's own conditions or refuses naming the unmet one:
+            a decision cannot stand in for a gate (#1037).
     """
     body: dict[str, Any] = {
         "action": action,
