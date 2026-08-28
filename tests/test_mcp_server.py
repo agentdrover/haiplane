@@ -3533,17 +3533,17 @@ async def test_unknown_refine_argument_is_named_beside_no_op() -> None:
     """
     from hub.mcp_server import mcp
 
-    secret = "sentinel-value-must-not-echo-1015"
+    dropped = "sentinel-value-must-not-echo-1015"
     result = await mcp.call_tool(
         "hub_refine_task",
-        {"task_id": 42, "descriptoin": secret},
+        {"task_id": 42, "descriptoin": dropped},
     )
     structured = _call_tool_structured(result)
     assert structured is not None
     assert structured["no_op"] is True
     assert _unknown_arguments(result) == ["descriptoin"]
     dumped = json.dumps(structured) + _call_tool_text(result)
-    assert secret not in dumped
+    assert dropped not in dumped
 
 
 async def test_declared_refine_arguments_do_not_warn(
