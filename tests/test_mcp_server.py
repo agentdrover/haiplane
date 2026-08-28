@@ -72,6 +72,53 @@ def _mcp_structured(result: CallToolResult | str) -> dict[str, Any] | None:
     return None
 
 
+def _call_tool_text(result: Any) -> str:
+    """Plain text from any FastMCP ``call_tool`` return shape."""
+    if isinstance(result, CallToolResult):
+        return _mcp_text(result)
+    if isinstance(result, tuple) and len(result) == 2:
+        blocks, _structured = result
+        return "\n".join(
+            block.text for block in (blocks or []) if isinstance(block, TextContent)
+        )
+    if isinstance(result, (list, tuple)):
+        return "\n".join(
+            block.text for block in result if isinstance(block, TextContent)
+        )
+    if isinstance(result, str):
+        return result
+    return ""
+
+
+def _call_tool_structured(result: Any) -> dict[str, Any] | None:
+    if isinstance(result, CallToolResult):
+        payload = result.structuredContent
+        return payload if isinstance(payload, dict) else None
+    if isinstance(result, tuple) and len(result) == 2:
+        payload = result[1]
+        return payload if isinstance(payload, dict) else None
+    if isinstance(result, dict):
+        return result
+    return None
+
+
+def _unknown_arguments(result: Any) -> list[str] | None:
+    """Names advertised on the call_tool result, or None when the key is absent."""
+    structured = _call_tool_structured(result)
+    if isinstance(structured, dict) and "unknown_arguments" in structured:
+        value = structured["unknown_arguments"]
+        return list(value) if isinstance(value, list) else None
+    text = _call_tool_text(result)
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and "unknown_arguments" in payload:
+        value = payload["unknown_arguments"]
+        return list(value) if isinstance(value, list) else None
+    return None
+
+
 @pytest.fixture
 def mock_api_get() -> AsyncMock:
     with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as m:
@@ -3471,3 +3518,72 @@ async def test_my_context_digest_does_not_name_removed_review_worktree(
     assert "#910" in text
     assert "task-910" not in text
     assert "worktrees" not in text
+
+
+# ---------------------------------------------------------------------------
+# #1015: unknown MCP arguments must be named, not swallowed
+# ---------------------------------------------------------------------------
+
+
+async def test_unknown_refine_argument_is_named_beside_no_op() -> None:
+    """AC-1 / AC-3: a dropped field is visible next to no_op, and the call succeeds.
+
+    ``description`` became a real refine field in #1013; the live failure mode
+    is now any *other* undeclared name (here a typo of that field).
+    """
+    from hub.mcp_server import mcp
+
+    secret = "sk-live-do-not-echo-1015"
+    result = await mcp.call_tool(
+        "hub_refine_task",
+        {"task_id": 42, "descriptoin": secret},
+    )
+    structured = _call_tool_structured(result)
+    assert structured is not None
+    assert structured["no_op"] is True
+    assert _unknown_arguments(result) == ["descriptoin"]
+    dumped = json.dumps(structured) + _call_tool_text(result)
+    assert secret not in dumped
+
+
+async def test_declared_refine_arguments_do_not_warn(
+    mock_api_post: AsyncMock,
+) -> None:
+    """AC-2: a clean call must not carry a discarded-fields warning."""
+    from hub.mcp_server import mcp
+
+    mock_api_post.return_value = {
+        "id": 42,
+        "title": "New title",
+        "acceptance_criteria": [],
+        "risks": [],
+        "readiness_score": 70,
+        "dor_passed": False,
+    }
+    result = await mcp.call_tool(
+        "hub_refine_task",
+        {"task_id": 42, "title": "New title"},
+    )
+    structured = _call_tool_structured(result)
+    assert structured is not None
+    assert structured.get("no_op") is not True
+    assert "unknown_arguments" not in structured
+    text_payload = json.loads(_call_tool_text(result))
+    assert "unknown_arguments" not in text_payload
+
+
+async def test_unknown_argument_is_named_on_echo_json(
+    mock_api_get: AsyncMock,
+) -> None:
+    """The same warning must land on format_echo_response tools, not only structured ones."""
+    from hub.mcp_server import mcp
+
+    mock_api_get.return_value = []
+    result = await mcp.call_tool(
+        "hub_list_acceptance_criteria",
+        {"task_id": 9, "limit": 10},
+    )
+    assert _unknown_arguments(result) == ["limit"]
+    text_payload = json.loads(_call_tool_text(result))
+    assert text_payload["unknown_arguments"] == ["limit"]
+    assert "message" in text_payload

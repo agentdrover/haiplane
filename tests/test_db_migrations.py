@@ -734,6 +734,7 @@ MCP_CALL_EVENT_COLUMNS = {
     "latency_ms",
     "response_chars",
     "task_id",
+    "unknown_arg_count",
     "created_at",
 }
 
@@ -765,7 +766,8 @@ async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
         await upgraded.execute("DROP TABLE mcp_call_events")
         await upgraded.execute(
             "DELETE FROM _migrations WHERE name IN "
-            "('create_mcp_call_events', 'idx_mcp_call_events_window')"
+            "('create_mcp_call_events', 'idx_mcp_call_events_window', "
+            "'add_mcp_call_events_unknown_arg_count')"
         )
         await upgraded.commit()
 
