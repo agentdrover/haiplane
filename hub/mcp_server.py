@@ -468,20 +468,20 @@ async def hub_create_task(
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
     Creates work that is already approved, so an agent token gets 403
-    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which
-    creates a draft for human approval. The refusal is enforced by the API, not
-    here, so it also holds for a token calling POST /api/tasks directly.
+    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which drafts
+    for human approval. Enforced by the API, not here, so it also holds for a
+    token calling POST /api/tasks directly.
 
     Args:
         title: Short title (required)
-        description: Detailed description of what needs to be done
+        description: What needs to be done
         task_type: 'epic', 'feature', 'task', or 'subtask'
-        parent_id: Parent task ID (required for feature/subtask, optional for task)
+        parent_id: Parent ID (required for feature/subtask, optional for task)
         priority: 'critical', 'high', 'medium', or 'low'
         runtime: 'auto' or 'openrouter'
-        run_immediately: If True, dispatch immediately (not applicable for epic/feature)
-        human_owner: Person who owns / is accountable for this task
-        human_reviewer: Person who will review and accept the result
+        run_immediately: Dispatch at once (not for epic/feature)
+        human_owner: Who is accountable for this task
+        human_reviewer: Who accepts the result
         client_request_id: Optional idempotency key; safe to retry on timeout
     """
     body: dict[str, Any] = {
@@ -1516,21 +1516,21 @@ async def hub_pair_start(
     """Start pair mode: move an open task to running without headless dispatch.
 
     Use this when a human works with a local agent, instead of hub_start_task
-    (which always dispatches). In worktree mode the response names your
-    task's isolated git worktree — work THERE, not in the shared clone.
+    (which dispatches). In worktree mode the response names your task's
+    isolated worktree — work THERE, not in the shared clone.
 
     Args:
         task_id: The open task ID to pair-start
-        plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
-        assigned_agent: Agent name recorded on the task. On a claimed task it
-            must equal the claim holder (the hub_claim_task agent), or the call
-            is refused with pair_start_claim_mismatch naming both. The same
-            authenticated principal is accepted under a different name.
-        branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
+        plan: Work plan if none exists yet (kind='status' starting with 'Plan:')
+        assigned_agent: Agent recorded on the task. On a claimed task it must
+            equal the claim holder, or the call is refused with
+            pair_start_claim_mismatch naming both. The same principal is
+            accepted under another name.
+        branch_slug: Optional slug (task-<id>/<slug>). Empty uses title slug.
         session_id: YOUR session id — required for agents (#852): several
-            sessions run under one agent name and all pass a name-based check.
-            Reuse the id from hub_session_register and hub_claim_task; another
-            session is refused with pair_start_session_mismatch.
+            sessions share one agent name and all pass a name check. Reuse the
+            id from hub_session_register and hub_claim_task; another session is
+            refused with pair_start_session_mismatch.
         git_mode: hub (default) prepares the branch on the hub host; remote
             records the canonical name and skips host git (#975).
     """
@@ -1613,25 +1613,25 @@ async def hub_submit_for_review(
 
     This does NOT complete the task and you do not write the verdict — the
     reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Moves a running pair task into status=review and bumps the submission
-    generation, invalidating any earlier APPROVED. After the verdict the task
-    returns to running: APPROVED means take the normal done path,
-    CHANGES_REQUESTED means fix and resubmit.
+    Moves a running pair task to status=review and bumps the submission
+    generation, invalidating any earlier APPROVED. After the verdict it returns
+    to running: APPROVED means take the done path, CHANGES_REQUESTED means fix
+    and resubmit.
 
     Args:
         task_id: The running pair task ID
-        agent: Name of the submitting agent (empty uses task's assigned agent)
+        agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: The branch you actually worked in, compared against the
-            canonical name pair-start gave you; a mismatch is refused with both
-            names. Omitting it skips the check — the hub cannot see your
-            working copy, so this is your report, not its observation (#533).
+        branch: The branch you actually worked in, checked against the
+            canonical name pair-start gave you; a mismatch is refused naming
+            both. Omitting it skips the check — your report, not the hub's
+            observation (#533).
         model: The model that wrote this submission (#758) — a declaration,
-            auditable rather than provable. The auto-verdict's model-diversity
-            rule needs it: empty keeps the verdict with the human.
+            not a proof. The auto-verdict's diversity rule needs it: empty
+            keeps the verdict with the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
-            affected_areas (#890), recorded as a visible event. Nothing is
-            widened without this flag and nothing is hidden with it.
+            affected_areas (#890), as a visible event. Nothing widens without
+            it, nothing hides with it.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1805,17 +1805,16 @@ async def hub_submit_review(
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
-    Not for the task's own implementer — a verdict from the submitting agent
-    is refused. The verdict binds to the current submission generation and
-    does NOT complete the task: it returns to running, where APPROVED lets
-    the author take the done path and CHANGES_REQUESTED sends them back to
-    hub_submit_for_review.
+    Not for the task's own implementer — such a verdict is refused. Binds to
+    the current submission generation and does NOT complete the task: it
+    returns to running, where APPROVED lets the author take the done path and
+    CHANGES_REQUESTED sends them back to hub_submit_for_review.
 
-    Finding scope (#435): every finding carries scope
-    (in_scope|out_of_scope, default in_scope). changes_requested with
-    findings requires at least one in_scope finding — if everything is out
-    of scope, approve and keep those as recommendations linked to follow-up
-    tasks. Out-of-scope findings without linked_task_id warn, non-blocking.
+    Finding scope (#435): every finding carries scope (in_scope|out_of_scope,
+    default in_scope). changes_requested with findings requires at least one
+    in_scope finding — if everything is out of scope, approve and keep those
+    as recommendations linked to follow-up tasks. Out-of-scope findings
+    without linked_task_id warn, non-blocking.
 
     Auto-drafts (#436): create_tasks_for_out_of_scope=true creates a DRAFT
     follow-up for every unlinked out_of_scope finding and stamps its id into
@@ -1826,13 +1825,13 @@ async def hub_submit_review(
         verdict: 'approved' or 'changes_requested'
         comments: Free-text review summary
         agent: Reviewer agent name
-        findings: For changes_requested — list of dicts with id (int, stable
-            within this submission), severity (high|medium|low), message,
-            and optional file, line, recommendation,
+        findings: For changes_requested — dicts with id (int, stable within
+            this submission), severity (high|medium|low), message, and
+            optional file, line, recommendation,
             scope (in_scope|out_of_scope, default in_scope),
-            linked_task_id (int — follow-up task for out_of_scope findings).
-        create_tasks_for_out_of_scope: Auto-create draft follow-up tasks
-            for unlinked out_of_scope findings (default false).
+            linked_task_id (int — follow-up for out_of_scope findings).
+        create_tasks_for_out_of_scope: Auto-create draft follow-ups for
+            unlinked out_of_scope findings (default false).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2225,22 +2224,21 @@ async def hub_decide_task(
 ) -> str:
     """Human decision after arbiter review — the Decision Gate.
 
-    When a task reaches needs_decision (review ambiguity, CI/review cycle
-    limit, or arbiter escalation), a human must explicitly accept or rework
-    it. This tool records the human decision and optionally persists it as
-    a reusable decision record through the notes integration.
+    When a task reaches needs_decision (review ambiguity, cycle limit, arbiter
+    escalation), a human must accept or rework it. This records that decision
+    and can persist it as a reusable record through notes.
 
-    The decision_summary is always written into the task update log so the
-    reasoning is visible even without a notes backend. When record_decision
-    is True the summary is additionally saved through the notes plugin (if
-    configured); if notes are unavailable, core flow continues unaffected.
+    decision_summary is always written to the task log, so the reasoning
+    survives without a notes backend. record_decision also saves it through
+    the notes plugin when configured; if notes are unavailable, the core flow
+    is unaffected.
 
     Args:
         task_id: The needs_decision task ID
         action: 'accept' to complete, 'rework' to send back for fixes
         instructions: When action='rework', what needs to be fixed
-        decision_summary: Short summary/reason for the decision (recorded in task updates)
-        record_decision: If True, also persist the decision through the notes integration
+        decision_summary: Short reason (recorded in task updates)
+        record_decision: Also persist through the notes integration
         pr_disposition: On accept, the PR's fate — 'deliver'|'abandon'|''.
             Recorded, never acted on: the task stays in
             hub_undelivered_completed until the PR itself moves (#897).
@@ -2371,35 +2369,33 @@ async def hub_submit_machine_review(
 ) -> CallToolResult:
     """Submit a structured multi-agent review report (#381).
 
-    Bound to the task's current submission generation — resubmitting work
-    makes the report stale, like a human verdict. Metrics (#384) are
-    optional but wanted: tokens_spent/duration_ms feed practice economics.
+    Bound to the current submission generation: resubmitting work makes the
+    report stale. Metrics are optional but feed practice economics (#384).
 
-    ``incomplete`` is REQUIRED and has no default (#549): "0 confirmed" means
-    nothing unless it stands next to incomplete=False. A finding nobody could
-    judge goes to ``unresolved``, never to ``findings_rejected`` — "nobody
-    voted" and "someone refuted it" are opposite outcomes.
+    ``incomplete`` is REQUIRED, no default (#549): "0 confirmed" means nothing
+    without it. A finding nobody could judge goes to ``unresolved``, never to
+    ``findings_rejected`` — "nobody voted" and "refuted" are opposite.
 
     Args:
         task_id: Reviewed task.
         raw_count: Findings before adversarial verification.
-        incomplete: True when any agent died, any dimension was lost, context
-            was truncated, or a budget ran out. No default on purpose: a
-            silently-defaulted False is how a run with dead agents reads clean.
+        incomplete: True when an agent died, a dimension was lost, context was
+            truncated, or a budget ran out. No default: a silent False is how
+            a run with dead agents reads clean.
         findings_confirmed: [{title, severity, locator, category?, file?,
             start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
             'lines' (file + start_line), 'file' (module known, line not),
             'none' (no place found). 'none' is an answer; an empty file is
-            not. The finding's stable id is derived by the hub.
+            not. The stable id is derived by the hub.
         findings_rejected: [{title, category?, reason?}] — actually refuted.
         unresolved: [{title, why}] — nobody could judge these. Never rejected.
         lost_dimensions: names of dimensions that returned nothing.
-        harness_skill: Skill name used (hub_get_skill source).
+        harness_skill: Skill used (hub_get_skill source).
         harness_version: Skill version executed.
         agent_count: Total subagents in the run.
         tokens_spent: Tokens consumed by the run.
         duration_ms: Wall-clock duration.
-        orchestrator: Client/orchestrator name (e.g. claude-code-workflow).
+        orchestrator: Client name (e.g. claude-code-workflow).
         model: Model id used by review agents.
         agent: Submitting agent name.
     """
@@ -3855,8 +3851,8 @@ async def hub_refine_task(
 ) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
-    Only fields you pass are written; omit one to leave it untouched. Every
-    list REPLACES the stored list. Mirrors POST /api/tasks/{id}/refine.
+    Only fields you pass are written; every list REPLACES the stored one.
+    Mirrors POST /api/tasks/{id}/refine.
 
     Args:
         task_id: Task to refine.
@@ -3868,32 +3864,32 @@ async def hub_refine_task(
         wip_tag: feature_work | bugfix | tech_debt | support
         due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
-        problem_statement: What's broken / why this work exists.
-        business_value: Outcome / why it matters.
-        outcome_metric: Which number moves, from what to what — e.g. "median
-            lead time, 3d -> 1d". Makes business_value checkable.
-        outcome_indicator: Leading indicator, visible before the metric moves.
-        outcome_deadline: When the outcome gets checked.
-        outcome_revisit_condition: What would reopen this decision.
-        redesign_decision: adapt | redesign — fits the process or reshapes it.
+        problem_statement: What's broken and why.
+        business_value: Why it matters.
+        outcome_metric: Which number moves, from what to what (lead time
+            3d -> 1d). Makes business_value checkable.
+        outcome_indicator: Leading signal, before the metric moves.
+        outcome_deadline: When the outcome is checked.
+        outcome_revisit_condition: What reopens this decision.
+        redesign_decision: adapt | redesign.
         redesign_rationale: Why that choice.
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
-        caused_by_task_id: Task that introduced the defect; must resolve.
-        detected_at: When the defect was noticed.
-        technical_hints: Hints, references, suggested approach.
+        caused_by_task_id: Task that introduced the defect.
+        detected_at: When it was noticed.
+        technical_hints: Hints, references, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
         assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
-        out_of_scope_for_review: What the reviewer should ignore.
-        review_checklist: What the reviewer verifies in the diff.
-        human_owner: Who is accountable for this task.
-        human_reviewer: Who reviews and accepts the result.
-        acceptance_criteria: Full AC replacement list (REST refine shape).
-        risks: Full risks replacement list (TaskRisk shape).
+        out_of_scope_for_review: What the reviewer ignores.
+        review_checklist: What the reviewer verifies.
+        human_owner: Who is accountable.
+        human_reviewer: Who accepts the result.
+        acceptance_criteria: Full AC replacement (REST refine shape).
+        risks: Full replacement (TaskRisk shape).
     """
     body: dict[str, Any] = {}
     for key, val in (
