@@ -1135,3 +1135,29 @@ async def test_chat_pair_hash_is_unique():
             )
     finally:
         await conn.close()
+
+
+async def test_steward_judgements_table_and_unique_triple():
+    """#1022: judgements persist, and (task, generation, kind) is at-most-once."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "steward_judgements")
+        assert "verdict" in cols
+        assert "submitted_verdict" in cols
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO steward_judgements (task_id, generation, kind, "
+            "submitted_verdict, verdict) VALUES (1, 1, 'verdict', 'approve', "
+            "'approve')"
+        )
+        await conn.commit()
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO steward_judgements (task_id, generation, kind, "
+                "submitted_verdict, verdict) VALUES (1, 1, 'verdict', "
+                "'escalate', 'escalate')"
+            )
+    finally:
+        await conn.close()

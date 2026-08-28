@@ -19,6 +19,7 @@ from hub.services.delivery_state import (
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
+from hub.services.steward_judgement import record_steward_judgement
 from hub.services.finding_identity import (
     finding_uid,
     finding_uids,
@@ -188,6 +189,7 @@ __all__ = [
     "live_check_view",
     "record_category_check",
     "record_finding_dispositions",
+    "record_steward_judgement",
     "finding_uid",
     "finding_uids",
     "refuse_supplied_uid",
