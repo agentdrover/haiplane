@@ -2116,6 +2116,18 @@ async def record_submission(
     )
 
 
+async def get_submission(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The commit pinned for this generation, or None if none was recorded."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM submissions WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
 async def previous_submission(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> aiosqlite.Row | None:
