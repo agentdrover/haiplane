@@ -1251,6 +1251,37 @@ async def _deliver_pair_task(db, task: dict) -> None:
         if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
             await _note_pair_delivery_wait(db, task_id, pr_num, detail)
             return
+        reason = "merge_gate"
+        if detail.startswith(services.RECOVERABLE_GATE_PREFIXES):
+            # #1030: this is the path #1015 actually took — the sweep, not the
+            # done report. A red CI here is not a decision to make but work to
+            # do, and the executor is the one who does it, so the task stays on
+            # the conveyor. Two things bound the waiting, because they bound
+            # different failures: the budget stops an executor that keeps
+            # failing, and presence stops a task nobody is working on any more.
+            budget_spent = False
+            if detail.startswith(services.CI_BUDGET_GATE_PREFIXES):
+                _cycle, budget_spent = await services.charge_ci_fix_budget(db, task)
+            if not budget_spent:
+                if await services.pair_executor_online(db, task):
+                    await _note_pair_delivery_wait(
+                        db,
+                        task_id,
+                        pr_num,
+                        detail,
+                        hint=services.RESUBMIT_AFTER_FIX_HINT,
+                    )
+                    return
+                # Nobody is around to push the fix. Said out loud: without it
+                # the human reads "the CI is red" and misses that the reason
+                # they are being called is that the executor left.
+                detail = f"{detail} (исполнитель не на связи)"
+            else:
+                reason = "ci_fix_cycle_limit"
+                detail = (
+                    f"{detail} (бюджет починки исчерпан: "
+                    f"{task.get('ci_fix_cycle')}/{config.MAX_CI_FIX_CYCLES})"
+                )
         await repo.update_task(db, task_id, status="needs_decision")
         await repo.add_task_update(
             db,
@@ -1266,7 +1297,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
             kind="needs_decision",
             task_id=task_id,
             actor="hub",
-            payload={"reason": "merge_gate", "detail": detail, "via": "poller"},
+            payload={"reason": reason, "detail": detail, "via": "poller"},
         )
         await db.commit()
         log.info(
@@ -1311,8 +1342,15 @@ async def _deliver_pair_task(db, task: dict) -> None:
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
 
-async def _note_pair_delivery_wait(db, task_id: int, pr_num, detail: str) -> None:
-    """Say once that delivery is waiting, and then be quiet (#534)."""
+async def _note_pair_delivery_wait(
+    db, task_id: int, pr_num, detail: str, *, hint: str = ""
+) -> None:
+    """Say once that delivery is waiting, and then be quiet (#534).
+
+    ``hint`` names what happens next when it is not "the hub comes back on its
+    own": a refusal the executor has to cure is also a wait, but waiting for a
+    different actor, and the default sentence would promise the wrong one.
+    """
     if _pair_delivery_waits.get(task_id) == detail:
         return
     _pair_delivery_waits[task_id] = detail
@@ -1321,9 +1359,12 @@ async def _note_pair_delivery_wait(db, task_id: int, pr_num, detail: str) -> Non
         task_id,
         "hub",
         "status",
-        f"Доставка отложена: PR #{pr_num} — {detail}. Это временное "
-        "состояние, решение человека не требуется — хаб вернётся к нему "
-        "следующим циклом.",
+        f"Доставка отложена: PR #{pr_num} — {detail}. "
+        + (
+            hint
+            or "Это временное состояние, решение человека не требуется — хаб "
+            "вернётся к нему следующим циклом."
+        ),
     )
     await db.commit()
     log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
