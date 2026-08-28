@@ -7,6 +7,7 @@ import pytest
 
 from hub import config
 from hub import repository as repo
+from hub.db import fetchall
 from hub import services
 from hub.integrations.noop import NoopDispatch, NoopGitOps
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
@@ -2222,3 +2223,146 @@ async def test_absent_directory_costs_no_git_call(db, monkeypatch, tmp_path):
     await _sweep_stale_worktrees(db)
 
     assert spy.removed == []
+
+
+# --- A transcribed log passage is not a done report (#1018) ------------------
+#
+# When a headless job finished without a done report, the poller took the last
+# long passage out of the dispatch log and stored it as kind='done'. From there
+# it was indistinguishable from a real report and opened the whole git tail —
+# commit, squash, push, create_pr — plus a reviewer run of up to 300k tokens
+# over work nobody said was finished. The passage is chosen by LENGTH, and
+# length cannot tell a report from a thought about what to do next.
+#
+# Measured on production before the change (30 days): zero. Not because the
+# selection is good — because the headless path was not used at all: no task
+# carried a job_id and the log holds no such line. So this closes the door
+# before anyone walks through it, and the "tasks will queue up in the inbox"
+# risk is zero tasks today.
+
+
+async def _headless_task(db, *, title: str) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id=f"job-{task_id}")
+    await db.commit()
+    return task_id
+
+
+def _dispatch_with_log(passage: str) -> NoopDispatch:
+    mock = NoopDispatch()
+    mock.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0, "result_text": "ok"}
+    )
+    mock.job_log_full = MagicMock(return_value=passage)
+    return mock
+
+
+_LONG_THOUGHT = "\n".join(
+    [
+        '{"type":"assistant","subtype":"start"}',
+        '  "text": "Смотрю тест страничного обхода и не понимаю, почему он '
+        'зелёный на мутации."',
+        '  "text": "Дальше нужно решить, чинить ли гонку в ретраях здесь или '
+        "вынести в отдельную задачу. Скорее всего вынести: правка задевает три "
+        'модуля, а бюджета на прогон уже нет."',
+    ]
+)
+
+
+async def test_synthetic_done_routes_to_pending_report(db, monkeypatch):
+    # AC-2: the job finished, the log has a long passage, the agent said
+    # nothing. The task must wait for a human, and no git step may run.
+    from hub.poller import _sweep_running_dispatch
+
+    task_id = await _headless_task(db, title="died mid-task")
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    forbidden: list[str] = []
+    for step in ("auto_commit", "squash_branch", "push_branch", "create_pr"):
+
+        async def refuse(*a, _step=step, **kw):
+            forbidden.append(_step)
+            return None
+
+        monkeypatch.setattr(plugins.git_ops, step, refuse, raising=False)
+
+    # TWICE on purpose, and through the sweep itself rather than the poll loop:
+    # one pass proves little, because has_done is read BEFORE the passage is
+    # stored. A transcription that kept full report rights would route
+    # correctly this time and open the conveyor on the NEXT pass — which is the
+    # exact shape being closed, so the test has to reach it.
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        for _ in range(2):
+            await repo.update_task(db, task_id, status="running")
+            await db.commit()
+            await _sweep_running_dispatch(db)
+            assert dict(await repo.get_task(db, task_id))["status"] == (
+                "pending_report"
+            )
+
+    assert forbidden == [], f"the git tail must stay shut, ran: {forbidden}"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_synthetic_done_is_flagged_in_db(mock_sleep, db):
+    # AC-3: the passage is KEPT — a person in the inbox wants it — but it is
+    # queryable as unclaimed. A phrase inside the text would not be a flag:
+    # it could not be asked for, and a rule nobody can check is not a rule.
+    task_id = await _headless_task(db, title="flag me")
+    app = _make_app(db)
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(app)
+
+    rows = [
+        dict(r)
+        for r in await fetchall(
+            db,
+            "SELECT content, agent_claimed FROM task_updates "
+            "WHERE task_id=? AND kind='done'",
+            (task_id,),
+        )
+    ]
+    assert len(rows) == 1
+    assert rows[0]["agent_claimed"] == 0, "the transcription must be queryable"
+    assert "чинить ли гонку" in rows[0]["content"], "the text itself is kept"
+    assert not await repo.has_done_updates(db, task_id), (
+        "and it must not answer 'did the agent report done?'"
+    )
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_real_done_report_still_reaches_ci_check(mock_sleep, db):
+    # AC-4: nothing moves for a real report. The agent claimed it, so the
+    # conveyor runs exactly as before.
+    task_id = await _headless_task(db, title="properly reported")
+    await repo.add_task_update(db, task_id, "dev", "done", "All done, tests green")
+    await db.commit()
+    app = _make_app(db)
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(app)
+
+    assert dict(await repo.get_task(db, task_id))["status"] != "pending_report"
+    assert await repo.has_done_updates(db, task_id)
