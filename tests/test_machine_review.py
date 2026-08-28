@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from hub.models import FindingLocator, MachineFinding
+import json
+
+from hub.models import FindingLocator, MachineReviewView
 from hub.services.finding_identity import finding_uid, finding_uids
 
 
@@ -110,6 +112,21 @@ async def test_every_stated_locator_is_accepted(client: AsyncClient, db, finding
             "carries no lines",
         ),
         ({"title": "t", "severity": "low", "locator": "none", "file": "a.py"}, "none"),
+        (
+            {"title": "t", "severity": "low", "locator": "none", "end_line": 14},
+            "none",
+        ),
+        (
+            {
+                "title": "t",
+                "severity": "low",
+                "locator": "lines",
+                "file": "a.py",
+                "start_line": 10,
+                "line": 40,
+            },
+            "disagree",
+        ),
     ],
 )
 async def test_a_stated_locator_must_agree_with_itself(
@@ -126,9 +143,83 @@ async def test_a_stated_locator_must_agree_with_itself(
 def test_legacy_reports_still_load_without_a_locator():
     # The read model stays permissive on purpose: 116 reports are already in the
     # ground without this field, and a required field would make them unreadable
-    # — the split #505 drew between the write path and the stored row.
-    finding = MachineFinding(title="old", severity="low", file="hub/a.py", line=3)
-    assert finding.locator is None
+    # — the split #505 drew between the write path and the stored row. Built
+    # from a stored JSON row, not from keyword arguments, because that is the
+    # shape the card and the brief actually read.
+    stored = json.dumps(
+        [{"title": "old", "severity": "low", "file": "hub/a.py", "line": 3}]
+    )
+    view = MachineReviewView(
+        id=1,
+        task_id=1,
+        submission_generation=1,
+        raw_count=1,
+        findings_confirmed=stored,
+    )
+    assert view.findings_confirmed[0].locator is None
+    # And it still gets an id, so a person judging an old report addresses it
+    # the same way as a new one.
+    assert view.findings_confirmed[0].finding_uid
+
+
+async def test_the_report_comes_back_with_an_id_per_finding(client: AsyncClient, db):
+    # AC: the derived id is useless if no reader ever sees it. The submit
+    # response is itself a MachineReviewView, so the id is there from the first
+    # moment the report exists.
+    task_id = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=_report(
+            [
+                {
+                    "title": "a",
+                    "severity": "low",
+                    "locator": "lines",
+                    "file": "hub/a.py",
+                    "start_line": 10,
+                },
+                {"title": "b", "severity": "low", "locator": "none"},
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    uids = [f["finding_uid"] for f in resp.json()["findings_confirmed"]]
+    assert all(uids) and len(set(uids)) == 2
+
+
+async def test_a_supplied_id_is_refused(client: AsyncClient, db):
+    # A harness has no memory of the previous report, so an id it invents is
+    # random — and it would quietly beat the derived one.
+    task_id = await _reviewable_task(client, db)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=_report(
+            [
+                {
+                    "title": "a",
+                    "severity": "low",
+                    "locator": "none",
+                    "finding_uid": "deadbeefdeadbeef",
+                }
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+    assert "derives" in resp.text
+
+
+def test_two_findings_in_one_file_are_two_ids():
+    # The place is part of the identity: without it these two collapse into one
+    # id, and a judgement lands on whichever survives the next report.
+    first = {
+        "title": "unchecked error",
+        "category": "correctness",
+        "file": "hub/app.py",
+        "locator": "lines",
+        "start_line": 40,
+    }
+    second = dict(first, start_line=200)
+    assert finding_uid(first) != finding_uid(second)
 
 
 # --- AC-2: identity is derived and repeats across generations --------------

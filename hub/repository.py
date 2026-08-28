@@ -1113,15 +1113,25 @@ async def upsert_finding_disposition(
     disposition: str,
     note: str,
     decided_by: str,
-    finding_uid: str = "",
+    finding_uid: str,
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert stays on (review_id, finding_index): the slot is what rows filed
-    before #1007 carry, so keeping the conflict target there means a gate
-    revisiting its judgement still corrects the same row instead of leaving two
-    contradictory ones for the metrics to average. ``finding_uid`` rides along
-    as the identity the caller actually judged.
+    Upsert stays on (review_id, finding_index), and that is correct rather than
+    legacy: a stored report is IMMUTABLE. ``findings_confirmed`` is written once
+    by ``insert_machine_review`` and never rewritten, and a resubmission files a
+    NEW report with its own id and its own judgements — so inside one report a
+    slot names one finding for good. A gate revisiting its own call corrects
+    that row instead of stacking a contradictory one beside it.
+
+    What the slot cannot do is carry identity ACROSS reports, which is why
+    ``finding_uid`` is stored beside it (#1007): the same defect in the next
+    generation has a different position and the same id.
+
+    ``finding_uid`` is required and has no default: an empty one used to be
+    accepted and then written over an id already computed — the silent
+    substitution #549 exists to prevent. Rows filed before the column exists
+    keep their empty id; nothing back-fills them.
     """
     await db.execute(
         "INSERT INTO finding_dispositions (review_id, task_id, "
@@ -1129,6 +1139,7 @@ async def upsert_finding_disposition(
         "disposition, note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
         "finding_uid=excluded.finding_uid, "
+        "finding_title=excluded.finding_title, "
         "disposition=excluded.disposition, note=excluded.note, "
         "decided_by=excluded.decided_by, decided_at=datetime('now')",
         (

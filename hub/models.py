@@ -1952,6 +1952,11 @@ class MachineFinding(BaseModel):
     locator: FindingLocator | None = None
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
+    # The id the hub DERIVES for this finding (#1007). Filled in on reads so a
+    # caller has something to address a disposition with; refused on writes by
+    # ``refuse_supplied_uid`` — an id a harness invents is fresh randomness and
+    # would defeat the point of deriving one.
+    finding_uid: str = Field("", max_length=64)
 
     @model_validator(mode="after")
     def _locator_agrees_with_itself(self) -> "MachineFinding":
@@ -1970,11 +1975,23 @@ class MachineFinding(BaseModel):
                 raise ValueError(
                     "locator='lines' needs start_line (or the legacy 'line')"
                 )
+            if (
+                self.start_line is not None
+                and self.line is not None
+                and self.line != self.start_line
+            ):
+                raise ValueError(
+                    f"line {self.line} and start_line {self.start_line} "
+                    "disagree — a finding sits in one place, not two"
+                )
             end = self.end_line if self.end_line is not None else start
             if end < start:
                 raise ValueError(f"end_line {end} is before start_line {start}")
             self.start_line = start
             self.end_line = end
+            # Keep the legacy field in step, so a reader of either sees one
+            # number instead of two that drifted apart in storage.
+            self.line = start
             return self
         if self.locator is FindingLocator.file:
             if not self.file.strip():
@@ -1990,7 +2007,12 @@ class MachineFinding(BaseModel):
             return self
         # none: the report says it cannot place this finding, so a place
         # alongside that answer is a contradiction, not extra detail.
-        if self.file.strip() or self.start_line is not None or self.line is not None:
+        if (
+            self.file.strip()
+            or self.start_line is not None
+            or self.end_line is not None
+            or self.line is not None
+        ):
             raise ValueError(
                 "locator='none' means no place is known — drop file/line or "
                 "state 'file'/'lines' instead"
@@ -2228,7 +2250,11 @@ class FindingDispositionItem(BaseModel):
 
     @model_validator(mode="after")
     def _addressed_exactly_once(self) -> "FindingDispositionItem":
-        has_uid = bool(self.finding_uid.strip())
+        # Normalised once, here: the resolver tested the raw string while this
+        # tested the stripped one, so "  <uid>  " passed the schema and then
+        # failed to resolve against the report.
+        self.finding_uid = self.finding_uid.strip()
+        has_uid = bool(self.finding_uid)
         has_index = self.finding_index is not None
         if has_uid and has_index:
             raise ValueError(
@@ -2304,6 +2330,23 @@ class MachineReviewView(BaseModel):
     @classmethod
     def _mr_iso_ts(cls, v: str | None) -> str | None:
         return to_iso_utc(v)
+
+    @model_validator(mode="after")
+    def _stamp_finding_uids(self) -> "MachineReviewView":
+        """Hand every confirmed finding the id the hub derives for it (#1007).
+
+        Stamped on the way OUT rather than stored: the id is a function of the
+        finding's content, and a stored copy could drift from the content it
+        claims to identify. Every reader — card, brief, API, MCP — therefore
+        gets the id from the same place the resolver will compute it.
+        """
+        from hub.services.finding_identity import finding_uids
+
+        for finding, uid in zip(
+            self.findings_confirmed, finding_uids(self.findings_confirmed)
+        ):
+            finding.finding_uid = uid
+        return self
 
     @field_validator(
         "findings_confirmed",

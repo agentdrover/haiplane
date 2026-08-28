@@ -8,7 +8,6 @@ way must keep reading — they were filed under the only scheme that existed.
 
 from __future__ import annotations
 
-import json
 
 import pytest
 from httpx import AsyncClient
@@ -105,18 +104,22 @@ async def test_uid_from_another_report_is_refused(client: AsyncClient, db):
 async def test_legacy_index_dispositions_still_read(client: AsyncClient, db):
     # A row exactly as #876 wrote them: a slot, a title and no uid at all.
     task_id, review_id = await _task_with_report(client, db)
-    from hub import repository as repo_module
-
-    await repo_module.upsert_finding_disposition(
-        db,
-        review_id=review_id,
-        task_id=task_id,
-        submission_generation=1,
-        finding_index=0,
-        finding_title="boundary lost",
-        disposition="false_positive",
-        note="checked by hand",
-        decided_by="denis",
+    # Written as the row exists in the ground, not through today's code: the
+    # repository now requires an id, and these rows predate the column.
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_title, disposition, "
+        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            review_id,
+            task_id,
+            1,
+            0,
+            "boundary lost",
+            "false_positive",
+            "by hand",
+            "denis",
+        ),
     )
     await db.commit()
 
@@ -191,30 +194,70 @@ async def test_out_of_range_index_still_refused(client: AsyncClient, db):
     assert "outside the 2 confirmed" in str(err.value)
 
 
-async def test_uid_survives_a_reordered_resubmission(client: AsyncClient, db):
-    """The defect this whole change exists to prevent.
+async def test_uid_identifies_the_same_defect_in_the_next_report(
+    client: AsyncClient, db
+):
+    """What the id is actually for — and what it is NOT for.
 
-    The same two findings come back in the opposite order. A judgement filed by
-    slot would now point at the other finding; filed by uid it still points at
-    the one that was judged.
+    A stored report is immutable: ``findings_confirmed`` is written once and a
+    resubmission files a NEW report with its own id, so INSIDE one report the
+    slot never moves and needs no help. What the slot cannot do is survive the
+    generation boundary: the same defect comes back at another position, in
+    another report, and only the derived id ties the two together.
     """
-    task_id, review_id = await _task_with_report(client, db)
+    from hub import repository as repo_module
+    from hub import services as services_module
+
+    task_id, first_review = await _task_with_report(client, db)
     uid = finding_uids(_FINDINGS)[0]
-
-    # The report comes back with the same two findings in the opposite order.
-    await db.execute(
-        "UPDATE machine_reviews SET findings_confirmed=? WHERE id=?",
-        (json.dumps(list(reversed(_FINDINGS))), review_id),
-    )
-    await db.commit()
-
     await record_finding_dispositions(
         db,
         task_id,
         [FindingDispositionItem(finding_uid=uid, disposition=FindingDisposition.fixed)],
         decided_by="denis",
     )
-    rows = await _stored(db, review_id)
-    # Slot 1 now, slot 0 before — the same finding either way.
-    assert rows[0]["finding_index"] == 1
+
+    # Second generation, same defects, reported in the opposite order. The
+    # verdict that sent the work back is not what this test is about, so the
+    # task is put back to running directly and resubmitted — the generation
+    # boundary is the whole point.
+    await repo_module.update_task(db, task_id, status="running")
+    await db.commit()
+    await services_module.submit_for_review(db, task_id)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "raw_count": 2,
+            "incomplete": False,
+            "harness_skill": "lite-diff-review",
+            "findings_confirmed": list(reversed(_FINDINGS)),
+            "agent": "reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    second_review = int(
+        dict(await repo_module.get_latest_machine_review(db, task_id))["id"]
+    )
+    assert second_review != first_review
+
+    # Same defect, other slot, same id — that is the whole guarantee.
+    returned = {f["title"]: f["finding_uid"] for f in resp.json()["findings_confirmed"]}
+    assert returned["boundary lost"] == uid
+
+    # And judging it in the new report addresses the finding, not a position.
+    await record_finding_dispositions(
+        db,
+        task_id,
+        [FindingDispositionItem(finding_uid=uid, disposition=FindingDisposition.fixed)],
+        decided_by="denis",
+    )
+    rows = await _stored(db, second_review)
+    assert len(rows) == 1
     assert rows[0]["finding_title"] == "boundary lost"
+    assert rows[0]["finding_index"] == 1
+
+    # The judgement filed against the first report is untouched: reports are
+    # separate ledgers, and nothing reached across to correct the other one.
+    old_rows = await _stored(db, first_review)
+    assert len(old_rows) == 1
+    assert old_rows[0]["finding_index"] == 0

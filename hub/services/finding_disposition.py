@@ -55,8 +55,10 @@ async def record_finding_dispositions(
     success, it means the caller judged something else.
 
     Addressing is by ``finding_uid`` (#1007); ``finding_index`` is still
-    resolved for callers written before uids existed. Both are stored, so a row
-    filed either way stays readable and the metrics keep one key.
+    resolved for callers written before uids existed. Both are stored: the slot
+    keys the row inside this report — which is immutable, so the slot is stable
+    — and the uid is what identifies the same defect in the NEXT report, where
+    the position will be different.
     """
     if await repo.get_task(db, task_id) is None:
         raise LookupError(f"task #{task_id} not found")

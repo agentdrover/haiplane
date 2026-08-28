@@ -22,6 +22,7 @@ from hub.services.finding_disposition import record_finding_dispositions
 from hub.services.finding_identity import (
     finding_uid,
     finding_uids,
+    refuse_supplied_uid,
     require_locator_decision,
 )
 from hub.services.live_check import (
@@ -178,6 +179,7 @@ __all__ = [
     "record_finding_dispositions",
     "finding_uid",
     "finding_uids",
+    "refuse_supplied_uid",
     "require_locator_decision",
     "message_event_is_addressed",
     "message_view",

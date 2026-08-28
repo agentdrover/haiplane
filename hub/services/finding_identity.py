@@ -19,10 +19,13 @@ Two rules fix that, and they are deliberately different in kind.
 report, so any id it invents is fresh randomness — it would satisfy a schema
 and answer none of the questions above. What repeats across runs is the
 finding's own content, so the id is a hash of (category, file, normalised
-title). The guarantee is exactly that and no more: identical content yields an
-identical id. A reworded title is a different id, because the hub cannot know
-that two sentences describe one defect, and a confident id over that guess
-would be worse than an honest miss.
+title, locator, start line). The guarantee is exactly that and no more:
+identical content yields an identical id. A reworded title — or a defect that
+moved to another line — is a different id, because the hub cannot know that two
+sentences describe one defect, and a confident id over that guess would be
+worse than an honest miss. The place is in the material on purpose: without it
+two defects sharing a file and a title collapse into one id, and a human's
+judgement then lands on whichever of them survived the next report.
 
 **Location is DECLARED, and refusing to place a finding is a valid answer.**
 ``locator='none'`` says the reviewer could not point at a place. That is
@@ -49,7 +52,31 @@ _WHITESPACE = re.compile(r"\s+")
 
 def _normalised(value: Any) -> str:
     """Lowercase, whitespace-collapsed text — the form two runs can agree on."""
-    return _WHITESPACE.sub(" ", str(value or "").strip().lower())
+    raw = getattr(value, "value", value)  # accepts the FindingLocator enum
+    return _WHITESPACE.sub(" ", str(raw or "").strip().lower())
+
+
+def _as_mapping(entry: Mapping[str, Any] | Any) -> Mapping[str, Any]:
+    """A finding as a key-value view, whether it arrived as a dict or a model.
+
+    Both shapes reach this module: the API layer holds parsed models, storage
+    holds JSON. A helper that silently understood only one of them is exactly
+    how ``getattr`` on a dict returned None for every field it was asked about.
+    """
+    if isinstance(entry, Mapping):
+        return entry
+    return {
+        key: getattr(entry, key, None)
+        for key in (
+            "category",
+            "file",
+            "title",
+            "locator",
+            "start_line",
+            "line",
+            "finding_uid",
+        )
+    }
 
 
 def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
@@ -62,17 +89,27 @@ def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
     would depend on how many twins happened to precede it, and the id would
     stop surviving a reordering, which is the whole point.
     """
-    if not isinstance(entry, Mapping):
-        entry = {
-            "category": getattr(entry, "category", ""),
-            "file": getattr(entry, "file", ""),
-            "title": getattr(entry, "title", ""),
-        }
+    entry = _as_mapping(entry)
+    # The PLACE is part of the identity, not decoration: two defects in one
+    # file can share a category and a title and still be two defects. Leaving
+    # lines out let them collapse into one id, and a disposition then landed on
+    # whichever of them survived the next report.
+    #
+    # The cost is stated rather than hidden: code that moves shifts start_line,
+    # and the finding gets a new id. Between "the same defect looks new" and
+    # "two defects look like one", only the second silently misfiles a human's
+    # judgement, so that is the one the identity is built to avoid.
+    locator = _normalised(entry.get("locator"))
+    start = entry.get("start_line")
+    if start is None:
+        start = entry.get("line")
     material = "\x1f".join(
         (
             _normalised(entry.get("category")),
             _normalised(entry.get("file")),
             _normalised(entry.get("title")),
+            locator,
+            "" if start is None else str(start),
         )
     )
     if ordinal:
@@ -109,7 +146,7 @@ def require_locator_decision(findings: Sequence[Any]) -> None:
     missing = [
         idx
         for idx, finding in enumerate(findings)
-        if getattr(finding, "locator", None) is None
+        if _as_mapping(finding).get("locator") is None
     ]
     if not missing:
         return
@@ -125,4 +162,35 @@ def require_locator_decision(findings: Sequence[Any]) -> None:
     )
 
 
-__all__ = ["finding_uid", "finding_uids", "require_locator_decision"]
+def refuse_supplied_uid(findings: Sequence[Any]) -> None:
+    """Refuse a report that brings its own finding ids (#1007).
+
+    The id is derived from content precisely so that two runs of a harness with
+    no memory of each other land on the same one. A submitted id would be
+    random by construction and would quietly win over the derived one, which is
+    the failure this whole change exists to prevent — so it is refused loudly
+    instead of ignored silently (#553).
+    """
+    supplied = [
+        idx
+        for idx, finding in enumerate(findings)
+        if str(_as_mapping(finding).get("finding_uid") or "").strip()
+    ]
+    if not supplied:
+        return
+    listed = ", ".join(f"#{i}" for i in supplied)
+    raise HTTPException(
+        422,
+        f"confirmed findings {listed} carry a finding_uid: the hub derives "
+        "that id from the finding's own content, so a submitted one is "
+        "random by construction. Drop the field — the id comes back on every "
+        "read of the report.",
+    )
+
+
+__all__ = [
+    "finding_uid",
+    "finding_uids",
+    "refuse_supplied_uid",
+    "require_locator_decision",
+]
