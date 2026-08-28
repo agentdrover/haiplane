@@ -6,6 +6,7 @@ import re
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.auth import CSRF_COOKIE_NAME
 
 
 async def test_dashboard_page(client: AsyncClient):
@@ -82,6 +83,17 @@ async def test_task_detail_page(client: AsyncClient):
     assert "task-meta-list" in resp.text
     assert "Передать в облачный чат" in resp.text
     assert f'action="/tasks/{task_id}/web-implementer-start"' in resp.text
+
+
+async def test_second_task_card_get_reuses_csrf_cookie(client: AsyncClient):
+    """#990 AC-4: a second task-card GET must keep the first CSRF cookie."""
+    first = await client.post("/api/tasks", json={"title": "CSRF card A"})
+    other = await client.post("/api/tasks", json={"title": "CSRF card B"})
+    page_a = await client.get(f"/tasks/{first.json()['id']}")
+    token = page_a.cookies.get(CSRF_COOKIE_NAME)
+    assert token
+    page_b = await client.get(f"/tasks/{other.json()['id']}")
+    assert page_b.cookies.get(CSRF_COOKIE_NAME) == token
 
 
 async def test_inbox_partial(client: AsyncClient):

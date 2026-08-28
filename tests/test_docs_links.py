@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -72,3 +73,17 @@ def test_implementer_sdd_matches_allowlist_and_freezes_intake_role():
     )
     assert "Intake-only" in intake
     assert "task-979-chat-pair-implementer.md" in intake
+
+
+def test_steward_spec_links_resolve():
+    # #1002: the steward spec cites hub modules by relative path so a reader can
+    # check every claim it makes about the code. A moved or renamed module must
+    # break this suite rather than leave the document quietly pointing at
+    # nothing — the citations are the reason to trust it.
+    spec = REPO_ROOT / "docs" / "issues" / "steward-agent.md"
+    assert spec.is_file()
+    text = spec.read_text(encoding="utf-8")
+    targets = re.findall(r"\]\((\.\./\.\./[^)#\s]+)\)", text)
+    assert targets, "spec cites no repository files at all"
+    for rel in targets:
+        assert (spec.parent / rel).resolve().is_file(), f"broken link: {rel}"

@@ -2655,7 +2655,13 @@ async def test_new_independent_verdict_clears_self_approved_mark(
     await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="dev-agent"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="dev-agent",
+            # #1010: sending work back needs a reason; the subject here is the
+            # self-approved mark, so any reason will do — but not none.
+            comments="исправьте гонку в bump",
+        ),
         self_approved=True,
     )
 
@@ -3375,7 +3381,11 @@ async def test_stale_approval_does_not_complete_after_resubmission(
     await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     await services.add_update(
         db,
@@ -4024,7 +4034,11 @@ async def test_verdict_blocked_in_require_mode(db: aiosqlite.Connection, monkeyp
     rejected = await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     assert rejected.review_verdict == ReviewVerdict.changes_requested
     # возвращаем задачу в review для продолжения сценария
@@ -4615,7 +4629,11 @@ async def test_ac_tests_gate_require_allows_changes_requested_when_red(db, monke
     view = await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     assert view.review_verdict == ReviewVerdict.changes_requested
 
@@ -5365,6 +5383,41 @@ async def test_repair_closes_parent_stuck_by_rejected_child(
 
     assert repaired >= 1
     assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+
+
+async def test_list_tasks_claimed_by_completed_still_returns(
+    db: aiosqlite.Connection,
+):
+    """#987 AC-4: the digest stopped showing history; REST did not lose it.
+
+    hub_my_context now names only live work, so the completed rows have to stay
+    reachable somewhere — and that somewhere is this list, unchanged. Filtering
+    the digest is a change of what one surface claims to answer, not a change
+    of what the hub remembers.
+    """
+    done = await repo.create_task(
+        db,
+        title="Long finished",
+        description="",
+        assigned_agent="bot",
+        rationale="",
+        status="completed",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+        runtime="auto",
+        source="agent",
+    )
+    await repo.update_task(db, done, claimed_by="alice")
+    await db.commit()
+
+    held = await services.list_tasks(db, claimed_by="alice", status="completed")
+    assert done in {t.id for t in held}
+
+    # And without a status filter it is still holder history, not a live list.
+    everything = await services.list_tasks(db, claimed_by="alice")
+    assert done in {t.id for t in everything}
 
 
 from unittest.mock import AsyncMock as _AsyncMock991  # noqa: E402

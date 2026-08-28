@@ -313,3 +313,107 @@ def test_ci_script_reports_a_missing_budget_instead_of_passing(tmp_path: Path):
     )
     assert proc.returncode == 2
     assert "No budget found" in proc.stderr
+
+
+# --- #988: the trim is measured, and the ceilings only ever go down ---------
+#
+# Pinned literals rather than a comparison with another branch: a test running
+# on a branch cannot measure `develop`, and "beat whatever develop says" is not
+# something a test can assert. These are the numbers measured on origin/develop
+# on 2026-08-28, before the trim.
+PRE_TRIM_CEILINGS = {
+    "tools": 75,
+    "description_chars": 40145,
+    "schema_chars": 31390,
+    "model_visible_chars": 73293,
+    "max_tool_chars": 7120,
+}
+FROZEN_DESCRIPTION_CHARS = 36495  # the 2026-08-21 freeze; live was 38130
+FROZEN_MAX_TOOL_CHARS = 6472  # same freeze; live was 7065, 55 under the ceiling
+PRE_TRIM_INSTRUCTION_PER_TOOL = 179598
+
+
+def test_no_ceiling_rises() -> None:
+    """AC-2: a shrink re-freezes downwards; raising a ceiling is a different act.
+
+    The budget file exists so growth cannot happen quietly. A trim that leaves
+    `measured` stale is the mirror image of that failure: the headroom grows
+    instead, and the check stops constraining anything. So the file may be
+    re-frozen — but never upwards in this task.
+    """
+    budgets = load_budget()
+    for metric, ceiling in PRE_TRIM_CEILINGS.items():
+        assert budgets[metric] <= ceiling, (
+            f"{metric}: ceiling rose from {ceiling} to {budgets[metric]}"
+        )
+
+
+async def test_description_chars_below_36495() -> None:
+    """AC-3: the docstring trim is real, not a rounding error."""
+    snapshot = await catalog_snapshot()
+    assert snapshot["description_chars"] < FROZEN_DESCRIPTION_CHARS
+
+
+async def test_max_tool_chars_back_under_freeze() -> None:
+    """AC-9: the fattest tool stops eating the last of the headroom.
+
+    Before the trim the biggest tool was 7065 against a 7120 ceiling — 55
+    characters left, which the report already flagged as "decide now".
+    """
+    snapshot = await catalog_snapshot()
+    assert snapshot["max_tool_chars"] <= FROZEN_MAX_TOOL_CHARS
+    budgets = load_budget()
+    spent = snapshot["max_tool_chars"] / budgets["max_tool_chars"]
+    assert spent < 0.95, f"still {spent:.1%} of the ceiling"
+
+
+async def test_instruction_win_measured_on_its_own_metric() -> None:
+    """AC-10: the instruction is not part of description_chars, so it cannot be
+    claimed on that number.
+
+    Counted once per session for the measured clients (#815), and once per tool
+    for a client that copies server instructions into each tool. The second
+    number is the one a shorter instruction moves.
+    """
+    snapshot = await catalog_snapshot()
+    assert snapshot["instruction_chars"] not in (0, None)
+    assert (
+        snapshot["model_visible_chars_if_instruction_per_tool"]
+        < PRE_TRIM_INSTRUCTION_PER_TOOL
+    )
+    # The instruction is not counted inside the descriptions it points at.
+    assert snapshot["description_chars"] < snapshot["catalog_chars"]
+
+
+async def test_no_empty_tool_descriptions() -> None:
+    """AC-4: a trim may shorten a description; it may not delete one.
+
+    Every published tool still describes itself, and the ones that take
+    arguments still name them — the guard against trimming a tool down to its
+    title.
+    """
+    snapshot = await catalog_snapshot()
+    empty = [t["name"] for t in snapshot["tools_list"] if t["description_chars"] < 40]
+    assert empty == [], f"tools shipped without a usable description: {empty}"
+
+    from hub.mcp_server import (
+        hub_list_tasks,
+        hub_pair_start,
+        hub_refine_task,
+        hub_submit_for_review,
+        hub_submit_machine_review,
+        hub_submit_review,
+    )
+
+    for func, args in (
+        (hub_refine_task, ("task_id", "scope_in", "acceptance_criteria", "risks")),
+        (hub_pair_start, ("task_id", "assigned_agent", "session_id", "git_mode")),
+        (hub_submit_for_review, ("task_id", "branch", "model", "accept_areas")),
+        (hub_submit_review, ("task_id", "verdict", "findings")),
+        (hub_submit_machine_review, ("task_id", "incomplete", "unresolved")),
+        (hub_list_tasks, ("status", "claimed_by", "limit")),
+    ):
+        doc = func.__doc__ or ""
+        assert "Args:" in doc, func.__name__
+        for arg in args:
+            assert f"{arg}:" in doc, f"{func.__name__} stopped describing {arg}"
