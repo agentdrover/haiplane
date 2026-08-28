@@ -3221,6 +3221,14 @@ async def test_my_context_pages_past_a_window_of_final_rows(
     assert "#700" in text
     assert "none live" not in text
     assert {t["id"] for t in _mcp_structured(out)["my_tasks"]} == {700}
+    # The cursor must actually be USED, not merely stored: an ordered mock
+    # hands over page 2 whatever the URL says, so without this the test passes
+    # even when the walk re-fetches the same newest window five times — which
+    # is precisely the defect AC-6 exists to prevent.
+    second_page = mock_api_get.await_args_list[2].args[0]
+    assert "after_id=800" in second_page, second_page
+    first_page = mock_api_get.await_args_list[1].args[0]
+    assert "after_id=0" in first_page, first_page
 
 
 async def test_my_context_says_when_the_walk_stopped_short(
@@ -3243,6 +3251,14 @@ async def test_my_context_says_when_the_walk_stopped_short(
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "claimed rows" in text, "the cap must be visible, not silent"
+    # Each page asks past the previous one; five distinct windows, not one
+    # window five times.
+    windows = [
+        c.args[0].split("after_id=")[1]
+        for c in mock_api_get.await_args_list[1:]
+        if "after_id=" in c.args[0]
+    ]
+    assert len(set(windows)) == len(windows), f"walk repeated a window: {windows}"
 
 
 async def test_my_context_never_fetches_full_cards_it_drops(
@@ -3291,3 +3307,39 @@ async def test_my_context_summary_keeps_in_flight_ids(mock_api_get: AsyncMock) -
     text = _mcp_text(await hub_my_context(mode="summary"))
     assert "#940" in text
     assert "#941" not in text
+
+
+async def test_my_context_names_an_unreadable_page_instead_of_saying_none(
+    mock_api_get: AsyncMock,
+) -> None:
+    """A walk that broke must not answer in the voice of a walk that finished.
+
+    Page one is all history and points at more; page two fails. "None live" on
+    its own would state as fact something the hub never got to look at.
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
+        HubApiError({"message": "boom"}),
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "none live" in text
+    assert "could be read" in text or "could not be read" in text
+
+
+async def test_my_context_says_when_review_bucketing_is_a_guess(
+    mock_api_get: AsyncMock,
+) -> None:
+    """If the headless lookup fails, the review row is listed but flagged.
+
+    Falling back to Waiting is the safer default, and it is still a guess: an
+    agent that idles on a review the poller owns is waiting for nobody.
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 610, "title": "Submitted", "status": "review"}]),
+        HubApiError({"message": "boom"}),
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#610" in text
+    assert "could not tell headless review" in text
