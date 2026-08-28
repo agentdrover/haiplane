@@ -799,6 +799,7 @@ async def _judged(
             task_id=task_id,
             submission_generation=1,
             finding_index=index,
+            finding_uid=f"uid-{index}",
             finding_title=f"f{index}",
             disposition=disposition,
             note="",

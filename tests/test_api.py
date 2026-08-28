@@ -2442,6 +2442,7 @@ async def test_machine_review_submit_and_brief(client: AsyncClient, db):
             "orchestrator": "claude-code-workflow",
             "findings_confirmed": [
                 {
+                    "locator": "lines",
                     "title": "policy JSON error path untested",
                     "severity": "medium",
                     "category": "tests",
@@ -2554,8 +2555,18 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
             "harness_skill": "multi-agent-review",
             "harness_version": 1,
             "findings_confirmed": [
-                {"title": "a", "severity": "low", "category": "tests"},
-                {"title": "b", "severity": "medium", "category": "consistency"},
+                {
+                    "locator": "none",
+                    "title": "a",
+                    "severity": "low",
+                    "category": "tests",
+                },
+                {
+                    "locator": "none",
+                    "title": "b",
+                    "severity": "medium",
+                    "category": "consistency",
+                },
             ],
             "findings_rejected": [
                 {"title": "c", "reason": "noise"},
@@ -2572,7 +2583,12 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
             "harness_skill": "multi-agent-review",
             "harness_version": 2,
             "findings_confirmed": [
-                {"title": "e", "severity": "low", "category": "tests"},
+                {
+                    "locator": "none",
+                    "title": "e",
+                    "severity": "low",
+                    "category": "tests",
+                },
             ],
             "findings_rejected": [],
         },
@@ -3647,8 +3663,8 @@ async def _task_with_machine_report(client: AsyncClient) -> int:
             "model": "grok-4.6",
             "raw_count": 2,
             "findings_confirmed": [
-                {"title": "boundary lost", "severity": "medium"},
-                {"title": "race on retry", "severity": "high"},
+                {"locator": "none", "title": "boundary lost", "severity": "medium"},
+                {"locator": "none", "title": "race on retry", "severity": "high"},
             ],
             "findings_rejected": [],
             "incomplete": False,

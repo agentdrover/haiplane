@@ -255,7 +255,9 @@ async def test_brief_carries_the_same_review_report(client: AsyncClient):
             "agent_count": 1,
             "model": "grok-4.6",
             "raw_count": 1,
-            "findings_confirmed": [{"title": "leak", "severity": "high"}],
+            "findings_confirmed": [
+                {"locator": "none", "title": "leak", "severity": "high"}
+            ],
             "findings_rejected": [],
             "incomplete": False,
             "unresolved": [],
