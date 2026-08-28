@@ -76,6 +76,7 @@ def _as_mapping(entry: Mapping[str, Any] | Any) -> Mapping[str, Any]:
             "title",
             "locator",
             "start_line",
+            "end_line",
             "line",
             "finding_uid",
         )
@@ -103,6 +104,16 @@ def _place(entry: Mapping[str, Any]) -> tuple[str, str]:
     neither makes it "none". Two reports agreeing about where a defect sits now
     agree about its id, whichever vocabulary they used to say so.
 
+    THE EXTENT OF A FINDING IS NOT PART OF ITS PLACE. A finding that says
+    lines 40-52 and one that says line 40 are one defect described with
+    different precision, exactly like ``file`` and ``lines`` are — so
+    ``end_line`` is deliberately absent from the material. Hashing it would
+    reintroduce the instability this function removes: the same reviewer
+    widening a range on a second run would produce a second id, and the
+    disposition filed against the first would stop matching. Two defects that
+    truly share a file, a category, a title AND a start line are twins, and
+    twins are what ``ordinal`` is for.
+
     The remaining cost stays and is meant to: code that moves shifts the line
     and the finding gets a new id. Of the two possible errors — "the same
     defect looks new" and "two defects look like one" — only the second
@@ -111,6 +122,12 @@ def _place(entry: Mapping[str, Any]) -> tuple[str, str]:
     start = entry.get("start_line")
     if start is None:
         start = entry.get("line")
+    if start is None:
+        # A range whose start went missing still names a line, and a placed
+        # finding must not degrade to file level over a field that was never
+        # filled in. Reachable only through legacy rows and hand-built
+        # payloads: the write model refuses ``end_line`` without a start.
+        start = entry.get("end_line")
     if start is not None:
         return ("lines", str(start))
     if _normalised(entry.get("file")):
