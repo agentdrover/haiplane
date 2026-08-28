@@ -1086,3 +1086,29 @@ async def test_live_implementer_session_does_not_release_running_task(hub):
     assert row["status"] == "running"
     who = await hub.client.get("/api/whoami", headers=session)
     assert who.status_code == 200, who.text
+
+
+@pytest.mark.asyncio
+async def test_expired_sibling_implementer_session_does_not_release_live_task(hub):
+    """#983: a dead sibling session must not reopen work a live session still holds."""
+    task_id = await _make_task(hub)
+    stale = await _implementer_session(hub, task_id)
+    live = await _implementer_session(hub, task_id)
+    await _pair_start_implementer(hub, task_id, live)
+
+    stale_token = stale["Authorization"].removeprefix("Bearer ")
+    await hub.db.execute(
+        "UPDATE chat_pair_sessions SET expires_at = datetime('now', '-1 second') "
+        "WHERE token_hash = ?",
+        (cp.hash_pair_code(stale_token),),
+    )
+    await hub.db.commit()
+
+    await cp.purge_expired(hub.db)
+
+    row = dict(
+        (await _rows(hub.db, "SELECT status FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    assert row["status"] == "running"
+    who = await hub.client.get("/api/whoami", headers=live)
+    assert who.status_code == 200, who.text

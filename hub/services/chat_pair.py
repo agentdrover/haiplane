@@ -368,6 +368,8 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
     Intake TTL is unchanged (#983 out of scope). A live token must not trip
     this. Review/completed stay: the work already left the pairing window.
     Headless ``job_id`` rows are not pairing sessions and are left alone.
+    A dead sibling session must not yank a task that still has another
+    unexpired, unrevoked implementer session on the same bound task.
     """
     rows = await fetchall(
         db,
@@ -376,7 +378,14 @@ async def release_expired_implementer_tasks(db: aiosqlite.Connection) -> list[in
         "JOIN tasks t ON t.id = s.bound_task_id "
         "WHERE s.kind = 'implementer' AND s.bound_task_id IS NOT NULL "
         "AND (s.expires_at < datetime('now') OR s.revoked_at IS NOT NULL) "
-        "AND t.status IN ('running', 'claimed')",
+        "AND t.status IN ('running', 'claimed') "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM chat_pair_sessions live "
+        "  WHERE live.kind = 'implementer' "
+        "  AND live.bound_task_id = s.bound_task_id "
+        "  AND live.revoked_at IS NULL "
+        "  AND live.expires_at > datetime('now')"
+        ")",
     )
     released: list[int] = []
     seen: set[int] = set()

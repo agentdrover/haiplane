@@ -337,9 +337,11 @@ curl -sS https://<hub>/api/whoami -H "Authorization: Bearer $TOKEN"
 
 TTL сессии тот же `HAIPLANE_CHAT_PAIR_TTL_SECONDS` (7200), что у intake.
 **Продления нет:** новый маршрут не добавляется в implementer allowlist.
-Если сессия истекла или отозвана, пока bound-задача ещё `running` или
-`claimed`, reaper хаба возвращает её в `open` и пишет status-update
-(release-on-expiry, #983). Задача в `review` / `completed` не трогается.
+Если последняя живая implementer-сессия истекла или отозвана, пока bound-задача
+ещё `running` или `claimed`, reaper хаба возвращает её в `open` и пишет
+status-update (release-on-expiry, #983). Просроченный sibling не трогает задачу,
+пока на том же `bound_task_id` есть другая живая сессия. Задача в `review` /
+`completed` не трогается.
 
 ---
 
