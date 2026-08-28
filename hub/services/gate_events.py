@@ -20,6 +20,9 @@ HUMAN_GATE_EVENT_KINDS: frozenset[str] = frozenset(
         "task_decided",
         "audit_result",
         "disposition_recorded",
+        "steward_judgement",
+        "steward_applied",
+        "steward_escalated",
     }
 )
 
@@ -29,6 +32,10 @@ HUMAN_GATE_EVENT_KINDS: frozenset[str] = frozenset(
 NON_HUMAN_GATE_ACTORS: frozenset[str] = frozenset({"hub", "policy", "steward"})
 
 DISPOSITION_RECORDED = "disposition_recorded"
+STEWARD_JUDGEMENT = "steward_judgement"
+STEWARD_APPLIED = "steward_applied"
+STEWARD_ESCALATED = "steward_escalated"
+STEWARD_OVERRIDE_WINDOW_DAYS = 7
 
 
 def sql_in(values: frozenset[str]) -> tuple[str, tuple[str, ...]]:

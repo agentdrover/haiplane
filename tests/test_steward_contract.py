@@ -1,7 +1,7 @@
 """Контракт hub_submit_steward_judgement: закрытые словари и at-most-once (#1022).
 
 Спека: docs/specs/steward-agent.md §5, §6.1, §7. Только запись — без
-транзишена и без событий (#1023 / F4).
+транзишена. События аудита пишет #1023; применение суждения — F4.
 
 AC-1: нет verdict → 422 с reason и hint, ряд не появляется.
 AC-2: ground.source и escalate_reason вне закрытых словарей → 422; unknown нет.
