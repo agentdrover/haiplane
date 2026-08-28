@@ -1462,6 +1462,10 @@ async def api_task_context(
         task_view.project = TaskProjectRef(
             id=project_row["id"], slug=project_row["slug"]
         )
+    # #989: /context skipped enrich_task_view, so GET filling the field
+    # was not enough — name the live pair tree on both surfaces.
+    task_view = await services.apply_live_worktree(db, task_view)
+    worktree_advisory = await services.worktree_session_advisory(db, task_view)
 
     # --- Readiness summary. Reuse the same calculator as /readiness so
     # /context and /readiness can never drift.
@@ -1508,6 +1512,10 @@ async def api_task_context(
         f"Type: {task.get('task_type', 'task')} | Status: {task['status']} "
         f"| Priority: {task.get('priority', 'medium')}"
     )
+    if task_view.worktree_path:
+        lines.append(f"Worktree: {task_view.worktree_path}")
+    if worktree_advisory:
+        lines.append(worktree_advisory)
     if progress:
         lines.append(
             f"Progress: {progress['completed']}/{progress['total']} "

@@ -4569,6 +4569,29 @@ async def test_pair_start_legacy_no_worktree_path(
     assert started.worktree_path == ""
 
 
+async def test_enrich_task_view_fills_only_registered_worktree(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#989: GET enrichment uses registration, not the deterministic path alone."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+    plugins.git_ops.worktree_path = MagicMock(return_value="/srv/.ws-worktrees/task-1")
+    plugins.git_ops.worktree_is_registered = AsyncMock(return_value=False)
+
+    created = await services.create_task(db, TaskCreate(title="No live tree"))
+    tv = created.task
+    enriched = await services.enrich_task_view(db, tv)
+    assert enriched.worktree_path == ""
+
+    plugins.git_ops.worktree_is_registered = AsyncMock(return_value=True)
+    live = await services.enrich_task_view(db, tv)
+    assert live.worktree_path == "/srv/.ws-worktrees/task-1"
+    assert live.workspace_mode == "worktree"
+
+
 # ---- Verifiable SDD: AC-tests verdict gate (#508) ----
 
 

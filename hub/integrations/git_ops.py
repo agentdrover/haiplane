@@ -1431,6 +1431,10 @@ class GitOpsIntegration:
         """Deterministic worktree path for a task (#459); where its branch lives."""
         return _worktree_path(task_id, repo or _repo_root())
 
+    async def worktree_is_registered(self, path: str, repo: str | None = None) -> bool:
+        """True when ``path`` is a registered worktree of ``repo`` (#989)."""
+        return await _worktree_registered(path, repo or _repo_root())
+
     async def pair_prepare_worktree(
         self,
         task_id: int,

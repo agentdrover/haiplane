@@ -89,6 +89,7 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
+    apply_live_worktree,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -660,7 +661,7 @@ async def enrich_task_view(
             id=project_row["id"], slug=project_row["slug"]
         )
 
-    return task_view
+    return await apply_live_worktree(db, task_view)
 
 
 @dataclass(frozen=True)

@@ -180,6 +180,9 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
     ) -> bool: ...
     def worktree_path(self, task_id: int, repo: str | None = None) -> str: ...
+    async def worktree_is_registered(
+        self, path: str, repo: str | None = None
+    ) -> bool: ...
     async def pair_prepare_worktree(
         self,
         task_id: int,
