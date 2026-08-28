@@ -753,6 +753,9 @@ async def test_mcp_call_events_table_has_no_payload_column():
         assert columns["task_id"]["type"] == "INTEGER"
         assert columns["latency_ms"]["notnull"] == 1
         assert columns["response_chars"]["notnull"] == 1
+        # #549: pre-column rows must read as unknown, not as "discarded none".
+        assert columns["unknown_arg_count"]["type"] == "INTEGER"
+        assert columns["unknown_arg_count"]["notnull"] == 0
     finally:
         await conn.close()
 
@@ -785,6 +788,22 @@ async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
     finally:
         await fresh.close()
         await upgraded.close()
+
+
+async def test_unknown_arg_count_omitted_insert_reads_as_unmeasured():
+    """#549: a telemetry row that never recorded discards is NULL, not zero."""
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        await db.execute("INSERT INTO mcp_call_events (tool) VALUES ('hub_whoami')")
+        await db.commit()
+        rows = list(
+            await db.execute_fetchall(
+                "SELECT unknown_arg_count FROM mcp_call_events WHERE tool = 'hub_whoami'"
+            )
+        )
+        assert rows and rows[0]["unknown_arg_count"] is None
 
 
 async def test_provider_tokens_migration_is_additive():
