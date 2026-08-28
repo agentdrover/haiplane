@@ -118,7 +118,10 @@ async def record_steward_judgement(
         )
     await db.commit()
     saved = await repo.get_steward_judgement_by_id(db, inserted)
-    assert saved is not None
+    if saved is None:
+        raise RuntimeError(
+            f"steward judgement {inserted} missing after insert for task #{task_id}"
+        )
     return StewardJudgementView(**dict(saved))
 
 
