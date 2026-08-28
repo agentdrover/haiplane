@@ -74,7 +74,35 @@ async def test_successful_call_is_recorded_with_allowlist_metadata(sink):
     assert event["latency_ms"] >= 0
     assert event["response_chars"] > 0
     assert event["task_id"] == 41
+    assert event["unknown_arg_count"] == 0
     assert set(event) == {"id", "created_at"} | set(repo.MCP_CALL_EVENT_COLUMNS)
+
+
+async def test_unknown_arguments_are_counted_without_storing_values(sink):
+    """AC-4 (#1015): a discard is countable metadata; the dropped value is not stored."""
+    with (
+        patch("hub.mcp_server._api_post", new_callable=AsyncMock) as post,
+        patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get,
+    ):
+        post.return_value = {"status": "claimed", "claimed_by": "composer"}
+        get.side_effect = [
+            {"id": 41, "status": "open"},
+            {"id": 41, "status": "claimed", "claimed_by": "composer"},
+        ]
+        await mcp.call_tool(
+            "hub_claim_task",
+            {
+                "task_id": 41,
+                "agent": "composer",
+                "session_id": "",
+                "bogus": SENTINEL,
+            },
+        )
+
+    events = await _events(sink)
+    assert len(events) == 1
+    assert events[0]["unknown_arg_count"] == 1
+    assert SENTINEL not in await _dump(sink)
 
 
 async def test_argument_values_never_reach_storage(sink):
