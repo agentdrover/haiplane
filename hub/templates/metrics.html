@@ -130,6 +130,26 @@ first-pass от того, что её одобрили следом.</p>
 как пересдача. Самоодобрение показано рядом: рейт, который растёт от того, что
 ревьюера убрали, ничего не измеряет — полная картина в отдельной метрике.</p>
 
+<h2>Касания человека на доставленную задачу</h2>
+<p class="muted">Знаменатель — задачи, которые хаб сам смержил в окне
+(<code>pipeline_merges</code>). Числитель — события человеческих гейтов только
+по этим задачам. Одно множество, один запрос: задача без доставки не попадает
+ни в числитель, ни в знаменатель, а <code>hub</code> / <code>policy</code> /
+<code>steward</code> не считаются касаниями — тот же фильтр, что у human_gates
+(#1009, урок #518).</p>
+<table class="task-table">
+    <tbody>
+        <tr><td>Доставленных задач</td>
+            <td>{{ m.human_touches.delivered_tasks }}</td></tr>
+        <tr><td>Касаний на них</td>
+            <td>{{ m.human_touches.touches }}</td></tr>
+        <tr><td>Касаний на доставленную задачу</td>
+            <td>{% if m.human_touches.touches_per_delivered is not none %}{{ m.human_touches.touches_per_delivered }}
+                <span class="muted">({{ m.human_touches.touches }} / {{ m.human_touches.delivered_tasks }})</span>
+                {% else %}<span class="muted">нет доставок в окне</span>{% endif %}</td></tr>
+    </tbody>
+</table>
+
 <h2>By review profile</h2>
 <p class="muted">Профиль отвечает не на «что прогналось», а на то, как прогон
 устроен: lite — один проход по диффу, deep — многоагентный харнесс. Профиль

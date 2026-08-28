@@ -1145,3 +1145,103 @@ async def test_profile_with_no_bill_reports_unknown_not_zero(
 
     assert lite["provider_tokens_per_run"] is None
     assert lite["billed_runs"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Human touches on delivered tasks (#1009)
+# ---------------------------------------------------------------------------
+
+
+async def _deliver(db: aiosqlite.Connection, task_id: int, *, pr: int) -> None:
+    """A merge the hub performed: the denominator of the touch metric."""
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (NULL, ?, ?, ?)",
+        (pr, task_id, f"sha-{pr}"),
+    )
+
+
+async def test_touches_share_one_task_set(db: aiosqlite.Connection):
+    # AC-2 (#1009): numerator and denominator come from the delivered set.
+    # An undelivered task with plenty of human events must not enter either.
+    shipped = await _task(db, title="delivered with two touches")
+    also_shipped = await _task(db, title="delivered with none")
+    still_open = await _task(db, title="undelivered with five touches")
+    await _deliver(db, shipped, pr=101)
+    await _deliver(db, also_shipped, pr=102)
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="human")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=shipped,
+        actor="reviewer",
+        payload={"verdict": "approved"},
+    )
+    for _ in range(5):
+        await repo.insert_event(
+            db, kind="task_approved", task_id=still_open, actor="human"
+        )
+    await db.commit()
+
+    touches = (await practice_metrics(db))["human_touches"]
+    assert touches["delivered_tasks"] == 2, (
+        "undelivered work must not pad the denominator"
+    )
+    assert touches["touches"] == 2, (
+        "touches on undelivered tasks must not pad the numerator"
+    )
+    assert touches["touches_per_delivered"] == 1.0
+
+
+async def test_machine_actors_are_not_touches(db: aiosqlite.Connection):
+    # AC-3 (#1009): hub and policy on a delivered task are not human touches,
+    # and they must not create a human touch that the gate metric would also
+    # refuse. The filter is the same set of actors.
+    shipped = await _task(db, title="delivered mixed actors")
+    await _deliver(db, shipped, pr=201)
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="hub")
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="policy")
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="human")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=shipped,
+        actor="policy",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
+    touches = (await practice_metrics(db))["human_touches"]
+    assert touches["delivered_tasks"] == 1
+    assert touches["touches"] == 1, "hub and policy must not count as touches"
+
+
+def test_gate_event_vocabulary_is_single_source():
+    # AC-4 (#1009): the kind list lives in one place. Queries import it; they
+    # must not restype the same strings into a second IN-list.
+    import inspect
+
+    from hub.services.gate_events import HUMAN_GATE_EVENT_KINDS, NON_HUMAN_GATE_ACTORS
+    from hub.services import orchestration
+
+    assert HUMAN_GATE_EVENT_KINDS == frozenset(
+        {
+            "task_approved",
+            "task_rejected",
+            "review_verdict_recorded",
+            "task_decided",
+            "audit_result",
+            "disposition_recorded",
+        }
+    )
+    assert "unknown" not in HUMAN_GATE_EVENT_KINDS
+    assert NON_HUMAN_GATE_ACTORS == frozenset({"hub", "policy", "steward"})
+
+    gate_src = inspect.getsource(orchestration._human_gate_metrics)
+    touch_src = inspect.getsource(orchestration._human_touch_metrics)
+    assert "HUMAN_GATE_EVENT_KINDS" in gate_src
+    assert "HUMAN_GATE_EVENT_KINDS" in touch_src
+    assert "NON_HUMAN_GATE_ACTORS" in gate_src
+    assert "NON_HUMAN_GATE_ACTORS" in touch_src
+    assert "task_approved', 'task_rejected'" not in gate_src
+    assert "task_approved', 'task_rejected'" not in touch_src
