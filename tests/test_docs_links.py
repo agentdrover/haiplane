@@ -45,30 +45,30 @@ def test_operator_guide_separates_intake_and_implementer_pairing():
     assert "возвращает её в `open`" in section_4b
 
 
-def test_implementer_path_spec_freezes_intake_961():
-    # #984: path pack lives next to #961; intake SDD must point at it.
-    path_spec = REPO_ROOT / "docs" / "issues" / "chat-pair-implementer-path.md"
-    intake = REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md"
-    assert path_spec.is_file()
-    intake_text = intake.read_text(encoding="utf-8")
-    assert "Intake заморожен" in intake_text
-    assert "chat-pair-implementer-path.md" in intake_text
-    spec = path_spec.read_text(encoding="utf-8")
-    assert "kind=implementer" in spec
-    assert "#983" in spec
+def test_no_links_to_removed_internal_docs():
+    """#1004: the per-task SDDs and admin design drafts left the public repo.
 
-
-def test_implementer_sdd_matches_allowlist_and_freezes_intake_role():
-    # #979: full SDD next to #961; presentational role stays intake-only.
-    sdd = (
-        REPO_ROOT / "docs" / "issues" / "task-979-chat-pair-implementer.md"
-    ).read_text(encoding="utf-8")
-    assert "CHAT_PAIR_IMPLEMENTER_ALLOWLIST" in sdd
-    assert "POST   /api/tasks/{task_id}/pair-start" in sdd
-    assert "POST /api/tasks" in sdd  # closed-routes table names create
-    assert "chat_pair_task_not_open" in sdd
-    intake = (REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md").read_text(
-        encoding="utf-8"
+    They were working notes, not product documentation. What must not survive
+    them is a dangling pointer: a reader following one lands on nothing.
+    """
+    removed = (
+        "docs/issues/",
+        "admin-section-design",
+        "admin-ui-functional-spec",
+        "software-development-workflow-implementation-plan",
     )
-    assert "Intake-only" in intake
-    assert "task-979-chat-pair-implementer.md" in intake
+    roots = [REPO_ROOT / "docs", REPO_ROOT / "skills", REPO_ROOT / "agents"]
+    files = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "README.en.md",
+        REPO_ROOT / "AGENTS.md",
+    ]
+    for root in roots:
+        if root.is_dir():
+            files.extend(p for p in root.rglob("*") if p.suffix in {".md", ".html"})
+    for path in files:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in removed:
+            assert needle not in text, f"{path} still points at removed {needle}"
