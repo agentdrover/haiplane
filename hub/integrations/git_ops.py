@@ -67,6 +67,7 @@ class PairBranchConflictError(Exception):
         workspace_path: str | None = None,
         hostname: str | None = None,
         suggested_tool: str | None = "hub_pair_start",
+        files: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -75,6 +76,7 @@ class PairBranchConflictError(Exception):
         self.workspace_path = workspace_path
         self.hostname = hostname
         self.suggested_tool = suggested_tool
+        self.files = files or []
 
     def to_detail(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -83,6 +85,8 @@ class PairBranchConflictError(Exception):
         }
         if self.hint:
             payload["hint"] = self.hint
+        if self.files:
+            payload["files"] = self.files
         if self.workspace_path:
             payload["workspace_path"] = self.workspace_path
         if self.hostname:
@@ -118,6 +122,44 @@ def _task_id_from_branch(branch: str) -> int | None:
         return None
 
 
+# How many paths a refusal names before it starts counting instead. The tail
+# is counted rather than dropped: a bare "10 files" list reads as the whole of
+# it, and the person then stashes believing they have seen everything.
+_DIRTY_PATHS_NAMED = 10
+
+
+async def _dirty_state(repo: str) -> tuple[str, list[str]]:
+    """``(raw porcelain, paths)`` for ``repo`` — dirtiness and what is dirty.
+
+    Both halves come from one ``git status`` because they must agree: the raw
+    text decides whether to refuse, the parsed paths say what to name. The
+    ``-z`` form is what makes the second half usable — without it git escapes
+    any non-ASCII path (``docs/Тест.md`` arrives as ``"docs/\\320\\242..."``),
+    and a refusal that names a file under a name the person cannot find in
+    their own checkout has not really named it (#555, same defect one layer up).
+    """
+    _, out, _ = await _git("status", "--porcelain", "-z", repo=repo, check=False)
+    return out, parse_porcelain_paths(out)
+
+
+def _name_dirty_files(paths: list[str]) -> str:
+    if not paths:
+        return "git не назвал ни одного пути"
+    named = ", ".join(paths[:_DIRTY_PATHS_NAMED])
+    rest = len(paths) - _DIRTY_PATHS_NAMED
+    return f"{named} и ещё {rest}" if rest > 0 else named
+
+
+def _rescue_command(repo: str, task_id: int | None = None) -> str:
+    """A command that PRESERVES the dirty work, ready to paste.
+
+    ``stash push -u`` and not ``clean``: the whole point of the refusal is that
+    untracked files do not come back, so the way out it offers must keep them.
+    """
+    label = f" -m 'before pair-start #{task_id}'" if task_id is not None else ""
+    return f"cd {repo} && git stash push -u{label}"
+
+
 def _pair_branch_conflict(
     message: str,
     *,
@@ -128,6 +170,7 @@ def _pair_branch_conflict(
     current_branch: str | None = None,
     task_id: int | None = None,
     base_branch: str | None = None,
+    files: list[str] | None = None,
 ) -> PairBranchConflictError:
     host = _hostname()
     if hint is None and current_branch and task_id is not None:
@@ -149,6 +192,7 @@ def _pair_branch_conflict(
         workspace_path=repo,
         hostname=host,
         suggested_tool=suggested_tool,
+        files=files,
     )
 
 
@@ -697,12 +741,12 @@ class GitOpsIntegration:
         # rather than proceed. P1 of that policy documents the destructive
         # behaviour as a known wart with "commit or stash first" as the
         # workaround; this removes the need for the workaround.
-        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        dirty, dirty_files = await _dirty_state(repo)
         if dirty.strip():
             raise WorkspaceNotReadyError(
                 f"refusing to prepare #{task_id} in dirty workspace {repo} — "
-                f"commit or stash first. Files: "
-                + ", ".join(dirty.strip().splitlines()[:10])
+                f"commit or stash first. Files: {_name_dirty_files(dirty_files)}. "
+                f"To keep them: {_rescue_command(repo, task_id)}"
             )
 
         rc, _, err = await _git("checkout", base, repo=repo, check=False)
@@ -758,15 +802,17 @@ class GitOpsIntegration:
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
 
-        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        dirty, dirty_files = await _dirty_state(repo)
         if dirty.strip():
             raise _pair_branch_conflict(
-                "Uncommitted changes in workspace; commit or stash before pair-start",
+                "Uncommitted changes in workspace; commit or stash before "
+                f"pair-start. Files: {_name_dirty_files(dirty_files)}",
                 repo=repo,
                 reason="pair_branch_dirty",
+                files=dirty_files,
                 hint=(
-                    f"Commit or stash uncommitted changes in {repo} "
-                    f"(host {_hostname()}), then retry hub_pair_start."
+                    f"On host {_hostname()}: {_rescue_command(repo, task_id)} "
+                    f"(or commit them), then retry hub_pair_start."
                 ),
             )
 
@@ -1475,18 +1521,18 @@ class GitOpsIntegration:
             cur = (cur or "").strip()
             if cur == branch:
                 return branch
-            rc, dirty, _ = await _git(
-                "status", "--porcelain", repo=wt_path, check=False
-            )
+            dirty, dirty_files = await _dirty_state(wt_path)
             if dirty.strip():
                 raise _pair_branch_conflict(
                     f"Worktree {wt_path} is on {cur!r} with uncommitted changes; "
-                    f"refusing to switch it to {branch!r}",
+                    f"refusing to switch it to {branch!r}. "
+                    f"Files: {_name_dirty_files(dirty_files)}",
                     repo=wt_path,
                     reason="pair_worktree_dirty",
+                    files=dirty_files,
                     hint=(
-                        f"Commit or stash changes in {wt_path} (host {_hostname()}), "
-                        f"then retry pair-start for #{task_id}."
+                        f"On host {_hostname()}: {_rescue_command(wt_path, task_id)} "
+                        f"(or commit them), then retry pair-start for #{task_id}."
                     ),
                     task_id=task_id,
                 )

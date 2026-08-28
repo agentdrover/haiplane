@@ -909,6 +909,84 @@ async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
     assert (Path(wt) / "wip.txt").exists()  # data preserved
 
 
+async def test_dirty_refusal_names_the_files_and_the_way_out(tmp_path, git_ops):
+    """#1017 AC-1: the refusal names what is dirty, in the person's own names.
+
+    The non-ASCII file is the point. Both dirty probes read
+    ``git status --porcelain``, which escapes any such path — so a message
+    built from that output would say ``"\\320\\267..."``, a name matching
+    nothing the person can see in their checkout. Naming a file unfindably is
+    not naming it.
+    """
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        8, "Task A", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = Path(_worktree_path(8, str(repo)))
+    (wt / "заметки.md").write_text("черновик, ещё не в коммите")
+    (wt / "f.txt").write_text("edited, tracked")
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            8, "Task A", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+
+    detail = exc.value.to_detail()
+    assert set(detail["files"]) == {"заметки.md", "f.txt"}
+    assert "заметки.md" in detail["message"] and "f.txt" in detail["message"]
+    # The way out must PRESERVE the work: -u carries the untracked file too,
+    # which is the half no git command can bring back once it is gone.
+    assert "git stash push -u" in detail["hint"]
+    assert (wt / "заметки.md").exists()
+    assert (wt / "f.txt").read_text() == "edited, tracked"
+
+
+async def test_shared_clone_refusal_names_the_files(git_ops: GitOpsIntegration) -> None:
+    """#1017 AC-1 on the other pair path: the shared clone, not a worktree."""
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "\0".join((" M hub/app.py", "?? заметки.md")) + "\0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+        patch("hub.integrations.git_ops._hostname", return_value="hub-server"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(9, "Dirty")
+
+    detail = exc.value.to_detail()
+    assert detail["files"] == ["hub/app.py", "заметки.md"]
+    assert "hub/app.py" in detail["message"]
+    assert "git stash push -u" in detail["hint"]
+
+
+async def test_dirty_refusal_counts_the_files_it_does_not_name(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """#1017: a truncated list says so, instead of reading as the whole of it."""
+    paths = [f"pkg/mod_{i}.py" for i in range(14)]
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "\0".join(f" M {p}" for p in paths) + "\0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(9, "Dirty")
+
+    detail = exc.value.to_detail()
+    assert detail["files"] == paths  # the structured field keeps all of them
+    assert "и ещё 4" in detail["message"]
+
+
 async def test_worktree_base_ahead_guard(tmp_path, git_ops):
     # #459 review MEDIUM: pair_prepare_worktree must reject cutting a new branch
     # when local base is ahead of origin/base (broken fetch → foreign commits).
