@@ -2955,9 +2955,19 @@ async def has_done_updates(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> bool:
+    """Did the AGENT say the work is done? (#1018)
+
+    Only a claimed report counts. A passage the hub transcribed from a
+    dispatch log is stored with the same kind so a person still reads it in
+    the feed, but it must not answer this question — otherwise the next poll
+    pass sees a ``done`` row and opens the conveyor the transcription was
+    kept out of. Rows from before the column read as claimed, which is what
+    they were.
+    """
     rows = await fetchall(
         db,
-        "SELECT id FROM task_updates WHERE task_id=? AND kind='done'",
+        "SELECT id FROM task_updates "
+        "WHERE task_id=? AND kind='done' AND agent_claimed=1",
         (task_id,),
     )
     return bool(rows)
@@ -3098,9 +3108,15 @@ async def add_task_update(
     *,
     principal_id: int | None = None,
     author_kind: str = "hub",
+    agent_claimed: bool = True,
 ) -> int:
     """Append an update. ``agent`` is display-only; authorship is the pair
     (principal_id, author_kind) (#559).
+
+    ``agent_claimed=False`` marks a report the hub TRANSCRIBED rather than
+    received — today only the dispatch log's last long passage (#1018). It
+    defaults to True because every other caller is a real claim, and because
+    the rows written before the column existed were claims too.
 
     ``author_kind`` defaults to "hub" rather than to the column default
     "legacy": the column default exists to stamp rows written before the field
@@ -3111,8 +3127,16 @@ async def add_task_update(
     """
     cur = await db.execute(
         "INSERT INTO task_updates (task_id, agent, kind, content, principal_id, "
-        "author_kind) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, agent, kind, content, principal_id, author_kind),
+        "author_kind, agent_claimed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            agent,
+            kind,
+            content,
+            principal_id,
+            author_kind,
+            int(agent_claimed),
+        ),
     )
     return cur.lastrowid  # type: ignore[return-value]
 

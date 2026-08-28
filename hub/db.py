@@ -1558,6 +1558,20 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_steward_judgements_unique "
         "ON steward_judgements(task_id, generation, kind)",
     ),
+    (
+        # #1018: did the AGENT claim this report, or did the hub transcribe it
+        # from a dispatch log? Until now the two were the same row, so a text
+        # picked out of a log by LENGTH opened the whole git tail — commit,
+        # squash, push, create_pr — on work nobody said was finished.
+        #
+        # A phrase inside `content` would not do: it cannot be queried, and a
+        # rule nobody can check is not a rule. Default 1 means "claimed by the
+        # agent", so every row written before this column keeps the behaviour
+        # it had — the flag marks the new, narrower case, never re-judges
+        # history.
+        "add_task_updates_agent_claimed",
+        "ALTER TABLE task_updates ADD COLUMN agent_claimed INTEGER NOT NULL DEFAULT 1",
+    ),
 ]
 
 
