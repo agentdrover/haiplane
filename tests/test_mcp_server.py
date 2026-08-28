@@ -2667,14 +2667,14 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
         "submission_generation": 2,
         "is_current": True,
         "raw_count": 4,
-        "findings_confirmed": [{"title": "x", "severity": "low"}],
+        "findings_confirmed": [{"locator": "none", "title": "x", "severity": "low"}],
         "findings_rejected": [],
     }
     out = await hub_submit_machine_review(
         42,
         raw_count=4,
         incomplete=False,
-        findings_confirmed=[{"title": "x", "severity": "low"}],
+        findings_confirmed=[{"locator": "none", "title": "x", "severity": "low"}],
         tokens_spent=1000,
         agent="claude-code",
     )
@@ -2898,7 +2898,10 @@ async def test_machine_review_receipt_quotes_the_stored_raw_count(
     mock_api_post.return_value = {
         "submission_generation": 1,
         "raw_count": 2,  # normalised up from the 0 that was sent
-        "findings_confirmed": [{"title": "a"}, {"title": "b"}],
+        "findings_confirmed": [
+            {"locator": "none", "title": "a"},
+            {"locator": "none", "title": "b"},
+        ],
         "findings_rejected": [],
     }
 
@@ -2906,7 +2909,10 @@ async def test_machine_review_receipt_quotes_the_stored_raw_count(
         7,
         raw_count=0,
         incomplete=False,
-        findings_confirmed=[{"title": "a"}, {"title": "b"}],
+        findings_confirmed=[
+            {"locator": "none", "title": "a"},
+            {"locator": "none", "title": "b"},
+        ],
     )
 
     text = out.content[0].text if hasattr(out, "content") else str(out)

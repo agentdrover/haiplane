@@ -220,7 +220,12 @@ async def test_any_unclean_ground_leaves_review_to_human(
         client,
         with_finding,
         findings_confirmed=[
-            {"title": "real bug", "severity": "high", "category": "correctness"}
+            {
+                "locator": "none",
+                "title": "real bug",
+                "severity": "high",
+                "category": "correctness",
+            }
         ],
     )
     assert (await client.get(f"/api/tasks/{with_finding}")).json()["status"] == "review"

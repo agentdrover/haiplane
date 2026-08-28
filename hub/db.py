@@ -1205,6 +1205,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON finding_dispositions(review_id, finding_index)",
     ),
     (
+        # The finding's own identity beside the slot it occupied (#1007).
+        # NOT backfilled: rows filed before this column were addressed by
+        # position and are still readable that way, and computing an id for
+        # them now would claim they were judged under a scheme that did not
+        # exist. The conflict target stays (review_id, finding_index) so those
+        # rows keep being corrected in place rather than duplicated.
+        "add_finding_uid_to_dispositions",
+        "ALTER TABLE finding_dispositions ADD COLUMN finding_uid TEXT NOT NULL "
+        "DEFAULT ''",
+    ),
+    (
         # A finding class that keeps coming back, and the check that ended it
         # (#878, feature #871). ``recurring_categories`` has counted repeats
         # since #384 and closed nothing: a class found in three tasks is still
@@ -2257,7 +2268,7 @@ MULTI_AGENT_REVIEW_SKILL = """\
 
 ## Фаза 1 — ревьюверы по измерениям (параллельно, по одному агенту на роль)
 Каждому: узкий мандат, контекст задачи (постановка + ограничения из хаба),
-схема ответа findings[] = {title, file, line, severity: high|medium|low,
+схема ответа findings[] = {title, file, locator, start_line, severity: high|medium|low,
 detail, category}.
 
 1. security — только реально эксплуатируемое: инъекции, XSS, обход
@@ -2273,7 +2284,9 @@ detail, category}.
    требовать тестов на поведение фреймворка.
 
 Всем: «Верни только находки, которые готов защищать перед автором.
-Каждая привязана к file:line. Лучше 2 настоящих, чем 10 предположительных».
+Каждая называет своё место: locator=lines с file и start_line, либо
+locator=file, либо честное locator=none. Лучше 2 настоящих, чем 10
+предположительных».
 
 ## Фаза 2 — адверсариальная верификация (на КАЖДУЮ находку, 2 агента)
 Без барьера: находки измерения уходят на проверку сразу.
@@ -2341,8 +2354,17 @@ HAIPLANE_MACHINE_REVIEW=require
    отчёт его информирует, не заменяет.
 
 ## Формат находок
-confirmed: {title, severity high|medium|low, category slug, file, line,
-detail}; rejected: {title, category, reason}; unresolved: {title, why}.
+confirmed: {title, severity high|medium|low, locator, category slug, file,
+start_line, end_line, detail}; rejected: {title, category, reason};
+unresolved: {title, why}.
+
+`locator` ОБЯЗАТЕЛЕН (#1007) и говорит, где находка сидит: `lines` — известны
+файл и строки (file + start_line, end_line для диапазона); `file` — известен
+модуль, строка нет; `none` — место определить не удалось. `none` это ОТВЕТ и он
+принимается: харнесс, который не может указать место, всё равно сдаёт годный
+отчёт. Пустой file ответом не является — его не отличить от забытого поля.
+Идентификатор находки НЕ присылается: хаб выводит его из содержания и
+возвращает на каждом чтении отчёта.
 category питает метрики повторяемости — используй устойчивые слаги
 (security, correctness, consistency, tests, …).
 
@@ -2356,8 +2378,15 @@ category питает метрики повторяемости — исполь
 async def seed_default_skills(db: aiosqlite.Connection) -> None:
     """Seed built-in skills (#380, #383).
 
-    Idempotent per skill: only inserts when the name has no versions at
-    all, so operator edits and newer versions are never overwritten.
+    Idempotent per skill: only inserts when the name has no versions at all,
+    so operator edits and newer versions are never overwritten.
+
+    When the shipped text has MOVED ON from every stored version, a new version
+    is filed as a DRAFT (#1007). Nothing is overwritten and nothing activates
+    itself — a human still decides, exactly as #380 set out. The alternative
+    was worse than it looks: the contract for machine-review findings changed
+    with this release, and a library still teaching the old shape would send
+    every harness into a 422 while the docs claimed otherwise.
     """
     seeds = (
         (
@@ -2374,13 +2403,25 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         ),
     )
     for name, kind, content, tags in seeds:
-        rows = await fetchall(db, "SELECT id FROM skills WHERE name=? LIMIT 1", (name,))
-        if rows:
+        rows = await fetchall(
+            db,
+            "SELECT version, content FROM skills WHERE name=? ORDER BY version DESC",
+            (name,),
+        )
+        if not rows:
+            await db.execute(
+                "INSERT INTO skills (name, kind, version, content, tags, status, "
+                "created_by) VALUES (?, ?, 1, ?, ?, 'active', 'seed')",
+                (name, kind, content, tags),
+            )
+            continue
+        if any(str(row["content"]) == content for row in rows):
+            # The shipped text is already in the library, active or not.
             continue
         await db.execute(
             "INSERT INTO skills (name, kind, version, content, tags, status, "
-            "created_by) VALUES (?, ?, 1, ?, ?, 'active', 'seed')",
-            (name, kind, content, tags),
+            "created_by) VALUES (?, ?, ?, ?, ?, 'draft', 'seed')",
+            (name, kind, int(rows[0]["version"]) + 1, content, tags),
         )
     await db.commit()
 

@@ -420,7 +420,12 @@ async def test_self_reported_overspend_follows_the_recorded_decision(
         "tokens_spent": 1_500_000,
         "raw_count": 1,
         "findings_confirmed": [
-            {"title": "off-by-one", "severity": "medium", "file": "a.py"}
+            {
+                "locator": "file",
+                "title": "off-by-one",
+                "severity": "medium",
+                "file": "a.py",
+            }
         ],
         "findings_rejected": [],
         "incomplete": False,
@@ -798,7 +803,9 @@ async def test_provider_usage_is_stored_on_the_report(
             "harness_skill": "multi-agent-review",
             "harness_version": 8,
             "raw_count": 1,
-            "findings_confirmed": [{"title": "real one", "severity": "medium"}],
+            "findings_confirmed": [
+                {"locator": "none", "title": "real one", "severity": "medium"}
+            ],
             "findings_rejected": [],
             "incomplete": False,
             "unresolved": [],

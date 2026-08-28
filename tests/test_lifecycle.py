@@ -15,6 +15,7 @@ import aiosqlite
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.services.finding_identity import finding_uids
 
 
 async def _walk_pair_lifecycle(client: AsyncClient, task_id: int) -> list[str]:
@@ -196,14 +197,17 @@ async def test_disposed_findings_produce_no_note(
 ):
     """AC-3: answered findings raise nothing — a warning that always fires is wallpaper."""
     task_id = await _task_in_review(client, "approved after judging")
-    review_id = await _report(db, task_id, 1, ["one", "two"])
-    for index in (0, 1):
+    titles = ["one", "two"]
+    review_id = await _report(db, task_id, 1, titles)
+    uids = finding_uids([{"title": t, "severity": "medium"} for t in titles])
+    for index, uid in enumerate(uids):
         await repo.upsert_finding_disposition(
             db,
             review_id=review_id,
             task_id=task_id,
             submission_generation=1,
             finding_index=index,
+            finding_uid=uid,
             finding_title="",
             disposition="fixed",
             note="",
@@ -300,7 +304,9 @@ async def test_second_report_names_the_dispatched_reviewer(
             "agent": "pda_claude",
             "model": "claude-fable-5",
             "tokens_spent": 71296,
-            "findings_confirmed": [{"title": "found by hand", "severity": "low"}],
+            "findings_confirmed": [
+                {"title": "found by hand", "severity": "low", "locator": "none"}
+            ],
         },
     )
     assert resp.status_code == 200, resp.text

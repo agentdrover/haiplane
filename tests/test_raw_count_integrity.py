@@ -37,8 +37,13 @@ async def _reviewable(client: AsyncClient, db: aiosqlite.Connection) -> int:
 
 
 def _finding(idx: int) -> dict:
-    """A confirmed finding: severity and category."""
-    return {"title": f"f{idx}", "severity": "low", "category": "tests"}
+    """A confirmed finding: severity, category and where it sits (#1007)."""
+    return {
+        "title": f"f{idx}",
+        "severity": "low",
+        "category": "tests",
+        "locator": "none",
+    }
 
 
 def _rejected(idx: int) -> dict:

@@ -1113,18 +1113,33 @@ async def upsert_finding_disposition(
     disposition: str,
     note: str,
     decided_by: str,
+    finding_uid: str,
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert on (review_id, finding_index): a gate revisiting its own judgement
-    corrects it instead of leaving two contradictory rows for the metrics to
-    average.
+    Upsert stays on (review_id, finding_index), and that is correct rather than
+    legacy: a stored report is IMMUTABLE. ``findings_confirmed`` is written once
+    by ``insert_machine_review`` and never rewritten, and a resubmission files a
+    NEW report with its own id and its own judgements — so inside one report a
+    slot names one finding for good. A gate revisiting its own call corrects
+    that row instead of stacking a contradictory one beside it.
+
+    What the slot cannot do is carry identity ACROSS reports, which is why
+    ``finding_uid`` is stored beside it (#1007): the same defect in the next
+    generation has a different position and the same id.
+
+    ``finding_uid`` is required and has no default: an empty one used to be
+    accepted and then written over an id already computed — the silent
+    substitution #549 exists to prevent. Rows filed before the column exists
+    keep their empty id; nothing back-fills them.
     """
     await db.execute(
         "INSERT INTO finding_dispositions (review_id, task_id, "
-        "submission_generation, finding_index, finding_title, disposition, "
-        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "submission_generation, finding_index, finding_uid, finding_title, "
+        "disposition, note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "finding_uid=excluded.finding_uid, "
+        "finding_title=excluded.finding_title, "
         "disposition=excluded.disposition, note=excluded.note, "
         "decided_by=excluded.decided_by, decided_at=datetime('now')",
         (
@@ -1132,6 +1147,7 @@ async def upsert_finding_disposition(
             task_id,
             submission_generation,
             finding_index,
+            finding_uid,
             finding_title,
             disposition,
             note,
