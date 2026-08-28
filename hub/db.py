@@ -5,8 +5,6 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-import sqlite3
-
 import aiosqlite
 
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
@@ -478,6 +476,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
     (
         "idx_skills_name_status",
         "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
+    ),
+    # Who decided agents should READ this version, as opposed to who wrote it
+    # (#1028). Activation is a human gate (#380) and leaves ``created_by``
+    # untouched, so without this column a person activating a seeded draft is
+    # indistinguishable from the seed itself — and the next deploy would
+    # replace their decision believing it was its own.
+    (
+        "add_skills_activated_by_column",
+        "ALTER TABLE skills ADD COLUMN activated_by TEXT NOT NULL DEFAULT ''",
     ),
     # ---- Machine review policy (#382): project default + task override.
     (
@@ -2454,8 +2461,15 @@ unresolved: {title, why}.
 модуль, строка нет; `none` — место определить не удалось. `none` это ОТВЕТ и он
 принимается: харнесс, который не может указать место, всё равно сдаёт годный
 отчёт. Пустой file ответом не является — его не отличить от забытого поля.
-Идентификатор находки НЕ присылается: хаб выводит его из содержания и
-возвращает на каждом чтении отчёта.
+Идентификатор находки НЕ присылается: хаб выводит его из содержания —
+category, file, нормализованный title и КАНОНИЧЕСКОЕ место — и возвращает на
+каждом чтении отчёта. Каноническое значит выведенное из того, что известно
+(есть строка → «строки», есть только файл → «файл», нет ничего → «нигде»), а не
+скопированное из поля `locator`: одно и то же место, названное двумя способами,
+обязано давать один id, иначе диспозиция с прошлого отчёта не найдётся (#1028).
+Поэтому старая находка `{file, line}` и новая `{locator: lines, file,
+start_line}` с теми же значениями — одна находка. `end_line` в id не входит:
+диапазон это уточнение того же места, а не другое место.
 category питает метрики повторяемости — используй устойчивые слаги
 (security, correctness, consistency, tests, …).
 
@@ -2469,29 +2483,42 @@ category питает метрики повторяемости — исполь
 async def seed_default_skills(db: aiosqlite.Connection) -> None:
     """Seed built-in skills, and keep the ACTIVE one current (#380, #383, #1028).
 
-    Three cases, and the difference between them is whose words are at stake.
+    The question this function asks is not "is the shipped text in the library"
+    but "is the shipped text the one agents READ". ``hub_get_skill`` serves the
+    ACTIVE version, so a library holding the new text as a draft is a library
+    still teaching the old one. The first attempt (#1007) filed everything as a
+    draft and left exactly that state in production: on 2026-08-28 the write
+    path already refused reports without a ``locator`` while the active
+    ``machine-review-cycle`` was v1 from July, teaching the format that gets a
+    422 — every harness that honestly read the library walked into it.
 
-    1. No versions at all — insert the shipped text as version 1, active.
-    2. The active version is the hub's own previous word (``created_by='seed'``,
-       never touched by a person) — replace it: the new version becomes active
-       and the old one steps down. The automaton is correcting itself, not
-       overruling anybody.
-    3. A person edited the active version — leave it exactly where it is and
-       file the shipped text beside it as a draft. Nothing a human wrote is
-       ever overwritten here, which is the rule #380 set and this keeps.
+    So the branches are cut by whose word is at stake, and only the active row
+    decides:
 
-    Case 2 exists because filing everything as a draft (#1007) did not close the
-    hole it was written for. ``hub_get_skill`` serves the ACTIVE version, so a
-    library still teaching the old finding format kept teaching it: the write
-    path had already started refusing reports without a locator, and every
-    harness following the active skill walked into a 422 on the whole report.
-    A draft nobody activated is a note to the operator, not a fix.
+    1. The active version already carries the shipped text — nothing to do.
+    2. A person activated the current version — it stays, and the shipped text
+       waits beside it as a draft. Nothing a human published is overwritten,
+       which is the rule #380 set. That a draft already waits there is not a
+       reason to stop looking: the answer to case 3 can change under it.
+    3. Nobody's word is at stake — there is no active version at all, or the
+       active one is the hub's own previous seed. The shipped text becomes
+       active: promoted in place if some version already holds it, inserted
+       otherwise. "No active version" belongs HERE and not in case 2, because
+       an operator who published nothing has said nothing, and leaving another
+       draft behind would keep ``hub_get_skill`` answering 404.
+
+    Whose word it is cannot be read off ``created_by`` alone. Activation is its
+    own act: a person who activates a seeded draft leaves ``created_by='seed'``
+    on the row, and a seed keyed on that field would overrule them on the next
+    deploy. ``activated_by`` records the act rather than the authorship, and
+    only a row nobody but the seed activated is replaceable.
 
     Concurrency: ``get_db`` runs this on every connection, so two workers can
     read the same max version and both insert. ``UNIQUE(name, version)`` makes
     one of them lose, and losing is FINE — the winner wrote the same text. The
-    loser swallows the integrity error rather than taking a connection down
-    with it (#1028).
+    insert says ``ON CONFLICT DO NOTHING`` rather than raising, because a
+    swallowed ``IntegrityError`` leaves the transaction aborted and the next
+    seed in the loop dies on a healthy statement (#1028).
     """
     seeds = (
         (
@@ -2510,31 +2537,97 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
     for name, kind, content, tags in seeds:
         rows = await fetchall(
             db,
-            "SELECT id, version, content, status, created_by FROM skills "
-            "WHERE name=? ORDER BY version DESC",
+            "SELECT id, version, content, status, created_by, activated_by "
+            "FROM skills WHERE name=? ORDER BY version DESC",
             (name,),
         )
         if not rows:
             await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
             continue
-        if any(str(row["content"]) == content for row in rows):
-            # The shipped text is already in the library, active or not.
-            continue
+        # Highest active version — the same row ``get_active_skill`` serves.
         active = next((r for r in rows if str(r["status"]) == "active"), None)
-        version = int(rows[0]["version"]) + 1
-        if active is not None and str(active["created_by"]) == "seed":
-            superseded = int(active["id"])
-            if await _insert_seed_skill(
-                db, name, kind, content, tags, version, "active"
-            ):
+        if active is not None and str(active["content"]) == content:
+            continue
+        next_version = int(rows[0]["version"]) + 1
+        if active is not None and not _is_seed_word(active):
+            # Case 2. Someone published this; our text waits beside it.
+            if not any(str(r["content"]) == content for r in rows):
+                await _insert_seed_skill(
+                    db, name, kind, content, tags, next_version, "draft"
+                )
+            continue
+        # Case 3. The shipped text has to become the one agents read.
+        shipped = next((r for r in rows if str(r["content"]) == content), None)
+        if shipped is not None:
+            if _is_seed_word(shipped):
                 await db.execute(
-                    "UPDATE skills SET status='superseded' WHERE id=?",
-                    (superseded,),
+                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                    (int(shipped["id"]),),
+                )
+            else:
+                # A person published this exact text. Activating it is AGREEING
+                # with them, not replacing them, so their signature outlives the
+                # act — stamping 'seed' here would erase the only record that a
+                # human ever spoke, and the next upgrade would then read the row
+                # as ours and overrule a decision that was never ours to make.
+                await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=?",
+                    (int(shipped["id"]),),
                 )
         else:
-            # Operator's word stands; ours waits beside it.
-            await _insert_seed_skill(db, name, kind, content, tags, version, "draft")
+            await _insert_seed_skill(
+                db, name, kind, content, tags, next_version, "active"
+            )
+        # And the hub's own PREVIOUS word steps back to a draft. Without this
+        # every upgrade leaves another live version behind, and since
+        # ``get_active_skill`` serves the HIGHEST active one, a revert never
+        # takes effect: reverting the constant re-activates an older version
+        # while the reverted-away text keeps winning on version number, for
+        # good. ``draft`` is the existing vocabulary for "in the library, not
+        # served" — a third status would be one this schema has never had.
+        #
+        # Two guards, and both are load-bearing.
+        #
+        # The seed-ownership half is ``_is_seed_word`` said in SQL, deliberately:
+        # it must be impossible for this statement to demote a row a person
+        # published, and the safest way to say that is to spell the same
+        # condition the branch above was chosen by.
+        #
+        # The EXISTS half is what makes losing the insert survivable. The
+        # statement above says ON CONFLICT DO NOTHING, so this connection may
+        # have written nothing at all — and if the row that took its version
+        # number belongs to somebody else (an agent proposing a version through
+        # POST /api/skills files a DRAFT), stepping our previous word down would
+        # leave the library with NO active version and ``hub_get_skill``
+        # answering 404. Serving stale text until the next seeder replaces it is
+        # bad; serving nothing is worse. So the old word only steps down once
+        # the shipped text is demonstrably the one being served.
+        await db.execute(
+            "UPDATE skills SET status='draft' WHERE name=? AND status='active' "
+            "AND content<>? AND created_by='seed' AND activated_by IN ('', 'seed') "
+            "AND EXISTS (SELECT 1 FROM skills live WHERE live.name=skills.name "
+            "AND live.content=? AND live.status='active')",
+            (name, content, content),
+        )
     await db.commit()
+
+
+def _is_seed_word(row: aiosqlite.Row) -> bool:
+    """True when the hub is the only one who ever spoke for this row.
+
+    Two acts, two fields. ``created_by`` says who wrote the text;
+    ``activated_by`` says who decided agents should read it. A person who
+    activates a seeded draft (#380 makes activation a human gate) writes the
+    second without touching the first — so a check that reads only
+    ``created_by`` would call that row ours and replace a human's decision on
+    the next deploy. Rows that predate the column carry an empty
+    ``activated_by`` and are judged by authorship alone, which is all that was
+    ever recorded about them.
+    """
+    return str(row["created_by"]) == "seed" and str(row["activated_by"] or "") in (
+        "",
+        "seed",
+    )
 
 
 async def _insert_seed_skill(
@@ -2545,23 +2638,31 @@ async def _insert_seed_skill(
     tags: str,
     version: int,
     status: str,
-) -> bool:
-    """Insert one seeded version; False when another connection got there first.
+) -> None:
+    """Insert one seeded version, tolerating a parallel seeder.
 
     The race is real and benign: ``get_db`` seeds on every connection, so two
-    workers starting together compute the same next version. Whoever loses the
-    UNIQUE(name, version) race would otherwise take its whole connection down
-    over a row that already says what it wanted to say.
+    workers starting together compute the same next version. ``ON CONFLICT DO
+    NOTHING`` is what makes losing cheap — catching the ``IntegrityError``
+    instead would leave sqlite's transaction aborted, and the very next
+    statement of this loop (the second seeded skill) would fail on nothing it
+    did wrong, taking the connection down over a row that already says what we
+    wanted to say.
     """
-    try:
-        await db.execute(
-            "INSERT INTO skills (name, kind, version, content, tags, status, "
-            "created_by) VALUES (?, ?, ?, ?, ?, ?, 'seed')",
-            (name, kind, version, content, tags, status),
-        )
-    except sqlite3.IntegrityError:
-        return False
-    return True
+    await db.execute(
+        "INSERT INTO skills (name, kind, version, content, tags, status, "
+        "created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, 'seed', ?) "
+        "ON CONFLICT(name, version) DO NOTHING",
+        (
+            name,
+            kind,
+            version,
+            content,
+            tags,
+            status,
+            "seed" if status == "active" else "",
+        ),
+    )
 
 
 async def seed_system_roles(db: aiosqlite.Connection) -> None:

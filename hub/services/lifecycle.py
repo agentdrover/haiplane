@@ -2979,6 +2979,9 @@ async def decide_task(
         # #897: the acceptance is done and stays done — this only refuses to
         # let it be silent. On 21.08.2026 exactly this transition left #878 and
         # #885 completed with their PRs open, and nothing in the task said so.
+        await deliver_on_disposition(
+            db, task_id, getattr(body, "pr_disposition", "") or "", via="decide_accept"
+        )
         await note_completion_without_delivery(
             db,
             task_id,
@@ -3535,6 +3538,17 @@ async def force_complete_task(
     # Outside the write lock: this asks git and possibly GitHub, and holding a
     # database lock across a network call is how a slow provider becomes an
     # outage. The completion is already committed — this is a note about it.
+    #
+    # #1037: force-complete writes the same pr_disposition as decide, so it
+    # gets the same delivery. Left out, it would stay the second door with the
+    # same silence behind it — and the one people reach for when the first
+    # refuses.
+    await deliver_on_disposition(
+        db,
+        task_id,
+        ((body.pr_disposition if body else "") or ""),
+        via="force_complete",
+    )
     await note_completion_without_delivery(
         db,
         task_id,
@@ -3544,6 +3558,95 @@ async def force_complete_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+DELIVER_DISPOSITION = "deliver"
+
+
+async def deliver_on_disposition(
+    db: aiosqlite.Connection, task_id: int, disposition: str, *, via: str
+) -> tuple[bool, str]:
+    """Act on ``pr_disposition=deliver``: merge, or refuse and say why (#1037).
+
+    Until now the field was recorded and never acted on, so a human who
+    accepted a task with its PR still open had no way to finish the delivery
+    — the gate only looks at tasks inside the conveyor, and an accepted task
+    is not one. On 28.08 that left #1036 completed with its code in an open
+    PR, and the only way out was a manual merge: an exception to the rule
+    that the gate, not a person, merges into the base branch.
+
+    The one thing this must never become is a way AROUND the gate. A task
+    reaches the human decision along several paths, and some of them ARE a
+    failed condition: red CI, an exhausted review cycle, an arbiter
+    escalation. So the delivery here is not a new door — it is the same door,
+    opened from a different room:
+
+    * the approved-review check is made HERE, because
+      ``merge_before_completion`` does not make it. The gate only ever calls
+      that function on an already-approved path, while this one is reached
+      with no verdict at all. Skipping it would let a human decision stand in
+      for a reviewer's, which is the whole hole;
+    * everything else — the tip still matching what was approved (#612), the
+      idempotence against a second merge (#363), the green CI, the merge
+      itself and the pipeline_merges record the undelivered-work report reads
+      — comes from calling the gate's own function rather than re-deriving
+      its conditions. A second set would drift, and the weaker one would
+      become the real one (#519, #546).
+
+    Returns ``(delivered, reason)``. A refusal never undoes the acceptance:
+    those are two decisions, and the human made only one of them here.
+    """
+    if (disposition or "").strip() != DELIVER_DISPOSITION:
+        return False, ""
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return False, "task not found"
+    task = dict(row)
+    if not task.get("pr_number"):
+        return False, "no_pr"
+
+    from hub.services.orchestration import (
+        merge_before_completion,
+        review_approved_for_current_submission,
+    )
+
+    if not review_approved_for_current_submission(task):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Доставка по решению человека НЕ выполнена: у текущей сдачи нет "
+            "одобренного ревью. Решение человека принимает задачу, но не "
+            "заменяет вердикт ревьюера — PR остался открытым (#1037).",
+        )
+        await db.commit()
+        return False, "no_approved_review"
+
+    ok, reason = await merge_before_completion(db, task)
+    if ok:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
+            f"PR #{task['pr_number']} влит теми же условиями, что применяет "
+            "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
+            "(#1037).",
+        )
+    else:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Условия те "
+            "же, что у гейта, и обойти их решением нельзя — PR остался "
+            "открытым, задача остаётся принятой (#1037).",
+        )
+    await db.commit()
+    return ok, reason
 
 
 async def withdraw_own_draft(

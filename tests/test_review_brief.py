@@ -27,6 +27,7 @@ from hub import repository as repo
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.services import review_evidence
+from hub.services.finding_identity import finding_uids
 
 
 def _git(repo_dir: Path, *args: str) -> None:
@@ -318,7 +319,21 @@ async def test_brief_carries_finding_uids(client: AsyncClient):
     brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     findings = brief["review_report"]["machine_review"]["findings_confirmed"]
     uids = [f["finding_uid"] for f in findings]
-    assert all(uids), "every finding is addressable from the brief"
+    # Not "an id is present" — THE id. A non-empty string proves the field was
+    # filled; only equality with the id derived from the same content proves
+    # the brief addresses the same finding a disposition will be filed against.
+    assert uids == finding_uids(
+        [
+            {
+                "locator": "lines",
+                "file": "hub/app.py",
+                "start_line": 12,
+                "title": "leak",
+                "severity": "high",
+            },
+            {"locator": "none", "title": "smell", "severity": "low"},
+        ]
+    )
     assert len(set(uids)) == 2
 
 
