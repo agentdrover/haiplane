@@ -2096,3 +2096,129 @@ async def test_expired_claim_restores_workspace_base(db):
     cursor = await db.execute("SELECT status FROM tasks")
     assert [r["status"] for r in await cursor.fetchall()] == ["open", "open"]
     assert restore.await_count == 2
+
+
+# --- Worktrees of finished tasks (#1033) ------------------------------------
+#
+# 189 directories had piled up on production, some a week old. Since #989 the
+# hub names a worktree to an agent exactly when the directory exists, so an
+# abandoned tree is a live path to a forgotten branch — not disk noise.
+
+
+class _WorktreeSpy(NoopGitOps):
+    """Records removals and answers whether a tree is 'on disk'."""
+
+    def __init__(self, path: str, removable: bool = True) -> None:
+        self._path = path
+        self._removable = removable
+        self.removed: list[int] = []
+
+    def worktree_path(self, task_id: int, repo: str | None = None) -> str:
+        return self._path
+
+    async def pair_remove_worktree(self, task_id: int, *, repo: str | None = None):
+        self.removed.append(task_id)
+        return self._removable
+
+
+async def _finished_task(db, *, status: str, finished_days_ago: float) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="tree owner",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status=status,
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', ?) WHERE id = ?",
+        (f"-{finished_days_ago} days", task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _sweep_with(db, monkeypatch, tmp_path, spy_factory, task_id: int):
+    from hub.poller import _sweep_stale_worktrees
+
+    tree = tmp_path / f"task-{task_id}"
+    tree.mkdir(exist_ok=True)
+    spy = spy_factory(str(tree))
+    monkeypatch.setattr(plugins, "git_ops", spy)
+    await _sweep_stale_worktrees(db)
+    return spy
+
+
+async def test_stale_worktree_of_completed_task_is_removed(db, monkeypatch, tmp_path):
+    # AC-1 (#1033): finished long enough ago, tree on disk and clean — retired.
+    task_id = await _finished_task(db, status="completed", finished_days_ago=10)
+
+    spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+    assert spy.removed == [task_id]
+
+
+async def test_live_task_worktree_is_never_removed(db, monkeypatch, tmp_path):
+    # AC-2 (#1033): a non-terminal status protects the tree at any age. The
+    # rule lives in the query, so "still working" can never be forgotten by a
+    # caller.
+    for status in ("running", "review"):
+        task_id = await _finished_task(db, status=status, finished_days_ago=30)
+
+        spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+        assert spy.removed == [], f"{status} must keep its worktree"
+
+
+async def test_recently_completed_task_keeps_its_worktree(db, monkeypatch, tmp_path):
+    # AC-4 (#1033): inside the retention window the tree stays. This is the
+    # case the window exists for — on 28.08 review findings twice arrived
+    # after the verdict had merged, and the fix lived in that tree.
+    task_id = await _finished_task(db, status="completed", finished_days_ago=1)
+
+    spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+    assert spy.removed == []
+
+
+async def test_dirty_worktree_survives_cleanup_and_says_why(
+    db, monkeypatch, tmp_path, caplog
+):
+    # AC-3 (#1033): pair_remove_worktree refuses a dirty tree; the sweep must
+    # keep it and say so out loud. Somebody's unsaved work is not an error to
+    # retry away.
+    import logging
+
+    task_id = await _finished_task(db, status="completed", finished_days_ago=10)
+
+    def dirty(path: str) -> _WorktreeSpy:
+        return _WorktreeSpy(path, removable=False)
+
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        spy = await _sweep_with(db, monkeypatch, tmp_path, dirty, task_id)
+
+    assert spy.removed == [task_id], "it was attempted"
+    assert any(f"#{task_id} kept" in rec.getMessage() for rec in caplog.records), (
+        "the refusal must be visible, not swallowed"
+    )
+
+
+async def test_absent_directory_costs_no_git_call(db, monkeypatch, tmp_path):
+    # A finished task whose tree is already gone must not buy a git call on
+    # every poll: with 189 rows in the backlog that is the difference between
+    # a sweep and a stall.
+    await _finished_task(db, status="completed", finished_days_ago=10)
+    from hub.poller import _sweep_stale_worktrees
+
+    spy = _WorktreeSpy(str(tmp_path / "never-created"))
+    monkeypatch.setattr(plugins, "git_ops", spy)
+
+    await _sweep_stale_worktrees(db)
+
+    assert spy.removed == []

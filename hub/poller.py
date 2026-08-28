@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Iterator
 from typing import Any
 import logging
@@ -1186,6 +1187,57 @@ async def _sweep_events_retention(db) -> None:
         log.info("Poll: pruned %d events older than 14 days", pruned)
 
 
+async def _sweep_stale_worktrees(db) -> None:
+    # Worktrees of finished tasks (#1033): 189 directories had piled up on
+    # production, some a week old. Since #989 the hub names a worktree to an
+    # agent exactly when the directory exists, so an abandoned tree is not
+    # disk noise — it is a live path to a forgotten branch.
+    #
+    # Deliberately gentle in three ways: only terminal tasks, only past the
+    # retention age, and only trees that are actually on disk (a cheap stat
+    # before any git). A dirty tree is never removed — pair_remove_worktree
+    # refuses it and says why, and that refusal is somebody's unsaved work,
+    # not an error to retry away.
+    try:
+        from hub.services.orchestration import project_git_context
+
+        rows = await repo.tasks_with_retired_worktrees(
+            db,
+            keep_days=config.WORKTREE_RETENTION_DAYS,
+            limit=config.WORKTREE_RETENTION_BATCH,
+        )
+        for row in rows:
+            task = dict(row)
+            task_id = int(task["id"])
+            try:
+                ctx = await project_git_context(db, task_id)
+                workspace = (ctx.get("repo") or "").strip() or None
+                path = plugins.git_ops.worktree_path(task_id, workspace)
+                if not path or not os.path.isdir(path):
+                    continue
+                removed = await plugins.git_ops.pair_remove_worktree(
+                    task_id, repo=workspace
+                )
+            except Exception:  # noqa: BLE001 - one task must not stop the sweep
+                log.exception("worktree retirement failed for task #%s", task_id)
+                continue
+            if removed:
+                log.info(
+                    "Poll: retired worktree of task #%s (%s, finished %s)",
+                    task_id,
+                    task["status"],
+                    task["completed_at"],
+                )
+            else:
+                log.warning(
+                    "Poll: worktree of task #%s kept — pair_remove_worktree "
+                    "refused it (uncommitted work or git error)",
+                    task_id,
+                )
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("worktree retention sweep failed")
+
+
 async def _sweep_sessions_retention(db) -> None:
     # Session registry retention (#771): same reasoning as the feed —
     # the registry answers "who is around now", and a session with no
@@ -1487,6 +1539,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             await _sweep_machine_deadlines(db)
             await _sweep_stale_arbiter(db)
             await _sweep_events_retention(db)
+            await _sweep_stale_worktrees(db)
             await _sweep_sessions_retention(db)
             await _sweep_release_policy(db)
             await _sweep_messages_retention(db)
