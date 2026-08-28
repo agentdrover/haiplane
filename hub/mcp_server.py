@@ -2452,6 +2452,78 @@ async def hub_submit_machine_review(
 
 
 @mcp.tool()
+async def hub_submit_steward_judgement(
+    task_id: int,
+    generation: int,
+    kind: str,
+    verdict: str,
+    grounds: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    closures: list[dict[str, Any]] | None = None,
+    escalate_reason: str = "",
+    confidence: str = "",
+    model: str = "",
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+) -> CallToolResult:
+    """Record a steward judgement. Does not transition the task (#1022).
+
+    ``verdict`` has no default (422, never a silent approve). ``kind`` is
+    verdict|dor|disposition. ``ground.source`` and ``escalate_reason`` are
+    closed sets with no ``unknown``. ``confidence=low`` stores as
+    escalate/low_confidence. At-most-once on (task_id, generation, kind).
+    Closures address findings by finding_uid.
+
+    Args:
+        task_id: Task being judged.
+        generation: Submission generation being judged.
+        kind: verdict, dor, or disposition.
+        verdict: approve, changes_requested, or escalate.
+        grounds: [{source, detail?}].
+        findings: Same shape as a human review verdict.
+        closures: [{finding_uid, type}].
+        escalate_reason: Required when verdict is escalate.
+        confidence: high, medium, or low.
+        model: Model that produced the judgement.
+        tokens_spent: Tokens spent producing it.
+        duration_ms: Duration.
+    """
+    body: dict[str, Any] = {
+        "generation": generation,
+        "kind": kind,
+        "verdict": verdict,
+        "grounds": grounds or [],
+        "findings": findings or [],
+        "closures": closures or [],
+        "model": model,
+    }
+    if escalate_reason:
+        body["escalate_reason"] = escalate_reason
+    if confidence:
+        body["confidence"] = confidence
+    if tokens_spent is not None:
+        body["tokens_spent"] = tokens_spent
+    if duration_ms is not None:
+        body["duration_ms"] = duration_ms
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/steward-judgement", body)
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(
+        f"Steward judgement for task #{task_id} recorded "
+        f"(generation {result.get('generation')}, kind {result.get('kind')}): "
+        f"{result.get('verdict')}"
+        + (
+            f" ({result.get('escalate_reason')})"
+            if result.get("escalate_reason")
+            else ""
+        )
+        + ". Not applied — recording only.",
+        steward_judgement=result,
+    )
+
+
+@mcp.tool()
 async def hub_undelivered_completed() -> CallToolResult:
     """Completed tasks whose PR is neither merged nor closed (#897).
 

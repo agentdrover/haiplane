@@ -2758,6 +2758,35 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
     assert "duration_ms" not in body  # omitted optionals stay omitted
 
 
+async def test_hub_submit_steward_judgement(mock_api_post: AsyncMock) -> None:
+    from hub.mcp_server import hub_submit_steward_judgement
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 42,
+        "generation": 1,
+        "kind": "verdict",
+        "verdict": "escalate",
+        "escalate_reason": "low_confidence",
+        "submitted_verdict": "approve",
+    }
+    out = await hub_submit_steward_judgement(
+        42,
+        generation=1,
+        kind="verdict",
+        verdict="approve",
+        confidence="low",
+        grounds=[{"source": "ci_pinned_sha"}],
+    )
+    structured = _mcp_structured(out)
+    assert structured["steward_judgement"]["verdict"] == "escalate"
+    path, body = mock_api_post.await_args.args
+    assert path == "/api/tasks/42/steward-judgement"
+    assert body["verdict"] == "approve"
+    assert body["confidence"] == "low"
+    assert "tokens_spent" not in body
+
+
 async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     # #384: MCP wrapper summarises economics and recurring categories.
     from hub.mcp_server import hub_practice_metrics

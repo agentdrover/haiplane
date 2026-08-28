@@ -1106,6 +1106,36 @@ def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
     mock_api.assert_not_called()
 
 
+def test_cmd_steward_judgement() -> None:
+    mock_api = MagicMock(return_value={"id": 1, "verdict": "approve"})
+    args = argparse.Namespace(
+        task_id=42,
+        generation=1,
+        kind="verdict",
+        verdict="approve",
+        confidence="high",
+        escalate_reason="",
+        model="gpt-5.3-codex",
+        grounds_json='[{"source":"ci_pinned_sha"}]',
+        closures_json="",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_steward_judgement(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/steward-judgement",
+        {
+            "generation": 1,
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+            "model": "gpt-5.3-codex",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        },
+    )
+
+
 def test_cmd_approve_batch() -> None:
     result = {"approved": [1, 2], "skipped": [{"task_id": 3, "reason": "dor_failed"}]}
     mock_api = MagicMock(return_value=result)

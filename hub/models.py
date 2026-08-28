@@ -2795,6 +2795,127 @@ class IdentityDiagnosticsView(BaseModel):
     app_version: str
 
 
+# Closed vocabularies for steward judgements (#1022). `unknown` is absent on
+# purpose: a catch-all would reopen the dictionary (#549 on a different axis).
+STEWARD_JUDGEMENT_KINDS: tuple[str, ...] = ("verdict", "dor", "disposition")
+STEWARD_VERDICTS: tuple[str, ...] = ("approve", "changes_requested", "escalate")
+STEWARD_CONFIDENCE: tuple[str, ...] = ("high", "medium", "low")
+STEWARD_GROUND_SOURCES: tuple[str, ...] = (
+    "ci_pinned_sha",
+    "machine_review_report",
+    "diff_vs_areas",
+    "risk_class",
+    "ac_locator",
+    "branch_tip",
+    "red_base",
+    "dependency_state",
+)
+STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
+    "precondition_failed",
+    "unclosed_finding",
+    "ladder_surface",
+    "same_family_as_implementer",
+    "same_family_as_reviewer",
+    "self_authored",
+    "no_current_report",
+    "report_security_finding",
+    "report_token_budget",
+    "report_sibling_mismatch",
+    "report_incomplete",
+    "risk_class_raised",
+    "class_above_policy_ceiling",
+    "low_confidence",
+    "passes_disagree",
+    "author_disputes",
+    "no_new_information",
+    "budget_exhausted",
+    "daily_cap",
+    "run_failed",
+    "run_timeout",
+    "injection_suspected",
+)
+STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
+    "fixed",
+    "human_disposition",
+    "out_of_scope_linked",
+)
+
+
+class StewardGround(BaseModel):
+    """One checkable fact the steward names as a ground (#1022)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(..., min_length=1, max_length=80)
+    detail: str = Field("", max_length=2000)
+
+
+class StewardClosure(BaseModel):
+    """A dirty-path finding closure addressed by finding_uid (#1007, #1022)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_uid: str = Field(..., min_length=1, max_length=64)
+    type: str = Field(..., min_length=1, max_length=40)
+
+
+class StewardJudgementSubmit(BaseModel):
+    """Record a steward judgement. Verdict has no default (#549 / AC-1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    generation: int = Field(..., ge=0)
+    kind: str = Field(..., min_length=1, max_length=40)
+    # Optional HERE so an omitted key is distinguishable from a default
+    # approve. The route refuses None with 422 — it must not be stored.
+    verdict: str | None = Field(default=None, max_length=40)
+    grounds: list[StewardGround] = Field(default_factory=list, max_length=50)
+    findings: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    closures: list[StewardClosure] = Field(default_factory=list, max_length=100)
+    escalate_reason: str | None = Field(default=None, max_length=80)
+    confidence: str | None = Field(default=None, max_length=20)
+    model: str = Field("", max_length=100)
+    tokens_spent: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0)
+
+
+class StewardJudgementView(BaseModel):
+    """Stored judgement as the writer reads it back. Not an applied transition."""
+
+    id: int
+    task_id: int
+    generation: int
+    kind: str
+    submitted_verdict: str
+    verdict: str
+    confidence: str = ""
+    escalate_reason: str = ""
+    grounds: list[StewardGround] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    closures: list[StewardClosure] = Field(default_factory=list)
+    model: str = ""
+    tokens_spent: int | None = None
+    duration_ms: int | None = None
+    submitted_by: str = ""
+    created_at: str = ""
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _sj_iso_ts(cls, v: str | None) -> str | None:
+        return to_iso_utc(v)
+
+    @field_validator("grounds", "findings", "closures", mode="before")
+    @classmethod
+    def _sj_json_lists(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v or "[]")
+                return parsed if isinstance(parsed, list) else []
+            except ValueError:
+                return []
+        return v
+
+
 # --- Deprecated aliases for backward compatibility ---
 
 ProposalStatus = TaskStatus

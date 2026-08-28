@@ -1034,6 +1034,78 @@ async def insert_machine_review(
     return cur.lastrowid  # type: ignore[return-value]
 
 
+async def insert_steward_judgement(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    kind: str,
+    submitted_verdict: str,
+    verdict: str,
+    confidence: str = "",
+    escalate_reason: str = "",
+    grounds: str = "[]",
+    findings: str = "[]",
+    closures: str = "[]",
+    model: str = "",
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+    submitted_by: str = "",
+    principal_id: int | None = None,
+) -> int | None:
+    """Insert one judgement. None when the (task, generation, kind) slot is taken."""
+    try:
+        cur = await db.execute(
+            "INSERT INTO steward_judgements (task_id, generation, kind, "
+            "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
+            "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
+            "principal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                generation,
+                kind,
+                submitted_verdict,
+                verdict,
+                confidence,
+                escalate_reason,
+                grounds,
+                findings,
+                closures,
+                model,
+                tokens_spent,
+                duration_ms,
+                submitted_by,
+                principal_id,
+            ),
+        )
+    except aiosqlite.IntegrityError:
+        return None
+    return cur.lastrowid
+
+
+async def get_steward_judgement(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kind: str,
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_judgements WHERE task_id=? AND generation=? AND kind=?",
+        (task_id, generation, kind),
+    )
+    return rows[0] if rows else None
+
+
+async def get_steward_judgement_by_id(
+    db: aiosqlite.Connection, judgement_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db, "SELECT * FROM steward_judgements WHERE id=?", (judgement_id,)
+    )
+    return rows[0] if rows else None
+
+
 async def set_machine_review_provider_tokens(
     db: aiosqlite.Connection,
     task_id: int,

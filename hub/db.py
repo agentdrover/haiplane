@@ -1527,6 +1527,37 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN ci_fix_charged_generation "
         "INTEGER NOT NULL DEFAULT -1",
     ),
+    (
+        # Steward judgement is a stored structured record, not a transition
+        # (#1022). Unique on (task_id, generation, kind) is the at-most-once
+        # claim, same shape as claim_arbiter_dispatch (#421). No backfill:
+        # there were no judgements before this table.
+        "create_steward_judgements",
+        """CREATE TABLE IF NOT EXISTS steward_judgements (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id            INTEGER NOT NULL,
+            generation         INTEGER NOT NULL,
+            kind               TEXT    NOT NULL,
+            submitted_verdict  TEXT    NOT NULL,
+            verdict            TEXT    NOT NULL,
+            confidence         TEXT    NOT NULL DEFAULT '',
+            escalate_reason    TEXT    NOT NULL DEFAULT '',
+            grounds            TEXT    NOT NULL DEFAULT '[]',
+            findings           TEXT    NOT NULL DEFAULT '[]',
+            closures           TEXT    NOT NULL DEFAULT '[]',
+            model              TEXT    NOT NULL DEFAULT '',
+            tokens_spent       INTEGER,
+            duration_ms        INTEGER,
+            submitted_by       TEXT    NOT NULL DEFAULT '',
+            principal_id       INTEGER,
+            created_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_steward_judgements_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_steward_judgements_unique "
+        "ON steward_judgements(task_id, generation, kind)",
+    ),
 ]
 
 
