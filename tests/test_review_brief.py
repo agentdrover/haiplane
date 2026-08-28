@@ -277,6 +277,51 @@ async def test_brief_carries_the_same_review_report(client: AsyncClient):
     assert "Проверялось:" in card and "grok-4.6" in card
 
 
+async def test_brief_carries_finding_uids(client: AsyncClient):
+    # AC-7 (#1028): the derived id has to reach the reader, not just the POST
+    # response. The brief is where a reviewing agent reads the findings, and it
+    # is the place a disposition gets addressed from.
+    resp = await client.post("/api/tasks", json={"title": "Brief uid task"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "grok-4.6",
+            "raw_count": 2,
+            "findings_confirmed": [
+                {
+                    "locator": "lines",
+                    "file": "hub/app.py",
+                    "start_line": 12,
+                    "title": "leak",
+                    "severity": "high",
+                },
+                {"locator": "none", "title": "smell", "severity": "low"},
+            ],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    findings = brief["review_report"]["machine_review"]["findings_confirmed"]
+    uids = [f["finding_uid"] for f in findings]
+    assert all(uids), "every finding is addressable from the brief"
+    assert len(set(uids)) == 2
+
+
 async def test_brief_report_says_when_no_review_happened(client: AsyncClient):
     # The absence travels too: an agent reading the brief must be able to see
     # that nothing has reviewed this submission yet.
