@@ -75,7 +75,7 @@ stateDiagram-v2
 | Инстанс | URL | Назначение |
 |---|---|---|
 | **Локальный** | `http://127.0.0.1:8080` | разработка, своя `hub.db` |
-| **Production** | `http://agenthai.ru:8080` | боевой сервер |
+| **Production** | `https://<HUB_URL>` (домен вашей инсталляции) | боевой сервер |
 
 Ключевые факты:
 
@@ -532,7 +532,7 @@ CI на PR гоняет также `pip-audit`, `bandit` и secret-scan — сл
 ## 14. Чеклист первого запуска
 
 1. `make setup` в свежем клоне (ставит окружение И вооружает pre-push хук); проверить — `make doctor`.
-2. Понять, на каком инстансе работаешь (локальный vs agenthai).
+2. Понять, на каком инстансе работаешь (локальный vs production).
 3. Проверить доступ к MCP (`initialize` → `serverInfo: haiplane-hub`).
 4. `hub_my_context(task_id)` или `hub_project_status` для контекста.
 5. Убедиться, что задача готова (`hub_get_readiness`), иначе — refine.
