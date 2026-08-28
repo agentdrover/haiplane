@@ -1035,14 +1035,27 @@ async def insert_machine_review(
 
 
 async def set_machine_review_provider_tokens(
-    db: aiosqlite.Connection, task_id: int, generation: int, tokens: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    tokens: int,
+    review_id: int | None = None,
 ) -> None:
     """Record what the provider billed for this generation's review (#828).
 
     Written by the sweep that already fetches usage for the mismatch check.
-    Only the latest report of the generation is stamped: a resubmission gets
-    its own dispatch and its own run.
+    ``review_id`` targets the report the sweep actually MATCHED to the
+    dispatch (#1025): the latest-of-generation fallback used to stamp the
+    dispatched run's bill onto whatever row arrived last — a foreign report
+    landing after the own one inherited the money, and the own report kept
+    NULL. Without ``review_id`` the old latest-row rule stands.
     """
+    if review_id is not None:
+        await db.execute(
+            "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ?",
+            (tokens, review_id),
+        )
+        return
     await db.execute(
         "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ("
         "SELECT id FROM machine_reviews WHERE task_id = ? "
