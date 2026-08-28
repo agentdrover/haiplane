@@ -53,13 +53,11 @@ def test_no_links_to_removed_internal_docs():
     them is a dangling pointer: a reader following one lands on nothing.
     """
     removed = (
-        # NOT the whole docs/issues/ directory: the steward spec (#1002) is a
-        # deliberate repository deliverable that lives there and is cited on
-        # purpose. Only the per-task working papers left.
-        "chat-pair-implementer-path",
-        "task-237-branch-policy-resolver",
-        "task-961-chat-pair",
-        "task-979-chat-pair-implementer",
+        # The whole directory, not a list of names: "issues" invited per-task
+        # working papers and collected five of them. The one document there
+        # worth publishing — the steward spec (#1002) — moved to docs/specs/,
+        # which is what it always was. A pointer at the old path is a bug now.
+        "docs/issues/",
         "admin-section-design",
         "admin-ui-functional-spec",
         "software-development-workflow-implementation-plan",
@@ -122,7 +120,7 @@ def test_steward_spec_links_resolve():
     # check every claim it makes about the code. A moved or renamed module must
     # break this suite rather than leave the document quietly pointing at
     # nothing — the citations are the reason to trust it.
-    spec = REPO_ROOT / "docs" / "issues" / "steward-agent.md"
+    spec = REPO_ROOT / "docs" / "specs" / "steward-agent.md"
     assert spec.is_file()
     text = spec.read_text(encoding="utf-8")
     targets = re.findall(r"\]\((\.\./\.\./[^)#\s]+)\)", text)
