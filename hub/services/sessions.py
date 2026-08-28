@@ -210,6 +210,30 @@ async def note_session_task(
     await repo.set_agent_session_task(db, session_id, task_id)
 
 
+async def pair_executor_online(
+    db: aiosqlite.Connection, task: dict, *, now: datetime | None = None
+) -> bool:
+    """Is the session that owns this pair task still signing in (#1030)?
+
+    Asked by the delivery sweep before it keeps a task on the conveyor over a
+    refusal only the executor can cure. Waiting for somebody who is not there
+    is not patience — it is a task nobody will ever pick up, and ``running:pair``
+    has no machine deadline to catch it (the #418 backstop covers machine-owned
+    instances only).
+
+    Presence is the registry's own answer, computed at read time as everywhere
+    else: an unregistered claim, an unknown session or a stale sign of life all
+    mean "not around", which is exactly today's behaviour — a human is called.
+    """
+    session_id = (task.get("claim_session_id") or "").strip()
+    if not session_id:
+        return False
+    row = await repo.get_agent_session(db, session_id)
+    if row is None:
+        return False
+    return bool(session_view(row, now=now)["online"])
+
+
 async def unaddressable_tasks(
     db: aiosqlite.Connection, *, limit: int = 200
 ) -> list[UnaddressableTask]:

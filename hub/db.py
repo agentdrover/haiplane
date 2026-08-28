@@ -1513,6 +1513,18 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_mcp_call_events_unknown_arg_count",
         "ALTER TABLE mcp_call_events ADD COLUMN unknown_arg_count INTEGER",
     ),
+    (
+        # #1030: which submission's red CI has already been charged to the
+        # pair fix budget. The delivery gate refuses once per poll cycle while
+        # the CI stays red, and a per-refusal counter would spend a budget of
+        # three in ninety seconds. The submission generation is the unit that
+        # matches what is being counted — one attempt by the executor — so a
+        # charge is idempotent until the work is submitted again. -1 is "never
+        # charged": generation 0 is a real submission and must not read as one.
+        "add_ci_fix_charged_generation_column",
+        "ALTER TABLE tasks ADD COLUMN ci_fix_charged_generation "
+        "INTEGER NOT NULL DEFAULT -1",
+    ),
 ]
 
 
