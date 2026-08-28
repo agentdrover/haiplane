@@ -1,5 +1,20 @@
 # Security Remediation Recommendations
 
+> **Status: historical — all four findings are closed.** This is the record of a
+> security review and of what was done about it, not a list of open holes. It is
+> kept because the acceptance criteria below are what the current tests defend.
+> Verified against the code on 26.08.2026:
+>
+> | Finding | Closed by |
+> |---------|-----------|
+> | 1. Network-open unauthenticated default | `HUB_HOST` now defaults to `127.0.0.1` (`hub/config.py`), and `validate_network_auth()` in the same module — called from `hub/app.py` at startup — raises `RuntimeError` on a non-loopback bind with open auth, unless `HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1`. Covered by `tests/test_auth.py`. |
+> | 2. No role boundary between agents and humans | Tokens carry a role: `VALID_ROLES = {"human", "agent", "admin"}` (`hub/config.py`), rejected at parse time if unknown. `hub/auth.py` exposes `require_human_or_admin`, `require_agent_caller`, `require_admin` and `require_permission`, and human-only routes go through them (`_require_human_web` in `hub/web.py`). |
+> | 3. HTMX fragment stored XSS | `_htmx_task_done_fragment` in `hub/web.py` escapes both interpolated values with `html.escape()` (title and status). Jinja autoescaping is on for the whole template set (`Jinja2Templates` in `hub/web.py`), and no template applies `\|safe` to user content — the single occurrence, in `partials/inbox.html`, marks a server-built `urlencode` query string from a fixed set of filter params. |
+> | 4. Unbounded collection payloads | `MAX_ACCEPTANCE_CRITERIA = 50` and `MAX_RISKS = 50` in `hub/models.py`, enforced by validators on `TaskRefine`, by the `PUT /api/tasks/{id}/acceptance_criteria` handler in `hub/app.py`, and by the incremental insert paths in `hub/services/refinement.py`. Covered by `tests/test_models.py` and `tests/test_api_refine.py`. |
+>
+> The "Additional Hardening" section at the end is advisory and was never a
+> finding; treat it as a backlog, not as an outstanding defect.
+
 This document turns the security review findings into implementation guidance
 for a developer. Keep fixes narrow and update API, Web, MCP, CLI, and tests
 together when behavior or contracts change.

@@ -19,7 +19,10 @@ Two rules fix that, and they are deliberately different in kind.
 report, so any id it invents is fresh randomness — it would satisfy a schema
 and answer none of the questions above. What repeats across runs is the
 finding's own content, so the id is a hash of (category, file, normalised
-title, locator, start line). The guarantee is exactly that and no more:
+title, canonical place). "Canonical" is load-bearing: the place is derived from
+what is known — a line, a file, or nothing — never copied from the ``locator``
+field, because the same location described in two vocabularies must not produce
+two ids (#1028). The guarantee is exactly that and no more:
 identical content yields an identical id. A reworded title — or a defect that
 moved to another line — is a different id, because the hub cannot know that two
 sentences describe one defect, and a confident id over that guess would be
@@ -79,6 +82,42 @@ def _as_mapping(entry: Mapping[str, Any] | Any) -> Mapping[str, Any]:
     }
 
 
+def _place(entry: Mapping[str, Any]) -> tuple[str, str]:
+    """The finding's location, canonical rather than as declared (#1028).
+
+    The PLACE belongs in the identity: two defects in one file can share a
+    category and a title and still be two defects, and without a line they
+    collapsed into one id (#1007). But the first attempt hashed the ``locator``
+    field VERBATIM, and that broke the thing the id exists for.
+
+    A declaration is a description of the location, not the location. The same
+    defect is described differently by different reporters and by the same
+    reporter over time: 116 reports predate the field and carry no locator at
+    all; a harness that first said ``file`` and later pinned the line says
+    ``lines``. Each of those rewordings produced a different id for one defect,
+    so a disposition made on the previous report stopped matching — exactly at
+    the format boundary this change was supposed to cross.
+
+    So the kind is DERIVED from what is actually known, and the raw field never
+    enters the hash: a line makes it "lines", a file alone makes it "file",
+    neither makes it "none". Two reports agreeing about where a defect sits now
+    agree about its id, whichever vocabulary they used to say so.
+
+    The remaining cost stays and is meant to: code that moves shifts the line
+    and the finding gets a new id. Of the two possible errors — "the same
+    defect looks new" and "two defects look like one" — only the second
+    silently misfiles a human's judgement onto the wrong defect.
+    """
+    start = entry.get("start_line")
+    if start is None:
+        start = entry.get("line")
+    if start is not None:
+        return ("lines", str(start))
+    if _normalised(entry.get("file")):
+        return ("file", "")
+    return ("none", "")
+
+
 def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
     """Content-derived id of one confirmed finding.
 
@@ -90,26 +129,12 @@ def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
     stop surviving a reordering, which is the whole point.
     """
     entry = _as_mapping(entry)
-    # The PLACE is part of the identity, not decoration: two defects in one
-    # file can share a category and a title and still be two defects. Leaving
-    # lines out let them collapse into one id, and a disposition then landed on
-    # whichever of them survived the next report.
-    #
-    # The cost is stated rather than hidden: code that moves shifts start_line,
-    # and the finding gets a new id. Between "the same defect looks new" and
-    # "two defects look like one", only the second silently misfiles a human's
-    # judgement, so that is the one the identity is built to avoid.
-    locator = _normalised(entry.get("locator"))
-    start = entry.get("start_line")
-    if start is None:
-        start = entry.get("line")
     material = "\x1f".join(
         (
             _normalised(entry.get("category")),
             _normalised(entry.get("file")),
             _normalised(entry.get("title")),
-            locator,
-            "" if start is None else str(start),
+            *_place(entry),
         )
     )
     if ordinal:

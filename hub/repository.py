@@ -1035,14 +1035,27 @@ async def insert_machine_review(
 
 
 async def set_machine_review_provider_tokens(
-    db: aiosqlite.Connection, task_id: int, generation: int, tokens: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    tokens: int,
+    review_id: int | None = None,
 ) -> None:
     """Record what the provider billed for this generation's review (#828).
 
     Written by the sweep that already fetches usage for the mismatch check.
-    Only the latest report of the generation is stamped: a resubmission gets
-    its own dispatch and its own run.
+    ``review_id`` targets the report the sweep actually MATCHED to the
+    dispatch (#1025): the latest-of-generation fallback used to stamp the
+    dispatched run's bill onto whatever row arrived last — a foreign report
+    landing after the own one inherited the money, and the own report kept
+    NULL. Without ``review_id`` the old latest-row rule stands.
     """
+    if review_id is not None:
+        await db.execute(
+            "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ?",
+            (tokens, review_id),
+        )
+        return
     await db.execute(
         "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ("
         "SELECT id FROM machine_reviews WHERE task_id = ? "
@@ -3213,6 +3226,33 @@ async def list_unaddressable_tasks(
             "AND COALESCE(archived, 0) = 0 "
             "ORDER BY claimed_at ASC, id ASC LIMIT ?",
             (min(limit, 500),),
+        )
+    )
+
+
+async def tasks_with_retired_worktrees(
+    db: aiosqlite.Connection, *, keep_days: int, limit: int
+) -> list[aiosqlite.Row]:
+    """Finished tasks whose pair worktree has outlived ``keep_days`` (#1033).
+
+    Age comes from ``completed_at`` and from nothing else: the directory's
+    mtime moves whenever anything reads the tree, so a forgotten worktree
+    somebody grepped last night would look brand new.
+
+    Only terminal statuses are listed, and a task still in review or running
+    can never appear here whatever its age — the caller must not be the place
+    where that rule is remembered. Oldest first, so a backlog drains in a
+    predictable order rather than by whatever the database returns.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, title, status, completed_at FROM tasks "
+            "WHERE status IN ('completed', 'failed', 'rejected') "
+            "AND completed_at IS NOT NULL AND completed_at != '' "
+            "AND completed_at < datetime('now', ?) "
+            "ORDER BY completed_at ASC LIMIT ?",
+            (f"-{keep_days} days", limit),
         )
     )
 

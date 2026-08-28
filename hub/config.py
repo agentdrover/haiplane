@@ -208,6 +208,22 @@ DEADLINE_REVIEW_MINUTES = int(env_get("DEADLINE_REVIEW_MINUTES", "180"))
 SESSION_TTL_MINUTES = int(env_get("SESSION_TTL_MINUTES", "10"))
 SESSION_RETENTION_DAYS = int(env_get("SESSION_RETENTION_DAYS", "14"))
 
+# Worktrees of finished tasks (#1033). Measured on production 2026-08-28: 189
+# directories under .hub-worktrees, some from tasks closed a week earlier. They
+# are not only disk — since #989 the hub decides whether to NAME a worktree to
+# an agent by whether the directory exists, so an old tree is a live path to a
+# forgotten branch.
+#
+# Three days, not zero: the tree is needed precisely AFTER delivery. Twice on
+# 28.08 machine-review findings arrived after the verdict had merged (#1011,
+# #1025), and the fix for the second was sitting in its worktree when this was
+# written. Removal at delivery would have cut off exactly the case it exists
+# for; three days covers every delay observed so far.
+WORKTREE_RETENTION_DAYS = int(env_get("WORKTREE_RETENTION_DAYS", "3"))
+# How many trees one pass may retire. The first pass on production faces a
+# backlog of 189, and a poller tick should not spend minutes in git.
+WORKTREE_RETENTION_BATCH = int(env_get("WORKTREE_RETENTION_BATCH", "20"))
+
 # Agent messages (#773): a channel without limits becomes a dump nobody reads,
 # and one that blocks work becomes a toll booth. Both defaults are generous
 # enough that ordinary coordination never meets them, and a refusal always says

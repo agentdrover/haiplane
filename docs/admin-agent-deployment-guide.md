@@ -5,8 +5,12 @@
 или Debian 12). Все шаги предполагают неинтерактивный запуск под учётной записью
 с правами `sudo`.
 
-Если сервер уже развёрнут и нужно только обновить текущий `agenthai.ru`
-используйте короткий runbook для агентов:
+Документ обезличен: конкретные значения инсталляции (домен, хост, владелец
+репозитория) заданы плейсхолдерами и параметрами из раздела 0 — подставьте
+значения своей инсталляции.
+
+Если сервер уже развёрнут и нужно только выкатить новую версию, используйте
+короткий runbook для агентов:
 [`docs/agent-deploy-runbook.md`](agent-deploy-runbook.md).
 
 > Принципы работы агента:
@@ -34,7 +38,7 @@
 | `SSH_KEY_PATH`           | `~/.ssh/id_ed25519_hub`                       | да                                  |
 | `DOMAIN`                 | `hub.example.com`                             | да (для TLS)                        |
 | `ADMIN_EMAIL`            | `ops@example.com`                             | да (для Let's Encrypt)              |
-| `GITHUB_REPO`            | `mrPDA/haiplane-hub`                          | да                                  |
+| `GITHUB_REPO`            | `owner/haiplane-hub`                          | да                                  |
 | `HAIPLANE_HUB_REPO`      | `owner/managed-repo`                          | опционально                         |
 | `GH_TOKEN`               | `ghp_…`                                       | если используется GitHub-интеграция |
 | `INITIAL_ADMIN_LOGIN`    | `admin`                                       | да                                  |
@@ -124,7 +128,7 @@ sudo -u haiplane /opt/haiplane-hub/venv/bin/pip install -e /opt/haiplane-hub/src
 
 ```bash
 sudo -u haiplane /opt/haiplane-hub/venv/bin/haiplane-hub --help || true
-sudo -u haiplane /opt/haiplane-hub/venv/bin/oc-hub --help
+sudo -u haiplane /opt/haiplane-hub/venv/bin/hp-hub --help
 ```
 
 ---
@@ -330,8 +334,8 @@ curl -fsS -X POST "https://${DOMAIN}/api/admin/bootstrap" \
     -d "{\"username\":\"${INITIAL_ADMIN_LOGIN}\",\"password\":\"${INITIAL_ADMIN_PASSWORD}\"}"
 ```
 
-> Если эндпойнт отличается — агент сверяется с `hub/services/admin.py` и
-> `docs/admin-section-design.md`, затем уточняет вызов.
+> Если эндпойнт отличается — агент сверяется с `hub/services/admin.py`
+> и `hub/app.py` (маршруты `/api/admin/...`), затем уточняет вызов.
 
 После успешного ответа:
 

@@ -1101,6 +1101,15 @@ async def reviewer_principal_id(db: aiosqlite.Connection) -> int | None:
     token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
     if not token:
         return None
+    # Open mode never reads the bearer header, so every report lands with
+    # principal_id NULL — a pinned dispatch would be unsatisfiable there and
+    # die by a FALSE grace alert, with the reviewer's own report flagged as
+    # foreign. Worse than the old rule, which is exactly what degradation
+    # must never be: no pin in open mode.
+    from hub import auth
+
+    if auth._is_open_mode():
+        return None
     from hub.services.admin import hash_api_key
 
     rows = await fetchall(
@@ -1141,7 +1150,7 @@ async def _dispatch_report(
     a 36x discrepancy of a run that had submitted nothing).
     """
     expected = _expected_principal(dispatch)
-    if expected is None:
+    if dispatch is None or expected is None:
         row = await repo.get_latest_machine_review(db, task_id)
         if row is None:
             return None
@@ -1151,7 +1160,26 @@ async def _dispatch_report(
         return review
     rows = await repo.machine_reviews_of_generation(db, task_id, generation)
     own = [dict(r) for r in rows if dict(r).get("principal_id") == expected]
-    return own[-1] if own else None
+    # The ladder (#879) runs two SAME-principal dispatches on one generation,
+    # so principal+generation alone still matched the lite report to the deep
+    # dispatch — settled 'done' before its run reported, grace alert
+    # unreachable. Rungs pair with reports by order instead: the k-th
+    # dispatch of the generation waits for the principal's k-th report.
+    # Exact for every current path, because a second dispatch exists only
+    # after the first report bought it (top-up is the sole same-generation
+    # re-dispatch).
+    dispatch_ids = await fetchall(
+        db,
+        "SELECT id FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? ORDER BY id",
+        (task_id, generation),
+    )
+    order = [int(dict(r)["id"]) for r in dispatch_ids]
+    try:
+        rung = order.index(int(dispatch["id"]))
+    except (ValueError, KeyError, TypeError):
+        return None  # the dispatch row is gone or unreadable — nothing to match
+    return own[rung] if rung < len(own) else None
 
 
 def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
@@ -1196,7 +1224,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
                 # #828: keep the number on the report too so existing
                 # practice metrics over machine_reviews stay honest.
                 await repo.set_machine_review_provider_tokens(
-                    db, task_id, dispatch["submission_generation"], total
+                    db,
+                    task_id,
+                    dispatch["submission_generation"],
+                    total,
+                    review_id=int(review["id"]),
                 )
             if isinstance(total, int) and total > 0:
                 mismatch = reported is None or (

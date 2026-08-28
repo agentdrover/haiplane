@@ -252,3 +252,122 @@ def test_every_repository_ac_write_sits_behind_the_gate():
         "these functions write acceptance criteria without applying the "
         f"locator policy: {offenders}"
     )
+
+
+# --- Upper levels: warn, never block (#1032) --------------------------------
+#
+# The locator gate above runs on WRITES; it checks the form of a locator, not
+# whether the test exists. An epic or a feature never submits — it folds up
+# when its children finish — so nothing ever asked whether its criteria point
+# at a real test. #985 closed with AC-3 naming
+# tests/test_api.py::test_worktree_path_only_when_tree_exists, which collects
+# zero tests, under sdd_ac_locator=require.
+
+
+async def _draft(db: aiosqlite.Connection, task_type: str, locator: str) -> int:
+    """A draft of ``task_type`` carrying one test-AC with ``locator``."""
+    parent_id = None
+    if task_type == "feature":
+        epic = await services.create_task(
+            db, TaskCreate(title="parent epic", task_type="epic")
+        )
+        parent_id = epic.id
+    tv = await services.create_task(
+        db,
+        TaskCreate(
+            title=f"{task_type} probe", task_type=task_type, parent_id=parent_id
+        ),
+    )
+    await repo.upsert_acceptance_criterion(
+        db,
+        tv.id,
+        AcceptanceCriterion(
+            id="AC-1",
+            given="a criterion",
+            when="it is written",
+            then="it names a test",
+            verifiable_by="test",
+            test_ref=locator,
+        ),
+    )
+    await db.execute("UPDATE tasks SET status='draft' WHERE id=?", (tv.id,))
+    await db.commit()
+    return tv.id
+
+
+def _collector(found: set[str] | None):
+    async def collect(nodeids, repo_path):
+        return found
+
+    return collect
+
+
+async def _approve_with(db, monkeypatch, task_id: int, found: set[str] | None):
+    from hub.models import TaskApprove
+    from hub.services import ac_tests
+
+    monkeypatch.setattr(ac_tests, "default_locator_collector", _collector(found))
+    return await services.approve_task(db, task_id, TaskApprove(force=True))
+
+
+def _alerts(updates) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in updates
+        if "несуществующие тесты" in dict(u)["content"]
+    ]
+
+
+async def test_epic_approval_warns_on_dead_locator(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1032): the approval goes through, and the feed names both the
+    # criterion and the locator — a warning nobody can act on is not one.
+    dead = "tests/test_api.py::test_worktree_path_only_when_tree_exists"
+    task_id = await _draft(db, "epic", dead)
+
+    view = await _approve_with(db, monkeypatch, task_id, found=set())
+
+    assert view.status.value == "open", "the warning must not block the approval"
+    alerts = _alerts(await repo.get_task_updates(db, task_id))
+    assert len(alerts) == 1, "named once, at approval"
+    assert "AC-1" in alerts[0] and dead in alerts[0]
+
+
+async def test_live_locator_is_silent_on_upper_levels(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1032): only a DEAD locator speaks. A living one, and a criterion
+    # with no locator at all, leave the feed alone — a warning on every
+    # approval is one nobody reads.
+    live = "tests/test_ac_locator_gate.py::test_epic_approval_warns_on_dead_locator"
+    task_id = await _draft(db, "feature", live)
+
+    await _approve_with(db, monkeypatch, task_id, found={live})
+
+    assert not _alerts(await repo.get_task_updates(db, task_id))
+
+
+async def test_unreadable_collection_says_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # The #725 rule: "could not check" must never be reported as "checked and
+    # clean". A collector that could not run produces no verdict at all.
+    task_id = await _draft(db, "epic", "tests/test_api.py::test_gone")
+
+    await _approve_with(db, monkeypatch, task_id, found=None)
+
+    assert not _alerts(await repo.get_task_updates(db, task_id))
+
+
+async def test_task_level_require_is_unchanged(db: aiosqlite.Connection, require):
+    # AC-3 (#1032): nothing moved for tasks. With sdd_ac_locator=require an
+    # unresolvable locator on a task is still REFUSED at the write, not
+    # softened into a warning by this feature.
+    task_id = await _task(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await services.upsert_acceptance_criterion(db, task_id, _ac())
+
+    assert exc.value.status_code == 422
+    assert not await repo.list_acceptance_criteria(db, task_id)

@@ -133,9 +133,8 @@ test: cover pending report force complete api
 2. Найти область изменения в `docs/agent-context/change-map.md`.
 3. Если изменение касается lifecycle, schema, DoR, MCP, CLI или integrations, прочитать `docs/agent-context/invariants.md`.
 4. Для выбора тестов открыть `docs/agent-context/testing-playbook.md`.
-5. Если задача относится к human + AI-agent workflow, открыть:
-   - `docs/software-development-workflow.md`;
-   - `docs/software-development-workflow-implementation-plan.md`.
+5. Если задача относится к human + AI-agent workflow, открыть
+   `docs/software-development-workflow.md`.
 
 ## Контрактные изменения
 
