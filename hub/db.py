@@ -2559,10 +2559,21 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         # Case 3. The shipped text has to become the one agents read.
         shipped = next((r for r in rows if str(r["content"]) == content), None)
         if shipped is not None:
-            await db.execute(
-                "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
-                (int(shipped["id"]),),
-            )
+            if _is_seed_word(shipped):
+                await db.execute(
+                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                    (int(shipped["id"]),),
+                )
+            else:
+                # A person published this exact text. Activating it is AGREEING
+                # with them, not replacing them, so their signature outlives the
+                # act — stamping 'seed' here would erase the only record that a
+                # human ever spoke, and the next upgrade would then read the row
+                # as ours and overrule a decision that was never ours to make.
+                await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=?",
+                    (int(shipped["id"]),),
+                )
         else:
             await _insert_seed_skill(
                 db, name, kind, content, tags, next_version, "active"

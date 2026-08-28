@@ -151,6 +151,93 @@ async def test_no_active_version_at_all_is_published(db: aiosqlite.Connection):
     assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
 
 
+async def test_a_revert_is_served_even_though_its_version_is_lower(
+    db: aiosqlite.Connection,
+):
+    """The step the demote actually exists for: promote LOW while HIGH is live.
+
+    One upgrade proves nothing here — the version it inserts is the highest, so
+    it would be served with or without a demote. The failure appears on the
+    second step: reverting the constant re-activates an EARLIER version while
+    the reverted-away text keeps winning on version number, and
+    ``get_active_skill`` serves the highest active one. Without the demote the
+    library goes on serving text the code no longer contains, for good.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, MACHINE_REVIEW_CYCLE_SKILL, "draft", "seed", ""),
+            (2, "текст, который откатили", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+    versions = {
+        v["version"]: v["status"] for v in await _versions(db, "machine-review-cycle")
+    }
+    assert versions == {1: "active", 2: "draft"}, (
+        "the reverted-away version steps down, or it keeps winning on number"
+    )
+
+
+async def test_the_demote_never_touches_what_a_person_published(
+    db: aiosqlite.Connection,
+):
+    """The demote runs over a MIXED library, and only our own rows may move.
+
+    Every other test lands in a branch where the statement either does not run
+    or has nothing of a person's to hit. This one puts a human-published
+    version and a stale seed version side by side at different numbers, which
+    is the only population where the WHERE clause has to do any work.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, "версия человека", "active", "denis", "denis"),
+            (2, "прежнее слово сида", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    by_version = {v["version"]: v for v in await _versions(db, "machine-review-cycle")}
+    assert by_version[1]["status"] == "active", "a person's version is never demoted"
+    assert by_version[1]["activated_by"] == "denis"
+    assert by_version[2]["status"] == "draft", "our own previous word steps down"
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_promoting_what_a_person_published_keeps_their_signature(
+    db: aiosqlite.Connection,
+):
+    """Agreeing with a person is not the same act as replacing them.
+
+    When the shipped text is already in the library on a row a HUMAN activated,
+    the seed activates that row — and must leave their name on it. Stamping
+    'seed' would erase the only record that a person ever spoke here, and the
+    next upgrade would read the row as the hub's own and replace a decision it
+    never made. The library serves the right text either way, so nothing but
+    this assertion can tell the two apart.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, MACHINE_REVIEW_CYCLE_SKILL, "active", "seed", "denis"),
+            (2, "прежнее слово сида", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    by_version = {v["version"]: v for v in await _versions(db, "machine-review-cycle")}
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+    assert by_version[1]["activated_by"] == "denis", (
+        "the person who published this text keeps their name on it"
+    )
+
+
 async def test_operator_edit_is_never_overwritten(db: aiosqlite.Connection):
     # AC-4: a version a person published stays active. The shipped text waits
     # beside it as a draft — the automaton does not overrule a human (#380).
