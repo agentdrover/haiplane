@@ -3503,6 +3503,7 @@ MCP_CALL_EVENT_COLUMNS: tuple[str, ...] = (
     "latency_ms",
     "response_chars",
     "task_id",
+    "unknown_arg_count",
 )
 
 
@@ -3518,6 +3519,7 @@ async def insert_mcp_call_event(
     latency_ms: int,
     response_chars: int,
     task_id: int | None,
+    unknown_arg_count: int = 0,
 ) -> int:
     """Append one call record. One INSERT, no read-back, no aggregation.
 
@@ -3528,8 +3530,8 @@ async def insert_mcp_call_event(
     cur = await db.execute(
         "INSERT INTO mcp_call_events "
         "(tool, profile, principal_id, principal_role, status, error_reason, "
-        " latency_ms, response_chars, task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " latency_ms, response_chars, task_id, unknown_arg_count) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             tool,
             profile,
@@ -3540,6 +3542,7 @@ async def insert_mcp_call_event(
             latency_ms,
             response_chars,
             task_id,
+            max(0, int(unknown_arg_count)),
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]

@@ -255,6 +255,7 @@ async def record_call(
     principal_id: int | None = None,
     principal_role: str = "",
     profile: str = "",
+    unknown_arg_count: int = 0,
 ) -> bool:
     """Record one MCP call. Returns whether a row was written.
 
@@ -284,6 +285,7 @@ async def record_call(
             latency_ms=max(0, int(latency_ms)),
             response_chars=max(0, int(chars)),
             task_id=task_reference(arguments),
+            unknown_arg_count=max(0, int(unknown_arg_count)),
         )
         await db.commit()
         return True

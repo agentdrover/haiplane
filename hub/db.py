@@ -1503,6 +1503,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_dispatches_provider_tokens",
         "ALTER TABLE review_dispatches ADD COLUMN provider_tokens INTEGER",
     ),
+    (
+        # #1015: how many argument names Pydantic extra=ignore dropped on this
+        # call. A count, not the names and never the values — the table has
+        # nowhere a payload can land (#780). NULL is "never measured" (rows
+        # written before this column); 0 is "schema matched"; a positive
+        # number is the discarded-field warning made countable. Never collapse
+        # the two (#549).
+        "add_mcp_call_events_unknown_arg_count",
+        "ALTER TABLE mcp_call_events ADD COLUMN unknown_arg_count INTEGER",
+    ),
 ]
 
 

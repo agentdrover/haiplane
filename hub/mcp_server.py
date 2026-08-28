@@ -21,7 +21,9 @@ from hub.services.tree_output import (
 )
 from hub.hub_instance import instance_echo_fields, with_instance_echo
 from hub.mcp_envelope import (
+    attach_unknown_arguments,
     build_mutation_envelope,
+    discarded_argument_names,
     enrich_error_payload,
     format_echo_response,
     merge_mutation_response,
@@ -65,11 +67,34 @@ class InstrumentedFastMCP(FastMCP):
     Recording happens after the answer exists, never before, and cannot fail
     the call — see ``record_call``. Cancellation is deliberately not recorded
     as an error: the tool did not fail, the client left.
+
+    Unknown argument names are listed on the same funnel (#1015). Pydantic
+    ``extra="ignore"`` would otherwise swallow them, and the caller would see
+    a successful no-op. Names only — never values. The call still succeeds:
+    ``extra="forbid"`` would 422 live sessions holding a stale ``tools/list``
+    (#899).
     """
+
+    def _declared_argument_names(self, name: str) -> set[str] | None:
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            return None
+        names: set[str] = set()
+        for field_name, field_info in tool.fn_metadata.arg_model.model_fields.items():
+            names.add(field_name)
+            if field_info.alias:
+                names.add(field_info.alias)
+        return names
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         principal_id, role = identity_context_get()
         started = time.perf_counter()
+        declared = self._declared_argument_names(name)
+        discarded = (
+            discarded_argument_names(arguments, declared)
+            if declared is not None
+            else []
+        )
         try:
             result = await super().call_tool(name, arguments)
         except Exception as exc:
@@ -80,8 +105,10 @@ class InstrumentedFastMCP(FastMCP):
                 error=exc,
                 principal_id=principal_id,
                 principal_role=role,
+                unknown_arg_count=len(discarded),
             )
             raise
+        result = attach_unknown_arguments(result, discarded)
         await record_call(
             tool=name,
             arguments=arguments,
@@ -89,6 +116,7 @@ class InstrumentedFastMCP(FastMCP):
             result=result,
             principal_id=principal_id,
             principal_role=role,
+            unknown_arg_count=len(discarded),
         )
         return result
 

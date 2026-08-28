@@ -6,12 +6,17 @@ import json
 import logging
 from typing import Any, Literal
 
+from mcp.types import CallToolResult, TextContent
+
 from hub.hub_instance import with_instance_echo
 
 log = logging.getLogger("hub")
 
 Awaiting = Literal["none", "human_decision", "ci", "review"]
 ActorHint = Literal["agent", "human", "ci", "none"]
+
+# Names of arguments the schema did not declare. Values never belong here (#1015).
+UNKNOWN_ARGUMENTS_KEY = "unknown_arguments"
 
 MUTATION_ENVELOPE_FIELDS = (
     "instance",
@@ -246,3 +251,89 @@ def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if "message" not in merged:
         merged["message"] = payload.get("hint") or payload.get("message") or ""
     return merged
+
+
+def discarded_argument_names(
+    arguments: dict[str, Any] | None,
+    declared: set[str],
+) -> list[str]:
+    """Argument names present on the call but absent from the tool schema.
+
+    Names only: the values that were dropped are the caller's payload and
+    must not be copied into the response or into telemetry (#780, #1015).
+    """
+    if not arguments:
+        return []
+    return sorted(name for name in arguments if name not in declared)
+
+
+def _inject_unknown_into_text(text: str, names: list[str]) -> str:
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        payload[UNKNOWN_ARGUMENTS_KEY] = names
+        return json.dumps(payload, ensure_ascii=False)
+    return text + f"\n{UNKNOWN_ARGUMENTS_KEY}: {json.dumps(names, ensure_ascii=False)}"
+
+
+def _inject_unknown_into_blocks(blocks: Any, names: list[str]) -> Any:
+    if not blocks:
+        return blocks
+    out = []
+    for block in blocks:
+        if isinstance(block, TextContent):
+            out.append(
+                TextContent(
+                    type="text", text=_inject_unknown_into_text(block.text, names)
+                )
+            )
+        else:
+            out.append(block)
+    return out
+
+
+def _inject_unknown_into_structured(structured: Any, names: list[str]) -> Any:
+    if not isinstance(structured, dict):
+        return structured
+    updated = dict(structured)
+    updated[UNKNOWN_ARGUMENTS_KEY] = names
+    inner = updated.get("result")
+    if isinstance(inner, str):
+        updated["result"] = _inject_unknown_into_text(inner, names)
+    return updated
+
+
+def attach_unknown_arguments(result: Any, names: list[str]) -> Any:
+    """Advertise discarded argument names on every FastMCP return shape.
+
+    Tools answer as ``CallToolResult``, a ``(blocks, structured)`` pair, or a
+    sequence of content blocks. The warning has to land on all three: a
+    structured-only client never reads ``format_echo_response`` JSON, and a
+    text-only client never reads ``structuredContent``.
+    """
+    if not names:
+        return result
+    if isinstance(result, CallToolResult):
+        return result.model_copy(
+            update={
+                "content": _inject_unknown_into_blocks(result.content, names),
+                "structuredContent": _inject_unknown_into_structured(
+                    result.structuredContent, names
+                ),
+            }
+        )
+    if isinstance(result, tuple) and len(result) == 2:
+        blocks, structured = result
+        return (
+            _inject_unknown_into_blocks(blocks, names),
+            _inject_unknown_into_structured(structured, names),
+        )
+    if isinstance(result, list):
+        return _inject_unknown_into_blocks(result, names)
+    if isinstance(result, dict):
+        return _inject_unknown_into_structured(result, names)
+    if isinstance(result, str):
+        return _inject_unknown_into_text(result, names)
+    return result
