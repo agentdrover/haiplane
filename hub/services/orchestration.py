@@ -730,6 +730,7 @@ async def practice_metrics(
 
     escaped = await _escaped_defect_metrics(db, since)
 
+    model_declarations = await _model_declaration_metrics(db, since)
     human_gates = await _human_gate_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
@@ -745,6 +746,7 @@ async def practice_metrics(
         "category_debt": debt,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
+        "model_declarations": model_declarations,
         "human_gates": human_gates,
         "review_outcomes": review_outcomes,
     }
@@ -1011,6 +1013,64 @@ def _parse_hub_ts(raw: str | None) -> Any:
     except ValueError:
         return None
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+async def _model_declaration_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """How often the diversity rule has anything to work with (#1008).
+
+    The rule compares the implementer's model with the reviewer's, and both
+    arrive as declarations. Before this window existed, "the gate escalates on
+    monoculture" was a statement about code, not about data: nothing said how
+    many reports carried a model at all, or how many named one the hub cannot
+    place. On 2026-08-28 the answer was 102 of 116 reports with no declared
+    profile and an empty by_reviewer_model — a rule running on almost no input.
+
+    Three states per side, kept apart on purpose. ``missing`` is an empty
+    field; ``unrecognised`` is a string ``family()`` cannot map — and it is the
+    one that used to read as diversity (#1008); ``known`` is the only state the
+    gate can actually reason about. Folding the first two together would hide
+    which of "nobody filled it in" and "filled in with something invented" is
+    the problem to fix.
+    """
+    from hub.services.model_family import UNKNOWN, family
+
+    rows = await fetchall(
+        db,
+        "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
+        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "
+        "WHERE mr.created_at >= datetime('now', ?)",
+        (since,),
+    )
+
+    def _tally(values: list[Any]) -> dict[str, int]:
+        out = {"missing": 0, "unrecognised": 0, "known": 0}
+        for value in values:
+            fam = family(value)
+            if not fam:
+                out["missing"] += 1
+            elif fam.startswith(UNKNOWN):
+                out["unrecognised"] += 1
+            else:
+                out["known"] += 1
+        return out
+
+    return {
+        "reports": len(rows),
+        "reviewer": _tally([row["reviewer_model"] for row in rows]),
+        "implementer": _tally([row["implementer_model"] for row in rows]),
+        # Both sides known is the only combination the diversity rule can
+        # answer; everything else keeps the verdict with the human.
+        "comparable": sum(
+            1
+            for row in rows
+            if family(row["reviewer_model"])
+            and not family(row["reviewer_model"]).startswith(UNKNOWN)
+            and family(row["implementer_model"])
+            and not family(row["implementer_model"]).startswith(UNKNOWN)
+        ),
+    }
 
 
 async def _human_gate_metrics(
