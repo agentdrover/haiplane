@@ -282,7 +282,7 @@ Intake-маршруты create/refine **остаются** на `CHAT_PAIR_ALLOW
 |---|---|
 | Спека разъедется с allowlist | AC-1 + этот документ копирует кортеж из `hub/auth.py`; правка списка — решение в задаче, не «заодно» |
 | Читатель примет `role` за гейт | Constraints здесь и changelog в #961: human = intake-only |
-| TTL 2h молча оставляет running | #983, не этот документ |
+| TTL 2h молча оставляет running | #983: нет renew; reaper возвращает bound running/claimed в open |
 
 ---
 

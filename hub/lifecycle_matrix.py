@@ -130,6 +130,9 @@ LIFECYCLE_MATRIX: dict[str, LifecyclePolicy] = {
         next_actor="agent",
         surface="board",
     ),
+    # Pair running has no task-row deadline (stale-alert only). Implementer
+    # chat-pair expiry (#983) is a session-reaper side-effect on the bound
+    # task, not a matrix deadline — same shape as claim-lease → open (#417).
     "running:pair": _waiting(
         "running:pair",
         "running",
