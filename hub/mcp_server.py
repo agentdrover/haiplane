@@ -2328,7 +2328,11 @@ async def hub_submit_machine_review(
         incomplete: True when any agent died, any dimension was lost, context
             was truncated, or a budget ran out. No default on purpose: a
             silently-defaulted False is how a run with dead agents reads clean.
-        findings_confirmed: [{title, severity, category?, file?, line?, detail?}]
+        findings_confirmed: [{title, severity, locator, category?, file?,
+            start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
+            'lines' (file + start_line), 'file' (module known, line not),
+            'none' (no place found). 'none' is an answer; an empty file is
+            not. The finding's stable id is derived by the hub.
         findings_rejected: [{title, category?, reason?}] — actually refuted.
         unresolved: [{title, why}] — nobody could judge these. Never rejected.
         lost_dimensions: names of dimensions that returned nothing.

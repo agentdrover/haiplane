@@ -1113,18 +1113,22 @@ async def upsert_finding_disposition(
     disposition: str,
     note: str,
     decided_by: str,
+    finding_uid: str = "",
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert on (review_id, finding_index): a gate revisiting its own judgement
-    corrects it instead of leaving two contradictory rows for the metrics to
-    average.
+    Upsert stays on (review_id, finding_index): the slot is what rows filed
+    before #1007 carry, so keeping the conflict target there means a gate
+    revisiting its judgement still corrects the same row instead of leaving two
+    contradictory ones for the metrics to average. ``finding_uid`` rides along
+    as the identity the caller actually judged.
     """
     await db.execute(
         "INSERT INTO finding_dispositions (review_id, task_id, "
-        "submission_generation, finding_index, finding_title, disposition, "
-        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "submission_generation, finding_index, finding_uid, finding_title, "
+        "disposition, note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "finding_uid=excluded.finding_uid, "
         "disposition=excluded.disposition, note=excluded.note, "
         "decided_by=excluded.decided_by, decided_at=datetime('now')",
         (
@@ -1132,6 +1136,7 @@ async def upsert_finding_disposition(
             task_id,
             submission_generation,
             finding_index,
+            finding_uid,
             finding_title,
             disposition,
             note,

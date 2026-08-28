@@ -63,6 +63,23 @@ class ReviewSeverity(str, Enum):
     low = "low"
 
 
+class FindingLocator(str, Enum):
+    """Where a finding sits — stated by the report, never inferred (#1007).
+
+    ``none`` is a VALUE. A harness that cannot point at a place says so and the
+    report stays usable; what must not happen is an empty ``file`` standing in
+    for that answer, because "no location" and "forgot to fill it in" would
+    then look identical. Same rule the neighbouring keys got in #549.
+
+    ``file`` exists because the middle case is real: the reviewer knows which
+    module is wrong and not which line.
+    """
+
+    lines = "lines"
+    file = "file"
+    none = "none"
+
+
 class FindingScope(str, Enum):
     """Whether a review finding belongs to the reviewed task (#435).
 
@@ -1928,6 +1945,57 @@ class MachineFinding(BaseModel):
     file: str = Field("", max_length=500)
     line: int | None = Field(default=None, ge=1)
     detail: str = Field("", max_length=4000)
+    # Where the finding sits (#1007). Optional HERE so the 116 reports stored
+    # before this field existed keep loading — enforcement belongs to the write
+    # path (``require_locator_decision``), never to the read model. That split
+    # is the one #505 already drew for AC locators.
+    locator: FindingLocator | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _locator_agrees_with_itself(self) -> "MachineFinding":
+        """A stated locator must match the fields around it.
+
+        Nothing is checked when ``locator`` is absent: that is a legacy row,
+        which claimed nothing and cannot be caught lying.
+        """
+        if self.locator is None:
+            return self
+        if self.locator is FindingLocator.lines:
+            if not self.file.strip():
+                raise ValueError("locator='lines' needs a file to point into")
+            start = self.start_line if self.start_line is not None else self.line
+            if start is None:
+                raise ValueError(
+                    "locator='lines' needs start_line (or the legacy 'line')"
+                )
+            end = self.end_line if self.end_line is not None else start
+            if end < start:
+                raise ValueError(f"end_line {end} is before start_line {start}")
+            self.start_line = start
+            self.end_line = end
+            return self
+        if self.locator is FindingLocator.file:
+            if not self.file.strip():
+                raise ValueError("locator='file' needs a file")
+            if (
+                self.start_line is not None
+                or self.end_line is not None
+                or self.line is not None
+            ):
+                raise ValueError(
+                    "locator='file' carries no lines — use 'lines' to name them"
+                )
+            return self
+        # none: the report says it cannot place this finding, so a place
+        # alongside that answer is a contradiction, not extra detail.
+        if self.file.strip() or self.start_line is not None or self.line is not None:
+            raise ValueError(
+                "locator='none' means no place is known — drop file/line or "
+                "state 'file'/'lines' instead"
+            )
+        return self
 
 
 class MachineRejectedFinding(BaseModel):
@@ -2140,13 +2208,35 @@ class FindingDisposition(str, Enum):
 
 
 class FindingDispositionItem(BaseModel):
-    """One judged finding, addressed by its position in findings_confirmed."""
+    """One judged finding, addressed by ``finding_uid`` (#1007).
+
+    ``finding_index`` stays accepted because a position is what callers had
+    before uids existed, but it addresses a SLOT, not a finding: a resubmitted
+    report shifts every position at once, so a judgement filed by index can end
+    up describing its neighbour. New callers send the uid.
+
+    Exactly one of the two: sending both invites them to disagree, and the hub
+    would have to pick a winner nobody asked it to pick.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    finding_index: int = Field(..., ge=0)
+    finding_uid: str = Field("", max_length=64)
+    finding_index: int | None = Field(default=None, ge=0)
     disposition: FindingDisposition
     note: str = Field("", max_length=1000)
+
+    @model_validator(mode="after")
+    def _addressed_exactly_once(self) -> "FindingDispositionItem":
+        has_uid = bool(self.finding_uid.strip())
+        has_index = self.finding_index is not None
+        if has_uid and has_index:
+            raise ValueError(
+                "address the finding by finding_uid OR finding_index, not both"
+            )
+        if not has_uid and not has_index:
+            raise ValueError("finding_uid is required (finding_index is legacy)")
+        return self
 
 
 class FindingDispositionsSubmit(BaseModel):
@@ -2161,6 +2251,9 @@ class FindingDispositionView(BaseModel):
     """A stored disposition, as the card and the brief read it back."""
 
     finding_index: int
+    # Empty for rows judged before uids existed (#1007) — those are readable
+    # by position and title, which is exactly what they were filed with.
+    finding_uid: str = ""
     finding_title: str = ""
     disposition: FindingDisposition
     note: str = ""

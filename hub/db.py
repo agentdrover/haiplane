@@ -1205,6 +1205,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON finding_dispositions(review_id, finding_index)",
     ),
     (
+        # The finding's own identity beside the slot it occupied (#1007).
+        # NOT backfilled: rows filed before this column were addressed by
+        # position and are still readable that way, and computing an id for
+        # them now would claim they were judged under a scheme that did not
+        # exist. The conflict target stays (review_id, finding_index) so those
+        # rows keep being corrected in place rather than duplicated.
+        "add_finding_uid_to_dispositions",
+        "ALTER TABLE finding_dispositions ADD COLUMN finding_uid TEXT NOT NULL "
+        "DEFAULT ''",
+    ),
+    (
         # A finding class that keeps coming back, and the check that ended it
         # (#878, feature #871). ``recurring_categories`` has counted repeats
         # since #384 and closed nothing: a class found in three tasks is still

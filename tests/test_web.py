@@ -1851,7 +1851,12 @@ async def test_review_panel_shows_machine_review(client: AsyncClient, db):
             "raw_count": 5,
             "incomplete": False,
             "findings_confirmed": [
-                {"title": "missing test", "severity": "low", "category": "tests"}
+                {
+                    "locator": "none",
+                    "title": "missing test",
+                    "severity": "low",
+                    "category": "tests",
+                }
             ],
             "findings_rejected": [{"title": "noise", "reason": "unreachable"}],
         },
@@ -4706,7 +4711,12 @@ async def _machine_report(client: AsyncClient, task_id: int, **overrides) -> Non
         "model": "grok-4.6",
         "raw_count": 2,
         "findings_confirmed": [
-            {"title": "boundary lost", "severity": "medium", "file": "hub/a.py"}
+            {
+                "locator": "file",
+                "title": "boundary lost",
+                "severity": "medium",
+                "file": "hub/a.py",
+            }
         ],
         "findings_rejected": [
             {"title": "style nit", "category": "style", "reason": "не дефект"}
@@ -5287,8 +5297,18 @@ async def test_diff_lines_carry_their_new_side_address(
 # could not be computed at all.
 
 _TWO_FINDINGS = [
-    {"title": "boundary lost", "severity": "medium", "file": "hub/a.py"},
-    {"title": "race on retry", "severity": "high", "file": "hub/b.py"},
+    {
+        "title": "boundary lost",
+        "severity": "medium",
+        "file": "hub/a.py",
+        "locator": "file",
+    },
+    {
+        "title": "race on retry",
+        "severity": "high",
+        "file": "hub/b.py",
+        "locator": "file",
+    },
 ]
 
 

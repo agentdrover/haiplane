@@ -19,6 +19,11 @@ from hub.services.delivery_state import (
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
+from hub.services.finding_identity import (
+    finding_uid,
+    finding_uids,
+    require_locator_decision,
+)
 from hub.services.live_check import (
     list_checks,
     live_check_view,
@@ -171,6 +176,9 @@ __all__ = [
     "live_check_view",
     "record_category_check",
     "record_finding_dispositions",
+    "finding_uid",
+    "finding_uids",
+    "require_locator_decision",
     "message_event_is_addressed",
     "message_view",
     "note_session_task",

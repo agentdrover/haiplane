@@ -37,6 +37,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.models import FindingDispositionItem
+from hub.services.finding_identity import finding_uids
 
 
 async def record_finding_dispositions(
@@ -49,9 +50,13 @@ async def record_finding_dispositions(
     """Store the gate's judgement of the CURRENT report's confirmed findings.
 
     Raises ``LookupError`` when the task or its report is missing and
-    ``ValueError`` when an index points outside the findings that report
-    actually carries — a disposition for finding #7 of a five-finding report is
-    not a partial success, it means the caller judged something else.
+    ``ValueError`` when the address points at nothing this report carries — a
+    disposition for finding #7 of a five-finding report is not a partial
+    success, it means the caller judged something else.
+
+    Addressing is by ``finding_uid`` (#1007); ``finding_index`` is still
+    resolved for callers written before uids existed. Both are stored, so a row
+    filed either way stays readable and the metrics keep one key.
     """
     if await repo.get_task(db, task_id) is None:
         raise LookupError(f"task #{task_id} not found")
@@ -66,23 +71,40 @@ async def record_finding_dispositions(
     if not isinstance(confirmed, list):
         confirmed = []
 
-    for item in items:
-        if item.finding_index >= len(confirmed):
-            raise ValueError(
-                f"finding_index={item.finding_index} is outside the "
-                f"{len(confirmed)} confirmed finding(s) of review "
-                f"#{review['id']}"
-            )
+    uids = finding_uids(confirmed)
+    index_by_uid = {uid: idx for idx, uid in enumerate(uids)}
 
+    resolved: list[int] = []
     for item in items:
-        entry = confirmed[item.finding_index]
+        if item.finding_uid:
+            index = index_by_uid.get(item.finding_uid)
+            if index is None:
+                raise ValueError(
+                    f"finding_uid={item.finding_uid} is not among the "
+                    f"{len(confirmed)} confirmed finding(s) of review "
+                    f"#{review['id']} — the report may have been resubmitted "
+                    "since you read it"
+                )
+        else:
+            index = int(item.finding_index or 0)
+            if index >= len(confirmed):
+                raise ValueError(
+                    f"finding_index={index} is outside the "
+                    f"{len(confirmed)} confirmed finding(s) of review "
+                    f"#{review['id']}"
+                )
+        resolved.append(index)
+
+    for item, index in zip(items, resolved):
+        entry = confirmed[index]
         title = str(entry.get("title") or "") if isinstance(entry, dict) else ""
         await repo.upsert_finding_disposition(
             db,
             review_id=int(review["id"]),
             task_id=task_id,
             submission_generation=int(review["submission_generation"] or 0),
-            finding_index=item.finding_index,
+            finding_index=index,
+            finding_uid=uids[index],
             finding_title=title[:300],
             disposition=item.disposition.value,
             note=item.note,

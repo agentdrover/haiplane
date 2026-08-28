@@ -1667,6 +1667,10 @@ async def api_submit_machine_review(
     # (#519). Normalised upward rather than rejected: the recorded risk asks
     # not to break existing clients, and a report with a miscounted header is
     # still worth keeping — its findings are real.
+    # Where each confirmed finding sits, before anything is stored (#1007):
+    # a report that never placed its findings cannot be matched against a diff
+    # later, and the gap is invisible once the report is in the ground.
+    services.require_locator_decision(body.findings_confirmed)
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
     raw_count = body.raw_count
     if raw_count < adjudicated:
