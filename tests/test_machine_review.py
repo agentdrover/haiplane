@@ -8,10 +8,10 @@ to point" and "nobody filled this in" were the same empty value.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import AsyncClient
-
-import json
 
 from hub.models import FindingLocator, MachineReviewView
 from hub.services.finding_identity import finding_uid, finding_uids
