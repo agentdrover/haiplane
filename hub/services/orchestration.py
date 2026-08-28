@@ -1731,6 +1731,72 @@ TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.unavailable.value}",
 )
 
+# #1030: refusals the executor cures WITHOUT a human — a red CI is fixed by a
+# push, and an approval the branch outran is cured by resubmitting. Both used
+# to share the terminal branch with merge_failed, and needs_decision is a door
+# that only opens outward: from there the agent can neither report done nor
+# submit for review. On 28.08.2026 that cost #1015 a manual merge — the CI fix
+# was pushed four minutes after the refusal and there was no way back onto the
+# conveyor. Not the same class as #951: a transient state resolves itself and
+# nobody has to act, while these two wait for the executor to do something.
+RECOVERABLE_GATE_PREFIXES = (
+    f"ci_{CIProbeOutcome.failed.value}",
+    "stale_approval",
+)
+# Only a red CI is charged to the fix budget. A stale approval is not a spent
+# attempt — it is the branch moving while the agent works, and charging it
+# would spend the CI budget on evidence that the executor is alive.
+CI_BUDGET_GATE_PREFIXES = (f"ci_{CIProbeOutcome.failed.value}",)
+
+# #952: written together with the decision to keep the task running, and read
+# after it — so it names only what running accepts. "Report done again" is not
+# that action here: fixing the CI creates commits, which makes the verdict
+# stale (#612), and delivery then needs a new review rather than another done.
+RESUBMIT_AFTER_FIX_HINT = (
+    "Это чинится на конвейере, решение человека не требуется: устраните "
+    "причину на той же ветке и пересдайте через hub_submit_for_review. "
+    "Новые коммиты после одобрения требуют нового ревью (#612), поэтому "
+    "повторный отчёт о готовности здесь не поможет."
+)
+
+
+async def charge_ci_fix_budget(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[int, bool]:
+    """Charge this submission's red CI to the pair fix budget once (#1030).
+
+    Returns ``(cycle, spent)``. The budget is the one the headless conveyor
+    already spends on dispatched CI fixes — same counter, same limit, so two
+    conveyors cannot drift into two different ideas of "enough tries".
+
+    Charged per SUBMISSION, not per refusal: the delivery sweep asks the gate
+    every cycle while the CI stays red, and a per-refusal counter would spend
+    three tries in ninety seconds. Until the executor submits again this is the
+    same attempt, and re-charging it would only measure how long the poller
+    ran. ``spent`` is what sends the task to a human — the executor has had its
+    tries and the CI is still red.
+    """
+    task_id = task["id"]
+    generation = int(task.get("submission_generation") or 0)
+    charged = task.get("ci_fix_charged_generation")
+    charged = -1 if charged is None else int(charged)
+    cycle = int(task.get("ci_fix_cycle") or 0)
+    if charged == generation:
+        return cycle, cycle > config.MAX_CI_FIX_CYCLES
+    cycle += 1
+    await repo.update_task(
+        db,
+        task_id,
+        ci_fix_cycle=cycle,
+        ci_fix_charged_generation=generation,
+    )
+    # The caller keeps working with the dict it was handed; leaving it behind
+    # the row would make the very next read of the budget answer with the
+    # value this call just replaced.
+    task["ci_fix_cycle"] = cycle
+    task["ci_fix_charged_generation"] = generation
+    return cycle, cycle > config.MAX_CI_FIX_CYCLES
+
 
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
@@ -2221,6 +2287,39 @@ async def transition_after_agent_done(
                         detail,
                     )
                     return "running"
+                budget_spent = False
+                if detail.startswith(RECOVERABLE_GATE_PREFIXES):
+                    # #1030: the executor is right here — it just reported —
+                    # so the refusal it can cure itself keeps the task on the
+                    # conveyor instead of handing a human a door the agent
+                    # cannot walk back through. The budget is what stops this
+                    # from being an infinite loop: after MAX_CI_FIX_CYCLES
+                    # attempts on a still-red CI the escalation below is the
+                    # honest answer, and it names the spent budget as the
+                    # cause rather than the CI outcome.
+                    cycle = 0
+                    if detail.startswith(CI_BUDGET_GATE_PREFIXES):
+                        cycle, budget_spent = await charge_ci_fix_budget(db, task)
+                    if not budget_spent:
+                        attempt = (
+                            f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}."
+                            if cycle
+                            else ""
+                        )
+                        await repo.add_task_update(
+                            db,
+                            task_id,
+                            "hub",
+                            "alert",
+                            f"Доставка не состоялась: PR #{task['pr_number']} — "
+                            f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
+                        )
+                        log.info(
+                            "Task #%d stays running: recoverable gate refusal (%s)",
+                            task_id,
+                            detail,
+                        )
+                        return "running"
                 await repo.update_task(db, task_id, status="needs_decision")
                 await repo.add_task_update(
                     db,
@@ -2234,7 +2333,19 @@ async def transition_after_agent_done(
                     # (human_decision_required), which on 25.08.2026 sent an
                     # agent down a dead end the hint had pointed to (#949).
                     f"Done report NOT completed: PR #{task['pr_number']} is not "
-                    f"delivered — {detail}. Решение за человеком "
+                    f"delivered — {detail}."
+                    + (
+                        # #1030: after the budget the cause is no longer "the
+                        # CI is red" but "the executor has had its tries" —
+                        # naming the CI outcome alone would read as a first
+                        # refusal and hide that the conveyor already gave way.
+                        f" Бюджет починки исчерпан "
+                        f"({task.get('ci_fix_cycle')}/"
+                        f"{config.MAX_CI_FIX_CYCLES})."
+                        if budget_spent
+                        else ""
+                    )
+                    + " Решение за человеком "
                     "(hub_decide_task): rework вернёт задачу в running — "
                     "устраните причину и пересдайте done; accept завершит "
                     "задачу БЕЗ доставки PR.",
@@ -2244,7 +2355,12 @@ async def transition_after_agent_done(
                     kind="needs_decision",
                     task_id=task_id,
                     actor=task.get("assigned_agent") or "agent",
-                    payload={"reason": "merge_gate", "detail": detail},
+                    payload={
+                        "reason": (
+                            "ci_fix_cycle_limit" if budget_spent else "merge_gate"
+                        ),
+                        "detail": detail,
+                    },
                 )
                 log.info(
                     "Task #%d → needs_decision: merge gate refused (%s)",

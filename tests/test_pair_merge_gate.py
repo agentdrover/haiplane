@@ -94,14 +94,19 @@ async def test_report_done_merges_an_approved_pair_pr_before_completing(db):
 # for a CI that went green four minutes later (#949).
 
 
-async def test_red_ci_blocks_pair_completion(db):
+async def test_red_ci_never_merges_and_never_completes(db):
+    # #605\'s invariant, kept whole: a red CI is not deliverable and does not
+    # complete the task. Its SECOND half — "so call a human" — is what #1030
+    # took away: the executor cures a red CI with a push, and needs_decision is
+    # a door that only opens outward. See the #1030 block at the end of this
+    # file for where the task goes instead.
     g = _git(CIProbeOutcome.failed, merged=True)
     task_id = await _approved_pair_task(db)
 
     await _report_done(db, task_id)
 
     task = dict(await repo.get_task(db, task_id))
-    assert task["status"] == "needs_decision", "CI=failed must not read as deliverable"
+    assert task["status"] != "completed", "CI=failed must not read as deliverable"
     g.merge_pr.assert_not_awaited()
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert any("ci_fail" in (u.get("content") or "") for u in updates), (
@@ -370,7 +375,7 @@ async def test_a_commit_pushed_after_approval_is_not_delivered(db, monkeypatch):
     await _report_done(db, task_id)
 
     task = dict(await repo.get_task(db, task_id))
-    assert task["status"] == "needs_decision", (
+    assert task["status"] != "completed", (
         "delivering here would put unreviewed code in develop under an approval"
     )
     g.merge_pr.assert_not_awaited()
@@ -664,8 +669,12 @@ async def test_the_terminal_refusal_hint_names_reachable_actions_only(db):
     (human_decision_required) — 25.08 подсказка «report done again» отправила
     исполнителя ровно в этот отказ (#949). Текст обязан вести через решение:
     hub_decide_task, и объяснять, что даёт каждый исход.
+
+    Отказ здесь — тот, который агент НЕ лечит сам: GitHub отказал в мерже.
+    Раньше пример был красным CI, но с #1030 он больше не терминальный — а
+    проверяется тут не он, а текст подсказки на терминальной ветке.
     """
-    _git(CIProbeOutcome.failed, merged=True)
+    _git(CIProbeOutcome.passed, merged=False)
     task_id = await _approved_pair_task(db)
 
     await _report_done(db, task_id)
@@ -1186,3 +1195,217 @@ async def test_a_task_with_a_dispatch_job_is_left_to_its_own_conveyor(db):
 
     g.merge_pr.assert_not_awaited()
     assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# #1030 — восстановимый отказ доставки не выносит задачу с конвейера
+# ---------------------------------------------------------------------------
+#
+# 28.08.2026, #1015. APPROVED в 16:53:56Z; через 21 секунду свип увёл задачу в
+# needs_decision: «PR #142 не доставлен — ci_failed: checks_failed». Исполнитель
+# починил CI двумя коммитами, в 17:05Z checks зелёные. Пересдать было нельзя:
+# из needs_decision hub_submit_for_review отвечает 400. Человек нажал accept —
+# задача completed, PR открыт, мержили руками.
+#
+# Дыра не в CI и не в #1015: красный CI и устаревший апрув — это работа, а не
+# решение, и лечит их тот же агент. Ждать их можно ровно потому, что ждать есть
+# кому: бюджет останавливает исполнителя, который не справляется, присутствие —
+# задачу, над которой уже никто не работает.
+
+
+async def _live_session(db, task_id: int, session_id: str = "sess-1030") -> str:
+    """Bind a signing-in session to the task, the way a claim does (#852)."""
+    from hub.models import SessionRegister
+
+    await services.register_session(
+        db, SessionRegister(session_id=session_id), agent="dev", principal_id=None
+    )
+    await repo.update_task(db, task_id, claim_session_id=session_id)
+    await db.commit()
+    return session_id
+
+
+async def _go_silent(db, session_id: str = "sess-1030") -> None:
+    """The same session, last seen long past its TTL."""
+    await db.execute(
+        "UPDATE agent_sessions SET last_seen_at = datetime('now', '-1 day') "
+        "WHERE session_id = ?",
+        (session_id,),
+    )
+    await db.commit()
+
+
+async def test_a_recoverable_red_ci_keeps_the_pair_task_running(db):
+    # AC-1: красный CI на done-пути — не решение человека. Задача остаётся в
+    # running, события needs_decision нет, мержа нет, завершения нет, и агент
+    # снова может сдать. На базовом коде тест красный: задача уходила к человеку.
+    g = _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "починка CI — работа исполнителя, а не решение человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "восстановимый отказ не рождает событие решения"
+    await services.submit_for_review(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["status"] == "review", (
+        "из running пересдача проходит — это и есть выход, которого не было"
+    )
+
+
+async def test_the_recoverable_refusal_hint_points_at_resubmission(db):
+    # AC-4 (#952): подсказка пишется вместе с решением оставить задачу в running
+    # и читается после него, поэтому обязана называть действие, доступное из
+    # running. Повторный done тут не работает: починка порождает коммиты, и
+    # вердикт становится устаревшим (#612).
+    _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    hint = " ".join(u.get("content") or "" for u in updates)
+    assert "hub_submit_for_review" in hint, "подсказка обязана назвать пересдачу"
+    assert "отчитайтесь о готовности снова" not in hint, (
+        "совет из транзитной ветки здесь ведёт в тупик: вердикт устареет"
+    )
+
+
+async def test_a_stale_approval_keeps_the_task_on_the_conveyor(db, monkeypatch):
+    # AC-2: пуш CI-фикса поверх APPROVED — ровно то, что делает исполнитель
+    # после AC-1. Гейт #612 обязан отказать в мерже и обязан НЕ уводить задачу:
+    # иначе починка красного CI возвращает тот же тупик следующим же циклом
+    # свипа, просто под другой строкой отказа.
+    g = _git_seeing(monkeypatch, "approved0commit")
+    task_id = await _approved_pair_task(db)
+    await _live_session(db, task_id)
+    g.head_sha = AsyncMock(return_value="ci0fix0pushed")
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "ветка ушла после апрува — это повод пересдать, а не звать человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    await services.submit_for_review(db, task_id)
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+
+async def test_repeated_red_ci_escalates_once_the_fix_budget_is_spent(db):
+    # AC-3: у running:pair машинного дедлайна нет (lifecycle_matrix), поэтому
+    # «оставить в running» без бюджета — это вечное ожидание. Бюджет тот же,
+    # что тратит безголовый конвейер, и причина названа именно бюджетом.
+    from hub import config
+
+    _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    for _ in range(config.MAX_CI_FIX_CYCLES):
+        await _report_done(db, task_id)
+        assert dict(await repo.get_task(db, task_id))["status"] == "running"
+        # Пересдача — то, чем исполнитель тратит попытку: новая генерация,
+        # новый апрув, новая доставка.
+        await services.submit_for_review(db, task_id)
+        await services.record_review_verdict(
+            db, task_id, TaskReviewVerdict(verdict="approved", agent="reviewer")
+        )
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "после исчерпанного бюджета человек — честный следующий шаг"
+    )
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    escalations = [
+        e for e in events if e["kind"] == "needs_decision" and e["task_id"] == task_id
+    ]
+    assert escalations, "эскалация обязана быть событием, а не только текстом"
+    assert "ci_fix_cycle_limit" in (escalations[-1].get("payload") or ""), (
+        "причина — исчерпанный бюджет, а не «красный CI» первого отказа"
+    )
+
+
+async def test_the_fix_budget_counts_submissions_not_poll_cycles(db):
+    # Свип спрашивает гейт каждый цикл, пока CI красный. Счётчик попыток,
+    # который двигался бы на каждый отказ, потратил бы бюджет из трёх попыток
+    # за полторы минуты — и «три попытки починить» означало бы «полторы минуты
+    # на починку».
+    _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+    await _live_session(db, task_id)
+
+    for _ in range(4):
+        await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "четыре цикла свипа — это одна попытка"
+    assert task["ci_fix_cycle"] == 1, (
+        f"бюджет считает сдачи, а не циклы поллера: {task['ci_fix_cycle']}"
+    )
+
+
+async def test_a_red_ci_with_nobody_on_the_task_calls_a_human(db):
+    # Обратная сторона AC-1: ждать починки можно, только пока есть кому чинить.
+    # Сессия исполнителя молчит дольше TTL — задача уходит к человеку, как и
+    # сегодня, и причина названа: дело не в CI, а в том, что чинить некому.
+    g = _git(CIProbeOutcome.failed, merged=True)
+    task_id = await _approved_pair_task(db)
+    await _live_session(db, task_id)
+    await _go_silent(db)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    alert = " ".join(u.get("content") or "" for u in updates)
+    assert "не на связи" in alert, alert
+
+
+async def test_task_1015_recovers_via_resubmit_not_stale_merge(db, monkeypatch):
+    # AC-8: лента #1015 целиком. APPROVED → красный CI на доставке → пуш фикса
+    # → CI зелёный. Задача не должна ни разу уйти в needs_decision, и зелёный CI
+    # на коммите ПОСЛЕ вердикта не должен доставить работу сам: это ровно тот
+    # мерж, который запрещает #612. Доставка — только после новой сдачи.
+    g = _git_seeing(monkeypatch, "approved0commit", ci=CIProbeOutcome.failed)
+    task_id = await _approved_pair_task(db)
+    await _live_session(db, task_id)
+
+    # 16:54Z — гейт доставки отказал по красному CI.
+    await _drain_pair_delivery(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+    # 17:05Z — два коммита починили CI. Ветка ушла после апрува.
+    g.head_sha = AsyncMock(return_value="ci0fix0pushed")
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "зелёный CI на новом SHA — не доставка"
+    g.merge_pr.assert_not_awaited(), "мерж stale-апрува — это нарушение #612"
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "ни одного вызова человека на всей ленте"
+
+    # Пересдача — тот выход, которого не было 28.08.2026.
+    await services.submit_for_review(db, task_id)
+    await services.record_review_verdict(
+        db, task_id, TaskReviewVerdict(verdict="approved", agent="reviewer")
+    )
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "работа доехала сама, без рук"
+    assert g.merge_pr.await_count == 1, "ровно одна доставка, по новому вердикту"

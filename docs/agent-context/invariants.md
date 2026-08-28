@@ -51,6 +51,19 @@ These are the rules most likely to be broken by “small” changes.
   exists solely in a foreign unpushed clone stays silent (#966's territory).
   This deliberately RETIRES the old carve-out "a task with a branch and no
   PR completes as before" for anything with observable commits.
+- Delivery-gate refusals split three ways, by WHO has to act (#951, #1030).
+  Transient (`ci_pending`, `ci_unavailable`): nobody acts, the task stays
+  `running` and the hub asks again. Recoverable (`ci_failed`,
+  `stale_approval`): the EXECUTOR acts, the task stays `running`, and the hint
+  names `hub_submit_for_review` — a fix is new commits, so delivery needs a new
+  review (#612), never another done report. Terminal (`merge_failed`, closed
+  PR, `no_pr`, `merge_gate_error`): a human acts, `needs_decision` as before.
+  Waiting on a recoverable refusal is bounded twice, because two different
+  things can go wrong: the fix budget (`ci_fix_cycle` vs `MAX_CI_FIX_CYCLES`,
+  charged once per submission — the same budget the headless conveyor spends)
+  stops an executor that keeps failing, and session presence stops a task
+  nobody works on any more. `running:pair` has no machine deadline, so the
+  #418 backstop does NOT cover this — the bounds above are the only ones.
 - Human overrides bypass the gate by design and stay audited: `hub_decide_task`
   accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
