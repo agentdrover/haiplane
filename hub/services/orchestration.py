@@ -2362,36 +2362,101 @@ async def transition_after_agent_done(
             )
             log.error("Task #%d → needs_decision: %s", task_id, exc)
             return "needs_decision"
-        squashed = await plugins.git_ops.squash_branch(
-            task_id,
-            task.get("title", ""),
-            branch,
-            repo=git_repo,
-            base_branch=ctx.get("base_branch"),
-        )
-        await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
-        if not task.get("pr_number"):
-            pr_num = await plugins.git_ops.create_pr(
-                task_id,
-                task["title"],
-                task.get("description", ""),
+        # #991: the CI gate asks for a PR where it means "is there anything to
+        # deliver". For a task whose work is not code — a policy turned on, a
+        # mechanism watched, a decision recorded — the branch exists (pair_start
+        # always makes one) and carries nothing the base does not have. There is
+        # no PR to open, so the poller retried and escalated: #927 sat in
+        # needs_decision with "Cannot create PR: no commits on branch or push
+        # failed" while its work was finished and evidenced by three live checks.
+        #
+        # The question is asked HERE and not earlier, and against git_repo and
+        # not the clone — both learned from the review of the first attempt:
+        #
+        #   * after auto_commit, because auto_commit is what turns a dirty tree
+        #     into commits. Asking before it called work-in-progress "nothing to
+        #     deliver" and skipped the very commit that delivers it.
+        #   * against git_repo, because for a pair task in worktree mode the
+        #     work lives in the worktree while the clone stays on base. Deciding
+        #     from the clone and acting on the worktree is how a decision comes
+        #     out right by accident.
+        #
+        # Three answers, and only one skips: content that does not differ means
+        # the CI gate has no subject. "Could not compare" keeps the old path —
+        # ignorance must not close a task quietly (#725). The REVIEW gate is
+        # untouched either way: skipping it would let anything uncommitted
+        # complete itself, a worse defect than the one being fixed.
+        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
+        # empty base is passed through, never recomputed here.
+        try:
+            differs = await plugins.git_ops.content_differs(
+                (ctx.get("base_branch") or "").strip(),
                 branch,
                 repo=git_repo,
                 gh_repo=ctx.get("gh_repo"),
+            )
+        except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+            # A done report must not 500 because git blinked. An unanswered
+            # question keeps the old path, exactly like an explicit None.
+            log.warning("delivery check for #%s failed: %s", task_id, exc)
+            differs = None
+        # ONLY an explicit False skips. None means "could not compare", and it
+        # deliberately keeps the ordinary path — PR, CI and the gate — because
+        # the risk to guard against is silently closing a task, not opening a
+        # pull request that the CI gate will judge anyway (#725).
+        nothing_to_deliver = differs is False
+        if nothing_to_deliver:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлять нечего: ветка {branch} после коммита не "
+                "отличается по содержимому от базовой ветки проекта, PR "
+                "открывать не из чего. Гейт CI пропущен как беспредметный — "
+                "ревью задача проходит обычным порядком (#991). Если работа "
+                "должна была быть в коде, значит она не закоммичена.",
+            )
+            log.info(
+                "Task #%d: nothing to deliver on %s — CI gate skipped",
+                task_id,
+                branch,
+            )
+
+        # Fall through to the review gate when there is nothing to deliver:
+        # squash, push and PR all have no subject, and the task still owes a
+        # verdict — it just owes no pull request (#991).
+        if not nothing_to_deliver:
+            squashed = await plugins.git_ops.squash_branch(
+                task_id,
+                task.get("title", ""),
+                branch,
+                repo=git_repo,
                 base_branch=ctx.get("base_branch"),
             )
-            if pr_num:
-                await repo.update_task(db, task_id, pr_number=pr_num)
-                task["pr_number"] = pr_num
-        await repo.update_task(
-            db,
-            task_id,
-            status="ci_check",
-            exit_code=exit_code,
-            result_text=result_text,
-        )
-        log.info("Task #%d → ci_check after done report", task_id)
-        return "ci_check"
+            await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
+            if not task.get("pr_number"):
+                pr_num = await plugins.git_ops.create_pr(
+                    task_id,
+                    task["title"],
+                    task.get("description", ""),
+                    branch,
+                    repo=git_repo,
+                    gh_repo=ctx.get("gh_repo"),
+                    base_branch=ctx.get("base_branch"),
+                )
+                if pr_num:
+                    await repo.update_task(db, task_id, pr_number=pr_num)
+                    task["pr_number"] = pr_num
+            await repo.update_task(
+                db,
+                task_id,
+                status="ci_check",
+                exit_code=exit_code,
+                result_text=result_text,
+            )
+            log.info("Task #%d → ci_check after done report", task_id)
+            return "ci_check"
 
     if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human
