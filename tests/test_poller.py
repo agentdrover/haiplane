@@ -207,7 +207,7 @@ async def test_poll_headless_approved_converges_on_gate_transition(mock_sleep, d
     # gate-checked transition as external submit_review — verdict stays
     # bound to the completed submission (no generation bump).
     task_id = await _make_review_task(db)
-    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await repo.record_review_verdict(db, task_id, "approved")
     await db.commit()
 
     mock_dispatch = NoopDispatch()
@@ -457,17 +457,30 @@ async def test_poll_uses_persisted_verdict_without_text_scan(mock_sleep, db):
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
-async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
-    # AC-2 (#326): no persisted verdict → the old text channel still works.
+async def test_scanned_verdict_does_not_complete(mock_sleep, db):
+    """#1019 AC-2: an APPROVED found by scanning text does not open delivery.
+
+    This replaces #326's test of the opposite contract — the text channel used
+    to complete a task on its own. The line below is the kind that made that
+    dangerous: a reviewer QUOTING what they found in someone else's log, whose
+    last word happens to be "approved". No string match can tell that from a
+    verdict, and the consequence of guessing wrong is a merge.
+    """
     task_id = await _make_review_task(db)
-    await repo.add_task_update(db, task_id, "reviewer", "review", "ok\nAPPROVED")
+    await repo.update_task(db, task_id, pr_number=77, branch="task-x/b")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "reviewer",
+        "review",
+        "Нашёл в логе чужой задачи строку status=approved",
+    )
     await db.commit()
 
-    mock_dispatch = NoopDispatch()
-    mock_dispatch.get_job = MagicMock(
-        return_value={"status": "completed", "exit_code": 0}
-    )
-    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
 
     with (
         patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
@@ -476,8 +489,67 @@ async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
         await _poll_running_tasks(_make_app(db))
 
     d = dict(await repo.get_task(db, task_id))
-    assert d["status"] == "completed"
-    assert d["review_verdict"] == "approved"
+    assert d["status"] == "needs_decision"
+    assert not d["review_verdict"]  # never recorded as a verdict
+    mock_git.merge_pr.assert_not_awaited()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_scanned_verdict_quotes_its_basis(mock_sleep, db):
+    """#1019 AC-3: the alert shows WHAT was taken for a verdict, and from where.
+
+    Naming only the fact ("no verdict") leaves the person to go looking for the
+    text themselves — in a log they may not be able to read.
+    """
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "итог обсуждения: approved"
+    )
+    await db.commit()
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    updates = [dict(r) for r in await repo.get_task_updates(db, task_id)]
+    alerts = [u["content"] for u in updates if u["kind"] == "alert"]
+    assert any("итог обсуждения: approved" in a for a in alerts)
+    assert any("апдейт ревью" in a for a in alerts)
+
+    events = [dict(r) for r in await repo.list_events(db, since=0)]
+    reasons = [e["payload"] for e in events if e["kind"] == "needs_decision"]
+    assert any("scanned_approval_not_a_verdict" in str(p) for p in reasons)
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_scanned_changes_requested_still_returns_the_work(mock_sleep, db):
+    """#1019: only the approving direction is refused.
+
+    A false positive here costs a round of rework; the same false positive on
+    the approving side costs a merge. The task's constraint says so explicitly,
+    and this test is what keeps the two from being treated alike.
+    """
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "verdict: CHANGES_REQUESTED"
+    )
+    await db.commit()
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.dispatch_fix", new_callable=AsyncMock) as fix,
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["review_verdict"] == "changes_requested"
+    assert d["status"] != "needs_decision"
+    fix.assert_awaited()
 
 
 async def test_events_pruning(db):
@@ -1187,7 +1259,7 @@ async def test_approved_merge_targets_the_projects_repo(mock_sleep, db):
     )
     task_id = await _make_review_task(db)
     await repo.update_task(db, task_id, project_id=pid, pr_number=99, branch="task-x/b")
-    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await repo.record_review_verdict(db, task_id, "approved")  # submitted, not scanned
     await db.commit()
 
     mock_git = NoopGitOps()
@@ -1304,6 +1376,12 @@ async def _approved_task_with_pr(db, *, pr_number=99):
     task_id = await _make_review_task(db)
     await repo.update_task(db, task_id, pr_number=pr_number, branch="task-x/b")
     await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    # The approval these tests stand on is the submitted one (#1019). It used to
+    # come from the review text above, which the poller no longer reads as a
+    # verdict — so a fixture built on the text would have quietly stopped
+    # approving anything, and every merge test below would have passed by
+    # never reaching a merge.
+    await repo.record_review_verdict(db, task_id, "approved")
     await db.commit()
     return task_id
 

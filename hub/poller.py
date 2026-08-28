@@ -321,6 +321,12 @@ async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
     return
 
 
+# A scanned approval was refused and the task already routed to a human. Not a
+# verdict and not "nothing found" — both of those have their own handling, and
+# collapsing this into either would either deliver the work or hide why it stopped.
+SCANNED_APPROVAL_DEFERRED = "scanned_approval_deferred"
+
+
 async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> str:
     """Verdict for the CURRENT submission: persisted state first (#326), then text.
 
@@ -334,24 +340,76 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
     if persisted and task.get("review_verdict_generation") == task.get(
         "submission_generation"
     ):
-        verdict = persisted
         log.info(
             "Poll: task #%d verdict '%s' from persisted review state",
             task["id"],
-            verdict,
+            persisted,
         )
-    else:
-        verdict = services.extract_review_verdict(
-            task["id"], task["review_job_id"], updates_list
-        )
-
-    if verdict:
         # Canonical verdict state (#305): bind the verdict to the
         # current submission generation so a later resubmission
         # invalidates this approval.
-        await repo.record_review_verdict(db, task["id"], verdict)
+        await repo.record_review_verdict(db, task["id"], persisted)
+        return str(persisted)
 
-    return verdict or ""
+    scanned = services.extract_review_verdict(
+        task["id"], task["review_job_id"], updates_list
+    )
+    if scanned is None:
+        return ""
+
+    if scanned.verdict == "approved":
+        # #1019: a line ending in "approved" is not an approval. The word turns
+        # up in a quoted finding, in a plan, in a stretch of diff that reached
+        # the log — and the consequence here is delivery. Every other way past
+        # the Universal Review Gate (force_complete, decide accept) leaves a
+        # human decision in the audit; this one left an ordinary-looking
+        # APPROVED, so the bypass was the one nobody could see afterwards.
+        await _defer_scanned_approval(db, task, scanned)
+        return SCANNED_APPROVAL_DEFERRED
+
+    # changes_requested keeps working: it returns work to its author instead of
+    # opening delivery, so a false positive costs a round, not a merge.
+    await repo.record_review_verdict(db, task["id"], scanned.verdict)
+    return scanned.verdict
+
+
+async def _defer_scanned_approval(db, task: dict, scanned) -> None:
+    """Hand a scanned approval to a human, quoting what was taken for a verdict."""
+    log.warning(
+        "Poll: task #%d approval came from a text match in %s, not from a "
+        "review submission → needs_decision",
+        task["id"],
+        scanned.source,
+    )
+    quoted = scanned.line.strip()
+    if len(quoted) > 300:
+        quoted = quoted[:300] + "…"
+    await repo.add_task_update(
+        db,
+        task["id"],
+        "hub",
+        "alert",
+        "Одобрение найдено СКАНИРОВАНИЕМ текста, а не сдано ревьюером, "
+        "поэтому доставку оно не открывает.\n"
+        f"Источник: {scanned.source}.\n"
+        f"Строка, принятая за вердикт: «{quoted}»\n"
+        "Если это действительно вердикт — вынесите его через ревью "
+        "(hub_submit_review) или примите решение вручную (hub_decide_task).",
+    )
+    await repo.update_task(db, task["id"], status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task["id"],
+        actor="hub",
+        payload={
+            "reason": "scanned_approval_not_a_verdict",
+            "source": scanned.source,
+            "line": quoted,
+        },
+    )
+    await db.commit()
+    await services.maybe_destroy_vast(db, task)
 
 
 async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> None:
@@ -606,6 +664,8 @@ async def _review_task_tick(db, task: dict, job: dict) -> None:
         await _deliver_approved_review(db, task)
     elif verdict == "changes_requested":
         await _request_review_fixes(db, task, updates_list)
+    elif verdict == SCANNED_APPROVAL_DEFERRED:
+        return  # already routed to a human, with the matched line quoted
     else:
         await _mark_no_clear_verdict(db, task)
 
