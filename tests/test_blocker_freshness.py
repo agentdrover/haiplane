@@ -125,7 +125,11 @@ async def test_the_boundary_is_the_LAST_submission_not_the_first(
     await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict="changes_requested", agent="reviewer"),
+        TaskReviewVerdict(
+            verdict="changes_requested",
+            agent="reviewer",
+            comments="доработать",  # #1010: возврат работы обязан назвать причину
+        ),
     )
     await _blocker(db, task_id, "Блокер между первой и второй сдачей")
     await _submit_and_approve(db, task_id)

@@ -553,6 +553,39 @@ def hierarchy_error_detail(
     return enrich_error_payload(payload)
 
 
+def changes_requested_requires_content_detail() -> dict[str, Any]:
+    """A verdict that sends work back has to say what to redo (#1010).
+
+    The next actor is whoever just called: the refusal is answered by adding a
+    sentence and resending, never by handing the task to another party. No
+    ActorHint literal says "the caller again", and the reviewer may be either
+    kind — an agent through hub_submit_review or a human through the task
+    card. So the literal is the closest one and the real constraint lives in
+    ``required_role``, the same shape self_review_forbidden_detail uses for
+    the same impossibility. Declaring it matters either way: undeclared, the
+    envelope falls back to "agent" *with a warning*, and a caller reading that
+    fallback would think the developer is on the hook for an empty verdict.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "changes_requested_requires_content",
+            "actor_hint": "agent",
+            "required_role": "reviewer",
+            "retry_by_same_caller": True,
+            "message": (
+                "changes_requested requires a reason: send at least one "
+                "finding, or a non-empty comments text"
+            ),
+            "hint": (
+                "Say what to redo — one sentence in `comments` is enough; "
+                "structured `findings` are optional. A verdict with neither "
+                "leaves the developer guessing."
+            ),
+            "suggested_tool": "hub_submit_review",
+        }
+    )
+
+
 def done_report_error_detail(
     task: dict[str, Any],
     *,

@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    changes_requested_requires_content_detail,
     claim_without_session_detail,
     done_report_error_detail,
     hierarchy_error_detail,
@@ -2190,6 +2191,12 @@ async def record_review_verdict(
     to ``running`` so the developer can fix findings or report done (#307);
     headless transitions remain with the poller. Never a completion path.
 
+    Content (#1010): ``changes_requested`` is refused without a reason —
+    either one finding or a non-empty ``comments``. The refusal happens
+    before any write, so the task stays in ``review`` and the submission
+    generation is untouched: a rejected verdict must not consume the
+    submission it was rejected on. ``approved`` carries no such requirement.
+
     Finding scope (#435): a ``changes_requested`` verdict with findings must
     include at least one ``in_scope`` finding — if everything is out of
     scope there is nothing to fix in this task, so the verdict should be
@@ -2218,6 +2225,25 @@ async def record_review_verdict(
             400,
             "no submission to review yet: the task has never been submitted for review",
         )
+
+    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
+    # came in with no findings and no comments: the task went back to running,
+    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
+    # the developer's only options were to guess or to ask the human the gate
+    # exists to spare. Every neighbouring gate already demands content — DoR
+    # refuses a task without acceptance criteria, submission refuses a branch
+    # it cannot name, delivery refuses a task without a live verdict — and
+    # this one asked for nothing. Either field satisfies it: one sentence is a
+    # reason, and demanding structured findings for "tests are red" would buy
+    # a formality. APPROVED stays free of the requirement (it is
+    # self-sufficient), which is why it is now filed under its author instead
+    # — see the principal_id passed from the web form.
+    if (
+        body.verdict.value == "changes_requested"
+        and not body.findings
+        and not body.comments.strip()
+    ):
+        raise HTTPException(422, detail=changes_requested_requires_content_detail())
 
     if body.verdict.value == "changes_requested" and body.findings:
         if all(f.scope == FindingScope.out_of_scope for f in body.findings):

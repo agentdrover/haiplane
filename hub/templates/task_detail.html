@@ -969,15 +969,41 @@
                     <div class="u-pre-wrap">{{ evidence.latest_submission_summary }}</div>
                 </details>
                 {% endif %}
-                <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack">
+                <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack" id="review-verdict-form">
                     <label class="task-action-label" for="review-comments">Review comments</label>
                     <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
                     <button class="btn btn-success task-action-btn" type="submit" name="verdict" value="approved">Approve</button>
                     <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...; клик по строке диффа добавит «@ файл:строка»)</label>
                     <textarea id="review-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: race condition in bump&#10;low: typo in docstring"></textarea>
+                    {# #1010: возврат работы обязан назвать причину. Сервер откажет
+                       в любом случае — это подсказка ДО отправки, чтобы человек не
+                       узнавал о требовании из ошибки после заполнения формы. #}
+                    <p class="task-action-note" id="review-cr-hint" hidden role="alert">
+                        «Request Changes» вернёт работу исполнителю — напишите, что
+                        править: одной строки в комментариях достаточно, находки
+                        необязательны.
+                    </p>
                     <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
                 </form>
                 <script>
+                // #1010: не пускаем пустой «Request Changes» дальше формы.
+                // Сервер отказывает независимо от этого — здесь только чтобы
+                // требование встретило ревьюера там, где он печатает.
+                document.addEventListener('submit', function (event) {
+                    var form = event.target.closest('#review-verdict-form');
+                    if (!form) return;
+                    var submitter = event.submitter;
+                    if (!submitter || submitter.value !== 'changes_requested') return;
+                    var comments = form.querySelector('#review-comments');
+                    var findings = form.querySelector('#review-findings');
+                    var filled = (comments && comments.value.trim())
+                        || (findings && findings.value.trim());
+                    if (filled) return;
+                    event.preventDefault();
+                    var hint = document.getElementById('review-cr-hint');
+                    if (hint) hint.hidden = false;
+                    if (comments) comments.focus();
+                });
                 document.addEventListener('click', function (event) {
                     var line = event.target.closest('.task-diff-line--anchorable');
                     if (!line) return;

@@ -2655,7 +2655,13 @@ async def test_new_independent_verdict_clears_self_approved_mark(
     await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="dev-agent"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="dev-agent",
+            # #1010: sending work back needs a reason; the subject here is the
+            # self-approved mark, so any reason will do — but not none.
+            comments="исправьте гонку в bump",
+        ),
         self_approved=True,
     )
 
@@ -3375,7 +3381,11 @@ async def test_stale_approval_does_not_complete_after_resubmission(
     await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     await services.add_update(
         db,
@@ -4024,7 +4034,11 @@ async def test_verdict_blocked_in_require_mode(db: aiosqlite.Connection, monkeyp
     rejected = await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     assert rejected.review_verdict == ReviewVerdict.changes_requested
     # возвращаем задачу в review для продолжения сценария
@@ -4615,7 +4629,11 @@ async def test_ac_tests_gate_require_allows_changes_requested_when_red(db, monke
     view = await services.record_review_verdict(
         db,
         task_id,
-        TaskReviewVerdict(verdict=ReviewVerdict.changes_requested, agent="reviewer"),
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="исправьте находки",  # #1010: a verdict must say what to redo
+        ),
     )
     assert view.review_verdict == ReviewVerdict.changes_requested
 
