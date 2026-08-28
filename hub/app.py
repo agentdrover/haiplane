@@ -337,7 +337,7 @@ def _reject_agent_authored_source(request: Request, source: TaskSource) -> None:
     ``source=agent`` stays open to agents: that is the path hub_propose_task
     itself takes.
     """
-    if source != TaskSource.agent and current_identity(request).is_agent:
+    if source != TaskSource.agent and not current_identity(request).is_human:
         raise HTTPException(403, detail=agent_create_forbidden_detail())
 
 
@@ -378,7 +378,7 @@ async def _chat_pair_issuer(request: Request) -> int:
     make the operator's browser burn their live code.
     """
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
 
     if _extract_bearer(request) is None:
@@ -656,10 +656,12 @@ async def api_create_project(
     db = _db(request)
     import json as _json
 
-    if identity.is_agent and config.ALLOW_AGENT_PROJECTS != "direct":
-        status_value = "pending"
-    else:
+    if identity.is_human or (
+        identity.is_agent and config.ALLOW_AGENT_PROJECTS == "direct"
+    ):
         status_value = "active"
+    else:
+        status_value = "pending"
     # Write lock serializes check-then-insert: two concurrent creates with the
     # same slug would otherwise both pass the SELECT and the second INSERT
     # would surface as IntegrityError → 500 instead of the promised 409.
@@ -932,7 +934,7 @@ async def api_create_skill(
     import json as _json
 
     db = _db(request)
-    status_value = "draft" if identity.is_agent else "active"
+    status_value = "active" if identity.is_human else "draft"
     skill_id, version = await repo.create_skill_version(
         db,
         name=body.name,
@@ -2112,6 +2114,30 @@ async def api_ci_run_report(
     return CIRunReportResult(**result)
 
 
+@app.get("/api/tasks/{task_id}/steward-evidence")
+async def api_steward_evidence(
+    task_id: int,
+    _identity=Depends(require_permission("steward.evidence.read")),
+):
+    """Read the evidence pack. Assembly is #996; this task only names the door."""
+    raise HTTPException(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        f"steward evidence pack for task {task_id} is assembled in #996",
+    )
+
+
+@app.post("/api/tasks/{task_id}/steward-judgement")
+async def api_steward_judgement(
+    task_id: int,
+    _identity=Depends(require_permission("steward.judgement.write")),
+):
+    """Write a judgement. Contract is #1022; this task only names the door."""
+    raise HTTPException(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        f"steward judgement for task {task_id} is #1022",
+    )
+
+
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
 async def api_review_brief(
     task_id: int,
@@ -2390,7 +2416,7 @@ async def api_inbox(
             agent=identity.username,
             principal_id=identity.principal_id,
             session_id=session_id,
-            is_human=not identity.is_agent,
+            is_human=identity.is_human,
             limit=limit,
         )
     return await services.inbox(

@@ -317,11 +317,22 @@ CHAT_PAIR_IMPLEMENTER_PERMS: frozenset[str] = frozenset(
     }
 )
 
+# Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
+# Those four include create/refine/update and would let the steward write the
+# statement it then judges. Deny-by-default lives in hub/auth.py; these strings
+# are what the two allowed routes ask for.
+STEWARD_PERMS: frozenset[str] = frozenset(
+    {
+        "steward.evidence.read",
+        "steward.judgement.write",
+    }
+)
+
 
 class TokenIdentity:
     """Authenticated identity resolved from a token or DB principal.
 
-    For env-token identities: role is 'human', 'agent', or 'admin';
+    For env-token identities: role is 'human', 'agent', 'admin', or 'steward';
     principal_id and permissions are empty.
     For DB-backed identities: principal_id is set, permissions are populated
     from role_permissions, and role is the effective legacy role.
@@ -368,13 +379,21 @@ class TokenIdentity:
         return "admin.read" in self.permissions
 
     @property
+    def is_steward(self) -> bool:
+        return self.role == "steward"
+
+    @property
     def is_human(self) -> bool:
+        if self.is_steward:
+            return False
         if self.role in ("human", "admin", "super_admin"):
             return True
         return "tasks.human_gate" in self.permissions
 
     @property
     def is_agent(self) -> bool:
+        if self.is_steward:
+            return False
         if self.role == "agent":
             return True
         return not self.is_human and bool(self.principal_id)
@@ -382,6 +401,9 @@ class TokenIdentity:
     def has_permission(self, perm: str) -> bool:
         if self.role == "super_admin":
             return True
+        if self.is_steward:
+            held = self.permissions if self.permissions else STEWARD_PERMS
+            return perm in held
         if self.permissions:
             return perm in self.permissions
         if self.role == "admin":
@@ -415,14 +437,14 @@ _AGENT_DEFAULT_PERMS = frozenset(
 )
 
 
-VALID_ROLES = frozenset({"human", "agent", "admin"})
+VALID_ROLES = frozenset({"human", "agent", "admin", "steward"})
 
 
 def parse_tokens(raw: str) -> dict[str, TokenIdentity]:
     """Parse HAIPLANE_HUB_TOKENS into a {token: TokenIdentity} mapping.
 
     Format: "name:token[:role],name2:token2[:role2]"
-    Role is optional — defaults to ``human``. Valid roles: human, agent, admin.
+    Role is optional — defaults to ``human``. Valid roles: human, agent, admin, steward.
     Whitespace tolerated. Malformed entries are skipped silently.
     """
     out: dict[str, TokenIdentity] = {}
