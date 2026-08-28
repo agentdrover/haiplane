@@ -13,7 +13,7 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from hub.models import FindingLocator, MachineReviewView
+from hub.models import FindingLocator, MachineFinding, MachineReviewView
 from hub.services.finding_identity import finding_uid, finding_uids
 
 
@@ -296,6 +296,66 @@ def test_a_placed_finding_differs_from_an_unplaced_one():
     nowhere = {"title": "t", "category": "c", "locator": "none"}
     assert len({finding_uid(placed), finding_uid(unplaced), finding_uid(nowhere)}) == 3
     assert finding_uid(placed) != finding_uid(dict(placed, start_line=200))
+
+
+def test_a_range_is_the_same_place_as_its_first_line():
+    """The extent of a finding is not part of its place (#1028).
+
+    Stated as a test because it is a DECISION, not an oversight. A reviewer
+    that says lines 40-52 and one that says line 40 are pointing at one defect
+    with different precision — the same relationship ``file`` and ``lines``
+    have, and the same reason the raw locator stayed out of the hash. Hashing
+    the end would put the id back at the mercy of how widely a harness happened
+    to draw the range on its second run, and the disposition filed against the
+    first would stop matching.
+    """
+    start_only = {
+        "title": "t",
+        "category": "c",
+        "file": "hub/app.py",
+        "locator": "lines",
+        "start_line": 40,
+    }
+    ranged = dict(start_only, end_line=52)
+    wider = dict(start_only, end_line=90)
+    assert finding_uid(start_only) == finding_uid(ranged) == finding_uid(wider)
+
+    # A range that lost its start still names a line, so it must not fall back
+    # to file level — that would silently move it to a different place.
+    end_only = {
+        "title": "t",
+        "category": "c",
+        "file": "hub/app.py",
+        "end_line": 40,
+    }
+    file_only = {"title": "t", "category": "c", "file": "hub/app.py"}
+    assert finding_uid(end_only) == finding_uid(start_only)
+    assert finding_uid(end_only) != finding_uid(file_only)
+
+
+def test_identity_reads_a_model_and_a_dict_alike():
+    """Both shapes reach this module, so both must expose the same keys.
+
+    Storage holds JSON and the API layer holds parsed models. A key the model
+    view forgets to copy is invisible only on one of the two paths — which is
+    the hardest kind of divergence to see, because every test that builds a
+    dict stays green.
+    """
+    # A legacy-shaped finding (no locator — the shape all 116 stored reports
+    # have) whose only line information is an end. It is the one payload where
+    # the model view forgetting ``end_line`` changes the answer: the dict path
+    # places it on line 40, the model path would demote it to file level.
+    payload = {
+        "title": "t",
+        "severity": "high",
+        "category": "c",
+        "file": "hub/app.py",
+        "end_line": 40,
+    }
+    assert finding_uid(MachineFinding(**payload)) == finding_uid(payload)
+    assert finding_uid(MachineFinding(**payload)) != finding_uid(
+        {"title": "t", "category": "c", "file": "hub/app.py"}
+    )
 
 
 def test_a_reworded_finding_is_a_different_id():
