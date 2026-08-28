@@ -150,6 +150,28 @@ first-pass от того, что её одобрили следом.</p>
     </tbody>
 </table>
 
+<h2>Стюард гейтов</h2>
+<p class="muted">Собственная строка <code>gate=steward</code>, не человеческий
+гейт: суждения стюарда не входят ни в числитель, ни в знаменатель override-rate
+(#1023, урок #559). <code>overridden_by_human</code> — человек изменил исход
+задачи в течение 7 дней после <code>steward_applied</code>.</p>
+<table class="task-table">
+    <thead><tr><th>Проект</th><th>Applied</th><th>Escalated</th>
+        <th>Overridden by human</th></tr></thead>
+    <tbody>
+        {% for g in m.human_gates if g.gate == 'steward' %}
+        <tr>
+            <td>{{ g.project }}</td>
+            <td>{{ g.applied }}</td>
+            <td>{{ g.escalated }}</td>
+            <td>{{ g.overridden_by_human }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="muted">нет суждений стюарда в окне</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
 <h2>By review profile</h2>
 <p class="muted">Профиль отвечает не на «что прогналось», а на то, как прогон
 устроен: lite — один проход по диффу, deep — многоагентный харнесс. Профиль

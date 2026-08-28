@@ -2812,6 +2812,15 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
             "touches": 10,
             "touches_per_delivered": 2.5,
         },
+        "human_gates": [
+            {
+                "gate": "steward",
+                "project": "default",
+                "applied": 3,
+                "escalated": 1,
+                "overridden_by_human": 1,
+            }
+        ],
         "by_harness": [],
         "recurring_categories": [
             {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
@@ -2828,6 +2837,7 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     )
     assert "1 closed run(s) with unknown usage" in text
     assert "Human touches per delivered task: 2.5 (10/4)" in text
+    assert "Steward gate: default applied 3 escalated 1 overridden_by_human 1" in text
     mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")
 
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import aiosqlite
@@ -24,6 +26,9 @@ from hub.services import workflow_seed
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
     NON_HUMAN_GATE_ACTORS,
+    STEWARD_APPLIED,
+    STEWARD_ESCALATED,
+    STEWARD_OVERRIDE_WINDOW_DAYS,
     sql_in,
 )
 from hub.services.project_policy import (
@@ -1281,7 +1286,87 @@ async def _human_gate_metrics(
             round(statistics.median(waits), 2) if waits else None
         )
         result.append(entry)
+    result.extend(_steward_gate_rows(event_rows, project_cache))
     return result
+
+
+def _event_payload(row: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _human_changed_outcome(row: Any) -> bool:
+    """A later human click that actually changed the task's outcome (#1023)."""
+    actor = (row["actor"] or "").strip()
+    if actor in NON_HUMAN_GATE_ACTORS:
+        return False
+    kind = row["kind"]
+    if kind == "task_rejected" and actor == "human":
+        return True
+    payload = _event_payload(row)
+    if kind == "review_verdict_recorded":
+        return (payload.get("verdict") or "").lower() == "changes_requested"
+    if kind == "task_decided":
+        return (payload.get("action") or "").lower() == "rework"
+    return False
+
+
+def _steward_gate_rows(
+    event_rows: list[Any], project_cache: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Own row for the steward so override-rate does not measure itself (#1023)."""
+    by_project: dict[str, dict[str, Any]] = {}
+    applied: list[Any] = []
+
+    def entry_for(project: str) -> dict[str, Any]:
+        return by_project.setdefault(
+            project,
+            {
+                "gate": "steward",
+                "project": project,
+                "applied": 0,
+                "escalated": 0,
+                "overridden_by_human": 0,
+            },
+        )
+
+    def project_of(row: Any) -> str:
+        task_id = row["task_id"]
+        if task_id is None:
+            return "default"
+        return project_cache.get(int(task_id), "default")
+
+    for row in event_rows:
+        if (row["actor"] or "").strip() != "steward":
+            continue
+        project = project_of(row)
+        if row["kind"] == STEWARD_APPLIED:
+            entry_for(project)["applied"] += 1
+            applied.append(row)
+        elif row["kind"] == STEWARD_ESCALATED:
+            entry_for(project)["escalated"] += 1
+
+    window = timedelta(days=STEWARD_OVERRIDE_WINDOW_DAYS)
+    for applied_row in applied:
+        t0 = _parse_hub_ts(applied_row["created_at"])
+        if t0 is None:
+            continue
+        deadline = t0 + window
+        task_id = applied_row["task_id"]
+        for other in event_rows:
+            if other["task_id"] != task_id:
+                continue
+            t = _parse_hub_ts(other["created_at"])
+            if t is None or t <= t0 or t > deadline:
+                continue
+            if _human_changed_outcome(other):
+                entry_for(project_of(applied_row))["overridden_by_human"] += 1
+                break
+
+    return [by_project[key] for key in sorted(by_project)]
 
 
 async def provision_project(
