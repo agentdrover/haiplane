@@ -2148,6 +2148,40 @@ def _parse_findings_form(text: str) -> list[ReviewFinding]:
     return findings
 
 
+def _verdict_refusal_text(detail: Any) -> str:
+    """Flatten a service refusal into one line for the review form (#1010).
+
+    ``enrich_error_payload`` produces a dict; a plain string is also legal.
+    The hint is what tells the reviewer how to proceed, so it is kept rather
+    than dropped in favour of the terser message.
+    """
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("reason") or "").strip()
+        hint = str(detail.get("hint") or "").strip()
+        joined = " ".join(part for part in (message, hint) if part)
+        return joined or "Вердикт отклонён."
+    return str(detail).strip() or "Вердикт отклонён."
+
+
+def _review_form_error(
+    request: Request, task_id: int, message: str
+) -> HTMLResponse | RedirectResponse:
+    """Show a review-form refusal where the reviewer was typing (#1010).
+
+    htmx swaps the note in place; a plain form post carries it back on the
+    redirect. Escaped on the htmx path because the text now includes service
+    messages, not only our own constants.
+    """
+    if _is_htmx(request):
+        return HTMLResponse(
+            f'<div class="task-action-note">{html.escape(message)}</div>',
+            status_code=422,
+        )
+    return RedirectResponse(
+        f"/tasks/{task_id}?review_error={quote(message)}", status_code=303
+    )
+
+
 @router.post("/tasks/{task_id}/web-review-verdict")
 async def web_review_verdict(
     task_id: int,
@@ -2162,6 +2196,19 @@ async def web_review_verdict(
     independence check plus the canonical record_review_verdict service —
     no web-only verdict logic. The verdict is recorded under the logged-in
     identity, not a free-text name.
+
+    #1010: that last sentence was only half true. The API route passed
+    ``principal_id`` to the service and this one did not, so a verdict
+    submitted from the card was filed anonymously — visible on task #1005,
+    whose CHANGES_REQUESTED landed with ``principal_id=null`` and
+    ``author_kind=anonymous``. It is passed here now, which also matters for
+    APPROVED: content is required of the reviewer who sends work back, so the
+    reviewer who waves it through has to at least be named.
+
+    The service can now refuse a verdict (an empty CHANGES_REQUESTED). Its
+    422 is rendered in the same note as a form validation error rather than
+    escaping as a raw error page — a human who filled the form in should see
+    the reason where they were typing.
     """
     db = _db(request)
     identity = current_identity(request)
@@ -2186,15 +2233,19 @@ async def web_review_verdict(
         first_msg = (
             errors[0].get("msg", "validation error") if errors else "validation error"
         )
-        msg = f"Invalid review form: {first_msg}"
-        if _is_htmx(request):
-            return HTMLResponse(
-                f'<div class="task-action-note">{msg}</div>', status_code=422
-            )
-        return RedirectResponse(
-            f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
+        return _review_form_error(request, task_id, f"Invalid review form: {first_msg}")
+    try:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            body,
+            self_approved=self_approved,
+            principal_id=identity.principal_id,
         )
-    await services.record_review_verdict(db, task_id, body, self_approved=self_approved)
+    except HTTPException as exc:
+        if exc.status_code != 422:
+            raise
+        return _review_form_error(request, task_id, _verdict_refusal_text(exc.detail))
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
