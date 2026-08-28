@@ -36,6 +36,10 @@
            требует навигации назад, то есть ровно той цены, которую эта
            страница снимает. #}
         <input type="hidden" name="return_to" value="queue">
+        {# Какой отчёт судят. Лестница #879 может оставить два текущих отчёта на
+           одной сдаче, и очередь показывает оба; без этого поля ответ лёг бы на
+           новейший, то есть на находку, которую никто не читал. #}
+        <input type="hidden" name="review_id" value="{{ g.review_id }}">
         <ul class="task-review-findings">
             {% for item in g.findings %}
             <li>[{{ item.f.severity }}{% if item.f.category %}/{{ item.f.category }}{% endif %}]

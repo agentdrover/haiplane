@@ -1249,13 +1249,21 @@ async def web_finding_dispositions(task_id: int, request: Request):
         if str(form.get("return_to") or "") == "queue"
         else f"/tasks/{task_id}"
     )
+    # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
+    # поле не шлёт; очередь показывает и ранний отчёт лестницы (#879), у которого
+    # та же генерация, и обязана назвать его — иначе ответ ляжет на новейший.
+    raw_review = str(form.get("review_id") or "").strip()
+    try:
+        review_id = int(raw_review) if raw_review else None
+    except ValueError:
+        raise HTTPException(400, "review_id must be a number") from None
     if not items:
         # Nothing chosen is not an error and not a judgement: the gate looked
         # and marked nothing, which must leave the report exactly as it was.
         return RedirectResponse(back, status_code=303)
     try:
         await services.record_finding_dispositions(
-            db, task_id, items, decided_by=identity.username
+            db, task_id, items, decided_by=identity.username, review_id=review_id
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -1265,7 +1273,7 @@ async def web_finding_dispositions(task_id: int, request: Request):
 
 
 @router.get("/findings", response_class=HTMLResponse)
-async def web_findings_queue(request: Request):
+async def web_findings_queue(request: Request, project: str = Query(default="")):
     """Every confirmed finding nobody has answered yet (#1038).
 
     The page exists because the JUDGEMENT was never the expensive part — the
@@ -1280,7 +1288,10 @@ async def web_findings_queue(request: Request):
     judgement would be a second thing to keep honest.
     """
     db = _db(request)
-    rows = await repo.list_unjudged_findings(db)
+    # The project narrows the query, not its result (#627). Arriving here from a
+    # board filtered to one project must not silently widen to every project.
+    project_id = await services.project_id_for(db, project or None)
+    rows = await repo.list_unjudged_findings(db, project_id=project_id)
     groups: list[dict[str, Any]] = []
     by_review: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -1312,7 +1323,7 @@ async def web_findings_queue(request: Request):
     return TEMPLATES.TemplateResponse(
         request,
         "findings_queue.html",
-        {"groups": groups, "total": total},
+        {"groups": groups, "total": total, "project": project or ""},
     )
 
 

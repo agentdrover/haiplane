@@ -28,7 +28,7 @@ from hub.services.project_policy import clone_branch_state
 log = logging.getLogger("hub")
 
 
-async def _project_id_for(db: aiosqlite.Connection, project: str | None) -> int | None:
+async def project_id_for(db: aiosqlite.Connection, project: str | None) -> int | None:
     """Resolve a project slug to its id, or None for "every project" (#627).
 
     An unknown slug resolves to a project id nothing matches rather than to
@@ -52,7 +52,7 @@ async def get_dashboard_data(
     project whose rows were not among the newest 20 of a status disappeared
     from the board entirely.
     """
-    project_id = await _project_id_for(db, project)
+    project_id = await project_id_for(db, project)
     commits_t = asyncio.create_task(plugins.github.recent_commits(8))
     prs_t = asyncio.create_task(plugins.github.open_prs())
     decisions_t = asyncio.create_task(plugins.notes.recent_decisions(limit=8))
@@ -161,7 +161,7 @@ async def get_inbox_data(
     ``project`` narrows the limited lists inside their queries (#627), for the
     same reason as get_dashboard_data.
     """
-    project_id = await _project_id_for(db, project)
+    project_id = await project_id_for(db, project)
     person: _PersonFilters = {
         "human_owner": human_owner,
         "claimed_by": claimed_by,
@@ -266,7 +266,7 @@ async def get_inbox_data(
     # confirmed findings unanswered and precision uncomputable — not because
     # judging is expensive (the form has existed since #876) but because
     # nothing led to it.
-    unjudged = await repo.count_unjudged_findings(db)
+    unjudged = await repo.count_unjudged_findings(db, project_id=project_id)
 
     return {
         "undelivered": undelivered,

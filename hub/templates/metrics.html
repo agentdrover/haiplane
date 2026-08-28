@@ -52,6 +52,7 @@ latency и размер ответов — на отдельной страни�
         <tr><td>Покрытие петли: отчётов без разметки / находок без ответа</td>
             <td>{{ m.machine_reviews.dispositions.reports_unjudged }} из {{ m.machine_reviews.reviews }}
                 / <a href="/findings">{{ m.machine_reviews.dispositions.confirmed_unjudged }} ждут суждения</a>
+                <span class="muted">за всё время</span>
                 {# #1038: число вело в никуда — чтобы разметить, надо было
                    вспомнить, у каких задач были отчёты, и открыть каждую.
                    Считается по ТЕКУЩИМ отчётам: находки пересданной генерации

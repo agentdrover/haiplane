@@ -47,8 +47,18 @@ async def record_finding_dispositions(
     items: list[FindingDispositionItem],
     *,
     decided_by: str,
+    review_id: int | None = None,
 ) -> dict[str, Any]:
     """Store the gate's judgement of the CURRENT report's confirmed findings.
+
+    ``review_id`` names WHICH report is being judged, and the queue (#1038) is
+    the first caller that has to. The ladder (#879) can leave two reports on one
+    generation, and both are current; the task card renders only the newest, so
+    "the latest report" was an unambiguous answer everywhere until a page
+    started showing the earlier one. Judging it without naming it wrote the
+    verdict onto the newest report instead — marking a finding nobody read and
+    leaving the one they did read in the queue. Omitted, the newest is still
+    used, which is what every caller written before this meant.
 
     Raises ``LookupError`` when the task or its report is missing and
     ``ValueError`` when the address points at nothing this report carries — a
@@ -61,12 +71,33 @@ async def record_finding_dispositions(
     — and the uid is what identifies the same defect in the NEXT report, where
     the position will be different.
     """
-    if await repo.get_task(db, task_id) is None:
+    task = await repo.get_task(db, task_id)
+    if task is None:
         raise LookupError(f"task #{task_id} not found")
-    row = await repo.get_latest_machine_review(db, task_id)
+    if review_id is None:
+        row = await repo.get_latest_machine_review(db, task_id)
+    else:
+        row = await repo.get_machine_review(db, review_id)
+        if row is not None and int(dict(row)["task_id"]) != task_id:
+            # Naming another task's report is not a near miss to be resolved
+            # into something reasonable — it is a judgement filed against work
+            # nobody asked about.
+            raise ValueError(
+                f"report #{review_id} belongs to task "
+                f"#{dict(row)['task_id']}, not #{task_id}"
+            )
     if row is None:
         raise LookupError(f"task #{task_id} has no machine review to judge")
     review = dict(row)
+    generation = int(dict(task).get("submission_generation") or 0)
+    if int(review["submission_generation"]) != generation:
+        # A superseded report describes code a resubmission already replaced.
+        # Storing an answer about it would put a judgement in the metrics that
+        # was never about the work as it stands.
+        raise ValueError(
+            f"report #{review['id']} is from submission "
+            f"{review['submission_generation']}, the task is on {generation}"
+        )
     try:
         confirmed = json.loads(review.get("findings_confirmed") or "[]")
     except ValueError:

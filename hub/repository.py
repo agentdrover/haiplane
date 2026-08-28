@@ -1172,6 +1172,14 @@ async def get_latest_machine_review(
     return rows[0] if rows else None
 
 
+async def get_machine_review(
+    db: aiosqlite.Connection, review_id: int
+) -> aiosqlite.Row | None:
+    """One report by id — the queue judges a NAMED report, not "the latest"."""
+    rows = await fetchall(db, "SELECT * FROM machine_reviews WHERE id=?", (review_id,))
+    return rows[0] if rows else None
+
+
 async def machine_reviews_of_generation(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> list[aiosqlite.Row]:
@@ -1304,9 +1312,31 @@ _UNJUDGED_FINDINGS_FROM = (
     "WHERE d.id IS NULL"
 )
 
+#: The project narrows the QUERY, never its result (#627 fixed this three
+#: times already). ``PROJECT_SUBTREE_CONDITION`` names a bare ``id``; here the
+#: tasks table is aliased, so the same subtree is spelled against ``t``.
+_UNJUDGED_PROJECT_CONDITION = " AND t." + PROJECT_SUBTREE_CONDITION
+
+
+def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, list[Any]]:
+    """The one place the queue's WHERE is assembled, for list and count alike."""
+    where = _UNJUDGED_FINDINGS_FROM
+    params: list[Any] = []
+    if since is not None:
+        where += " AND mr.created_at >= datetime('now', ?)"
+        params.append(since)
+    if project_id is not None:
+        where += _UNJUDGED_PROJECT_CONDITION
+        params.append(project_id)
+    return where, params
+
 
 async def list_unjudged_findings(
-    db: aiosqlite.Connection, *, since: str | None = None, limit: int | None = None
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
+    limit: int | None = None,
 ) -> list[aiosqlite.Row]:
     """Confirmed findings of CURRENT reports that nobody has answered yet.
 
@@ -1320,11 +1350,7 @@ async def list_unjudged_findings(
     ``since`` takes the same relative form as the metrics window
     ('-90 days'); omitted, the whole history answers.
     """
-    where = _UNJUDGED_FINDINGS_FROM
-    params: list[Any] = []
-    if since is not None:
-        where += " AND mr.created_at >= datetime('now', ?)"
-        params.append(since)
+    where, params = _unjudged_where(since, project_id)
     sql = (
         "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
         "t.status AS task_status, mr.id AS review_id, "
@@ -1340,7 +1366,10 @@ async def list_unjudged_findings(
 
 
 async def count_unjudged_findings(
-    db: aiosqlite.Connection, *, since: str | None = None
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
 ) -> dict[str, int]:
     """How many findings wait, and across how many reports.
 
@@ -1349,11 +1378,7 @@ async def count_unjudged_findings(
     it are the same question, and answering it twice is how the two start
     disagreeing.
     """
-    where = _UNJUDGED_FINDINGS_FROM
-    params: list[Any] = []
-    if since is not None:
-        where += " AND mr.created_at >= datetime('now', ?)"
-        params.append(since)
+    where, params = _unjudged_where(since, project_id)
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS findings, "  # nosec B608 - constant fragment

@@ -15,7 +15,13 @@ import json
 import aiosqlite
 from httpx import AsyncClient
 
-from hub.repository import count_unjudged_findings, list_unjudged_findings
+from hub.repository import (
+    count_unjudged_findings,
+    list_finding_dispositions,
+    list_unjudged_findings,
+)
+from hub.services.finding_disposition import record_finding_dispositions
+from hub.models import FindingDisposition, FindingDispositionItem
 from hub.services.orchestration import practice_metrics
 
 
@@ -180,3 +186,153 @@ async def test_the_queue_records_through_the_same_path(client: AsyncClient):
         "разметка из очереди возвращает в очередь, иначе цена навигации остаётся"
     )
     assert (await client.get("/findings")).text.count("утечка") == 0
+
+
+async def test_finding_text_is_escaped_on_the_queue(client: AsyncClient):
+    """Текст находки пишет агент-ревьюер, то есть это НЕДОВЕРЕННЫЙ вход.
+
+    Заголовок, деталь и путь к файлу приходят из отчёта чужой модели и попадают
+    на страницу владельца. Шаблон обязан показывать их как данные, а не как
+    разметку — то же правило, по которому пакет доказательств стюарда цитирует
+    входы, а не исполняет их.
+    """
+    resp = await client.post("/api/tasks", json={"title": "Escaping task"})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "grok-4.6",
+            "raw_count": 1,
+            "findings_confirmed": [
+                {
+                    "locator": "none",
+                    "title": "<script>alert(1)</script>",
+                    "severity": "high",
+                    "detail": "<img src=x onerror=alert(2)>",
+                }
+            ],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "reviewer",
+        },
+    )
+
+    page = (await client.get("/findings")).text
+    # Сверяются ТОЧНЫЕ полезные нагрузки, а не общие подстроки. Широкая проверка
+    # вроде «нет "</script>"» ловит собственный тег htmx из базового шаблона, а
+    # «нет "onerror="» — саму экранированную строку, где это слово безвредно:
+    # тег обезвреживает угловая скобка, и проверять надо именно её.
+    assert "<script>alert(1)</script>" not in page
+    assert "<img src=x onerror=alert(2)>" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page, "показан, но как текст"
+    assert "&lt;img src=x onerror=alert(2)&gt;" in page
+
+
+async def test_judging_names_the_report_it_read(db: aiosqlite.Connection):
+    """Лестница #879 оставляет ДВА текущих отчёта, и судят конкретный.
+
+    Карточка задачи рисует только новейший, поэтому «последний отчёт» был
+    однозначным ответом везде — до очереди, которая показывает и ранний. Запись
+    без указания отчёта легла бы на новейший: находка, которую никто не читал,
+    оказалась бы размечена, а прочитанная осталась бы в очереди.
+    """
+    await _task(db, 21, "completed", 1)
+    await _report(db, 50, 21, 1, [_finding("дешёвый-A")])
+    await _report(db, 51, 21, 1, [_finding("глубокий-B")])
+    await db.commit()
+
+    await record_finding_dispositions(
+        db,
+        21,
+        [
+            FindingDispositionItem(
+                finding_index=0, disposition=FindingDisposition("fixed")
+            )
+        ],
+        decided_by="denis",
+        review_id=50,
+    )
+    await db.commit()
+
+    assert [
+        dict(r)["finding_index"] for r in await list_finding_dispositions(db, 50)
+    ] == [0]
+    assert await list_finding_dispositions(db, 51) == [], (
+        "ответ лёг на прочитанный отчёт, а не на новейший"
+    )
+    assert _titles(await list_unjudged_findings(db)) == ["глубокий-B"]
+
+
+async def test_a_superseded_report_cannot_be_judged(db: aiosqlite.Connection):
+    """Названный устаревший отчёт — не почти-угаданный, а другой вопрос."""
+    await _task(db, 22, "completed", 2)
+    await _report(db, 60, 22, 1, [_finding("устаревшая")])
+    await _report(db, 61, 22, 2, [_finding("живая")])
+    await db.commit()
+
+    try:
+        await record_finding_dispositions(
+            db,
+            22,
+            [
+                FindingDispositionItem(
+                    finding_index=0, disposition=FindingDisposition("fixed")
+                )
+            ],
+            decided_by="denis",
+            review_id=60,
+        )
+    except ValueError as exc:
+        assert "submission" in str(exc)
+    else:  # pragma: no cover - защита от молчаливого приёма
+        raise AssertionError("разметка устаревшего отчёта принята")
+
+
+async def test_the_queue_is_narrowed_by_project(db: aiosqlite.Connection):
+    """Доска, отфильтрованная по проекту, не показывает чужие находки (#627)."""
+    await db.execute("INSERT INTO projects (id, slug, name) VALUES (1, 'alpha', 'A')")
+    await db.execute("INSERT INTO projects (id, slug, name) VALUES (2, 'beta', 'B')")
+    await _task(db, 31, "completed", 1)
+    await _task(db, 32, "completed", 1)
+    await db.execute("UPDATE tasks SET project_id=1 WHERE id=31")
+    await db.execute("UPDATE tasks SET project_id=2 WHERE id=32")
+    await _report(db, 70, 31, 1, [_finding("альфа-1")])
+    await _report(db, 71, 32, 1, [_finding("бета-1"), _finding("бета-2")])
+    await db.commit()
+
+    assert _titles(await list_unjudged_findings(db, project_id=1)) == ["альфа-1"]
+    assert (await count_unjudged_findings(db, project_id=1))["findings"] == 1
+    assert (await count_unjudged_findings(db))["findings"] == 3
+
+
+async def test_the_backlog_is_not_windowed(db: aiosqlite.Connection):
+    """Ждущая находка не истекает, и число на метриках равно длине очереди.
+
+    Precision — поток: как обернулись отчёты периода. «Сколько ждёт» — запас, и
+    находка, оставшаяся без ответа в апреле, без ответа и сегодня. Окно спрятало
+    бы ровно самые старые и развело бы счётчик со страницей, на которую он ведёт.
+    """
+    await _task(db, 41, "completed", 1)
+    await _report(db, 80, 41, 1, [_finding("древняя")])
+    await db.execute(
+        "UPDATE machine_reviews SET created_at = datetime('now', '-100 days') "
+        "WHERE id = 80"
+    )
+    await db.commit()
+
+    metrics = await practice_metrics(db, since_days=90)
+    assert len(await list_unjudged_findings(db)) == 1
+    assert metrics["machine_reviews"]["dispositions"]["confirmed_unjudged"] == 1, (
+        "находка старше окна всё ещё ждёт ответа и обязана считаться"
+    )

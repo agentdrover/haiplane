@@ -326,7 +326,14 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # totals do not know which finding they came from. The number will read
     # LOWER than before on the same data. That is the correction, not a
     # regression: it stopped counting work that does not exist.
-    unjudged = await repo.count_unjudged_findings(db, since=since)
+    # Deliberately NOT windowed, unlike every rate above it. Precision is a
+    # flow — how the reports of a period turned out — but "what is waiting" is
+    # a stock, and a backlog does not expire: a finding nobody answered in
+    # April is still unanswered today. Windowing it would hide exactly the
+    # oldest items, and it would also split this number from the queue page it
+    # links to, which shows everything. The page says "за всё время" next to it
+    # so the reader is not told a windowed number by the header.
+    unjudged = await repo.count_unjudged_findings(db)
     result["confirmed_unjudged"] = unjudged["findings"]
     result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
