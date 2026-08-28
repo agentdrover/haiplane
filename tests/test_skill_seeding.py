@@ -21,7 +21,7 @@ from hub.db import (
     fetchall,
     seed_default_skills,
 )
-from hub.repository import get_active_skill
+from hub.repository import activate_skill_version, get_active_skill
 
 OLD_TEXT = "старый текст без locator"
 
@@ -66,15 +66,51 @@ async def _served(db: aiosqlite.Connection, name: str) -> str | None:
 
 
 async def test_unedited_seed_skill_is_promoted(db: aiosqlite.Connection):
-    # AC-3: the hub replaces its OWN previous word — the version it seeded and
-    # nobody published over — so hub_get_skill serves the contract the write
-    # path actually enforces.
+    """AC-3, on the row an upgrade ACTUALLY finds.
+
+    ``activated_by`` arrives by ``ALTER TABLE ... DEFAULT ''``, so every row
+    that predates the column — which today is every row in production — carries
+    an EMPTY value, not ``'seed'``. A suite that only ever sets ``'seed'``
+    leaves the one input the library really holds untested: narrowing the
+    predicate to ``activated_by == 'seed'`` keeps such a suite green while the
+    hub goes on serving the July contract and the write path goes on answering
+    422 (#1035).
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_the_hubs_own_published_version_is_replaced(db: aiosqlite.Connection):
+    """The other half: a row the seed itself published, on a later upgrade."""
     await _install(
         db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "seed")]
     )
     await seed_default_skills(db)
 
     assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_only_one_version_stays_live(db: aiosqlite.Connection):
+    """A revert of the shipped text has to take effect, so it must be served.
+
+    ``get_active_skill`` serves the HIGHEST active version. If each upgrade
+    left its predecessor active, reverting the constant would re-activate an
+    older version while the reverted-away text kept winning on version number —
+    permanently. The hub's own previous word steps back to a draft; a person's
+    never does.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
+    await seed_default_skills(db)
+
+    live = [
+        v
+        for v in await _versions(db, "machine-review-cycle")
+        if v["status"] == "active"
+    ]
+    assert len(live) == 1, f"exactly one live version, got {len(live)}"
+    assert live[0]["content"] == MACHINE_REVIEW_CYCLE_SKILL
 
 
 async def test_shipped_text_waiting_as_a_draft_is_activated(db: aiosqlite.Connection):
@@ -139,9 +175,13 @@ async def test_human_activation_of_a_seeded_draft_is_respected(
     person is now standing behind. A seed keyed on authorship alone would read
     that row as its own and replace a decision it never made.
     """
-    await _install(
-        db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "denis")]
-    )
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "draft", "seed", "")])
+    # Through the real activation path, not by writing the column by hand: the
+    # column only protects a person if the code that publishes actually fills
+    # it in, and a test that stubs the value cannot tell whether it does.
+    await activate_skill_version(db, "machine-review-cycle", 1, activated_by="denis")
+    await db.commit()
+
     await seed_default_skills(db)
 
     assert await _served(db, "machine-review-cycle") == OLD_TEXT, (

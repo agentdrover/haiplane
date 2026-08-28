@@ -2567,6 +2567,23 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             await _insert_seed_skill(
                 db, name, kind, content, tags, next_version, "active"
             )
+        # And the hub's own PREVIOUS word steps back to a draft. Without this
+        # every upgrade leaves another live version behind, and since
+        # ``get_active_skill`` serves the HIGHEST active one, a revert never
+        # takes effect: reverting the constant re-activates an older version
+        # while the reverted-away text keeps winning on version number, for
+        # good. ``draft`` is the existing vocabulary for "in the library, not
+        # served" — a third status would be one this schema has never had.
+        #
+        # The WHERE clause is ``_is_seed_word`` said in SQL, deliberately: it
+        # must be impossible for this statement to demote a row a person
+        # published, and the safest way to say that is to spell the same
+        # condition the branch above was chosen by.
+        await db.execute(
+            "UPDATE skills SET status='draft' WHERE name=? AND status='active' "
+            "AND content<>? AND created_by='seed' AND activated_by IN ('', 'seed')",
+            (name, content),
+        )
     await db.commit()
 
 

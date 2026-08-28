@@ -979,7 +979,7 @@ async def get_skill_version(
 
 
 async def activate_skill_version(
-    db: aiosqlite.Connection, name: str, version: int, activated_by: str = ""
+    db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
     """Publish one version, recording WHO published it (#1028).
 
@@ -988,6 +988,12 @@ async def activate_skill_version(
     row a person is now standing behind. ``seed_default_skills`` replaces only
     its own previous word, and without this field it could not tell the two
     apart — it would overrule the person on the next deploy.
+
+    ``activated_by`` is REQUIRED and keyword-only on purpose. An empty value
+    means "nobody published this", which is exactly what the seed reads as its
+    own word — so a default would let a caller who simply forgot the argument
+    hand a person's decision to the next deploy, silently and with every test
+    still green (#1035).
     """
     await db.execute(
         "UPDATE skills SET status='active', activated_by=? WHERE name=? AND version=?",
