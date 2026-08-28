@@ -211,8 +211,9 @@ def lifecycle_map_lines() -> list[str]:
         # shape of a self-review. The brief and the verdict belong to someone
         # else, and hub_submit_review refuses a verdict from the implementer.
         (
-            "Author lane: hub_submit_for_review (pair; carries branch, model, "
-            "accept_areas, wait_baseline) or hub_report_done — either is a "
+            "Author lane: hub_submit_for_review (pair; takes branch, model, "
+            "accept_areas, and hands back a wait_baseline) or hub_report_done "
+            "— either is a "
             "submission while no current APPROVED review exists. Then wait "
             "(awaiting=review). After APPROVED puts the task back in running: "
             "hub_report_done → completed."
