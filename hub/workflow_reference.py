@@ -202,9 +202,25 @@ def lifecycle_map_lines() -> list[str]:
             "Gates: DoR at draft (hub_approve_task, human); "
             "CI at ci_check (poller); "
             "Review — Universal Review Gate: no completed without a current "
-            "APPROVED review (hub_submit_for_review → hub_get_review_brief → "
-            "hub_submit_review; auto_review=false is the explicit opt-out); "
+            "APPROVED review (auto_review=false is the explicit opt-out); "
             "Decision at needs_decision (hub_decide_task, human)."
+        ),
+        # Two actors, not one chain (#988). The gate line above used to read
+        # "hub_submit_for_review → hub_get_review_brief → hub_submit_review",
+        # which is a four-step recipe for the submitting agent — i.e. the
+        # shape of a self-review. The brief and the verdict belong to someone
+        # else, and hub_submit_review refuses a verdict from the implementer.
+        (
+            "Author lane: hub_submit_for_review (pair; carries branch, model, "
+            "accept_areas, wait_baseline) or hub_report_done — either is a "
+            "submission while no current APPROVED review exists. Then wait "
+            "(awaiting=review). After APPROVED puts the task back in running: "
+            "hub_report_done → completed."
+        ),
+        (
+            "Reviewer lane, NOT the assigned agent: hub_get_review_brief → "
+            "hub_submit_review. A verdict from the task's own implementer is "
+            "refused."
         ),
         f"Agent completion: {AGENT_COMPLETION_TOOL} only (hub_task_update kind=done = deprecated alias).",
         f"Human-only: {', '.join(HUMAN_ONLY_TOOLS)}.",
@@ -221,30 +237,22 @@ def lifecycle_map_lines() -> list[str]:
 
 
 def mcp_workflow_instruction_section() -> str:
-    """Enriched workflow section for MCP server instructions (<4KB total with base)."""
-    ref = workflow_reference_dict()
-    hierarchy = ref["hierarchy"]
-    hierarchy_text = "; ".join(
-        f"{edge['child']} parent={edge['parent'] or 'none'}" for edge in hierarchy
-    )
-    gate_bits = [
-        f"DoR→{ref['gates']['dor']['tool']} ({ref['gates']['dor']['actor']})",
-        f"CI→ci_check ({ref['gates']['ci']['actor']})",
-        "Review→hub_submit_review (agent; no completed without current APPROVED)",
-        f"Decision→{ref['gates']['decision']['tool']} ({ref['gates']['decision']['actor']})",
-    ]
-    transition_bits = [
-        f"{t['from']}→{t['to']} via {t['tool']} ({t['actor']})"
-        for t in LIFECYCLE_TRANSITIONS[:10]
-    ]
+    """A pointer to the lifecycle map, not a second copy of it (#988).
+
+    The instruction used to carry the hierarchy, the gate list and ten
+    from→to→tool transitions — all of which hub_my_context(mode=full) already
+    prints under "Workflow reference". Every session paid for the same map
+    twice, and a client that repeats server instructions per tool paid for it
+    once per tool. What stays here is what a caller cannot look up without
+    already knowing where to look: where the map lives, and that review has
+    two actors.
+    """
     return (
-        " Hierarchy (HIERARCHY_RULES): "
-        + hierarchy_text
-        + ". Gates: "
-        + "; ".join(gate_bits)
-        + ". Key transitions: "
-        + "; ".join(transition_bits)
-        + ". Full transition list is in hub_my_context (mode=full) Workflow reference section."
+        " Lifecycle map — hierarchy, gates and the full transition list: "
+        "hub_my_context(mode=full), section 'Workflow reference'. "
+        "Review is two actors: the author submits (hub_submit_for_review or "
+        "hub_report_done) and waits; a DIFFERENT agent runs "
+        "hub_get_review_brief and hub_submit_review."
     )
 
 
