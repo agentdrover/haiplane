@@ -1000,14 +1000,15 @@ async def insert_machine_review(
     lost_dimensions: str = "[]",
     profile: str = "",
     self_reviewed: bool = False,
+    principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1027,6 +1028,7 @@ async def insert_machine_review(
             lost_dimensions,
             profile,
             int(self_reviewed),
+            principal_id,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1113,18 +1115,33 @@ async def upsert_finding_disposition(
     disposition: str,
     note: str,
     decided_by: str,
+    finding_uid: str,
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert on (review_id, finding_index): a gate revisiting its own judgement
-    corrects it instead of leaving two contradictory rows for the metrics to
-    average.
+    Upsert stays on (review_id, finding_index), and that is correct rather than
+    legacy: a stored report is IMMUTABLE. ``findings_confirmed`` is written once
+    by ``insert_machine_review`` and never rewritten, and a resubmission files a
+    NEW report with its own id and its own judgements — so inside one report a
+    slot names one finding for good. A gate revisiting its own call corrects
+    that row instead of stacking a contradictory one beside it.
+
+    What the slot cannot do is carry identity ACROSS reports, which is why
+    ``finding_uid`` is stored beside it (#1007): the same defect in the next
+    generation has a different position and the same id.
+
+    ``finding_uid`` is required and has no default: an empty one used to be
+    accepted and then written over an id already computed — the silent
+    substitution #549 exists to prevent. Rows filed before the column exists
+    keep their empty id; nothing back-fills them.
     """
     await db.execute(
         "INSERT INTO finding_dispositions (review_id, task_id, "
-        "submission_generation, finding_index, finding_title, disposition, "
-        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "submission_generation, finding_index, finding_uid, finding_title, "
+        "disposition, note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "finding_uid=excluded.finding_uid, "
+        "finding_title=excluded.finding_title, "
         "disposition=excluded.disposition, note=excluded.note, "
         "decided_by=excluded.decided_by, decided_at=datetime('now')",
         (
@@ -1132,6 +1149,7 @@ async def upsert_finding_disposition(
             task_id,
             submission_generation,
             finding_index,
+            finding_uid,
             finding_title,
             disposition,
             note,
@@ -1899,12 +1917,22 @@ async def create_review_dispatch(
     run_id: str,
     model: str,
     profile: str = "",
+    reviewer_principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches "
-        "(task_id, submission_generation, agent_id, run_id, model, profile) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, submission_generation, agent_id, run_id, model, profile),
+        "(task_id, submission_generation, agent_id, run_id, model, profile, "
+        "reviewer_principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            agent_id,
+            run_id,
+            model,
+            profile,
+            reviewer_principal_id,
+        ),
     )
     return inserted_id(cur)
 
@@ -2019,6 +2047,20 @@ async def set_review_dispatch_status(
 ) -> None:
     await db.execute(
         "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+async def set_review_dispatch_provider_tokens(
+    db: aiosqlite.Connection, dispatch_id: int, tokens: int
+) -> None:
+    """Record what the provider billed for this dispatched run (#1026).
+
+    Lives on the dispatch because a failed run has no machine_review row.
+    NULL on the column (never written) is "unknown"; 0 is a real zero.
+    """
+    await db.execute(
+        "UPDATE review_dispatches SET provider_tokens = ? WHERE id = ?",
+        (tokens, dispatch_id),
     )
 
 
@@ -3461,6 +3503,7 @@ MCP_CALL_EVENT_COLUMNS: tuple[str, ...] = (
     "latency_ms",
     "response_chars",
     "task_id",
+    "unknown_arg_count",
 )
 
 
@@ -3476,6 +3519,7 @@ async def insert_mcp_call_event(
     latency_ms: int,
     response_chars: int,
     task_id: int | None,
+    unknown_arg_count: int = 0,
 ) -> int:
     """Append one call record. One INSERT, no read-back, no aggregation.
 
@@ -3486,8 +3530,8 @@ async def insert_mcp_call_event(
     cur = await db.execute(
         "INSERT INTO mcp_call_events "
         "(tool, profile, principal_id, principal_role, status, error_reason, "
-        " latency_ms, response_chars, task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " latency_ms, response_chars, task_id, unknown_arg_count) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             tool,
             profile,
@@ -3498,6 +3542,7 @@ async def insert_mcp_call_event(
             latency_ms,
             response_chars,
             task_id,
+            max(0, int(unknown_arg_count)),
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]

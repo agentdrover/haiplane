@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    changes_requested_requires_content_detail,
     claim_without_session_detail,
     done_report_error_detail,
     hierarchy_error_detail,
@@ -88,6 +89,7 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
+    apply_live_worktree,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -659,7 +661,7 @@ async def enrich_task_view(
             id=project_row["id"], slug=project_row["slug"]
         )
 
-    return task_view
+    return await apply_live_worktree(db, task_view)
 
 
 @dataclass(frozen=True)
@@ -2190,6 +2192,12 @@ async def record_review_verdict(
     to ``running`` so the developer can fix findings or report done (#307);
     headless transitions remain with the poller. Never a completion path.
 
+    Content (#1010): ``changes_requested`` is refused without a reason —
+    either one finding or a non-empty ``comments``. The refusal happens
+    before any write, so the task stays in ``review`` and the submission
+    generation is untouched: a rejected verdict must not consume the
+    submission it was rejected on. ``approved`` carries no such requirement.
+
     Finding scope (#435): a ``changes_requested`` verdict with findings must
     include at least one ``in_scope`` finding — if everything is out of
     scope there is nothing to fix in this task, so the verdict should be
@@ -2218,6 +2226,25 @@ async def record_review_verdict(
             400,
             "no submission to review yet: the task has never been submitted for review",
         )
+
+    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
+    # came in with no findings and no comments: the task went back to running,
+    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
+    # the developer's only options were to guess or to ask the human the gate
+    # exists to spare. Every neighbouring gate already demands content — DoR
+    # refuses a task without acceptance criteria, submission refuses a branch
+    # it cannot name, delivery refuses a task without a live verdict — and
+    # this one asked for nothing. Either field satisfies it: one sentence is a
+    # reason, and demanding structured findings for "tests are red" would buy
+    # a formality. APPROVED stays free of the requirement (it is
+    # self-sufficient), which is why it is now filed under its author instead
+    # — see the principal_id passed from the web form.
+    if (
+        body.verdict.value == "changes_requested"
+        and not body.findings
+        and not body.comments.strip()
+    ):
+        raise HTTPException(422, detail=changes_requested_requires_content_detail())
 
     if body.verdict.value == "changes_requested" and body.findings:
         if all(f.scope == FindingScope.out_of_scope for f in body.findings):
@@ -2294,6 +2321,30 @@ async def record_review_verdict(
             elif current_tip != pinned_sha:
                 diverged_tip = current_tip
 
+    # #1012: the other thing an approval can quietly override. The report is
+    # already bound to a submission and already knows whether the gate judged
+    # its findings; what was missing is anyone saying so at the moment the
+    # verdict is written. Read here, next to the sha check, for the same
+    # reason: both are questions about what the approver may not have seen,
+    # and neither may hold the write lock while it answers.
+    undisposed_note = ""
+    if body.verdict.value == "approved":
+        from hub.services.review_evidence import (
+            attach_dispositions,
+            undisposed_confirmed,
+        )
+        from hub.services.review_evidence import undisposed_note as _undisposed_note
+        from hub.models import MachineReviewView
+
+        mr_row = await repo.get_latest_machine_review(db, task_id)
+        if mr_row is not None:
+            mr_view = MachineReviewView(**dict(mr_row))
+            mr_view.is_current = mr_view.submission_generation == (
+                task.get("submission_generation") or 0
+            )
+            await attach_dispositions(db, mr_view)
+            undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
     # it must run outside the verdict's write-lock critical section).
@@ -2325,6 +2376,8 @@ async def record_review_verdict(
             )
         elif sha_note:
             content += f"\n{sha_note}"
+        if undisposed_note:
+            content += f"\n{undisposed_note}"
         if self_approved:
             content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
             log.warning(
@@ -2447,6 +2500,15 @@ async def record_review_verdict(
         )
     elif sha_note:
         view.lifecycle_hint = sha_note
+    if undisposed_note:
+        # Appended, never replacing: a diverged tip and unanswered findings are
+        # two different things the approver may not have seen, and dropping one
+        # to make room for the other is how a warning becomes decorative.
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{undisposed_note}"
+            if view.lifecycle_hint
+            else undisposed_note
+        )
     return view
 
 

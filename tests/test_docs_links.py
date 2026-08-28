@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -52,7 +53,13 @@ def test_no_links_to_removed_internal_docs():
     them is a dangling pointer: a reader following one lands on nothing.
     """
     removed = (
-        "docs/issues/",
+        # NOT the whole docs/issues/ directory: the steward spec (#1002) is a
+        # deliberate repository deliverable that lives there and is cited on
+        # purpose. Only the per-task working papers left.
+        "chat-pair-implementer-path",
+        "task-237-branch-policy-resolver",
+        "task-961-chat-pair",
+        "task-979-chat-pair-implementer",
         "admin-section-design",
         "admin-ui-functional-spec",
         "software-development-workflow-implementation-plan",
@@ -108,3 +115,17 @@ def test_implementer_allowlist_stays_pinned():
         ("POST", "/api/auth/chat-pair/redeem"),
         ("POST", "/api/auth/chat-pair/revoke"),
     }
+
+
+def test_steward_spec_links_resolve():
+    # #1002: the steward spec cites hub modules by relative path so a reader can
+    # check every claim it makes about the code. A moved or renamed module must
+    # break this suite rather than leave the document quietly pointing at
+    # nothing — the citations are the reason to trust it.
+    spec = REPO_ROOT / "docs" / "issues" / "steward-agent.md"
+    assert spec.is_file()
+    text = spec.read_text(encoding="utf-8")
+    targets = re.findall(r"\]\((\.\./\.\./[^)#\s]+)\)", text)
+    assert targets, "spec cites no repository files at all"
+    for rel in targets:
+        assert (spec.parent / rel).resolve().is_file(), f"broken link: {rel}"

@@ -353,6 +353,9 @@ class NoopGitOps:
     def worktree_path(self, task_id: int, repo: str | None = None) -> str:
         return ""
 
+    async def worktree_is_registered(self, path: str, repo: str | None = None) -> bool:
+        return False
+
     async def pair_prepare_worktree(
         self,
         task_id: int,

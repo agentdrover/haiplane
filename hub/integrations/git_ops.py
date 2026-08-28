@@ -1431,6 +1431,10 @@ class GitOpsIntegration:
         """Deterministic worktree path for a task (#459); where its branch lives."""
         return _worktree_path(task_id, repo or _repo_root())
 
+    async def worktree_is_registered(self, path: str, repo: str | None = None) -> bool:
+        """True when ``path`` is a registered worktree of ``repo`` (#989)."""
+        return await _worktree_registered(path, repo or _repo_root())
+
     async def pair_prepare_worktree(
         self,
         task_id: int,
@@ -2276,6 +2280,7 @@ class GitOpsIntegration:
         so this compares them directly rather than counting what the graph
         happens to contain.
         """
+        base = _resolve_base(base)
         # The clone may be behind, and the question is about upstream, not
         # about this checkout — so refresh the two ends first. A fetch that
         # fails is not fatal: the local refs may still answer, and only a
@@ -2288,7 +2293,19 @@ class GitOpsIntegration:
             repo=repo,
             check=False,
         )
-        for left, right in ((f"origin/{base}", f"origin/{head}"), (base, head)):
+        # Order matters, and it was learned the hard way (#991 review round 2).
+        # The done pipeline asks this BEFORE pushing, so origin/<head> does not
+        # exist yet and the first pair cannot answer. The second pair is the one
+        # that does: a local branch against the base as it stands UPSTREAM. The
+        # local base is asked last and only as a fallback, because it drifts —
+        # in a per-task worktree it may not be checked out at all, and in a
+        # clone it may be stale or already carry the task's commits, which is
+        # how "nothing to deliver" gets said about work that never shipped.
+        for left, right in (
+            (f"origin/{base}", f"origin/{head}"),
+            (f"origin/{base}", head),
+            (base, head),
+        ):
             rc, _, _ = await _git(
                 "diff", "--quiet", left, right, repo=repo, check=False
             )

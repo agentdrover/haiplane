@@ -19,6 +19,12 @@ from hub.services.delivery_state import (
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
+from hub.services.finding_identity import (
+    finding_uid,
+    finding_uids,
+    refuse_supplied_uid,
+    require_locator_decision,
+)
 from hub.services.live_check import (
     list_checks,
     live_check_view,
@@ -133,6 +139,8 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     project_git_context,
     provision_project,
+    apply_live_worktree,
+    worktree_session_advisory,
     restore_pair_workspace_base,
     review_budget_exhausted,
     scan_text_for_verdict,
@@ -158,6 +166,7 @@ __all__ = [
     "add_risk",
     "add_update",
     "addressable_refs",
+    "apply_live_worktree",
     "delete_acceptance_criterion",
     "get_agent_sessions_panel",
     "get_message_threads_panel",
@@ -171,6 +180,10 @@ __all__ = [
     "live_check_view",
     "record_category_check",
     "record_finding_dispositions",
+    "finding_uid",
+    "finding_uids",
+    "refuse_supplied_uid",
+    "require_locator_decision",
     "message_event_is_addressed",
     "message_view",
     "note_session_task",
@@ -257,4 +270,5 @@ __all__ = [
     "transition_after_agent_done",
     "unarchive_task",
     "withdraw_own_draft",
+    "worktree_session_advisory",
 ]

@@ -63,6 +63,23 @@ class ReviewSeverity(str, Enum):
     low = "low"
 
 
+class FindingLocator(str, Enum):
+    """Where a finding sits — stated by the report, never inferred (#1007).
+
+    ``none`` is a VALUE. A harness that cannot point at a place says so and the
+    report stays usable; what must not happen is an empty ``file`` standing in
+    for that answer, because "no location" and "forgot to fill it in" would
+    then look identical. Same rule the neighbouring keys got in #549.
+
+    ``file`` exists because the middle case is real: the reviewer knows which
+    module is wrong and not which line.
+    """
+
+    lines = "lines"
+    file = "file"
+    none = "none"
+
+
 class FindingScope(str, Enum):
     """Whether a review finding belongs to the reviewed task (#435).
 
@@ -1233,6 +1250,13 @@ class TaskRefine(BaseModel):
     project: str | None = Field(default=None, max_length=60)
 
     title: str | None = Field(default=None, min_length=1, max_length=500)
+    # #1013: the statement's own text used to be the one part of it that could
+    # not be refined — writable at INSERT and nowhere after, while the title
+    # beside it was editable and even audited. Every refine that corrected a
+    # premise left the description asserting the old one, and the review brief
+    # carries that text to the reviewer. Same ceiling as at creation; the empty
+    # string is a legal value, so min_length is deliberately absent.
+    description: str | None = Field(default=None, max_length=10000)
     work_type: WorkType | None = None
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
@@ -1638,8 +1662,10 @@ class TaskView(BaseModel):
     # Pair-start git location (#975): hub prepares/restores on the hub host;
     # remote records the canonical branch name and skips host git.
     git_mode: PairGitMode = PairGitMode.hub
-    # Pair-start workspace signal (#530): set only on pair-start so an agent
-    # learns where its isolated worktree is. "" elsewhere.
+    # Pair workspace signal (#530/#989): pair-start always fills these in
+    # worktree mode. Later GET/context fill worktree_path only when that
+    # tree is still registered — not by status, and never after submit
+    # removes it or for a headless start_task that never created one.
     workspace_mode: str = ""
     worktree_path: str = ""
     claimed_by: str | None = None
@@ -1928,6 +1954,79 @@ class MachineFinding(BaseModel):
     file: str = Field("", max_length=500)
     line: int | None = Field(default=None, ge=1)
     detail: str = Field("", max_length=4000)
+    # Where the finding sits (#1007). Optional HERE so the 116 reports stored
+    # before this field existed keep loading — enforcement belongs to the write
+    # path (``require_locator_decision``), never to the read model. That split
+    # is the one #505 already drew for AC locators.
+    locator: FindingLocator | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    # The id the hub DERIVES for this finding (#1007). Filled in on reads so a
+    # caller has something to address a disposition with; refused on writes by
+    # ``refuse_supplied_uid`` — an id a harness invents is fresh randomness and
+    # would defeat the point of deriving one.
+    finding_uid: str = Field("", max_length=64)
+
+    @model_validator(mode="after")
+    def _locator_agrees_with_itself(self) -> "MachineFinding":
+        """A stated locator must match the fields around it.
+
+        Nothing is checked when ``locator`` is absent: that is a legacy row,
+        which claimed nothing and cannot be caught lying.
+        """
+        if self.locator is None:
+            return self
+        if self.locator is FindingLocator.lines:
+            if not self.file.strip():
+                raise ValueError("locator='lines' needs a file to point into")
+            start = self.start_line if self.start_line is not None else self.line
+            if start is None:
+                raise ValueError(
+                    "locator='lines' needs start_line (or the legacy 'line')"
+                )
+            if (
+                self.start_line is not None
+                and self.line is not None
+                and self.line != self.start_line
+            ):
+                raise ValueError(
+                    f"line {self.line} and start_line {self.start_line} "
+                    "disagree — a finding sits in one place, not two"
+                )
+            end = self.end_line if self.end_line is not None else start
+            if end < start:
+                raise ValueError(f"end_line {end} is before start_line {start}")
+            self.start_line = start
+            self.end_line = end
+            # Keep the legacy field in step, so a reader of either sees one
+            # number instead of two that drifted apart in storage.
+            self.line = start
+            return self
+        if self.locator is FindingLocator.file:
+            if not self.file.strip():
+                raise ValueError("locator='file' needs a file")
+            if (
+                self.start_line is not None
+                or self.end_line is not None
+                or self.line is not None
+            ):
+                raise ValueError(
+                    "locator='file' carries no lines — use 'lines' to name them"
+                )
+            return self
+        # none: the report says it cannot place this finding, so a place
+        # alongside that answer is a contradiction, not extra detail.
+        if (
+            self.file.strip()
+            or self.start_line is not None
+            or self.end_line is not None
+            or self.line is not None
+        ):
+            raise ValueError(
+                "locator='none' means no place is known — drop file/line or "
+                "state 'file'/'lines' instead"
+            )
+        return self
 
 
 class MachineRejectedFinding(BaseModel):
@@ -2140,13 +2239,39 @@ class FindingDisposition(str, Enum):
 
 
 class FindingDispositionItem(BaseModel):
-    """One judged finding, addressed by its position in findings_confirmed."""
+    """One judged finding, addressed by ``finding_uid`` (#1007).
+
+    ``finding_index`` stays accepted because a position is what callers had
+    before uids existed, but it addresses a SLOT, not a finding: a resubmitted
+    report shifts every position at once, so a judgement filed by index can end
+    up describing its neighbour. New callers send the uid.
+
+    Exactly one of the two: sending both invites them to disagree, and the hub
+    would have to pick a winner nobody asked it to pick.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    finding_index: int = Field(..., ge=0)
+    finding_uid: str = Field("", max_length=64)
+    finding_index: int | None = Field(default=None, ge=0)
     disposition: FindingDisposition
     note: str = Field("", max_length=1000)
+
+    @model_validator(mode="after")
+    def _addressed_exactly_once(self) -> "FindingDispositionItem":
+        # Normalised once, here: the resolver tested the raw string while this
+        # tested the stripped one, so "  <uid>  " passed the schema and then
+        # failed to resolve against the report.
+        self.finding_uid = self.finding_uid.strip()
+        has_uid = bool(self.finding_uid)
+        has_index = self.finding_index is not None
+        if has_uid and has_index:
+            raise ValueError(
+                "address the finding by finding_uid OR finding_index, not both"
+            )
+        if not has_uid and not has_index:
+            raise ValueError("finding_uid is required (finding_index is legacy)")
+        return self
 
 
 class FindingDispositionsSubmit(BaseModel):
@@ -2161,6 +2286,9 @@ class FindingDispositionView(BaseModel):
     """A stored disposition, as the card and the brief read it back."""
 
     finding_index: int
+    # Empty for rows judged before uids existed (#1007) — those are readable
+    # by position and title, which is exactly what they were filed with.
+    finding_uid: str = ""
     finding_title: str = ""
     disposition: FindingDisposition
     note: str = ""
@@ -2211,6 +2339,23 @@ class MachineReviewView(BaseModel):
     @classmethod
     def _mr_iso_ts(cls, v: str | None) -> str | None:
         return to_iso_utc(v)
+
+    @model_validator(mode="after")
+    def _stamp_finding_uids(self) -> "MachineReviewView":
+        """Hand every confirmed finding the id the hub derives for it (#1007).
+
+        Stamped on the way OUT rather than stored: the id is a function of the
+        finding's content, and a stored copy could drift from the content it
+        claims to identify. Every reader — card, brief, API, MCP — therefore
+        gets the id from the same place the resolver will compute it.
+        """
+        from hub.services.finding_identity import finding_uids
+
+        for finding, uid in zip(
+            self.findings_confirmed, finding_uids(self.findings_confirmed)
+        ):
+            finding.finding_uid = uid
+        return self
 
     @field_validator(
         "findings_confirmed",

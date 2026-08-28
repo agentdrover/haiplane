@@ -957,6 +957,90 @@ async def test_chat_pair_page_copy_stays_intake(hub):
 
 
 # ---------------------------------------------------------------------------
+# #990: task-card GET must not rotate the shared CSRF cookie
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_second_task_card_get_does_not_invalidate_implementer_form(hub):
+    """#990 AC-1: a later task-card GET must not 403 the original form token."""
+    await _browser_human(hub)
+    first_id = await _make_task(hub)
+    other_id = await _make_task(hub)
+
+    page = await hub.client.get(f"/tasks/{first_id}", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    csrf = page.cookies.get(CSRF_COOKIE_NAME)
+    assert csrf
+
+    later = await hub.client.get(f"/tasks/{other_id}", headers={"Accept": "text/html"})
+    assert later.status_code == 200, later.text
+    assert later.cookies.get(CSRF_COOKIE_NAME) == csrf
+
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    issued = await hub.client.post(
+        f"/tasks/{first_id}/web-implementer-start",
+        data={"csrf_token": csrf},
+        headers={"Accept": "text/html"},
+        follow_redirects=True,
+    )
+    assert issued.status_code == 200, issued.text
+    assert "Форма устарела" not in issued.text
+    assert "AH-" in issued.text
+
+
+@pytest.mark.asyncio
+async def test_task_card_get_does_not_invalidate_chat_pair_form(hub):
+    """#990 AC-2: viewing a task card must not 403 the original /chat-pair form."""
+    await _browser_human(hub)
+    task_id = await _make_task(hub)
+
+    pair = await hub.client.get("/chat-pair", headers={"Accept": "text/html"})
+    assert pair.status_code == 200, pair.text
+    csrf = pair.cookies.get(CSRF_COOKIE_NAME)
+    assert csrf
+
+    card = await hub.client.get(f"/tasks/{task_id}", headers={"Accept": "text/html"})
+    assert card.status_code == 200, card.text
+    assert card.cookies.get(CSRF_COOKIE_NAME) == csrf
+
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    issued = await hub.client.post(
+        "/chat-pair/web-start",
+        data={"csrf_token": csrf},
+        headers={"Accept": "text/html"},
+        follow_redirects=True,
+    )
+    assert issued.status_code == 200, issued.text
+    assert "Форма устарела" not in issued.text
+    assert "AH-" in issued.text
+
+
+@pytest.mark.asyncio
+async def test_implementer_start_wrong_csrf_is_403_and_inserts_nothing(hub):
+    """#990 AC-3: a mismatched CSRF token is 403 and creates no AH- row."""
+    await _browser_human(hub)
+    task_id = await _make_task(hub)
+    page = await hub.client.get(f"/tasks/{task_id}", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    csrf = page.cookies.get(CSRF_COOKIE_NAME)
+    assert csrf
+    hub.client.cookies.set(CSRF_COOKIE_NAME, csrf)
+
+    before = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    resp = await hub.client.post(
+        f"/tasks/{task_id}/web-implementer-start",
+        data={"csrf_token": "wrong"},
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403, resp.text
+    assert "AH-" not in resp.text
+    after = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    assert after == before
+
+
+# ---------------------------------------------------------------------------
 # #983 TTL: refuse renew; release bound pair task when implementer session dies
 # ---------------------------------------------------------------------------
 

@@ -834,11 +834,15 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     if task.get("status") != "review" or generation <= 0:
         return False
 
-    review = await repo.get_latest_machine_review(db, task_id)
-    if review is None:
-        return False
-    report = dict(review)
-    if report.get("submission_generation") != generation:
+    # #1025: the ladder climbs on OUR run's own declaration. A foreign
+    # incomplete report at an active dispatch must not buy a top-up — the
+    # dispatch is still waiting for its own report.
+    dispatch_row = await repo.get_review_dispatch_for_generation(
+        db, task_id, generation
+    )
+    dispatch = dict(dispatch_row) if dispatch_row is not None else None
+    report = await _dispatch_report(db, task_id, generation, dispatch)
+    if report is None:
         return False
     if not report.get("incomplete"):
         return False
@@ -1011,6 +1015,17 @@ async def maybe_dispatch_review(
         await db.commit()
         return False
 
+    # #1025: pin whose report this dispatch waits for, resolved from the
+    # reviewer token at dispatch time. An unresolved token is logged and
+    # falls back to the old task+generation match rather than blocking the
+    # dispatch — degradation is this module's contract.
+    expected_principal = await reviewer_principal_id(db)
+    if expected_principal is None:
+        log.warning(
+            "reviewer token resolves to no principal — dispatch for task #%s "
+            "matches its report by task+generation only",
+            task_id,
+        )
     await repo.create_review_dispatch(
         db,
         task_id=task_id,
@@ -1019,6 +1034,7 @@ async def maybe_dispatch_review(
         run_id=run_info.get("id") or agent_info.get("latestRunId") or "",
         model=model_id,
         profile=profile,
+        reviewer_principal_id=expected_principal,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -1075,16 +1091,88 @@ def instance_base_url() -> str:
     return instance_echo_fields().get("base_url") or "https://agenthai.ru"
 
 
-async def _current_review(
-    db: aiosqlite.Connection, task_id: int, generation: int
+async def reviewer_principal_id(db: aiosqlite.Connection) -> int | None:
+    """The principal behind CURSOR_REVIEWER_HUB_TOKEN, or None (#1025).
+
+    The same hash lookup auth performs, without its side effects. None — an
+    empty token, an env-map token, a rotated key — leaves the dispatch under
+    the old task+generation matching rule rather than inventing an identity.
+    """
+    token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
+    if not token:
+        return None
+    from hub.services.admin import hash_api_key
+
+    rows = await fetchall(
+        db,
+        "SELECT principal_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+        (hash_api_key(token),),
+    )
+    return int(dict(rows[0])["principal_id"]) if rows else None
+
+
+def _expected_principal(dispatch: dict[str, Any] | None) -> int | None:
+    """Whose report settles this dispatch, or None for the old rule (#1025).
+
+    None — a dispatch recorded before the column existed, or one whose token
+    never resolved — keeps the task+generation match: history must not change
+    its meaning retroactively.
+    """
+    if dispatch is None:
+        return None
+    raw = dispatch.get("reviewer_principal_id")
+    return int(raw) if raw is not None else None
+
+
+async def _dispatch_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    dispatch: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    row = await repo.get_latest_machine_review(db, task_id)
-    if row is None:
-        return None
-    review = dict(row)
-    if (review.get("submission_generation") or 0) != generation:
-        return None
-    return review
+    """The report THIS dispatch is waiting for, or None (#1025).
+
+    With a known reviewer principal only that principal's report counts,
+    matched by the token-derived ``principal_id`` on the row — never by
+    ``submitted_by``, which is the caller naming itself. Before this rule the
+    author's parallel report closed the hub's own dispatch as done, silenced
+    the no-report alert and fed the author's numbers to the usage
+    cross-check (#1011 gen 1: 71296 declared against 2574930 billed read as
+    a 36x discrepancy of a run that had submitted nothing).
+    """
+    expected = _expected_principal(dispatch)
+    if expected is None:
+        row = await repo.get_latest_machine_review(db, task_id)
+        if row is None:
+            return None
+        review = dict(row)
+        if (review.get("submission_generation") or 0) != generation:
+            return None
+        return review
+    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
+    own = [dict(r) for r in rows if dict(r).get("principal_id") == expected]
+    return own[-1] if own else None
+
+
+def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
+    """The billed total, or None when the provider did not answer (#1026)."""
+    total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+    if isinstance(total, int) and total >= 0:
+        return total
+    return None
+
+
+async def _stamp_dispatch_usage(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> int | None:
+    """Ask the provider what this run billed; leave NULL when unknown (#1026)."""
+    usage = await cursor_cloud.get_usage(
+        dispatch["agent_id"], dispatch["run_id"] or None
+    )
+    total = _provider_token_total(usage)
+    if total is not None:
+        await repo.set_review_dispatch_provider_tokens(db, dispatch["id"], total)
+    return total
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
@@ -1098,18 +1186,15 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
-        review = await _current_review(db, task_id, dispatch["submission_generation"])
+        review = await _dispatch_report(
+            db, task_id, dispatch["submission_generation"], dispatch
+        )
         if review is not None:
-            usage = await cursor_cloud.get_usage(
-                dispatch["agent_id"], dispatch["run_id"] or None
-            )
-            total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+            total = await _stamp_dispatch_usage(db, dispatch)
             reported = review.get("tokens_spent")
-            if isinstance(total, int) and total >= 0:
-                # #828: keep the number, not just the complaint about it. The
-                # economics of the practice were being computed from the
-                # harness's own claim; the billed figure was fetched here and
-                # dropped on the floor.
+            if total is not None:
+                # #828: keep the number on the report too so existing
+                # practice metrics over machine_reviews stay honest.
                 await repo.set_machine_review_provider_tokens(
                     db, task_id, dispatch["submission_generation"], total
                 )
@@ -1145,6 +1230,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         )
         if not grace_rows:
             continue
+        await _stamp_dispatch_usage(db, dispatch)
         await repo.add_task_update(
             db,
             task_id,

@@ -1462,6 +1462,10 @@ async def api_task_context(
         task_view.project = TaskProjectRef(
             id=project_row["id"], slug=project_row["slug"]
         )
+    # #989: /context skipped enrich_task_view, so GET filling the field
+    # was not enough — name the live pair tree on both surfaces.
+    task_view = await services.apply_live_worktree(db, task_view)
+    worktree_advisory = await services.worktree_session_advisory(db, task_view)
 
     # --- Readiness summary. Reuse the same calculator as /readiness so
     # /context and /readiness can never drift.
@@ -1508,6 +1512,10 @@ async def api_task_context(
         f"Type: {task.get('task_type', 'task')} | Status: {task['status']} "
         f"| Priority: {task.get('priority', 'medium')}"
     )
+    if task_view.worktree_path:
+        lines.append(f"Worktree: {task_view.worktree_path}")
+    if worktree_advisory:
+        lines.append(worktree_advisory)
     if progress:
         lines.append(
             f"Progress: {progress['completed']}/{progress['total']} "
@@ -1667,6 +1675,11 @@ async def api_submit_machine_review(
     # (#519). Normalised upward rather than rejected: the recorded risk asks
     # not to break existing clients, and a report with a miscounted header is
     # still worth keeping — its findings are real.
+    # Where each confirmed finding sits, before anything is stored (#1007):
+    # a report that never placed its findings cannot be matched against a diff
+    # later, and the gap is invisible once the report is in the ground.
+    services.require_locator_decision(body.findings_confirmed)
+    services.refuse_supplied_uid(body.findings_confirmed)
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
     raw_count = body.raw_count
     if raw_count < adjudicated:
@@ -1748,7 +1761,32 @@ async def api_submit_machine_review(
             ensure_ascii=False,
         ),
         lost_dimensions=_json.dumps(body.lost_dimensions, ensure_ascii=False),
+        # #1025: the report's owner as the TOKEN says, beside submitted_by
+        # which stays the caller's self-description. The dispatch sweep
+        # matches on this and on nothing self-reported.
+        principal_id=identity.principal_id,
     )
+    # #1025: a foreign report at an active dispatch is recorded loudly ONCE,
+    # here at intake — the sweep would repeat it every pass. The dispatch
+    # keeps waiting for its own run's report; before this note the collision
+    # was invisible until the usage cross-check misread it as a 36x token
+    # discrepancy (#1011 gen 1).
+    if (
+        dispatch is not None
+        and (dispatch["status"] or "") == "active"
+        and dispatch["reviewer_principal_id"] is not None
+        and identity.principal_id != dispatch["reviewer_principal_id"]
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Отчёт machine-review принят от другого принципала: по этой сдаче "
+            "уже вызвано диспетчерское ревью, и его прогон ещё не отчитался. "
+            "Диспетч продолжает ждать СВОЙ отчёт, сверка расходов по чужому "
+            "отчёту не выполняется (#1025).",
+        )
     await repo.insert_event(
         db,
         kind="machine_review_completed",
@@ -1794,6 +1832,34 @@ async def api_submit_machine_review(
                     "«чисто» не подтверждено (#750)."
                 ),
             )
+    # #1012: the hub may already have called a reviewer for this very
+    # submission. A second report is not refused — two profiles on one
+    # generation is a real shape (#879) — but it must not arrive silently:
+    # the spend reconciliation (#757) matches a report's declared tokens
+    # against the provider's usage for the dispatched run, and on 2026-08-28
+    # a hand-run report of 71296 tokens was compared with a dispatch that had
+    # spent 2574930, raising an audit alert about nobody's dishonesty.
+    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if dispatch is not None and (dispatch["agent_id"] or "").strip() not in (
+        "",
+        (body.agent or identity.username or "").strip(),
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            (
+                "Второй отчёт по этой сдаче: хаб уже вызвал ревьюера "
+                f"{dispatch['model'] or 'неизвестной модели'} "
+                f"(агент {dispatch['agent_id']}, статус {dispatch['status']}). "
+                "Отчёт принят и не заменяет первый, но сверка расходов "
+                "сопоставляет задекларированные токены с расходом "
+                "ДИСПЕТЧЕРСКОГО прогона — расхождение в алерте аудита будет "
+                "означать столкновение двух прогонов, а не чью-то нечестность "
+                "(#757, #1012)."
+            ),
+        )
     await db.commit()
     await db_module.log_activity(
         db,
