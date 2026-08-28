@@ -980,7 +980,9 @@ async def api_activate_skill(
     if row is None:
         raise HTTPException(404, "skill version not found")
     if row["status"] != "active":
-        await repo.activate_skill_version(db, name, version)
+        await repo.activate_skill_version(
+            db, name, version, activated_by=_identity.username
+        )
         await repo.insert_event(
             db,
             kind="skill_activated",

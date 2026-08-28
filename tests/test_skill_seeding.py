@@ -2,9 +2,10 @@
 
 ``hub_get_skill`` serves the ACTIVE version, so a library still teaching the
 previous contract keeps teaching it however many drafts pile up beside it. That
-is not a cosmetic gap: the write path started refusing reports without a
-locator (#1007) while the active skill still described the old shape, so every
-harness following it walked into a 422 on the whole report.
+is not a cosmetic gap: on 2026-08-28 production refused a report without a
+``locator`` (#1007) while the active ``machine-review-cycle`` was still v1 from
+July, teaching the shape that gets the 422 — every harness that honestly read
+the library walked into it.
 """
 
 from __future__ import annotations
@@ -13,8 +14,17 @@ import asyncio
 
 import aiosqlite
 
-from hub.db import MACHINE_REVIEW_CYCLE_SKILL, seed_default_skills
-from hub.db import fetchall
+from hub.db import (
+    _SCHEMA,
+    MACHINE_REVIEW_CYCLE_SKILL,
+    _migrate,
+    fetchall,
+    seed_default_skills,
+)
+import hub.db as db_module
+from hub.repository import activate_skill_version, get_active_skill
+
+OLD_TEXT = "старый текст без locator"
 
 
 async def _versions(db: aiosqlite.Connection, name: str) -> list[dict]:
@@ -22,56 +32,290 @@ async def _versions(db: aiosqlite.Connection, name: str) -> list[dict]:
         dict(r)
         for r in await fetchall(
             db,
-            "SELECT version, content, status, created_by FROM skills "
+            "SELECT version, content, status, created_by, activated_by FROM skills "
             "WHERE name=? ORDER BY version ASC",
             (name,),
         )
     ]
 
 
-async def _install_old_version(
-    db: aiosqlite.Connection, name: str, *, created_by: str
+async def _install(
+    db: aiosqlite.Connection,
+    name: str,
+    rows: list[tuple[int, str, str, str, str]],
 ) -> None:
-    """Put a stale ACTIVE version in the library, as an upgrade would find it."""
+    """Put an exact population in the library, as an upgrade would find it.
+
+    Each row is (version, content, status, created_by, activated_by). The
+    library is emptied first so the test states the whole population rather
+    than adding to whatever the fixture happened to seed.
+    """
     await db.execute("DELETE FROM skills WHERE name=?", (name,))
-    await db.execute(
-        "INSERT INTO skills (name, kind, version, content, tags, status, created_by) "
-        "VALUES (?, 'skill', 1, 'старый текст без locator', '[]', 'active', ?)",
-        (name, created_by),
-    )
+    for version, content, status, created_by, activated_by in rows:
+        await db.execute(
+            "INSERT INTO skills (name, kind, version, content, tags, status, "
+            "created_by, activated_by) VALUES (?, 'skill', ?, ?, '[]', ?, ?, ?)",
+            (name, version, content, status, created_by, activated_by),
+        )
     await db.commit()
 
 
+async def _served(db: aiosqlite.Connection, name: str) -> str | None:
+    """What ``hub_get_skill`` would return — the only answer that matters."""
+    row = await get_active_skill(db, name)
+    return None if row is None else str(row["content"])
+
+
 async def test_unedited_seed_skill_is_promoted(db: aiosqlite.Connection):
-    # AC-3: the hub replaces its OWN previous word — the version it seeded and
-    # nobody touched — so hub_get_skill serves the contract the write path
-    # actually enforces.
-    await _install_old_version(db, "machine-review-cycle", created_by="seed")
+    """AC-3, on the row an upgrade ACTUALLY finds.
+
+    ``activated_by`` arrives by ``ALTER TABLE ... DEFAULT ''``, so every row
+    that predates the column — which today is every row in production — carries
+    an EMPTY value, not ``'seed'``. A suite that only ever sets ``'seed'``
+    leaves the one input the library really holds untested: narrowing the
+    predicate to ``activated_by == 'seed'`` keeps such a suite green while the
+    hub goes on serving the July contract and the write path goes on answering
+    422 (#1035).
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
     await seed_default_skills(db)
 
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_the_hubs_own_published_version_is_replaced(db: aiosqlite.Connection):
+    """The other half: a row the seed itself published, on a later upgrade."""
+    await _install(
+        db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "seed")]
+    )
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_only_one_version_stays_live(db: aiosqlite.Connection):
+    """A revert of the shipped text has to take effect, so it must be served.
+
+    ``get_active_skill`` serves the HIGHEST active version. If each upgrade
+    left its predecessor active, reverting the constant would re-activate an
+    older version while the reverted-away text kept winning on version number —
+    permanently. The hub's own previous word steps back to a draft; a person's
+    never does.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
+    await seed_default_skills(db)
+
+    live = [
+        v
+        for v in await _versions(db, "machine-review-cycle")
+        if v["status"] == "active"
+    ]
+    assert len(live) == 1, f"exactly one live version, got {len(live)}"
+    assert live[0]["content"] == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_shipped_text_waiting_as_a_draft_is_activated(db: aiosqlite.Connection):
+    """The state #1007 leaves behind: right text, wrong status.
+
+    This is the population the previous fix created and the one a check of the
+    form "is the shipped text present anywhere" reads as done. It is not done:
+    the library still SERVES the July contract, so the harness still collects a
+    422 on the whole report. Promotion has to look at the active row, not at
+    the set of rows.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, OLD_TEXT, "active", "seed", "seed"),
+            (2, MACHINE_REVIEW_CYCLE_SKILL, "draft", "seed", ""),
+        ],
+    )
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
     versions = await _versions(db, "machine-review-cycle")
-    assert len(versions) == 2
-    assert versions[0]["status"] == "superseded"
-    active = [v for v in versions if v["status"] == "active"]
-    assert len(active) == 1
-    assert active[0]["content"] == MACHINE_REVIEW_CYCLE_SKILL
-    assert "locator" in active[0]["content"], "the served text teaches the contract"
+    assert len(versions) == 2, "the waiting draft is promoted, not duplicated"
+
+
+async def test_no_active_version_at_all_is_published(db: aiosqlite.Connection):
+    """Nobody published anything, so nobody is being overruled.
+
+    A library holding only drafts answers 404 to ``hub_get_skill``. Treating
+    that as "an operator is mid-edit" and filing yet another draft leaves the
+    contract unreadable for as long as the hub runs.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "draft", "denis", "")])
+    assert await _served(db, "machine-review-cycle") is None
+
+    await seed_default_skills(db)
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_a_revert_is_served_even_though_its_version_is_lower(
+    db: aiosqlite.Connection,
+):
+    """The step the demote actually exists for: promote LOW while HIGH is live.
+
+    One upgrade proves nothing here — the version it inserts is the highest, so
+    it would be served with or without a demote. The failure appears on the
+    second step: reverting the constant re-activates an EARLIER version while
+    the reverted-away text keeps winning on version number, and
+    ``get_active_skill`` serves the highest active one. Without the demote the
+    library goes on serving text the code no longer contains, for good.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, MACHINE_REVIEW_CYCLE_SKILL, "draft", "seed", ""),
+            (2, "текст, который откатили", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+    versions = {
+        v["version"]: v["status"] for v in await _versions(db, "machine-review-cycle")
+    }
+    assert versions == {1: "active", 2: "draft"}, (
+        "the reverted-away version steps down, or it keeps winning on number"
+    )
+
+
+async def test_the_demote_never_touches_what_a_person_published(
+    db: aiosqlite.Connection,
+):
+    """The demote runs over a MIXED library, and only our own rows may move.
+
+    Every other test lands in a branch where the statement either does not run
+    or has nothing of a person's to hit. This one puts a human-published
+    version and a stale seed version side by side at different numbers, which
+    is the only population where the WHERE clause has to do any work.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, "версия человека", "active", "denis", "denis"),
+            (2, "прежнее слово сида", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    by_version = {v["version"]: v for v in await _versions(db, "machine-review-cycle")}
+    assert by_version[1]["status"] == "active", "a person's version is never demoted"
+    assert by_version[1]["activated_by"] == "denis"
+    assert by_version[2]["status"] == "draft", "our own previous word steps down"
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_promoting_what_a_person_published_keeps_their_signature(
+    db: aiosqlite.Connection,
+):
+    """Agreeing with a person is not the same act as replacing them.
+
+    When the shipped text is already in the library on a row a HUMAN activated,
+    the seed activates that row — and must leave their name on it. Stamping
+    'seed' would erase the only record that a person ever spoke here, and the
+    next upgrade would read the row as the hub's own and replace a decision it
+    never made. The library serves the right text either way, so nothing but
+    this assertion can tell the two apart.
+    """
+    await _install(
+        db,
+        "machine-review-cycle",
+        [
+            (1, MACHINE_REVIEW_CYCLE_SKILL, "active", "seed", "denis"),
+            (2, "прежнее слово сида", "active", "seed", "seed"),
+        ],
+    )
+    await seed_default_skills(db)
+
+    by_version = {v["version"]: v for v in await _versions(db, "machine-review-cycle")}
+    assert await _served(db, "machine-review-cycle") == MACHINE_REVIEW_CYCLE_SKILL
+    assert by_version[1]["activated_by"] == "denis", (
+        "the person who published this text keeps their name on it"
+    )
 
 
 async def test_operator_edit_is_never_overwritten(db: aiosqlite.Connection):
-    # AC-4: a version a person wrote stays active. The shipped text waits beside
-    # it as a draft — the automaton does not get to overrule a human (#380).
-    await _install_old_version(db, "machine-review-cycle", created_by="denis")
+    # AC-4: a version a person published stays active. The shipped text waits
+    # beside it as a draft — the automaton does not overrule a human (#380).
+    await _install(
+        db, "machine-review-cycle", [(1, OLD_TEXT, "active", "denis", "denis")]
+    )
     await seed_default_skills(db)
 
-    versions = await _versions(db, "machine-review-cycle")
-    assert len(versions) == 2
-    active = [v for v in versions if v["status"] == "active"]
-    assert len(active) == 1
-    assert active[0]["created_by"] == "denis"
-    assert active[0]["content"] == "старый текст без locator"
-    drafts = [v for v in versions if v["status"] == "draft"]
+    assert await _served(db, "machine-review-cycle") == OLD_TEXT
+    drafts = [
+        v for v in await _versions(db, "machine-review-cycle") if v["status"] == "draft"
+    ]
     assert drafts and drafts[0]["content"] == MACHINE_REVIEW_CYCLE_SKILL
+
+
+async def test_human_activation_of_a_seeded_draft_is_respected(
+    db: aiosqlite.Connection,
+):
+    """Authorship is not the same act as publication (#380).
+
+    Activation is a human gate, and it leaves ``created_by='seed'`` on a row a
+    person is now standing behind. A seed keyed on authorship alone would read
+    that row as its own and replace a decision it never made.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "draft", "seed", "")])
+    # Through the real activation path, not by writing the column by hand: the
+    # column only protects a person if the code that publishes actually fills
+    # it in, and a test that stubs the value cannot tell whether it does.
+    await activate_skill_version(db, "machine-review-cycle", 1, activated_by="denis")
+    await db.commit()
+
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == OLD_TEXT, (
+        "the person who published this version keeps it published"
+    )
+
+
+async def test_a_lost_version_number_never_leaves_the_library_unreadable(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Losing the INSERT must not take the only active version down with it.
+
+    ``ON CONFLICT DO NOTHING`` makes losing cheap, and the demote runs whether
+    we won or not — so a seeder that lost its version number to somebody ELSE's
+    row would step the library's only active version down and put nothing in
+    its place. ``hub_get_skill`` then answers 404 for as long as nobody
+    intervenes, which is a worse outcome than the stale text this whole
+    function exists to replace.
+
+    Reachable: an agent proposing a version through ``POST /api/skills`` files
+    a DRAFT, and it commits between this seeder's SELECT and its INSERT. The
+    row that won the version number is neither ours nor active, so nothing else
+    puts the library back.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
+
+    real_insert = db_module._insert_seed_skill
+
+    async def _lose_the_race(conn, name, kind, content, tags, version, status):
+        if name != "machine-review-cycle":
+            return await real_insert(conn, name, kind, content, tags, version, status)
+        # Somebody else took this version number a moment ago; our INSERT hits
+        # UNIQUE(name, version) and does nothing.
+        await conn.execute(
+            "INSERT INTO skills (name, kind, version, content, tags, status, "
+            "created_by, activated_by) VALUES (?, ?, ?, ?, ?, 'draft', 'agent', '')",
+            (name, kind, version, "версия, предложенная агентом", tags),
+        )
+
+    monkeypatch.setattr(db_module, "_insert_seed_skill", _lose_the_race)
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == OLD_TEXT, (
+        "the library keeps serving the stale text until a seeder actually "
+        "replaces it — it never goes dark"
+    )
 
 
 async def test_second_start_adds_nothing(db: aiosqlite.Connection):
@@ -84,19 +328,45 @@ async def test_second_start_adds_nothing(db: aiosqlite.Connection):
     assert await _versions(db, "machine-review-cycle") == before
 
 
-async def test_seeding_is_safe_on_a_parallel_start(db: aiosqlite.Connection):
-    # AC-5: two connections seeding at once compute the same next version. One
-    # loses the UNIQUE(name, version) race — and losing is fine, because the
-    # winner wrote the same text. What must not happen is a connection dying
-    # over it.
-    await _install_old_version(db, "machine-review-cycle", created_by="seed")
-    await asyncio.gather(
-        seed_default_skills(db),
-        seed_default_skills(db),
-        seed_default_skills(db),
-    )
-    versions = await _versions(db, "machine-review-cycle")
-    assert len(versions) == 2, "three racing seeders, one new version"
-    assert [v for v in versions if v["status"] == "active"][0][
-        "content"
-    ] == MACHINE_REVIEW_CYCLE_SKILL
+async def test_seeding_is_safe_on_a_parallel_start(tmp_path):
+    """AC-5: two WORKERS, not two coroutines sharing one connection.
+
+    ``get_db`` seeds per connection, so the race that matters is between
+    processes holding separate handles to the same file. Coroutines on a single
+    ``aiosqlite`` connection serialise behind its own lock and never contend
+    for ``UNIQUE(name, version)`` at all — a test built that way reports green
+    without executing the branch it exists to cover.
+    """
+    path = tmp_path / "race.db"
+    connections = []
+    for _ in range(3):
+        conn = await aiosqlite.connect(path)
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript(_SCHEMA)
+        await _migrate(conn)
+        connections.append(conn)
+    try:
+        await _install(
+            connections[0],
+            "machine-review-cycle",
+            [(1, OLD_TEXT, "active", "seed", "seed")],
+        )
+        results = await asyncio.gather(
+            *(seed_default_skills(c) for c in connections),
+            return_exceptions=True,
+        )
+        raised = [r for r in results if isinstance(r, BaseException)]
+        assert not raised, f"a seeder died on a benign race: {raised}"
+
+        versions = await _versions(connections[0], "machine-review-cycle")
+        assert len(versions) == 2, "three racing seeders, one new version"
+        assert (
+            await _served(connections[0], "machine-review-cycle")
+            == MACHINE_REVIEW_CYCLE_SKILL
+        )
+        # The loser must not leave its transaction aborted: the connection has
+        # to keep working for the statements that come after it.
+        assert await _served(connections[-1], "multi-agent-review") is not None
+    finally:
+        for conn in connections:
+            await conn.close()

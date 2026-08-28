@@ -2395,6 +2395,10 @@ class SkillView(BaseModel):
     project_id: int | None = None
     status: str
     created_by: str = ""
+    # Who published this version, which is not who wrote it (#1028): the human
+    # gate of #380 lets a person activate seeded text. Empty means nobody has
+    # published it, or the row predates the field.
+    activated_by: str = ""
     created_at: str = ""
 
     @field_validator("created_at", mode="before")

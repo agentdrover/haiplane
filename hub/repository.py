@@ -915,8 +915,19 @@ async def create_skill_version(
     version = (rows[0]["v"] or 0) + 1
     cur = await db.execute(
         "INSERT INTO skills (name, kind, version, content, tags, project_id, "
-        "status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, kind, version, content, tags, project_id, status, created_by),
+        "status, created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            name,
+            kind,
+            version,
+            content,
+            tags,
+            project_id,
+            status,
+            created_by,
+            # Creating a version straight as active IS publishing it.
+            created_by if status == "active" else "",
+        ),
     )
     return cur.lastrowid, version  # type: ignore[return-value]
 
@@ -968,11 +979,25 @@ async def get_skill_version(
 
 
 async def activate_skill_version(
-    db: aiosqlite.Connection, name: str, version: int
+    db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
+    """Publish one version, recording WHO published it (#1028).
+
+    Activation is a distinct act from authorship: the human gate of #380 lets a
+    person publish text the seed wrote, which leaves ``created_by='seed'`` on a
+    row a person is now standing behind. ``seed_default_skills`` replaces only
+    its own previous word, and without this field it could not tell the two
+    apart — it would overrule the person on the next deploy.
+
+    ``activated_by`` is REQUIRED and keyword-only on purpose. An empty value
+    means "nobody published this", which is exactly what the seed reads as its
+    own word — so a default would let a caller who simply forgot the argument
+    hand a person's decision to the next deploy, silently and with every test
+    still green (#1035).
+    """
     await db.execute(
-        "UPDATE skills SET status='active' WHERE name=? AND version=?",
-        (name, version),
+        "UPDATE skills SET status='active', activated_by=? WHERE name=? AND version=?",
+        (activated_by, name, version),
     )
 
 
