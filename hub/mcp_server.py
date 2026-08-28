@@ -2549,6 +2549,13 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    rd = data.get("review_dispatches") or {}
+    lines.append(
+        "Wasted dispatch spend (no report): "
+        f"{rd.get('wasted_provider_tokens_total', 0)} tokens across "
+        f"{rd.get('wasted_dispatches', 0)} failed run(s); "
+        f"{rd.get('unknown_usage', 0)} closed run(s) with unknown usage"
+    )
     # #877: the rate travels with its sample, and an unjudged window says so
     # rather than printing a zero that reads as "nothing was real".
     disp = mr.get("dispositions") or {}

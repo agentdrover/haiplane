@@ -528,6 +528,71 @@ async def test_both_numbers_stay_visible_when_they_disagree(
     assert "175000" in page.replace(" ", "").replace("&nbsp;", "")
 
 
+async def _failed_dispatch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    provider_tokens: int | None = None,
+) -> int:
+    did = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-waste",
+        run_id="run-waste",
+        model="grok-4.6",
+    )
+    if provider_tokens is not None:
+        await repo.set_review_dispatch_provider_tokens(db, did, provider_tokens)
+    await repo.set_review_dispatch_status(db, did, "failed")
+    return did
+
+
+async def test_wasted_dispatch_spend_is_a_sibling_of_confirmed_price(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#1026): wasted spend is visible and does not enter the price of
+    # a confirmed finding. Mixing the two would flatten a dead channel into
+    # a cheaper-looking practice (#516).
+    billed = await _task(db, title="billed report")
+    silent = await _task(db, title="failed dispatch")
+    await _report(db, billed, confirmed=2, tokens_spent=1000, provider_tokens=90_000)
+    await _failed_dispatch(db, silent, provider_tokens=2_500_000)
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    mr = metrics["machine_reviews"]
+    rd = metrics["review_dispatches"]
+
+    assert rd["wasted_provider_tokens_total"] == 2_500_000
+    assert rd["wasted_dispatches"] == 1
+    assert rd["unknown_usage"] == 0
+    assert mr["provider_tokens_total"] == 90_000
+    assert mr["provider_tokens_per_confirmed"] == 45_000
+    assert mr["tokens_per_confirmed"] == 500
+
+    page = (await client.get("/metrics")).text
+    assert "2500000" in page.replace(" ", "").replace("&nbsp;", "")
+    assert "Сожжено без отчёта" in page
+
+
+async def test_unknown_dispatch_usage_is_not_a_zero_bill(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#1026): NULL is unknown, counted beside the sum, never as 0.
+    silent = await _task(db, title="failed with no bill")
+    billed = await _task(db, title="failed with a bill")
+    await _failed_dispatch(db, silent, provider_tokens=None)
+    await _failed_dispatch(db, billed, provider_tokens=1_000_000)
+    await db.commit()
+
+    rd = (await practice_metrics(db))["review_dispatches"]
+    assert rd["wasted_provider_tokens_total"] == 1_000_000
+    assert rd["wasted_dispatches"] == 1
+    assert rd["unknown_usage"] == 1
+    assert rd["closed_dispatches"] == 2
+
+
 # --- Escaped defects (#528) -------------------------------------------------
 #
 # The leak side of the ledger: what review did NOT stop. Every test below is
