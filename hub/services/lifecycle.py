@@ -2320,6 +2320,30 @@ async def record_review_verdict(
             elif current_tip != pinned_sha:
                 diverged_tip = current_tip
 
+    # #1012: the other thing an approval can quietly override. The report is
+    # already bound to a submission and already knows whether the gate judged
+    # its findings; what was missing is anyone saying so at the moment the
+    # verdict is written. Read here, next to the sha check, for the same
+    # reason: both are questions about what the approver may not have seen,
+    # and neither may hold the write lock while it answers.
+    undisposed_note = ""
+    if body.verdict.value == "approved":
+        from hub.services.review_evidence import (
+            attach_dispositions,
+            undisposed_confirmed,
+        )
+        from hub.services.review_evidence import undisposed_note as _undisposed_note
+        from hub.models import MachineReviewView
+
+        mr_row = await repo.get_latest_machine_review(db, task_id)
+        if mr_row is not None:
+            mr_view = MachineReviewView(**dict(mr_row))
+            mr_view.is_current = mr_view.submission_generation == (
+                task.get("submission_generation") or 0
+            )
+            await attach_dispositions(db, mr_view)
+            undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
     # it must run outside the verdict's write-lock critical section).
@@ -2351,6 +2375,8 @@ async def record_review_verdict(
             )
         elif sha_note:
             content += f"\n{sha_note}"
+        if undisposed_note:
+            content += f"\n{undisposed_note}"
         if self_approved:
             content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
             log.warning(
@@ -2473,6 +2499,15 @@ async def record_review_verdict(
         )
     elif sha_note:
         view.lifecycle_hint = sha_note
+    if undisposed_note:
+        # Appended, never replacing: a diverged tip and unanswered findings are
+        # two different things the approver may not have seen, and dropping one
+        # to make room for the other is how a warning becomes decorative.
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{undisposed_note}"
+            if view.lifecycle_hint
+            else undisposed_note
+        )
     return view
 
 

@@ -1250,6 +1250,13 @@ class TaskRefine(BaseModel):
     project: str | None = Field(default=None, max_length=60)
 
     title: str | None = Field(default=None, min_length=1, max_length=500)
+    # #1013: the statement's own text used to be the one part of it that could
+    # not be refined — writable at INSERT and nowhere after, while the title
+    # beside it was editable and even audited. Every refine that corrected a
+    # premise left the description asserting the old one, and the review brief
+    # carries that text to the reviewer. Same ceiling as at creation; the empty
+    # string is a legal value, so min_length is deliberately absent.
+    description: str | None = Field(default=None, max_length=10000)
     work_type: WorkType | None = None
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
