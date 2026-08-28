@@ -908,6 +908,19 @@
                                 <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
                                     {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
                                     {{ f.title }}
+                                    {% set ev = finding_touch[loop.index0] if finding_touch and loop.index0 < finding_touch|length else none %}
+                                    {% if ev %}
+                                    <span class="muted">
+                                        {% if ev.outcome == 'touched' %}
+                                        Место тронуто после отчёта:{% for c in ev.commits %}
+                                        {{ c.short }} {{ c.subject }}{% endfor %}
+                                        {% elif ev.outcome == 'untouched' %}
+                                        Место не тронуто после отчёта
+                                        {% else %}
+                                        Ответа нет: {{ ev.reason_label }}
+                                        {% endif %}
+                                    </span>
+                                    {% endif %}
                                     <label><input type="radio" name="disposition-{{ loop.index0 }}"
                                         value="fixed"
                                         {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'fixed' %}checked{% endif %}>

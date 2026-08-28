@@ -41,6 +41,7 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
+from hub.services.finding_evidence import evidence_for_findings
 from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
@@ -1561,6 +1562,15 @@ async def _web_task_detail_page(
 
     evidence = await gate_evidence(db, dict(row))
 
+    finding_touch: list[dict[str, Any]] = []
+    if machine_review is not None and machine_review.findings_confirmed:
+        finding_touch = await evidence_for_findings(
+            db,
+            task_id,
+            [f.model_dump() for f in machine_review.findings_confirmed],
+            generation=int(machine_review.submission_generation),
+        )
+
     # #497: merged is not running. The hub records both facts now — its own
     # merge (#534) and the deploy CI reported (#839, #496) — and this compares
     # them. Computed, never stored: the answer changes with every release.
@@ -1681,6 +1691,7 @@ async def _web_task_detail_page(
             "evidence": evidence,
             "change_map": change_map,
             "machine_review": machine_review,
+            "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,
             "review_runs": review_runs,
