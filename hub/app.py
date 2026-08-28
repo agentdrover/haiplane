@@ -75,6 +75,8 @@ from hub.models import (
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    StewardJudgementSubmit,
+    StewardJudgementView,
     CategoryCheckSubmit,
     CloneBranchState,
     FindingDispositionsSubmit,
@@ -2122,15 +2124,24 @@ async def api_steward_evidence(
     )
 
 
-@app.post("/api/tasks/{task_id}/steward-judgement")
+@app.post(
+    "/api/tasks/{task_id}/steward-judgement",
+    response_model=StewardJudgementView,
+)
 async def api_steward_judgement(
     task_id: int,
-    _identity=Depends(require_permission("steward.judgement.write")),
+    body: StewardJudgementSubmit,
+    request: Request,
+    identity=Depends(require_permission("steward.judgement.write")),
 ):
-    """Write a judgement. Contract is #1022; this task only names the door."""
-    raise HTTPException(
-        status.HTTP_501_NOT_IMPLEMENTED,
-        f"steward judgement for task {task_id} is #1022",
+    """Record a structured steward judgement (#1022).
+
+    Closed dictionaries, no silent verdict default, at-most-once on
+    (task_id, generation, kind). The task is not transitioned here — applying
+    the judgement is F4.
+    """
+    return await services.record_steward_judgement(
+        _db(request), task_id, body, identity
     )
 
 

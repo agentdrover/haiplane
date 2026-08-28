@@ -164,6 +164,98 @@ def chat_pair_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     )
 
 
+def steward_verdict_required_detail() -> dict[str, Any]:
+    """422: steward judgement omitted verdict. Silent default is forbidden (#549)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_verdict_required",
+            "actor_hint": "agent",
+            "message": "verdict is required and has no default",
+            "hint": (
+                "Send verdict as approve, changes_requested or escalate. "
+                "Omitting it must not become an approve."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_closed_vocabulary_detail(
+    field: str, got: str, allowed: tuple[str, ...] | list[str]
+) -> dict[str, Any]:
+    """422: a closed dictionary rejected a value, including any 'unknown'."""
+    allowed_list = list(allowed)
+    return enrich_error_payload(
+        {
+            "reason": "steward_closed_vocabulary",
+            "actor_hint": "agent",
+            "field": field,
+            "got": got,
+            "allowed": allowed_list,
+            "message": f"invalid {field}: {got!r}",
+            "hint": (
+                f"{field} must be one of: {', '.join(allowed_list)}. "
+                "There is no unknown bucket — a new code is a spec change."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_escalate_reason_required_detail(
+    allowed: tuple[str, ...] | list[str],
+) -> dict[str, Any]:
+    """422: escalate without a closed-set reason."""
+    allowed_list = list(allowed)
+    return enrich_error_payload(
+        {
+            "reason": "steward_escalate_reason_required",
+            "actor_hint": "agent",
+            "allowed": allowed_list,
+            "message": "escalate_reason is required when verdict is escalate",
+            "hint": f"Send escalate_reason as one of: {', '.join(allowed_list)}.",
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_unknown_finding_uid_detail(uid: str) -> dict[str, Any]:
+    """422: a closure named a finding that is not in this generation's report."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_unknown_finding_uid",
+            "actor_hint": "agent",
+            "message": f"finding_uid {uid} is not in this generation's report",
+            "hint": (
+                "Closures address confirmed findings of this submission by "
+                "finding_uid. A uid the hub cannot see cannot close a finding."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_judgement_exists_detail(
+    task_id: int, generation: int, kind: str
+) -> dict[str, Any]:
+    """409: at-most-once on (task_id, generation, kind), like the arbiter (#421)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_judgement_exists",
+            "actor_hint": "none",
+            "message": (
+                f"steward judgement already recorded for task #{task_id} "
+                f"generation {generation} kind {kind}"
+            ),
+            "hint": (
+                "A second judgement of the same triple is refused, not stacked. "
+                "A new submission generation opens a new slot."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
 def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     """A steward token reached a route outside its two-op allowlist (#1021)."""
     return enrich_error_payload(

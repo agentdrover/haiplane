@@ -454,6 +454,35 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_steward_judgement(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "generation": args.generation,
+        "kind": args.kind,
+        "verdict": args.verdict,
+    }
+    if args.confidence:
+        body["confidence"] = args.confidence
+    if args.escalate_reason:
+        body["escalate_reason"] = args.escalate_reason
+    if args.model:
+        body["model"] = args.model
+    if args.grounds_json:
+        try:
+            body["grounds"] = json.loads(args.grounds_json)
+        except json.JSONDecodeError as exc:
+            print(f"invalid --grounds-json: {exc}", file=sys.stderr)
+            return 2
+    if args.closures_json:
+        try:
+            body["closures"] = json.loads(args.closures_json)
+        except json.JSONDecodeError as exc:
+            print(f"invalid --closures-json: {exc}", file=sys.stderr)
+            return 2
+    result = _api("POST", f"/api/tasks/{args.task_id}/steward-judgement", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
     body = {"agent": args.agent, "session_id": args.session_id or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
@@ -1534,6 +1563,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_review_verdict.set_defaults(func=cmd_review_verdict)
+
+    p_steward_judgement = sub.add_parser(
+        "steward-judgement",
+        help="Record a steward judgement (no transition)",
+    )
+    p_steward_judgement.add_argument("task_id", type=int)
+    p_steward_judgement.add_argument("--generation", type=int, required=True)
+    p_steward_judgement.add_argument(
+        "--kind", required=True, choices=["verdict", "dor", "disposition"]
+    )
+    p_steward_judgement.add_argument(
+        "--verdict",
+        required=True,
+        choices=["approve", "changes_requested", "escalate"],
+    )
+    p_steward_judgement.add_argument(
+        "--confidence", default="", choices=["", "high", "medium", "low"]
+    )
+    p_steward_judgement.add_argument("--escalate-reason", default="")
+    p_steward_judgement.add_argument("--model", default="")
+    p_steward_judgement.add_argument(
+        "--grounds-json",
+        default="",
+        help='JSON list of grounds: [{"source":"ci_pinned_sha"}]',
+    )
+    p_steward_judgement.add_argument(
+        "--closures-json",
+        default="",
+        help='JSON list of closures: [{"finding_uid":"...","type":"fixed"}]',
+    )
+    p_steward_judgement.set_defaults(func=cmd_steward_judgement)
 
     p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
     p_claim.add_argument("task_id", type=int)
