@@ -21,6 +21,7 @@ from hub.db import (
     fetchall,
     seed_default_skills,
 )
+import hub.db as db_module
 from hub.repository import activate_skill_version, get_active_skill
 
 OLD_TEXT = "старый текст без locator"
@@ -273,6 +274,47 @@ async def test_human_activation_of_a_seeded_draft_is_respected(
 
     assert await _served(db, "machine-review-cycle") == OLD_TEXT, (
         "the person who published this version keeps it published"
+    )
+
+
+async def test_a_lost_version_number_never_leaves_the_library_unreadable(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Losing the INSERT must not take the only active version down with it.
+
+    ``ON CONFLICT DO NOTHING`` makes losing cheap, and the demote runs whether
+    we won or not — so a seeder that lost its version number to somebody ELSE's
+    row would step the library's only active version down and put nothing in
+    its place. ``hub_get_skill`` then answers 404 for as long as nobody
+    intervenes, which is a worse outcome than the stale text this whole
+    function exists to replace.
+
+    Reachable: an agent proposing a version through ``POST /api/skills`` files
+    a DRAFT, and it commits between this seeder's SELECT and its INSERT. The
+    row that won the version number is neither ours nor active, so nothing else
+    puts the library back.
+    """
+    await _install(db, "machine-review-cycle", [(1, OLD_TEXT, "active", "seed", "")])
+
+    real_insert = db_module._insert_seed_skill
+
+    async def _lose_the_race(conn, name, kind, content, tags, version, status):
+        if name != "machine-review-cycle":
+            return await real_insert(conn, name, kind, content, tags, version, status)
+        # Somebody else took this version number a moment ago; our INSERT hits
+        # UNIQUE(name, version) and does nothing.
+        await conn.execute(
+            "INSERT INTO skills (name, kind, version, content, tags, status, "
+            "created_by, activated_by) VALUES (?, ?, ?, ?, ?, 'draft', 'agent', '')",
+            (name, kind, version, "версия, предложенная агентом", tags),
+        )
+
+    monkeypatch.setattr(db_module, "_insert_seed_skill", _lose_the_race)
+    await seed_default_skills(db)
+
+    assert await _served(db, "machine-review-cycle") == OLD_TEXT, (
+        "the library keeps serving the stale text until a seeder actually "
+        "replaces it — it never goes dark"
     )
 
 

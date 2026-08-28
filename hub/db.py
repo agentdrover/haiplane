@@ -2586,14 +2586,28 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         # good. ``draft`` is the existing vocabulary for "in the library, not
         # served" — a third status would be one this schema has never had.
         #
-        # The WHERE clause is ``_is_seed_word`` said in SQL, deliberately: it
-        # must be impossible for this statement to demote a row a person
+        # Two guards, and both are load-bearing.
+        #
+        # The seed-ownership half is ``_is_seed_word`` said in SQL, deliberately:
+        # it must be impossible for this statement to demote a row a person
         # published, and the safest way to say that is to spell the same
         # condition the branch above was chosen by.
+        #
+        # The EXISTS half is what makes losing the insert survivable. The
+        # statement above says ON CONFLICT DO NOTHING, so this connection may
+        # have written nothing at all — and if the row that took its version
+        # number belongs to somebody else (an agent proposing a version through
+        # POST /api/skills files a DRAFT), stepping our previous word down would
+        # leave the library with NO active version and ``hub_get_skill``
+        # answering 404. Serving stale text until the next seeder replaces it is
+        # bad; serving nothing is worse. So the old word only steps down once
+        # the shipped text is demonstrably the one being served.
         await db.execute(
             "UPDATE skills SET status='draft' WHERE name=? AND status='active' "
-            "AND content<>? AND created_by='seed' AND activated_by IN ('', 'seed')",
-            (name, content),
+            "AND content<>? AND created_by='seed' AND activated_by IN ('', 'seed') "
+            "AND EXISTS (SELECT 1 FROM skills live WHERE live.name=skills.name "
+            "AND live.content=? AND live.status='active')",
+            (name, content, content),
         )
     await db.commit()
 
