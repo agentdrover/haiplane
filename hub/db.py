@@ -5,6 +5,8 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
+import sqlite3
+
 import aiosqlite
 
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
@@ -2419,17 +2421,31 @@ category питает метрики повторяемости — исполь
 
 
 async def seed_default_skills(db: aiosqlite.Connection) -> None:
-    """Seed built-in skills (#380, #383).
+    """Seed built-in skills, and keep the ACTIVE one current (#380, #383, #1028).
 
-    Idempotent per skill: only inserts when the name has no versions at all,
-    so operator edits and newer versions are never overwritten.
+    Three cases, and the difference between them is whose words are at stake.
 
-    When the shipped text has MOVED ON from every stored version, a new version
-    is filed as a DRAFT (#1007). Nothing is overwritten and nothing activates
-    itself — a human still decides, exactly as #380 set out. The alternative
-    was worse than it looks: the contract for machine-review findings changed
-    with this release, and a library still teaching the old shape would send
-    every harness into a 422 while the docs claimed otherwise.
+    1. No versions at all — insert the shipped text as version 1, active.
+    2. The active version is the hub's own previous word (``created_by='seed'``,
+       never touched by a person) — replace it: the new version becomes active
+       and the old one steps down. The automaton is correcting itself, not
+       overruling anybody.
+    3. A person edited the active version — leave it exactly where it is and
+       file the shipped text beside it as a draft. Nothing a human wrote is
+       ever overwritten here, which is the rule #380 set and this keeps.
+
+    Case 2 exists because filing everything as a draft (#1007) did not close the
+    hole it was written for. ``hub_get_skill`` serves the ACTIVE version, so a
+    library still teaching the old finding format kept teaching it: the write
+    path had already started refusing reports without a locator, and every
+    harness following the active skill walked into a 422 on the whole report.
+    A draft nobody activated is a note to the operator, not a fix.
+
+    Concurrency: ``get_db`` runs this on every connection, so two workers can
+    read the same max version and both insert. ``UNIQUE(name, version)`` makes
+    one of them lose, and losing is FINE — the winner wrote the same text. The
+    loser swallows the integrity error rather than taking a connection down
+    with it (#1028).
     """
     seeds = (
         (
@@ -2448,25 +2464,58 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
     for name, kind, content, tags in seeds:
         rows = await fetchall(
             db,
-            "SELECT version, content FROM skills WHERE name=? ORDER BY version DESC",
+            "SELECT id, version, content, status, created_by FROM skills "
+            "WHERE name=? ORDER BY version DESC",
             (name,),
         )
         if not rows:
-            await db.execute(
-                "INSERT INTO skills (name, kind, version, content, tags, status, "
-                "created_by) VALUES (?, ?, 1, ?, ?, 'active', 'seed')",
-                (name, kind, content, tags),
-            )
+            await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
             continue
         if any(str(row["content"]) == content for row in rows):
             # The shipped text is already in the library, active or not.
             continue
+        active = next((r for r in rows if str(r["status"]) == "active"), None)
+        version = int(rows[0]["version"]) + 1
+        if active is not None and str(active["created_by"]) == "seed":
+            superseded = int(active["id"])
+            if await _insert_seed_skill(
+                db, name, kind, content, tags, version, "active"
+            ):
+                await db.execute(
+                    "UPDATE skills SET status='superseded' WHERE id=?",
+                    (superseded,),
+                )
+        else:
+            # Operator's word stands; ours waits beside it.
+            await _insert_seed_skill(db, name, kind, content, tags, version, "draft")
+    await db.commit()
+
+
+async def _insert_seed_skill(
+    db: aiosqlite.Connection,
+    name: str,
+    kind: str,
+    content: str,
+    tags: str,
+    version: int,
+    status: str,
+) -> bool:
+    """Insert one seeded version; False when another connection got there first.
+
+    The race is real and benign: ``get_db`` seeds on every connection, so two
+    workers starting together compute the same next version. Whoever loses the
+    UNIQUE(name, version) race would otherwise take its whole connection down
+    over a row that already says what it wanted to say.
+    """
+    try:
         await db.execute(
             "INSERT INTO skills (name, kind, version, content, tags, status, "
-            "created_by) VALUES (?, ?, ?, ?, ?, 'draft', 'seed')",
-            (name, kind, int(rows[0]["version"]) + 1, content, tags),
+            "created_by) VALUES (?, ?, ?, ?, ?, ?, 'seed')",
+            (name, kind, version, content, tags, status),
         )
-    await db.commit()
+    except sqlite3.IntegrityError:
+        return False
+    return True
 
 
 async def seed_system_roles(db: aiosqlite.Connection) -> None:

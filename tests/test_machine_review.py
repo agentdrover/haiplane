@@ -226,11 +226,16 @@ def test_two_findings_in_one_file_are_two_ids():
 
 
 def test_finding_uid_stable_across_generations():
+    # Computed on the payload the WRITE path requires (#1028): locator is
+    # mandatory in production, so a stability test without it proved nothing
+    # about the identity the hub actually stores.
     first = {
         "title": "Race on retry",
         "severity": "high",
         "category": "correctness",
         "file": "hub/poller.py",
+        "locator": "lines",
+        "start_line": 42,
     }
     # A second run words severity differently and reports the same defect; the
     # id is derived from what identifies the finding, not from the whole row.
@@ -239,8 +244,58 @@ def test_finding_uid_stable_across_generations():
         "severity": "medium",
         "category": "Correctness",
         "file": "hub/poller.py",
+        "locator": "lines",
+        "start_line": 42,
     }
     assert finding_uid(first) == finding_uid(second)
+
+
+def test_legacy_and_new_locator_give_one_id():
+    """AC-1 (#1028): the format boundary must not break identity.
+
+    116 reports are stored with no locator at all. If the field went into the
+    hash verbatim, none of them could ever match a finding reported after the
+    contract changed — and the id exists precisely to carry a human's judgement
+    across that boundary.
+    """
+    legacy = {
+        "title": "unchecked error",
+        "category": "correctness",
+        "file": "hub/app.py",
+        "line": 40,
+    }
+    modern = {
+        "title": "unchecked error",
+        "category": "correctness",
+        "file": "hub/app.py",
+        "locator": "lines",
+        "start_line": 40,
+    }
+    assert finding_uid(legacy) == finding_uid(modern)
+
+    # And the same holds one step up: a file-only finding, however it says so.
+    legacy_file = {"title": "t", "category": "c", "file": "hub/app.py"}
+    modern_file = dict(legacy_file, locator="file")
+    assert finding_uid(legacy_file) == finding_uid(modern_file)
+
+
+def test_a_placed_finding_differs_from_an_unplaced_one():
+    """AC-2 (#1028): canonicalising the place must not re-merge what #1007 split.
+
+    The line is what tells two defects in one file apart. Dropping the raw
+    locator from the hash is only safe while the line still counts.
+    """
+    placed = {
+        "title": "t",
+        "category": "c",
+        "file": "hub/app.py",
+        "locator": "lines",
+        "start_line": 40,
+    }
+    unplaced = {"title": "t", "category": "c", "file": "hub/app.py", "locator": "file"}
+    nowhere = {"title": "t", "category": "c", "locator": "none"}
+    assert len({finding_uid(placed), finding_uid(unplaced), finding_uid(nowhere)}) == 3
+    assert finding_uid(placed) != finding_uid(dict(placed, start_line=200))
 
 
 def test_a_reworded_finding_is_a_different_id():
