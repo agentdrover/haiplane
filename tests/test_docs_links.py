@@ -52,3 +52,19 @@ def test_implementer_path_spec_freezes_intake_961():
     spec = path_spec.read_text(encoding="utf-8")
     assert "kind=implementer" in spec
     assert "#983" in spec
+
+
+def test_implementer_sdd_matches_allowlist_and_freezes_intake_role():
+    # #979: full SDD next to #961; presentational role stays intake-only.
+    sdd = (
+        REPO_ROOT / "docs" / "issues" / "task-979-chat-pair-implementer.md"
+    ).read_text(encoding="utf-8")
+    assert "CHAT_PAIR_IMPLEMENTER_ALLOWLIST" in sdd
+    assert "POST   /api/tasks/{task_id}/pair-start" in sdd
+    assert "POST /api/tasks" in sdd  # closed-routes table names create
+    assert "chat_pair_task_not_open" in sdd
+    intake = (REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Intake-only" in intake
+    assert "task-979-chat-pair-implementer.md" in intake
