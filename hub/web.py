@@ -2077,7 +2077,7 @@ async def web_batch_approve_selected(
     """
     db = _db(request)
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
     result = None
     if task_ids:
