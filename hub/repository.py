@@ -3230,6 +3230,33 @@ async def list_unaddressable_tasks(
     )
 
 
+async def tasks_with_retired_worktrees(
+    db: aiosqlite.Connection, *, keep_days: int, limit: int
+) -> list[aiosqlite.Row]:
+    """Finished tasks whose pair worktree has outlived ``keep_days`` (#1033).
+
+    Age comes from ``completed_at`` and from nothing else: the directory's
+    mtime moves whenever anything reads the tree, so a forgotten worktree
+    somebody grepped last night would look brand new.
+
+    Only terminal statuses are listed, and a task still in review or running
+    can never appear here whatever its age — the caller must not be the place
+    where that rule is remembered. Oldest first, so a backlog drains in a
+    predictable order rather than by whatever the database returns.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, title, status, completed_at FROM tasks "
+            "WHERE status IN ('completed', 'failed', 'rejected') "
+            "AND completed_at IS NOT NULL AND completed_at != '' "
+            "AND completed_at < datetime('now', ?) "
+            "ORDER BY completed_at ASC LIMIT ?",
+            (f"-{keep_days} days", limit),
+        )
+    )
+
+
 async def prune_agent_sessions(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
     """Drop sessions with no sign of life for ``keep_days``. Rows removed."""
     cur = await db.execute(
