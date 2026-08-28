@@ -12,6 +12,7 @@ import json
 import aiosqlite
 from httpx import AsyncClient
 
+from hub import auth as hub_auth
 from hub import config
 from hub import repository as repo
 from hub import services
@@ -1427,8 +1428,13 @@ async def test_previous_findings_travel_with_the_delta(
 # dispatched run's own: the author's parallel report closed the hub's dispatch
 # as done, silenced the no-report alert and fed the author's numbers to the
 # usage cross-check (#1011 gen 1). The dispatch now pins the reviewer
-# principal from the TOKEN and matches reports on it; a dispatch without one
-# (history, unresolved token) keeps the old rule.
+# principal from the TOKEN and matches reports on it — rung by rung within
+# the ladder; a dispatch without a pin (history, unresolved token, open mode)
+# keeps the old rule.
+#
+# Auth is real in these tests (open mode off): the pin resolves only where
+# intake can read the bearer — in open mode every report lands with
+# principal_id NULL, so pinning there would make the dispatch unsatisfiable.
 
 
 _FOREIGN_REPORT = {
@@ -1445,20 +1451,28 @@ _FOREIGN_REPORT = {
 }
 
 
-async def _pinned_reviewer(db, monkeypatch) -> tuple[int, str]:
-    """A db-backed reviewer principal whose token the dispatcher resolves.
-
-    Overrides the placeholder token _wire sets, so call it after _wire and
-    before _submitted — the dispatch pins the principal at creation time.
-    """
+async def _agent_key(db, username: str) -> tuple[int, str]:
+    """A db-backed agent principal and its plaintext API key."""
     from hub.services import admin as admin_svc
 
-    principal = await admin_svc.create_principal(
-        db, kind="agent", username="cloud-reviewer"
-    )
-    key = await admin_svc.create_api_key(db, principal["id"], name="reviewer")
-    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", key["plaintext_key"])
+    principal = await admin_svc.create_principal(db, kind="agent", username=username)
+    key = await admin_svc.create_api_key(db, principal["id"], name=username)
     return principal["id"], key["plaintext_key"]
+
+
+async def _pinned_setup(db, monkeypatch) -> tuple[int, str, str]:
+    """Real auth + a reviewer principal the dispatcher will pin.
+
+    Returns (reviewer_principal_id, reviewer_token, author_token). Call after
+    _wire and before _submitted — the pin resolves at dispatch creation.
+    """
+    from hub import auth as hub_auth
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    reviewer_pid, reviewer_token = await _agent_key(db, "cloud-reviewer")
+    _, author_token = await _agent_key(db, "parallel-author")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", reviewer_token)
+    return reviewer_pid, reviewer_token, author_token
 
 
 async def test_foreign_report_does_not_settle_dispatch(
@@ -1469,14 +1483,16 @@ async def test_foreign_report_does_not_settle_dispatch(
     # exactly once.
     recorder = _DispatchRecorder({"agent": {"id": "bc-f1"}, "run": {"id": "run-f1"}})
     _wire(monkeypatch, recorder)
-    expected_pid, _ = await _pinned_reviewer(db, monkeypatch)
+    expected_pid, _, author_token = await _pinned_setup(db, monkeypatch)
     task_id = await _submitted(
         client, db, "spike-foreign", policy={"review": "dispatch"}
     )
     assert (await _dispatch_row(db, task_id))["reviewer_principal_id"] == expected_pid
 
     resp = await client.post(
-        f"/api/tasks/{task_id}/machine-review", json=_FOREIGN_REPORT
+        f"/api/tasks/{task_id}/machine-review",
+        json=_FOREIGN_REPORT,
+        headers={"Authorization": f"Bearer {author_token}"},
     )
     assert resp.status_code == 200, resp.text
 
@@ -1505,24 +1521,19 @@ async def test_foreign_report_does_not_settle_dispatch(
 async def test_own_report_settles_dispatch(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-2 (#1025): the pinned principal's report settles the dispatch and
-    # goes through the usage cross-check — the working channel is unchanged.
+    # AC-2 (#1025): the pinned principal's report settles the dispatch, goes
+    # through the usage cross-check, and the provider's bill lands on THAT
+    # report's row — with no collision noise in the feed.
     recorder = _DispatchRecorder({"agent": {"id": "bc-f2"}, "run": {"id": "run-f2"}})
     _wire(monkeypatch, recorder)
-    expected_pid, token = await _pinned_reviewer(db, monkeypatch)
+    expected_pid, reviewer_token, _ = await _pinned_setup(db, monkeypatch)
     task_id = await _submitted(client, db, "spike-own", policy={"review": "dispatch"})
-
-    # The test client runs in open mode, which never reads the bearer header;
-    # the reviewer's identity IS the subject here, so auth must be real.
-    from hub import auth as hub_auth
-
-    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
 
     own = dict(_FOREIGN_REPORT, agent="cloud-reviewer", model="grok-4.6")
     resp = await client.post(
         f"/api/tasks/{task_id}/machine-review",
         json=own,
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {reviewer_token}"},
     )
     assert resp.status_code == 200, resp.text
     saved = dict(await repo.get_latest_machine_review(db, task_id))
@@ -1535,9 +1546,14 @@ async def test_own_report_settles_dispatch(
 
     await sweep_review_dispatches(db)
     assert not await repo.list_active_review_dispatches(db), "dispatch settles"
+    stamped = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stamped["provider_tokens"] == 100_000, "the bill lands on the matched row"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert [u for u in updates if "расходится с данными провайдера" in u["content"]]
     assert not [u for u in updates if "другого принципала" in u["content"]]
+    assert not [u for u in updates if "Второй отчёт" in u["content"]], (
+        "the dispatched run's own report must pass without ceremony"
+    )
 
 
 async def test_grace_alert_fires_despite_foreign_report(
@@ -1548,11 +1564,13 @@ async def test_grace_alert_fires_despite_foreign_report(
     # silenced by the foreign report.
     recorder = _DispatchRecorder({"agent": {"id": "bc-f3"}, "run": {"id": "run-f3"}})
     _wire(monkeypatch, recorder)
-    await _pinned_reviewer(db, monkeypatch)
+    _, _, author_token = await _pinned_setup(db, monkeypatch)
     task_id = await _submitted(client, db, "spike-grace", policy={"review": "dispatch"})
 
     resp = await client.post(
-        f"/api/tasks/{task_id}/machine-review", json=_FOREIGN_REPORT
+        f"/api/tasks/{task_id}/machine-review",
+        json=_FOREIGN_REPORT,
+        headers={"Authorization": f"Bearer {author_token}"},
     )
     assert resp.status_code == 200, resp.text
     await db.execute(
@@ -1575,28 +1593,91 @@ async def test_top_up_ignores_foreign_report(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
     # AC-4 (#1025): a foreign incomplete report buys no top-up; the pinned
-    # run's own incomplete report still does.
+    # run's own incomplete report still does — and the deep rung then waits
+    # for ITS OWN report instead of settling on the lite one.
     recorder = _DispatchRecorder({"agent": {"id": "bc-f4"}, "run": {"id": "run-f4"}})
     _wire(monkeypatch, recorder)
-    _, token = await _pinned_reviewer(db, monkeypatch)
+    _, reviewer_token, author_token = await _pinned_setup(db, monkeypatch)
     task_id = await _submitted(client, db, "spike-topup", policy={"review": "dispatch"})
     assert len(recorder.calls) == 1
 
     foreign = dict(_FOREIGN_REPORT, incomplete=True)
-    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=foreign)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=foreign,
+        headers={"Authorization": f"Bearer {author_token}"},
+    )
     assert resp.status_code == 200, resp.text
     assert len(recorder.calls) == 1, "no ladder step on a foreign declaration"
 
-    from hub import auth as hub_auth
-
-    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
     own = dict(
         _FOREIGN_REPORT, incomplete=True, agent="cloud-reviewer", model="grok-4.6"
     )
     resp = await client.post(
         f"/api/tasks/{task_id}/machine-review",
         json=own,
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {reviewer_token}"},
     )
     assert resp.status_code == 200, resp.text
     assert len(recorder.calls) == 2, "our own incomplete run buys the deep top-up"
+
+    # Both rungs pin the same principal. The lite report must settle only
+    # the lite rung — before rung-ordered matching the SAME report settled
+    # the deep dispatch too, before its run ever reported (#1025 review).
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    async def _running(agent_id, run_id):
+        return {"id": run_id, "status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    monkeypatch.setattr(cursor_cloud, "get_run", _running)
+
+    await sweep_review_dispatches(db)
+    active = [dict(r) for r in await repo.list_active_review_dispatches(db)]
+    assert len(active) == 1, "the deep rung keeps waiting for its own report"
+    settled = await repo.get_settled_review_dispatch(db, task_id, 1)
+    assert settled is not None and int(dict(settled)["id"]) != int(active[0]["id"])
+
+
+async def test_open_mode_pins_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1029): open mode never reads the bearer, so every report lands
+    # with principal_id NULL. Pinning a dispatch there would make it
+    # unsatisfiable — its own reviewer's report would be flagged foreign and
+    # the dispatch would die by a FALSE "отчёт НЕ сдан". So no pin is taken,
+    # and the old task+generation rule stands: degradation must never be
+    # worse than the behaviour it degrades from.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-om"}, "run": {"id": "run-om"}})
+    _wire(monkeypatch, recorder)
+    # A resolvable reviewer key EXISTS in the db — the only thing missing is
+    # an auth mode that would let a report carry its owner.
+    _, reviewer_token = await _agent_key(db, "cloud-reviewer")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", reviewer_token)
+    assert hub_auth._is_open_mode(), "the fixture client runs in open mode"
+
+    task_id = await _submitted(
+        client, db, "spike-openmode", policy={"review": "dispatch"}
+    )
+    dispatch = await _dispatch_row(db, task_id)
+    assert dispatch["reviewer_principal_id"] is None, "no pin under open mode"
+
+    # And the legacy rule still settles the dispatch: any report of the
+    # generation counts, exactly as before #1025.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review", json=_FOREIGN_REPORT
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+    await sweep_review_dispatches(db)
+    assert not await repo.list_active_review_dispatches(db), "legacy rule settles"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "другого принципала" in u["content"]], (
+        "an unpinned dispatch must not accuse anyone of being foreign"
+    )
