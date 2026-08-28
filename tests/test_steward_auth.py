@@ -14,11 +14,16 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
 from hub import config
+from hub.app import _reject_agent_authored_source
+from hub.auth import require_human_or_admin
 from hub.config import TokenIdentity
+from hub.models import TaskSource
 from hub.services import admin as admin_svc
+from hub.web import _require_human_web
 
 STEWARD_TOKEN = "steward-env-token"  # pragma: allowlist secret
 
@@ -121,7 +126,7 @@ def _named_api_routes():
 
 
 @pytest.mark.asyncio
-async def test_steward_is_forbidden_on_every_route_except_two(hub):
+async def test_steward_principal_denied_everything_else(hub):
     """AC-1: 403 на каждом маршруте вне allowlist, включая human/agent write."""
     task_id = await _make_task(hub)
     named = [
@@ -194,18 +199,29 @@ async def test_steward_may_reach_the_two_allowed_ops(hub):
 # ---------------------------------------------------------------------------
 
 
-def test_steward_identity_is_neither_human_nor_agent():
+def test_steward_is_never_read_as_human():
+    """AC-2: identity flags AND the helpers that used to read 'not agent' as human."""
     ident = TokenIdentity("s", "steward", principal_id=9)
     assert ident.is_human is False
     assert ident.is_agent is False
     assert ident.is_steward is True
+    request = SimpleNamespace(state=SimpleNamespace(identity=ident))
+    with pytest.raises(HTTPException) as web_gate:
+        _require_human_web(request)
+    assert web_gate.value.status_code == 403
+    with pytest.raises(HTTPException) as rest_gate:
+        require_human_or_admin(request)
+    assert rest_gate.value.status_code == 403
+    with pytest.raises(HTTPException) as create_gate:
+        _reject_agent_authored_source(request, TaskSource.human)
+    assert create_gate.value.status_code == 403
+    # The web create form uses the same predicate, not _require_human_web
+    # (different error body). Steward must not fall through as a human author.
+    assert not ident.is_human
 
 
 def test_require_human_or_admin_rejects_steward_env_token():
     """Env-token without principal_id used to pass this gate: is_agent was false."""
-    from fastapi import HTTPException
-    from hub.auth import require_human_or_admin
-
     ident = TokenIdentity("s", "steward")
     request = SimpleNamespace(state=SimpleNamespace(identity=ident))
     with pytest.raises(HTTPException) as caught:
@@ -302,7 +318,7 @@ def test_steward_perms_are_the_two_ops_and_nothing_forbidden():
         assert ident.has_permission(perm) is False
 
 
-def test_unlisted_path_is_refused_even_if_the_route_does_not_exist():
+def test_new_routes_are_denied_by_default():
     """AC-3: a route that appears later is closed until explicitly listed."""
     from hub.auth import steward_route_allowed
 
