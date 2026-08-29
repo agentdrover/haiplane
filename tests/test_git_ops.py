@@ -2538,3 +2538,96 @@ async def test_real_stack_is_still_detected(git_ops: GitOpsIntegration) -> None:
             repo="/tmp/repo",
         )
     assert stacked is True
+
+
+# ---- #1055: the diff resolves refs the workspace actually has ----
+
+
+def _remote_only_clone(tmp_path) -> tuple[str, str]:
+    """A clone shaped like production: the branch exists only as origin/<name>.
+
+    The hub's workspace never checks a task branch out — the developer pushes
+    it and the clone fetches it — so a bare name resolves to nothing there.
+    """
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path),
+    }
+
+    def run(cwd, *args):
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, env=env
+        )
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    author = tmp_path / "author"
+    subprocess.run(
+        ["git", "clone", str(origin), str(author)],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (author / "file.py").write_text("def f():\n    return 1\n")
+    run(author, "add", ".")
+    run(author, "commit", "-qm", "base")
+    run(author, "push", "-q", "origin", "develop")
+    run(author, "checkout", "-qb", "task-1055/work")
+    (author / "file.py").write_text("def f():\n    return 2\n")
+    run(author, "commit", "-qam", "work")
+    run(author, "push", "-q", "origin", "task-1055/work")
+
+    workspace = tmp_path / "workspace"
+    subprocess.run(
+        ["git", "clone", str(origin), str(workspace)],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    heads = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.split()
+    assert "task-1055/work" not in heads, (
+        "the test must reproduce production: no local head for the task branch"
+    )
+    return str(workspace), "task-1055/work"
+
+
+async def test_branch_diff_reads_a_branch_present_only_as_remote_ref(
+    tmp_path, git_ops: GitOpsIntegration
+) -> None:
+    # #1055 AC-1: this is the state every pair task is in. Before the fix git
+    # answered "unknown revision" and the diff came back None, which each
+    # caller then reported as "could not look".
+    workspace, branch = _remote_only_clone(tmp_path)
+
+    diff = await git_ops.branch_diff(workspace, "develop", branch)
+
+    assert diff is not None, "the branch is in the clone as origin/<name>"
+    assert "return 2" in diff, "and the diff is the branch's own work"
+
+
+async def test_branch_diff_still_returns_none_when_the_branch_is_nowhere(
+    tmp_path, git_ops: GitOpsIntegration
+) -> None:
+    # #1055 AC-2: resolving more refs must not turn "I could not look" into
+    # "nothing changed" — the distinction #601 introduced None for.
+    workspace, _ = _remote_only_clone(tmp_path)
+
+    diff = await git_ops.branch_diff(workspace, "develop", "task-1055/never-pushed")
+
+    assert diff is None, "unknown ref stays unreadable, never an empty diff"

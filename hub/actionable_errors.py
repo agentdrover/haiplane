@@ -694,6 +694,63 @@ def hierarchy_error_detail(
     return enrich_error_payload(payload)
 
 
+def verdict_repeats_previous_detail(when: str) -> dict[str, Any]:
+    """A verdict whose words are the previous verdict's, unacknowledged (#1057).
+
+    Refused, not rewritten: repeating is legitimate when the defect is still
+    there, and only the reviewer knows whether it is. What the hub can tell is
+    that this exact text has already been said, which on #1042 it had — the
+    complaint it carried was closed by a resubmission 18 minutes before the
+    paste, and the task stood in review until someone read it again.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "verdict_repeats_previous",
+            "actor_hint": "agent",
+            "required_role": "reviewer",
+            "retry_by_same_caller": True,
+            "message": (
+                "this verdict repeats the text of the previous verdict on this "
+                f"task ({when}) word for word"
+            ),
+            "hint": (
+                "If the defect is still there, resend with "
+                "acknowledge_repeat=true and the repeat is recorded as meant. "
+                "If this was a paste of the old text, read the current "
+                "submission first — it may have closed what the text asks for."
+            ),
+            "suggested_tool": "hub_submit_review",
+        }
+    )
+
+
+def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str, Any]:
+    """The filed outcome and the body's own first word disagree (#1057).
+
+    No acknowledgement for this one. Two outcomes in one call is not a decision
+    a reviewer can confirm — it is the typo that filed #1041's 06:33 verdict as
+    CHANGES_REQUESTED over a text beginning with the word APPROVED.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "verdict_contradicts_its_text",
+            "actor_hint": "agent",
+            "required_role": "reviewer",
+            "retry_by_same_caller": True,
+            "message": (
+                f"verdict={verdict} but the text opens by declaring {declared.upper()}"
+            ),
+            "hint": (
+                "Send the outcome you mean: either change the verdict field or "
+                "drop the opposite word from the opening line. Quoting an "
+                "earlier verdict further down the text is fine — only the "
+                "first meaningful line is read as a declaration."
+            ),
+            "suggested_tool": "hub_submit_review",
+        }
+    )
+
+
 def changes_requested_requires_content_detail() -> dict[str, Any]:
     """A verdict that sends work back has to say what to redo (#1010).
 

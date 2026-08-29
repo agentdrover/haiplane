@@ -666,6 +666,11 @@ class TaskReviewVerdict(BaseModel):
     comments: str = Field("", max_length=50000)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=50)
     create_tasks_for_out_of_scope: bool = False
+    # #1057: a verdict repeating the previous one word for word is refused
+    # unless the caller says the repeat is meant. Repeating IS legitimate when
+    # the defect was not fixed; pasting the old text over a complaint the
+    # author already closed is not, and only the reviewer can tell them apart.
+    acknowledge_repeat: bool = False
 
 
 class LatestReview(BaseModel):

@@ -1850,6 +1850,7 @@ async def hub_submit_review(
     agent: str = "",
     findings: list[dict[str, Any]] | None = None,
     create_tasks_for_out_of_scope: bool = False,
+    acknowledge_repeat: bool = False,
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
@@ -1858,15 +1859,12 @@ async def hub_submit_review(
     returns to running, where APPROVED lets the author take the done path and
     CHANGES_REQUESTED sends them back to hub_submit_for_review.
 
-    Finding scope (#435): every finding carries scope (in_scope|out_of_scope,
-    default in_scope). changes_requested with findings requires at least one
-    in_scope finding — if everything is out of scope, approve and keep those
-    as recommendations linked to follow-up tasks. Out-of-scope findings
-    without linked_task_id warn, non-blocking.
+    Finding scope (#435): changes_requested with findings needs at least one
+    in_scope one — all-out-of-scope means approve and keep them as linked
+    recommendations. Unlinked out_of_scope findings warn, non-blocking.
 
-    Auto-drafts (#436): create_tasks_for_out_of_scope=true creates a DRAFT
-    follow-up for every unlinked out_of_scope finding and stamps its id into
-    the finding. Drafts still need human DoR approval. Idempotent on resubmit.
+    Auto-drafts (#436): create_tasks_for_out_of_scope=true opens a DRAFT
+    follow-up per unlinked out_of_scope finding (DoR still human, idempotent).
 
     Args:
         task_id: The task under review
@@ -1880,6 +1878,8 @@ async def hub_submit_review(
             linked_task_id (int — follow-up for out_of_scope findings).
         create_tasks_for_out_of_scope: Auto-create draft follow-ups for
             unlinked out_of_scope findings (default false).
+        acknowledge_repeat: A verdict repeating the previous one word for
+            word is refused without it (#1057).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1892,6 +1892,8 @@ async def hub_submit_review(
         body["findings"] = findings
     if create_tasks_for_out_of_scope:
         body["create_tasks_for_out_of_scope"] = True
+    if acknowledge_repeat:
+        body["acknowledge_repeat"] = True
     try:
         task = await _api_post(f"/api/tasks/{task_id}/review-verdict", body)
     except HubApiError as exc:
