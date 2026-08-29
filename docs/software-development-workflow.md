@@ -1,7 +1,5 @@
 # Путь разработки ПО через Haiplane Hub
 
-Implementation roadmap: `docs/software-development-workflow-implementation-plan.md`.
-
 ## Цель
 
 Haiplane Hub должен быть общей контрольной плоскостью для работы людей и AI-агентов из Cursor. Люди формулируют намерение, утверждают готовность задач, отвечают на вопросы, принимают спорные решения и контролируют результат. Агенты помогают разбирать требования, готовить задачи, писать код, проверять изменения и возвращать отчеты в хаб.
@@ -282,7 +280,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 
 Используйте, когда hub и Cursor работают с одним локальным репозиторием:
 
-1. **Закоммитьте или stash** все незакоммиченные изменения **до** `hub_pair_start`. Git ops при создании branch делает `checkout main`, при dirty worktree — `git checkout .` и **`git clean -fd`** (см. `hub/integrations/git_ops.py`). Незакоммиченная работа может быть потеряна.
+1. **Закоммитьте или stash** все незакоммиченные изменения **до** `hub_pair_start`. Хаб ничего не удаляет: при грязном дереве pair-start **отказывает** (422), называет файлы и даёт готовую команду `git stash push -u` (см. `hub/integrations/git_ops.py`). Раньше здесь было написано, что git ops выполняет `git checkout .` и `git clean -fd` — это перестало быть правдой с #361, но текст сохранялся до #1017 и заставлял считать, что хаб уничтожает несохранённую работу.
 2. После pair-start проверьте `git branch --show-current` и поле `branch` в задаче. Если вы уже на своей dev-ветке (`task-37/pair-start`), а хаб создал другую (`task-37/<slug-from-title>`), **согласуйте вручную**: checkout ветки задачи, cherry-pick/merge или переименование — и зафиксируйте update в хабе.
 3. Работайте только в branch этой задачи (см. [workspace-safety-policy.md](workspace-safety-policy.md)).
 4. Коммиты — с ноутбука по [repository-rules.md](repository-rules.md): `feat|fix: ...`, узкие diff.

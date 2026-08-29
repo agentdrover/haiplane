@@ -12,6 +12,7 @@ import json
 import aiosqlite
 from httpx import AsyncClient
 
+from hub import auth as hub_auth
 from hub import config
 from hub import repository as repo
 from hub import services
@@ -20,7 +21,9 @@ from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
+from hub.services.model_family import family
 from hub.services.review_dispatch import (
+    _REVIEW_MODEL_PREFERENCES,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
     diff_plan,
@@ -108,6 +111,22 @@ def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
     monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
     monkeypatch.setattr(cursor_cloud, "create_review_agent", recorder)
 
+    async def _no_usage(agent_id, run_id=None):
+        # Default: the API did not answer. Sweep must not hit the network
+        # just because _wire set a fake key (#1026 stamps usage on every
+        # terminal close). Tests that care override this.
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+
+
+async def _any_dispatch_row(db: aiosqlite.Connection, task_id: int) -> dict:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    assert rows, "no dispatch recorded for the task"
+    return dict(rows[-1])
+
 
 async def _submitted(
     client: AsyncClient,
@@ -162,7 +181,10 @@ async def _submitted(
 def test_pick_review_model_prefers_another_family(monkeypatch):
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "")
     assert pick_review_model("claude-fable-5") == "grok-4.6"
-    assert pick_review_model("grok-4.5") == "gpt-5.3-codex"
+    # #1036: the preference list is now the subscription's, so a grok
+    # implementer lands on composer — still another family, and unlike
+    # gpt-5.3-codex it is a model this account can actually launch.
+    assert pick_review_model("grok-4.5") == "composer-2.5"
     assert pick_review_model("") == "grok-4.6"
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "gemini-3.1-pro")
     assert pick_review_model("claude-fable-5") == "gemini-3.1-pro"
@@ -221,15 +243,47 @@ async def test_finished_run_without_report_alerts_once(
 
     monkeypatch.setattr(cursor_cloud, "get_run", _finished)
 
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 2_500_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
     await sweep_review_dispatches(db)
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     alerts = [u for u in updates if "отчёт НЕ сдан" in u["content"]]
     assert len(alerts) == 1
     assert not await repo.list_active_review_dispatches(db)
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "failed"
+    assert closed["provider_tokens"] == 2_500_000
 
     await sweep_review_dispatches(db)
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert len([u for u in updates if "отчёт НЕ сдан" in u["content"]]) == 1
+
+
+async def test_missing_usage_leaves_dispatch_tokens_null(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1026): the API did not answer → NULL on the dispatch, not 0.
+    # A missing bill is unknown, never a free run (#549).
+    recorder = _DispatchRecorder({"agent": {"id": "bc-unk"}, "run": {"id": "run-unk"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-unknown-bill")
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+
+    await sweep_review_dispatches(db)
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "failed"
+    assert closed["provider_tokens"] is None
 
 
 async def test_usage_mismatch_is_flagged(
@@ -420,7 +474,12 @@ async def test_self_reported_overspend_follows_the_recorded_decision(
         "tokens_spent": 1_500_000,
         "raw_count": 1,
         "findings_confirmed": [
-            {"title": "off-by-one", "severity": "medium", "file": "a.py"}
+            {
+                "locator": "file",
+                "title": "off-by-one",
+                "severity": "medium",
+                "file": "a.py",
+            }
         ],
         "findings_rejected": [],
         "incomplete": False,
@@ -798,7 +857,9 @@ async def test_provider_usage_is_stored_on_the_report(
             "harness_skill": "multi-agent-review",
             "harness_version": 8,
             "raw_count": 1,
-            "findings_confirmed": [{"title": "real one", "severity": "medium"}],
+            "findings_confirmed": [
+                {"locator": "none", "title": "real one", "severity": "medium"}
+            ],
             "findings_rejected": [],
             "incomplete": False,
             "unresolved": [],
@@ -819,6 +880,11 @@ async def test_provider_usage_is_stored_on_the_report(
     saved = dict(await repo.get_latest_machine_review(db, task_id))
     assert saved["provider_tokens"] == 6_013_569
     assert saved["tokens_spent"] == 175_000, "the self-report is not overwritten"
+    closed = await _any_dispatch_row(db, task_id)
+    assert closed["status"] == "done"
+    assert closed["provider_tokens"] == 6_013_569, (
+        "the bill lives on the dispatch too — a failed run has no report row"
+    )
 
 
 # --- Repository review rules in the prompt (#873) ---------------------------
@@ -1380,3 +1446,440 @@ def test_instance_base_url_never_names_the_vendor_host(monkeypatch):
     resolved = instance_base_url()
     assert resolved, "an unconfigured hub still answers with its own bind address"
     assert "agenthai" not in resolved
+
+
+# --- Report ↔ dispatch identity (#1025) --------------------------------------
+#
+# The sweep used to accept ANY report of the right task+generation as the
+# dispatched run's own: the author's parallel report closed the hub's dispatch
+# as done, silenced the no-report alert and fed the author's numbers to the
+# usage cross-check (#1011 gen 1). The dispatch now pins the reviewer
+# principal from the TOKEN and matches reports on it — rung by rung within
+# the ladder; a dispatch without a pin (history, unresolved token, open mode)
+# keeps the old rule.
+#
+# Auth is real in these tests (open mode off): the pin resolves only where
+# intake can read the bearer — in open mode every report lands with
+# principal_id NULL, so pinning there would make the dispatch unsatisfiable.
+
+
+_FOREIGN_REPORT = {
+    "harness_skill": "lite-diff-review",
+    "raw_count": 1,
+    "findings_confirmed": [],
+    "findings_rejected": [{"title": "x", "category": "correctness", "reason": "no"}],
+    "incomplete": False,
+    "unresolved": [],
+    "lost_dimensions": [],
+    "agent": "author-run-harness",
+    "model": "claude-fable-5",
+    "tokens_spent": 1000,
+}
+
+
+async def _agent_key(db, username: str) -> tuple[int, str]:
+    """A db-backed agent principal and its plaintext API key."""
+    from hub.services import admin as admin_svc
+
+    principal = await admin_svc.create_principal(db, kind="agent", username=username)
+    key = await admin_svc.create_api_key(db, principal["id"], name=username)
+    return principal["id"], key["plaintext_key"]
+
+
+async def _pinned_setup(db, monkeypatch) -> tuple[int, str, str]:
+    """Real auth + a reviewer principal the dispatcher will pin.
+
+    Returns (reviewer_principal_id, reviewer_token, author_token). Call after
+    _wire and before _submitted — the pin resolves at dispatch creation.
+    """
+    from hub import auth as hub_auth
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    reviewer_pid, reviewer_token = await _agent_key(db, "cloud-reviewer")
+    _, author_token = await _agent_key(db, "parallel-author")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", reviewer_token)
+    return reviewer_pid, reviewer_token, author_token
+
+
+async def test_foreign_report_does_not_settle_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1025): a foreign report of the right generation leaves the
+    # dispatch waiting, skips the usage cross-check and is named in the feed
+    # exactly once.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-f1"}, "run": {"id": "run-f1"}})
+    _wire(monkeypatch, recorder)
+    expected_pid, _, author_token = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(
+        client, db, "spike-foreign", policy={"review": "dispatch"}
+    )
+    assert (await _dispatch_row(db, task_id))["reviewer_principal_id"] == expected_pid
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=_FOREIGN_REPORT,
+        headers={"Authorization": f"Bearer {author_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    usage_calls: list[str] = []
+
+    async def _usage(agent_id, run_id=None):
+        usage_calls.append(agent_id)
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    async def _running(agent_id, run_id):
+        return {"id": run_id, "status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    monkeypatch.setattr(cursor_cloud, "get_run", _running)
+
+    await sweep_review_dispatches(db)
+    assert await repo.list_active_review_dispatches(db), "dispatch keeps waiting"
+    assert not usage_calls, "a foreign report must not feed the cross-check"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert len([u for u in updates if "другого принципала" in u["content"]]) == 1, (
+        "the collision is named once, at intake"
+    )
+    assert not [u for u in updates if "расходится с данными провайдера" in u["content"]]
+
+
+async def test_own_report_settles_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1025): the pinned principal's report settles the dispatch, goes
+    # through the usage cross-check, and the provider's bill lands on THAT
+    # report's row — with no collision noise in the feed.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-f2"}, "run": {"id": "run-f2"}})
+    _wire(monkeypatch, recorder)
+    expected_pid, reviewer_token, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-own", policy={"review": "dispatch"})
+
+    own = dict(_FOREIGN_REPORT, agent="cloud-reviewer", model="grok-4.6")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=own,
+        headers={"Authorization": f"Bearer {reviewer_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["principal_id"] == expected_pid, "owner recorded from the token"
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+    await sweep_review_dispatches(db)
+    assert not await repo.list_active_review_dispatches(db), "dispatch settles"
+    stamped = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stamped["provider_tokens"] == 100_000, "the bill lands on the matched row"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "расходится с данными провайдера" in u["content"]]
+    assert not [u for u in updates if "другого принципала" in u["content"]]
+    assert not [u for u in updates if "Второй отчёт" in u["content"]], (
+        "the dispatched run's own report must pass without ceremony"
+    )
+
+
+async def test_grace_alert_fires_despite_foreign_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1025): the exact #1011 shape — terminal run, only a foreign
+    # report, grace expired. The safety net must fire instead of being
+    # silenced by the foreign report.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-f3"}, "run": {"id": "run-f3"}})
+    _wire(monkeypatch, recorder)
+    _, _, author_token = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-grace", policy={"review": "dispatch"})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=_FOREIGN_REPORT,
+        headers={"Authorization": f"Bearer {author_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+
+    await sweep_review_dispatches(db)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert len([u for u in updates if "отчёт НЕ сдан" in u["content"]]) == 1
+    assert not await repo.list_active_review_dispatches(db)
+
+
+async def test_top_up_ignores_foreign_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1025): a foreign incomplete report buys no top-up; the pinned
+    # run's own incomplete report still does — and the deep rung then waits
+    # for ITS OWN report instead of settling on the lite one.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-f4"}, "run": {"id": "run-f4"}})
+    _wire(monkeypatch, recorder)
+    _, reviewer_token, author_token = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-topup", policy={"review": "dispatch"})
+    assert len(recorder.calls) == 1
+
+    foreign = dict(_FOREIGN_REPORT, incomplete=True)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=foreign,
+        headers={"Authorization": f"Bearer {author_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(recorder.calls) == 1, "no ladder step on a foreign declaration"
+
+    own = dict(
+        _FOREIGN_REPORT, incomplete=True, agent="cloud-reviewer", model="grok-4.6"
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=own,
+        headers={"Authorization": f"Bearer {reviewer_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(recorder.calls) == 2, "our own incomplete run buys the deep top-up"
+
+    # Both rungs pin the same principal. The lite report must settle only
+    # the lite rung — before rung-ordered matching the SAME report settled
+    # the deep dispatch too, before its run ever reported (#1025 review).
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    async def _running(agent_id, run_id):
+        return {"id": run_id, "status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    monkeypatch.setattr(cursor_cloud, "get_run", _running)
+
+    await sweep_review_dispatches(db)
+    active = [dict(r) for r in await repo.list_active_review_dispatches(db)]
+    assert len(active) == 1, "the deep rung keeps waiting for its own report"
+    settled = await repo.get_settled_review_dispatch(db, task_id, 1)
+    assert settled is not None and int(dict(settled)["id"]) != int(active[0]["id"])
+
+
+async def test_open_mode_pins_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1029): open mode never reads the bearer, so every report lands
+    # with principal_id NULL. Pinning a dispatch there would make it
+    # unsatisfiable — its own reviewer's report would be flagged foreign and
+    # the dispatch would die by a FALSE "отчёт НЕ сдан". So no pin is taken,
+    # and the old task+generation rule stands: degradation must never be
+    # worse than the behaviour it degrades from.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-om"}, "run": {"id": "run-om"}})
+    _wire(monkeypatch, recorder)
+    # A resolvable reviewer key EXISTS in the db — the only thing missing is
+    # an auth mode that would let a report carry its owner.
+    _, reviewer_token = await _agent_key(db, "cloud-reviewer")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", reviewer_token)
+    assert hub_auth._is_open_mode(), "the fixture client runs in open mode"
+
+    task_id = await _submitted(
+        client, db, "spike-openmode", policy={"review": "dispatch"}
+    )
+    dispatch = await _dispatch_row(db, task_id)
+    assert dispatch["reviewer_principal_id"] is None, "no pin under open mode"
+
+    # And the legacy rule still settles the dispatch: any report of the
+    # generation counts, exactly as before #1025.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review", json=_FOREIGN_REPORT
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+    await sweep_review_dispatches(db)
+    assert not await repo.list_active_review_dispatches(db), "legacy rule settles"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "другого принципала" in u["content"]], (
+        "an unpinned dispatch must not accuse anyone of being foreign"
+    )
+
+
+# --- Report delivered in the run's own text (#1036) --------------------------
+#
+# Since 22.08 Cursor stops delivering the hub's MCP into cloud runs: verified
+# on grok-4.6, grok-4.5, composer-2.5 and default, and through GetDynamicTools,
+# whose catalog does not list the server at all. The reviewers still work — the
+# findings just die in the final text. So the text becomes a second, weaker
+# delivery path, and its weakness is recorded rather than smoothed over.
+
+
+def _report_block(**over) -> str:
+    payload = {
+        "raw_count": 2,
+        "incomplete": False,
+        "findings_confirmed": [
+            {
+                "title": "race on retry",
+                "severity": "medium",
+                "category": "correctness",
+                "locator": "lines",
+                "file": "hub/a.py",
+                "start_line": 10,
+            }
+        ],
+        "findings_rejected": [],
+        "unresolved": [],
+        "lost_dimensions": [],
+        "harness_skill": "lite-diff-review",
+        "tokens_spent": 40000,
+        "model": "grok-4.6",
+        "orchestrator": "cursor-cloud",
+    }
+    payload.update(over)
+    return (
+        "Прочитал дифф, ревью выполнено.\n\n"
+        "```haiplane-review\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+    )
+
+
+async def _finished_run_with(monkeypatch, text: str) -> None:
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED", "result": text}
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 900_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+
+async def _expire_grace(db) -> None:
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+
+async def test_report_recovered_from_run_result(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1036): a finished run with no contract report, but a valid block
+    # in its text — the report is stored, marked as transcribed, and the
+    # dispatch settles instead of failing.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r1"}, "run": {"id": "run-r1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-rec", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["raw_count"] == 2
+    assert saved["principal_id"] == reviewer_pid, "owner is the dispatch's reviewer"
+    assert saved["orchestrator"].startswith("cursor-cloud-result"), (
+        "origin must live in the data, not only in a feed line"
+    )
+    assert not await repo.list_active_review_dispatches(db), "dispatch settles"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "восстановлен из текста" in u["content"]]
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+
+
+async def test_unparsable_result_is_kept_as_text_not_invented(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1036): prose without a block stores NOTHING. The text survives in
+    # the feed and the dispatch fails exactly as before — "could not read" must
+    # never become "read and clean".
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r2"}, "run": {"id": "run-r2"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-prose", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(
+        monkeypatch,
+        "Нашёл две проблемы: гонка в ретраях и незакрытый файл. Отчёт сдать "
+        "не смог, MCP не примонтирован.",
+    )
+
+    await sweep_review_dispatches(db)
+
+    assert await repo.get_latest_machine_review(db, task_id) is None, (
+        "findings must never be invented out of prose"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "нет разбираемого блока" in u["content"]]
+    assert [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+    assert not await repo.list_active_review_dispatches(db), (
+        "the dispatch still fails — nothing was recovered"
+    )
+
+
+async def test_mcp_report_wins_over_result_fallback(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1036): when the contract path worked, the text is not read at all
+    # — one submission must not end up with two reports.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r3"}, "run": {"id": "run-r3"}})
+    _wire(monkeypatch, recorder)
+    _, reviewer_token, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-both", policy={"review": "dispatch"})
+
+    own = dict(_FOREIGN_REPORT, agent="cloud-reviewer", model="grok-4.6")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json=own,
+        headers={"Authorization": f"Bearer {reviewer_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block(raw_count=99))
+
+    await sweep_review_dispatches(db)
+
+    rows = await repo.machine_reviews_of_generation(db, task_id, 1)
+    assert len(rows) == 1, "the contract report stands alone"
+    assert dict(rows[0])["raw_count"] != 99
+
+
+async def test_recovered_report_settles_its_own_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1036): the transcribed report must read as the dispatch's OWN on
+    # the next pass too — a foreign-looking one would raise the false "report
+    # not submitted" alert this area already fixed once (#1025).
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r4"}, "run": {"id": "run-r4"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "spike-own2", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+    await sweep_review_dispatches(db)  # second pass must find nothing to do
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+    assert not [u for u in updates if "другого принципала" in u["content"]]
+    assert len([u for u in updates if "восстановлен из текста" in u["content"]]) == 1
+
+
+def test_pick_review_model_stays_within_available_models(monkeypatch):
+    # AC-5 (#1036): every preference must be a model the account can actually
+    # launch. Before this, a grok implementer sent the diversity rule to
+    # gpt-5.3-codex, which refuses at creation with usage_limit_exceeded.
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "")
+    available = {"grok-4.6", "grok-4.5", "composer-2.5"}
+
+    assert set(_REVIEW_MODEL_PREFERENCES) <= available
+    assert pick_review_model("claude-opus-5") in available
+    grok_reviewer = pick_review_model("grok-4.6")
+    assert grok_reviewer in available
+    assert family(grok_reviewer) != family("grok-4.6"), "diversity still holds"

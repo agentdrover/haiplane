@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.db import fetchall, get_db, log_activity
+from hub.db import get_db, log_activity
 from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -75,6 +75,8 @@ from hub.models import (
     TaskProjectRef,
     MachineReviewSubmit,
     MachineReviewView,
+    StewardJudgementSubmit,
+    StewardJudgementView,
     CategoryCheckSubmit,
     CloneBranchState,
     FindingDispositionsSubmit,
@@ -337,7 +339,7 @@ def _reject_agent_authored_source(request: Request, source: TaskSource) -> None:
     ``source=agent`` stays open to agents: that is the path hub_propose_task
     itself takes.
     """
-    if source != TaskSource.agent and current_identity(request).is_agent:
+    if source != TaskSource.agent and not current_identity(request).is_human:
         raise HTTPException(403, detail=agent_create_forbidden_detail())
 
 
@@ -378,7 +380,7 @@ async def _chat_pair_issuer(request: Request) -> int:
     make the operator's browser burn their live code.
     """
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
 
     if _extract_bearer(request) is None:
@@ -656,10 +658,12 @@ async def api_create_project(
     db = _db(request)
     import json as _json
 
-    if identity.is_agent and config.ALLOW_AGENT_PROJECTS != "direct":
-        status_value = "pending"
-    else:
+    if identity.is_human or (
+        identity.is_agent and config.ALLOW_AGENT_PROJECTS == "direct"
+    ):
         status_value = "active"
+    else:
+        status_value = "pending"
     # Write lock serializes check-then-insert: two concurrent creates with the
     # same slug would otherwise both pass the SELECT and the second INSERT
     # would surface as IntegrityError → 500 instead of the promised 409.
@@ -932,7 +936,7 @@ async def api_create_skill(
     import json as _json
 
     db = _db(request)
-    status_value = "draft" if identity.is_agent else "active"
+    status_value = "active" if identity.is_human else "draft"
     skill_id, version = await repo.create_skill_version(
         db,
         name=body.name,
@@ -976,7 +980,9 @@ async def api_activate_skill(
     if row is None:
         raise HTTPException(404, "skill version not found")
     if row["status"] != "active":
-        await repo.activate_skill_version(db, name, version)
+        await repo.activate_skill_version(
+            db, name, version, activated_by=_identity.username
+        )
         await repo.insert_event(
             db,
             kind="skill_activated",
@@ -1462,6 +1468,10 @@ async def api_task_context(
         task_view.project = TaskProjectRef(
             id=project_row["id"], slug=project_row["slug"]
         )
+    # #989: /context skipped enrich_task_view, so GET filling the field
+    # was not enough — name the live pair tree on both surfaces.
+    task_view = await services.apply_live_worktree(db, task_view)
+    worktree_advisory = await services.worktree_session_advisory(db, task_view)
 
     # --- Readiness summary. Reuse the same calculator as /readiness so
     # /context and /readiness can never drift.
@@ -1508,6 +1518,10 @@ async def api_task_context(
         f"Type: {task.get('task_type', 'task')} | Status: {task['status']} "
         f"| Priority: {task.get('priority', 'medium')}"
     )
+    if task_view.worktree_path:
+        lines.append(f"Worktree: {task_view.worktree_path}")
+    if worktree_advisory:
+        lines.append(worktree_advisory)
     if progress:
         lines.append(
             f"Progress: {progress['completed']}/{progress['total']} "
@@ -1647,191 +1661,20 @@ async def api_submit_machine_review(
     Bound to the task's CURRENT submission generation — resubmitting work
     makes the report stale, exactly like human verdicts (#305). Informs
     the human verdict; never replaces it.
-    """
-    import json as _json
 
-    db = _db(request)
-    row = await repo.get_task(db, task_id)
-    if row is None:
-        raise HTTPException(404, "task not found")
-    task = dict(row)
-    generation = task.get("submission_generation") or 0
-    if generation == 0:
-        raise HTTPException(
-            400,
-            "no submission to review: submit_for_review must run at least once",
-        )
-    # raw_count is self-reported and was stored unchecked, so reports arrived
-    # claiming fewer raw findings than the findings they themselves listed —
-    # on production one had raw_count=0 alongside two confirmed findings
-    # (#519). Normalised upward rather than rejected: the recorded risk asks
-    # not to break existing clients, and a report with a miscounted header is
-    # still worth keeping — its findings are real.
-    adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
-    raw_count = body.raw_count
-    if raw_count < adjudicated:
-        log.warning(
-            "machine review for task #%s: raw_count=%s is below the %s findings "
-            "it lists; normalised upward",
-            task_id,
-            raw_count,
-            adjudicated,
-        )
-        raw_count = adjudicated
-    # #807: the profile is taken from the DISPATCH, not from the report — a
-    # run's own claim about how thoroughly it ran is exactly the evidence
-    # #750 showed to be worthless. No dispatch behind the report leaves the
-    # profile empty, which reads as "unknown", not as "cheap".
-    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
-    profile = (dispatch["profile"] if dispatch is not None else "") or ""
-    # #807 forced incomplete=true on a lite run whose SELF-REPORTED spend
-    # reached the ceiling. Removed in #893: it never once fired, and could
-    # not. Eleven runs measured against the provider's bill cost 777k-6.0M
-    # while reporting 25k-312k — the report's own number missed the bill by
-    # 12-62x every time, so a run that burned 1.5M and declared 36k sailed
-    # through as complete. A guard that reads the checked party's estimate of
-    # itself is not a guard; keeping it would only say we have one.
-    #
-    # Coverage honesty stays, and it never depended on the number: the
-    # reviewer declares which files it did not read, and that IS checkable
-    # against the diff. The provider-vs-self gap keeps being recorded as an
-    # audit signal (#828), where it belongs — beside the numbers, not
-    # pretending to bound them.
-    incomplete = body.incomplete
-    # #728: the twin of the human path's guard. hub_submit_review refuses a
-    # verdict from the implementer and the brief warns before the effort is
-    # spent, while this door had no check at all — so the rule was bypassable
-    # by choosing it, and the operator said what that bought: "для аудита
-    # слабо, для пропуска в очередь — ок".
-    #
-    # Recorded rather than refused: the statement rules out removing machine
-    # review as a queue mechanism, and a report of one's own work is still
-    # worth keeping — its findings are real. What must never happen is that it
-    # passes for an independent one, so the fact travels with it (and the
-    # auto-verdict acts on it). Same definition of "implementer" as the verdict
-    # gate — caller_implemented_task — not a second one that could drift.
-    #
-    # From the TOKEN, never from submitted_by: that field is written below as
-    # `body.agent or identity.username`, i.e. the caller names itself, and a
-    # guard reading the checked party's account of itself is not a guard (#893).
-    self_reviewed = services.caller_implemented_task(
-        task,
+    The work lives in services.machine_review_intake since #1036: the sweep
+    records reports too, when a cloud run leaves one in its text instead of
+    calling this route, and two write paths for one fact drift apart.
+    """
+    from hub.services.machine_review_intake import record_machine_review
+
+    return await record_machine_review(
+        _db(request),
+        task_id,
+        body,
         principal_id=identity.principal_id,
         username=identity.username,
     )
-    await repo.insert_machine_review(
-        db,
-        task_id=task_id,
-        submission_generation=generation,
-        profile=profile,
-        self_reviewed=self_reviewed,
-        harness_skill=body.harness_skill,
-        harness_version=body.harness_version,
-        agent_count=body.agent_count,
-        tokens_spent=body.tokens_spent,
-        duration_ms=body.duration_ms,
-        orchestrator=body.orchestrator,
-        model=body.model,
-        raw_count=raw_count,
-        findings_confirmed=_json.dumps(
-            [f.model_dump(exclude_none=True) for f in body.findings_confirmed],
-            ensure_ascii=False,
-        ),
-        findings_rejected=_json.dumps(
-            [f.model_dump(exclude_none=True) for f in body.findings_rejected],
-            ensure_ascii=False,
-        ),
-        submitted_by=(body.agent or identity.username)[:100],
-        incomplete=incomplete,
-        unresolved=_json.dumps(
-            [f.model_dump(exclude_none=True) for f in body.unresolved],
-            ensure_ascii=False,
-        ),
-        lost_dimensions=_json.dumps(body.lost_dimensions, ensure_ascii=False),
-    )
-    await repo.insert_event(
-        db,
-        kind="machine_review_completed",
-        task_id=task_id,
-        actor=(body.agent or identity.username)[:100],
-        payload={
-            "confirmed": len(body.findings_confirmed),
-            "rejected": len(body.findings_rejected),
-            "raw": raw_count,
-            "generation": generation,
-        },
-    )
-    # #750: a report that surfaced NO candidates, ran ONE agent and counted
-    # NO tokens is the shape of a harness that never actually ran — 60 such
-    # reports landed in 36 minutes on 2026-08-19 (cursor_cloud), silently
-    # gutting the filtration metrics and, later, the auto-verdict (#745
-    # already refuses raw_count=0). Warned once per generation, never
-    # refused: the report itself is still worth keeping as evidence.
-    if raw_count == 0:
-        prior_zero = await fetchall(
-            db,
-            "SELECT COUNT(*) AS n FROM machine_reviews "
-            "WHERE task_id=? AND submission_generation=? AND raw_count=0",
-            (task_id, generation),
-        )
-        if int(prior_zero[0]["n"]) == 1:
-            single_agent = (body.agent_count or 0) <= 1
-            no_tokens = body.tokens_spent is None
-            detail = (
-                "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
-                if single_agent and no_tokens
-                else "проверьте, что фазы измерений и адъюдикации исполнялись"
-            )
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                (
-                    "Machine-review с raw_count=0: ноль кандидатов — это "
-                    f"отсутствие данных, а не отсутствие находок; {detail}. "
-                    "Отчёт принят, но автовердикт по нему невозможен, а "
-                    "«чисто» не подтверждено (#750)."
-                ),
-            )
-    await db.commit()
-    await db_module.log_activity(
-        db,
-        "machine_review_completed",
-        f"Task #{task_id}: machine review — {raw_count} raw → "
-        f"{len(body.findings_confirmed)} confirmed, "
-        f"{len(body.findings_rejected)} rejected",
-    )
-    saved = _row_or_404(
-        await repo.get_latest_machine_review(db, task_id), "machine review not found"
-    )
-    view = MachineReviewView(**dict(saved))
-    view.is_current = view.submission_generation == generation
-
-    # Auto-verdict (#745): a clean report in a project whose policy allows
-    # it gets its APPROVED right here. Best-effort by contract — the report
-    # intake must never fail because the autopilot stumbled.
-    try:
-        from hub.services.auto_verdict import maybe_auto_verdict
-
-        await maybe_auto_verdict(db, task_id)
-    except Exception:  # noqa: BLE001 - degradation is the contract
-        log.exception("auto-verdict failed for task #%s", task_id)
-
-    # The ladder (#879): a cheap run that declared it did not finish buys the
-    # heavy profile instead of handing a human unfinished work. After the
-    # auto-verdict, not before — an incomplete report can never earn one
-    # (auto_verdict refuses on `incomplete`), so the order costs nothing and
-    # keeps the clean path first. Best-effort like the verdict above: the
-    # report intake must not fail because the ladder stumbled.
-    try:
-        from hub.services.review_dispatch import maybe_top_up_incomplete
-
-        await maybe_top_up_incomplete(db, task_id)
-    except Exception:  # noqa: BLE001 - degradation is the contract
-        log.exception("review top-up failed for task #%s", task_id)
-
-    return view
 
 
 @app.post("/api/tasks/{task_id}/review-verdict", response_model=TaskView)
@@ -2044,6 +1887,39 @@ async def api_ci_run_report(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     return CIRunReportResult(**result)
+
+
+@app.get("/api/tasks/{task_id}/steward-evidence")
+async def api_steward_evidence(
+    task_id: int,
+    _identity=Depends(require_permission("steward.evidence.read")),
+):
+    """Read the evidence pack. Assembly is #996; this task only names the door."""
+    raise HTTPException(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        f"steward evidence pack for task {task_id} is assembled in #996",
+    )
+
+
+@app.post(
+    "/api/tasks/{task_id}/steward-judgement",
+    response_model=StewardJudgementView,
+)
+async def api_steward_judgement(
+    task_id: int,
+    body: StewardJudgementSubmit,
+    request: Request,
+    identity=Depends(require_permission("steward.judgement.write")),
+):
+    """Record a structured steward judgement (#1022).
+
+    Closed dictionaries, no silent verdict default, at-most-once on
+    (task_id, generation, kind). The task is not transitioned here — applying
+    the judgement is F4.
+    """
+    return await services.record_steward_judgement(
+        _db(request), task_id, body, identity
+    )
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)
@@ -2324,7 +2200,7 @@ async def api_inbox(
             agent=identity.username,
             principal_id=identity.principal_id,
             session_id=session_id,
-            is_human=not identity.is_agent,
+            is_human=identity.is_human,
             limit=limit,
         )
     return await services.inbox(

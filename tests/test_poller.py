@@ -7,6 +7,7 @@ import pytest
 
 from hub import config
 from hub import repository as repo
+from hub.db import fetchall
 from hub import services
 from hub.integrations.noop import NoopDispatch, NoopGitOps
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
@@ -206,7 +207,7 @@ async def test_poll_headless_approved_converges_on_gate_transition(mock_sleep, d
     # gate-checked transition as external submit_review — verdict stays
     # bound to the completed submission (no generation bump).
     task_id = await _make_review_task(db)
-    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await repo.record_review_verdict(db, task_id, "approved")
     await db.commit()
 
     mock_dispatch = NoopDispatch()
@@ -456,17 +457,30 @@ async def test_poll_uses_persisted_verdict_without_text_scan(mock_sleep, db):
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
-async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
-    # AC-2 (#326): no persisted verdict → the old text channel still works.
+async def test_scanned_verdict_does_not_complete(mock_sleep, db):
+    """#1019 AC-2: an APPROVED found by scanning text does not open delivery.
+
+    This replaces #326's test of the opposite contract — the text channel used
+    to complete a task on its own. The line below is the kind that made that
+    dangerous: a reviewer QUOTING what they found in someone else's log, whose
+    last word happens to be "approved". No string match can tell that from a
+    verdict, and the consequence of guessing wrong is a merge.
+    """
     task_id = await _make_review_task(db)
-    await repo.add_task_update(db, task_id, "reviewer", "review", "ok\nAPPROVED")
+    await repo.update_task(db, task_id, pr_number=77, branch="task-x/b")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "reviewer",
+        "review",
+        "Нашёл в логе чужой задачи строку status=approved",
+    )
     await db.commit()
 
-    mock_dispatch = NoopDispatch()
-    mock_dispatch.get_job = MagicMock(
-        return_value={"status": "completed", "exit_code": 0}
-    )
-    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.merge_pr = AsyncMock(return_value=True)
+    plugins.git_ops = mock_git
+    plugins.dispatch = _completed_job_dispatch()
 
     with (
         patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
@@ -475,8 +489,67 @@ async def test_poll_falls_back_to_text_scan_for_legacy_reviewer(mock_sleep, db):
         await _poll_running_tasks(_make_app(db))
 
     d = dict(await repo.get_task(db, task_id))
-    assert d["status"] == "completed"
-    assert d["review_verdict"] == "approved"
+    assert d["status"] == "needs_decision"
+    assert not d["review_verdict"]  # never recorded as a verdict
+    mock_git.merge_pr.assert_not_awaited()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_scanned_verdict_quotes_its_basis(mock_sleep, db):
+    """#1019 AC-3: the alert shows WHAT was taken for a verdict, and from where.
+
+    Naming only the fact ("no verdict") leaves the person to go looking for the
+    text themselves — in a log they may not be able to read.
+    """
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "итог обсуждения: approved"
+    )
+    await db.commit()
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    updates = [dict(r) for r in await repo.get_task_updates(db, task_id)]
+    alerts = [u["content"] for u in updates if u["kind"] == "alert"]
+    assert any("итог обсуждения: approved" in a for a in alerts)
+    assert any("апдейт ревью" in a for a in alerts)
+
+    events = [dict(r) for r in await repo.list_events(db, since=0)]
+    reasons = [e["payload"] for e in events if e["kind"] == "needs_decision"]
+    assert any("scanned_approval_not_a_verdict" in str(p) for p in reasons)
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_scanned_changes_requested_still_returns_the_work(mock_sleep, db):
+    """#1019: only the approving direction is refused.
+
+    A false positive here costs a round of rework; the same false positive on
+    the approving side costs a merge. The task's constraint says so explicitly,
+    and this test is what keeps the two from being treated alike.
+    """
+    task_id = await _make_review_task(db)
+    await repo.add_task_update(
+        db, task_id, "reviewer", "review", "verdict: CHANGES_REQUESTED"
+    )
+    await db.commit()
+    plugins.dispatch = _completed_job_dispatch()
+
+    with (
+        patch("hub.poller.services.dispatch_fix", new_callable=AsyncMock) as fix,
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(_make_app(db))
+
+    d = dict(await repo.get_task(db, task_id))
+    assert d["review_verdict"] == "changes_requested"
+    assert d["status"] != "needs_decision"
+    fix.assert_awaited()
 
 
 async def test_events_pruning(db):
@@ -1186,7 +1259,7 @@ async def test_approved_merge_targets_the_projects_repo(mock_sleep, db):
     )
     task_id = await _make_review_task(db)
     await repo.update_task(db, task_id, project_id=pid, pr_number=99, branch="task-x/b")
-    await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    await repo.record_review_verdict(db, task_id, "approved")  # submitted, not scanned
     await db.commit()
 
     mock_git = NoopGitOps()
@@ -1303,6 +1376,12 @@ async def _approved_task_with_pr(db, *, pr_number=99):
     task_id = await _make_review_task(db)
     await repo.update_task(db, task_id, pr_number=pr_number, branch="task-x/b")
     await repo.add_task_update(db, task_id, "reviewer", "review", "LGTM\nAPPROVED")
+    # The approval these tests stand on is the submitted one (#1019). It used to
+    # come from the review text above, which the poller no longer reads as a
+    # verdict — so a fixture built on the text would have quietly stopped
+    # approving anything, and every merge test below would have passed by
+    # never reaching a merge.
+    await repo.record_review_verdict(db, task_id, "approved")
     await db.commit()
     return task_id
 
@@ -2096,3 +2175,438 @@ async def test_expired_claim_restores_workspace_base(db):
     cursor = await db.execute("SELECT status FROM tasks")
     assert [r["status"] for r in await cursor.fetchall()] == ["open", "open"]
     assert restore.await_count == 2
+
+
+# --- Worktrees of finished tasks (#1033) ------------------------------------
+#
+# 189 directories had piled up on production, some a week old. Since #989 the
+# hub names a worktree to an agent exactly when the directory exists, so an
+# abandoned tree is a live path to a forgotten branch — not disk noise.
+
+
+class _WorktreeSpy(NoopGitOps):
+    """Records removals and answers whether a tree is 'on disk'."""
+
+    def __init__(self, path: str, removable: bool = True) -> None:
+        self._path = path
+        self._removable = removable
+        self.removed: list[int] = []
+
+    def worktree_path(self, task_id: int, repo: str | None = None) -> str:
+        return self._path
+
+    async def pair_remove_worktree(self, task_id: int, *, repo: str | None = None):
+        self.removed.append(task_id)
+        return self._removable
+
+
+async def _finished_task(db, *, status: str, finished_days_ago: float) -> int:
+    task_id = await repo.create_task(
+        db,
+        title="tree owner",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status=status,
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', ?) WHERE id = ?",
+        (f"-{finished_days_ago} days", task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _sweep_with(db, monkeypatch, tmp_path, spy_factory, task_id: int):
+    from hub.poller import _sweep_stale_worktrees
+
+    tree = tmp_path / f"task-{task_id}"
+    tree.mkdir(exist_ok=True)
+    spy = spy_factory(str(tree))
+    monkeypatch.setattr(plugins, "git_ops", spy)
+    await _sweep_stale_worktrees(db)
+    return spy
+
+
+async def test_stale_worktree_of_completed_task_is_removed(db, monkeypatch, tmp_path):
+    # AC-1 (#1033): finished long enough ago, tree on disk and clean — retired.
+    task_id = await _finished_task(db, status="completed", finished_days_ago=10)
+
+    spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+    assert spy.removed == [task_id]
+
+
+async def test_live_task_worktree_is_never_removed(db, monkeypatch, tmp_path):
+    # AC-2 (#1033): a non-terminal status protects the tree at any age. The
+    # rule lives in the query, so "still working" can never be forgotten by a
+    # caller.
+    for status in ("running", "review"):
+        task_id = await _finished_task(db, status=status, finished_days_ago=30)
+
+        spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+        assert spy.removed == [], f"{status} must keep its worktree"
+
+
+async def test_recently_completed_task_keeps_its_worktree(db, monkeypatch, tmp_path):
+    # AC-4 (#1033): inside the retention window the tree stays. This is the
+    # case the window exists for — on 28.08 review findings twice arrived
+    # after the verdict had merged, and the fix lived in that tree.
+    task_id = await _finished_task(db, status="completed", finished_days_ago=1)
+
+    spy = await _sweep_with(db, monkeypatch, tmp_path, _WorktreeSpy, task_id)
+
+    assert spy.removed == []
+
+
+async def test_dirty_worktree_survives_cleanup_and_says_why(
+    db, monkeypatch, tmp_path, caplog
+):
+    # AC-3 (#1033): pair_remove_worktree refuses a dirty tree; the sweep must
+    # keep it and say so out loud. Somebody's unsaved work is not an error to
+    # retry away.
+    import logging
+
+    task_id = await _finished_task(db, status="completed", finished_days_ago=10)
+
+    def dirty(path: str) -> _WorktreeSpy:
+        return _WorktreeSpy(path, removable=False)
+
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        spy = await _sweep_with(db, monkeypatch, tmp_path, dirty, task_id)
+
+    assert spy.removed == [task_id], "it was attempted"
+    assert any(f"#{task_id} kept" in rec.getMessage() for rec in caplog.records), (
+        "the refusal must be visible, not swallowed"
+    )
+
+
+async def test_absent_directory_costs_no_git_call(db, monkeypatch, tmp_path):
+    # A finished task whose tree is already gone must not buy a git call on
+    # every poll: with 189 rows in the backlog that is the difference between
+    # a sweep and a stall.
+    await _finished_task(db, status="completed", finished_days_ago=10)
+    from hub.poller import _sweep_stale_worktrees
+
+    spy = _WorktreeSpy(str(tmp_path / "never-created"))
+    monkeypatch.setattr(plugins, "git_ops", spy)
+
+    await _sweep_stale_worktrees(db)
+
+    assert spy.removed == []
+
+
+# --- A transcribed log passage is not a done report (#1018) ------------------
+#
+# When a headless job finished without a done report, the poller took the last
+# long passage out of the dispatch log and stored it as kind='done'. From there
+# it was indistinguishable from a real report and opened the whole git tail —
+# commit, squash, push, create_pr — plus a reviewer run of up to 300k tokens
+# over work nobody said was finished. The passage is chosen by LENGTH, and
+# length cannot tell a report from a thought about what to do next.
+#
+# Measured on production before the change (30 days): zero. Not because the
+# selection is good — because the headless path was not used at all: no task
+# carried a job_id and the log holds no such line. So this closes the door
+# before anyone walks through it, and the "tasks will queue up in the inbox"
+# risk is zero tasks today.
+
+
+async def _headless_task(db, *, title: str) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="running",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, job_id=f"job-{task_id}")
+    await db.commit()
+    return task_id
+
+
+def _dispatch_with_log(passage: str) -> NoopDispatch:
+    mock = NoopDispatch()
+    mock.get_job = MagicMock(
+        return_value={"status": "completed", "exit_code": 0, "result_text": "ok"}
+    )
+    mock.job_log_full = MagicMock(return_value=passage)
+    return mock
+
+
+_LONG_THOUGHT = "\n".join(
+    [
+        '{"type":"assistant","subtype":"start"}',
+        '  "text": "Смотрю тест страничного обхода и не понимаю, почему он '
+        'зелёный на мутации."',
+        '  "text": "Дальше нужно решить, чинить ли гонку в ретраях здесь или '
+        "вынести в отдельную задачу. Скорее всего вынести: правка задевает три "
+        'модуля, а бюджета на прогон уже нет."',
+    ]
+)
+
+
+async def test_synthetic_done_routes_to_pending_report(db, monkeypatch):
+    # AC-2: the job finished, the log has a long passage, the agent said
+    # nothing. The task must wait for a human, and no git step may run.
+    from hub.poller import _sweep_running_dispatch
+
+    task_id = await _headless_task(db, title="died mid-task")
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    forbidden: list[str] = []
+    for step in ("auto_commit", "squash_branch", "push_branch", "create_pr"):
+
+        async def refuse(*a, _step=step, **kw):
+            forbidden.append(_step)
+            return None
+
+        monkeypatch.setattr(plugins.git_ops, step, refuse, raising=False)
+
+    # TWICE on purpose, and through the sweep itself rather than the poll loop:
+    # one pass proves little, because has_done is read BEFORE the passage is
+    # stored. A transcription that kept full report rights would route
+    # correctly this time and open the conveyor on the NEXT pass — which is the
+    # exact shape being closed, so the test has to reach it.
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        for _ in range(2):
+            await repo.update_task(db, task_id, status="running")
+            await db.commit()
+            await _sweep_running_dispatch(db)
+            assert dict(await repo.get_task(db, task_id))["status"] == (
+                "pending_report"
+            )
+
+    assert forbidden == [], f"the git tail must stay shut, ran: {forbidden}"
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_synthetic_done_is_flagged_in_db(mock_sleep, db):
+    # AC-3: the passage is KEPT — a person in the inbox wants it — but it is
+    # queryable as unclaimed. A phrase inside the text would not be a flag:
+    # it could not be asked for, and a rule nobody can check is not a rule.
+    task_id = await _headless_task(db, title="flag me")
+    app = _make_app(db)
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(app)
+
+    rows = [
+        dict(r)
+        for r in await fetchall(
+            db,
+            "SELECT content, agent_claimed FROM task_updates "
+            "WHERE task_id=? AND kind='done'",
+            (task_id,),
+        )
+    ]
+    assert len(rows) == 1
+    assert rows[0]["agent_claimed"] == 0, "the transcription must be queryable"
+    assert "чинить ли гонку" in rows[0]["content"], "the text itself is kept"
+    assert not await repo.has_done_updates(db, task_id), (
+        "and it must not answer 'did the agent report done?'"
+    )
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_real_done_report_still_reaches_ci_check(mock_sleep, db):
+    # AC-4: nothing moves for a real report. The agent claimed it, so the
+    # conveyor runs exactly as before.
+    task_id = await _headless_task(db, title="properly reported")
+    await repo.add_task_update(db, task_id, "dev", "done", "All done, tests green")
+    await db.commit()
+    app = _make_app(db)
+    plugins.dispatch = _dispatch_with_log(_LONG_THOUGHT)
+
+    with (
+        patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock),
+        pytest.raises(_BreakLoop),
+    ):
+        await _poll_running_tasks(app)
+
+    assert dict(await repo.get_task(db, task_id))["status"] != "pending_report"
+    assert await repo.has_done_updates(db, task_id)
+
+
+# --- #1020: the human queue gets hours -------------------------------------
+#
+# Every clock in the poller above watches a machine, which escalates by
+# itself. The statuses where work actually waits had one lifetime alert and
+# then silence, so a task could stand for a month (production #404 has stood
+# in needs_info since 20 July) with nothing but a person's eye on the board to
+# find it — the very resource the queue is short of.
+
+
+async def _waiting_task(db, *, status="needs_decision", hours=25) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=f"Waiting in {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await _set_wait_age(db, task_id, hours)
+    return task_id
+
+
+async def _set_wait_age(db, task_id: int, hours: int) -> None:
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', ?) WHERE id=?",
+        (f"-{hours} hours", task_id),
+    )
+    await db.commit()
+
+
+async def _reminders(db, task_id: int) -> list[dict]:
+    rows = await fetchall(
+        db,
+        "SELECT rung, age_minutes FROM human_queue_reminders "
+        "WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_human_owned_reminder_ladder(db):
+    """#1020 AC-1: past 24h the queue speaks once, and says what it waits for."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+
+    await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h"]
+    events = await _events_for(db, task_id, "human_queue_reminder")
+    assert len(events) == 1
+    payload = str(events[0]["payload"])
+    assert "hub_decide_task" in payload  # the action, not just the age
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"  # volume only: nothing moved
+
+
+async def test_reminder_dedup_per_step(db):
+    """#1020 AC-2: dozens of passes inside one rung stay silent.
+
+    The alert this replaces deduped on "has any alert at all", which is why a
+    task that went quiet for a week never got a second word (#443). Dedup here
+    is per RUNG, so silence still climbs.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_info", hours=30)
+
+    for _ in range(12):
+        await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h"]
+    assert len(await _events_for(db, task_id, "human_queue_reminder")) == 1
+
+
+async def test_ladder_three_steps(db):
+    """#1020 AC-3: a day, three days, a week — three reminders, each its own."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="draft", hours=25)
+    await _sweep_human_queue(db)
+
+    await _set_wait_age(db, task_id, 73)
+    await _sweep_human_queue(db)
+
+    await _set_wait_age(db, task_id, 169)
+    await _sweep_human_queue(db)
+    await _sweep_human_queue(db)  # a fourth pass adds nothing
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h", "72h", "168h"]
+
+
+async def test_rung_is_part_of_the_dedup_key(db):
+    """#1016: the per-rung dedup, asked without moving the wait's own stamp.
+
+    Found by the wave's mutation pass. ``test_ladder_three_steps`` grows the
+    age the only way a test can without a clock — by rewriting
+    ``status_entered_at`` — so each of its three rungs lands under a DIFFERENT
+    stamp, and the key it actually exercises is (task, instance, entered_at).
+    A dedup that dropped ``rung`` from the key entirely — the "one alert
+    forever" shape #1020 was written to remove — keeps all four G3 tests
+    green. In production the stamp is fixed and only ``now`` moves, so that is
+    the case with no coverage at all.
+
+    This asks it directly: one wait, one stamp, the rung already rung and the
+    next one still owed.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+    await _sweep_human_queue(db)
+
+    rows = await fetchall(
+        db,
+        "SELECT instance, entered_at, rung FROM human_queue_reminders "
+        "WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    # Instance and stamp are read back from the row the sweep wrote, not
+    # guessed here: the point is the key the code uses, not one we restate.
+    assert [r["rung"] for r in rows] == ["24h"]
+    instance, stamp = rows[0]["instance"], rows[0]["entered_at"]
+
+    assert await repo.human_queue_rung_raised(db, task_id, instance, stamp, "24h")
+    assert not await repo.human_queue_rung_raised(db, task_id, instance, stamp, "72h")
+
+
+async def test_reminder_ladder_restarts_after_a_new_wait(db):
+    """#1020: coming back to the same status is a new wait, not a rung already rung.
+
+    Keyed on the task alone, a task that was decided and later returned to the
+    queue would inherit its old ladder and never be heard from again.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+    await _sweep_human_queue(db)
+
+    await repo.update_task(db, task_id, status="running")
+    await repo.update_task(db, task_id, status="needs_decision")
+    # A different age, because the stamp IS the identity of a wait and sqlite
+    # keeps it to the second: re-entering the status in production stamps the
+    # current second, which is never the backdated one above.
+    await _set_wait_age(db, task_id, 26)
+    await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h", "24h"]
+
+
+async def test_machine_owned_queue_is_not_reminded(db):
+    """#1020: the ladder is for people. ci_check escalates on its own clock."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="ci_check", hours=200)
+
+    await _sweep_human_queue(db)
+
+    assert await _reminders(db, task_id) == []

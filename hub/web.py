@@ -41,6 +41,7 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
+from hub.services.finding_evidence import evidence_for_findings
 from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
@@ -303,8 +304,8 @@ def _is_htmx(request: Request) -> bool:
 
 
 def _require_human_web(request: Request) -> None:
-    """Reject agent tokens on human-only web mutations (mirrors REST gates)."""
-    if current_identity(request).is_agent:
+    """Reject anyone who is not a human on human-only web mutations."""
+    if not current_identity(request).is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
 
 
@@ -887,6 +888,10 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["ci_check_tasks"])
         + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
+        # #1038: находки живут не в статусном списке, а в своём счёте, и без
+        # этой строки верхняя плашка показывала бы «Inbox 0» при непустой
+        # секции ниже — ровно та невидимость, которую задача и убирает.
+        + (1 if inbox.get("unjudged_findings", {}).get("findings") else 0)
         # #897: a completed task with an open PR belongs in the count the owner
         # glances at. Left out of it, the section would be a thing you only see
         # if you already scrolled to where you were not looking.
@@ -1238,19 +1243,103 @@ async def web_finding_dispositions(task_id: int, request: Request):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    # Where to land afterwards. Judging from the queue (#1038) has to return to
+    # the queue — sending a person to the task card after every report would
+    # make them navigate back for each one, which is the cost this page exists
+    # to remove. The value is not a URL from the form: only the two pages that
+    # carry this form may be named, so the field cannot become an open redirect.
+    if str(form.get("return_to") or "") == "queue":
+        # Обратно в очередь — и в ТУ ЖЕ очередь: проект, по которому её
+        # отфильтровали, обязан пережить сохранение, иначе после первого же
+        # отчёта человек оказывается в общем списке. Слаг не берётся как URL:
+        # он подставляется в один известный путь и экранируется.
+        back_project = str(form.get("return_project") or "").strip()
+        back = (
+            f"/findings?project={quote(back_project)}" if back_project else "/findings"
+        )
+    else:
+        back = f"/tasks/{task_id}"
+    # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
+    # поле не шлёт; очередь показывает и ранний отчёт лестницы (#879), у которого
+    # та же генерация, и обязана назвать его — иначе ответ ляжет на новейший.
+    raw_review = str(form.get("review_id") or "").strip()
+    try:
+        review_id = int(raw_review) if raw_review else None
+    except ValueError:
+        raise HTTPException(400, "review_id must be a number") from None
+    # Ограничение диапазона — не педантизм: id вне ширины SQLite INTEGER
+    # доходит до bind и даёт OverflowError, то есть 500 вместо 400. Отказ
+    # должен говорить, что запрос неверен, а не что сломался хаб.
+    if review_id is not None and not 0 < review_id <= 2**63 - 1:
+        raise HTTPException(400, f"review_id {review_id} is out of range")
     if not items:
         # Nothing chosen is not an error and not a judgement: the gate looked
         # and marked nothing, which must leave the report exactly as it was.
-        return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+        return RedirectResponse(back, status_code=303)
     try:
         await services.record_finding_dispositions(
-            db, task_id, items, decided_by=identity.username
+            db, task_id, items, decided_by=identity.username, review_id=review_id
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+    return RedirectResponse(back, status_code=303)
+
+
+@router.get("/findings", response_class=HTMLResponse)
+async def web_findings_queue(request: Request, project: str = Query(default="")):
+    """Every confirmed finding nobody has answered yet (#1038).
+
+    The page exists because the JUDGEMENT was never the expensive part — the
+    form has been in the task card since #876. What was missing is a way to
+    reach it: reports are written while a task is in review, and every inbox
+    section is built from ``list_tasks_by_status``, so once the task completes
+    its findings appear nowhere. Judging them meant remembering which of
+    twenty-eight tasks had reports.
+
+    Grouped by task so a person answers a whole report in one pass, and posting
+    through the same route the task card uses — a second way to record a
+    judgement would be a second thing to keep honest.
+    """
+    db = _db(request)
+    # The project narrows the query, not its result (#627). Arriving here from a
+    # board filtered to one project must not silently widen to every project.
+    project_id = await services.project_id_for(db, project or None)
+    rows = await repo.list_unjudged_findings(db, project_id=project_id)
+    groups: list[dict[str, Any]] = []
+    by_review: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        r = dict(row)
+        review_id = int(r["review_id"])
+        group = by_review.get(review_id)
+        if group is None:
+            group = {
+                "task_id": int(r["task_id"]),
+                "task_title": str(r["task_title"] or ""),
+                "task_status": str(r["task_status"] or ""),
+                "review_id": review_id,
+                "generation": int(r["submission_generation"] or 0),
+                "model": str(r["model"] or ""),
+                "reported_at": str(r["reported_at"] or ""),
+                "findings": [],
+            }
+            by_review[review_id] = group
+            groups.append(group)
+        try:
+            finding = json.loads(str(r["finding"]))
+        except ValueError:
+            # A report whose JSON we cannot read is still a row a person should
+            # see: dropping it here would shrink the queue below the count on
+            # the metrics page and make the two disagree.
+            finding = {}
+        group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    total = sum(len(g["findings"]) for g in groups)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "findings_queue.html",
+        {"groups": groups, "total": total, "project": project or ""},
+    )
 
 
 @router.get("/metrics", response_class=HTMLResponse)
@@ -1545,6 +1634,12 @@ async def _web_task_detail_page(
     mr_row = await repo.get_latest_machine_review(db, task_id)
     review_report = await _review_report(db, dict(row), mr_row)
     machine_review = review_report.machine_review
+    # #1012: how much of that report nobody answered — computed by the same
+    # helper the verdict itself uses, so the sentence beside the button and
+    # the sentence written into the record cannot disagree.
+    from hub.services.review_evidence import undisposed_confirmed
+
+    mr_confirmed, mr_undisposed = undisposed_confirmed(machine_review)
 
     # #823: the evidence the reviewing agent has always had — per-AC test
     # results, CI against the pinned sha, statement freshness, call sites and
@@ -1554,6 +1649,15 @@ async def _web_task_detail_page(
     from hub.services.review_brief import gate_evidence
 
     evidence = await gate_evidence(db, dict(row))
+
+    finding_touch: list[dict[str, Any]] = []
+    if machine_review is not None and machine_review.findings_confirmed:
+        finding_touch = await evidence_for_findings(
+            db,
+            task_id,
+            [f.model_dump() for f in machine_review.findings_confirmed],
+            generation=int(machine_review.submission_generation),
+        )
 
     # #497: merged is not running. The hub records both facts now — its own
     # merge (#534) and the deploy CI reported (#839, #496) — and this compares
@@ -1658,7 +1762,10 @@ async def _web_task_detail_page(
         for row in await repo.list_live_checks(db, task_id)
     ]
 
-    csrf_token = generate_csrf_token()
+    # #990: reuse the shared cookie. Minting on every card GET (including the
+    # 15s HTMX poller) 403s an open form in another tab. verify_csrf stays
+    # strict equality; we only skip minting when the cookie already exists.
+    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
     response = TEMPLATES.TemplateResponse(
         request,
         "task_detail.html",
@@ -1672,6 +1779,9 @@ async def _web_task_detail_page(
             "evidence": evidence,
             "change_map": change_map,
             "machine_review": machine_review,
+            "finding_touch": finding_touch,
+            "mr_confirmed": mr_confirmed,
+            "mr_undisposed": mr_undisposed,
             "review_runs": review_runs,
             "review_runs_cost": review_runs_cost,
             "review_report": review_report,
@@ -1860,7 +1970,7 @@ async def web_create_task(
     # alternative, so it must point at hub_propose_task exactly as the REST
     # endpoints do. The other web routes keep human_only_gate, because for
     # approve/reject/decide "a human must do this" really is the whole answer.
-    if current_identity(request).is_agent:
+    if not current_identity(request).is_human:
         raise HTTPException(403, detail=agent_create_forbidden_detail())
     user = current_user(request)
     # scope_in arrives as a textarea, one item per line
@@ -2066,7 +2176,7 @@ async def web_batch_approve_selected(
     """
     db = _db(request)
     identity = current_identity(request)
-    if identity.is_agent:
+    if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
     result = None
     if task_ids:
@@ -2148,6 +2258,40 @@ def _parse_findings_form(text: str) -> list[ReviewFinding]:
     return findings
 
 
+def _verdict_refusal_text(detail: Any) -> str:
+    """Flatten a service refusal into one line for the review form (#1010).
+
+    ``enrich_error_payload`` produces a dict; a plain string is also legal.
+    The hint is what tells the reviewer how to proceed, so it is kept rather
+    than dropped in favour of the terser message.
+    """
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("reason") or "").strip()
+        hint = str(detail.get("hint") or "").strip()
+        joined = " ".join(part for part in (message, hint) if part)
+        return joined or "Вердикт отклонён."
+    return str(detail).strip() or "Вердикт отклонён."
+
+
+def _review_form_error(
+    request: Request, task_id: int, message: str
+) -> HTMLResponse | RedirectResponse:
+    """Show a review-form refusal where the reviewer was typing (#1010).
+
+    htmx swaps the note in place; a plain form post carries it back on the
+    redirect. Escaped on the htmx path because the text now includes service
+    messages, not only our own constants.
+    """
+    if _is_htmx(request):
+        return HTMLResponse(
+            f'<div class="task-action-note">{html.escape(message)}</div>',
+            status_code=422,
+        )
+    return RedirectResponse(
+        f"/tasks/{task_id}?review_error={quote(message)}", status_code=303
+    )
+
+
 @router.post("/tasks/{task_id}/web-review-verdict")
 async def web_review_verdict(
     task_id: int,
@@ -2162,6 +2306,19 @@ async def web_review_verdict(
     independence check plus the canonical record_review_verdict service —
     no web-only verdict logic. The verdict is recorded under the logged-in
     identity, not a free-text name.
+
+    #1010: that last sentence was only half true. The API route passed
+    ``principal_id`` to the service and this one did not, so a verdict
+    submitted from the card was filed anonymously — visible on task #1005,
+    whose CHANGES_REQUESTED landed with ``principal_id=null`` and
+    ``author_kind=anonymous``. It is passed here now, which also matters for
+    APPROVED: content is required of the reviewer who sends work back, so the
+    reviewer who waves it through has to at least be named.
+
+    The service can now refuse a verdict (an empty CHANGES_REQUESTED). Its
+    422 is rendered in the same note as a form validation error rather than
+    escaping as a raw error page — a human who filled the form in should see
+    the reason where they were typing.
     """
     db = _db(request)
     identity = current_identity(request)
@@ -2186,15 +2343,19 @@ async def web_review_verdict(
         first_msg = (
             errors[0].get("msg", "validation error") if errors else "validation error"
         )
-        msg = f"Invalid review form: {first_msg}"
-        if _is_htmx(request):
-            return HTMLResponse(
-                f'<div class="task-action-note">{msg}</div>', status_code=422
-            )
-        return RedirectResponse(
-            f"/tasks/{task_id}?review_error={quote(msg)}", status_code=303
+        return _review_form_error(request, task_id, f"Invalid review form: {first_msg}")
+    try:
+        await services.record_review_verdict(
+            db,
+            task_id,
+            body,
+            self_approved=self_approved,
+            principal_id=identity.principal_id,
         )
-    await services.record_review_verdict(db, task_id, body, self_approved=self_approved)
+    except HTTPException as exc:
+        if exc.status_code != 422:
+            raise
+        return _review_form_error(request, task_id, _verdict_refusal_text(exc.detail))
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

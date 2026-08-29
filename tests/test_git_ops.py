@@ -353,6 +353,42 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
     assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
 
 
+async def test_pr_is_draft_reads_isDraft(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, '{"isDraft": true}', ""),
+    ) as mock_gh:
+        assert await git_ops.pr_is_draft(185, repo="/ws", gh_repo="owner/repo") is True
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--json") + 1] == "isDraft"
+
+
+async def test_pr_is_draft_treats_silence_as_not_a_draft(
+    git_ops: GitOpsIntegration,
+) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "gh: Not Found"),
+    ):
+        assert await git_ops.pr_is_draft(185, gh_repo="owner/repo") is False
+
+
+async def test_mark_pr_ready_calls_gh_pr_ready(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        assert (
+            await git_ops.mark_pr_ready(185, repo="/ws", gh_repo="owner/repo") is True
+        )
+    args = list(mock_gh.await_args.args)
+    assert args[:2] == ["pr", "ready"]
+    assert args[args.index("--repo") + 1] == "owner/repo"
+
+
 @pytest.mark.parametrize(
     "rc,out,expected",
     [
@@ -480,6 +516,7 @@ async def test_pair_prepare_branch_rejects_dirty_workspace(
     assert detail["workspace_path"] == "/srv/ws"
     assert detail["hostname"] == "hub-server"
     assert "hub_pair_start" in detail["hint"]
+    assert detail["actor_hint"] == "human"
 
 
 # --- pair_branch_unpushed: хаб расшивает сам (#966) --------------------------
@@ -907,6 +944,85 @@ async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
     assert detail["reason"] == "pair_worktree_dirty"
     assert detail["workspace_path"] == wt
     assert (Path(wt) / "wip.txt").exists()  # data preserved
+    assert detail["actor_hint"] == "agent"
+
+
+async def test_dirty_refusal_names_the_files_and_the_way_out(tmp_path, git_ops):
+    """#1017 AC-1: the refusal names what is dirty, in the person's own names.
+
+    The non-ASCII file is the point. Both dirty probes read
+    ``git status --porcelain``, which escapes any such path — so a message
+    built from that output would say ``"\\320\\267..."``, a name matching
+    nothing the person can see in their checkout. Naming a file unfindably is
+    not naming it.
+    """
+    repo = tmp_path / "main"
+    _git_setup(repo)
+    await git_ops.pair_prepare_worktree(
+        8, "Task A", repo=str(repo), base_branch="develop", branch_slug="a"
+    )
+    wt = Path(_worktree_path(8, str(repo)))
+    (wt / "заметки.md").write_text("черновик, ещё не в коммите")
+    (wt / "f.txt").write_text("edited, tracked")
+
+    with pytest.raises(PairBranchConflictError) as exc:
+        await git_ops.pair_prepare_worktree(
+            8, "Task A", repo=str(repo), base_branch="develop", branch_slug="b"
+        )
+
+    detail = exc.value.to_detail()
+    assert set(detail["files"]) == {"заметки.md", "f.txt"}
+    assert "заметки.md" in detail["message"] and "f.txt" in detail["message"]
+    # The way out must PRESERVE the work: -u carries the untracked file too,
+    # which is the half no git command can bring back once it is gone.
+    assert "git stash push -u" in detail["hint"]
+    assert (wt / "заметки.md").exists()
+    assert (wt / "f.txt").read_text() == "edited, tracked"
+
+
+async def test_shared_clone_refusal_names_the_files(git_ops: GitOpsIntegration) -> None:
+    """#1017 AC-1 on the other pair path: the shared clone, not a worktree."""
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "\0".join((" M hub/app.py", "?? заметки.md")) + "\0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+        patch("hub.integrations.git_ops._hostname", return_value="hub-server"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(9, "Dirty")
+
+    detail = exc.value.to_detail()
+    assert detail["files"] == ["hub/app.py", "заметки.md"]
+    assert "hub/app.py" in detail["message"]
+    assert "git stash push -u" in detail["hint"]
+
+
+async def test_dirty_refusal_counts_the_files_it_does_not_name(
+    git_ops: GitOpsIntegration,
+) -> None:
+    """#1017: a truncated list says so, instead of reading as the whole of it."""
+    paths = [f"pkg/mod_{i}.py" for i in range(14)]
+
+    async def fake_git(*cmd: str, **kwargs):
+        if cmd[:2] == ("status", "--porcelain"):
+            return 0, "\0".join(f" M {p}" for p in paths) + "\0", ""
+        return 0, "", ""
+
+    with (
+        patch("hub.integrations.git_ops._git", side_effect=fake_git),
+        patch("hub.integrations.git_ops._repo_root", return_value="/srv/ws"),
+    ):
+        with pytest.raises(PairBranchConflictError) as exc:
+            await git_ops.pair_prepare_branch(9, "Dirty")
+
+    detail = exc.value.to_detail()
+    assert detail["files"] == paths  # the structured field keeps all of them
+    assert "и ещё 4" in detail["message"]
 
 
 async def test_worktree_base_ahead_guard(tmp_path, git_ops):
@@ -2243,3 +2359,83 @@ async def test_release_range_is_empty_on_refusal_or_empty_range(
 
     with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=empty)):
         assert await git_ops.release_range("main", "develop") == []
+
+
+# --- #1046: stack advisory must judge origin refs, not a stale local base ---
+
+_STALE_BASE = "stalebase01"
+_FRESH_BASE = "freshbase02"
+_HEAD_SHA = "headsha0003"
+_OTHER_SHA = "othersha004"
+
+
+def _stack_ref_git(*, real_stack_on_origin: bool):
+    """Local develop is stale; origin/develop is current.
+
+    Against the stale local base, two independent branches share the
+    fresh-base commits and look stacked. Against origin/develop they
+    do not — unless ``real_stack_on_origin`` (head really contains
+    other's unique-vs-origin-base commits).
+    """
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args and args[0] == "rev-parse" and "--verify" in args:
+            table = {
+                "develop^{commit}": _STALE_BASE,
+                "origin/develop^{commit}": _FRESH_BASE,
+                "task-1046/fix^{commit}": _HEAD_SHA,
+                "origin/task-1046/fix^{commit}": _HEAD_SHA,
+                "task-1042/other^{commit}": _OTHER_SHA,
+                "origin/task-1042/other^{commit}": _OTHER_SHA,
+            }
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args and args[0] == "rev-list" and "--count" in args:
+            other = args[2]
+            negated = [a[1:] for a in args[3:] if a.startswith("^")]
+            base = negated[0]
+            head = negated[1] if len(negated) > 1 else None
+            if other == _OTHER_SHA and base == _STALE_BASE:
+                total, excluded = 2, 1
+            elif other == _OTHER_SHA and base == _FRESH_BASE:
+                total, excluded = (3, 1) if real_stack_on_origin else (1, 1)
+            else:
+                total, excluded = 0, 0
+            return (0, str(total if head is None else excluded), "")
+        return (0, "", "")
+
+    return fake_git
+
+
+async def test_stacking_judges_pushed_refs_not_stale_local_ones(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-2: local develop lags origin; the submitted branch carries the
+    # fresh base. Other's commits already landed in origin/develop.
+    with patch(
+        "hub.integrations.git_ops._git",
+        side_effect=_stack_ref_git(real_stack_on_origin=False),
+    ):
+        stacked = await git_ops.branch_contains_unmerged_commits_of(
+            "task-1046/fix",
+            "task-1042/other",
+            base_branch="develop",
+            repo="/tmp/repo",
+        )
+    assert stacked is False
+
+
+async def test_real_stack_is_still_detected(git_ops: GitOpsIntegration) -> None:
+    # AC-3: a branch actually cut from another unmerged task still stacks
+    # when judged on origin refs (#438).
+    with patch(
+        "hub.integrations.git_ops._git",
+        side_effect=_stack_ref_git(real_stack_on_origin=True),
+    ):
+        stacked = await git_ops.branch_contains_unmerged_commits_of(
+            "task-1046/fix",
+            "task-1042/other",
+            base_branch="develop",
+            repo="/tmp/repo",
+        )
+    assert stacked is True

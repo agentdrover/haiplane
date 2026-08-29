@@ -52,11 +52,37 @@ def family(model_id: str | None) -> str:
     return f"unknown:{raw}"
 
 
+#: The pseudo-family :func:`family` returns for an id it does not recognise.
+UNKNOWN = "unknown:"
+
+
+def is_known_family(model_id: str | None) -> bool:
+    """Whether this id names a family we can actually reason about (#1008).
+
+    An id we do not recognise is not a family — it is a string. Treating it as
+    one is what let the monoculture gate be walked past: see
+    :func:`same_family`.
+    """
+    fam = family(model_id)
+    return bool(fam) and not fam.startswith(UNKNOWN)
+
+
 def same_family(model_a: str | None, model_b: str | None) -> bool | None:
-    """True/False when both sides are known enough to compare; None when
-    either declaration is missing — absence of data is not diversity."""
-    fam_a = family(model_a)
-    fam_b = family(model_b)
-    if not fam_a or not fam_b:
+    """True/False when both sides are known enough to compare; None otherwise.
+
+    None means "cannot tell", and it covers two cases that used to be one and
+    a half: a MISSING declaration, and an UNRECOGNISED one (#1008).
+
+    The second case was a hole, not a subtlety. ``family()`` maps an id it does
+    not know to ``unknown:<id>``, and two different unknown ids are different
+    strings — so ``same_family("my-model-42", "grok-4.6")`` answered False, the
+    gate read that as "diverse", and the escalation it exists to raise turned
+    into a pass. An implementer declaring a garbage string got its work
+    auto-approved by claiming to be a model nobody has heard of.
+
+    Absence of data is not diversity — the same direction every unknown
+    degrades in this codebase. The caller keeps the human gate instead.
+    """
+    if not is_known_family(model_a) or not is_known_family(model_b):
         return None
-    return fam_a == fam_b
+    return family(model_a) == family(model_b)

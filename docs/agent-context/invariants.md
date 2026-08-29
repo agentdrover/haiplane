@@ -33,7 +33,10 @@ These are the rules most likely to be broken by “small” changes.
   task on the SAME branch — pushing commits alone does not re-trigger review.
   A review of task A never sees task B's branch; do not base new task branches
   on unmerged branches under review (see `docs/repository-rules.md`,
-  «Жизненный цикл ветки задачи»).
+  «Жизненный цикл ветки задачи»). The stacking *advisory* (#438) judges
+  pushed refs (`_resolve_ref_remote_first`): a stale local `develop` in the
+  hub clone must not invent a stack or tell the implementer to merge another
+  task's unreviewed branch (#1046).
 - Finding routing (#435, #437): `in_scope` findings are closed ONLY via a
   resubmit of the same task on the same branch (`changes_requested` →
   `running` → fix → `hub_submit_for_review`). Never spawn parallel tasks for
@@ -51,6 +54,22 @@ These are the rules most likely to be broken by “small” changes.
   exists solely in a foreign unpushed clone stays silent (#966's territory).
   This deliberately RETIRES the old carve-out "a task with a branch and no
   PR completes as before" for anything with observable commits.
+- Delivery-gate refusals split three ways, by WHO has to act (#951, #1030, #1053).
+  Transient (`ci_pending`, `ci_unavailable`, `pr_draft`): nobody acts, the task
+  stays `running` and the hub asks again. A GitHub draft after Hub APPROVED is
+  transient, not recoverable: the hub marks the PR ready (approval is the ready
+  signal) and retries; resubmitting would stale the verdict (#612) with no new
+  commits. Recoverable (`ci_failed`, `stale_approval`): the EXECUTOR acts, the
+  task stays `running`, and the hint names `hub_submit_for_review` — a fix is
+  new commits, so delivery needs a new review (#612), never another done report.
+  Terminal (`merge_failed`, closed PR, `no_pr`, `merge_gate_error`): a human
+  acts, `needs_decision` as before.
+  Waiting on a recoverable refusal is bounded twice, because two different
+  things can go wrong: the fix budget (`ci_fix_cycle` vs `MAX_CI_FIX_CYCLES`,
+  charged once per submission — the same budget the headless conveyor spends)
+  stops an executor that keeps failing, and session presence stops a task
+  nobody works on any more. `running:pair` has no machine deadline, so the
+  #418 backstop does NOT cover this — the bounds above are the only ones.
 - Human overrides bypass the gate by design and stay audited: `hub_decide_task`
   accept and `force_complete`.
 - Parent rollup: completing the last child `task` under a `feature` (or the last
@@ -97,7 +116,10 @@ These are the rules most likely to be broken by “small” changes.
 - Core code depends on plugin protocols, not concrete integrations.
 - No-op plugins are valid runtime behavior and should keep the app usable without external binaries.
 - Dispatch, git, GitHub, notes, transcripts, and Vast integrations are optional adapters, not prerequisites for core task CRUD.
+- Review-dispatch billing (#1026): `cursor_cloud.get_usage` is stamped on `review_dispatches.provider_tokens` for every terminal close (`done` and `failed`). NULL is unknown; 0 is a billed zero. Wasted spend of failed runs is a sibling of `machine_reviews` and must not enter `tokens_per_confirmed` / `provider_tokens_per_confirmed` (#516).
 - Shared project workspace (`workspace_path`): pair-start may auto-switch away from a **clean, pushed** `task-N/*` branch (#451); dirty or unpushed foreign branches still block with 422. After submit-for-review, report-done, or release, Hub best-effort checks out the project base branch when the workspace is clean and on that task's branch.
-- Pair-start `git_mode=remote` (#975) records the canonical `task-<id>/<slug>` name and skips host git at prepare, restore (submit/done/release), and switch (CHANGES_REQUESTED / worktree recreate). Omitted/`hub` keeps today's laptop path. Remote submit-review on a project without `repo`/`gh_repo` names that diff/PR could not be made on the response (lifecycle_hint); it must not look like empty success. Laptop `git_mode=hub` still treats "could not look" as not an accusation (#498).
+- Pair-start `git_mode=remote` (#975) records the canonical `task-<id>/<slug>` name and skips host git at prepare, restore (submit/done/release), and switch (CHANGES_REQUESTED / worktree recreate). Omitted/`hub` keeps today's laptop path. Remote submit-review on a project without `repo`/`gh_repo` names that diff/PR could not be made on the response (lifecycle_hint); it must not look like empty success. Laptop `git_mode=hub` still treats "could not look" as not an accusation (#498). GET `/api/tasks/{id}` and `/context` fill `worktree_path` only when a pair worktree is still registered (`worktree_is_registered`), not by status (#989): `submit_for_review` removes the tree; headless `start_task` never creates one; `git_mode=remote` has no hub-host tree. A session.workspace mismatch is an advisory line on `/context`, never HTTP 409.
 - Session registry ownership (#977): `POST /api/sessions/register` must not overwrite another principal's `principal_id` or `agent` (HTTP 409, row unchanged). `POST /api/sessions/{id}/heartbeat` from a foreign principal is HTTP 404 with the same body as an unknown id and must not bump `last_seen_at`. Same-principal re-register stays 200 and refreshes `last_seen_at`.
 - Chat-pair implementer (#980): sibling `kind` on the same code machinery, not a flip of intake #961. Intake `role=human` / `CHAT_PAIR_PERMS` / create stay. Implementer is issued only from `open`, acts as `role=agent` with `CHAT_PAIR_IMPLEMENTER_PERMS` (no `tasks.create`), and `{task_id}` outside `bound_task_id` is 403 `chat_pair_gate_forbidden`. Revoke is scoped by kind so intake and implementer do not kill each other. Missing acting principal is 503 on issue and indistinguishable 401 on redeem. The open task card issues that code (#981); `/chat-pair` stays intake copy and counts only intake sessions. Operator path is guide §4b, not §4a. Cloud implementer pair-start uses `git_mode=remote` so host git is skipped (#975) — that skip is the same invariant as the previous bullet, not a second git mode. Implementer session TTL is the same `CHAT_PAIR_TTL_SECONDS` as intake; there is no renew (#983, allowlist stays closed). When the last live implementer session for that bound task expires or is revoked while the task is still `running` or `claimed` (pair, no `job_id`), the chat-pair reaper returns the task to `open` with a recorded status update before deleting the session row. A dead sibling must not yank a task that still has another unexpired, unrevoked implementer session. Intake expiry does not move tasks. Review/completed are left alone.
+- Steward principal (#1021): role `steward` is neither human nor agent. `is_human` is false even when `tasks.human_gate` is absent and `principal_id` is set; `is_agent` is false so "not an agent" must not be read as "a human". Access is deny-by-default: `STEWARD_ALLOWLIST` is two routes (GET evidence pack, POST judgement). A new route is 403 until it is listed explicitly. `CHAT_PAIR_PERMS` is the pattern, not the permission set.
+- Steward judgement contract (#1022): `POST /api/tasks/{id}/steward-judgement` records a structured judgement and does not transition the task. `verdict` has no default (422). `ground.source` and `escalate_reason` are closed sets with no `unknown`. `confidence=low` is stored as `escalate` / `low_confidence`. At-most-once on `(task_id, generation, kind)`. Closures address findings by `finding_uid` of that generation's report.

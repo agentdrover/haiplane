@@ -8,6 +8,7 @@ from hub.services.dashboard import (
     get_project_cards,
     get_epics_enriched,
     get_inbox_data,
+    project_id_for,
     list_activity,
     list_tasks,
 )
@@ -19,6 +20,13 @@ from hub.services.delivery_state import (
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
+from hub.services.steward_judgement import record_steward_judgement
+from hub.services.finding_identity import (
+    finding_uid,
+    finding_uids,
+    refuse_supplied_uid,
+    require_locator_decision,
+)
 from hub.services.live_check import (
     list_checks,
     live_check_view,
@@ -38,6 +46,7 @@ from hub.services.sessions import (
     list_sessions,
     unaddressable_tasks,
     note_session_task,
+    pair_executor_online,
     register_session,
     session_view,
 )
@@ -117,7 +126,13 @@ from hub.services.lifecycle import (
     withdraw_own_draft,
 )
 from hub.services.orchestration import (
+    CI_BUDGET_GATE_PREFIXES,
+    PR_DRAFT_PREFIX,
+    PR_DRAFT_WAIT_HINT,
+    RECOVERABLE_GATE_PREFIXES,
+    RESUBMIT_AFTER_FIX_HINT,
     TRANSIENT_GATE_PREFIXES,
+    charge_ci_fix_budget,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_arbiter,
@@ -133,6 +148,8 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     project_git_context,
     provision_project,
+    apply_live_worktree,
+    worktree_session_advisory,
     restore_pair_workspace_base,
     review_budget_exhausted,
     scan_text_for_verdict,
@@ -149,6 +166,11 @@ __all__ = [
     "LimitExceededError",
     "MESSAGE_EVENT_KIND",
     "ProjectBindError",
+    "CI_BUDGET_GATE_PREFIXES",
+    "PR_DRAFT_PREFIX",
+    "PR_DRAFT_WAIT_HINT",
+    "RECOVERABLE_GATE_PREFIXES",
+    "RESUBMIT_AFTER_FIX_HINT",
     "TRANSIENT_GATE_PREFIXES",
     "ReadinessConfig",
     "SEVERITY_ORDER",
@@ -158,6 +180,7 @@ __all__ = [
     "add_risk",
     "add_update",
     "addressable_refs",
+    "apply_live_worktree",
     "delete_acceptance_criterion",
     "get_agent_sessions_panel",
     "get_message_threads_panel",
@@ -170,10 +193,17 @@ __all__ = [
     "unaddressable_tasks",
     "live_check_view",
     "record_category_check",
+    "project_id_for",
     "record_finding_dispositions",
+    "record_steward_judgement",
+    "finding_uid",
+    "finding_uids",
+    "refuse_supplied_uid",
+    "require_locator_decision",
     "message_event_is_addressed",
     "message_view",
     "note_session_task",
+    "pair_executor_online",
     "readiness_tree",
     "record_live_check",
     "refine_task",
@@ -225,6 +255,7 @@ __all__ = [
     "list_activity",
     "list_tasks",
     "maybe_destroy_vast",
+    "charge_ci_fix_budget",
     "merge_before_completion",
     "reorder_task",
     "latest_review_projection",
@@ -257,4 +288,5 @@ __all__ = [
     "transition_after_agent_done",
     "unarchive_task",
     "withdraw_own_draft",
+    "worktree_session_advisory",
 ]

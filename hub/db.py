@@ -477,6 +477,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "idx_skills_name_status",
         "CREATE INDEX IF NOT EXISTS idx_skills_name_status ON skills(name, status)",
     ),
+    # Who decided agents should READ this version, as opposed to who wrote it
+    # (#1028). Activation is a human gate (#380) and leaves ``created_by``
+    # untouched, so without this column a person activating a seeded draft is
+    # indistinguishable from the seed itself — and the next deploy would
+    # replace their decision believing it was its own.
+    (
+        "add_skills_activated_by_column",
+        "ALTER TABLE skills ADD COLUMN activated_by TEXT NOT NULL DEFAULT ''",
+    ),
     # ---- Machine review policy (#382): project default + task override.
     (
         "add_projects_machine_review_column",
@@ -1205,6 +1214,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON finding_dispositions(review_id, finding_index)",
     ),
     (
+        # The finding's own identity beside the slot it occupied (#1007).
+        # NOT backfilled: rows filed before this column were addressed by
+        # position and are still readable that way, and computing an id for
+        # them now would claim they were judged under a scheme that did not
+        # exist. The conflict target stays (review_id, finding_index) so those
+        # rows keep being corrected in place rather than duplicated.
+        "add_finding_uid_to_dispositions",
+        "ALTER TABLE finding_dispositions ADD COLUMN finding_uid TEXT NOT NULL "
+        "DEFAULT ''",
+    ),
+    (
         # A finding class that keeps coming back, and the check that ended it
         # (#878, feature #871). ``recurring_categories`` has counted repeats
         # since #384 and closed nothing: a class found in three tasks is still
@@ -1470,6 +1490,155 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_chat_pair_sessions_acting_principal_id",
         "ALTER TABLE chat_pair_sessions ADD COLUMN acting_principal_id INTEGER "
         "REFERENCES principals(id)",
+    ),
+    # #1025: who a review report and a dispatched run belong to, as facts from
+    # the TOKEN — submitted_by is the caller naming itself and stays what it
+    # was. Both nullable, no backfill: a NULL means "recorded before this
+    # existed" and every reader falls back to the old rule on it.
+    (
+        "add_machine_reviews_principal_id",
+        "ALTER TABLE machine_reviews ADD COLUMN principal_id INTEGER",
+    ),
+    (
+        "add_review_dispatches_reviewer_principal_id",
+        "ALTER TABLE review_dispatches ADD COLUMN reviewer_principal_id INTEGER",
+    ),
+    (
+        # #1026: what the PROVIDER billed for this dispatched run, including
+        # runs that never produced a report. machine_reviews.provider_tokens
+        # still holds the bill for the report path; a failed dispatch has no
+        # report row to stamp. NULL is "never asked or the API did not
+        # answer"; 0 is "answered zero". Never collapsed (#549).
+        "add_review_dispatches_provider_tokens",
+        "ALTER TABLE review_dispatches ADD COLUMN provider_tokens INTEGER",
+    ),
+    (
+        # #1015: how many argument names Pydantic extra=ignore dropped on this
+        # call. A count, not the names and never the values — the table has
+        # nowhere a payload can land (#780). NULL is "never measured" (rows
+        # written before this column); 0 is "schema matched"; a positive
+        # number is the discarded-field warning made countable. Never collapse
+        # the two (#549).
+        "add_mcp_call_events_unknown_arg_count",
+        "ALTER TABLE mcp_call_events ADD COLUMN unknown_arg_count INTEGER",
+    ),
+    (
+        # #1030: which submission's red CI has already been charged to the
+        # pair fix budget. The delivery gate refuses once per poll cycle while
+        # the CI stays red, and a per-refusal counter would spend a budget of
+        # three in ninety seconds. The submission generation is the unit that
+        # matches what is being counted — one attempt by the executor — so a
+        # charge is idempotent until the work is submitted again. -1 is "never
+        # charged": generation 0 is a real submission and must not read as one.
+        "add_ci_fix_charged_generation_column",
+        "ALTER TABLE tasks ADD COLUMN ci_fix_charged_generation "
+        "INTEGER NOT NULL DEFAULT -1",
+    ),
+    (
+        # Steward judgement is a stored structured record, not a transition
+        # (#1022). Unique on (task_id, generation, kind) is the at-most-once
+        # claim, same shape as claim_arbiter_dispatch (#421). No backfill:
+        # there were no judgements before this table.
+        "create_steward_judgements",
+        """CREATE TABLE IF NOT EXISTS steward_judgements (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id            INTEGER NOT NULL,
+            generation         INTEGER NOT NULL,
+            kind               TEXT    NOT NULL,
+            submitted_verdict  TEXT    NOT NULL,
+            verdict            TEXT    NOT NULL,
+            confidence         TEXT    NOT NULL DEFAULT '',
+            escalate_reason    TEXT    NOT NULL DEFAULT '',
+            grounds            TEXT    NOT NULL DEFAULT '[]',
+            findings           TEXT    NOT NULL DEFAULT '[]',
+            closures           TEXT    NOT NULL DEFAULT '[]',
+            model              TEXT    NOT NULL DEFAULT '',
+            tokens_spent       INTEGER,
+            duration_ms        INTEGER,
+            submitted_by       TEXT    NOT NULL DEFAULT '',
+            principal_id       INTEGER,
+            created_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+        )""",
+    ),
+    (
+        "idx_steward_judgements_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_steward_judgements_unique "
+        "ON steward_judgements(task_id, generation, kind)",
+    ),
+    (
+        # #1018: did the AGENT claim this report, or did the hub transcribe it
+        # from a dispatch log? Until now the two were the same row, so a text
+        # picked out of a log by LENGTH opened the whole git tail — commit,
+        # squash, push, create_pr — on work nobody said was finished.
+        #
+        # A phrase inside `content` would not do: it cannot be queried, and a
+        # rule nobody can check is not a rule. Default 1 means "claimed by the
+        # agent", so every row written before this column keeps the behaviour
+        # it had — the flag marks the new, narrower case, never re-judges
+        # history.
+        "add_task_updates_agent_claimed",
+        "ALTER TABLE task_updates ADD COLUMN agent_claimed INTEGER NOT NULL DEFAULT 1",
+    ),
+    # #1020: which rung of the human-queue ladder has already been rung. Its
+    # own table rather than the events feed, which is pruned at 14 days — the
+    # queue outlives that (a production needs_info has stood since 20 July),
+    # so rungs recorded as events would quietly re-fire on a fortnightly
+    # cycle. ``entered_at`` is part of the key on purpose: re-entering the
+    # same status is a NEW wait and deserves a fresh ladder, while a task that
+    # simply keeps standing never repeats a rung it has already had.
+    (
+        "add_human_queue_reminders",
+        "CREATE TABLE IF NOT EXISTS human_queue_reminders ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  task_id INTEGER NOT NULL,"
+        "  instance TEXT NOT NULL,"
+        "  entered_at TEXT NOT NULL,"
+        "  rung TEXT NOT NULL,"
+        "  age_minutes INTEGER NOT NULL,"
+        "  age_estimated INTEGER NOT NULL DEFAULT 0,"
+        "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  UNIQUE(task_id, instance, entered_at, rung)"
+        ")",
+    ),
+    # What the IMPLEMENTER says became of each confirmed finding, recorded at
+    # the moment of resubmission (#911). Deliberately NOT ``finding_dispositions``.
+    #
+    # Those two tables answer different questions and belong to different
+    # actors. A disposition is a HUMAN's judgement of whether the finding was
+    # real — it is the numerator of precision, and #876 makes naming it a human
+    # act. An outcome is the AUTHOR's account of what they DID about it. Writing
+    # the author's account into the dispositions table would be the cheapest
+    # possible way to destroy the metric: ``_disposition_metrics`` selects from
+    # it without filtering ``decided_by``, so every self-reported "fixed" would
+    # count as a human confirming the finding was real, and precision would
+    # start measuring an author's opinion of their own work.
+    #
+    # UNIQUE(review_id, finding_uid): one account per finding per report. A
+    # second pass corrects the first rather than stacking a contradictory row
+    # beside it. Addressed by uid, not by slot — a position belongs to the list,
+    # not to the finding (#1007).
+    (
+        "create_finding_outcomes",
+        "CREATE TABLE IF NOT EXISTS finding_outcomes ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  review_id INTEGER NOT NULL,"
+        "  task_id INTEGER NOT NULL,"
+        "  submission_generation INTEGER NOT NULL,"
+        "  finding_uid TEXT NOT NULL,"
+        "  finding_index INTEGER NOT NULL DEFAULT -1,"
+        "  finding_title TEXT NOT NULL DEFAULT '',"
+        "  outcome TEXT NOT NULL,"
+        "  note TEXT NOT NULL DEFAULT '',"
+        "  linked_task_id INTEGER,"
+        "  reported_by TEXT NOT NULL DEFAULT '',"
+        "  reported_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  UNIQUE(review_id, finding_uid)"
+        ")",
+    ),
+    (
+        "idx_finding_outcomes_task",
+        "CREATE INDEX IF NOT EXISTS idx_finding_outcomes_task "
+        "ON finding_outcomes(task_id, submission_generation)",
     ),
 ]
 
@@ -2061,6 +2230,11 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     "deploys.record",
     "integrations.vast.manage",
     "system.settings.write",
+    # #1021: the steward principal's two verbs. Asked by the two allowed
+    # routes; the rest of the surface is refused by the allowlist, not by
+    # omitting these from some other role.
+    "steward.evidence.read",
+    "steward.judgement.write",
 )
 
 # #614: which of the permissions above actually decide anything.
@@ -2098,6 +2272,8 @@ ENFORCED_PERMISSIONS: tuple[str, ...] = (
     # Consulted indirectly: config.py reads it to answer is_human, and
     # require_human_or_admin is built on that — so it does gate, via one hop.
     "tasks.human_gate",
+    "steward.evidence.read",
+    "steward.judgement.write",
 )
 
 DECLARED_ONLY_PERMISSIONS: tuple[str, ...] = (
@@ -2216,6 +2392,14 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Read tasks and report run results; cannot change task state",
         ("tasks.read", "tasks.ci_report", "deploys.record"),
     ),
+    (
+        # #1021: judgement, not action. Two verbs only; chat-pair's four would
+        # let this principal write the statement it then judges.
+        "steward",
+        "Steward",
+        "Read the evidence pack and write a judgement; cannot change task state",
+        ("steward.evidence.read", "steward.judgement.write"),
+    ),
 )
 
 
@@ -2257,7 +2441,7 @@ MULTI_AGENT_REVIEW_SKILL = """\
 
 ## Фаза 1 — ревьюверы по измерениям (параллельно, по одному агенту на роль)
 Каждому: узкий мандат, контекст задачи (постановка + ограничения из хаба),
-схема ответа findings[] = {title, file, line, severity: high|medium|low,
+схема ответа findings[] = {title, file, locator, start_line, severity: high|medium|low,
 detail, category}.
 
 1. security — только реально эксплуатируемое: инъекции, XSS, обход
@@ -2273,7 +2457,9 @@ detail, category}.
    требовать тестов на поведение фреймворка.
 
 Всем: «Верни только находки, которые готов защищать перед автором.
-Каждая привязана к file:line. Лучше 2 настоящих, чем 10 предположительных».
+Каждая называет своё место: locator=lines с file и start_line, либо
+locator=file, либо честное locator=none. Лучше 2 настоящих, чем 10
+предположительных».
 
 ## Фаза 2 — адверсариальная верификация (на КАЖДУЮ находку, 2 агента)
 Без барьера: находки измерения уходят на проверку сразу.
@@ -2341,8 +2527,24 @@ HAIPLANE_MACHINE_REVIEW=require
    отчёт его информирует, не заменяет.
 
 ## Формат находок
-confirmed: {title, severity high|medium|low, category slug, file, line,
-detail}; rejected: {title, category, reason}; unresolved: {title, why}.
+confirmed: {title, severity high|medium|low, locator, category slug, file,
+start_line, end_line, detail}; rejected: {title, category, reason};
+unresolved: {title, why}.
+
+`locator` ОБЯЗАТЕЛЕН (#1007) и говорит, где находка сидит: `lines` — известны
+файл и строки (file + start_line, end_line для диапазона); `file` — известен
+модуль, строка нет; `none` — место определить не удалось. `none` это ОТВЕТ и он
+принимается: харнесс, который не может указать место, всё равно сдаёт годный
+отчёт. Пустой file ответом не является — его не отличить от забытого поля.
+Идентификатор находки НЕ присылается: хаб выводит его из содержания —
+category, file, нормализованный title и КАНОНИЧЕСКОЕ место — и возвращает на
+каждом чтении отчёта. Каноническое значит выведенное из того, что известно
+(есть строка → «строки», есть только файл → «файл», нет ничего → «нигде»), а не
+скопированное из поля `locator`: одно и то же место, названное двумя способами,
+обязано давать один id, иначе диспозиция с прошлого отчёта не найдётся (#1028).
+Поэтому старая находка `{file, line}` и новая `{locator: lines, file,
+start_line}` с теми же значениями — одна находка. `end_line` в id не входит:
+диапазон это уточнение того же места, а не другое место.
 category питает метрики повторяемости — используй устойчивые слаги
 (security, correctness, consistency, tests, …).
 
@@ -2354,10 +2556,44 @@ category питает метрики повторяемости — исполь
 
 
 async def seed_default_skills(db: aiosqlite.Connection) -> None:
-    """Seed built-in skills (#380, #383).
+    """Seed built-in skills, and keep the ACTIVE one current (#380, #383, #1028).
 
-    Idempotent per skill: only inserts when the name has no versions at
-    all, so operator edits and newer versions are never overwritten.
+    The question this function asks is not "is the shipped text in the library"
+    but "is the shipped text the one agents READ". ``hub_get_skill`` serves the
+    ACTIVE version, so a library holding the new text as a draft is a library
+    still teaching the old one. The first attempt (#1007) filed everything as a
+    draft and left exactly that state in production: on 2026-08-28 the write
+    path already refused reports without a ``locator`` while the active
+    ``machine-review-cycle`` was v1 from July, teaching the format that gets a
+    422 — every harness that honestly read the library walked into it.
+
+    So the branches are cut by whose word is at stake, and only the active row
+    decides:
+
+    1. The active version already carries the shipped text — nothing to do.
+    2. A person activated the current version — it stays, and the shipped text
+       waits beside it as a draft. Nothing a human published is overwritten,
+       which is the rule #380 set. That a draft already waits there is not a
+       reason to stop looking: the answer to case 3 can change under it.
+    3. Nobody's word is at stake — there is no active version at all, or the
+       active one is the hub's own previous seed. The shipped text becomes
+       active: promoted in place if some version already holds it, inserted
+       otherwise. "No active version" belongs HERE and not in case 2, because
+       an operator who published nothing has said nothing, and leaving another
+       draft behind would keep ``hub_get_skill`` answering 404.
+
+    Whose word it is cannot be read off ``created_by`` alone. Activation is its
+    own act: a person who activates a seeded draft leaves ``created_by='seed'``
+    on the row, and a seed keyed on that field would overrule them on the next
+    deploy. ``activated_by`` records the act rather than the authorship, and
+    only a row nobody but the seed activated is replaceable.
+
+    Concurrency: ``get_db`` runs this on every connection, so two workers can
+    read the same max version and both insert. ``UNIQUE(name, version)`` makes
+    one of them lose, and losing is FINE — the winner wrote the same text. The
+    insert says ``ON CONFLICT DO NOTHING`` rather than raising, because a
+    swallowed ``IntegrityError`` leaves the transaction aborted and the next
+    seed in the loop dies on a healthy statement (#1028).
     """
     seeds = (
         (
@@ -2374,15 +2610,134 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
         ),
     )
     for name, kind, content, tags in seeds:
-        rows = await fetchall(db, "SELECT id FROM skills WHERE name=? LIMIT 1", (name,))
-        if rows:
+        rows = await fetchall(
+            db,
+            "SELECT id, version, content, status, created_by, activated_by "
+            "FROM skills WHERE name=? ORDER BY version DESC",
+            (name,),
+        )
+        if not rows:
+            await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
             continue
+        # Highest active version — the same row ``get_active_skill`` serves.
+        active = next((r for r in rows if str(r["status"]) == "active"), None)
+        if active is not None and str(active["content"]) == content:
+            continue
+        next_version = int(rows[0]["version"]) + 1
+        if active is not None and not _is_seed_word(active):
+            # Case 2. Someone published this; our text waits beside it.
+            if not any(str(r["content"]) == content for r in rows):
+                await _insert_seed_skill(
+                    db, name, kind, content, tags, next_version, "draft"
+                )
+            continue
+        # Case 3. The shipped text has to become the one agents read.
+        shipped = next((r for r in rows if str(r["content"]) == content), None)
+        if shipped is not None:
+            if _is_seed_word(shipped):
+                await db.execute(
+                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                    (int(shipped["id"]),),
+                )
+            else:
+                # A person published this exact text. Activating it is AGREEING
+                # with them, not replacing them, so their signature outlives the
+                # act — stamping 'seed' here would erase the only record that a
+                # human ever spoke, and the next upgrade would then read the row
+                # as ours and overrule a decision that was never ours to make.
+                await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=?",
+                    (int(shipped["id"]),),
+                )
+        else:
+            await _insert_seed_skill(
+                db, name, kind, content, tags, next_version, "active"
+            )
+        # And the hub's own PREVIOUS word steps back to a draft. Without this
+        # every upgrade leaves another live version behind, and since
+        # ``get_active_skill`` serves the HIGHEST active one, a revert never
+        # takes effect: reverting the constant re-activates an older version
+        # while the reverted-away text keeps winning on version number, for
+        # good. ``draft`` is the existing vocabulary for "in the library, not
+        # served" — a third status would be one this schema has never had.
+        #
+        # Two guards, and both are load-bearing.
+        #
+        # The seed-ownership half is ``_is_seed_word`` said in SQL, deliberately:
+        # it must be impossible for this statement to demote a row a person
+        # published, and the safest way to say that is to spell the same
+        # condition the branch above was chosen by.
+        #
+        # The EXISTS half is what makes losing the insert survivable. The
+        # statement above says ON CONFLICT DO NOTHING, so this connection may
+        # have written nothing at all — and if the row that took its version
+        # number belongs to somebody else (an agent proposing a version through
+        # POST /api/skills files a DRAFT), stepping our previous word down would
+        # leave the library with NO active version and ``hub_get_skill``
+        # answering 404. Serving stale text until the next seeder replaces it is
+        # bad; serving nothing is worse. So the old word only steps down once
+        # the shipped text is demonstrably the one being served.
         await db.execute(
-            "INSERT INTO skills (name, kind, version, content, tags, status, "
-            "created_by) VALUES (?, ?, 1, ?, ?, 'active', 'seed')",
-            (name, kind, content, tags),
+            "UPDATE skills SET status='draft' WHERE name=? AND status='active' "
+            "AND content<>? AND created_by='seed' AND activated_by IN ('', 'seed') "
+            "AND EXISTS (SELECT 1 FROM skills live WHERE live.name=skills.name "
+            "AND live.content=? AND live.status='active')",
+            (name, content, content),
         )
     await db.commit()
+
+
+def _is_seed_word(row: aiosqlite.Row) -> bool:
+    """True when the hub is the only one who ever spoke for this row.
+
+    Two acts, two fields. ``created_by`` says who wrote the text;
+    ``activated_by`` says who decided agents should read it. A person who
+    activates a seeded draft (#380 makes activation a human gate) writes the
+    second without touching the first — so a check that reads only
+    ``created_by`` would call that row ours and replace a human's decision on
+    the next deploy. Rows that predate the column carry an empty
+    ``activated_by`` and are judged by authorship alone, which is all that was
+    ever recorded about them.
+    """
+    return str(row["created_by"]) == "seed" and str(row["activated_by"] or "") in (
+        "",
+        "seed",
+    )
+
+
+async def _insert_seed_skill(
+    db: aiosqlite.Connection,
+    name: str,
+    kind: str,
+    content: str,
+    tags: str,
+    version: int,
+    status: str,
+) -> None:
+    """Insert one seeded version, tolerating a parallel seeder.
+
+    The race is real and benign: ``get_db`` seeds on every connection, so two
+    workers starting together compute the same next version. ``ON CONFLICT DO
+    NOTHING`` is what makes losing cheap — catching the ``IntegrityError``
+    instead would leave sqlite's transaction aborted, and the very next
+    statement of this loop (the second seeded skill) would fail on nothing it
+    did wrong, taking the connection down over a row that already says what we
+    wanted to say.
+    """
+    await db.execute(
+        "INSERT INTO skills (name, kind, version, content, tags, status, "
+        "created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, 'seed', ?) "
+        "ON CONFLICT(name, version) DO NOTHING",
+        (
+            name,
+            kind,
+            version,
+            content,
+            tags,
+            status,
+            "seed" if status == "active" else "",
+        ),
+    )
 
 
 async def seed_system_roles(db: aiosqlite.Connection) -> None:

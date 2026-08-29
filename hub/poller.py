@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Iterator
 from typing import Any
 import logging
@@ -203,15 +204,37 @@ async def _sweep_running_dispatch(db) -> None:
                 await services.maybe_destroy_vast(db, task)
                 continue
             if not has_done and job_status == "completed":
+                # #1018: the log's last long passage is KEPT, because a person
+                # reading the inbox wants it — but it no longer counts as the
+                # agent saying "done". The passage is chosen by LENGTH, and
+                # length cannot tell a report of finished work from a thought
+                # about what to do next; an agent that died mid-task or hit a
+                # limit used to "report" its last reasoning, and that opened
+                # the whole git tail — commit, squash, push, create_pr — plus a
+                # reviewer run of up to 300k tokens over code nobody finished.
+                #
+                # has_done stays False on purpose: the task goes to
+                # pending_report, the status that exists for exactly this — a
+                # human decides whether the work is done.
                 summary = _extract_agent_summary(
                     plugins.dispatch.job_log_full(task["job_id"])
                 )
                 if summary:
-                    await repo.add_task_update(db, task["id"], "agent", "done", summary)
+                    await repo.add_task_update(
+                        db,
+                        task["id"],
+                        "agent",
+                        "done",
+                        "Отчёт НЕ заявлен агентом — это последний длинный "
+                        "фрагмент лога прогона, сохранённый хабом. Прав "
+                        "отчёта у него нет: конвейер не открыт, решение за "
+                        "человеком (#1018).\n\n" + summary,
+                        agent_claimed=False,
+                    )
                     await db.commit()
-                    has_done = True
                     log.info(
-                        "Poll: task #%d — synthetic done from dispatch log",
+                        "Poll: task #%d — log passage kept, NOT taken as a done "
+                        "report (#1018)",
                         task["id"],
                     )
             next_status = await services.transition_after_agent_done(
@@ -298,6 +321,12 @@ async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
     return
 
 
+# A scanned approval was refused and the task already routed to a human. Not a
+# verdict and not "nothing found" — both of those have their own handling, and
+# collapsing this into either would either deliver the work or hide why it stopped.
+SCANNED_APPROVAL_DEFERRED = "scanned_approval_deferred"
+
+
 async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> str:
     """Verdict for the CURRENT submission: persisted state first (#326), then text.
 
@@ -311,24 +340,76 @@ async def _resolve_review_verdict(db, task: dict, updates_list: list[dict]) -> s
     if persisted and task.get("review_verdict_generation") == task.get(
         "submission_generation"
     ):
-        verdict = persisted
         log.info(
             "Poll: task #%d verdict '%s' from persisted review state",
             task["id"],
-            verdict,
+            persisted,
         )
-    else:
-        verdict = services.extract_review_verdict(
-            task["id"], task["review_job_id"], updates_list
-        )
-
-    if verdict:
         # Canonical verdict state (#305): bind the verdict to the
         # current submission generation so a later resubmission
         # invalidates this approval.
-        await repo.record_review_verdict(db, task["id"], verdict)
+        await repo.record_review_verdict(db, task["id"], persisted)
+        return str(persisted)
 
-    return verdict or ""
+    scanned = services.extract_review_verdict(
+        task["id"], task["review_job_id"], updates_list
+    )
+    if scanned is None:
+        return ""
+
+    if scanned.verdict == "approved":
+        # #1019: a line ending in "approved" is not an approval. The word turns
+        # up in a quoted finding, in a plan, in a stretch of diff that reached
+        # the log — and the consequence here is delivery. Every other way past
+        # the Universal Review Gate (force_complete, decide accept) leaves a
+        # human decision in the audit; this one left an ordinary-looking
+        # APPROVED, so the bypass was the one nobody could see afterwards.
+        await _defer_scanned_approval(db, task, scanned)
+        return SCANNED_APPROVAL_DEFERRED
+
+    # changes_requested keeps working: it returns work to its author instead of
+    # opening delivery, so a false positive costs a round, not a merge.
+    await repo.record_review_verdict(db, task["id"], scanned.verdict)
+    return scanned.verdict
+
+
+async def _defer_scanned_approval(db, task: dict, scanned) -> None:
+    """Hand a scanned approval to a human, quoting what was taken for a verdict."""
+    log.warning(
+        "Poll: task #%d approval came from a text match in %s, not from a "
+        "review submission → needs_decision",
+        task["id"],
+        scanned.source,
+    )
+    quoted = scanned.line.strip()
+    if len(quoted) > 300:
+        quoted = quoted[:300] + "…"
+    await repo.add_task_update(
+        db,
+        task["id"],
+        "hub",
+        "alert",
+        "Одобрение найдено СКАНИРОВАНИЕМ текста, а не сдано ревьюером, "
+        "поэтому доставку оно не открывает.\n"
+        f"Источник: {scanned.source}.\n"
+        f"Строка, принятая за вердикт: «{quoted}»\n"
+        "Если это действительно вердикт — вынесите его через ревью "
+        "(hub_submit_review) или примите решение вручную (hub_decide_task).",
+    )
+    await repo.update_task(db, task["id"], status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task["id"],
+        actor="hub",
+        payload={
+            "reason": "scanned_approval_not_a_verdict",
+            "source": scanned.source,
+            "line": quoted,
+        },
+    )
+    await db.commit()
+    await services.maybe_destroy_vast(db, task)
 
 
 async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> None:
@@ -583,6 +664,8 @@ async def _review_task_tick(db, task: dict, job: dict) -> None:
         await _deliver_approved_review(db, task)
     elif verdict == "changes_requested":
         await _request_review_fixes(db, task, updates_list)
+    elif verdict == SCANNED_APPROVAL_DEFERRED:
+        return  # already routed to a human, with the matched line quoted
     else:
         await _mark_no_clear_verdict(db, task)
 
@@ -994,6 +1077,112 @@ async def _sweep_unrefined_drafts(db) -> None:
             )
 
 
+# What each human-owned instance is actually waiting for. The age alone does
+# not tell a person what to do with the task — and "someone should look at
+# this" is what the single lifetime alert already said, to no effect.
+_HUMAN_QUEUE_ACTIONS: dict[str, str] = {
+    "draft": "черновик ждёт одобрения или отклонения (hub_approve_task / hub_reject_task)",
+    "needs_info": "агент ждёт ответа на вопрос (hub_answer_question)",
+    "needs_decision": "задача ждёт решения человека (hub_decide_task)",
+    "review:client": "сдача ждёт вердикта ревьюера (hub_submit_review)",
+}
+
+
+def _human_queue_rows_sql(policy) -> tuple[str, tuple]:
+    """Rows in this human-owned instance, oldest wait first."""
+    sql = (
+        "SELECT id, title, status, status_entered_at, updated_at "
+        "FROM tasks WHERE status=? AND archived=0"
+    )
+    params: tuple = (policy.status,)
+    if policy.discriminator == "client":
+        # review:client is the half of review that waits on a person; the
+        # headless half is the conveyor's own and escalates by deadline.
+        sql += " AND (review_job_id IS NULL OR review_job_id='')"
+    return sql + " ORDER BY status_entered_at ASC", params
+
+
+async def _sweep_human_queue(db) -> None:
+    """The human queue gets hours (#1020): 24h / 72h / 168h, one rung each.
+
+    Volume only. Status, owner and next actor are untouched — the matrix's
+    invariant is that a human-owned instance never auto-transitions, and a
+    reminder is not a deadline. The reminder goes to the events feed and the
+    activity log, NOT to the task's own updates: that feed is the story of the
+    work, and an alarm clock ringing in it three times a week would be read as
+    part of the work.
+    """
+    for policy in lifecycle_matrix.human_owned_policies():
+        sql, params = _human_queue_rows_sql(policy)
+        rows = await fetchall(db, sql, params)
+        for row in rows:
+            with _task_isolation("human queue", dict(row).get("id")):
+                await _human_queue_tick(db, dict(row), policy)
+
+
+async def _human_queue_tick(db, task: dict, policy) -> None:
+    task_id = task["id"]
+    entered_at = str(task.get("status_entered_at") or "")
+    estimated = not entered_at
+    if estimated:
+        # #416 backfilled this column for every row, so this is a guard, not a
+        # path anyone is expected to walk. It says so out loud rather than
+        # presenting a guess as a measurement.
+        entered_at = str(task.get("updated_at") or "")
+    age = _silence_minutes(entered_at)
+    if age is None:
+        return
+
+    due = [label for gate, label in config.HUMAN_QUEUE_LADDER_MINUTES if age >= gate]
+    if not due:
+        return
+    rung = due[-1]
+    if await repo.human_queue_rung_raised(
+        db, task_id, policy.instance, entered_at, rung
+    ):
+        return
+    if not await repo.record_human_queue_reminder(
+        db,
+        task_id=task_id,
+        instance=policy.instance,
+        entered_at=entered_at,
+        rung=rung,
+        age_minutes=int(age),
+        age_estimated=estimated,
+    ):
+        return  # another pass got there first
+
+    action = _HUMAN_QUEUE_ACTIONS.get(policy.instance, "задача ждёт человека")
+    age_text = _age_phrase(age) + (" (возраст оценочный)" if estimated else "")
+    await repo.insert_event(
+        db,
+        kind="human_queue_reminder",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "instance": policy.instance,
+            "rung": rung,
+            "age_minutes": int(age),
+            "age_estimated": estimated,
+            "surface": policy.surface,
+            "action": action,
+        },
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "human_queue_reminder",
+        f"Task #{task_id} ждёт человека {age_text} [рубеж {rung}]: {action}"[:200],
+    )
+    log.warning(
+        "Poll: task #%d waiting on a human in %s for %s (%s)",
+        task_id,
+        policy.instance,
+        age_text,
+        rung,
+    )
+
+
 async def _sweep_autopilot_digests(db) -> None:
     # Autopilot digests (#739): one per project per UTC day of
     # autopilot activity. Idempotent via the UNIQUE key, so every
@@ -1186,6 +1375,57 @@ async def _sweep_events_retention(db) -> None:
         log.info("Poll: pruned %d events older than 14 days", pruned)
 
 
+async def _sweep_stale_worktrees(db) -> None:
+    # Worktrees of finished tasks (#1033): 189 directories had piled up on
+    # production, some a week old. Since #989 the hub names a worktree to an
+    # agent exactly when the directory exists, so an abandoned tree is not
+    # disk noise — it is a live path to a forgotten branch.
+    #
+    # Deliberately gentle in three ways: only terminal tasks, only past the
+    # retention age, and only trees that are actually on disk (a cheap stat
+    # before any git). A dirty tree is never removed — pair_remove_worktree
+    # refuses it and says why, and that refusal is somebody's unsaved work,
+    # not an error to retry away.
+    try:
+        from hub.services.orchestration import project_git_context
+
+        rows = await repo.tasks_with_retired_worktrees(
+            db,
+            keep_days=config.WORKTREE_RETENTION_DAYS,
+            limit=config.WORKTREE_RETENTION_BATCH,
+        )
+        for row in rows:
+            task = dict(row)
+            task_id = int(task["id"])
+            try:
+                ctx = await project_git_context(db, task_id)
+                workspace = (ctx.get("repo") or "").strip() or None
+                path = plugins.git_ops.worktree_path(task_id, workspace)
+                if not path or not os.path.isdir(path):
+                    continue
+                removed = await plugins.git_ops.pair_remove_worktree(
+                    task_id, repo=workspace
+                )
+            except Exception:  # noqa: BLE001 - one task must not stop the sweep
+                log.exception("worktree retirement failed for task #%s", task_id)
+                continue
+            if removed:
+                log.info(
+                    "Poll: retired worktree of task #%s (%s, finished %s)",
+                    task_id,
+                    task["status"],
+                    task["completed_at"],
+                )
+            else:
+                log.warning(
+                    "Poll: worktree of task #%s kept — pair_remove_worktree "
+                    "refused it (uncommitted work or git error)",
+                    task_id,
+                )
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("worktree retention sweep failed")
+
+
 async def _sweep_sessions_retention(db) -> None:
     # Session registry retention (#771): same reasoning as the feed —
     # the registry answers "who is around now", and a session with no
@@ -1249,8 +1489,49 @@ async def _deliver_pair_task(db, task: dict) -> None:
         # Said once, not once per cycle: a line every thirty seconds is how a
         # real signal gets muted (#534).
         if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
-            await _note_pair_delivery_wait(db, task_id, pr_num, detail)
+            await _note_pair_delivery_wait(
+                db,
+                task_id,
+                pr_num,
+                detail,
+                hint=(
+                    services.PR_DRAFT_WAIT_HINT
+                    if detail.startswith(services.PR_DRAFT_PREFIX)
+                    else ""
+                ),
+            )
             return
+        reason = "merge_gate"
+        if detail.startswith(services.RECOVERABLE_GATE_PREFIXES):
+            # #1030: this is the path #1015 actually took — the sweep, not the
+            # done report. A red CI here is not a decision to make but work to
+            # do, and the executor is the one who does it, so the task stays on
+            # the conveyor. Two things bound the waiting, because they bound
+            # different failures: the budget stops an executor that keeps
+            # failing, and presence stops a task nobody is working on any more.
+            budget_spent = False
+            if detail.startswith(services.CI_BUDGET_GATE_PREFIXES):
+                _cycle, budget_spent = await services.charge_ci_fix_budget(db, task)
+            if not budget_spent:
+                if await services.pair_executor_online(db, task):
+                    await _note_pair_delivery_wait(
+                        db,
+                        task_id,
+                        pr_num,
+                        detail,
+                        hint=services.RESUBMIT_AFTER_FIX_HINT,
+                    )
+                    return
+                # Nobody is around to push the fix. Said out loud: without it
+                # the human reads "the CI is red" and misses that the reason
+                # they are being called is that the executor left.
+                detail = f"{detail} (исполнитель не на связи)"
+            else:
+                reason = "ci_fix_cycle_limit"
+                detail = (
+                    f"{detail} (бюджет починки исчерпан: "
+                    f"{task.get('ci_fix_cycle')}/{config.MAX_CI_FIX_CYCLES})"
+                )
         await repo.update_task(db, task_id, status="needs_decision")
         await repo.add_task_update(
             db,
@@ -1266,7 +1547,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
             kind="needs_decision",
             task_id=task_id,
             actor="hub",
-            payload={"reason": "merge_gate", "detail": detail, "via": "poller"},
+            payload={"reason": reason, "detail": detail, "via": "poller"},
         )
         await db.commit()
         log.info(
@@ -1311,8 +1592,15 @@ async def _deliver_pair_task(db, task: dict) -> None:
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
 
-async def _note_pair_delivery_wait(db, task_id: int, pr_num, detail: str) -> None:
-    """Say once that delivery is waiting, and then be quiet (#534)."""
+async def _note_pair_delivery_wait(
+    db, task_id: int, pr_num, detail: str, *, hint: str = ""
+) -> None:
+    """Say once that delivery is waiting, and then be quiet (#534).
+
+    ``hint`` names what happens next when it is not "the hub comes back on its
+    own": a refusal the executor has to cure is also a wait, but waiting for a
+    different actor, and the default sentence would promise the wrong one.
+    """
     if _pair_delivery_waits.get(task_id) == detail:
         return
     _pair_delivery_waits[task_id] = detail
@@ -1321,9 +1609,12 @@ async def _note_pair_delivery_wait(db, task_id: int, pr_num, detail: str) -> Non
         task_id,
         "hub",
         "status",
-        f"Доставка отложена: PR #{pr_num} — {detail}. Это временное "
-        "состояние, решение человека не требуется — хаб вернётся к нему "
-        "следующим циклом.",
+        f"Доставка отложена: PR #{pr_num} — {detail}. "
+        + (
+            hint
+            or "Это временное состояние, решение человека не требуется — хаб "
+            "вернётся к нему следующим циклом."
+        ),
     )
     await db.commit()
     log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
@@ -1439,6 +1730,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             await _sweep_stale_running(db)
             await _sweep_stale_statuses(db)
             await _sweep_unrefined_drafts(db)
+            await _sweep_human_queue(db)
             await _sweep_autopilot_digests(db)
             await _sweep_delivery_discrepancies(db)
             await _sweep_review_dispatches(db)
@@ -1446,6 +1738,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             await _sweep_machine_deadlines(db)
             await _sweep_stale_arbiter(db)
             await _sweep_events_retention(db)
+            await _sweep_stale_worktrees(db)
             await _sweep_sessions_retention(db)
             await _sweep_release_policy(db)
             await _sweep_messages_retention(db)

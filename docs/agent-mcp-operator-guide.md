@@ -434,6 +434,6 @@ MCP streamable HTTP negotiation требует JSON **и** SSE в Accept. Cursor
 - [`docs/agent-onboarding.md`](agent-onboarding.md) — жизненный цикл задач и MCP tools
 - [`docs/cursor-agent-rules.md`](cursor-agent-rules.md) — правила агента
 - [`docs/admin-agent-deployment-guide.md`](admin-agent-deployment-guide.md) — полный деплой сервера
-- [`docs/agent-deploy-runbook.md`](agent-deploy-runbook.md) — runbook agenthai / обновления
+- [`docs/agent-deploy-runbook.md`](agent-deploy-runbook.md) — runbook обновления развёрнутого сервера
 - [`deploy/TAILSCALE.md`](../deploy/TAILSCALE.md) — tailnet + MCP для команды
 - [`.cursor/mcp.json.example`](../.cursor/mcp.json.example) — готовые фрагменты конфига

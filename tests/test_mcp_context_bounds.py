@@ -61,7 +61,10 @@ def _heavy_task(task_id: int) -> dict[str, Any]:
     return {
         "id": task_id,
         "title": f"Задача #{task_id} про ограничение объёма ответа",
-        "status": "completed",
+        # Live, not completed: this fixture exists to measure the WEIGHT of a
+        # card, and since #987 the general digest lists only non-final work —
+        # a pile of completed rows would be filtered out and bound nothing.
+        "status": "running",
         "task_type": "task",
         "parent_id": 779,
         "priority": "medium",
@@ -123,6 +126,17 @@ def _fake_api(tasks: list[dict[str, Any]], ctx: dict[str, Any] | None = None):
         if "/context" in path:
             assert ctx is not None, f"no context fixture for {path}"
             return ctx
+        # #989: general digest may GET a live card just for worktree_path.
+        # Compact list cards do not carry that field.
+        if path.startswith("/api/tasks/") and "?" not in path:
+            tid = int(path.rsplit("/", 1)[-1])
+            match = next((t for t in tasks if t.get("id") == tid), None)
+            if match is None:
+                raise AssertionError(f"unexpected API call: {path}")
+            return {
+                "id": tid,
+                "worktree_path": match.get("worktree_path") or "",
+            }
         raise AssertionError(f"unexpected API call: {path}")
 
     _get.calls = calls  # type: ignore[attr-defined]
@@ -163,17 +177,26 @@ async def test_summary_bounds_the_whole_response(
     assert "pda_claude" in text
 
 
-async def test_full_mode_stays_complete(many_tasks: list[dict[str, Any]]) -> None:
-    """AC-2: mode=full is untouched — full cards, all of them."""
+async def test_full_mode_stays_unbounded(many_tasks: list[dict[str, Any]]) -> None:
+    """AC-2: mode=full still drops nothing — every live row is returned.
+
+    #987 changed what a full card costs, not how many arrive: the claimed list
+    is fetched as compact cards on this path too, because the digest names id,
+    title and status and the filter throws the rest away. Paying ~10 KB a row
+    to discard it moved the cost to the server instead of removing it.
+    """
     fake = _fake_api(many_tasks)
     with patch("hub.mcp_server._api_get", new=AsyncMock(side_effect=fake)):
         out = await hub_my_context()
 
     payload = out.structuredContent or {}
     assert len(payload["my_tasks"]) == 50
-    assert payload["my_tasks"][0]["description"], "full mode lost card fields"
     assert "bounds" not in payload, "unbounded call must not claim to be bounded"
-    assert all("mode=summary" not in call for call in fake.calls)  # type: ignore[attr-defined]
+    claimed = [c for c in fake.calls if c.startswith("/api/tasks?")]  # type: ignore[attr-defined]
+    assert claimed and all("mode=summary" in call for call in claimed), (
+        "the uncapped path must not fetch full cards it is about to drop"
+    )
+    assert set(payload["my_tasks"][0]) == set(SUMMARY_CARD_FIELDS)
 
 
 async def test_dropped_data_is_named(many_tasks: list[dict[str, Any]]) -> None:

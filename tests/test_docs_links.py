@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -45,30 +46,84 @@ def test_operator_guide_separates_intake_and_implementer_pairing():
     assert "возвращает её в `open`" in section_4b
 
 
-def test_implementer_path_spec_freezes_intake_961():
-    # #984: path pack lives next to #961; intake SDD must point at it.
-    path_spec = REPO_ROOT / "docs" / "issues" / "chat-pair-implementer-path.md"
-    intake = REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md"
-    assert path_spec.is_file()
-    intake_text = intake.read_text(encoding="utf-8")
-    assert "Intake заморожен" in intake_text
-    assert "chat-pair-implementer-path.md" in intake_text
-    spec = path_spec.read_text(encoding="utf-8")
-    assert "kind=implementer" in spec
-    assert "#983" in spec
+def test_no_links_to_removed_internal_docs():
+    """#1004: the per-task SDDs and admin design drafts left the public repo.
 
-
-def test_implementer_sdd_matches_allowlist_and_freezes_intake_role():
-    # #979: full SDD next to #961; presentational role stays intake-only.
-    sdd = (
-        REPO_ROOT / "docs" / "issues" / "task-979-chat-pair-implementer.md"
-    ).read_text(encoding="utf-8")
-    assert "CHAT_PAIR_IMPLEMENTER_ALLOWLIST" in sdd
-    assert "POST   /api/tasks/{task_id}/pair-start" in sdd
-    assert "POST /api/tasks" in sdd  # closed-routes table names create
-    assert "chat_pair_task_not_open" in sdd
-    intake = (REPO_ROOT / "docs" / "issues" / "task-961-chat-pair.md").read_text(
-        encoding="utf-8"
+    They were working notes, not product documentation. What must not survive
+    them is a dangling pointer: a reader following one lands on nothing.
+    """
+    removed = (
+        # The whole directory, not a list of names: "issues" invited per-task
+        # working papers and collected five of them. The one document there
+        # worth publishing — the steward spec (#1002) — moved to docs/specs/,
+        # which is what it always was. A pointer at the old path is a bug now.
+        "docs/issues/",
+        "admin-section-design",
+        "admin-ui-functional-spec",
+        "software-development-workflow-implementation-plan",
     )
-    assert "Intake-only" in intake
-    assert "task-979-chat-pair-implementer.md" in intake
+    roots = [REPO_ROOT / "docs", REPO_ROOT / "skills", REPO_ROOT / "agents"]
+    files = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "README.en.md",
+        REPO_ROOT / "AGENTS.md",
+    ]
+    for root in roots:
+        if root.is_dir():
+            files.extend(p for p in root.rglob("*") if p.suffix in {".md", ".html"})
+    for path in files:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in removed:
+            assert needle not in text, f"{path} still points at removed {needle}"
+
+
+def test_implementer_allowlist_stays_pinned():
+    """#1004: the deleted SDD used to hold this list; the test outlives it.
+
+    ``CHAT_PAIR_IMPLEMENTER_ALLOWLIST`` is what a restricted implementer
+    session may call, so a route arriving there silently is exactly the
+    change nobody should be able to make in passing. The per-task SDD that
+    used to pin it left the public repository with the rest of the working
+    papers, and for a few minutes this surface had no guard at all. Pinning
+    it here costs one deliberate edit per intended change and refuses the
+    accidental one.
+    """
+    from hub.auth import CHAT_PAIR_IMPLEMENTER_ALLOWLIST
+
+    assert set(CHAT_PAIR_IMPLEMENTER_ALLOWLIST) == {
+        ("GET", "/api/whoami"),
+        ("GET", "/api/diagnostics/identity"),
+        ("GET", "/api/tasks/{task_id}"),
+        ("GET", "/api/tasks/{task_id}/tree"),
+        ("GET", "/api/tasks/{task_id}/context"),
+        ("GET", "/api/tasks/{task_id}/readiness"),
+        ("GET", "/api/tasks/{task_id}/review-brief"),
+        ("GET", "/api/tasks/{task_id}/acceptance_criteria"),
+        ("GET", "/api/tasks/{task_id}/updates"),
+        ("POST", "/api/tasks/{task_id}/updates"),
+        ("POST", "/api/tasks/{task_id}/question"),
+        ("POST", "/api/tasks/{task_id}/claim"),
+        ("POST", "/api/tasks/{task_id}/pair-start"),
+        ("POST", "/api/tasks/{task_id}/submit-review"),
+        ("POST", "/api/tasks/{task_id}/declare-wait"),
+        ("POST", "/api/sessions/register"),
+        ("POST", "/api/sessions/{session_id}/heartbeat"),
+        ("POST", "/api/auth/chat-pair/redeem"),
+        ("POST", "/api/auth/chat-pair/revoke"),
+    }
+
+
+def test_steward_spec_links_resolve():
+    # #1002: the steward spec cites hub modules by relative path so a reader can
+    # check every claim it makes about the code. A moved or renamed module must
+    # break this suite rather than leave the document quietly pointing at
+    # nothing — the citations are the reason to trust it.
+    spec = REPO_ROOT / "docs" / "specs" / "steward-agent.md"
+    assert spec.is_file()
+    text = spec.read_text(encoding="utf-8")
+    targets = re.findall(r"\]\((\.\./\.\./[^)#\s]+)\)", text)
+    assert targets, "spec cites no repository files at all"
+    for rel in targets:
+        assert (spec.parent / rel).resolve().is_file(), f"broken link: {rel}"

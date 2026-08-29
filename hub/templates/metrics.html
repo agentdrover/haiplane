@@ -49,15 +49,46 @@ latency и размер ответов — на отдельной страни�
             <td>{% if m.machine_reviews.tokens_per_fixed is not none %}{{ m.machine_reviews.tokens_per_fixed }}{% else %}<span class="muted">нет данных</span>{% endif %}
                 <span class="muted">/ по счёту провайдера:
                 {% if m.machine_reviews.provider_tokens_per_fixed is not none %}{{ m.machine_reviews.provider_tokens_per_fixed }}{% else %}нет данных провайдера{% endif %}</span></td></tr>
-        <tr><td>Покрытие петли: отчётов без разметки / находок без ответа</td>
-            <td>{{ m.machine_reviews.dispositions.reports_unjudged }} из {{ m.machine_reviews.reviews }}
-                / {{ m.machine_reviews.dispositions.confirmed_unjudged }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
+        {# #1038: раньше здесь стояло число, которое вело в никуда — чтобы
+           разметить, надо было вспомнить, у каких задач были отчёты, и открыть
+           каждую. Теперь это ссылка на очередь.
+
+           Оба числа взяты из ОДНОГО множества — того же запроса, что рисует
+           очередь: находки ТЕКУЩИХ отчётов без диспозиции, за всё время.
+           Прежняя строка складывала три разных: reports_unjudged считал
+           отчёты окна ВКЛЮЧАЯ пересданные, confirmed_total — их находки, а
+           confirmed_unjudged уже был про одни текущие. Читалось как «1 из 2 /
+           0 ждут суждения», где единица про отчёт, который очередь как раз и
+           прячет. Знаменатели из чужого множества здесь не ставятся вовсе
+           (#518): доли считаются строками выше, у них свои. #}
+        <tr><td>Ждут суждения <span class="muted">(за всё время, по текущим сдачам)</span></td>
+            <td><a href="/findings">{{ m.machine_reviews.dispositions.confirmed_unjudged }} находок</a>
+                <span class="muted">по {{ m.machine_reviews.dispositions.reports_with_unjudged }} отчёт(ам)</span></td></tr>
         <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
         <tr><td>Покрытие: отчётов без токенов / находок в расчёте цены</td>
             <td>{{ m.machine_reviews.reports_without_tokens or 0 }} из {{ m.machine_reviews.reviews }}
                 / {{ m.machine_reviews.confirmed_with_tokens }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
     </tbody>
 </table>
+
+<h2>Review dispatches</h2>
+<table class="task-table">
+    <tbody>
+        <tr><td>Сожжено без отчёта (счёт провайдера)</td>
+            <td>{{ m.review_dispatches.wasted_provider_tokens_total }}
+                <span class="muted">(прогонов: {{ m.review_dispatches.wasted_dispatches }})</span></td></tr>
+        <tr><td>Расход неизвестен</td>
+            <td>{{ m.review_dispatches.unknown_usage }} из {{ m.review_dispatches.closed_dispatches }} закрытых
+                <span class="muted">(API не ответил — это не ноль)</span></td></tr>
+    </tbody>
+</table>
+
+<p class="muted">Сожжённое без отчёта — биллинг диспетчей, которые закрылись
+<code>failed</code> и так и не сдали отчёт своего прогона. Эта строка стоит
+рядом с ценой подтверждённой находки и <em>не входит</em> в неё: смешивать
+расход прогонов без находок с ценой находок из отчитавшихся прогонов — тот же
+приём, что занизил цену на 38% (#516). Пока канал молчит, wasted растёт;
+<code>tokens_per_confirmed</code> этого не видит и не должен видеть.</p>
 
 <p class="muted">Отсев считается по находкам, которые действительно разобраны —
 подтверждены или отклонены. Считать его от самоотчётного raw_count значит
@@ -110,6 +141,48 @@ first-pass от того, что её одобрили следом.</p>
 задача выходит из знаменателя и показана отдельной строкой, а не засчитывается
 как пересдача. Самоодобрение показано рядом: рейт, который растёт от того, что
 ревьюера убрали, ничего не измеряет — полная картина в отдельной метрике.</p>
+
+<h2>Касания человека на доставленную задачу</h2>
+<p class="muted">Знаменатель — задачи, которые хаб сам смержил в окне
+(<code>pipeline_merges</code>). Числитель — события человеческих гейтов только
+по этим задачам. Одно множество, один запрос: задача без доставки не попадает
+ни в числитель, ни в знаменатель, а <code>hub</code> / <code>policy</code> /
+<code>steward</code> не считаются касаниями — тот же фильтр, что у human_gates
+(#1009, урок #518).</p>
+<table class="task-table">
+    <tbody>
+        <tr><td>Доставленных задач</td>
+            <td>{{ m.human_touches.delivered_tasks }}</td></tr>
+        <tr><td>Касаний на них</td>
+            <td>{{ m.human_touches.touches }}</td></tr>
+        <tr><td>Касаний на доставленную задачу</td>
+            <td>{% if m.human_touches.touches_per_delivered is not none %}{{ m.human_touches.touches_per_delivered }}
+                <span class="muted">({{ m.human_touches.touches }} / {{ m.human_touches.delivered_tasks }})</span>
+                {% else %}<span class="muted">нет доставок в окне</span>{% endif %}</td></tr>
+    </tbody>
+</table>
+
+<h2>Стюард гейтов</h2>
+<p class="muted">Собственная строка <code>gate=steward</code>, не человеческий
+гейт: суждения стюарда не входят ни в числитель, ни в знаменатель override-rate
+(#1023, урок #559). <code>overridden_by_human</code> — человек изменил исход
+задачи в течение 7 дней после <code>steward_applied</code>.</p>
+<table class="task-table">
+    <thead><tr><th>Проект</th><th>Applied</th><th>Escalated</th>
+        <th>Overridden by human</th></tr></thead>
+    <tbody>
+        {% for g in m.human_gates if g.gate == 'steward' %}
+        <tr>
+            <td>{{ g.project }}</td>
+            <td>{{ g.applied }}</td>
+            <td>{{ g.escalated }}</td>
+            <td>{{ g.overridden_by_human }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="muted">нет суждений стюарда в окне</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
 
 <h2>By review profile</h2>
 <p class="muted">Профиль отвечает не на «что прогналось», а на то, как прогон

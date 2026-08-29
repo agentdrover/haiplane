@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import aiosqlite
@@ -19,7 +21,16 @@ from hub.integrations.git_ops import (
 )
 from hub.integrations.protocols import CIProbeOutcome
 from hub.integrations.registry import plugins
+from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
+from hub.services.gate_events import (
+    HUMAN_GATE_EVENT_KINDS,
+    NON_HUMAN_GATE_ACTORS,
+    STEWARD_APPLIED,
+    STEWARD_ESCALATED,
+    STEWARD_OVERRIDE_WINDOW_DAYS,
+    sql_in,
+)
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
@@ -290,9 +301,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     coverage_rows = await fetchall(
         db,
         "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
-        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
-        "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
-        "COALESCE(SUM(judged.n), 0) AS judged "
+        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged "
         "FROM machine_reviews mr LEFT JOIN ("
         "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
@@ -307,9 +316,26 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
     result["reports_unjudged"] = reports - reports_judged
-    result["confirmed_unjudged"] = max(
-        int(cov.get("confirmed") or 0) - int(cov.get("judged") or 0), 0
-    )
+    # What is actually WAITING, from the same query the queue page reads
+    # (#1038). This used to subtract one sum from another — all confirmed
+    # findings in the window minus all dispositions in it — and that answered a
+    # different question in two ways at once. It counted the findings of
+    # SUPERSEDED reports, which describe code a resubmission has already
+    # replaced and which nobody should be asked to judge; and it let a
+    # judgement filed against a stale report cancel out a live finding, because
+    # totals do not know which finding they came from. The number will read
+    # LOWER than before on the same data. That is the correction, not a
+    # regression: it stopped counting work that does not exist.
+    # Deliberately NOT windowed, unlike every rate above it. Precision is a
+    # flow — how the reports of a period turned out — but "what is waiting" is
+    # a stock, and a backlog does not expire: a finding nobody answered in
+    # April is still unanswered today. Windowing it would hide exactly the
+    # oldest items, and it would also split this number from the queue page it
+    # links to, which shows everything. The page says "за всё время" next to it
+    # so the reader is not told a windowed number by the header.
+    unjudged = await repo.count_unjudged_findings(db)
+    result["confirmed_unjudged"] = unjudged["findings"]
+    result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
         dict(_rates(counts), profile=name)
         for name, counts in sorted(by_profile.items())
@@ -470,6 +496,10 @@ async def practice_metrics(
     90-day window that read "103 reviews" on 2026-08-21 keeps 103 as
     ``reports_total``, with at least the 60 rows of the v7 batch moving to
     ``no_data_reports``.
+
+    ``review_dispatches`` is a sibling (#1026): the provider bill of runs
+    that closed without a report. It is never folded into
+    ``tokens_per_confirmed`` / ``provider_tokens_per_confirmed``.
     """
     import statistics
 
@@ -725,12 +755,16 @@ async def practice_metrics(
 
     escaped = await _escaped_defect_metrics(db, since)
 
+    model_declarations = await _model_declaration_metrics(db, since)
     human_gates = await _human_gate_metrics(db, since)
+    human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
+    review_dispatches = await _review_dispatch_spend_metrics(db, since)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
+        "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,
         "by_reviewer_model": dispositions["by_model"],
@@ -738,9 +772,50 @@ async def practice_metrics(
         "category_debt": debt,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
+        "model_declarations": model_declarations,
         "human_gates": human_gates,
+        "human_touches": human_touches,
         "review_outcomes": review_outcomes,
     }
+
+
+async def _review_dispatch_spend_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """What dispatched runs billed, including those that never reported (#1026).
+
+    Wasted spend is the provider bill of *failed* dispatches — the channel
+    closed without a report of its own. It stays a sibling of
+    ``machine_reviews`` so it cannot inflate ``tokens_per_confirmed`` or
+    ``provider_tokens_per_confirmed`` (#516: numerator and denominator from
+    the same rows). NULL is "never asked or the API did not answer"; 0 is a
+    billed zero. Unknown rows are counted, never collapsed into the sum.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN provider_tokens ELSE 0 END), 0) "
+        "AS wasted_provider_tokens_total, "
+        "COALESCE(SUM(CASE WHEN status = 'failed' "
+        "AND provider_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) "
+        "AS wasted_dispatches, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "AND provider_tokens IS NULL THEN 1 ELSE 0 END), 0) "
+        "AS unknown_usage, "
+        "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
+        "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
+        "FROM review_dispatches WHERE created_at >= datetime('now', ?)",
+        (since,),
+    )
+    if not rows:
+        return {
+            "wasted_provider_tokens_total": 0,
+            "wasted_dispatches": 0,
+            "unknown_usage": 0,
+            "closed_dispatches": 0,
+        }
+    return dict(rows[0])
 
 
 async def _escaped_defect_metrics(
@@ -967,6 +1042,99 @@ def _parse_hub_ts(raw: str | None) -> Any:
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
+async def _model_declaration_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """How often the diversity rule has anything to work with (#1008).
+
+    The rule compares the implementer's model with the reviewer's, and both
+    arrive as declarations. Before this window existed, "the gate escalates on
+    monoculture" was a statement about code, not about data: nothing said how
+    many reports carried a model at all, or how many named one the hub cannot
+    place. On 2026-08-28 the answer was 102 of 116 reports with no declared
+    profile and an empty by_reviewer_model — a rule running on almost no input.
+
+    Three states per side, kept apart on purpose. ``missing`` is an empty
+    field; ``unrecognised`` is a string ``family()`` cannot map — and it is the
+    one that used to read as diversity (#1008); ``known`` is the only state the
+    gate can actually reason about. Folding the first two together would hide
+    which of "nobody filled it in" and "filled in with something invented" is
+    the problem to fix.
+    """
+    from hub.services.model_family import UNKNOWN, family
+
+    rows = await fetchall(
+        db,
+        "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
+        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "
+        "WHERE mr.created_at >= datetime('now', ?)",
+        (since,),
+    )
+
+    def _tally(values: list[Any]) -> dict[str, int]:
+        out = {"missing": 0, "unrecognised": 0, "known": 0}
+        for value in values:
+            fam = family(value)
+            if not fam:
+                out["missing"] += 1
+            elif fam.startswith(UNKNOWN):
+                out["unrecognised"] += 1
+            else:
+                out["known"] += 1
+        return out
+
+    return {
+        "reports": len(rows),
+        "reviewer": _tally([row["reviewer_model"] for row in rows]),
+        "implementer": _tally([row["implementer_model"] for row in rows]),
+        # Both sides known is the only combination the diversity rule can
+        # answer; everything else keeps the verdict with the human.
+        "comparable": sum(
+            1
+            for row in rows
+            if family(row["reviewer_model"])
+            and not family(row["reviewer_model"]).startswith(UNKNOWN)
+            and family(row["implementer_model"])
+            and not family(row["implementer_model"]).startswith(UNKNOWN)
+        ),
+    }
+
+
+async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Touches per delivered task (#1009, spec §13).
+
+    Denominator is tasks the hub merged in the window (``pipeline_merges``).
+    Numerator is human-gate events on THAT set only. One query, so the two
+    numbers cannot come from different slices (#518). Undelivered work with
+    events does not enter either side. Hub/policy/steward actors use the
+    same exclusion as :func:`_human_gate_metrics`.
+    """
+    kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
+    actor_ph, actors = sql_in(NON_HUMAN_GATE_ACTORS)
+    rows = await fetchall(
+        db,
+        "WITH delivered AS ("
+        " SELECT DISTINCT task_id FROM pipeline_merges"
+        " WHERE task_id IS NOT NULL"
+        " AND merged_at >= datetime('now', ?)"
+        ") SELECT"
+        " (SELECT COUNT(*) FROM delivered) AS delivered_tasks,"
+        " (SELECT COUNT(*) FROM events e"
+        "  WHERE e.task_id IN (SELECT task_id FROM delivered)"
+        f" AND e.kind IN ({kind_ph})"
+        f" AND e.actor NOT IN ({actor_ph})"
+        ") AS touches",  # nosec B608 - placeholders from module constants
+        (since, *kinds, *actors),
+    )
+    delivered = int(rows[0]["delivered_tasks"] or 0)
+    touches = int(rows[0]["touches"] or 0)
+    return {
+        "delivered_tasks": delivered,
+        "touches": touches,
+        "touches_per_delivered": (round(touches / delivered, 3) if delivered else None),
+    }
+
+
 async def _human_gate_metrics(
     db: aiosqlite.Connection, since: str
 ) -> list[dict[str, Any]]:
@@ -974,23 +1142,23 @@ async def _human_gate_metrics(
 
     A gate whose override-rate sits at ~0% over the window is a candidate
     for the autopilot (#738); a gate where the human actually changes
-    outcomes stays human. Only human decisions count: actor 'hub' (service
-    writes, #584) and 'policy' (autopilot, #738) are excluded from both
+    outcomes stays human. Only human decisions count: actors in
+    ``NON_HUMAN_GATE_ACTORS`` (hub, policy, steward) are excluded from both
     the numerator and the denominator. Waits that cannot be measured are
     reported as ``wait_unaccounted`` — never as zeros (the #518 lesson).
     """
     import json as _json
     import statistics
 
+    kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
     event_rows = await fetchall(
         db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
         "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
-        "('task_approved', 'task_rejected', 'review_verdict_recorded', "
-        "'task_decided', 'audit_result') ORDER BY e.created_at ASC",
-        (since,),
+        f"({kind_ph}) ORDER BY e.created_at ASC",  # nosec B608 - closed vocabulary
+        (since, *kinds),
     )
 
     # Project attribution (#747): project_id lives on epics only — children
@@ -1055,10 +1223,10 @@ async def _human_gate_metrics(
             # These carry an explicit human/non-human actor.
             if actor != "human":
                 continue
-        elif actor in {"hub", "policy"}:
+        elif actor in NON_HUMAN_GATE_ACTORS:
             # Verdicts name the reviewer; today every client-driven verdict
             # is the human gate, and the autopilot (#738) will stamp its
-            # own actor — excluded here by name.
+            # own actor — excluded here by name. steward is the same class.
             continue
 
         if kind == "task_approved":
@@ -1133,7 +1301,87 @@ async def _human_gate_metrics(
             round(statistics.median(waits), 2) if waits else None
         )
         result.append(entry)
+    result.extend(_steward_gate_rows(event_rows, project_cache))
     return result
+
+
+def _event_payload(row: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _human_changed_outcome(row: Any) -> bool:
+    """A later human click that actually changed the task's outcome (#1023)."""
+    actor = (row["actor"] or "").strip()
+    if actor in NON_HUMAN_GATE_ACTORS:
+        return False
+    kind = row["kind"]
+    if kind == "task_rejected" and actor == "human":
+        return True
+    payload = _event_payload(row)
+    if kind == "review_verdict_recorded":
+        return (payload.get("verdict") or "").lower() == "changes_requested"
+    if kind == "task_decided":
+        return (payload.get("action") or "").lower() == "rework"
+    return False
+
+
+def _steward_gate_rows(
+    event_rows: list[Any], project_cache: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Own row for the steward so override-rate does not measure itself (#1023)."""
+    by_project: dict[str, dict[str, Any]] = {}
+    applied: list[Any] = []
+
+    def entry_for(project: str) -> dict[str, Any]:
+        return by_project.setdefault(
+            project,
+            {
+                "gate": "steward",
+                "project": project,
+                "applied": 0,
+                "escalated": 0,
+                "overridden_by_human": 0,
+            },
+        )
+
+    def project_of(row: Any) -> str:
+        task_id = row["task_id"]
+        if task_id is None:
+            return "default"
+        return project_cache.get(int(task_id), "default")
+
+    for row in event_rows:
+        if (row["actor"] or "").strip() != "steward":
+            continue
+        project = project_of(row)
+        if row["kind"] == STEWARD_APPLIED:
+            entry_for(project)["applied"] += 1
+            applied.append(row)
+        elif row["kind"] == STEWARD_ESCALATED:
+            entry_for(project)["escalated"] += 1
+
+    window = timedelta(days=STEWARD_OVERRIDE_WINDOW_DAYS)
+    for applied_row in applied:
+        t0 = _parse_hub_ts(applied_row["created_at"])
+        if t0 is None:
+            continue
+        deadline = t0 + window
+        task_id = applied_row["task_id"]
+        for other in event_rows:
+            if other["task_id"] != task_id:
+                continue
+            t = _parse_hub_ts(other["created_at"])
+            if t is None or t <= t0 or t > deadline:
+                continue
+            if _human_changed_outcome(other):
+                entry_for(project_of(applied_row))["overridden_by_human"] += 1
+                break
+
+    return [by_project[key] for key in sorted(by_project)]
 
 
 async def provision_project(
@@ -1418,6 +1666,63 @@ async def pair_worktree_info(
     return "worktree", path or ""
 
 
+async def live_pair_worktree_info(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> tuple[str, str]:
+    """(workspace_mode, worktree_path) only when the pair tree still exists (#989).
+
+    ``pair_worktree_info`` is deterministic and does not check git. GET
+    surfaces must not name a directory that ``submit_for_review`` already
+    removed, or one that headless ``start_task`` never created.
+    """
+    mode, path = await pair_worktree_info(db, task_id)
+    if not path:
+        return mode, ""
+    ctx = await project_git_context(db, task_id)
+    local_kw, _ = _split_git_kwargs(ctx)
+    if await plugins.git_ops.worktree_is_registered(path, local_kw.get("repo")):
+        return mode, path
+    return mode, ""
+
+
+async def apply_live_worktree(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> TaskView:
+    """Fill ``worktree_path`` on a GET view when the pair tree is registered."""
+    if task_view.git_mode == PairGitMode.remote:
+        return task_view
+    mode, path = await live_pair_worktree_info(db, task_view.id)
+    if path:
+        task_view.workspace_mode = mode
+        task_view.worktree_path = path
+    return task_view
+
+
+async def worktree_session_advisory(
+    db: aiosqlite.Connection,
+    task_view: TaskView,
+) -> str:
+    """One digest line when claim session.workspace disagrees with the tree.
+
+    Advisory only — never a 409. Empty workspace or a matching path is silence.
+    """
+    path = (task_view.worktree_path or "").strip()
+    session_id = (task_view.claim_session_id or "").strip()
+    if not path or not session_id:
+        return ""
+    row = await repo.get_agent_session(db, session_id)
+    if row is None:
+        return ""
+    declared = (dict(row).get("workspace") or "").strip()
+    if not declared:
+        return ""
+    if os.path.normpath(declared) == os.path.normpath(path):
+        return ""
+    return f"Advisory: session workspace {declared} differs from pair worktree {path}"
+
+
 async def restore_pair_workspace_base(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1434,7 +1739,11 @@ async def restore_pair_workspace_base(
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
-        await plugins.git_ops.pair_remove_worktree(task_id, **local_kw)
+        # #1045: pair_remove_worktree accepts only task_id and repo.
+        # local_kw also carries base_branch for the legacy restore path;
+        # unpacking it here was a TypeError on every submit, swallowed by
+        # _try_restore_pair_workspace — 205 leftover trees on prod.
+        await plugins.git_ops.pair_remove_worktree(task_id, repo=local_kw.get("repo"))
         return
     await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
 
@@ -1623,10 +1932,88 @@ async def _approved_code_check(
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
 # human". Built from the same enum merge_before_completion prints, so the
 # prefix contract between the two spots of this file cannot silently drift.
+#
+# #1053: a GitHub draft after Hub APPROVED is the same class — nobody has to
+# decide, the hub marks the PR ready and asks again. It is NOT recoverable:
+# there are no new commits, so hub_submit_for_review would stale the verdict
+# (#612) and recreate the one-way door #1030 closed.
+PR_DRAFT_PREFIX = "pr_draft"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
+    PR_DRAFT_PREFIX,
 )
+PR_DRAFT_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: хаб пометит "
+    "PR ready (одобрение в Hub — и есть сигнал ready) и повторит доставку. "
+    "Пересдавать не нужно: новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+
+# #1030: refusals the executor cures WITHOUT a human — a red CI is fixed by a
+# push, and an approval the branch outran is cured by resubmitting. Both used
+# to share the terminal branch with merge_failed, and needs_decision is a door
+# that only opens outward: from there the agent can neither report done nor
+# submit for review. On 28.08.2026 that cost #1015 a manual merge — the CI fix
+# was pushed four minutes after the refusal and there was no way back onto the
+# conveyor. Not the same class as #951: a transient state resolves itself and
+# nobody has to act, while these two wait for the executor to do something.
+RECOVERABLE_GATE_PREFIXES = (
+    f"ci_{CIProbeOutcome.failed.value}",
+    "stale_approval",
+)
+# Only a red CI is charged to the fix budget. A stale approval is not a spent
+# attempt — it is the branch moving while the agent works, and charging it
+# would spend the CI budget on evidence that the executor is alive.
+CI_BUDGET_GATE_PREFIXES = (f"ci_{CIProbeOutcome.failed.value}",)
+
+# #952: written together with the decision to keep the task running, and read
+# after it — so it names only what running accepts. "Report done again" is not
+# that action here: fixing the CI creates commits, which makes the verdict
+# stale (#612), and delivery then needs a new review rather than another done.
+RESUBMIT_AFTER_FIX_HINT = (
+    "Это чинится на конвейере, решение человека не требуется: устраните "
+    "причину на той же ветке и пересдайте через hub_submit_for_review. "
+    "Новые коммиты после одобрения требуют нового ревью (#612), поэтому "
+    "повторный отчёт о готовности здесь не поможет."
+)
+
+
+async def charge_ci_fix_budget(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[int, bool]:
+    """Charge this submission's red CI to the pair fix budget once (#1030).
+
+    Returns ``(cycle, spent)``. The budget is the one the headless conveyor
+    already spends on dispatched CI fixes — same counter, same limit, so two
+    conveyors cannot drift into two different ideas of "enough tries".
+
+    Charged per SUBMISSION, not per refusal: the delivery sweep asks the gate
+    every cycle while the CI stays red, and a per-refusal counter would spend
+    three tries in ninety seconds. Until the executor submits again this is the
+    same attempt, and re-charging it would only measure how long the poller
+    ran. ``spent`` is what sends the task to a human — the executor has had its
+    tries and the CI is still red.
+    """
+    task_id = task["id"]
+    generation = int(task.get("submission_generation") or 0)
+    charged = task.get("ci_fix_charged_generation")
+    charged = -1 if charged is None else int(charged)
+    cycle = int(task.get("ci_fix_cycle") or 0)
+    if charged == generation:
+        return cycle, cycle > config.MAX_CI_FIX_CYCLES
+    cycle += 1
+    await repo.update_task(
+        db,
+        task_id,
+        ci_fix_cycle=cycle,
+        ci_fix_charged_generation=generation,
+    )
+    # The caller keeps working with the dict it was handed; leaving it behind
+    # the row would make the very next read of the budget answer with the
+    # value this call just replaced.
+    task["ci_fix_cycle"] = cycle
+    task["ci_fix_charged_generation"] = generation
+    return cycle, cycle > config.MAX_CI_FIX_CYCLES
 
 
 async def merge_before_completion(
@@ -1687,6 +2074,19 @@ async def merge_before_completion(
         ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
         if ci.outcome != CIProbeOutcome.passed:
             return False, f"ci_{ci.outcome.value}: {ci.reason}"
+
+        # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
+        # here is the ready signal. Asking merge_pr first collapses a draft
+        # into merge_failed — a one-way door to needs_decision.
+        if await plugins.git_ops.pr_is_draft(pr_num, repo=workspace, gh_repo=gh_repo):
+            marked = await plugins.git_ops.mark_pr_ready(
+                pr_num, repo=workspace, gh_repo=gh_repo
+            )
+            if not marked:
+                return False, (
+                    f"{PR_DRAFT_PREFIX}: GitHub PR ещё черновик — хаб не смог "
+                    "пометить его ready"
+                )
 
         merged = await plugins.git_ops.merge_pr(
             pr_num,
@@ -2094,16 +2494,22 @@ async def transition_after_agent_done(
                     # for a green CI" names a check that never ran and points
                     # at a PR the gate never established — the shape of hint
                     # #952 removed from the terminal branch, here in the
-                    # patient one.
-                    cause = (
-                        "Это временное состояние, решение человека не требуется: "
-                        "отчитайтесь о готовности снова, когда CI станет зелёным."
-                        if delivery_pr.established
-                        else "Состояние самого PR прочитать не удалось, поэтому "
-                        "про CI тут сказать нечего: отчитайтесь о готовности "
-                        "снова, когда PR станет доступен. Если он недоступен "
-                        "не временно — это вопрос к человеку."
-                    )
+                    # patient one. A draft is a third cause (#1053): CI is
+                    # already green, and resubmitting would stale the verdict.
+                    if detail.startswith(PR_DRAFT_PREFIX):
+                        cause = PR_DRAFT_WAIT_HINT
+                    elif delivery_pr.established:
+                        cause = (
+                            "Это временное состояние, решение человека не требуется: "
+                            "отчитайтесь о готовности снова, когда CI станет зелёным."
+                        )
+                    else:
+                        cause = (
+                            "Состояние самого PR прочитать не удалось, поэтому "
+                            "про CI тут сказать нечего: отчитайтесь о готовности "
+                            "снова, когда PR станет доступен. Если он недоступен "
+                            "не временно — это вопрос к человеку."
+                        )
                     await repo.add_task_update(
                         db,
                         task_id,
@@ -2118,6 +2524,39 @@ async def transition_after_agent_done(
                         detail,
                     )
                     return "running"
+                budget_spent = False
+                if detail.startswith(RECOVERABLE_GATE_PREFIXES):
+                    # #1030: the executor is right here — it just reported —
+                    # so the refusal it can cure itself keeps the task on the
+                    # conveyor instead of handing a human a door the agent
+                    # cannot walk back through. The budget is what stops this
+                    # from being an infinite loop: after MAX_CI_FIX_CYCLES
+                    # attempts on a still-red CI the escalation below is the
+                    # honest answer, and it names the spent budget as the
+                    # cause rather than the CI outcome.
+                    cycle = 0
+                    if detail.startswith(CI_BUDGET_GATE_PREFIXES):
+                        cycle, budget_spent = await charge_ci_fix_budget(db, task)
+                    if not budget_spent:
+                        attempt = (
+                            f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}."
+                            if cycle
+                            else ""
+                        )
+                        await repo.add_task_update(
+                            db,
+                            task_id,
+                            "hub",
+                            "alert",
+                            f"Доставка не состоялась: PR #{task['pr_number']} — "
+                            f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
+                        )
+                        log.info(
+                            "Task #%d stays running: recoverable gate refusal (%s)",
+                            task_id,
+                            detail,
+                        )
+                        return "running"
                 await repo.update_task(db, task_id, status="needs_decision")
                 await repo.add_task_update(
                     db,
@@ -2131,7 +2570,19 @@ async def transition_after_agent_done(
                     # (human_decision_required), which on 25.08.2026 sent an
                     # agent down a dead end the hint had pointed to (#949).
                     f"Done report NOT completed: PR #{task['pr_number']} is not "
-                    f"delivered — {detail}. Решение за человеком "
+                    f"delivered — {detail}."
+                    + (
+                        # #1030: after the budget the cause is no longer "the
+                        # CI is red" but "the executor has had its tries" —
+                        # naming the CI outcome alone would read as a first
+                        # refusal and hide that the conveyor already gave way.
+                        f" Бюджет починки исчерпан "
+                        f"({task.get('ci_fix_cycle')}/"
+                        f"{config.MAX_CI_FIX_CYCLES})."
+                        if budget_spent
+                        else ""
+                    )
+                    + " Решение за человеком "
                     "(hub_decide_task): rework вернёт задачу в running — "
                     "устраните причину и пересдайте done; accept завершит "
                     "задачу БЕЗ доставки PR.",
@@ -2141,7 +2592,12 @@ async def transition_after_agent_done(
                     kind="needs_decision",
                     task_id=task_id,
                     actor=task.get("assigned_agent") or "agent",
-                    payload={"reason": "merge_gate", "detail": detail},
+                    payload={
+                        "reason": (
+                            "ci_fix_cycle_limit" if budget_spent else "merge_gate"
+                        ),
+                        "detail": detail,
+                    },
                 )
                 log.info(
                     "Task #%d → needs_decision: merge gate refused (%s)",
@@ -2362,36 +2818,101 @@ async def transition_after_agent_done(
             )
             log.error("Task #%d → needs_decision: %s", task_id, exc)
             return "needs_decision"
-        squashed = await plugins.git_ops.squash_branch(
-            task_id,
-            task.get("title", ""),
-            branch,
-            repo=git_repo,
-            base_branch=ctx.get("base_branch"),
-        )
-        await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
-        if not task.get("pr_number"):
-            pr_num = await plugins.git_ops.create_pr(
-                task_id,
-                task["title"],
-                task.get("description", ""),
+        # #991: the CI gate asks for a PR where it means "is there anything to
+        # deliver". For a task whose work is not code — a policy turned on, a
+        # mechanism watched, a decision recorded — the branch exists (pair_start
+        # always makes one) and carries nothing the base does not have. There is
+        # no PR to open, so the poller retried and escalated: #927 sat in
+        # needs_decision with "Cannot create PR: no commits on branch or push
+        # failed" while its work was finished and evidenced by three live checks.
+        #
+        # The question is asked HERE and not earlier, and against git_repo and
+        # not the clone — both learned from the review of the first attempt:
+        #
+        #   * after auto_commit, because auto_commit is what turns a dirty tree
+        #     into commits. Asking before it called work-in-progress "nothing to
+        #     deliver" and skipped the very commit that delivers it.
+        #   * against git_repo, because for a pair task in worktree mode the
+        #     work lives in the worktree while the clone stays on base. Deciding
+        #     from the clone and acting on the worktree is how a decision comes
+        #     out right by accident.
+        #
+        # Three answers, and only one skips: content that does not differ means
+        # the CI gate has no subject. "Could not compare" keeps the old path —
+        # ignorance must not close a task quietly (#725). The REVIEW gate is
+        # untouched either way: skipping it would let anything uncommitted
+        # complete itself, a worse defect than the one being fixed.
+        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
+        # empty base is passed through, never recomputed here.
+        try:
+            differs = await plugins.git_ops.content_differs(
+                (ctx.get("base_branch") or "").strip(),
                 branch,
                 repo=git_repo,
                 gh_repo=ctx.get("gh_repo"),
+            )
+        except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+            # A done report must not 500 because git blinked. An unanswered
+            # question keeps the old path, exactly like an explicit None.
+            log.warning("delivery check for #%s failed: %s", task_id, exc)
+            differs = None
+        # ONLY an explicit False skips. None means "could not compare", and it
+        # deliberately keeps the ordinary path — PR, CI and the gate — because
+        # the risk to guard against is silently closing a task, not opening a
+        # pull request that the CI gate will judge anyway (#725).
+        nothing_to_deliver = differs is False
+        if nothing_to_deliver:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Доставлять нечего: ветка {branch} после коммита не "
+                "отличается по содержимому от базовой ветки проекта, PR "
+                "открывать не из чего. Гейт CI пропущен как беспредметный — "
+                "ревью задача проходит обычным порядком (#991). Если работа "
+                "должна была быть в коде, значит она не закоммичена.",
+            )
+            log.info(
+                "Task #%d: nothing to deliver on %s — CI gate skipped",
+                task_id,
+                branch,
+            )
+
+        # Fall through to the review gate when there is nothing to deliver:
+        # squash, push and PR all have no subject, and the task still owes a
+        # verdict — it just owes no pull request (#991).
+        if not nothing_to_deliver:
+            squashed = await plugins.git_ops.squash_branch(
+                task_id,
+                task.get("title", ""),
+                branch,
+                repo=git_repo,
                 base_branch=ctx.get("base_branch"),
             )
-            if pr_num:
-                await repo.update_task(db, task_id, pr_number=pr_num)
-                task["pr_number"] = pr_num
-        await repo.update_task(
-            db,
-            task_id,
-            status="ci_check",
-            exit_code=exit_code,
-            result_text=result_text,
-        )
-        log.info("Task #%d → ci_check after done report", task_id)
-        return "ci_check"
+            await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
+            if not task.get("pr_number"):
+                pr_num = await plugins.git_ops.create_pr(
+                    task_id,
+                    task["title"],
+                    task.get("description", ""),
+                    branch,
+                    repo=git_repo,
+                    gh_repo=ctx.get("gh_repo"),
+                    base_branch=ctx.get("base_branch"),
+                )
+                if pr_num:
+                    await repo.update_task(db, task_id, pr_number=pr_num)
+                    task["pr_number"] = pr_num
+            await repo.update_task(
+                db,
+                task_id,
+                status="ci_check",
+                exit_code=exit_code,
+                result_text=result_text,
+            )
+            log.info("Task #%d → ci_check after done report", task_id)
+            return "ci_check"
 
     if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human
@@ -2760,50 +3281,82 @@ async def dispatch_ci_fix(
     await db.commit()
 
 
+@dataclass(frozen=True)
+class ScannedVerdict:
+    """A verdict word found in text, together with what and where it was (#1019).
+
+    The basis travels with the verdict because a string match is evidence, not
+    a decision: whoever has to judge it needs to see the line that matched and
+    where it came from. Returning the bare word made a quotation from a finding
+    and a reviewer's actual conclusion indistinguishable at the call site.
+    """
+
+    verdict: str
+    line: str
+    source: str
+
+
+# Where a scanned verdict came from, in the words a person reads in the alert.
+SCAN_SOURCE_UPDATE = "апдейт ревью"
+SCAN_SOURCE_LOG = "лог ревью-джоба"
+
+
 def extract_review_verdict(
     task_id: int,
     review_job_id: str,
     db_updates: list[dict[str, Any]],
-) -> str | None:
-    """Return 'approved' or 'changes_requested' from task_updates or full dispatch log.
+) -> ScannedVerdict | None:
+    """Scan task_updates, then the dispatch log, for a verdict word.
 
     Search order:
     1. task_updates with kind='review' — scan all lines for verdict
     2. Full dispatch log — scan all lines for the LAST occurrence of a verdict keyword
+
+    The result is a candidate, not a verdict. What the caller may do with it
+    depends on which way it points: ``changes_requested`` returns work to its
+    author and costs a round, ``approved`` would open delivery — see
+    hub/poller.py, where the second one is refused.
     """
     for u in reversed(db_updates):
         if u.get("kind") == "review":
             text = u.get("content", "").strip()
-            verdict = scan_text_for_verdict(text)
-            if verdict:
-                return verdict
+            found = _scan_with_basis(text)
+            if found:
+                verdict, line = found
+                return ScannedVerdict(verdict, line, SCAN_SOURCE_UPDATE)
 
     full_log = plugins.dispatch.job_log_full(review_job_id)
     if full_log:
-        verdict = scan_text_for_verdict(full_log)
-        if verdict:
+        found = _scan_with_basis(full_log)
+        if found:
+            verdict, line = found
             log.info(
                 "Poll: task #%d verdict '%s' extracted from dispatch log",
                 task_id,
                 verdict,
             )
-            return verdict
+            return ScannedVerdict(verdict, line, SCAN_SOURCE_LOG)
 
     return None
 
 
+def _scan_with_basis(text: str) -> tuple[str, str] | None:
+    """``(verdict, the line it was read from)`` for the last match, or None."""
+    found: tuple[str, str] | None = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        line_lower = stripped.lower()
+        if "changes_requested" in line_lower:
+            found = ("changes_requested", stripped)
+        elif line_lower.endswith("approved"):
+            found = ("approved", stripped)
+    return found
+
+
 def scan_text_for_verdict(text: str) -> str | None:
     """Scan text for the last occurrence of APPROVED or CHANGES_REQUESTED."""
-    last_verdict: str | None = None
-    for line in text.split("\n"):
-        line_lower = line.strip().lower()
-        if "changes_requested" in line_lower:
-            last_verdict = "changes_requested"
-        elif (
-            line_lower.rstrip().endswith("approved") or line_lower.strip() == "approved"
-        ):
-            last_verdict = "approved"
-    return last_verdict
+    found = _scan_with_basis(text)
+    return found[0] if found else None
 
 
 async def maybe_destroy_vast(

@@ -96,6 +96,10 @@ SDD_SURFACES = env_get("SDD_SURFACES", "warn")
 # tokens each, and 61% of its raw findings were rejected — two thirds of the
 # budget spent on noise a rule cannot produce.
 SUBMIT_RULES = env_get("SUBMIT_RULES", "warn")
+# #911: does a resubmission have to say what became of the findings it was sent
+# back over? Default warn, like every gate that asks the author for something
+# new: a rule that starts by refusing work teaches people to route around it.
+FINDING_OUTCOME = env_get("FINDING_OUTCOME", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved
@@ -183,6 +187,20 @@ STALE_CI_CHECK_MINUTES = int(env_get("STALE_CI_CHECK_MINUTES", "60"))
 STALE_FIX_REQUESTED_MINUTES = int(env_get("STALE_FIX_REQUESTED_MINUTES", "60"))
 STALE_PENDING_REPORT_MINUTES = int(env_get("STALE_PENDING_REPORT_MINUTES", "30"))
 
+# The human queue's ladder (#1020): a day, three days, a week. Every other
+# deadline in this file watches a machine, which escalates on its own; the
+# statuses where work actually waits — draft, needs_info, needs_decision,
+# client review — had no clock at all, so their only detector was a person
+# noticing on the board, which is the very resource the queue is short of.
+# Three rungs in a week is the whole budget: a reminder that speaks on every
+# pass becomes the background nobody reads, which is how the single lifetime
+# alert it replaces already failed.
+HUMAN_QUEUE_LADDER_MINUTES: tuple[tuple[int, str], ...] = (
+    (int(env_get("HUMAN_QUEUE_RUNG_1_MINUTES", "1440")), "24h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_2_MINUTES", "4320")), "72h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_3_MINUTES", "10080")), "168h"),
+)
+
 # Bounded recovery (#417): a headless dispatch/review job that stays missing
 # past the grace escalates to needs_decision; a claim held past the lease is
 # auto-released back to open. Both decisions read persisted timestamps so a
@@ -207,6 +225,22 @@ DEADLINE_REVIEW_MINUTES = int(env_get("DEADLINE_REVIEW_MINUTES", "180"))
 # events feed: the registry is a directory of who is around, not an archive.
 SESSION_TTL_MINUTES = int(env_get("SESSION_TTL_MINUTES", "10"))
 SESSION_RETENTION_DAYS = int(env_get("SESSION_RETENTION_DAYS", "14"))
+
+# Worktrees of finished tasks (#1033). Measured on production 2026-08-28: 189
+# directories under .hub-worktrees, some from tasks closed a week earlier. They
+# are not only disk — since #989 the hub decides whether to NAME a worktree to
+# an agent by whether the directory exists, so an old tree is a live path to a
+# forgotten branch.
+#
+# Three days, not zero: the tree is needed precisely AFTER delivery. Twice on
+# 28.08 machine-review findings arrived after the verdict had merged (#1011,
+# #1025), and the fix for the second was sitting in its worktree when this was
+# written. Removal at delivery would have cut off exactly the case it exists
+# for; three days covers every delay observed so far.
+WORKTREE_RETENTION_DAYS = int(env_get("WORKTREE_RETENTION_DAYS", "3"))
+# How many trees one pass may retire. The first pass on production faces a
+# backlog of 189, and a poller tick should not spend minutes in git.
+WORKTREE_RETENTION_BATCH = int(env_get("WORKTREE_RETENTION_BATCH", "20"))
 
 # Agent messages (#773): a channel without limits becomes a dump nobody reads,
 # and one that blocks work becomes a toll booth. Both defaults are generous
@@ -317,11 +351,22 @@ CHAT_PAIR_IMPLEMENTER_PERMS: frozenset[str] = frozenset(
     }
 )
 
+# Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
+# Those four include create/refine/update and would let the steward write the
+# statement it then judges. Deny-by-default lives in hub/auth.py; these strings
+# are what the two allowed routes ask for.
+STEWARD_PERMS: frozenset[str] = frozenset(
+    {
+        "steward.evidence.read",
+        "steward.judgement.write",
+    }
+)
+
 
 class TokenIdentity:
     """Authenticated identity resolved from a token or DB principal.
 
-    For env-token identities: role is 'human', 'agent', or 'admin';
+    For env-token identities: role is 'human', 'agent', 'admin', or 'steward';
     principal_id and permissions are empty.
     For DB-backed identities: principal_id is set, permissions are populated
     from role_permissions, and role is the effective legacy role.
@@ -368,13 +413,21 @@ class TokenIdentity:
         return "admin.read" in self.permissions
 
     @property
+    def is_steward(self) -> bool:
+        return self.role == "steward"
+
+    @property
     def is_human(self) -> bool:
+        if self.is_steward:
+            return False
         if self.role in ("human", "admin", "super_admin"):
             return True
         return "tasks.human_gate" in self.permissions
 
     @property
     def is_agent(self) -> bool:
+        if self.is_steward:
+            return False
         if self.role == "agent":
             return True
         return not self.is_human and bool(self.principal_id)
@@ -382,6 +435,9 @@ class TokenIdentity:
     def has_permission(self, perm: str) -> bool:
         if self.role == "super_admin":
             return True
+        if self.is_steward:
+            held = self.permissions if self.permissions else STEWARD_PERMS
+            return perm in held
         if self.permissions:
             return perm in self.permissions
         if self.role == "admin":
@@ -415,14 +471,14 @@ _AGENT_DEFAULT_PERMS = frozenset(
 )
 
 
-VALID_ROLES = frozenset({"human", "agent", "admin"})
+VALID_ROLES = frozenset({"human", "agent", "admin", "steward"})
 
 
 def parse_tokens(raw: str) -> dict[str, TokenIdentity]:
     """Parse HAIPLANE_HUB_TOKENS into a {token: TokenIdentity} mapping.
 
     Format: "name:token[:role],name2:token2[:role2]"
-    Role is optional — defaults to ``human``. Valid roles: human, agent, admin.
+    Role is optional — defaults to ``human``. Valid roles: human, agent, admin, steward.
     Whitespace tolerated. Malformed entries are skipped silently.
     """
     out: dict[str, TokenIdentity] = {}

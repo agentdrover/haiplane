@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    changes_requested_requires_content_detail,
     claim_without_session_detail,
     done_report_error_detail,
     hierarchy_error_detail,
@@ -39,6 +40,7 @@ from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
 from hub.mcp_envelope import enrich_error_payload
+from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.outcomes import outcome_status_for_task
@@ -88,6 +90,7 @@ from hub.models import (
 )
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
+    apply_live_worktree,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -192,12 +195,29 @@ async def _try_restore_pair_workspace(
         return
     try:
         await restore_pair_workspace_base(db, task_id)
-    except Exception:
+    except Exception as exc:
         log.warning(
             "Failed to restore pair workspace base for task #%s",
             task_id,
             exc_info=True,
         )
+        # #1045: the TypeError from a signature mismatch lived only in this
+        # stack. The feed is what a person (or the next agent) reads.
+        try:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Уборка worktree не удалась: {exc}. Сдача не прервана.",
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001 - naming the failure must not fail the caller
+            log.warning(
+                "could not record worktree cleanup failure for task #%s",
+                task_id,
+                exc_info=True,
+            )
 
 
 async def _try_switch_pair_workspace_to_task(
@@ -265,6 +285,46 @@ def _children_allow_rollup(children: list[Any]) -> bool:
     return "completed" in statuses
 
 
+def _parent_has_own_work(parent: dict[str, Any]) -> bool:
+    """True when a feature/epic is itself in progress, not only a container (#1043).
+
+    Umbrella parents (#742) have none of these: empty ``claimed_by``,
+    ``claim_session_id``, ``branch``, and no ``pr_number``. A parent that
+    was pair-started or claimed is work of its own — children finishing
+    does not mean that work was reported.
+    """
+    if (parent.get("claimed_by") or "").strip():
+        return True
+    if (parent.get("claim_session_id") or "").strip():
+        return True
+    if (parent.get("branch") or "").strip():
+        return True
+    return bool(parent.get("pr_number"))
+
+
+async def _note_rollup_awaits_own_report(
+    db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
+) -> None:
+    """Write the skip to the task tape so the parent is not silently stuck."""
+    branch = (parent.get("branch") or "").strip() or "—"
+    claimed = (parent.get("claimed_by") or "").strip() or "—"
+    await repo.add_task_update(
+        db,
+        parent_id,
+        "hub",
+        "status",
+        "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
+        f"задачу, потому что у неё есть собственная работа "
+        f"(branch={branch}, claimed_by={claimed}).",
+    )
+    await log_activity(
+        db,
+        "task_updated",
+        f"Task #{parent_id} rollup skipped: parent has its own work, "
+        "awaiting its own report",
+    )
+
+
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     """Auto-complete feature/epic when every direct child is terminal (#742)."""
     row = await repo.get_task(db, child_id)
@@ -285,6 +345,9 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
 
     children = await db_module.get_children(db, parent_id)
     if not _children_allow_rollup(children):
+        return
+    if _parent_has_own_work(parent):
+        await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
 
     if not await repo.transition_status_if(
@@ -320,10 +383,14 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         parent_row = await repo.get_task(db, parent_id)
         if not parent_row:
             continue
+        parent = dict(parent_row)
         children = await db_module.get_children(db, parent_id)
-        if _children_allow_rollup(children):
-            await repo.update_task(db, parent_id, status="completed")
-            repaired += 1
+        if not _children_allow_rollup(children):
+            continue
+        if _parent_has_own_work(parent):
+            continue
+        await repo.update_task(db, parent_id, status="completed")
+        repaired += 1
     if repaired:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
@@ -659,7 +726,7 @@ async def enrich_task_view(
             id=project_row["id"], slug=project_row["slug"]
         )
 
-    return task_view
+    return await apply_live_worktree(db, task_view)
 
 
 @dataclass(frozen=True)
@@ -1045,9 +1112,61 @@ async def approve_task(
         detail=mutation_activity_detail(),
     )
 
+    await _warn_on_dead_locators(db, task_id, task.get("task_type"))
+
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+# Which levels get the warning (#1032). The locator gate lives on submission,
+# and an epic or a feature never submits — it folds up when its children are
+# done. So their acceptance criteria were the one place a test_ref could name
+# a test that does not exist and nobody would ever look: #985 closed with
+# AC-3 pointing at tests/test_api.py::test_worktree_path_only_when_tree_exists,
+# which collects zero tests, under a project policy of sdd_ac_locator=require.
+_LOCATOR_WARNED_TYPES = frozenset({"epic", "feature"})
+
+
+async def _warn_on_dead_locators(
+    db: aiosqlite.Connection, task_id: int, task_type: str | None
+) -> None:
+    """Name AC whose test does not exist, once, at approval (#1032).
+
+    A WARNING and never a gate: at the moment an epic is approved its children
+    do not exist yet, so the tests their criteria will be verified by usually
+    do not either. Blocking there would either stop the normal order of work
+    or teach people to invent test names in advance — both worse than the
+    silence being fixed.
+
+    Best-effort in the strict sense: any failure leaves the approval exactly as
+    it was. The one thing this must never do is turn "could not check" into
+    "checked and clean", so a collection that could not run says nothing at all
+    rather than reporting an empty list of dead locators.
+    """
+    if (task_type or "") not in _LOCATOR_WARNED_TYPES:
+        return
+    try:
+        from hub.services.ac_tests import unresolved_locators
+
+        dead, checked = await unresolved_locators(db, task_id)
+    except Exception:  # noqa: BLE001 - the approval must not depend on this
+        log.warning("locator check failed for task #%s", task_id, exc_info=True)
+        return
+    if not checked or not dead:
+        return
+    named = "; ".join(f"{ac_id} → {nodeid}" for ac_id, nodeid in sorted(dead.items()))
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        "Критерии приёмки ссылаются на несуществующие тесты: "
+        f"{named}. Апрув не заблокирован — на верхнем уровне теста может ещё "
+        "не быть. Но пока локатор не разрешается, критерий проверить нечем, и "
+        "узнать об этом иначе можно только вручную (#1032).",
+    )
+    await db.commit()
 
 
 async def batch_approve_tasks(
@@ -1754,6 +1873,38 @@ async def submit_for_review(
                 "Это не значит, что расхождений нет."
             )
 
+    # #911: what became of the findings the PREVIOUS submission was sent back
+    # over. Placed with the other pre-transition gates for the same reason they
+    # are here — a refusal has to happen while there is still something to
+    # refuse — and before the paid layers, because it costs one indexed read.
+    #
+    # The generation asked about is the CURRENT one, before the bump below: the
+    # report for the submission being made does not exist yet. On a first
+    # submission there are no reports and the gate is silent, which is the
+    # point — it asks only where an answer is owed.
+    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
+    outcome_note = ""
+    outcome_writes: list[Any] = []
+    outcome_generation = int(task.get("submission_generation") or 0)
+    if outcome_mode != "off":
+        open_items = await finding_outcome.open_findings(
+            db, task_id, outcome_generation
+        )
+        try:
+            outcome_writes, still_open = finding_outcome.plan_outcomes(
+                open_items, body.finding_outcomes
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if still_open:
+            if outcome_mode == "require":
+                raise HTTPException(422, finding_outcome.refusal_text(still_open))
+            outcome_note = (
+                f"Исходы находок: НЕ названы для {len(still_open)} "
+                "подтверждённых находок предыдущей сдачи. Режим проверки — "
+                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
+            )
+
     # #855: the cheap deterministic layer, on the diff this submission already
     # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
     # paid reviewer for a measured reason: over 30 days the harness confirmed
@@ -1885,6 +2036,28 @@ async def submit_for_review(
                 f"Task #{task_id} left running state during submit; retry from "
                 "its current status",
             )
+        # #911: only now, past every gate that could still refuse. The write
+        # goes to the process-wide connection, and a refusal after it would
+        # leave the author's outcomes recorded for a submission that never
+        # happened — their corrected retry would then be told the finding is
+        # already closed. Written BEFORE the bump so the rows belong to the
+        # generation they answer, not to the one starting here.
+        outcome_drafts: list[int] = []
+        if outcome_writes:
+            outcome_drafts = await finding_outcome.apply_outcomes(
+                db,
+                task_id,
+                outcome_generation,
+                outcome_writes,
+                reported_by=(body.agent or task.get("assigned_agent") or ""),
+            )
+        if outcome_drafts:
+            outcome_note = (
+                (outcome_note + " " if outcome_note else "")
+                + f"Исходы находок: заведено дефект-драфтов {len(outcome_drafts)} — "
+                + ", ".join(f"#{i}" for i in outcome_drafts)
+                + ". Находка, которую не чинят, остаётся работой, а не исчезает."
+            )
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -1993,7 +2166,7 @@ async def submit_for_review(
         # leave the reader with a single list of what was checked. The wording
         # of each line is preserved verbatim, so anything that read the old
         # alerts still finds its phrase.
-        report_lines = [ln for ln in ([surface_note] + rule_lines) if ln]
+        report_lines = [ln for ln in ([surface_note, outcome_note] + rule_lines) if ln]
         report_lines += unchecked_lines
         if report_lines:
             # Only now is "what ran and found nothing" worth printing: inside
@@ -2190,6 +2363,12 @@ async def record_review_verdict(
     to ``running`` so the developer can fix findings or report done (#307);
     headless transitions remain with the poller. Never a completion path.
 
+    Content (#1010): ``changes_requested`` is refused without a reason —
+    either one finding or a non-empty ``comments``. The refusal happens
+    before any write, so the task stays in ``review`` and the submission
+    generation is untouched: a rejected verdict must not consume the
+    submission it was rejected on. ``approved`` carries no such requirement.
+
     Finding scope (#435): a ``changes_requested`` verdict with findings must
     include at least one ``in_scope`` finding — if everything is out of
     scope there is nothing to fix in this task, so the verdict should be
@@ -2218,6 +2397,25 @@ async def record_review_verdict(
             400,
             "no submission to review yet: the task has never been submitted for review",
         )
+
+    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
+    # came in with no findings and no comments: the task went back to running,
+    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
+    # the developer's only options were to guess or to ask the human the gate
+    # exists to spare. Every neighbouring gate already demands content — DoR
+    # refuses a task without acceptance criteria, submission refuses a branch
+    # it cannot name, delivery refuses a task without a live verdict — and
+    # this one asked for nothing. Either field satisfies it: one sentence is a
+    # reason, and demanding structured findings for "tests are red" would buy
+    # a formality. APPROVED stays free of the requirement (it is
+    # self-sufficient), which is why it is now filed under its author instead
+    # — see the principal_id passed from the web form.
+    if (
+        body.verdict.value == "changes_requested"
+        and not body.findings
+        and not body.comments.strip()
+    ):
+        raise HTTPException(422, detail=changes_requested_requires_content_detail())
 
     if body.verdict.value == "changes_requested" and body.findings:
         if all(f.scope == FindingScope.out_of_scope for f in body.findings):
@@ -2294,6 +2492,30 @@ async def record_review_verdict(
             elif current_tip != pinned_sha:
                 diverged_tip = current_tip
 
+    # #1012: the other thing an approval can quietly override. The report is
+    # already bound to a submission and already knows whether the gate judged
+    # its findings; what was missing is anyone saying so at the moment the
+    # verdict is written. Read here, next to the sha check, for the same
+    # reason: both are questions about what the approver may not have seen,
+    # and neither may hold the write lock while it answers.
+    undisposed_note = ""
+    if body.verdict.value == "approved":
+        from hub.services.review_evidence import (
+            attach_dispositions,
+            undisposed_confirmed,
+        )
+        from hub.services.review_evidence import undisposed_note as _undisposed_note
+        from hub.models import MachineReviewView
+
+        mr_row = await repo.get_latest_machine_review(db, task_id)
+        if mr_row is not None:
+            mr_view = MachineReviewView(**dict(mr_row))
+            mr_view.is_current = mr_view.submission_generation == (
+                task.get("submission_generation") or 0
+            )
+            await attach_dispositions(db, mr_view)
+            undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
     # it must run outside the verdict's write-lock critical section).
@@ -2325,6 +2547,8 @@ async def record_review_verdict(
             )
         elif sha_note:
             content += f"\n{sha_note}"
+        if undisposed_note:
+            content += f"\n{undisposed_note}"
         if self_approved:
             content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
             log.warning(
@@ -2447,6 +2671,15 @@ async def record_review_verdict(
         )
     elif sha_note:
         view.lifecycle_hint = sha_note
+    if undisposed_note:
+        # Appended, never replacing: a diverged tip and unanswered findings are
+        # two different things the approver may not have seen, and dropping one
+        # to make room for the other is how a warning becomes decorative.
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{undisposed_note}"
+            if view.lifecycle_hint
+            else undisposed_note
+        )
     return view
 
 
@@ -2865,6 +3098,9 @@ async def decide_task(
         # #897: the acceptance is done and stays done — this only refuses to
         # let it be silent. On 21.08.2026 exactly this transition left #878 and
         # #885 completed with their PRs open, and nothing in the task said so.
+        await deliver_on_disposition(
+            db, task_id, getattr(body, "pr_disposition", "") or "", via="decide_accept"
+        )
         await note_completion_without_delivery(
             db,
             task_id,
@@ -3421,6 +3657,17 @@ async def force_complete_task(
     # Outside the write lock: this asks git and possibly GitHub, and holding a
     # database lock across a network call is how a slow provider becomes an
     # outage. The completion is already committed — this is a note about it.
+    #
+    # #1037: force-complete writes the same pr_disposition as decide, so it
+    # gets the same delivery. Left out, it would stay the second door with the
+    # same silence behind it — and the one people reach for when the first
+    # refuses.
+    await deliver_on_disposition(
+        db,
+        task_id,
+        ((body.pr_disposition if body else "") or ""),
+        via="force_complete",
+    )
     await note_completion_without_delivery(
         db,
         task_id,
@@ -3430,6 +3677,95 @@ async def force_complete_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+DELIVER_DISPOSITION = "deliver"
+
+
+async def deliver_on_disposition(
+    db: aiosqlite.Connection, task_id: int, disposition: str, *, via: str
+) -> tuple[bool, str]:
+    """Act on ``pr_disposition=deliver``: merge, or refuse and say why (#1037).
+
+    Until now the field was recorded and never acted on, so a human who
+    accepted a task with its PR still open had no way to finish the delivery
+    — the gate only looks at tasks inside the conveyor, and an accepted task
+    is not one. On 28.08 that left #1036 completed with its code in an open
+    PR, and the only way out was a manual merge: an exception to the rule
+    that the gate, not a person, merges into the base branch.
+
+    The one thing this must never become is a way AROUND the gate. A task
+    reaches the human decision along several paths, and some of them ARE a
+    failed condition: red CI, an exhausted review cycle, an arbiter
+    escalation. So the delivery here is not a new door — it is the same door,
+    opened from a different room:
+
+    * the approved-review check is made HERE, because
+      ``merge_before_completion`` does not make it. The gate only ever calls
+      that function on an already-approved path, while this one is reached
+      with no verdict at all. Skipping it would let a human decision stand in
+      for a reviewer's, which is the whole hole;
+    * everything else — the tip still matching what was approved (#612), the
+      idempotence against a second merge (#363), the green CI, the merge
+      itself and the pipeline_merges record the undelivered-work report reads
+      — comes from calling the gate's own function rather than re-deriving
+      its conditions. A second set would drift, and the weaker one would
+      become the real one (#519, #546).
+
+    Returns ``(delivered, reason)``. A refusal never undoes the acceptance:
+    those are two decisions, and the human made only one of them here.
+    """
+    if (disposition or "").strip() != DELIVER_DISPOSITION:
+        return False, ""
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return False, "task not found"
+    task = dict(row)
+    if not task.get("pr_number"):
+        return False, "no_pr"
+
+    from hub.services.orchestration import (
+        merge_before_completion,
+        review_approved_for_current_submission,
+    )
+
+    if not review_approved_for_current_submission(task):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Доставка по решению человека НЕ выполнена: у текущей сдачи нет "
+            "одобренного ревью. Решение человека принимает задачу, но не "
+            "заменяет вердикт ревьюера — PR остался открытым (#1037).",
+        )
+        await db.commit()
+        return False, "no_approved_review"
+
+    ok, reason = await merge_before_completion(db, task)
+    if ok:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
+            f"PR #{task['pr_number']} влит теми же условиями, что применяет "
+            "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
+            "(#1037).",
+        )
+    else:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Условия те "
+            "же, что у гейта, и обойти их решением нельзя — PR остался "
+            "открытым, задача остаётся принятой (#1037).",
+        )
+    await db.commit()
+    return ok, reason
 
 
 async def withdraw_own_draft(

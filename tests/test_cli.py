@@ -206,6 +206,26 @@ def test_cmd_show() -> None:
     assert json.loads(out.getvalue()) == task
 
 
+def test_cmd_status_json_includes_worktree_path_key() -> None:
+    """AC-6 (#989): oc-hub status dumps GET JSON, including worktree_path."""
+    task = {
+        "id": 7,
+        "title": "Show me",
+        "status": "running",
+        "worktree_path": "/srv/.ws-worktrees/task-7",
+    }
+    mock_api = MagicMock(return_value=task)
+    args = argparse.Namespace(task_id=7)
+    with (
+        patch.object(cli, "_api", mock_api),
+        patch("sys.stdout", new=StringIO()) as out,
+    ):
+        rc = cli.cmd_status(args)
+    assert rc == 0
+    dumped = json.loads(out.getvalue())
+    assert dumped["worktree_path"] == "/srv/.ws-worktrees/task-7"
+
+
 def test_cmd_tree() -> None:
     tree = {
         "id": 1,
@@ -1084,6 +1104,36 @@ def test_cmd_review_verdict_rejects_bad_findings_json(capsys) -> None:
     assert rc == 2
     assert "invalid --findings-json" in capsys.readouterr().err
     mock_api.assert_not_called()
+
+
+def test_cmd_steward_judgement() -> None:
+    mock_api = MagicMock(return_value={"id": 1, "verdict": "approve"})
+    args = argparse.Namespace(
+        task_id=42,
+        generation=1,
+        kind="verdict",
+        verdict="approve",
+        confidence="high",
+        escalate_reason="",
+        model="gpt-5.3-codex",
+        grounds_json='[{"source":"ci_pinned_sha"}]',
+        closures_json="",
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_steward_judgement(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/steward-judgement",
+        {
+            "generation": 1,
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+            "model": "gpt-5.3-codex",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        },
+    )
 
 
 def test_cmd_approve_batch() -> None:

@@ -72,6 +72,53 @@ def _mcp_structured(result: CallToolResult | str) -> dict[str, Any] | None:
     return None
 
 
+def _call_tool_text(result: Any) -> str:
+    """Plain text from any FastMCP ``call_tool`` return shape."""
+    if isinstance(result, CallToolResult):
+        return _mcp_text(result)
+    if isinstance(result, tuple) and len(result) == 2:
+        blocks, _structured = result
+        return "\n".join(
+            block.text for block in (blocks or []) if isinstance(block, TextContent)
+        )
+    if isinstance(result, (list, tuple)):
+        return "\n".join(
+            block.text for block in result if isinstance(block, TextContent)
+        )
+    if isinstance(result, str):
+        return result
+    return ""
+
+
+def _call_tool_structured(result: Any) -> dict[str, Any] | None:
+    if isinstance(result, CallToolResult):
+        payload = result.structuredContent
+        return payload if isinstance(payload, dict) else None
+    if isinstance(result, tuple) and len(result) == 2:
+        payload = result[1]
+        return payload if isinstance(payload, dict) else None
+    if isinstance(result, dict):
+        return result
+    return None
+
+
+def _unknown_arguments(result: Any) -> list[str] | None:
+    """Names advertised on the call_tool result, or None when the key is absent."""
+    structured = _call_tool_structured(result)
+    if isinstance(structured, dict) and "unknown_arguments" in structured:
+        value = structured["unknown_arguments"]
+        return list(value) if isinstance(value, list) else None
+    text = _call_tool_text(result)
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and "unknown_arguments" in payload:
+        value = payload["unknown_arguments"]
+        return list(value) if isinstance(value, list) else None
+    return None
+
+
 @pytest.fixture
 def mock_api_get() -> AsyncMock:
     with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as m:
@@ -177,6 +224,31 @@ async def test_hub_task_detail(
     assert structured["task"]["id"] == 42
     mock_api_post.assert_awaited_once_with("/api/tasks/42/refresh")
     mock_api_get.assert_awaited_once_with("/api/tasks/42")
+
+
+async def test_hub_task_status_names_worktree_path(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-2 (#989): hub_task_status names the live path from GET."""
+    mock_api_get.return_value = {
+        "id": 42,
+        "title": "Inspect me",
+        "status": "running",
+        "source": "human",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "worktree_path": "/srv/.ws-worktrees/task-42",
+        "updates": [],
+        "result_text": "",
+        "log_tail": [],
+    }
+    text = _mcp_text(await hub_task_status(42))
+    assert "Worktree: /srv/.ws-worktrees/task-42" in text
 
 
 async def test_hub_propose(mock_api_post: AsyncMock) -> None:
@@ -2667,14 +2739,14 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
         "submission_generation": 2,
         "is_current": True,
         "raw_count": 4,
-        "findings_confirmed": [{"title": "x", "severity": "low"}],
+        "findings_confirmed": [{"locator": "none", "title": "x", "severity": "low"}],
         "findings_rejected": [],
     }
     out = await hub_submit_machine_review(
         42,
         raw_count=4,
         incomplete=False,
-        findings_confirmed=[{"title": "x", "severity": "low"}],
+        findings_confirmed=[{"locator": "none", "title": "x", "severity": "low"}],
         tokens_spent=1000,
         agent="claude-code",
     )
@@ -2684,6 +2756,35 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
     assert path == "/api/tasks/42/machine-review"
     assert body["tokens_spent"] == 1000
     assert "duration_ms" not in body  # omitted optionals stay omitted
+
+
+async def test_hub_submit_steward_judgement(mock_api_post: AsyncMock) -> None:
+    from hub.mcp_server import hub_submit_steward_judgement
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 42,
+        "generation": 1,
+        "kind": "verdict",
+        "verdict": "escalate",
+        "escalate_reason": "low_confidence",
+        "submitted_verdict": "approve",
+    }
+    out = await hub_submit_steward_judgement(
+        42,
+        generation=1,
+        kind="verdict",
+        verdict="approve",
+        confidence="low",
+        grounds=[{"source": "ci_pinned_sha"}],
+    )
+    structured = _mcp_structured(out)
+    assert structured["steward_judgement"]["verdict"] == "escalate"
+    path, body = mock_api_post.await_args.args
+    assert path == "/api/tasks/42/steward-judgement"
+    assert body["verdict"] == "approve"
+    assert body["confidence"] == "low"
+    assert "tokens_spent" not in body
 
 
 async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
@@ -2700,6 +2801,26 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
             "tokens_total": 1428876,
             "tokens_per_confirmed": 357219,
         },
+        "review_dispatches": {
+            "wasted_provider_tokens_total": 2_500_000,
+            "wasted_dispatches": 2,
+            "unknown_usage": 1,
+            "closed_dispatches": 4,
+        },
+        "human_touches": {
+            "delivered_tasks": 4,
+            "touches": 10,
+            "touches_per_delivered": 2.5,
+        },
+        "human_gates": [
+            {
+                "gate": "steward",
+                "project": "default",
+                "applied": 3,
+                "escalated": 1,
+                "overridden_by_human": 1,
+            }
+        ],
         "by_harness": [],
         "recurring_categories": [
             {"category": "tests", "findings": 3, "tasks": 2, "recurring": True}
@@ -2709,6 +2830,14 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
     out = await hub_practice_metrics(since_days=90)
     structured = _mcp_structured(out)
     assert structured["metrics"]["machine_reviews"]["tokens_per_confirmed"] == 357219
+    text = _mcp_text(out)
+    assert (
+        "Wasted dispatch spend (no report): 2500000 tokens across 2 failed run(s)"
+        in (text)
+    )
+    assert "1 closed run(s) with unknown usage" in text
+    assert "Human touches per delivered task: 2.5 (10/4)" in text
+    assert "Steward gate: default applied 3 escalated 1 overridden_by_human 1" in text
     mock_api_get.assert_awaited_once_with("/api/metrics/practices?since_days=90")
 
 
@@ -2717,15 +2846,24 @@ async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:
 
 async def test_hub_my_context_without_task_id(mock_api_get: AsyncMock) -> None:
     # AC-1 (#454): no task_id → general Hub context, no validation error.
+    # #987 changed what the list means: it names live work, not holder history,
+    # so this fixture now carries a running row beside the completed one.
     mock_api_get.side_effect = [
         {"username": "cursor", "role": "agent", "principal_id": 7},
-        [{"id": 451, "title": "Pair workspace", "status": "completed"}],
+        {
+            "tasks": [
+                {"id": 451, "title": "Pair workspace", "status": "completed"},
+                {"id": 452, "title": "Live one", "status": "running"},
+            ],
+            "next_cursor": None,
+        },
     ]
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
     assert "Identity: cursor" in text
-    assert "#451" in text
+    assert "#452" in text
+    assert "#451" not in text
     assert "Workflow reference" in text
     # Identity + workspace mode resolved via diagnostics first (#530).
     assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"
@@ -2859,6 +2997,22 @@ async def test_hub_pair_start_legacy_no_worktree_note(
     assert "pair-started" in text
 
 
+async def test_hub_my_context_task_includes_worktree_from_context(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-2 (#989): hub_my_context(task_id) proxies /context including the path."""
+    mock_api_get.return_value = {
+        "context_text": "Worktree: /srv/.ws-worktrees/task-5",
+        "task": {"id": 5, "worktree_path": "/srv/.ws-worktrees/task-5"},
+    }
+    out = await hub_my_context(5)
+    assert "/srv/.ws-worktrees/task-5" in _mcp_text(out)
+    assert (
+        _mcp_structured(out)["context"]["task"]["worktree_path"]
+        == "/srv/.ws-worktrees/task-5"
+    )
+
+
 async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> None:
     # AC-3 (#530): general context reports the active workspace mode.
     mock_api_get.side_effect = [
@@ -2889,7 +3043,10 @@ async def test_machine_review_receipt_quotes_the_stored_raw_count(
     mock_api_post.return_value = {
         "submission_generation": 1,
         "raw_count": 2,  # normalised up from the 0 that was sent
-        "findings_confirmed": [{"title": "a"}, {"title": "b"}],
+        "findings_confirmed": [
+            {"locator": "none", "title": "a"},
+            {"locator": "none", "title": "b"},
+        ],
         "findings_rejected": [],
     }
 
@@ -2897,7 +3054,10 @@ async def test_machine_review_receipt_quotes_the_stored_raw_count(
         7,
         raw_count=0,
         incomplete=False,
-        findings_confirmed=[{"title": "a"}, {"title": "b"}],
+        findings_confirmed=[
+            {"locator": "none", "title": "a"},
+            {"locator": "none", "title": "b"},
+        ],
     )
 
     text = out.content[0].text if hasattr(out, "content") else str(out)
@@ -3119,3 +3279,356 @@ def test_mcp_initialize_server_name_is_haiplane_hub():
     instructions = options.instructions or ""
     assert "Haiplane" in instructions
     assert ("Open" + "Claw") not in instructions
+
+
+# --- #987: hub_my_context lists live work, not holder history ---------------
+#
+# `claimed_by` survives completion, so the unfiltered list called itself "your
+# claimed tasks" while answering "what have I ever held". Measured on prod:
+# 151 completed rows against two live ones, and 48 of the newest 50 final.
+
+
+def _page(rows: list[dict], cursor: int | None = None) -> dict:
+    return {"tasks": rows, "next_cursor": cursor}
+
+
+async def test_my_context_drops_completed_claimed(mock_api_get: AsyncMock) -> None:
+    """AC-1: digest and structured my_tasks name the running task, not the done one."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page(
+            [
+                {"id": 900, "title": "Done long ago", "status": "completed"},
+                {"id": 901, "title": "Live work", "status": "running"},
+                {"id": 902, "title": "Abandoned", "status": "failed"},
+                {"id": 903, "title": "Turned down", "status": "rejected"},
+            ]
+        ),
+    ]
+    out = await hub_my_context()
+    text = _mcp_text(out)
+    assert "#901" in text
+    for dead in ("#900", "#902", "#903"):
+        assert dead not in text
+    ids = {t["id"] for t in _mcp_structured(out)["my_tasks"]}
+    assert ids == {901}, "text and structured payload must name the same tasks"
+    # The third state — a walk that actually finished — needs pinning too, and
+    # only a negative assertion can do it. Cross-model review of #1011 mutated
+    # the clean-finish return to "capped" and all 365 tests stayed green: every
+    # digest, even this one-page one, would carry a false "stopped after 5
+    # pages" note, which is the same wrong-voice defect the three states exist
+    # to prevent.
+    assert "claimed rows" not in text, "a finished walk must not claim it was cut short"
+    assert "could not be read" not in text
+
+
+async def test_my_context_waiting_is_client_driven_review(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-2: a review nobody automated is waiting on a human, not on me."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+        # The compact card cannot carry review_job_id, so the exclusion is
+        # resolved with one status-filtered call.
+        [{"id": 910, "status": "review", "review_job_id": None}],
+    ]
+    text = _mcp_text(await hub_my_context())
+    waiting = next(
+        ln for ln in text.split("\\n") if ln.startswith("Waiting on a human")
+    )
+    assert "#910" in waiting
+    assert "In flight" not in text
+
+
+async def test_my_context_headless_review_is_in_flight(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-3: a review the poller owns is still the agent's turn."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 911, "title": "Headless", "status": "review"}]),
+        [{"id": 911, "status": "review", "review_job_id": "job-7"}],
+    ]
+    text = _mcp_text(await hub_my_context())
+    in_flight = next(ln for ln in text.split("\\n") if ln.startswith("In flight"))
+    assert "#911" in in_flight
+    assert "Waiting on a human" not in text
+
+
+async def test_my_context_pages_past_a_window_of_final_rows(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-6: filtering a window of history must not read as "nothing to do".
+
+    The live shape on prod: the newest page is all final, and the running task
+    sits below it. One page plus a filter would answer "none".
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page(
+            [
+                {"id": 800 + i, "title": f"old {i}", "status": "completed"}
+                for i in range(50)
+            ],
+            cursor=800,
+        ),
+        _page([{"id": 700, "title": "Still running", "status": "running"}]),
+    ]
+    out = await hub_my_context()
+    text = _mcp_text(out)
+    assert "#700" in text
+    assert "none live" not in text
+    assert {t["id"] for t in _mcp_structured(out)["my_tasks"]} == {700}
+    # The cursor must actually be USED, not merely stored: an ordered mock
+    # hands over page 2 whatever the URL says, so without this the test passes
+    # even when the walk re-fetches the same newest window five times — which
+    # is precisely the defect AC-6 exists to prevent.
+    second_page = mock_api_get.await_args_list[2].args[0]
+    assert "after_id=800" in second_page, second_page
+    first_page = mock_api_get.await_args_list[1].args[0]
+    assert "after_id=0" in first_page, first_page
+
+
+async def test_my_context_says_when_the_walk_stopped_short(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-6: a bounded walk that hits its cap says so instead of implying it saw all."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        *[
+            _page(
+                [
+                    {"id": 5000 + p * 50 + i, "title": "old", "status": "completed"}
+                    for i in range(50)
+                ],
+                cursor=5000 + p * 50,
+            )
+            for p in range(5)
+        ],
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "none live" in text
+    assert "claimed rows" in text, "the cap must be visible, not silent"
+    # Each page asks past the previous one; five distinct windows, not one
+    # window five times.
+    windows = [
+        c.args[0].split("after_id=")[1]
+        for c in mock_api_get.await_args_list[1:]
+        if "after_id=" in c.args[0]
+    ]
+    assert len(set(windows)) == len(windows), f"walk repeated a window: {windows}"
+
+
+async def test_my_context_never_fetches_full_cards_it_drops(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-7: the uncapped mode=full call must not pay ~10 KB a row to discard it."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 920, "title": "Live", "status": "running"}]),
+    ]
+    await hub_my_context()  # no max_chars, mode=full — the expensive path
+    claimed_call = mock_api_get.await_args_list[1].args[0]
+    assert "claimed_by=cursor" in claimed_call
+    assert "mode=summary" in claimed_call
+
+
+async def test_my_context_no_live_work_points_at_the_history(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-4's other half: completed work is not lost, it is one call away."""
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 930, "title": "Done", "status": "completed"}]),
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "none live" in text
+    assert "hub_list_tasks" in text and "claimed_by" in text
+
+
+async def test_my_context_summary_keeps_in_flight_ids(mock_api_get: AsyncMock) -> None:
+    """AC-5: under the 4000-char cap the live ids survive.
+
+    The Workflow reference is the part that gives way, and the structured
+    my_tasks may shrink under the cap as it did before (#834) — but a digest
+    that cannot name the work it exists to name would be pointless.
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page(
+            [
+                {"id": 940, "title": "Live one", "status": "running"},
+                {"id": 941, "title": "Old", "status": "completed"},
+            ]
+        ),
+    ]
+    text = _mcp_text(await hub_my_context(mode="summary"))
+    assert "#940" in text
+    assert "#941" not in text
+
+
+async def test_my_context_names_an_unreadable_page_instead_of_saying_none(
+    mock_api_get: AsyncMock,
+) -> None:
+    """A walk that broke must not answer in the voice of a walk that finished.
+
+    Page one is all history and points at more; page two fails. "None live" on
+    its own would state as fact something the hub never got to look at.
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
+        HubApiError({"message": "boom"}),
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "none live" in text
+    assert "could be read" in text or "could not be read" in text
+
+
+async def test_my_context_says_when_review_bucketing_is_a_guess(
+    mock_api_get: AsyncMock,
+) -> None:
+    """If the headless lookup fails, the review row is listed but flagged.
+
+    Falling back to Waiting is the safer default, and it is still a guess: an
+    agent that idles on a review the poller owns is waiting for nobody.
+    """
+    mock_api_get.side_effect = [
+        {"username": "cursor", "role": "agent", "principal_id": 7},
+        _page([{"id": 610, "title": "Submitted", "status": "review"}]),
+        HubApiError({"message": "boom"}),
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#610" in text
+    assert "could not tell headless review" in text
+
+
+async def test_my_context_digest_names_live_worktree(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-3 (#989): general digest lists the path next to an in-flight row."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 452, "title": "Live one", "status": "running"}]),
+        {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "In flight" in text
+    assert "#452" in text
+    assert "/srv/.ws-worktrees/task-452" in text
+
+
+async def test_my_context_digest_does_not_invent_worktree_for_claimed_only(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-4 (#989): claimed without a live tree does not invent a directory."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
+        {"id": 10, "worktree_path": ""},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#10" in text
+    assert "worktrees" not in text
+    assert "/srv/" not in text
+
+
+async def test_my_context_digest_does_not_name_removed_review_worktree(
+    mock_api_get: AsyncMock,
+) -> None:
+    """AC-7 (#989): a review row must not name the directory submit removed."""
+    mock_api_get.side_effect = [
+        {
+            "username": "cursor",
+            "role": "agent",
+            "principal_id": 7,
+            "workspace_mode": "worktree",
+        },
+        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+        [{"id": 910, "status": "review", "review_job_id": None}],
+        {"id": 910, "worktree_path": ""},
+    ]
+    text = _mcp_text(await hub_my_context())
+    assert "#910" in text
+    assert "task-910" not in text
+    assert "worktrees" not in text
+
+
+# ---------------------------------------------------------------------------
+# #1015: unknown MCP arguments must be named, not swallowed
+# ---------------------------------------------------------------------------
+
+
+async def test_unknown_refine_argument_is_named_beside_no_op() -> None:
+    """AC-1 / AC-3: a dropped field is visible next to no_op, and the call succeeds.
+
+    ``description`` became a real refine field in #1013; the live failure mode
+    is now any *other* undeclared name (here a typo of that field).
+    """
+    from hub.mcp_server import mcp
+
+    dropped = "sentinel-value-must-not-echo-1015"
+    result = await mcp.call_tool(
+        "hub_refine_task",
+        {"task_id": 42, "descriptoin": dropped},
+    )
+    structured = _call_tool_structured(result)
+    assert structured is not None
+    assert structured["no_op"] is True
+    assert _unknown_arguments(result) == ["descriptoin"]
+    dumped = json.dumps(structured) + _call_tool_text(result)
+    assert dropped not in dumped
+
+
+async def test_declared_refine_arguments_do_not_warn(
+    mock_api_post: AsyncMock,
+) -> None:
+    """AC-2: a clean call must not carry a discarded-fields warning."""
+    from hub.mcp_server import mcp
+
+    mock_api_post.return_value = {
+        "id": 42,
+        "title": "New title",
+        "acceptance_criteria": [],
+        "risks": [],
+        "readiness_score": 70,
+        "dor_passed": False,
+    }
+    result = await mcp.call_tool(
+        "hub_refine_task",
+        {"task_id": 42, "title": "New title"},
+    )
+    structured = _call_tool_structured(result)
+    assert structured is not None
+    assert structured.get("no_op") is not True
+    assert "unknown_arguments" not in structured
+    text_payload = json.loads(_call_tool_text(result))
+    assert "unknown_arguments" not in text_payload
+
+
+async def test_unknown_argument_is_named_on_echo_json(
+    mock_api_get: AsyncMock,
+) -> None:
+    """The same warning must land on format_echo_response tools, not only structured ones."""
+    from hub.mcp_server import mcp
+
+    mock_api_get.return_value = []
+    result = await mcp.call_tool(
+        "hub_list_acceptance_criteria",
+        {"task_id": 9, "limit": 10},
+    )
+    assert _unknown_arguments(result) == ["limit"]
+    text_payload = json.loads(_call_tool_text(result))
+    assert text_payload["unknown_arguments"] == ["limit"]
+    assert "message" in text_payload

@@ -915,8 +915,19 @@ async def create_skill_version(
     version = (rows[0]["v"] or 0) + 1
     cur = await db.execute(
         "INSERT INTO skills (name, kind, version, content, tags, project_id, "
-        "status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, kind, version, content, tags, project_id, status, created_by),
+        "status, created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            name,
+            kind,
+            version,
+            content,
+            tags,
+            project_id,
+            status,
+            created_by,
+            # Creating a version straight as active IS publishing it.
+            created_by if status == "active" else "",
+        ),
     )
     return cur.lastrowid, version  # type: ignore[return-value]
 
@@ -968,11 +979,25 @@ async def get_skill_version(
 
 
 async def activate_skill_version(
-    db: aiosqlite.Connection, name: str, version: int
+    db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
+    """Publish one version, recording WHO published it (#1028).
+
+    Activation is a distinct act from authorship: the human gate of #380 lets a
+    person publish text the seed wrote, which leaves ``created_by='seed'`` on a
+    row a person is now standing behind. ``seed_default_skills`` replaces only
+    its own previous word, and without this field it could not tell the two
+    apart — it would overrule the person on the next deploy.
+
+    ``activated_by`` is REQUIRED and keyword-only on purpose. An empty value
+    means "nobody published this", which is exactly what the seed reads as its
+    own word — so a default would let a caller who simply forgot the argument
+    hand a person's decision to the next deploy, silently and with every test
+    still green (#1035).
+    """
     await db.execute(
-        "UPDATE skills SET status='active' WHERE name=? AND version=?",
-        (name, version),
+        "UPDATE skills SET status='active', activated_by=? WHERE name=? AND version=?",
+        (activated_by, name, version),
     )
 
 
@@ -1000,14 +1025,15 @@ async def insert_machine_review(
     lost_dimensions: str = "[]",
     profile: str = "",
     self_reviewed: bool = False,
+    principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1027,20 +1053,106 @@ async def insert_machine_review(
             lost_dimensions,
             profile,
             int(self_reviewed),
+            principal_id,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
 
 
+async def insert_steward_judgement(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    kind: str,
+    submitted_verdict: str,
+    verdict: str,
+    confidence: str = "",
+    escalate_reason: str = "",
+    grounds: str = "[]",
+    findings: str = "[]",
+    closures: str = "[]",
+    model: str = "",
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+    submitted_by: str = "",
+    principal_id: int | None = None,
+) -> int | None:
+    """Insert one judgement. None when the (task, generation, kind) slot is taken."""
+    try:
+        cur = await db.execute(
+            "INSERT INTO steward_judgements (task_id, generation, kind, "
+            "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
+            "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
+            "principal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                generation,
+                kind,
+                submitted_verdict,
+                verdict,
+                confidence,
+                escalate_reason,
+                grounds,
+                findings,
+                closures,
+                model,
+                tokens_spent,
+                duration_ms,
+                submitted_by,
+                principal_id,
+            ),
+        )
+    except aiosqlite.IntegrityError:
+        return None
+    return cur.lastrowid
+
+
+async def get_steward_judgement(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kind: str,
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_judgements WHERE task_id=? AND generation=? AND kind=?",
+        (task_id, generation, kind),
+    )
+    return rows[0] if rows else None
+
+
+async def get_steward_judgement_by_id(
+    db: aiosqlite.Connection, judgement_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db, "SELECT * FROM steward_judgements WHERE id=?", (judgement_id,)
+    )
+    return rows[0] if rows else None
+
+
 async def set_machine_review_provider_tokens(
-    db: aiosqlite.Connection, task_id: int, generation: int, tokens: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    tokens: int,
+    review_id: int | None = None,
 ) -> None:
     """Record what the provider billed for this generation's review (#828).
 
     Written by the sweep that already fetches usage for the mismatch check.
-    Only the latest report of the generation is stamped: a resubmission gets
-    its own dispatch and its own run.
+    ``review_id`` targets the report the sweep actually MATCHED to the
+    dispatch (#1025): the latest-of-generation fallback used to stamp the
+    dispatched run's bill onto whatever row arrived last — a foreign report
+    landing after the own one inherited the money, and the own report kept
+    NULL. Without ``review_id`` the old latest-row rule stands.
     """
+    if review_id is not None:
+        await db.execute(
+            "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ?",
+            (tokens, review_id),
+        )
+        return
     await db.execute(
         "UPDATE machine_reviews SET provider_tokens = ? WHERE id = ("
         "SELECT id FROM machine_reviews WHERE task_id = ? "
@@ -1057,6 +1169,14 @@ async def get_latest_machine_review(
         "SELECT * FROM machine_reviews WHERE task_id=? ORDER BY id DESC LIMIT 1",
         (task_id,),
     )
+    return rows[0] if rows else None
+
+
+async def get_machine_review(
+    db: aiosqlite.Connection, review_id: int
+) -> aiosqlite.Row | None:
+    """One report by id — the queue judges a NAMED report, not "the latest"."""
+    rows = await fetchall(db, "SELECT * FROM machine_reviews WHERE id=?", (review_id,))
     return rows[0] if rows else None
 
 
@@ -1113,18 +1233,33 @@ async def upsert_finding_disposition(
     disposition: str,
     note: str,
     decided_by: str,
+    finding_uid: str,
 ) -> None:
     """Record what one confirmed finding turned out to be.
 
-    Upsert on (review_id, finding_index): a gate revisiting its own judgement
-    corrects it instead of leaving two contradictory rows for the metrics to
-    average.
+    Upsert stays on (review_id, finding_index), and that is correct rather than
+    legacy: a stored report is IMMUTABLE. ``findings_confirmed`` is written once
+    by ``insert_machine_review`` and never rewritten, and a resubmission files a
+    NEW report with its own id and its own judgements — so inside one report a
+    slot names one finding for good. A gate revisiting its own call corrects
+    that row instead of stacking a contradictory one beside it.
+
+    What the slot cannot do is carry identity ACROSS reports, which is why
+    ``finding_uid`` is stored beside it (#1007): the same defect in the next
+    generation has a different position and the same id.
+
+    ``finding_uid`` is required and has no default: an empty one used to be
+    accepted and then written over an id already computed — the silent
+    substitution #549 exists to prevent. Rows filed before the column exists
+    keep their empty id; nothing back-fills them.
     """
     await db.execute(
         "INSERT INTO finding_dispositions (review_id, task_id, "
-        "submission_generation, finding_index, finding_title, disposition, "
-        "note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "submission_generation, finding_index, finding_uid, finding_title, "
+        "disposition, note, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_index) DO UPDATE SET "
+        "finding_uid=excluded.finding_uid, "
+        "finding_title=excluded.finding_title, "
         "disposition=excluded.disposition, note=excluded.note, "
         "decided_by=excluded.decided_by, decided_at=datetime('now')",
         (
@@ -1132,6 +1267,7 @@ async def upsert_finding_disposition(
             task_id,
             submission_generation,
             finding_index,
+            finding_uid,
             finding_title,
             disposition,
             note,
@@ -1147,6 +1283,173 @@ async def list_finding_dispositions(
         db,
         "SELECT * FROM finding_dispositions WHERE review_id=? "
         "ORDER BY finding_index ASC",
+        (review_id,),
+    )
+
+
+# --- The queue of unjudged findings (#1038) --------------------------------
+
+#: Where an unjudged finding LIVES, written once and shared by the list and the
+#: count. Two queries spelling the same set separately is how a page and a
+#: metric come to disagree about one number (#518), so the answer is one
+#: fragment, not two careful copies of it.
+#:
+#: ``t.submission_generation = mr.submission_generation`` is what makes the
+#: report CURRENT. A resubmitted task leaves its earlier reports behind, and
+#: those findings describe code that no longer exists — asking a person to
+#: judge them is asking about a defect in a file as it used to be.
+#:
+#: The disposition is matched per FINDING, not per report. Subtracting one
+#: total from another (what ``confirmed_unjudged`` did before) treats a
+#: judgement on a stale report as an answer about a live one.
+_UNJUDGED_FINDINGS_FROM = (
+    "FROM machine_reviews mr "
+    "JOIN tasks t ON t.id = mr.task_id "
+    "AND t.submission_generation = mr.submission_generation "
+    "JOIN json_each(mr.findings_confirmed) f "
+    "LEFT JOIN finding_dispositions d "
+    "ON d.review_id = mr.id AND d.finding_index = f.key "
+    "WHERE d.id IS NULL"
+)
+
+#: The project narrows the QUERY, never its result (#627 fixed this three
+#: times already). ``PROJECT_SUBTREE_CONDITION`` names a bare ``id``; here the
+#: tasks table is aliased, so the same subtree is spelled against ``t``.
+_UNJUDGED_PROJECT_CONDITION = " AND t." + PROJECT_SUBTREE_CONDITION
+
+
+def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, list[Any]]:
+    """The one place the queue's WHERE is assembled, for list and count alike."""
+    where = _UNJUDGED_FINDINGS_FROM
+    params: list[Any] = []
+    if since is not None:
+        where += " AND mr.created_at >= datetime('now', ?)"
+        params.append(since)
+    if project_id is not None:
+        where += _UNJUDGED_PROJECT_CONDITION
+        params.append(project_id)
+    return where, params
+
+
+async def list_unjudged_findings(
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
+    limit: int | None = None,
+) -> list[aiosqlite.Row]:
+    """Confirmed findings of CURRENT reports that nobody has answered yet.
+
+    Deliberately keyed on nothing about the task's status. Every other inbox
+    section is built from ``list_tasks_by_status``, and that is exactly why
+    these findings were unreachable: a report is written while the task is in
+    review, and by the time anyone would judge it the task is ``completed`` and
+    appears in no section at all. The findings outlive the status, so the query
+    that finds them must not depend on it (#1038).
+
+    ``since`` takes the same relative form as the metrics window
+    ('-90 days'); omitted, the whole history answers.
+    """
+    where, params = _unjudged_where(since, project_id)
+    sql = (
+        "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
+        "t.status AS task_status, mr.id AS review_id, "
+        "mr.submission_generation AS submission_generation, "
+        "mr.created_at AS reported_at, mr.model AS model, "
+        "f.key AS finding_index, f.value AS finding "
+        f"{where} ORDER BY mr.created_at ASC, mr.id ASC, f.key ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return await fetchall(db, sql, tuple(params))
+
+
+async def count_unjudged_findings(
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
+) -> dict[str, int]:
+    """How many findings wait, and across how many reports.
+
+    Same FROM as :func:`list_unjudged_findings` by construction. The count a
+    person sees on the metrics page and the length of the queue they open from
+    it are the same question, and answering it twice is how the two start
+    disagreeing.
+    """
+    where, params = _unjudged_where(since, project_id)
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS findings, "  # nosec B608 - constant fragment
+        f"COUNT(DISTINCT mr.id) AS reports {where}",
+        tuple(params),
+    )
+    row = dict(rows[0]) if rows else {}
+    return {
+        "findings": int(row.get("findings") or 0),
+        "reports": int(row.get("reports") or 0),
+    }
+
+
+# --- Finding outcomes: what the AUTHOR did (#911) ---------------------------
+
+
+async def upsert_finding_outcome(
+    db: aiosqlite.Connection,
+    *,
+    review_id: int,
+    task_id: int,
+    submission_generation: int,
+    finding_uid: str,
+    finding_index: int,
+    finding_title: str,
+    outcome: str,
+    note: str,
+    linked_task_id: int | None,
+    reported_by: str,
+) -> None:
+    """Record one finding's fate as its author tells it.
+
+    Separate table from ``finding_dispositions`` and separate on purpose: this
+    is the author's account of what they did, not a human's judgement of
+    whether the finding was real. ``_disposition_metrics`` does not filter by
+    who decided, so a row written here instead of there is the difference
+    between precision meaning something and precision meaning nothing.
+
+    Upsert on ``(review_id, finding_uid)``: a resubmission may correct what the
+    author said last time, and two contradictory accounts of one finding would
+    leave a reader to pick.
+    """
+    await db.execute(
+        "INSERT INTO finding_outcomes (review_id, task_id, submission_generation, "
+        "finding_uid, finding_index, finding_title, outcome, note, linked_task_id, "
+        "reported_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(review_id, finding_uid) DO UPDATE SET "
+        "outcome=excluded.outcome, note=excluded.note, "
+        "linked_task_id=excluded.linked_task_id, "
+        "reported_by=excluded.reported_by, reported_at=datetime('now')",
+        (
+            review_id,
+            task_id,
+            submission_generation,
+            finding_uid,
+            finding_index,
+            finding_title,
+            outcome,
+            note,
+            linked_task_id,
+            reported_by,
+        ),
+    )
+
+
+async def list_finding_outcomes(
+    db: aiosqlite.Connection, review_id: int
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM finding_outcomes WHERE review_id=? ORDER BY finding_index",
         (review_id,),
     )
 
@@ -1899,12 +2202,22 @@ async def create_review_dispatch(
     run_id: str,
     model: str,
     profile: str = "",
+    reviewer_principal_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches "
-        "(task_id, submission_generation, agent_id, run_id, model, profile) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, submission_generation, agent_id, run_id, model, profile),
+        "(task_id, submission_generation, agent_id, run_id, model, profile, "
+        "reviewer_principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            agent_id,
+            run_id,
+            model,
+            profile,
+            reviewer_principal_id,
+        ),
     )
     return inserted_id(cur)
 
@@ -1978,6 +2291,18 @@ async def record_submission(
     )
 
 
+async def get_submission(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The commit pinned for this generation, or None if none was recorded."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM submissions WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
 async def previous_submission(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> aiosqlite.Row | None:
@@ -2019,6 +2344,20 @@ async def set_review_dispatch_status(
 ) -> None:
     await db.execute(
         "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+async def set_review_dispatch_provider_tokens(
+    db: aiosqlite.Connection, dispatch_id: int, tokens: int
+) -> None:
+    """Record what the provider billed for this dispatched run (#1026).
+
+    Lives on the dispatch because a failed run has no machine_review row.
+    NULL on the column (never written) is "unknown"; 0 is a real zero.
+    """
+    await db.execute(
+        "UPDATE review_dispatches SET provider_tokens = ? WHERE id = ?",
+        (tokens, dispatch_id),
     )
 
 
@@ -2828,9 +3167,19 @@ async def has_done_updates(
     db: aiosqlite.Connection,
     task_id: int,
 ) -> bool:
+    """Did the AGENT say the work is done? (#1018)
+
+    Only a claimed report counts. A passage the hub transcribed from a
+    dispatch log is stored with the same kind so a person still reads it in
+    the feed, but it must not answer this question — otherwise the next poll
+    pass sees a ``done`` row and opens the conveyor the transcription was
+    kept out of. Rows from before the column read as claimed, which is what
+    they were.
+    """
     rows = await fetchall(
         db,
-        "SELECT id FROM task_updates WHERE task_id=? AND kind='done'",
+        "SELECT id FROM task_updates "
+        "WHERE task_id=? AND kind='done' AND agent_claimed=1",
         (task_id,),
     )
     return bool(rows)
@@ -2902,6 +3251,70 @@ async def last_activity_at(db: aiosqlite.Connection, task_id: int) -> str:
     return str(rows[0]["at"]) if rows else ""
 
 
+async def human_queue_rung_raised(
+    db: aiosqlite.Connection,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+) -> bool:
+    """Has this rung already been rung for this wait (#1020)?
+
+    Scoped to the wait, not the task: ``entered_at`` in the key means a task
+    that comes back to the same status later starts the ladder again, while
+    one that simply keeps standing never hears the same rung twice.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM human_queue_reminders "
+        "WHERE task_id=? AND instance=? AND entered_at=? AND rung=? LIMIT 1",
+        (task_id, instance, entered_at, rung),
+    )
+    return bool(rows)
+
+
+async def record_human_queue_reminder(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+    age_minutes: int,
+    age_estimated: bool = False,
+) -> bool:
+    """Record a rung; False when this wait already had it.
+
+    ``INSERT OR IGNORE`` against the unique key rather than a check-then-write:
+    two poller passes overlapping on a slow database would otherwise both read
+    "not yet raised" and both remind.
+    """
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO human_queue_reminders "
+        "(task_id, instance, entered_at, rung, age_minutes, age_estimated) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, instance, entered_at, rung, int(age_minutes), int(age_estimated)),
+    )
+    await db.commit()
+    return bool(cursor.rowcount)
+
+
+async def human_queue_reminders_between(
+    db: aiosqlite.Connection, start: str, end: str
+) -> list[dict[str, Any]]:
+    """Reminders raised in ``[start, end)`` — what the digest reports (#1020)."""
+    rows = await fetchall(
+        db,
+        "SELECT r.task_id, r.instance, r.rung, r.age_minutes, r.age_estimated, "
+        "       r.created_at, t.title, t.status "
+        "FROM human_queue_reminders r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.created_at >= ? AND r.created_at < ? "
+        "ORDER BY r.age_minutes DESC",
+        (start, end),
+    )
+    return [dict(r) for r in rows]
+
+
 async def stale_rung_raised(
     db: aiosqlite.Connection, task_id: int, status: str, rung: str
 ) -> bool:
@@ -2971,9 +3384,15 @@ async def add_task_update(
     *,
     principal_id: int | None = None,
     author_kind: str = "hub",
+    agent_claimed: bool = True,
 ) -> int:
     """Append an update. ``agent`` is display-only; authorship is the pair
     (principal_id, author_kind) (#559).
+
+    ``agent_claimed=False`` marks a report the hub TRANSCRIBED rather than
+    received — today only the dispatch log's last long passage (#1018). It
+    defaults to True because every other caller is a real claim, and because
+    the rows written before the column existed were claims too.
 
     ``author_kind`` defaults to "hub" rather than to the column default
     "legacy": the column default exists to stamp rows written before the field
@@ -2984,8 +3403,16 @@ async def add_task_update(
     """
     cur = await db.execute(
         "INSERT INTO task_updates (task_id, agent, kind, content, principal_id, "
-        "author_kind) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, agent, kind, content, principal_id, author_kind),
+        "author_kind, agent_claimed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            agent,
+            kind,
+            content,
+            principal_id,
+            author_kind,
+            int(agent_claimed),
+        ),
     )
     return cur.lastrowid  # type: ignore[return-value]
 
@@ -3171,6 +3598,33 @@ async def list_unaddressable_tasks(
             "AND COALESCE(archived, 0) = 0 "
             "ORDER BY claimed_at ASC, id ASC LIMIT ?",
             (min(limit, 500),),
+        )
+    )
+
+
+async def tasks_with_retired_worktrees(
+    db: aiosqlite.Connection, *, keep_days: int, limit: int
+) -> list[aiosqlite.Row]:
+    """Finished tasks whose pair worktree has outlived ``keep_days`` (#1033).
+
+    Age comes from ``completed_at`` and from nothing else: the directory's
+    mtime moves whenever anything reads the tree, so a forgotten worktree
+    somebody grepped last night would look brand new.
+
+    Only terminal statuses are listed, and a task still in review or running
+    can never appear here whatever its age — the caller must not be the place
+    where that rule is remembered. Oldest first, so a backlog drains in a
+    predictable order rather than by whatever the database returns.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT id, title, status, completed_at FROM tasks "
+            "WHERE status IN ('completed', 'failed', 'rejected') "
+            "AND completed_at IS NOT NULL AND completed_at != '' "
+            "AND completed_at < datetime('now', ?) "
+            "ORDER BY completed_at ASC LIMIT ?",
+            (f"-{keep_days} days", limit),
         )
     )
 
@@ -3461,6 +3915,7 @@ MCP_CALL_EVENT_COLUMNS: tuple[str, ...] = (
     "latency_ms",
     "response_chars",
     "task_id",
+    "unknown_arg_count",
 )
 
 
@@ -3476,6 +3931,7 @@ async def insert_mcp_call_event(
     latency_ms: int,
     response_chars: int,
     task_id: int | None,
+    unknown_arg_count: int = 0,
 ) -> int:
     """Append one call record. One INSERT, no read-back, no aggregation.
 
@@ -3486,8 +3942,8 @@ async def insert_mcp_call_event(
     cur = await db.execute(
         "INSERT INTO mcp_call_events "
         "(tool, profile, principal_id, principal_role, status, error_reason, "
-        " latency_ms, response_chars, task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " latency_ms, response_chars, task_id, unknown_arg_count) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             tool,
             profile,
@@ -3498,6 +3954,7 @@ async def insert_mcp_call_event(
             latency_ms,
             response_chars,
             task_id,
+            max(0, int(unknown_arg_count)),
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]

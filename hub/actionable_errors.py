@@ -164,6 +164,116 @@ def chat_pair_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     )
 
 
+def steward_verdict_required_detail() -> dict[str, Any]:
+    """422: steward judgement omitted verdict. Silent default is forbidden (#549)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_verdict_required",
+            "actor_hint": "agent",
+            "message": "verdict is required and has no default",
+            "hint": (
+                "Send verdict as approve, changes_requested or escalate. "
+                "Omitting it must not become an approve."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_closed_vocabulary_detail(
+    field: str, got: str, allowed: tuple[str, ...] | list[str]
+) -> dict[str, Any]:
+    """422: a closed dictionary rejected a value, including any 'unknown'."""
+    allowed_list = list(allowed)
+    return enrich_error_payload(
+        {
+            "reason": "steward_closed_vocabulary",
+            "actor_hint": "agent",
+            "field": field,
+            "got": got,
+            "allowed": allowed_list,
+            "message": f"invalid {field}: {got!r}",
+            "hint": (
+                f"{field} must be one of: {', '.join(allowed_list)}. "
+                "There is no unknown bucket — a new code is a spec change."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_escalate_reason_required_detail(
+    allowed: tuple[str, ...] | list[str],
+) -> dict[str, Any]:
+    """422: escalate without a closed-set reason."""
+    allowed_list = list(allowed)
+    return enrich_error_payload(
+        {
+            "reason": "steward_escalate_reason_required",
+            "actor_hint": "agent",
+            "allowed": allowed_list,
+            "message": "escalate_reason is required when verdict is escalate",
+            "hint": f"Send escalate_reason as one of: {', '.join(allowed_list)}.",
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_unknown_finding_uid_detail(uid: str) -> dict[str, Any]:
+    """422: a closure named a finding that is not in this generation's report."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_unknown_finding_uid",
+            "actor_hint": "agent",
+            "message": f"finding_uid {uid} is not in this generation's report",
+            "hint": (
+                "Closures address confirmed findings of this submission by "
+                "finding_uid. A uid the hub cannot see cannot close a finding."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_judgement_exists_detail(
+    task_id: int, generation: int, kind: str
+) -> dict[str, Any]:
+    """409: at-most-once on (task_id, generation, kind), like the arbiter (#421)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_judgement_exists",
+            "actor_hint": "none",
+            "message": (
+                f"steward judgement already recorded for task #{task_id} "
+                f"generation {generation} kind {kind}"
+            ),
+            "hint": (
+                "A second judgement of the same triple is refused, not stacked. "
+                "A new submission generation opens a new slot."
+            ),
+            "suggested_tool": "hub_submit_steward_judgement",
+        }
+    )
+
+
+def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
+    """A steward token reached a route outside its two-op allowlist (#1021)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_gate_forbidden",
+            "actor_hint": "none",
+            "message": f"steward principals may not call {method} {path}",
+            "hint": (
+                "The steward principal may read the evidence pack and write a "
+                "judgement. Everything else is refused by default, including "
+                "routes that do not exist yet."
+            ),
+            "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )
+
+
 def chat_pair_agent_missing_detail() -> dict[str, Any]:
     """503 when implementer pairing has no acting principal (#980).
 
@@ -471,6 +581,37 @@ def pair_start_session_mismatch_detail(
     )
 
 
+def pair_branch_dirty_detail(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dirty shared hub clone: only a human on the host can clear it (#1040).
+
+    Agents cannot reach that directory. Addressing them is the #966 class of
+    refusal: an unfulfillable hint is worse than none. ``actor_hint`` is
+    declared here so the envelope cannot fall back to ``agent``.
+    """
+    body = dict(payload or {})
+    body["reason"] = "pair_branch_dirty"
+    body["actor_hint"] = "human"
+    body["required_role"] = "human"
+    body.setdefault("suggested_tool", "hub_pair_start")
+    return enrich_error_payload(body)
+
+
+def pair_worktree_dirty_detail(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dirty task worktree: the agent working there can stash it (#1040).
+
+    Same porcelain as ``pair_branch_dirty``, different place — collapsing the
+    two onto one addressee would wake the wrong person. The fallback to
+    ``agent`` happens to be right here; it still has to be declared, or the
+    next undeclared reason inherits a coincidence.
+    """
+    body = dict(payload or {})
+    body["reason"] = "pair_worktree_dirty"
+    body["actor_hint"] = "agent"
+    body["required_role"] = "agent"
+    body.setdefault("suggested_tool", "hub_pair_start")
+    return enrich_error_payload(body)
+
+
 def session_owned_by_other_detail(*, session_id: str) -> dict[str, Any]:
     """409 when register would overwrite another principal's session row (#977).
 
@@ -551,6 +692,39 @@ def hierarchy_error_detail(
     if allowed_parent:
         payload["required_parent_type"] = allowed_parent
     return enrich_error_payload(payload)
+
+
+def changes_requested_requires_content_detail() -> dict[str, Any]:
+    """A verdict that sends work back has to say what to redo (#1010).
+
+    The next actor is whoever just called: the refusal is answered by adding a
+    sentence and resending, never by handing the task to another party. No
+    ActorHint literal says "the caller again", and the reviewer may be either
+    kind — an agent through hub_submit_review or a human through the task
+    card. So the literal is the closest one and the real constraint lives in
+    ``required_role``, the same shape self_review_forbidden_detail uses for
+    the same impossibility. Declaring it matters either way: undeclared, the
+    envelope falls back to "agent" *with a warning*, and a caller reading that
+    fallback would think the developer is on the hook for an empty verdict.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "changes_requested_requires_content",
+            "actor_hint": "agent",
+            "required_role": "reviewer",
+            "retry_by_same_caller": True,
+            "message": (
+                "changes_requested requires a reason: send at least one "
+                "finding, or a non-empty comments text"
+            ),
+            "hint": (
+                "Say what to redo — one sentence in `comments` is enough; "
+                "structured `findings` are optional. A verdict with neither "
+                "leaves the developer guessing."
+            ),
+            "suggested_tool": "hub_submit_review",
+        }
+    )
 
 
 def done_report_error_detail(

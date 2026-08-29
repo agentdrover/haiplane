@@ -108,6 +108,46 @@ def _within_proven_empty_ceiling(task: dict) -> bool:
     return order.index(current) <= order.index(ceiling)
 
 
+async def _reviewer_model(
+    db: aiosqlite.Connection, task_id: int, generation: int, review: dict
+) -> str:
+    """Which model actually reviewed — the hub's record beats the report (#1008).
+
+    The two sides of the diversity rule are not equally knowable. The hub
+    LAUNCHES the reviewer, so for a dispatched run the model is a fact it holds
+    (``review_dispatches.model``); the implementer's model is a declaration and
+    stays one, because nothing here can observe what wrote the code.
+
+    That asymmetry is the point, not an oversight: a report is free to describe
+    itself, and a self-description is exactly what the gate must not lean on
+    when the hub has the real answer beside it. A disagreement is not silently
+    preferred either way — it is written into the task so the audit has the
+    two values, and the dispatched one is used.
+    """
+    claimed = (review.get("model") or "").strip()
+    dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    dispatched = (dict(dispatch).get("model") or "").strip() if dispatch else ""
+    if not dispatched:
+        # No dispatch behind this report: nothing more trustworthy exists, and
+        # the declaration is all there is. It still has to be recognisable to
+        # count as diversity — see same_family.
+        return claimed
+    if claimed and claimed.casefold() != dispatched.casefold():
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Отчёт ревью называет модель «{claimed}», а хаб запускал "
+            f"«{dispatched}». Для правила разнородности взята модель "
+            "диспетчера: её хаб знает, а не со слов отчёта. Сигнал аудиту "
+            "(#1008).",
+            author_kind="hub",
+        )
+        await db.commit()
+    return dispatched
+
+
 async def _proven_empty_usage(
     db: aiosqlite.Connection, task_id: int, generation: int, review: dict
 ) -> int | None:
@@ -348,7 +388,7 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     from hub.services.model_family import same_family
 
     implementer_model = (task.get("submission_model") or "").strip()
-    reviewer_model = (review.get("model") or "").strip()
+    reviewer_model = await _reviewer_model(db, task_id, generation, review)
     diversity = same_family(implementer_model, reviewer_model)
     if diversity is None:
         # Either declaration missing: absence of data is not diversity —

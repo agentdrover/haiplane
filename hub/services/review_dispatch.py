@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -39,11 +40,18 @@ log = logging.getLogger(__name__)
 
 # Real ids from GET /v1/models (checked live 2026-08-20). Order = preference;
 # the first whose family differs from the implementer's wins.
+#
+# Narrowed to the subscription on 2026-08-28 (#1036). Everything outside it
+# refuses at creation with HTTP 400 usage_limit_exceeded ("Background Agent
+# requires at least $2 remaining until your hard limit"), so gpt-5.3-codex,
+# gemini-3.1-pro and claude-sonnet-5 were not fallbacks at all — they were a
+# guaranteed failure the moment an implementer outside the claude family made
+# the diversity rule reach for the second entry. Checked live against
+# GET /v1/models and by launching each.
 _REVIEW_MODEL_PREFERENCES: tuple[str, ...] = (
     "grok-4.6",
-    "gpt-5.3-codex",
-    "gemini-3.1-pro",
-    "claude-sonnet-5",
+    "grok-4.5",
+    "composer-2.5",
 )
 
 _TERMINAL_RUN_STATUSES = {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}
@@ -701,6 +709,33 @@ async def collect_review_rules(
     return header + "".join(body), note
 
 
+# The text-delivery contract (#1036). Named fence, JSON inside, last block in
+# the answer wins — a model that quotes the format while explaining itself must
+# not be able to shadow its own report with the example.
+REPORT_FENCE = "haiplane-review"
+REPORT_BLOCK_INSTRUCTION = (
+    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+    "1) Если инструменты хаба тебе доступны — сдай hub_submit_machine_review, "
+    "это основной путь.\n"
+    "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
+    f"```{REPORT_FENCE}\n"
+    '{"raw_count": <число находок до проверки>, "incomplete": true|false, '
+    '"findings_confirmed": [{"title": "...", "severity": "high|medium|low", '
+    '"category": "...", "locator": "lines|file|none", "file": "путь", '
+    '"start_line": 1, "detail": "..."}], '
+    '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
+    '"unresolved": [{"title": "...", "why": "..."}], '
+    '"lost_dimensions": ["..."], "harness_skill": "...", '
+    '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
+    "```\n"
+    "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
+    "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
+    "никто не смог рассудить, идёт в unresolved, а НЕ в findings_rejected. "
+    "Если инструменты хаба недоступны — этот блок единственный способ "
+    "доставить работу, и без него прогон пропадёт целиком."
+)
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -723,6 +758,12 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1036: the report has to survive a run with no MCP. Since 22.08 the
+        # hub's MCP stopped reaching cloud runs at all — the reviewer works,
+        # finishes, and its findings die in the final text nobody parses. So
+        # the text becomes a second, weaker delivery: same fields, stated
+        # once, at the very end, where a machine can find them.
+        f"{REPORT_BLOCK_INSTRUCTION}\n\n"
     )
     if profile == LITE:
         # No token ceiling is stated (#893). It used to say "бюджет 40000
@@ -834,11 +875,15 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     if task.get("status") != "review" or generation <= 0:
         return False
 
-    review = await repo.get_latest_machine_review(db, task_id)
-    if review is None:
-        return False
-    report = dict(review)
-    if report.get("submission_generation") != generation:
+    # #1025: the ladder climbs on OUR run's own declaration. A foreign
+    # incomplete report at an active dispatch must not buy a top-up — the
+    # dispatch is still waiting for its own report.
+    dispatch_row = await repo.get_review_dispatch_for_generation(
+        db, task_id, generation
+    )
+    dispatch = dict(dispatch_row) if dispatch_row is not None else None
+    report = await _dispatch_report(db, task_id, generation, dispatch)
+    if report is None:
         return False
     if not report.get("incomplete"):
         return False
@@ -1011,6 +1056,17 @@ async def maybe_dispatch_review(
         await db.commit()
         return False
 
+    # #1025: pin whose report this dispatch waits for, resolved from the
+    # reviewer token at dispatch time. An unresolved token is logged and
+    # falls back to the old task+generation match rather than blocking the
+    # dispatch — degradation is this module's contract.
+    expected_principal = await reviewer_principal_id(db)
+    if expected_principal is None:
+        log.warning(
+            "reviewer token resolves to no principal — dispatch for task #%s "
+            "matches its report by task+generation only",
+            task_id,
+        )
     await repo.create_review_dispatch(
         db,
         task_id=task_id,
@@ -1019,6 +1075,7 @@ async def maybe_dispatch_review(
         run_id=run_info.get("id") or agent_info.get("latestRunId") or "",
         model=model_id,
         profile=profile,
+        reviewer_principal_id=expected_principal,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -1083,16 +1140,216 @@ def instance_base_url() -> str:
     return instance_echo_fields().get("base_url", "")
 
 
-async def _current_review(
-    db: aiosqlite.Connection, task_id: int, generation: int
+async def reviewer_principal_id(db: aiosqlite.Connection) -> int | None:
+    """The principal behind CURSOR_REVIEWER_HUB_TOKEN, or None (#1025).
+
+    The same hash lookup auth performs, without its side effects. None — an
+    empty token, an env-map token, a rotated key — leaves the dispatch under
+    the old task+generation matching rule rather than inventing an identity.
+    """
+    token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
+    if not token:
+        return None
+    # Open mode never reads the bearer header, so every report lands with
+    # principal_id NULL — a pinned dispatch would be unsatisfiable there and
+    # die by a FALSE grace alert, with the reviewer's own report flagged as
+    # foreign. Worse than the old rule, which is exactly what degradation
+    # must never be: no pin in open mode.
+    from hub import auth
+
+    if auth._is_open_mode():
+        return None
+    from hub.services.admin import hash_api_key
+
+    rows = await fetchall(
+        db,
+        "SELECT principal_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+        (hash_api_key(token),),
+    )
+    return int(dict(rows[0])["principal_id"]) if rows else None
+
+
+def _expected_principal(dispatch: dict[str, Any] | None) -> int | None:
+    """Whose report settles this dispatch, or None for the old rule (#1025).
+
+    None — a dispatch recorded before the column existed, or one whose token
+    never resolved — keeps the task+generation match: history must not change
+    its meaning retroactively.
+    """
+    if dispatch is None:
+        return None
+    raw = dispatch.get("reviewer_principal_id")
+    return int(raw) if raw is not None else None
+
+
+async def _dispatch_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    dispatch: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    row = await repo.get_latest_machine_review(db, task_id)
-    if row is None:
+    """The report THIS dispatch is waiting for, or None (#1025).
+
+    With a known reviewer principal only that principal's report counts,
+    matched by the token-derived ``principal_id`` on the row — never by
+    ``submitted_by``, which is the caller naming itself. Before this rule the
+    author's parallel report closed the hub's own dispatch as done, silenced
+    the no-report alert and fed the author's numbers to the usage
+    cross-check (#1011 gen 1: 71296 declared against 2574930 billed read as
+    a 36x discrepancy of a run that had submitted nothing).
+    """
+    expected = _expected_principal(dispatch)
+    if dispatch is None or expected is None:
+        row = await repo.get_latest_machine_review(db, task_id)
+        if row is None:
+            return None
+        review = dict(row)
+        if (review.get("submission_generation") or 0) != generation:
+            return None
+        return review
+    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
+    own = [dict(r) for r in rows if dict(r).get("principal_id") == expected]
+    # The ladder (#879) runs two SAME-principal dispatches on one generation,
+    # so principal+generation alone still matched the lite report to the deep
+    # dispatch — settled 'done' before its run reported, grace alert
+    # unreachable. Rungs pair with reports by order instead: the k-th
+    # dispatch of the generation waits for the principal's k-th report.
+    # Exact for every current path, because a second dispatch exists only
+    # after the first report bought it (top-up is the sole same-generation
+    # re-dispatch).
+    dispatch_ids = await fetchall(
+        db,
+        "SELECT id FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? ORDER BY id",
+        (task_id, generation),
+    )
+    order = [int(dict(r)["id"]) for r in dispatch_ids]
+    try:
+        rung = order.index(int(dispatch["id"]))
+    except (ValueError, KeyError, TypeError):
+        return None  # the dispatch row is gone or unreadable — nothing to match
+    return own[rung] if rung < len(own) else None
+
+
+def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
+    """The billed total, or None when the provider did not answer (#1026)."""
+    total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+    if isinstance(total, int) and total >= 0:
+        return total
+    return None
+
+
+async def _stamp_dispatch_usage(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> int | None:
+    """Ask the provider what this run billed; leave NULL when unknown (#1026)."""
+    usage = await cursor_cloud.get_usage(
+        dispatch["agent_id"], dispatch["run_id"] or None
+    )
+    total = _provider_token_total(usage)
+    if total is not None:
+        await repo.set_review_dispatch_provider_tokens(db, dispatch["id"], total)
+    return total
+
+
+def parse_report_block(text: str | None) -> Any | None:
+    """The report a run left in its own text, or None (#1036).
+
+    Returns a validated ``MachineReviewSubmit``. None means the text carried
+    no usable report — no fence, no JSON, or fields the contract refuses. The
+    caller must treat that as "no report", never as an empty one: inventing
+    structure out of prose is exactly how "could not read" turns into "read
+    and clean", which is the failure this whole area keeps circling.
+
+    The LAST block wins. A model explaining itself may quote the format on the
+    way, and the example must not be able to shadow the real answer.
+    """
+    if not text:
         return None
-    review = dict(row)
-    if (review.get("submission_generation") or 0) != generation:
-        return None
-    return review
+    from hub.models import MachineReviewSubmit
+
+    blocks = re.findall(
+        rf"```{re.escape(REPORT_FENCE)}\s*(.*?)```", text, flags=re.DOTALL
+    )
+    for raw in reversed(blocks):
+        try:
+            payload = json.loads(raw.strip())
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return MachineReviewSubmit(**payload)
+        except Exception:  # noqa: BLE001 - a refused report is simply not one
+            log.warning("run text carried a report the contract refused")
+            continue
+    return None
+
+
+async def _recover_report_from_run(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
+) -> bool:
+    """Record the report a finished run left in its text. True when stored.
+
+    The path exists because the contract path stopped working: Cursor no
+    longer delivers the hub's MCP into a cloud run, so since 22.08 reviewers
+    finish their work and leave it in ``result`` — measured, paid for, and
+    unread. The transcription is deliberately narrow.
+
+    * It runs only after the grace window, so a report still on its way
+      through MCP always wins (that path is checked first, above).
+    * The stored row belongs to the dispatch's OWN reviewer principal.
+      Anything else and the report would read as foreign to its own dispatch,
+      which is the defect #1025 closed.
+    * Its origin is recorded in the data, because a report typed into a text
+      field cannot be checked the way a submitted one can.
+    * No block, or a block the contract refuses, stores NOTHING. The text is
+      kept in the feed as prose and the dispatch fails as before.
+    """
+    report = parse_report_block(run.get("result"))
+    task_id = int(dispatch["task_id"])
+    if report is None:
+        tail = (run.get("result") or "").strip()
+        if tail:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                "Прогон ревью завершился без отчёта по контракту, а в тексте "
+                "рана нет разбираемого блока — структура НЕ восстанавливается "
+                "по прозе. Текст сохранён как есть, находки из него никем не "
+                f"подтверждены (#1036):\n\n{tail[:4000]}",
+            )
+        return False
+    from hub.services.machine_review_intake import (
+        ORIGIN_RUN_TEXT,
+        record_machine_review,
+    )
+
+    try:
+        await record_machine_review(
+            db,
+            task_id,
+            report,
+            principal_id=dispatch.get("reviewer_principal_id"),
+            username=(dispatch.get("model") or "cursor-cloud-reviewer"),
+            origin=ORIGIN_RUN_TEXT,
+        )
+    except Exception:  # noqa: BLE001 - the sweep must survive a bad report
+        log.exception("could not record the report recovered for task #%s", task_id)
+        return False
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Отчёт ревью восстановлен из текста прогона: MCP до рана не дошёл, и "
+        f"агент {dispatch['agent_id']} ({dispatch['model']}) оставил отчёт "
+        "блоком в ответе. Он записан с пометкой происхождения — это слабее "
+        "отчёта, сданного по контракту: прогон писал его о себе сам (#1036).",
+    )
+    return True
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
@@ -1106,20 +1363,21 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
-        review = await _current_review(db, task_id, dispatch["submission_generation"])
+        review = await _dispatch_report(
+            db, task_id, dispatch["submission_generation"], dispatch
+        )
         if review is not None:
-            usage = await cursor_cloud.get_usage(
-                dispatch["agent_id"], dispatch["run_id"] or None
-            )
-            total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
+            total = await _stamp_dispatch_usage(db, dispatch)
             reported = review.get("tokens_spent")
-            if isinstance(total, int) and total >= 0:
-                # #828: keep the number, not just the complaint about it. The
-                # economics of the practice were being computed from the
-                # harness's own claim; the billed figure was fetched here and
-                # dropped on the floor.
+            if total is not None:
+                # #828: keep the number on the report too so existing
+                # practice metrics over machine_reviews stay honest.
                 await repo.set_machine_review_provider_tokens(
-                    db, task_id, dispatch["submission_generation"], total
+                    db,
+                    task_id,
+                    dispatch["submission_generation"],
+                    total,
+                    review_id=int(review["id"]),
                 )
             if isinstance(total, int) and total > 0:
                 mismatch = reported is None or (
@@ -1152,6 +1410,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             (dispatch["id"], f"-{config.CURSOR_REVIEW_GRACE_MINUTES} minutes"),
         )
         if not grace_rows:
+            continue
+        await _stamp_dispatch_usage(db, dispatch)
+        if await _recover_report_from_run(db, dispatch, run):
+            await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+            await db.commit()
             continue
         await repo.add_task_update(
             db,

@@ -15,6 +15,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from hub.actionable_errors import (
+    pair_branch_dirty_detail,
+    pair_worktree_dirty_detail,
+)
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 from hub.integrations.protocols import (
     CIProbeOutcome,
@@ -67,6 +71,7 @@ class PairBranchConflictError(Exception):
         workspace_path: str | None = None,
         hostname: str | None = None,
         suggested_tool: str | None = "hub_pair_start",
+        files: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -75,6 +80,7 @@ class PairBranchConflictError(Exception):
         self.workspace_path = workspace_path
         self.hostname = hostname
         self.suggested_tool = suggested_tool
+        self.files = files or []
 
     def to_detail(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -83,12 +89,18 @@ class PairBranchConflictError(Exception):
         }
         if self.hint:
             payload["hint"] = self.hint
+        if self.files:
+            payload["files"] = self.files
         if self.workspace_path:
             payload["workspace_path"] = self.workspace_path
         if self.hostname:
             payload["hostname"] = self.hostname
         if self.suggested_tool:
             payload["suggested_tool"] = self.suggested_tool
+        if self.reason == "pair_branch_dirty":
+            return pair_branch_dirty_detail(payload)
+        if self.reason == "pair_worktree_dirty":
+            return pair_worktree_dirty_detail(payload)
         return enrich_error_payload(payload)
 
 
@@ -118,6 +130,44 @@ def _task_id_from_branch(branch: str) -> int | None:
         return None
 
 
+# How many paths a refusal names before it starts counting instead. The tail
+# is counted rather than dropped: a bare "10 files" list reads as the whole of
+# it, and the person then stashes believing they have seen everything.
+_DIRTY_PATHS_NAMED = 10
+
+
+async def _dirty_state(repo: str) -> tuple[str, list[str]]:
+    """``(raw porcelain, paths)`` for ``repo`` — dirtiness and what is dirty.
+
+    Both halves come from one ``git status`` because they must agree: the raw
+    text decides whether to refuse, the parsed paths say what to name. The
+    ``-z`` form is what makes the second half usable — without it git escapes
+    any non-ASCII path (``docs/Тест.md`` arrives as ``"docs/\\320\\242..."``),
+    and a refusal that names a file under a name the person cannot find in
+    their own checkout has not really named it (#555, same defect one layer up).
+    """
+    _, out, _ = await _git("status", "--porcelain", "-z", repo=repo, check=False)
+    return out, parse_porcelain_paths(out)
+
+
+def _name_dirty_files(paths: list[str]) -> str:
+    if not paths:
+        return "git не назвал ни одного пути"
+    named = ", ".join(paths[:_DIRTY_PATHS_NAMED])
+    rest = len(paths) - _DIRTY_PATHS_NAMED
+    return f"{named} и ещё {rest}" if rest > 0 else named
+
+
+def _rescue_command(repo: str, task_id: int | None = None) -> str:
+    """A command that PRESERVES the dirty work, ready to paste.
+
+    ``stash push -u`` and not ``clean``: the whole point of the refusal is that
+    untracked files do not come back, so the way out it offers must keep them.
+    """
+    label = f" -m 'before pair-start #{task_id}'" if task_id is not None else ""
+    return f"cd {repo} && git stash push -u{label}"
+
+
 def _pair_branch_conflict(
     message: str,
     *,
@@ -128,6 +178,7 @@ def _pair_branch_conflict(
     current_branch: str | None = None,
     task_id: int | None = None,
     base_branch: str | None = None,
+    files: list[str] | None = None,
 ) -> PairBranchConflictError:
     host = _hostname()
     if hint is None and current_branch and task_id is not None:
@@ -149,6 +200,7 @@ def _pair_branch_conflict(
         workspace_path=repo,
         hostname=host,
         suggested_tool=suggested_tool,
+        files=files,
     )
 
 
@@ -523,7 +575,12 @@ async def _reject_broken_files(repo: str) -> list[str]:
 
 
 async def _resolve_ref(name: str, repo: str) -> str | None:
-    """Resolve a branch name to a commit sha, falling back to origin/<name>."""
+    """Resolve a branch name to a commit sha, falling back to origin/<name>.
+
+    Local-first is for "does this clone have the ref?". Do not use it for a
+    comparison the hub will judge — a leftover checkout can trail origin
+    (#762, #1046). Those callers use ``_resolve_ref_remote_first``.
+    """
     for ref in (name, f"origin/{name}"):
         rc, out, _ = await _git(
             "rev-parse",
@@ -637,17 +694,21 @@ class GitOpsIntegration:
         Merge-base analysis against ``base_branch``: ``other_branch`` owns the
         commits reachable from it but not from base; if ``branch`` contains
         any of them, the branches are stacked and ``branch`` cannot be
-        verified against base independently. Best-effort: unresolvable refs
-        or any git failure return False (advisory check, never an error).
+        verified against base independently. Refs are resolved remote-first
+        (#1046 / #762): a stale local develop must not invent a stack.
+        Best-effort: unresolvable refs or any git failure return False
+        (advisory check, never an error).
         """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
                 return False
         repo = repo or _repo_root()
-        head = await _resolve_ref(branch, repo)
-        other = await _resolve_ref(other_branch, repo)
-        base = await _resolve_ref(_resolve_base(base_branch), repo)
+        # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
+        # local develop turn independent branches into a false stack.
+        head = await _resolve_ref_remote_first(branch, repo)
+        other = await _resolve_ref_remote_first(other_branch, repo)
+        base = await _resolve_ref_remote_first(_resolve_base(base_branch), repo)
         if not (head and other and base):
             return False
 
@@ -697,12 +758,12 @@ class GitOpsIntegration:
         # rather than proceed. P1 of that policy documents the destructive
         # behaviour as a known wart with "commit or stash first" as the
         # workaround; this removes the need for the workaround.
-        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        dirty, dirty_files = await _dirty_state(repo)
         if dirty.strip():
             raise WorkspaceNotReadyError(
                 f"refusing to prepare #{task_id} in dirty workspace {repo} — "
-                f"commit or stash first. Files: "
-                + ", ".join(dirty.strip().splitlines()[:10])
+                f"commit or stash first. Files: {_name_dirty_files(dirty_files)}. "
+                f"To keep them: {_rescue_command(repo, task_id)}"
             )
 
         rc, _, err = await _git("checkout", base, repo=repo, check=False)
@@ -758,15 +819,17 @@ class GitOpsIntegration:
         repo = repo or _repo_root()
         base = _resolve_base(base_branch)
 
-        rc, dirty, _ = await _git("status", "--porcelain", repo=repo, check=False)
+        dirty, dirty_files = await _dirty_state(repo)
         if dirty.strip():
             raise _pair_branch_conflict(
-                "Uncommitted changes in workspace; commit or stash before pair-start",
+                "Uncommitted changes in workspace; commit or stash before "
+                f"pair-start. Files: {_name_dirty_files(dirty_files)}",
                 repo=repo,
                 reason="pair_branch_dirty",
+                files=dirty_files,
                 hint=(
-                    f"Commit or stash uncommitted changes in {repo} "
-                    f"(host {_hostname()}), then retry hub_pair_start."
+                    f"On host {_hostname()}: {_rescue_command(repo, task_id)} "
+                    f"(or commit them), then retry hub_pair_start."
                 ),
             )
 
@@ -1242,6 +1305,22 @@ class GitOpsIntegration:
         rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
         return out if rc == 0 else None
 
+    async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
+        """Every path in the tree of ``ref``; ``None`` when it could not be read.
+
+        The distinction file_at_ref deliberately collapses is the one the AC
+        locator check needs (#764): a file the submission never added is
+        ``missing`` and a file that could not be read is ``unknown``, and
+        turning the second into the first is exactly the false accusation
+        #506 forbids. Knowing the tree tells the two apart in one call.
+        """
+        rc, out, _ = await _git(
+            "ls-tree", "-r", "--name-only", ref, repo=repo, check=False
+        )
+        if rc != 0:
+            return None
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
 
@@ -1431,6 +1510,10 @@ class GitOpsIntegration:
         """Deterministic worktree path for a task (#459); where its branch lives."""
         return _worktree_path(task_id, repo or _repo_root())
 
+    async def worktree_is_registered(self, path: str, repo: str | None = None) -> bool:
+        """True when ``path`` is a registered worktree of ``repo`` (#989)."""
+        return await _worktree_registered(path, repo or _repo_root())
+
     async def pair_prepare_worktree(
         self,
         task_id: int,
@@ -1471,18 +1554,18 @@ class GitOpsIntegration:
             cur = (cur or "").strip()
             if cur == branch:
                 return branch
-            rc, dirty, _ = await _git(
-                "status", "--porcelain", repo=wt_path, check=False
-            )
+            dirty, dirty_files = await _dirty_state(wt_path)
             if dirty.strip():
                 raise _pair_branch_conflict(
                     f"Worktree {wt_path} is on {cur!r} with uncommitted changes; "
-                    f"refusing to switch it to {branch!r}",
+                    f"refusing to switch it to {branch!r}. "
+                    f"Files: {_name_dirty_files(dirty_files)}",
                     repo=wt_path,
                     reason="pair_worktree_dirty",
+                    files=dirty_files,
                     hint=(
-                        f"Commit or stash changes in {wt_path} (host {_hostname()}), "
-                        f"then retry pair-start for #{task_id}."
+                        f"On host {_hostname()}: {_rescue_command(wt_path, task_id)} "
+                        f"(or commit them), then retry pair-start for #{task_id}."
                     ),
                     task_id=task_id,
                 )
@@ -2276,6 +2359,7 @@ class GitOpsIntegration:
         so this compares them directly rather than counting what the graph
         happens to contain.
         """
+        base = _resolve_base(base)
         # The clone may be behind, and the question is about upstream, not
         # about this checkout — so refresh the two ends first. A fetch that
         # fails is not fatal: the local refs may still answer, and only a
@@ -2288,7 +2372,19 @@ class GitOpsIntegration:
             repo=repo,
             check=False,
         )
-        for left, right in ((f"origin/{base}", f"origin/{head}"), (base, head)):
+        # Order matters, and it was learned the hard way (#991 review round 2).
+        # The done pipeline asks this BEFORE pushing, so origin/<head> does not
+        # exist yet and the first pair cannot answer. The second pair is the one
+        # that does: a local branch against the base as it stands UPSTREAM. The
+        # local base is asked last and only as a fallback, because it drifts —
+        # in a per-task worktree it may not be checked out at all, and in a
+        # clone it may be stale or already carry the task's commits, which is
+        # how "nothing to deliver" gets said about work that never shipped.
+        for left, right in (
+            (f"origin/{base}", f"origin/{head}"),
+            (f"origin/{base}", head),
+            (base, head),
+        ):
             rc, _, _ = await _git(
                 "diff", "--quiet", left, right, repo=repo, check=False
             )
@@ -2701,6 +2797,71 @@ class GitOpsIntegration:
         except json.JSONDecodeError:
             return ""
         return str(data.get("state") or "").lower()
+
+    async def pr_is_draft(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Whether GitHub still treats this PR as a draft (#1053).
+
+        A Cloud Agent opens PRs as drafts by default. Hub ``create_pr`` never
+        does. ``gh pr merge`` refuses a draft with the same boolean
+        ``merge_pr`` already returns for a conflict or a revoked token, and
+        that boolean used to send the task to ``needs_decision``. False here
+        means "not a draft or could not look" — same #498 rule as the other
+        readers: silence is not an accusation, and the merge call still runs.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "isDraft",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            log.info(
+                "PR #%d draft probe unavailable: %s",
+                pr_number,
+                (err or "gh молчит").strip()[:200],
+            )
+            return False
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return False
+        return bool(data.get("isDraft"))
+
+    async def mark_pr_ready(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Convert a draft PR to ready. Hub approval is the ready signal (#1053)."""
+        rc, _, err = await _gh(
+            "pr",
+            "ready",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            log.info("Marked PR #%d ready", pr_number)
+            return True
+        log.warning(
+            "Failed to mark PR #%d ready: %s",
+            pr_number,
+            (err or "").strip()[:200],
+        )
+        return False
 
     async def _pr_absent_or_unknown(
         self, pr_number: int, repo: str | None, gh_repo: str | None

@@ -734,6 +734,7 @@ MCP_CALL_EVENT_COLUMNS = {
     "latency_ms",
     "response_chars",
     "task_id",
+    "unknown_arg_count",
     "created_at",
 }
 
@@ -752,6 +753,9 @@ async def test_mcp_call_events_table_has_no_payload_column():
         assert columns["task_id"]["type"] == "INTEGER"
         assert columns["latency_ms"]["notnull"] == 1
         assert columns["response_chars"]["notnull"] == 1
+        # #549: pre-column rows must read as unknown, not as "discarded none".
+        assert columns["unknown_arg_count"]["type"] == "INTEGER"
+        assert columns["unknown_arg_count"]["notnull"] == 0
     finally:
         await conn.close()
 
@@ -765,7 +769,8 @@ async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
         await upgraded.execute("DROP TABLE mcp_call_events")
         await upgraded.execute(
             "DELETE FROM _migrations WHERE name IN "
-            "('create_mcp_call_events', 'idx_mcp_call_events_window')"
+            "('create_mcp_call_events', 'idx_mcp_call_events_window', "
+            "'add_mcp_call_events_unknown_arg_count')"
         )
         await upgraded.commit()
 
@@ -785,6 +790,22 @@ async def test_mcp_call_events_upgrade_path_matches_a_fresh_database():
         await upgraded.close()
 
 
+async def test_unknown_arg_count_omitted_insert_reads_as_unmeasured():
+    """#549: a telemetry row that never recorded discards is NULL, not zero."""
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        await db.execute("INSERT INTO mcp_call_events (tool) VALUES ('hub_whoami')")
+        await db.commit()
+        rows = list(
+            await db.execute_fetchall(
+                "SELECT unknown_arg_count FROM mcp_call_events WHERE tool = 'hub_whoami'"
+            )
+        )
+        assert rows and rows[0]["unknown_arg_count"] is None
+
+
 async def test_provider_tokens_migration_is_additive():
     # AC-5 (#828): reports written before the column exists keep reading, and
     # they read as "never billed" rather than as "cost nothing" (#549).
@@ -801,6 +822,29 @@ async def test_provider_tokens_migration_is_additive():
         rows = list(
             await db.execute_fetchall(
                 "SELECT provider_tokens FROM machine_reviews WHERE task_id = 1"
+            )
+        )
+        assert rows and rows[0]["provider_tokens"] is None
+
+
+async def test_review_dispatch_provider_tokens_migration_is_additive():
+    # #1026: a dispatch closed before the column existed reads as unknown,
+    # never as a free run (#549).
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.executescript(_SCHEMA)
+        await _migrate(db)
+        await db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, run_id, model, status) "
+            "VALUES (1, 1, 'bc-legacy', 'run-legacy', 'grok-4.6', 'failed')"
+        )
+        await db.commit()
+
+        rows = list(
+            await db.execute_fetchall(
+                "SELECT provider_tokens FROM review_dispatches WHERE agent_id = "
+                "'bc-legacy'"
             )
         )
         assert rows and rows[0]["provider_tokens"] is None
@@ -1088,6 +1132,32 @@ async def test_chat_pair_hash_is_unique():
             await conn.execute(
                 "INSERT INTO chat_pair_sessions (principal_id, token_hash, expires_at) "
                 "VALUES (1, 't', datetime('now', '+2 hours'))"
+            )
+    finally:
+        await conn.close()
+
+
+async def test_steward_judgements_table_and_unique_triple():
+    """#1022: judgements persist, and (task, generation, kind) is at-most-once."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "steward_judgements")
+        assert "verdict" in cols
+        assert "submitted_verdict" in cols
+        await conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES (1, 't', '')"
+        )
+        await conn.execute(
+            "INSERT INTO steward_judgements (task_id, generation, kind, "
+            "submitted_verdict, verdict) VALUES (1, 1, 'verdict', 'approve', "
+            "'approve')"
+        )
+        await conn.commit()
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO steward_judgements (task_id, generation, kind, "
+                "submitted_verdict, verdict) VALUES (1, 1, 'verdict', "
+                "'escalate', 'escalate')"
             )
     finally:
         await conn.close()

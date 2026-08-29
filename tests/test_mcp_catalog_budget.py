@@ -328,8 +328,15 @@ PRE_TRIM_CEILINGS = {
     "model_visible_chars": 73293,
     "max_tool_chars": 7120,
 }
-FROZEN_DESCRIPTION_CHARS = 36495  # the 2026-08-21 freeze; live was 38130
-FROZEN_MAX_TOOL_CHARS = 6472  # same freeze; live was 7065, 55 under the ceiling
+# Re-frozen 2026-08-28 (#1031) after the second trim: live was 36332 with only
+# 163 characters left under the previous freeze, and one day had just spent 380
+# of them (#1007 +281, #1013 +99). Each freeze sits a WORKING HEADROOM above
+# the measured catalog — 1000 characters here, 200 for the fattest tool — so a
+# field added to a contract has room to land, and a second one has to be paid
+# for by a trim rather than by raising the number. A freeze may only move
+# down: the pre-trim values were 36495 (2026-08-21, live 38130) and 6472.
+FROZEN_DESCRIPTION_CHARS = 36383  # live 35383 + 1000 working headroom
+FROZEN_MAX_TOOL_CHARS = 6404  # live 6204 + 200 working headroom
 PRE_TRIM_INSTRUCTION_PER_TOOL = 179598
 
 
@@ -348,8 +355,12 @@ def test_no_ceiling_rises() -> None:
         )
 
 
-async def test_description_chars_below_36495() -> None:
-    """AC-3: the docstring trim is real, not a rounding error."""
+async def test_description_chars_stay_under_freeze() -> None:
+    """AC-3: the docstring trim is real, not a rounding error.
+
+    Named without a number since #1031: the freeze moves down after every
+    trim, and a name carrying the old figure would be wrong the moment it did.
+    """
     snapshot = await catalog_snapshot()
     assert snapshot["description_chars"] < FROZEN_DESCRIPTION_CHARS
 

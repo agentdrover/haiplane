@@ -1,9 +1,9 @@
 """Slices of practice_metrics that must not flatter the practice.
 
 Human gates (#737): how often the human click changes the outcome and how long
-work queues for it. Only human decisions count — 'hub' and 'policy' actors are
-excluded on both sides of the ratio; unmeasurable waits are reported, never
-zeroed.
+work queues for it. Only human decisions count — 'hub', 'policy', and 'steward'
+actors are excluded on both sides of the ratio; unmeasurable waits are reported,
+never zeroed. Steward judgements get their own gate=steward row (#1023).
 
 Review economics (#828) and escaped defects (#528) follow the same rule from
 opposite ends: what a run cost, and what the gate failed to stop. Across all
@@ -21,7 +21,9 @@ from httpx import AsyncClient
 
 from hub import repository as repo
 from hub import services
-from hub.models import TaskDecide
+from hub.config import TokenIdentity
+from hub.models import StewardGround, StewardJudgementSubmit, TaskDecide
+from hub.services.steward_judgement import record_steward_judgement
 from hub.db import _MIGRATIONS, _SCHEMA, _migrate  # noqa: F401
 from hub.services.orchestration import practice_metrics
 
@@ -455,6 +457,15 @@ async def _report(
     findings = json.dumps(
         [{"title": f"f{i}", "severity": "medium"} for i in range(confirmed)]
     )
+    # The task's own generation moves with the report. In production
+    # hub_submit_for_review bumps it and the report is filed against the value
+    # it just set, so a task sitting at 0 with a report at 1 is a state nothing
+    # produces — and it reads as a SUPERSEDED report to anything that asks
+    # which report is current (#1038).
+    await db.execute(
+        "UPDATE tasks SET submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
     await repo.insert_machine_review(
         db,
         task_id=task_id,
@@ -526,6 +537,71 @@ async def test_both_numbers_stay_visible_when_they_disagree(
     page = (await client.get("/metrics")).text
     assert "6013569" in page.replace(" ", "").replace("&nbsp;", "")
     assert "175000" in page.replace(" ", "").replace("&nbsp;", "")
+
+
+async def _failed_dispatch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    provider_tokens: int | None = None,
+) -> int:
+    did = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-waste",
+        run_id="run-waste",
+        model="grok-4.6",
+    )
+    if provider_tokens is not None:
+        await repo.set_review_dispatch_provider_tokens(db, did, provider_tokens)
+    await repo.set_review_dispatch_status(db, did, "failed")
+    return did
+
+
+async def test_wasted_dispatch_spend_is_a_sibling_of_confirmed_price(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3 (#1026): wasted spend is visible and does not enter the price of
+    # a confirmed finding. Mixing the two would flatten a dead channel into
+    # a cheaper-looking practice (#516).
+    billed = await _task(db, title="billed report")
+    silent = await _task(db, title="failed dispatch")
+    await _report(db, billed, confirmed=2, tokens_spent=1000, provider_tokens=90_000)
+    await _failed_dispatch(db, silent, provider_tokens=2_500_000)
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    mr = metrics["machine_reviews"]
+    rd = metrics["review_dispatches"]
+
+    assert rd["wasted_provider_tokens_total"] == 2_500_000
+    assert rd["wasted_dispatches"] == 1
+    assert rd["unknown_usage"] == 0
+    assert mr["provider_tokens_total"] == 90_000
+    assert mr["provider_tokens_per_confirmed"] == 45_000
+    assert mr["tokens_per_confirmed"] == 500
+
+    page = (await client.get("/metrics")).text
+    assert "2500000" in page.replace(" ", "").replace("&nbsp;", "")
+    assert "Сожжено без отчёта" in page
+
+
+async def test_unknown_dispatch_usage_is_not_a_zero_bill(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#1026): NULL is unknown, counted beside the sum, never as 0.
+    silent = await _task(db, title="failed with no bill")
+    billed = await _task(db, title="failed with a bill")
+    await _failed_dispatch(db, silent, provider_tokens=None)
+    await _failed_dispatch(db, billed, provider_tokens=1_000_000)
+    await db.commit()
+
+    rd = (await practice_metrics(db))["review_dispatches"]
+    assert rd["wasted_provider_tokens_total"] == 1_000_000
+    assert rd["wasted_dispatches"] == 1
+    assert rd["unknown_usage"] == 1
+    assert rd["closed_dispatches"] == 2
 
 
 # --- Escaped defects (#528) -------------------------------------------------
@@ -799,6 +875,7 @@ async def _judged(
             task_id=task_id,
             submission_generation=1,
             finding_index=index,
+            finding_uid=f"uid-{index}",
             finding_title=f"f{index}",
             disposition=disposition,
             note="",
@@ -1079,3 +1156,275 @@ async def test_profile_with_no_bill_reports_unknown_not_zero(
 
     assert lite["provider_tokens_per_run"] is None
     assert lite["billed_runs"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Human touches on delivered tasks (#1009)
+# ---------------------------------------------------------------------------
+
+
+async def _deliver(db: aiosqlite.Connection, task_id: int, *, pr: int) -> None:
+    """A merge the hub performed: the denominator of the touch metric."""
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (NULL, ?, ?, ?)",
+        (pr, task_id, f"sha-{pr}"),
+    )
+
+
+async def test_touches_share_one_task_set(db: aiosqlite.Connection):
+    # AC-2 (#1009): numerator and denominator come from the delivered set.
+    # An undelivered task with plenty of human events must not enter either.
+    shipped = await _task(db, title="delivered with two touches")
+    also_shipped = await _task(db, title="delivered with none")
+    still_open = await _task(db, title="undelivered with five touches")
+    await _deliver(db, shipped, pr=101)
+    await _deliver(db, also_shipped, pr=102)
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="human")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=shipped,
+        actor="reviewer",
+        payload={"verdict": "approved"},
+    )
+    for _ in range(5):
+        await repo.insert_event(
+            db, kind="task_approved", task_id=still_open, actor="human"
+        )
+    await db.commit()
+
+    touches = (await practice_metrics(db))["human_touches"]
+    assert touches["delivered_tasks"] == 2, (
+        "undelivered work must not pad the denominator"
+    )
+    assert touches["touches"] == 2, (
+        "touches on undelivered tasks must not pad the numerator"
+    )
+    assert touches["touches_per_delivered"] == 1.0
+
+
+async def test_machine_actors_are_not_touches(db: aiosqlite.Connection):
+    # AC-3 (#1009): hub and policy on a delivered task are not human touches,
+    # and they must not create a human touch that the gate metric would also
+    # refuse. The filter is the same set of actors.
+    shipped = await _task(db, title="delivered mixed actors")
+    await _deliver(db, shipped, pr=201)
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="hub")
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="policy")
+    await repo.insert_event(db, kind="task_approved", task_id=shipped, actor="human")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=shipped,
+        actor="policy",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
+    touches = (await practice_metrics(db))["human_touches"]
+    assert touches["delivered_tasks"] == 1
+    assert touches["touches"] == 1, "hub and policy must not count as touches"
+
+
+def test_gate_event_vocabulary_is_single_source():
+    # AC-4 (#1009): the kind list lives in one place. Queries import it; they
+    # must not restype the same strings into a second IN-list.
+    import inspect
+
+    from hub.services.gate_events import HUMAN_GATE_EVENT_KINDS, NON_HUMAN_GATE_ACTORS
+    from hub.services import orchestration
+
+    assert HUMAN_GATE_EVENT_KINDS == frozenset(
+        {
+            "task_approved",
+            "task_rejected",
+            "review_verdict_recorded",
+            "task_decided",
+            "audit_result",
+            "disposition_recorded",
+            "steward_judgement",
+            "steward_applied",
+            "steward_escalated",
+        }
+    )
+    assert "unknown" not in HUMAN_GATE_EVENT_KINDS
+    assert NON_HUMAN_GATE_ACTORS == frozenset({"hub", "policy", "steward"})
+
+    gate_src = inspect.getsource(orchestration._human_gate_metrics)
+    touch_src = inspect.getsource(orchestration._human_touch_metrics)
+    assert "HUMAN_GATE_EVENT_KINDS" in gate_src
+    assert "HUMAN_GATE_EVENT_KINDS" in touch_src
+    assert "NON_HUMAN_GATE_ACTORS" in gate_src
+    assert "NON_HUMAN_GATE_ACTORS" in touch_src
+    assert "task_approved', 'task_rejected'" not in gate_src
+    assert "task_approved', 'task_rejected'" not in touch_src
+
+
+# ---------------------------------------------------------------------------
+# Steward audit: events, author_kind, own metric row (#1023)
+# ---------------------------------------------------------------------------
+
+
+async def test_steward_records_are_never_human(db: aiosqlite.Connection):
+    # AC-1 (#1023): a recorded judgement is steward in the feed and the
+    # timeline. Neither the event nor the update looks like a human click
+    # or a hub write (#559).
+    task_id = await _task(db, title="steward judgement feed")
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="approve",
+            confidence="high",
+            grounds=[StewardGround(source="ci_pinned_sha")],
+        ),
+        TokenIdentity("steward-bot", "steward"),
+    )
+
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    on_task = [e for e in events if e["task_id"] == task_id]
+    kinds = {e["kind"] for e in on_task}
+    assert "steward_judgement" in kinds
+    assert "steward_applied" in kinds
+    for event in on_task:
+        if event["kind"].startswith("steward_"):
+            assert event["actor"] == "steward"
+            assert event["actor"] not in {"human", "hub"}
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    steward_updates = [u for u in updates if u["author_kind"] == "steward"]
+    assert steward_updates, f"expected author_kind=steward, got {updates}"
+    assert all(u["author_kind"] not in {"human", "hub"} for u in steward_updates)
+
+    escalated_id = await _task(db, title="steward escalate feed")
+    await record_steward_judgement(
+        db,
+        escalated_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="approve",
+            confidence="low",
+            grounds=[StewardGround(source="ci_pinned_sha")],
+        ),
+        TokenIdentity("steward-bot", "steward"),
+    )
+    esc_kinds = {
+        e["kind"]
+        for e in await repo.list_events(db, since=0)
+        if e["task_id"] == escalated_id
+    }
+    assert "steward_judgement" in esc_kinds
+    assert "steward_escalated" in esc_kinds
+    assert "steward_applied" not in esc_kinds
+
+
+async def test_steward_excluded_from_human_gates(db: aiosqlite.Connection):
+    # AC-2 (#1023): steward judgements do not enter the numerator or the
+    # denominator of human gates — same exclusion as hub and policy.
+    human = await _task(db, title="human dor")
+    await repo.insert_event(db, kind="task_approved", task_id=human, actor="human")
+    await repo.insert_event(db, kind="task_rejected", task_id=human, actor="human")
+    await db.commit()
+
+    before = [
+        r for r in (await practice_metrics(db))["human_gates"] if r["gate"] != "steward"
+    ]
+
+    judged = await _task(db, title="steward beside human")
+    await repo.insert_event(
+        db, kind="steward_judgement", task_id=judged, actor="steward"
+    )
+    await repo.insert_event(db, kind="steward_applied", task_id=judged, actor="steward")
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=judged,
+        actor="steward",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
+    after_all = (await practice_metrics(db))["human_gates"]
+    after = [r for r in after_all if r["gate"] != "steward"]
+    assert after == before, "steward must not move human-gate counts"
+    dor = _gate(after_all, "dor", "default")
+    assert dor["approvals"] == 1
+    assert dor["overrides"] == 1
+
+
+async def test_steward_gate_row_exists(client: AsyncClient, db: aiosqlite.Connection):
+    # AC-3 (#1023): applied, escalated, and a human change of outcome land
+    # on gate=steward — not on a human gate.
+    applied = await _task(db, title="steward applied")
+    escalated = await _task(db, title="steward escalated")
+    overridden = await _task(db, title="steward then human reject")
+    await repo.insert_event(
+        db, kind="steward_applied", task_id=applied, actor="steward"
+    )
+    await repo.insert_event(
+        db, kind="steward_escalated", task_id=escalated, actor="steward"
+    )
+    applied_id = await repo.insert_event(
+        db, kind="steward_applied", task_id=overridden, actor="steward"
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(2.0), applied_id),
+    )
+    await repo.insert_event(db, kind="task_rejected", task_id=overridden, actor="human")
+    await db.commit()
+
+    gates = (await practice_metrics(db))["human_gates"]
+    row = _gate(gates, "steward", "default")
+    assert row["applied"] == 2
+    assert row["escalated"] == 1
+    assert row["overridden_by_human"] == 1
+
+    page = (await client.get("/metrics")).text
+    assert "gate=steward" in page or "Стюард" in page
+    assert str(row["applied"]) in page
+
+
+async def test_override_window_is_seven_days(db: aiosqlite.Connection):
+    # AC-4 (#1023): a human change six days after steward_applied counts;
+    # eight days later does not. The window is the denominator in time.
+    inside = await _task(db, title="overridden inside window")
+    outside = await _task(db, title="overridden outside window")
+    applied_in = await repo.insert_event(
+        db, kind="steward_applied", task_id=inside, actor="steward"
+    )
+    applied_out = await repo.insert_event(
+        db, kind="steward_applied", task_id=outside, actor="steward"
+    )
+    reject_in = await repo.insert_event(
+        db, kind="task_rejected", task_id=inside, actor="human"
+    )
+    reject_out = await repo.insert_event(
+        db, kind="task_rejected", task_id=outside, actor="human"
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(6 * 24 + 1), applied_in),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(1.0), reject_in),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(8 * 24 + 1), applied_out),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? WHERE id=?",
+        (_ts(1.0), reject_out),
+    )
+    await db.commit()
+
+    row = _gate((await practice_metrics(db))["human_gates"], "steward", "default")
+    assert row["applied"] == 2
+    assert row["overridden_by_human"] == 1
+    assert row["escalated"] == 0

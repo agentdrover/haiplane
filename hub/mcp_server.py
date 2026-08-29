@@ -21,11 +21,14 @@ from hub.services.tree_output import (
 )
 from hub.hub_instance import instance_echo_fields, with_instance_echo
 from hub.mcp_envelope import (
+    attach_unknown_arguments,
     build_mutation_envelope,
+    discarded_argument_names,
     enrich_error_payload,
     format_echo_response,
     merge_mutation_response,
 )
+from hub.models import AWAITING_HUMAN_STATUSES, FINAL_STATUSES
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
@@ -64,11 +67,34 @@ class InstrumentedFastMCP(FastMCP):
     Recording happens after the answer exists, never before, and cannot fail
     the call — see ``record_call``. Cancellation is deliberately not recorded
     as an error: the tool did not fail, the client left.
+
+    Unknown argument names are listed on the same funnel (#1015). Pydantic
+    ``extra="ignore"`` would otherwise swallow them, and the caller would see
+    a successful no-op. Names only — never values. The call still succeeds:
+    ``extra="forbid"`` would 422 live sessions holding a stale ``tools/list``
+    (#899).
     """
+
+    def _declared_argument_names(self, name: str) -> set[str] | None:
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            return None
+        names: set[str] = set()
+        for field_name, field_info in tool.fn_metadata.arg_model.model_fields.items():
+            names.add(field_name)
+            if field_info.alias:
+                names.add(field_info.alias)
+        return names
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         principal_id, role = identity_context_get()
         started = time.perf_counter()
+        declared = self._declared_argument_names(name)
+        discarded = (
+            discarded_argument_names(arguments, declared)
+            if declared is not None
+            else []
+        )
         try:
             result = await super().call_tool(name, arguments)
         except Exception as exc:
@@ -79,8 +105,10 @@ class InstrumentedFastMCP(FastMCP):
                 error=exc,
                 principal_id=principal_id,
                 principal_role=role,
+                unknown_arg_count=len(discarded),
             )
             raise
+        result = attach_unknown_arguments(result, discarded)
         await record_call(
             tool=name,
             arguments=arguments,
@@ -88,6 +116,7 @@ class InstrumentedFastMCP(FastMCP):
             result=result,
             principal_id=principal_id,
             principal_role=role,
+            unknown_arg_count=len(discarded),
         )
         return result
 
@@ -439,20 +468,20 @@ async def hub_create_task(
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
     Creates work that is already approved, so an agent token gets 403
-    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which
-    creates a draft for human approval. The refusal is enforced by the API, not
-    here, so it also holds for a token calling POST /api/tasks directly.
+    ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which drafts
+    for human approval. Enforced by the API, not here, so it also holds for a
+    token calling POST /api/tasks directly.
 
     Args:
         title: Short title (required)
-        description: Detailed description of what needs to be done
+        description: What needs to be done
         task_type: 'epic', 'feature', 'task', or 'subtask'
-        parent_id: Parent task ID (required for feature/subtask, optional for task)
+        parent_id: Parent ID (required for feature/subtask, optional for task)
         priority: 'critical', 'high', 'medium', or 'low'
         runtime: 'auto' or 'openrouter'
-        run_immediately: If True, dispatch immediately (not applicable for epic/feature)
-        human_owner: Person who owns / is accountable for this task
-        human_reviewer: Person who will review and accept the result
+        run_immediately: Dispatch at once (not for epic/feature)
+        human_owner: Who is accountable for this task
+        human_reviewer: Who accepts the result
         client_request_id: Optional idempotency key; safe to retry on timeout
     """
     body: dict[str, Any] = {
@@ -758,6 +787,8 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         f"Review: {'enabled' if task.get('auto_review', True) else 'disabled'}, cycle {task.get('review_cycle', 0)}",
         f"Created: {task['created_at']}",
     ]
+    if task.get("worktree_path"):
+        parts.append(f"Worktree: {task['worktree_path']}")
     parts.extend(_dependency_lines(task))
     if task.get("description"):
         parts.append(f"\nDescription:\n{task['description']}")
@@ -1097,6 +1128,147 @@ def _context_char_budget(max_chars: int | None, mode: str) -> int | None:
     return 4000 if mode == "summary" else None
 
 
+# How far the claimed walk goes before it stops and says so (#987).
+#
+# The filter alone was not enough, and prod is why: `claimed_by` survives
+# completion, so the holder of this hub carried 151 completed rows against two
+# live ones, and a single 50-row window held 48 finals — bottoming out at an id
+# far above the oldest running task. Filtering that window turns a noisy digest
+# into an empty one, which reads as "nothing to do" instead of "I only looked
+# at the newest fifty". So the walk pages until the holder's non-final work is
+# actually found, and when it hits the cap it prints that rather than implying
+# it saw everything.
+_CLAIMED_PAGE_LIMIT = 50
+_CLAIMED_MAX_PAGES = 5
+
+_FINAL_STATUS_VALUES = frozenset(s.value for s in FINAL_STATUSES)
+_AWAITING_HUMAN_VALUES = frozenset(s.value for s in AWAITING_HUMAN_STATUSES)
+
+
+async def _claimed_non_final(username: str) -> tuple[list[dict[str, Any]], str]:
+    """The holder's live claimed rows, and why the walk is incomplete if it is.
+
+    Second element is "" when the walk saw everything, "capped" when it ran
+    out of pages, and "unreadable" when a page could not be fetched. Those are
+    three different sentences and the digest says whichever is true: a walk
+    that stopped early must not answer "none live" in the same voice it uses
+    when it really looked at everything.
+
+    Compact cards on every page, never full ones: the digest names id, title
+    and status, and a full card of this hub weighs about 10 KB. Fetching those
+    only to drop the finals would move the cost to the server instead of
+    removing it (#834).
+    """
+    kept: list[dict[str, Any]] = []
+    cursor: int | None = 0
+    for _ in range(_CLAIMED_MAX_PAGES):
+        query = (
+            f"/api/tasks?claimed_by={urllib.parse.quote(username)}"
+            f"&limit={_CLAIMED_PAGE_LIMIT}&mode=summary&after_id={cursor}"
+        )
+        try:
+            page = await _api_get(query)
+        except HubApiError:
+            return kept, "unreadable"
+        rows = page.get("tasks", []) if isinstance(page, dict) else (page or [])
+        kept.extend(r for r in rows if r.get("status") not in _FINAL_STATUS_VALUES)
+        cursor = page.get("next_cursor") if isinstance(page, dict) else None
+        if not cursor:
+            return kept, ""
+    return kept, "capped"
+
+
+async def _headless_review_ids(
+    username: str, rows: list[dict[str, Any]]
+) -> tuple[set[int], bool]:
+    """Ids among ``rows`` whose review is owned by the poller, not a person.
+
+    ``review`` is an awaiting-human status by membership, with the exclusion
+    living in the query: a review carrying ``review_job_id`` is headless and
+    the agent is still on the hook. The compact card does not carry that field,
+    so it is resolved with one extra status-filtered call — and only when the
+    slice actually holds a review row, which is usually never.
+    """
+    if not any(r.get("status") == "review" for r in rows):
+        return set(), True
+    try:
+        page = await _api_get(
+            f"/api/tasks?claimed_by={urllib.parse.quote(username)}"
+            f"&status=review&limit={_CLAIMED_PAGE_LIMIT}"
+        )
+    except HubApiError:
+        # Unresolved, not resolved-as-human: every review row falls into
+        # Waiting below, and an agent idling on work that is still its own is
+        # exactly what that would cost. Say it instead of guessing quietly.
+        return set(), False
+    full = page.get("tasks", []) if isinstance(page, dict) else (page or [])
+    return {int(t["id"]) for t in full if t.get("review_job_id")}, True
+
+
+def _split_in_flight_and_waiting(
+    rows: list[dict[str, Any]], headless_review: set[int]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Mine vs theirs: what I move next against what a human moves next."""
+    in_flight: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    for row in rows:
+        status = row.get("status")
+        awaits_human = status in _AWAITING_HUMAN_VALUES and not (
+            status == "review" and int(row.get("id") or 0) in headless_review
+        )
+        (waiting if awaits_human else in_flight).append(row)
+    return in_flight, waiting
+
+
+# Three different sentences for three different amounts of ignorance (#987).
+_WALK_QUALIFIER = {
+    "capped": f" in the newest {_CLAIMED_PAGE_LIMIT * _CLAIMED_MAX_PAGES} claimed rows",
+    "unreadable": " in the rows that could be read — a page of claimed tasks failed",
+}
+_WALK_NOTE = {
+    "capped": (
+        f"Note: stopped after {_CLAIMED_MAX_PAGES} pages of claimed rows — "
+        "older live work, if any, is not listed."
+    ),
+    "unreadable": (
+        "Note: a page of claimed rows could not be read — this list may be "
+        "missing live work."
+    ),
+}
+
+
+def _claimed_line(label: str, rows: list[dict[str, Any]]) -> str:
+    """One digest line, saying out loud when it stopped short (#519/#810)."""
+    shown = []
+    for r in rows[:20]:
+        bit = f"#{r.get('id')} {r.get('title', '')} ({r.get('status', '?')})"
+        path = (r.get("worktree_path") or "").strip()
+        if path:
+            bit += f" @ {path}"
+        shown.append(bit)
+    more = f" ({len(shown)} of {len(rows)} shown)" if len(rows) > len(shown) else ""
+    return f"{label}{more}: " + "; ".join(shown)
+
+
+async def _attach_live_worktree_paths(rows: list[dict[str, Any]]) -> None:
+    """Name a live pair worktree next to a digest row without inventing one (#989).
+
+    Compact list cards do not carry ``worktree_path`` (and must not start).
+    One GET per live row is the cost of echoing a path that actually exists.
+    """
+    for row in rows:
+        tid = row.get("id")
+        if not tid:
+            continue
+        try:
+            full = await _api_get(f"/api/tasks/{tid}")
+        except HubApiError:
+            continue
+        path = (full or {}).get("worktree_path") or ""
+        if path:
+            row["worktree_path"] = path
+
+
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
@@ -1118,20 +1290,21 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         except HubApiError:
             identity = {}
     username = (identity.get("username") or "").strip()
+    in_flight: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    walk_incomplete = ""
+    headless_known = True
     if username:
-        # A capped call asks for compact cards at the source (#834): a full
-        # card of this hub weighs about 10 KB, and the digest below names only
-        # id, title and status. Fetching 50 full ones to then drop 47 would
-        # move the cost from the client to the server, not remove it.
-        query = f"/api/tasks?claimed_by={urllib.parse.quote(username)}&limit=50"
-        if budget is not None:
-            query += "&mode=summary"
-        try:
-            my_tasks = await _api_get(query)
-        except HubApiError:
-            my_tasks = []
-        if isinstance(my_tasks, dict):  # paginated envelope shape
-            my_tasks = my_tasks.get("tasks", [])
+        my_tasks, walk_incomplete = await _claimed_non_final(username)
+        headless, headless_known = await _headless_review_ids(username, my_tasks)
+        in_flight, waiting = _split_in_flight_and_waiting(my_tasks, headless)
+
+    workspace_mode = identity.get("workspace_mode") or "legacy"
+    if workspace_mode == "worktree" and (in_flight or waiting):
+        # Summary cards omit the path on purpose (#834/#989). Fetch the
+        # full GET only for the rows the digest will name (capped at 20).
+        await _attach_live_worktree_paths(in_flight[:20])
+        await _attach_live_worktree_paths(waiting[:20])
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
@@ -1143,7 +1316,6 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
         )
     else:
         lines.append("Identity: unavailable")
-    workspace_mode = identity.get("workspace_mode") or "legacy"
     lines.append(
         f"Workspace mode: {workspace_mode}"
         + (
@@ -1153,21 +1325,28 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             else " — single shared working tree (branch switching)"
         )
     )
-    if my_tasks:
-        task_strs = [
-            f"#{t.get('id')} {t.get('title', '')} ({t.get('status', '?')})"
-            for t in my_tasks[:20]
-        ]
-        # The digest has always stopped at 20 and never said so (#519/#810):
-        # a list that ends without a word reads as the whole list.
-        shown = (
-            f" ({len(task_strs)} of {len(my_tasks)} shown)"
-            if len(my_tasks) > len(task_strs)
-            else ""
+    # Work to do, not a holder history. `claimed_by` survives completion, so
+    # the unfiltered list answered "what have I ever held" while calling itself
+    # "your claimed tasks" — and on this hub that is 151 completed rows against
+    # two live ones. In flight is what I move next; Waiting is what a human
+    # moves next (#987).
+    if in_flight:
+        lines.append(_claimed_line("In flight", in_flight))
+    if waiting:
+        lines.append(_claimed_line("Waiting on a human", waiting))
+    if not in_flight and not waiting:
+        lines.append(
+            "Your claimed tasks: none live"
+            + _WALK_QUALIFIER.get(walk_incomplete, "")
+            + " (completed ones stay in hub_list_tasks with claimed_by + status)"
         )
-        lines.append(f"Your claimed tasks{shown}: " + "; ".join(task_strs))
-    else:
-        lines.append("Your claimed tasks: none")
+    elif walk_incomplete:
+        lines.append(_WALK_NOTE[walk_incomplete])
+    if not headless_known:
+        lines.append(
+            "Note: could not tell headless review from a client-driven one "
+            "(the review lookup failed) — rows in review are listed as Waiting."
+        )
     lines.append("")
     lines.extend(lifecycle_map_lines())
 
@@ -1337,21 +1516,21 @@ async def hub_pair_start(
     """Start pair mode: move an open task to running without headless dispatch.
 
     Use this when a human works with a local agent, instead of hub_start_task
-    (which always dispatches). In worktree mode the response names your
-    task's isolated git worktree — work THERE, not in the shared clone.
+    (which dispatches). In worktree mode the response names your task's
+    isolated worktree — work THERE, not in the shared clone.
 
     Args:
         task_id: The open task ID to pair-start
-        plan: Work plan if none exists yet (kind='status' content starting with 'Plan:')
-        assigned_agent: Agent name recorded on the task. On a claimed task it
-            must equal the claim holder (the hub_claim_task agent), or the call
-            is refused with pair_start_claim_mismatch naming both. The same
-            authenticated principal is accepted under a different name.
-        branch_slug: Optional branch slug (task-<id>/<slug>). Empty uses title slug.
+        plan: Work plan if none exists yet (kind='status' starting with 'Plan:')
+        assigned_agent: Agent recorded on the task. On a claimed task it must
+            equal the claim holder, or the call is refused with
+            pair_start_claim_mismatch naming both. The same principal is
+            accepted under another name.
+        branch_slug: Optional slug (task-<id>/<slug>). Empty uses title slug.
         session_id: YOUR session id — required for agents (#852): several
-            sessions run under one agent name and all pass a name-based check.
-            Reuse the id from hub_session_register and hub_claim_task; another
-            session is refused with pair_start_session_mismatch.
+            sessions share one agent name and all pass a name check. Reuse the
+            id from hub_session_register and hub_claim_task; another session is
+            refused with pair_start_session_mismatch.
         git_mode: hub (default) prepares the branch on the hub host; remote
             records the canonical name and skips host git (#975).
     """
@@ -1429,30 +1608,31 @@ async def hub_submit_for_review(
     branch: str = "",
     model: str = "",
     accept_areas: bool = False,
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    This does NOT complete the task and you do not write the verdict — the
+    This does NOT complete the task, and the verdict is not yours: the
     reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Moves a running pair task into status=review and bumps the submission
-    generation, invalidating any earlier APPROVED. After the verdict the task
-    returns to running: APPROVED means take the normal done path,
-    CHANGES_REQUESTED means fix and resubmit.
+    Bumps the generation, invalidating any earlier APPROVED.
 
     Args:
         task_id: The running pair task ID
-        agent: Name of the submitting agent (empty uses task's assigned agent)
+        agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: The branch you actually worked in, compared against the
-            canonical name pair-start gave you; a mismatch is refused with both
-            names. Omitting it skips the check — the hub cannot see your
-            working copy, so this is your report, not its observation (#533).
-        model: The model that wrote this submission (#758) — a declaration,
-            auditable rather than provable. The auto-verdict's model-diversity
-            rule needs it: empty keeps the verdict with the human.
+        branch: The branch you actually worked in, checked against the
+            canonical name pair-start gave you; a mismatch is refused naming
+            both. Omitting it skips the check — reported, not observed (#533).
+        model: The model that wrote this submission (#758) — declared, not
+            proven. The diversity rule needs it: empty keeps the verdict with
+            the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
-            affected_areas (#890), recorded as a visible event. Nothing is
-            widened without this flag and nothing is hidden with it.
+            affected_areas (#890), visibly.
+        finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
+            what became of the findings this resubmission was sent back over
+            (#911). outcome: fixed | false_positive | wont_fix | deferred; all
+            but fixed owe a note. The last two leave a defect draft unless
+            linked_task_id names existing work.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1467,6 +1647,8 @@ async def hub_submit_for_review(
         body["model"] = model
     if accept_areas:
         body["accept_areas"] = True
+    if finding_outcomes:
+        body["finding_outcomes"] = finding_outcomes
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
@@ -1626,17 +1808,16 @@ async def hub_submit_review(
 ) -> str:
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
-    Not for the task's own implementer — a verdict from the submitting agent
-    is refused. The verdict binds to the current submission generation and
-    does NOT complete the task: it returns to running, where APPROVED lets
-    the author take the done path and CHANGES_REQUESTED sends them back to
-    hub_submit_for_review.
+    Not for the task's own implementer — such a verdict is refused. Binds to
+    the current submission generation and does NOT complete the task: it
+    returns to running, where APPROVED lets the author take the done path and
+    CHANGES_REQUESTED sends them back to hub_submit_for_review.
 
-    Finding scope (#435): every finding carries scope
-    (in_scope|out_of_scope, default in_scope). changes_requested with
-    findings requires at least one in_scope finding — if everything is out
-    of scope, approve and keep those as recommendations linked to follow-up
-    tasks. Out-of-scope findings without linked_task_id warn, non-blocking.
+    Finding scope (#435): every finding carries scope (in_scope|out_of_scope,
+    default in_scope). changes_requested with findings requires at least one
+    in_scope finding — if everything is out of scope, approve and keep those
+    as recommendations linked to follow-up tasks. Out-of-scope findings
+    without linked_task_id warn, non-blocking.
 
     Auto-drafts (#436): create_tasks_for_out_of_scope=true creates a DRAFT
     follow-up for every unlinked out_of_scope finding and stamps its id into
@@ -1647,13 +1828,13 @@ async def hub_submit_review(
         verdict: 'approved' or 'changes_requested'
         comments: Free-text review summary
         agent: Reviewer agent name
-        findings: For changes_requested — list of dicts with id (int, stable
-            within this submission), severity (high|medium|low), message,
-            and optional file, line, recommendation,
+        findings: For changes_requested — dicts with id (int, stable within
+            this submission), severity (high|medium|low), message, and
+            optional file, line, recommendation,
             scope (in_scope|out_of_scope, default in_scope),
-            linked_task_id (int — follow-up task for out_of_scope findings).
-        create_tasks_for_out_of_scope: Auto-create draft follow-up tasks
-            for unlinked out_of_scope findings (default false).
+            linked_task_id (int — follow-up for out_of_scope findings).
+        create_tasks_for_out_of_scope: Auto-create draft follow-ups for
+            unlinked out_of_scope findings (default false).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1828,8 +2009,9 @@ async def hub_force_complete_task(
     Args:
         task_id: Task or subtask to complete
         comment: Audit-trail reason; required for most active lifecycle states
-        pr_disposition: The PR's fate — 'deliver'|'abandon'|''. Recorded,
-            never acted on (#897).
+        pr_disposition: The PR's fate — 'deliver'|'abandon'|''. 'deliver'
+            merges under the gate's conditions, else refuses with the reason
+            (#1037).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2046,25 +2228,22 @@ async def hub_decide_task(
 ) -> str:
     """Human decision after arbiter review — the Decision Gate.
 
-    When a task reaches needs_decision (review ambiguity, CI/review cycle
-    limit, or arbiter escalation), a human must explicitly accept or rework
-    it. This tool records the human decision and optionally persists it as
-    a reusable decision record through the notes integration.
+    When a task reaches needs_decision (review ambiguity, cycle limit, arbiter
+    escalation), a human must accept or rework it. This records that decision
+    and can persist it as a reusable record through notes.
 
-    The decision_summary is always written into the task update log so the
-    reasoning is visible even without a notes backend. When record_decision
-    is True the summary is additionally saved through the notes plugin (if
-    configured); if notes are unavailable, core flow continues unaffected.
+    decision_summary is always written to the task log, so the reasoning
+    survives without a notes backend; notes are optional and never block.
 
     Args:
         task_id: The needs_decision task ID
         action: 'accept' to complete, 'rework' to send back for fixes
         instructions: When action='rework', what needs to be fixed
-        decision_summary: Short summary/reason for the decision (recorded in task updates)
-        record_decision: If True, also persist the decision through the notes integration
-        pr_disposition: On accept, the PR's fate — 'deliver'|'abandon'|''.
-            Recorded, never acted on: the task stays in
-            hub_undelivered_completed until the PR itself moves (#897).
+        decision_summary: Short reason (recorded in task updates)
+        record_decision: Also persist through the notes integration
+        pr_disposition: On accept — 'deliver'|'abandon'|''. 'deliver' merges
+            under the gate's own conditions or refuses naming the unmet one:
+            a decision cannot stand in for a gate (#1037).
     """
     body: dict[str, Any] = {
         "action": action,
@@ -2192,31 +2371,33 @@ async def hub_submit_machine_review(
 ) -> CallToolResult:
     """Submit a structured multi-agent review report (#381).
 
-    Bound to the task's current submission generation — resubmitting work
-    makes the report stale, like a human verdict. Metrics (#384) are
-    optional but wanted: tokens_spent/duration_ms feed practice economics.
+    Bound to the current submission generation: resubmitting work makes the
+    report stale. Metrics are optional but feed practice economics (#384).
 
-    ``incomplete`` is REQUIRED and has no default (#549): "0 confirmed" means
-    nothing unless it stands next to incomplete=False. A finding nobody could
-    judge goes to ``unresolved``, never to ``findings_rejected`` — "nobody
-    voted" and "someone refuted it" are opposite outcomes.
+    ``incomplete`` is REQUIRED, no default (#549): "0 confirmed" means nothing
+    without it. A finding nobody could judge goes to ``unresolved``, never to
+    ``findings_rejected`` — "nobody voted" and "refuted" are opposite.
 
     Args:
         task_id: Reviewed task.
         raw_count: Findings before adversarial verification.
-        incomplete: True when any agent died, any dimension was lost, context
-            was truncated, or a budget ran out. No default on purpose: a
-            silently-defaulted False is how a run with dead agents reads clean.
-        findings_confirmed: [{title, severity, category?, file?, line?, detail?}]
+        incomplete: True when an agent died, a dimension was lost, context was
+            truncated, or a budget ran out. No default: a silent False is how
+            a run with dead agents reads clean.
+        findings_confirmed: [{title, severity, locator, category?, file?,
+            start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
+            'lines' (file + start_line), 'file' (module known, line not),
+            'none' (no place found). 'none' is an answer; an empty file is
+            not. The stable id is derived by the hub.
         findings_rejected: [{title, category?, reason?}] — actually refuted.
         unresolved: [{title, why}] — nobody could judge these. Never rejected.
         lost_dimensions: names of dimensions that returned nothing.
-        harness_skill: Skill name used (hub_get_skill source).
+        harness_skill: Skill used (hub_get_skill source).
         harness_version: Skill version executed.
         agent_count: Total subagents in the run.
         tokens_spent: Tokens consumed by the run.
         duration_ms: Wall-clock duration.
-        orchestrator: Client/orchestrator name (e.g. claude-code-workflow).
+        orchestrator: Client name (e.g. claude-code-workflow).
         model: Model id used by review agents.
         agent: Submitting agent name.
     """
@@ -2269,6 +2450,78 @@ async def hub_submit_machine_review(
         f"#{result.get('submission_generation')}): {stored_raw} raw → "
         f"{confirmed} confirmed / {rejected} rejected.{self_note}",
         machine_review=result,
+    )
+
+
+@mcp.tool()
+async def hub_submit_steward_judgement(
+    task_id: int,
+    generation: int,
+    kind: str,
+    verdict: str,
+    grounds: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    closures: list[dict[str, Any]] | None = None,
+    escalate_reason: str = "",
+    confidence: str = "",
+    model: str = "",
+    tokens_spent: int | None = None,
+    duration_ms: int | None = None,
+) -> CallToolResult:
+    """Record a steward judgement. Does not transition the task (#1022).
+
+    ``verdict`` has no default (422, never a silent approve). ``kind`` is
+    verdict|dor|disposition. ``ground.source`` and ``escalate_reason`` are
+    closed sets with no ``unknown``. ``confidence=low`` stores as
+    escalate/low_confidence. At-most-once on (task_id, generation, kind).
+    Closures address findings by finding_uid.
+
+    Args:
+        task_id: Task being judged.
+        generation: Submission generation being judged.
+        kind: verdict, dor, or disposition.
+        verdict: approve, changes_requested, or escalate.
+        grounds: [{source, detail?}].
+        findings: Same shape as a human review verdict.
+        closures: [{finding_uid, type}].
+        escalate_reason: Required when verdict is escalate.
+        confidence: high, medium, or low.
+        model: Model that produced the judgement.
+        tokens_spent: Tokens spent producing it.
+        duration_ms: Duration.
+    """
+    body: dict[str, Any] = {
+        "generation": generation,
+        "kind": kind,
+        "verdict": verdict,
+        "grounds": grounds or [],
+        "findings": findings or [],
+        "closures": closures or [],
+        "model": model,
+    }
+    if escalate_reason:
+        body["escalate_reason"] = escalate_reason
+    if confidence:
+        body["confidence"] = confidence
+    if tokens_spent is not None:
+        body["tokens_spent"] = tokens_spent
+    if duration_ms is not None:
+        body["duration_ms"] = duration_ms
+    try:
+        result = await _api_post(f"/api/tasks/{task_id}/steward-judgement", body)
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(
+        f"Steward judgement for task #{task_id} recorded "
+        f"(generation {result.get('generation')}, kind {result.get('kind')}): "
+        f"{result.get('verdict')}"
+        + (
+            f" ({result.get('escalate_reason')})"
+            if result.get("escalate_reason")
+            else ""
+        )
+        + ". Not applied — recording only.",
+        steward_judgement=result,
     )
 
 
@@ -2424,6 +2677,13 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    rd = data.get("review_dispatches") or {}
+    lines.append(
+        "Wasted dispatch spend (no report): "
+        f"{rd.get('wasted_provider_tokens_total', 0)} tokens across "
+        f"{rd.get('wasted_dispatches', 0)} failed run(s); "
+        f"{rd.get('unknown_usage', 0)} closed run(s) with unknown usage"
+    )
     # #877: the rate travels with its sample, and an unjudged window says so
     # rather than printing a zero that reads as "nothing was real".
     disp = mr.get("dispositions") or {}
@@ -2440,6 +2700,31 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         )
         + f"; {disp.get('confirmed_unjudged', 0)} confirmed finding(s) unanswered"
     )
+    touches = data.get("human_touches") or {}
+    rate = touches.get("touches_per_delivered")
+    lines.append(
+        "Human touches per delivered task: "
+        + (
+            f"{rate} ({touches.get('touches', 0)}/{touches.get('delivered_tasks', 0)})"
+            if rate is not None
+            else "— (no deliveries in window)"
+        )
+    )
+    steward_rows = [
+        g for g in (data.get("human_gates") or []) if g.get("gate") == "steward"
+    ]
+    if steward_rows:
+        lines.append(
+            "Steward gate: "
+            + "; ".join(
+                f"{row.get('project', 'default')} applied {row.get('applied', 0)} "
+                f"escalated {row.get('escalated', 0)} overridden_by_human "
+                f"{row.get('overridden_by_human', 0)}"
+                for row in steward_rows
+            )
+        )
+    else:
+        lines.append("Steward gate: — (no steward judgements in window)")
     outcomes = data.get("review_outcomes", {})
     first_pass = outcomes.get("first_pass_acceptance_rate")
     cr_rate = outcomes.get("changes_requested_rate")
@@ -3624,6 +3909,9 @@ async def hub_prepare_developer_task(
 async def hub_refine_task(
     task_id: int,
     title: str | None = None,
+    # #1013: the statement text was the one field refine could not touch, so a
+    # corrected premise lived on in the description the reviewer actually reads.
+    description: str | None = None,
     work_type: str | None = None,
     class_of_service: str | None = None,
     size: str | None = None,
@@ -3662,49 +3950,53 @@ async def hub_refine_task(
 ) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
-    Only fields you pass are written; omit one to leave it untouched. Every
-    list REPLACES the stored list. Mirrors POST /api/tasks/{id}/refine.
+    Only fields you pass are written; every list REPLACES the stored one.
+    Mirrors POST /api/tasks/{id}/refine.
 
     Args:
         task_id: Task to refine.
         title: New title (1–500 chars).
+        description: New statement text (≤10000); "" clears it.
         work_type: feature | bug | refactor | chore | docs | spike | incident
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
         wip_tag: feature_work | bugfix | tech_debt | support
         due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
-        problem_statement: What's broken / why this work exists.
-        business_value: Outcome / why it matters.
-        outcome_metric: Which number moves, from what to what — e.g. "median
-            lead time, 3d -> 1d". Makes business_value checkable.
-        outcome_indicator: Leading indicator, visible before the metric moves.
-        outcome_deadline: When the outcome gets checked.
-        outcome_revisit_condition: What would reopen this decision.
-        redesign_decision: adapt | redesign — fits the process or reshapes it.
+        problem_statement: What's broken and why.
+        business_value: Why it matters.
+        outcome_metric: Which number moves, from what to what (lead time
+            3d -> 1d). Makes business_value checkable.
+        outcome_indicator: Leading signal, before the metric moves.
+        outcome_deadline: When the outcome is checked.
+        outcome_revisit_condition: What reopens this decision.
+        redesign_decision: adapt | redesign.
         redesign_rationale: Why that choice.
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
-        caused_by_task_id: Task that introduced the defect; refused if it does
-            not resolve or is the defect itself.
-        detected_at: When the defect was noticed.
-        technical_hints: Hints, references, suggested approach.
-        scope_in: In-scope items.
-        scope_out: Out-of-scope items.
+        caused_by_task_id: Task that introduced the defect.
+        detected_at: When it was noticed.
+        technical_hints: Hints, references, approach.
+        scope_in: In scope.
+        scope_out: Out of scope.
+        constraints: Hard limits.
+        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
-        constraints: Hard constraints.
-        assumptions: Assumptions made.
-        out_of_scope_for_review: What the reviewer should ignore.
-        review_checklist: What the reviewer verifies in the diff.
-        human_owner: Who is accountable for this task.
-        human_reviewer: Who reviews and accepts the result.
-        acceptance_criteria: Full AC replacement list (REST refine shape).
-        risks: Full risks replacement list (TaskRisk shape).
+        out_of_scope_for_review: What the reviewer ignores.
+        review_checklist: What the reviewer verifies.
+        human_owner: Who is accountable.
+        human_reviewer: Who accepts the result.
+        acceptance_criteria: Full AC replacement (REST refine shape).
+        risks: Full replacement (TaskRisk shape).
     """
     body: dict[str, Any] = {}
     for key, val in (
         ("title", title),
+        # #1013: this list, not the signature, is what actually reaches the
+        # PATCH — a parameter present above and absent here is the #609 defect
+        # verbatim, and it fails silently.
+        ("description", description),
         ("work_type", work_type),
         ("class_of_service", class_of_service),
         ("size", size),

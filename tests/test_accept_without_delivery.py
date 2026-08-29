@@ -492,3 +492,252 @@ async def test_the_incident_of_21_08_would_be_caught(
     # from either end — the list, or the task somebody happens to open.
     alerts = await _alerts(db, incident["885"]["id"])
     assert any("444" in a and "НЕ доставлена" in a for a in alerts), alerts
+
+
+# --- deliver actually delivers, under the gate's conditions (#1037) ---------
+#
+# 28.08.2026: #1036 was approved, its CI failed once for two seconds on
+# infrastructure, and the gate sent it to a human. The human accepted it — and
+# the code stayed in an open PR with nobody left to merge it, because the gate
+# only looks inside the conveyor. The manual merge that closed it was an
+# exception to the rule that the gate, not a person, merges into develop.
+#
+# So `deliver` acts. What it must never become is a way AROUND the gate: a task
+# reaches the human along paths that ARE failed conditions. Hence one rule —
+# the same conditions, asked by calling the gate's own function — and four
+# tests below that each try to get work merged without one of them.
+
+
+class _MergeSpy:
+    """Records what the gate's merge entry point was asked to do."""
+
+    def __init__(self, ci: str = "passed", merges: bool = True) -> None:
+        self.ci = ci
+        self.merges = merges
+        self.merged: list[int] = []
+
+    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None):
+        from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+
+        outcome = (
+            CIProbeOutcome.passed if self.ci == "passed" else CIProbeOutcome.failed
+        )
+        return CIProbeResult(outcome=outcome, reason=f"probe says {self.ci}")
+
+    async def merge_pr(self, pr_number, task_id, title, repo=None, gh_repo=None):
+        if not self.merges:
+            return False
+        self.merged.append(int(pr_number))
+        return True
+
+    async def merge_commit_sha(self, pr_number, repo=None, gh_repo=None):
+        return f"{int(pr_number):040d}"
+
+    async def head_sha(self, repo, ref):
+        return "a" * 40
+
+    async def pull_main(self, repo=None, base_branch=None):
+        return True
+
+    async def delete_branch(self, branch, repo=None, base_branch=None):
+        return True
+
+
+async def _approved_task(
+    client: AsyncClient, db: aiosqlite.Connection, *, title: str, pr: int
+) -> int:
+    """A task parked at the decision gate WITH an approved current submission."""
+    task_id = await _task_awaiting_decision(client, db, title=title, pr=pr)
+    await repo.update_task(
+        db,
+        task_id,
+        submission_generation=1,
+        submission_sha="a" * 40,
+        review_verdict="approved",
+        review_verdict_generation=1,
+    )
+    await db.commit()
+    return task_id
+
+
+async def _decide_deliver(client: AsyncClient, task_id: int):
+    return await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "accept", "pr_disposition": "deliver"},
+    )
+
+
+def _install(monkeypatch, spy: _MergeSpy) -> None:
+    for name in (
+        "check_pr_ci",
+        "merge_pr",
+        "merge_commit_sha",
+        "head_sha",
+        "pull_main",
+        "delete_branch",
+    ):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(spy, name), raising=False)
+
+
+async def test_deliver_merges_and_records_like_the_gate(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1: every condition met — the PR is merged and the delivery is written
+    # to pipeline_merges, the same table the undelivered report reads.
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    task_id = await _approved_task(client, db, title="deliverable", pr=901)
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert spy.merged == [901]
+    assert await repo.pipeline_merge_recorded(db, task_id, 901), (
+        "the delivery must be recorded where the gate records it"
+    )
+
+
+async def test_deliver_refuses_on_red_ci(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2: red CI is one of the ways a task REACHES this gate. Delivering
+    # anyway would make the decision a way past CI.
+    spy = _MergeSpy(ci="failed")
+    _install(monkeypatch, spy)
+    task_id = await _approved_task(client, db, title="red ci", pr=902)
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200, "the acceptance itself still stands"
+    assert spy.merged == [], "nothing may be merged on red CI"
+    assert any("ci_" in a for a in await _alerts(db, task_id)), (
+        "the refusal must name CI, not just say no"
+    )
+
+
+async def test_deliver_refuses_without_approved_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3: the hole this task exists to avoid. A human decision accepts the
+    # task; it does not stand in for a reviewer's verdict.
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    task_id = await _task_awaiting_decision(client, db, title="unreviewed", pr=903)
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200
+    assert spy.merged == []
+    assert any("одобренного ревью" in a for a in await _alerts(db, task_id))
+
+
+async def test_deliver_refuses_when_the_tip_moved_after_approval(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#612): approved, then pushed. The verdict still reads as current
+    # because the generation never changed — only comparing the code catches
+    # it, and that comparison lives in the gate's function, not here.
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    task_id = await _approved_task(client, db, title="moved tip", pr=904)
+    await repo.update_task(db, task_id, submission_sha="b" * 40)
+    await db.commit()
+    # The branch now stands somewhere the reviewer never saw. The comparison
+    # reads the tip through resolve_branch_tip, so that is what has to answer.
+    from hub.services import lifecycle as lifecycle_mod
+
+    async def moved_tip(db_, task_id_, branch_):
+        return "c" * 40, ""
+
+    monkeypatch.setattr(lifecycle_mod, "resolve_branch_tip", moved_tip)
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200
+    assert spy.merged == [], "code that nobody approved must not be delivered"
+
+
+async def test_deliver_survives_a_refused_merge(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-5: GitHub can refuse for reasons the hub cannot see. The refusal is a
+    # named outcome, not an exception, and the acceptance stays.
+    spy = _MergeSpy(merges=False)
+    _install(monkeypatch, spy)
+    task_id = await _approved_task(client, db, title="github says no", pr=905)
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200
+    assert not await repo.pipeline_merge_recorded(db, task_id, 905)
+    assert any("merge_failed" in a for a in await _alerts(db, task_id))
+
+
+async def test_deliver_goes_through_the_gates_own_entry_point(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-6: the conditions are not re-derived here. If deliver ever grows its
+    # own set, the two will drift and the weaker one becomes the real one
+    # (#519, #546) — so the call itself is the thing asserted.
+    calls: list[int] = []
+    from hub.services import lifecycle as lifecycle_mod
+    from hub.services import orchestration as orch
+
+    real = orch.merge_before_completion
+
+    async def spy_merge(db_, task_):
+        calls.append(int(task_["id"]))
+        return await real(db_, task_)
+
+    monkeypatch.setattr(orch, "merge_before_completion", spy_merge)
+    _install(monkeypatch, _MergeSpy())
+    task_id = await _approved_task(client, db, title="same entry", pr=906)
+
+    await lifecycle_mod.deliver_on_disposition(db, task_id, "deliver", via="test")
+
+    assert calls == [task_id], "deliver must go through the gate's own function"
+
+
+async def test_delivered_task_leaves_the_undelivered_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-7: the alert that named the discrepancy must stop naming it once the
+    # work is in. The report reads pipeline_merges, which the gate's function
+    # writes — another reason not to merge on the side.
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {907: PR_OPEN})
+    task_id = await _approved_task(client, db, title="leaves report", pr=907)
+
+    await _decide_deliver(client, task_id)
+
+    delivered = await task_delivery(db, dict(await repo.get_task(db, task_id)))
+    assert delivered["state"] == DELIVERED
+    listed = await undelivered_completed_tasks(db)
+    assert task_id not in [row["task_id"] for row in listed["undelivered"]]
+
+
+async def test_force_complete_deliver_behaves_like_decide(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-8: force-complete writes the same field, so it gets the same door —
+    # otherwise it stays the quiet one people reach for when the first refuses.
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    good = await _approved_task(client, db, title="forced ok", pr=908)
+
+    resp = await client.post(
+        f"/api/tasks/{good}/force-complete",
+        json={"comment": "closing by hand", "pr_disposition": "deliver"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert spy.merged == [908]
+
+    spy.ci = "failed"
+    bad = await _approved_task(client, db, title="forced red", pr=909)
+    resp = await client.post(
+        f"/api/tasks/{bad}/force-complete",
+        json={"comment": "closing by hand", "pr_disposition": "deliver"},
+    )
+    assert resp.status_code == 200
+    assert 909 not in spy.merged, "force-complete is not a way past the gate"

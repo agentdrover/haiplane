@@ -26,6 +26,9 @@ FAIL = "fail"
 NOT_FOUND = "not_found"
 
 _RUN_TIMEOUT = 180
+# Collection is cheap next to a run, but it still imports the test modules, so
+# it gets its own, shorter budget: this one sits on the approval path.
+_COLLECT_TIMEOUT = 60
 
 # runner(nodeids, repo_path) -> {nodeid: passed} for the tests it managed to
 # run, or None when it could not run at all.
@@ -98,6 +101,92 @@ async def test_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
         if parsed is not None:
             out[ac.id] = parsed[1]
     return out
+
+
+# collector(nodeids, repo_path) -> the subset pytest could COLLECT, or None
+# when the collection itself could not run. Separate from TestRunner on
+# purpose: this asks whether a test exists, not whether it passes.
+LocatorCollector = Callable[[list[str], str | None], Awaitable[set[str] | None]]
+
+
+async def default_locator_collector(
+    nodeids: list[str], repo_path: str | None
+) -> set[str] | None:
+    """Which of ``nodeids`` pytest can collect in ``repo_path`` (#1032).
+
+    Collection, not execution: the question is whether the test a criterion
+    names exists at all. ``--collect-only -q`` prints one line per collected
+    nodeid and costs a fraction of a run, which is what makes this affordable
+    on the approval path.
+
+    None means "could not look" — no workspace, pytest missing, a timeout.
+    Every caller has to turn that into a stated answer of its own, never into
+    "all locators are fine".
+    """
+    if not nodeids or not repo_path:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "uv",
+            "run",
+            "pytest",
+            *nodeids,
+            "--collect-only",
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_COLLECT_TIMEOUT)
+    except (OSError, TimeoutError, asyncio.TimeoutError):
+        log.warning("AC locator collection failed in %s", repo_path)
+        return None
+    wanted = set(nodeids)
+    found: set[str] = set()
+    for raw in out.decode(errors="replace").splitlines():
+        reported = raw.strip()
+        if not reported:
+            continue
+        # Same exact-match rule as the runner: a parametrized case collects as
+        # "…::test_a[case]" and belongs to "…::test_a", but "…::test_a" must
+        # never absorb a different test whose name merely starts the same way.
+        key = reported if reported in wanted else reported.split("[", 1)[0]
+        if key in wanted:
+            found.add(key)
+    return found
+
+
+async def unresolved_locators(
+    db: Any,
+    task_id: int,
+    collector: LocatorCollector | None = None,
+) -> tuple[dict[str, str], bool]:
+    """AC whose named test does not exist, and whether the check ran (#1032).
+
+    Returns ``({ac_id: nodeid}, checked)``. ``checked=False`` means the
+    collection could not run — the empty mapping then says nothing about the
+    locators, which is why the flag travels with it instead of being inferred
+    from an empty result (#725).
+
+    Only well-formed locators are asked about: a malformed ``test_ref`` is a
+    different defect, already refused by the refine gate where the policy
+    requires it.
+    """
+    nodeid_by_ac = await test_ac_nodeids(db, task_id)
+    if not nodeid_by_ac:
+        return {}, True
+    ctx = await project_git_context(db, task_id)
+    collector = collector or default_locator_collector
+    found = await collector(list(nodeid_by_ac.values()), ctx.get("repo"))
+    if found is None:
+        return {}, False
+    return (
+        {ac_id: nid for ac_id, nid in nodeid_by_ac.items() if nid not in found},
+        True,
+    )
 
 
 async def record_ac_test_results(

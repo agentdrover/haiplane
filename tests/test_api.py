@@ -228,6 +228,152 @@ async def test_pair_start_api_remote_git_mode(client: AsyncClient):
     assert data["job_id"] is None
 
 
+def _enable_live_worktree(monkeypatch, *, path: str, registered: bool = True):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+    plugins.git_ops.pair_prepare_worktree = AsyncMock(return_value="task-wt")
+    plugins.git_ops.worktree_path = MagicMock(return_value=path)
+    plugins.git_ops.worktree_is_registered = AsyncMock(return_value=registered)
+    return {"registered": registered}
+
+
+async def test_get_task_echoes_live_pair_worktree(client: AsyncClient, monkeypatch):
+    """AC-1 (#989): GET after pair-start names the same live worktree path."""
+    create_resp = await client.post("/api/tasks", json={"title": "Echo WT get"})
+    task_id = create_resp.json()["id"]
+    path = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=path)
+
+    started = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: pair", "assigned_agent": "dev"},
+    )
+    assert started.status_code == 200
+    assert started.json()["worktree_path"] == path
+
+    got = await client.get(f"/api/tasks/{task_id}")
+    assert got.status_code == 200
+    assert got.json()["worktree_path"] == path
+    assert got.json()["workspace_mode"] == "worktree"
+
+
+async def test_get_task_claimed_only_has_empty_worktree(
+    client: AsyncClient, monkeypatch
+):
+    """AC-4 (#989): claimed without pair-start does not invent a directory."""
+    create_resp = await client.post("/api/tasks", json={"title": "Claimed no WT"})
+    task_id = create_resp.json()["id"]
+    invented = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=invented, registered=False)
+
+    claimed = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "dev", "session_id": "sess-claim"},
+    )
+    assert claimed.status_code == 200
+    got = await client.get(f"/api/tasks/{task_id}")
+    assert got.json()["worktree_path"] == ""
+    assert invented not in got.text
+
+
+async def test_get_task_headless_start_has_empty_worktree(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-8 (#989): hub_start_task never prepares a pair worktree."""
+    from hub import services
+
+    create_resp = await client.post("/api/tasks", json={"title": "Headless start WT"})
+    task_id = create_resp.json()["id"]
+    invented = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=invented, registered=False)
+    await repo.add_task_update(db, task_id, "dev", "status", "Plan: headless")
+    await db.commit()
+    await services.start_task(db, task_id)
+
+    got = await client.get(f"/api/tasks/{task_id}")
+    assert got.status_code == 200
+    assert got.json()["status"] == "running"
+    assert got.json()["worktree_path"] == ""
+    assert invented not in got.text
+
+
+async def test_get_task_empty_worktree_after_submit_then_back_on_rework(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-7 (#989): submit removes the tree; rework names it again."""
+    from unittest.mock import AsyncMock
+
+    from hub import services
+    from hub.integrations.registry import plugins
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+
+    create_resp = await client.post("/api/tasks", json={"title": "Submit clears WT"})
+    task_id = create_resp.json()["id"]
+    path = f"/srv/.ws-worktrees/task-{task_id}"
+    state = {"registered": True}
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+    plugins.git_ops.pair_prepare_worktree = AsyncMock(return_value="task-wt")
+    plugins.git_ops.worktree_path = lambda task_id, repo=None: path
+
+    async def _reg(p, repo=None):
+        return state["registered"]
+
+    plugins.git_ops.worktree_is_registered = _reg
+
+    started = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: pair", "assigned_agent": "dev"},
+    )
+    assert started.json()["worktree_path"] == path
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["worktree_path"] == path
+
+    state["registered"] = False
+    submitted = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={"agent": "dev"}
+    )
+    assert submitted.status_code == 200, submitted.text
+    after = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert after["status"] == "review"
+    assert after["worktree_path"] == ""
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    assert ctx["task"]["worktree_path"] == ""
+    assert path not in ctx["context_text"]
+
+    state["registered"] = True
+    await services.record_review_verdict(
+        db,
+        task_id,
+        TaskReviewVerdict(
+            verdict=ReviewVerdict.changes_requested,
+            agent="reviewer",
+            comments="1. fix",
+        ),
+    )
+    rework = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert rework["status"] == "running"
+    assert rework["worktree_path"] == path
+
+
+async def test_list_summary_cards_omit_worktree_path(client: AsyncClient, monkeypatch):
+    """Out of scope (#989): REST summary cards do not gain a worktree field."""
+    create_resp = await client.post("/api/tasks", json={"title": "Summary no WT field"})
+    task_id = create_resp.json()["id"]
+    path = f"/srv/.ws-worktrees/task-{task_id}"
+    _enable_live_worktree(monkeypatch, path=path)
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: pair", "assigned_agent": "dev"},
+    )
+    listed = await client.get("/api/tasks?mode=summary")
+    assert listed.status_code == 200
+    cards = listed.json()["tasks"]
+    match = next(c for c in cards if c["id"] == task_id)
+    assert "worktree_path" not in match
+
+
 async def test_claim_task_api(client: AsyncClient):
     create_resp = await client.post("/api/tasks", json={"title": "Claim API"})
     task_id = create_resp.json()["id"]
@@ -1333,7 +1479,13 @@ async def test_other_agent_and_human_verdicts_pass(client: AsyncClient, monkeypa
     task_id = await _task_in_review(client, "Independent review ok", impl)
     resp = await client.post(
         f"/api/tasks/{task_id}/review-verdict",
-        json={"verdict": "changes_requested", "agent": "reviewer-bot"},
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer-bot",
+            # #1010: the subject is reviewer independence, but a verdict that
+            # sends work back has to say what to redo.
+            "comments": "rework the branch handling",
+        },
         headers=reviewer,
     )
     assert resp.status_code == 200
@@ -2436,6 +2588,7 @@ async def test_machine_review_submit_and_brief(client: AsyncClient, db):
             "orchestrator": "claude-code-workflow",
             "findings_confirmed": [
                 {
+                    "locator": "lines",
                     "title": "policy JSON error path untested",
                     "severity": "medium",
                     "category": "tests",
@@ -2548,8 +2701,18 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
             "harness_skill": "multi-agent-review",
             "harness_version": 1,
             "findings_confirmed": [
-                {"title": "a", "severity": "low", "category": "tests"},
-                {"title": "b", "severity": "medium", "category": "consistency"},
+                {
+                    "locator": "none",
+                    "title": "a",
+                    "severity": "low",
+                    "category": "tests",
+                },
+                {
+                    "locator": "none",
+                    "title": "b",
+                    "severity": "medium",
+                    "category": "consistency",
+                },
             ],
             "findings_rejected": [
                 {"title": "c", "reason": "noise"},
@@ -2566,7 +2729,12 @@ async def test_practice_metrics_aggregates(client: AsyncClient, db):
             "harness_skill": "multi-agent-review",
             "harness_version": 2,
             "findings_confirmed": [
-                {"title": "e", "severity": "low", "category": "tests"},
+                {
+                    "locator": "none",
+                    "title": "e",
+                    "severity": "low",
+                    "category": "tests",
+                },
             ],
             "findings_rejected": [],
         },
@@ -3641,8 +3809,8 @@ async def _task_with_machine_report(client: AsyncClient) -> int:
             "model": "grok-4.6",
             "raw_count": 2,
             "findings_confirmed": [
-                {"title": "boundary lost", "severity": "medium"},
-                {"title": "race on retry", "severity": "high"},
+                {"locator": "none", "title": "boundary lost", "severity": "medium"},
+                {"locator": "none", "title": "race on retry", "severity": "high"},
             ],
             "findings_rejected": [],
             "incomplete": False,
