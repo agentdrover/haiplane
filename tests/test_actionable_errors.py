@@ -282,3 +282,16 @@ def test_string_detail_reason_derived_from_status() -> None:
         {"reason": "self_review_forbidden", "message": "no"}, status_code=409
     )
     assert structured["reason"] == "self_review_forbidden"
+
+
+def test_bad_request_is_named_because_the_hub_raises_it() -> None:
+    """400 is the class this table was most likely to be judged on (#882).
+
+    The first draft named 404/409/422/429 — the statuses a mapping usually
+    names — and left out the one the hub raises seven times in ``hub/app.py``
+    alone, always with a prose detail. Listing what the code actually emits,
+    rather than what such a table usually contains, is what found it.
+    """
+    payload = normalize_api_error_detail("page must be an integer", status_code=400)
+    assert payload["reason"] == "bad_request"
+    assert payload["actor_hint"] == "agent"
