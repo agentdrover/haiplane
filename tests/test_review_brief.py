@@ -675,3 +675,59 @@ def _awaitable(value):
         return value
 
     return _coro()
+
+
+# ---- #1055: the brief reads the diff of a branch it only has as origin/<name> ----
+
+
+@pytest.fixture
+def remote_only_workspace(tmp_path: Path) -> Path:
+    """A clone in production's shape: the task branch is a remote ref only."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "develop", ".")
+    author = tmp_path / "author"
+    author.mkdir()
+    _git(author, "clone", str(origin), ".")
+    (author / "hub").mkdir()
+    (author / "hub" / "mod.py").write_text("def touched():\n    return 1\n")
+    (author / "hub" / "caller.py").write_text(
+        "from hub.mod import touched\n\n\ndef use():\n    return touched()\n"
+    )
+    _git(author, "add", ".")
+    _git(author, "commit", "-m", "base")
+    _git(author, "push", "-q", "origin", "develop")
+    _git(author, "checkout", "-b", "task-42/work")
+    (author / "hub" / "mod.py").write_text("def touched():\n    return 2\n")
+    _git(author, "commit", "-am", "work")
+    _git(author, "push", "-q", "origin", "task-42/work")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _git(workspace, "clone", str(origin), ".")
+    return workspace
+
+
+async def test_call_sites_read_on_a_branch_only_in_origin(
+    db, client: AsyncClient, remote_only_workspace
+):
+    # #1055 AC-3: on production every pair branch is in this state, and the
+    # brief lost two of its six evidence blocks to it — call sites and diff
+    # volume both reported "could not read the diff of <branch> against
+    # <base>" while the commit sat in the clone under origin/<branch>.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    task_id = await _project_with(db, client, remote_only_workspace, "develop")
+    plugins.git_ops = GitOpsIntegration()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    assert "could not read the diff" not in brief["call_sites"]["reason"], (
+        "the diff of a branch the clone holds as origin/<name> must be readable"
+    )
+    assert brief["call_sites"]["status"] != "unknown", brief["call_sites"]["reason"]
+    report = brief["review_report"]
+    assert report["diff_files"] == 1 and report["diff_lines"] == 2, report
+    assert not report["diff_note"], (
+        "with the diff read there is nothing to excuse: the volume is the answer"
+    )

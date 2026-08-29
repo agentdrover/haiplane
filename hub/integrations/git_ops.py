@@ -1283,11 +1283,44 @@ class GitOpsIntegration:
 
         None rather than "" on failure: an empty diff and an unreadable one are
         different answers, and the section must be able to say which.
+
+        #1055: the names used to be interpolated verbatim, and on a pair task
+        that is a ref the workspace does not have. The branch is written on a
+        developer's machine and arrives as ``origin/<branch>`` only — no local
+        head is ever created — so ``git diff develop...task-1042/queue`` came
+        back "unknown revision", rc was not 0, and every caller lost its
+        subject while saying, honestly and uselessly, that it could not look:
+        the brief dropped call sites and diff volume, and the review dispatcher
+        sized its profile against nothing. Verified on production 29.08 in
+        the hub's own workspace clone: the commit was there and so was
+        origin/<branch>; the local head was not, and never is.
+
+        Both ends go through ``_resolve_ref_remote_first`` — the resolver
+        ``branch_diff_paths`` has used since #762, not a fourth chain of its
+        own — and a ref that resolves nowhere is fetched once before the answer
+        becomes None. A sha passed instead of a branch name still resolves:
+        ``origin/<sha>`` misses, the bare sha hits.
         """
+        base_sha = await _resolve_ref_remote_first(base, repo)
+        branch_sha = await _resolve_ref_remote_first(branch, repo)
+        if base_sha is None or branch_sha is None:
+            # Best effort, exactly as in branch_diff_paths: a workspace that
+            # cannot reach origin still has refs, and a network blip must not
+            # turn a readable diff into an unreadable one.
+            await _git("fetch", "origin", base, branch, repo=repo, check=False)
+            base_sha = base_sha or await _resolve_ref_remote_first(base, repo)
+            branch_sha = branch_sha or await _resolve_ref_remote_first(branch, repo)
+        if base_sha is None or branch_sha is None:
+            log.warning(
+                "branch_diff: %r not found in %s",
+                base if base_sha is None else branch,
+                repo,
+            )
+            return None
         rc, out, _ = await _git(
             "diff",
             "-U0",
-            f"{base}...{branch}",
+            f"{base_sha}...{branch_sha}",
             repo=repo,
             check=False,
         )
