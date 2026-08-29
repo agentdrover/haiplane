@@ -575,7 +575,12 @@ async def _reject_broken_files(repo: str) -> list[str]:
 
 
 async def _resolve_ref(name: str, repo: str) -> str | None:
-    """Resolve a branch name to a commit sha, falling back to origin/<name>."""
+    """Resolve a branch name to a commit sha, falling back to origin/<name>.
+
+    Local-first is for "does this clone have the ref?". Do not use it for a
+    comparison the hub will judge — a leftover checkout can trail origin
+    (#762, #1046). Those callers use ``_resolve_ref_remote_first``.
+    """
     for ref in (name, f"origin/{name}"):
         rc, out, _ = await _git(
             "rev-parse",
@@ -689,17 +694,21 @@ class GitOpsIntegration:
         Merge-base analysis against ``base_branch``: ``other_branch`` owns the
         commits reachable from it but not from base; if ``branch`` contains
         any of them, the branches are stacked and ``branch`` cannot be
-        verified against base independently. Best-effort: unresolvable refs
-        or any git failure return False (advisory check, never an error).
+        verified against base independently. Refs are resolved remote-first
+        (#1046 / #762): a stale local develop must not invent a stack.
+        Best-effort: unresolvable refs or any git failure return False
+        (advisory check, never an error).
         """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
                 return False
         repo = repo or _repo_root()
-        head = await _resolve_ref(branch, repo)
-        other = await _resolve_ref(other_branch, repo)
-        base = await _resolve_ref(_resolve_base(base_branch), repo)
+        # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
+        # local develop turn independent branches into a false stack.
+        head = await _resolve_ref_remote_first(branch, repo)
+        other = await _resolve_ref_remote_first(other_branch, repo)
+        base = await _resolve_ref_remote_first(_resolve_base(base_branch), repo)
         if not (head and other and base):
             return False
 
