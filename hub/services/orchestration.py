@@ -1739,7 +1739,11 @@ async def restore_pair_workspace_base(
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
-        await plugins.git_ops.pair_remove_worktree(task_id, **local_kw)
+        # #1045: pair_remove_worktree accepts only task_id and repo.
+        # local_kw also carries base_branch for the legacy restore path;
+        # unpacking it here was a TypeError on every submit, swallowed by
+        # _try_restore_pair_workspace — 205 leftover trees on prod.
+        await plugins.git_ops.pair_remove_worktree(task_id, repo=local_kw.get("repo"))
         return
     await plugins.git_ops.pair_restore_workspace_base(task_id, **local_kw)
 
