@@ -1,0 +1,319 @@
+{
+  "_comment": [
+    "Бюджет сложности (#1066, эпик #1064). Пороги — в pyproject.toml",
+    "([tool.ruff.lint.mccabe] max-complexity, [tool.ruff.lint.pylint]",
+    "max-statements). Проверку гоняет scripts/complexity_budget.py, её же гоняет",
+    "CI. Здесь лежит ledger исключений: функции, которые нарушают порог сегодня.",
+    "",
+    "Зачем ledger, а не отключение правила. Правило, которое нельзя удержать",
+    "зелёным, отключают целиком, и проверки не остаётся вовсе (#847). Здесь",
+    "правило удерживается зелёным с первого дня: сегодняшние 36 нарушений",
+    "названы поимённо, а тридцать седьмое красит проверку.",
+    "",
+    "Почему адресация 'путь::функция', а не строкой файла: правка выше по файлу",
+    "не должна двигать ledger. Почему потолок с запасом (headroom_pct), а не",
+    "точный замер: точная заморозка заставила бы любую правку внутри",
+    "waived-функции редактировать этот файл, и две такие ветки конфликтовали бы",
+    "по построению — это уже стоило трёх кругов пересдач на #815 (#829).",
+    "",
+    "removed_by — единственное поле, которое машина не выводит. Три значения:",
+    "  task:#NNNN — запись снимает названная задача;",
+    "  permanent  — исключение остаётся, и написано почему;",
+    "  unclaimed  — долг, за которым не стоит задача.",
+    "",
+    "unclaimed сейчас 27 из 36, и это записано, а не скрыто: эпик #1064 берёт",
+    "гейты (#1067) и поля MCP (#1068) — это 8 записей, плюс build_parser",
+    "постоянным. Молчание о непокрытом читается как 'покрыто всё'."
+  ],
+  "headroom_pct": 15.0,
+  "waivers": [
+    {
+      "path": "hub/app.py",
+      "function": "api_task_context",
+      "rule": "C901",
+      "measured": 37,
+      "max": 43,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/app.py",
+      "function": "api_task_context",
+      "rule": "PLR0915",
+      "measured": 108,
+      "max": 125,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/cli.py",
+      "function": "build_parser",
+      "rule": "PLR0915",
+      "measured": 383,
+      "max": 441,
+      "removed_by": "permanent — плоское объявление аргументов argparse: 383 оператора подряд, ни одной ветки (в C901 не попадает вовсе). Разбиение раздробит один читаемый список на десяток функций и ухудшит его."
+    },
+    {
+      "path": "hub/integrations/git_ops.py",
+      "function": "GitOpsIntegration.pair_prepare_branch",
+      "rule": "C901",
+      "measured": 17,
+      "max": 20,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_envelope.py",
+      "function": "compute_next_action",
+      "rule": "C901",
+      "measured": 30,
+      "max": 35,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_get_review_brief",
+      "rule": "C901",
+      "measured": 25,
+      "max": 29,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_list_tasks",
+      "rule": "C901",
+      "measured": 16,
+      "max": 19,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_prepare_developer_task",
+      "rule": "C901",
+      "measured": 20,
+      "max": 23,
+      "removed_by": "task:#1068 — 33 параметра выводятся из модели, а не перечисляются"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_prepare_developer_task",
+      "rule": "PLR0915",
+      "measured": 66,
+      "max": 76,
+      "removed_by": "task:#1068 — 33 параметра выводятся из модели, а не перечисляются"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_project_status",
+      "rule": "C901",
+      "measured": 17,
+      "max": 20,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_server.py",
+      "function": "hub_task_status",
+      "rule": "C901",
+      "measured": 19,
+      "max": 22,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/mcp_structured.py",
+      "function": "fit_echo_result",
+      "rule": "C901",
+      "measured": 21,
+      "max": 25,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/auto_verdict.py",
+      "function": "maybe_auto_verdict",
+      "rule": "C901",
+      "measured": 29,
+      "max": 34,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/auto_verdict.py",
+      "function": "maybe_auto_verdict",
+      "rule": "PLR0915",
+      "measured": 79,
+      "max": 91,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/delivery_state.py",
+      "function": "delivery_state",
+      "rule": "C901",
+      "measured": 19,
+      "max": 22,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/finding_evidence.py",
+      "function": "evidence_for_report",
+      "rule": "C901",
+      "measured": 22,
+      "max": 26,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/finding_evidence.py",
+      "function": "finding_touch_evidence",
+      "rule": "C901",
+      "measured": 16,
+      "max": 19,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "add_update",
+      "rule": "C901",
+      "measured": 23,
+      "max": 27,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "add_update",
+      "rule": "PLR0915",
+      "measured": 84,
+      "max": 97,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "approve_task",
+      "rule": "C901",
+      "measured": 16,
+      "max": 19,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "create_task",
+      "rule": "C901",
+      "measured": 18,
+      "max": 21,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "pair_start_task",
+      "rule": "C901",
+      "measured": 21,
+      "max": 25,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "pair_start_task",
+      "rule": "PLR0915",
+      "measured": 65,
+      "max": 75,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "record_review_verdict",
+      "rule": "C901",
+      "measured": 41,
+      "max": 48,
+      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "record_review_verdict",
+      "rule": "PLR0915",
+      "measured": 119,
+      "max": 137,
+      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "submit_for_review",
+      "rule": "C901",
+      "measured": 46,
+      "max": 53,
+      "removed_by": "task:#1067 — цепочка гейтов сдачи становится объявленным списком"
+    },
+    {
+      "path": "hub/services/lifecycle.py",
+      "function": "submit_for_review",
+      "rule": "PLR0915",
+      "measured": 173,
+      "max": 199,
+      "removed_by": "task:#1067 — цепочка гейтов сдачи становится объявленным списком"
+    },
+    {
+      "path": "hub/services/orchestration.py",
+      "function": "_human_gate_metrics",
+      "rule": "C901",
+      "measured": 28,
+      "max": 33,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/orchestration.py",
+      "function": "_human_gate_metrics",
+      "rule": "PLR0915",
+      "measured": 88,
+      "max": 102,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/orchestration.py",
+      "function": "transition_after_agent_done",
+      "rule": "C901",
+      "measured": 36,
+      "max": 42,
+      "removed_by": "task:#1067 — headless-путь переходит на тот же механизм"
+    },
+    {
+      "path": "hub/services/orchestration.py",
+      "function": "transition_after_agent_done",
+      "rule": "PLR0915",
+      "measured": 134,
+      "max": 155,
+      "removed_by": "task:#1067 — headless-путь переходит на тот же механизм"
+    },
+    {
+      "path": "hub/services/review_brief.py",
+      "function": "build_review_brief",
+      "rule": "C901",
+      "measured": 17,
+      "max": 20,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/review_brief.py",
+      "function": "build_review_brief",
+      "rule": "PLR0915",
+      "measured": 74,
+      "max": 86,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/services/risk_class.py",
+      "function": "derive_risk_class",
+      "rule": "C901",
+      "measured": 20,
+      "max": 23,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/web.py",
+      "function": "_web_task_detail_page",
+      "rule": "PLR0915",
+      "measured": 62,
+      "max": 72,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    },
+    {
+      "path": "hub/web.py",
+      "function": "web_edit_project",
+      "rule": "C901",
+      "measured": 19,
+      "max": 22,
+      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
+    }
+  ]
+}
