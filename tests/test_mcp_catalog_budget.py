@@ -360,10 +360,23 @@ PRE_TRIM_CEILINGS = {
 # first re-freeze.
 FROZEN_DESCRIPTION_CHARS = WORKING_FREEZE["description_chars"]
 FROZEN_MAX_TOOL_CHARS = WORKING_FREEZE["max_tool_chars"]
-# A freeze may only move DOWN. These pin that, the way PRE_TRIM_CEILINGS pins
-# the ceilings: raising a freeze to fit new text is the act the whole guard
-# exists to prevent, and it must not be possible to do it quietly (#1071).
-WORKING_FREEZE_FLOOR = {"description_chars": 36383, "max_tool_chars": 6404}
+# History of the working freezes, newest first. NOT a guard, and saying so is
+# the point: a literal pin only catches a rise above the value someone typed
+# once, so after the first legitimate trim to 36000 a later rise to 36300 walks
+# straight past it. A test on a branch cannot read what develop holds, so
+# "only down" is a REVIEW-TIME rule, not something asserted here — claiming
+# otherwise would be a guard that guards nothing, which is worse than an
+# honest list (#1071).
+#
+# What IS enforced: the live catalog must sit under the freeze
+# (test_description_chars_stay_under_freeze), and the file agents read must
+# publish the same freeze the code uses (test_the_binding_limit_is_readable_
+# where_work_is_planned). A change to a freeze therefore shows up in the diff
+# in two places at once, which is what a reviewer needs to see the direction.
+WORKING_FREEZE_HISTORY = [
+    ("2026-08-28", "#1031", {"description_chars": 36383, "max_tool_chars": 6404}),
+    ("2026-08-21", "#988", {"description_chars": 36495, "max_tool_chars": 6472}),
+]
 PRE_TRIM_INSTRUCTION_PER_TOOL = 179598
 
 
@@ -493,20 +506,22 @@ async def test_no_empty_tool_descriptions() -> None:
             assert f"{arg}:" in doc, f"{func.__name__} stopped describing {arg}"
 
 
-def test_no_working_freeze_rises() -> None:
-    """AC-2: a freeze may only move DOWN.
+def test_the_freeze_history_records_the_current_value() -> None:
+    """AC-2: every freeze that ever bound is written down, newest first.
 
-    The freeze is what stops a contract field from landing on borrowed room, so
-    raising it to fit new text is exactly the act it exists to prevent. Pinned
-    the way PRE_TRIM_CEILINGS pins the ceilings: a literal a change has to walk
-    past on purpose, not a value that follows whatever the catalog became.
+    This does not assert a direction — a literal cannot, see the note above the
+    history. It asserts that the current freeze IS the newest entry, so moving
+    one is impossible without adding a line that says when and why. A reviewer
+    then reads the direction off two adjacent numbers instead of trusting a
+    test that could not check it.
     """
-    for metric, floor in WORKING_FREEZE_FLOOR.items():
-        assert WORKING_FREEZE[metric] <= floor, (
-            f"{metric}: working freeze rose from {floor} to "
-            f"{WORKING_FREEZE[metric]} — pay for new text with a trim, or move "
-            "this floor deliberately and say why"
-        )
+    assert WORKING_FREEZE_HISTORY, "the history is how the direction stays legible"
+    _, _, newest = WORKING_FREEZE_HISTORY[0]
+    assert newest == WORKING_FREEZE, (
+        f"the newest history entry {newest} is not the freeze in force "
+        f"{WORKING_FREEZE}: add an entry when you move a freeze, so the next "
+        "reader can see whether it went down"
+    )
 
 
 def test_the_binding_limit_is_readable_where_work_is_planned() -> None:
@@ -521,11 +536,18 @@ def test_the_binding_limit_is_readable_where_work_is_planned() -> None:
     published = doc.get("working_freeze")
     assert published == WORKING_FREEZE, (
         "the budget file must publish the freeze that binds: "
-        f"file says {published}, code says {WORKING_FREEZE}. "
-        "Run scripts/mcp_catalog_budget.py --update after moving a freeze."
+        f"file says {published}, code says {WORKING_FREEZE}. Edit the "
+        "'working_freeze' key in docs/agent-context/mcp-catalog-budget.json to "
+        "match. Do NOT reach for --update to fix this: that is a full "
+        "re-freeze — it rewrites measured to the live catalog, recomputes the "
+        "percentage ceilings from it (which RAISES them when the catalog has "
+        "grown) and rewrites baseline_tools. One key is out of step; --update "
+        "would move four other things to put it back."
     )
-    assert doc.get("working_headroom_note"), (
-        "the file must say that the freeze, not the ceiling, is what refuses"
+    note = str(doc.get("working_headroom_note") or "")
+    assert "working_freeze" in note and "budgets" in note, (
+        "the note must name BOTH numbers and say which one refuses — a reader "
+        "who sees only the percentage ceiling plans work that will not fit"
     )
 
 
@@ -540,7 +562,18 @@ def test_measured_records_the_freeze_not_the_present() -> None:
     """
     measured = load_measured()
     assert measured, "the file records what the catalog was at the last freeze"
-    # No assertion that it equals the live catalog: that is the point.
     assert set(measured) >= set(WORKING_FREEZE), (
         "every freeze needs a recorded measurement to be a distance from"
     )
+    # The assertion that carries the meaning: headroom is a distance from the
+    # RECORDED measurement, so it does not move when the live catalog does. A
+    # test that only checked "measured is non-empty" stayed green in exactly
+    # the state this docstring says must be allowed — measured equal to live —
+    # and in the state it must not, measured recomputed per change.
+    room = catalog_working_headroom()
+    for metric, freeze in WORKING_FREEZE.items():
+        assert room[metric] == freeze - measured[metric], (
+            f"{metric}: headroom must be freeze minus RECORDED measurement, "
+            "not minus the live catalog — otherwise it changes under every "
+            "edit and stops answering 'how much of the slack has been spent'"
+        )
