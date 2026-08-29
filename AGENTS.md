@@ -12,6 +12,13 @@
 - Use `uv add <package>` for dependencies.
 - If a change touches API contracts, update `hub/cli.py`, `hub/mcp_server.py`, and affected tests in the same pass.
 - If a change touches persisted task data or schema, update migrations in `hub/db.py`.
+- Функция сверх бюджета сложности красит CI (`scripts/complexity_budget.py`,
+  #1066). Пороги — в `pyproject.toml`, ledger исключений — в
+  `docs/agent-context/complexity-budget.json`. Разбейте функцию; если это
+  невозможно, внесите запись через `--update` и впишите `removed_by` руками —
+  `task:#NNNN`, `permanent` с причиной или честное `unclaimed`. Запись
+  снимается удалением строки: если нарушения больше нет, проверка сама
+  потребует её убрать.
 - If a change touches MCP tool docstrings or signatures, it changes the published
   `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too)
   and re-freeze the budget with `--update` only as a deliberate, explained decision.
