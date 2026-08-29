@@ -861,6 +861,21 @@ class EvidenceCoverage(BaseModel):
     checks_not_applicable: list[dict[str, str]] = Field(default_factory=list)
 
 
+class ReviewInFlight(BaseModel):
+    """Active hub-called review for the current submission (#1027).
+
+    Shown on the card and at the verdict gate so an approval cannot pretend
+    the paid run was not already in the air. Empty / None means nothing is
+    flying — not that we did not look.
+    """
+
+    model: str = ""
+    profile: str = ""
+    elapsed_minutes: int = 0
+    grace_until: str = ""
+    headline: str = ""
+
+
 class ReviewReport(BaseModel):
     """What the human reads at the verdict gate instead of the diff (#808).
 
@@ -970,6 +985,8 @@ class ReviewBrief(BaseModel):
     # rendering of the same facts — one builder feeds both, so the two
     # readers cannot drift apart.
     review_report: "ReviewReport | None" = None
+    # #1027: a hub-called review still in the air for THIS submission.
+    review_in_flight: ReviewInFlight | None = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
     # #438: advisory — non-empty when the branch carries commits of another

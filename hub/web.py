@@ -42,6 +42,7 @@ from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
 from hub.services.finding_evidence import evidence_for_findings
+from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
@@ -1649,6 +1650,7 @@ async def _web_task_detail_page(
     from hub.services.review_brief import gate_evidence
 
     evidence = await gate_evidence(db, dict(row))
+    review_in_flight = await inflight_view(db, dict(row))
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -1777,6 +1779,7 @@ async def _web_task_detail_page(
             "delivered_sha": delivered_sha,
             "delivery": delivery,
             "evidence": evidence,
+            "review_in_flight": review_in_flight,
             "change_map": change_map,
             "machine_review": machine_review,
             "finding_touch": finding_touch,

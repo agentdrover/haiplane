@@ -403,6 +403,92 @@ async def test_repair_sweep_skips_parent_with_its_own_branch(db: aiosqlite.Conne
     assert repaired == 0
 
 
+async def test_verdict_notes_review_in_flight(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2 (#1027): the record, not only the screen, says the approval did not wait."""
+    task_id = await _task_in_review(client, "approved while dispatch flies")
+    row = dict(await repo.get_task(db, task_id))
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=int(row["submission_generation"] or 0),
+        agent_id="bc-inflight",
+        run_id="run-inflight",
+        model="grok-4.6",
+        profile="lite",
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    hint = resp.json().get("lifecycle_hint") or ""
+    written = await _verdict_updates(client, task_id)
+    assert "одобрено, не дождавшись вызванного ревью" in hint
+    assert "одобрено, не дождавшись вызванного ревью" in written
+    assert resp.json()["review_verdict"] == "approved"
+
+
+async def test_no_note_without_active_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-3 (#1027): no dispatch, a settled one, or a report already in — no caveat."""
+    phrase = "одобрено, не дождавшись вызванного ревью"
+
+    empty_id = await _task_in_review(client, "approved with no dispatch")
+    resp = await client.post(
+        f"/api/tasks/{empty_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert phrase not in (resp.json().get("lifecycle_hint") or "")
+    assert phrase not in await _verdict_updates(client, empty_id)
+
+    done_id = await _task_in_review(client, "approved after dispatch settled")
+    row = dict(await repo.get_task(db, done_id))
+    gen = int(row["submission_generation"] or 0)
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=done_id,
+        submission_generation=gen,
+        agent_id="bc-settled",
+        run_id="run-settled",
+        model="grok-4.6",
+        profile="lite",
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    await db.commit()
+    resp = await client.post(
+        f"/api/tasks/{done_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert phrase not in await _verdict_updates(client, done_id)
+
+    reported_id = await _task_in_review(client, "approved after report landed")
+    row = dict(await repo.get_task(db, reported_id))
+    gen = int(row["submission_generation"] or 0)
+    await repo.create_review_dispatch(
+        db,
+        task_id=reported_id,
+        submission_generation=gen,
+        agent_id="bc-reported",
+        run_id="run-reported",
+        model="grok-4.6",
+        profile="lite",
+    )
+    await _report(db, reported_id, gen, ["already in"])
+    resp = await client.post(
+        f"/api/tasks/{reported_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert phrase not in await _verdict_updates(client, reported_id)
+
+
 async def test_rollup_still_closes_umbrella_parent(db: aiosqlite.Connection):
     """AC-4 (#1043): umbrella parents without own work still close (#742)."""
     feature_id, child_id = await _feature_with_completed_child(db, parent_status="open")

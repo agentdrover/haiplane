@@ -458,6 +458,7 @@ async def build_review_brief(
         machine_review=machine_review,
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
+        review_in_flight=await review_evidence.inflight_view(db, task_row),
     )
 
 
