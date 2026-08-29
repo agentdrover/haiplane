@@ -185,3 +185,41 @@ def test_sample_deterministic():
     assert deterministic_sample([], "2026-08-20") == []
     other_day = deterministic_sample(ids, "2026-08-21")
     assert other_day == deterministic_sample(ids, "2026-08-21")
+
+
+async def test_digest_lists_waiting_human_queue(db: aiosqlite.Connection):
+    """#1020 AC-4: the digest names who is waiting on a person, and for how long.
+
+    It rides along a digest created for other reasons, exactly as the category
+    debt does (#878) — and that is a limit worth stating rather than hiding: a
+    digest exists only for a delegating project on a day with autopilot
+    activity, so this line is a summary, not the alarm. The alarm is the
+    events feed the poller writes on every rung.
+    """
+    _pid, feature = await _autopilot_project(db, "spike-queue")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    waiting = await _node(db, title="ждёт решения", task_type="task", parent_id=feature)
+    await repo.update_task(db, waiting, status="needs_decision")
+    await repo.record_human_queue_reminder(
+        db,
+        task_id=waiting,
+        instance="needs_decision",
+        entered_at="2026-08-01 00:00:00",
+        rung="168h",
+        age_minutes=10100,
+    )
+    await db.execute(
+        "UPDATE human_queue_reminders SET created_at = datetime('now') WHERE task_id=?",
+        (waiting,),
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = json.loads((await repo.list_digests(db))[0]["payload"])
+
+    queue = payload["human_queue"]
+    assert [q["task_id"] for q in queue] == [waiting]
+    assert queue[0]["rung"] == "168h"
+    assert queue[0]["age_minutes"] == 10100
+    assert queue[0]["title"] == "ждёт решения"
+    assert approved not in [q["task_id"] for q in queue]
