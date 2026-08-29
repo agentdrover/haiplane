@@ -157,6 +157,23 @@ class NoopGitOps:
         """
         return ""
 
+    async def pr_is_draft(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """No GitHub — "not a draft". Ignorance is not an accusation (#498)."""
+        return False
+
+    async def mark_pr_ready(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        return False
+
     async def release_range(
         self,
         base: str,

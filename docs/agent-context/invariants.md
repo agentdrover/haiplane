@@ -51,13 +51,16 @@ These are the rules most likely to be broken by “small” changes.
   exists solely in a foreign unpushed clone stays silent (#966's territory).
   This deliberately RETIRES the old carve-out "a task with a branch and no
   PR completes as before" for anything with observable commits.
-- Delivery-gate refusals split three ways, by WHO has to act (#951, #1030).
-  Transient (`ci_pending`, `ci_unavailable`): nobody acts, the task stays
-  `running` and the hub asks again. Recoverable (`ci_failed`,
-  `stale_approval`): the EXECUTOR acts, the task stays `running`, and the hint
-  names `hub_submit_for_review` — a fix is new commits, so delivery needs a new
-  review (#612), never another done report. Terminal (`merge_failed`, closed
-  PR, `no_pr`, `merge_gate_error`): a human acts, `needs_decision` as before.
+- Delivery-gate refusals split three ways, by WHO has to act (#951, #1030, #1053).
+  Transient (`ci_pending`, `ci_unavailable`, `pr_draft`): nobody acts, the task
+  stays `running` and the hub asks again. A GitHub draft after Hub APPROVED is
+  transient, not recoverable: the hub marks the PR ready (approval is the ready
+  signal) and retries; resubmitting would stale the verdict (#612) with no new
+  commits. Recoverable (`ci_failed`, `stale_approval`): the EXECUTOR acts, the
+  task stays `running`, and the hint names `hub_submit_for_review` — a fix is
+  new commits, so delivery needs a new review (#612), never another done report.
+  Terminal (`merge_failed`, closed PR, `no_pr`, `merge_gate_error`): a human
+  acts, `needs_decision` as before.
   Waiting on a recoverable refusal is bounded twice, because two different
   things can go wrong: the fix budget (`ci_fix_cycle` vs `MAX_CI_FIX_CYCLES`,
   charged once per submission — the same budget the headless conveyor spends)

@@ -127,6 +127,8 @@ from hub.services.lifecycle import (
 )
 from hub.services.orchestration import (
     CI_BUDGET_GATE_PREFIXES,
+    PR_DRAFT_PREFIX,
+    PR_DRAFT_WAIT_HINT,
     RECOVERABLE_GATE_PREFIXES,
     RESUBMIT_AFTER_FIX_HINT,
     TRANSIENT_GATE_PREFIXES,
@@ -165,6 +167,8 @@ __all__ = [
     "MESSAGE_EVENT_KIND",
     "ProjectBindError",
     "CI_BUDGET_GATE_PREFIXES",
+    "PR_DRAFT_PREFIX",
+    "PR_DRAFT_WAIT_HINT",
     "RECOVERABLE_GATE_PREFIXES",
     "RESUBMIT_AFTER_FIX_HINT",
     "TRANSIENT_GATE_PREFIXES",

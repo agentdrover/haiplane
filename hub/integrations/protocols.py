@@ -335,6 +335,12 @@ class GitOpsPlugin(Protocol):
     async def pr_state(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...
+    async def pr_is_draft(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool: ...
+    async def mark_pr_ready(
+        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool: ...
     async def release_range(
         self,
         base: str,
