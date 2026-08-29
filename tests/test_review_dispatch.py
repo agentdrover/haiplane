@@ -1445,7 +1445,23 @@ def test_instance_base_url_never_names_the_vendor_host(monkeypatch):
     monkeypatch.delenv("HAIPLANE_HUB_URL", raising=False)
     resolved = instance_base_url()
     assert resolved, "an unconfigured hub still answers with its own bind address"
-    assert "agenthai" not in resolved
+
+    # The half that actually discriminates. Everything above stays green on the
+    # pre-fix line as well: ``hub_base_url`` never returns an empty string —
+    # HUB_HOST/HUB_PORT are resolved at import and always compose one — so the
+    # ``or "<vendor host>"`` branch could not fire and both implementations
+    # answered identically. Only an echo that carries NO base_url at all
+    # reaches the branch the fix removed, and there the old code named the
+    # authors' server. Mutating this module back to the pre-fix line must turn
+    # this assertion red; if it does not, the test has stopped guarding #1005.
+    import hub.hub_instance as hub_instance
+
+    monkeypatch.setattr(
+        hub_instance,
+        "instance_echo_fields",
+        lambda: {"instance": "local", "server_id": "somebody-elses-box"},
+    )
+    assert instance_base_url() == ""
 
 
 # --- Report ↔ dispatch identity (#1025) --------------------------------------
