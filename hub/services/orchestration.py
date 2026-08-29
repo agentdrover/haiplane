@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
@@ -19,7 +19,7 @@ from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
-from hub.integrations.protocols import CIProbeOutcome
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
@@ -1929,6 +1929,26 @@ async def _approved_code_check(
     return "", ""
 
 
+def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
+    """Elapsed seconds since ``ci_check_started_at`` (naive UTC, #416 format)."""
+    if not iso_ts:
+        return None
+    try:
+        started = datetime.strptime(iso_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return (datetime.now(UTC) - started).total_seconds()
+
+
+def _missing_run_gate_detail(ci: CIProbeResult, *, elapsed: float) -> str:
+    """Within the grace window this is a wait; after it, a named fact (#1041)."""
+    sha = (ci.details or "").strip() or "unknown"
+    named = f"workflow есть, прогона по {sha} нет"
+    if elapsed < config.CI_GRACE_PERIOD:
+        return f"ci_{ci.outcome.value}: {ci.reason}"
+    return f"ci_untested: {named}"
+
+
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
 # human". Built from the same enum merge_before_completion prints, so the
 # prefix contract between the two spots of this file cannot silently drift.
@@ -1941,6 +1961,7 @@ PR_DRAFT_PREFIX = "pr_draft"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
+    f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
 )
 PR_DRAFT_WAIT_HINT = (
@@ -2072,6 +2093,12 @@ async def merge_before_completion(
         gh_repo = ctx.get("gh_repo")
 
         ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
+        if ci.outcome == CIProbeOutcome.missing_run:
+            elapsed = _seconds_since_ci_start(task.get("ci_check_started_at"))
+            if elapsed is None:
+                await repo.mark_ci_check_started(db, task_id)
+                elapsed = 0.0
+            return False, _missing_run_gate_detail(ci, elapsed=elapsed)
         if ci.outcome != CIProbeOutcome.passed:
             return False, f"ci_{ci.outcome.value}: {ci.reason}"
 

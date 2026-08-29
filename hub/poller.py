@@ -45,7 +45,9 @@ _pair_delivery_waits: dict[int, str] = {}
 
 POLL_INTERVAL = 30  # seconds
 
-CI_GRACE_PERIOD = 180  # wait >=3 min after push before checking CI
+CI_GRACE_PERIOD = (
+    config.CI_GRACE_PERIOD
+)  # wait after push before treating missing runs as a fact
 
 MAX_CI_NO_PR_ATTEMPTS = 3  # give up creating a PR after this many polls
 
@@ -774,6 +776,35 @@ async def _sweep_ci_check(db) -> None:
                     "Poll: task #%d CI probe unavailable (%s), will retry",
                     task["id"],
                     ci.reason,
+                )
+                continue
+            if ci.outcome == CIProbeOutcome.missing_run:
+                # Grace already elapsed — we only probe after it. Workflows
+                # exist and this SHA was never checked; skipping to review
+                # is how #505–#510 landed untested (#1041).
+                sha = (ci.details or "").strip() or "unknown"
+                named = f"workflow есть, прогона по {sha} нет"
+                await repo.add_task_update(
+                    db,
+                    task["id"],
+                    "hub",
+                    "alert",
+                    f"CI: {named} — код не проверялся.",
+                )
+                await repo.update_task(db, task["id"], status="needs_decision")
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "ci_untested", "sha": sha},
+                )
+                await repo.reset_ci_check_state(db, task["id"])
+                await db.commit()
+                log.info(
+                    "Poll: task #%d CI missing run for %s → needs_decision",
+                    task["id"],
+                    sha,
                 )
                 continue
             await repo.reset_ci_check_state(db, task["id"])
