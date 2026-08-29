@@ -140,11 +140,10 @@ def resolve_locator_absent_file(nodeid: str) -> tuple[str, str]:
 def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
     """``(status, reason)`` from the file's own text — no imports, no pytest (#764).
 
-    The fallback for when collection cannot run: the project's dependencies are
-    not installed, or — the ordinary case at review time — no working tree
-    holds the submitted branch at all, because submit removes the task's
-    worktree. ``text`` is the file as of the submitted commit; ``None`` means
-    it could not be read, which is ``unknown`` and never ``missing``.
+    The fallback for when collection cannot run: the project's dependencies
+    are not installed, the task's tree was retired, or no tree ever held this
+    branch. ``text`` is the file as of the submitted commit; ``None`` means it
+    could not be read, which is ``unknown`` and never ``missing``.
     """
     rel = nodeid.split("::", 1)[0]
     if text is None:

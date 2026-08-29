@@ -261,9 +261,13 @@ async def build_review_brief(
         from hub.services.orchestration import live_pair_worktree_info
 
         _mode, worktree = await live_pair_worktree_info(db, task_id)
-        # "" once the tree is gone — submit removes it, and the retirement
-        # sweep (#1033) clears the rest — so a stale path is never read as
-        # the task's code.
+        # "" when the tree is gone: submit asks for its removal and the
+        # retirement sweep (#1033) clears the rest, so a path that no longer
+        # exists is never read as the task's code. Whether the tree survives
+        # to review time is not something this code should assume either way —
+        # today most do (205 stand on production, because the removal at
+        # submit raises and the exception is swallowed), and the fallback
+        # below is what makes that difference not matter.
         workspace = worktree or ctx.get("repo")
         # #506: a working tree can hold another task's branch — the shared
         # clone is shared, and the pair flow switches it. Collecting there
@@ -274,11 +278,13 @@ async def build_review_brief(
             head = await plugins.git_ops.current_branch(repo=workspace)
             if head == task_view.branch:
                 collected = await collect_test_nodeids(workspace)
-        # #764: at review time no tree holds this branch at all — submit
-        # removed the worktree — so the ordinary path is to read the files out
-        # of the submitted commit itself. git hands over the text without a
-        # checkout, ast answers "is this test written here" without imports,
-        # and neither needs the project's dependencies installed.
+        # #764: the fallback, for every case where collection could not answer
+        # — the project's dependencies are not installed, the tree was retired,
+        # or no tree ever held this branch. The files are read out of the
+        # submitted commit itself: git hands over the text without a checkout,
+        # ast answers "is this test written here" without imports, and neither
+        # needs the project's dependencies. Weaker evidence than collection,
+        # which is why the reason says which one answered.
         sources: dict[str, str | None] | None = None
         absent: set[str] = set()
         if collected is None:

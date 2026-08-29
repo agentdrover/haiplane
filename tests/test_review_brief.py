@@ -608,9 +608,7 @@ async def test_locator_resolves_in_the_tasks_own_worktree(
         looked_in.append(path)
         return {"tests/test_a.py::test_ok"}
 
-    monkeypatch.setattr(
-        "hub.services.review_brief.collect_test_nodeids", _fake_collect
-    )
+    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _fake_collect)
     monkeypatch.setattr(
         "hub.services.orchestration.live_pair_worktree_info",
         lambda _db, _tid: _awaitable(("worktree", "/tmp/wt/task-42")),

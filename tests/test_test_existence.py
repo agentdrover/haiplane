@@ -69,7 +69,7 @@ def test_resolve_still_missing_for_unknown_base():
 # answers the only question a locator asks: is this test written here.
 
 
-_SOURCE = '''
+_SOURCE = """
 import pytest
 
 
@@ -85,7 +85,7 @@ def test_parametrised(case):
 class TestGroup:
     def test_method(self):
         assert True
-'''
+"""
 
 
 def test_static_resolution_reports_missing_with_what_it_looked_for():
