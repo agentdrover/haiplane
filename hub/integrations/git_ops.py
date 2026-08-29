@@ -2095,6 +2095,77 @@ class GitOpsIntegration:
 
         return result
 
+    async def _repo_has_workflows(
+        self, *, repo: str | None, gh_repo: str | None
+    ) -> bool | None:
+        """Whether the repository defines any Actions workflow (#1041).
+
+        Called only on the branch that used to return ``absent``: empty
+        ``gh pr checks`` or empty ``actions/runs?head_sha=``. A working
+        probe never pays this extra GitHub call.
+        """
+        rc, out, _err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return None
+        try:
+            payload = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        workflows = payload.get("workflows")
+        if isinstance(workflows, list) and workflows:
+            return True
+        try:
+            return int(payload.get("total_count") or 0) > 0
+        except (TypeError, ValueError):
+            return None
+
+    async def _pr_head_sha(
+        self, pr_number: int, *, repo: str | None, gh_repo: str | None
+    ) -> str:
+        rc, out, _err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "headRefOid",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return ""
+        try:
+            return str(json.loads(out).get("headRefOid") or "").strip()
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return ""
+
+    async def _absent_or_missing_run(
+        self,
+        pr_number: int,
+        reason: str,
+        *,
+        repo: str | None,
+        gh_repo: str | None,
+        sha: str = "",
+    ) -> CIProbeResult:
+        """Split 'no CI in the repo' from 'this SHA has no run yet' (#1041)."""
+        has = await self._repo_has_workflows(repo=repo, gh_repo=gh_repo)
+        if has is None:
+            return CIProbeResult(CIProbeOutcome.unavailable, "workflows_unavailable")
+        if not has:
+            return CIProbeResult(CIProbeOutcome.absent, reason)
+        if not sha:
+            sha = await self._pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        return CIProbeResult(CIProbeOutcome.missing_run, reason, details=sha or None)
+
     async def _workflow_runs_probe(
         self, pr_number: int, repo: str | None, gh_repo: str | None
     ) -> CIProbeResult:
@@ -2159,10 +2230,17 @@ class GitOpsIntegration:
                 CIProbeOutcome.unavailable, "workflow_runs_invalid_json"
             )
 
-        # No runs for this SHA is a definite answer, not a wait: the
-        # repository has no CI for it (#419's absent semantics).
+        # No runs for this SHA used to mean "the repository has no CI"
+        # (#419). That collapsed two facts: no workflows at all, and
+        # workflows that have not yet produced a run for this commit.
         if not runs:
-            return CIProbeResult(CIProbeOutcome.absent, "no_workflow_runs")
+            return await self._absent_or_missing_run(
+                pr_number,
+                "no_workflow_runs",
+                repo=repo,
+                gh_repo=gh_repo,
+                sha=head_sha,
+            )
 
         statuses = [str(r.get("status") or "").lower() for r in runs]
         conclusions = [str(r.get("conclusion") or "").lower() for r in runs]
@@ -2275,9 +2353,13 @@ class GitOpsIntegration:
         except json.JSONDecodeError:
             return CIProbeResult(CIProbeOutcome.unavailable, "invalid_json")
 
-        # An empty check set is a definite answer, not a wait: the PR has no CI.
+        # An empty check set used to skip the conveyor. It is still "no
+        # checks", but if the repo has workflows this SHA simply has no run
+        # yet — GitHub's registration lag, not "there is nothing to check".
         if not checks:
-            return CIProbeResult(CIProbeOutcome.absent, "no_checks")
+            return await self._absent_or_missing_run(
+                pr_number, "no_checks", repo=repo, gh_repo=gh_repo
+            )
 
         states = [c.get("state", "").upper() for c in checks]
         if any(

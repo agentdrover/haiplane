@@ -18,7 +18,10 @@ import aiosqlite
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.registry import plugins
 from hub.services.delivery_gate import undelivered_warning
+from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
 
 
 async def _running_task(client: AsyncClient, title: str = "Undelivered?") -> int:
@@ -147,3 +150,62 @@ async def test_warning_reaches_the_task_feed(
     assert any("не начала доставляться" in u["content"] for u in alerts), (
         "the owner reads the feed, not the agent's response"
     )
+
+
+async def test_missing_run_within_window_keeps_task_running(
+    db: aiosqlite.Connection,
+) -> None:
+    # #1041 AC-1: workflows exist, this SHA has no run yet, the grace window
+    # has not elapsed — delivery waits. needs_decision would turn a GitHub
+    # registration lag into a human chore.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(
+            CIProbeOutcome.missing_run, "no_workflow_runs", details="abc123def456"
+        )
+    )
+    plugins.git_ops = g
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running"
+    g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_missing_run_after_window_escalates_with_named_fact(
+    db: aiosqlite.Connection,
+) -> None:
+    # #1041 AC-2: the same fact past the window is a decision, and the reason
+    # names the fact and the commit — not the old ci_absent: no_workflow_runs
+    # slug that hid "GitHub has not registered a run yet" as "there is no CI".
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(
+            CIProbeOutcome.missing_run, "no_workflow_runs", details="abc123def456"
+        )
+    )
+    plugins.git_ops = g
+    task_id = await _approved_pair_task(db)
+    await db.execute(
+        "UPDATE tasks SET ci_check_started_at = datetime('now', '-30 minutes') "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ci_absent: no_workflow_runs" not in body
+    assert "workflow есть" in body
+    assert "abc123def456" in body

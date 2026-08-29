@@ -150,6 +150,10 @@ CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", 
 # averages 1.38M, deep 3.85M.
 REVIEW_LITE_TOKEN_BUDGET = int(env_get("REVIEW_LITE_TOKEN_BUDGET", "40000"))
 MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
+# Seconds after CI start / first missing-run probe before "no run for this
+# SHA" is a named fact rather than a wait. Same window the poller already
+# used (#1041). Project-level policy is a sibling, not this change.
+CI_GRACE_PERIOD = 180
 REVIEW_RUNTIME = env_get("REVIEW_RUNTIME", "openrouter")
 REVIEW_AGENT = env_get("REVIEW_AGENT", "code-reviewer")
 
