@@ -497,3 +497,153 @@ async def test_rollup_still_closes_umbrella_parent(db: aiosqlite.Connection):
 
     parent = dict(await repo.get_task(db, feature_id))
     assert parent["status"] == "completed"
+
+
+# ---- #1056: the submission line reports AC outcomes, not row counts ----
+#
+# The count that used to stand in this sentence made five unresolved locators
+# read exactly like five passing ones. The human at the gate reads the feed,
+# not the brief, so that sentence was the whole story he got.
+
+
+def _ci_headers(monkeypatch) -> dict:
+    from hub import config
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        config.parse_tokens("denis:human-token:human,ci:ci-token:admin"),
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return {"Authorization": "Bearer ci-token"}
+
+
+async def _submission_line(
+    client: AsyncClient,
+    monkeypatch,
+    *,
+    ac_results: dict[str, str],
+    ac_count: int = 0,
+    report: bool = True,
+) -> str:
+    """Walk a pair task to its submission and return the hub's report line."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Git(NoopGitOps):
+        async def fetch_base(self, repo: str, base: str):
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return "sha-pr-head"
+
+    monkeypatch.setattr(plugins, "git_ops", _Git())
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+
+    task_id = (await client.post("/api/tasks", json={"title": "AC outcomes"})).json()[
+        "id"
+    ]
+    total = ac_count or len(ac_results)
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "acceptance_criteria": [
+                {
+                    "id": f"AC-{n}",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                    "test_ref": f"tests/test_x.py::test_{n}",
+                }
+                for n in range(1, total + 1)
+            ]
+        },
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: work"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    ci = _ci_headers(monkeypatch)
+    if report:
+        resp = await client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json={
+                "head_sha": "sha-pr-head",
+                "ac_results": ac_results,
+                "validation_status": "pass",
+            },
+            headers=ci,
+        )
+        assert resp.status_code == 200, resp.text
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={}, headers=ci)
+    assert resp.status_code == 200, resp.text
+    updates = (await client.get(f"/api/tasks/{task_id}/updates", headers=ci)).json()
+    lines = [u["content"] for u in updates if "Submitted for review" in u["content"]]
+    assert len(lines) == 1, updates
+    return lines[0]
+
+
+async def test_submission_line_names_unresolved_ac_results(
+    client: AsyncClient, monkeypatch
+):
+    """#1056 AC-1: five not_found must not read as five results delivered."""
+    line = await _submission_line(
+        client,
+        monkeypatch,
+        ac_results={f"AC-{n}": "not_found" for n in range(1, 6)},
+    )
+    assert "AC: none of 5 resolved (5 not_found)" in line
+    assert "5 AC result(s)" not in line, (
+        "the count is exactly what hid the outcome: it must be gone, "
+        "not merely accompanied"
+    )
+
+
+async def test_submission_line_splits_ac_results_by_status(
+    client: AsyncClient, monkeypatch
+):
+    """#1056 AC-2: a mixed set shows both numbers; neither is inferred."""
+    line = await _submission_line(
+        client,
+        monkeypatch,
+        ac_results={
+            "AC-1": "pass",
+            "AC-2": "pass",
+            "AC-3": "fail",
+            "AC-4": "not_found",
+            "AC-5": "not_found",
+        },
+    )
+    assert "AC: 3 of 5 resolved (2 not_found), 1 failing" in line
+
+
+async def test_submission_line_says_every_ac_resolved(client: AsyncClient, monkeypatch):
+    """#1056 AC-3: all resolved is said in words, not left to arithmetic."""
+    line = await _submission_line(
+        client,
+        monkeypatch,
+        ac_results={f"AC-{n}": "pass" for n in range(1, 4)},
+    )
+    assert "AC: all 3 resolved" in line
+    assert "not_found" not in line
+    assert "failing" not in line
+
+
+async def test_no_ci_report_prints_no_ac_line(client: AsyncClient, monkeypatch):
+    """#1056 AC-4: no report is no line — never «0 of 0» (#762)."""
+    line = await _submission_line(
+        client, monkeypatch, ac_results={}, ac_count=2, report=False
+    )
+    assert "AC:" not in line
+    assert "CI run report adopted" not in line
