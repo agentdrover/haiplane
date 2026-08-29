@@ -215,6 +215,18 @@ def machine_deadline_policies() -> list[LifecyclePolicy]:
     return [p for p in LIFECYCLE_MATRIX.values() if p.owner == OWNER_MACHINE]
 
 
+def human_owned_policies() -> list[LifecyclePolicy]:
+    """Instances where a PERSON is the next actor (#1020).
+
+    Read by the poller's reminder ladder, which raises the volume on these and
+    nothing else. It changes no policy here: these instances keep
+    ``deadline_config=None`` and ``escalation=None``, because the matrix's own
+    invariant is that a human queue never auto-transitions. A reminder is not
+    a deadline — the owner and the status stay exactly where they were.
+    """
+    return [p for p in LIFECYCLE_MATRIX.values() if p.owner == OWNER_HUMAN]
+
+
 __all__ = [
     "LIFECYCLE_MATRIX",
     "LifecyclePolicy",
@@ -227,4 +239,5 @@ __all__ = [
     "resolve_instance",
     "policy_for",
     "machine_deadline_policies",
+    "human_owned_policies",
 ]

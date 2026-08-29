@@ -189,10 +189,19 @@ async def generate_due_digests(
             )
             if not d["covered"]
         ]
+        # #1020: the human queue rides along the same way the category debt
+        # does, and for the same reason — it is a property of the practice,
+        # not of this day's autopilot activity. Riding along has a real cost
+        # to state plainly: a digest is only created for a delegating project
+        # on a day with autopilot events, so this line appears when a digest
+        # happens to exist. The reminder's dependable channel is the events
+        # feed the poller writes; the digest is the summary, not the alarm.
+        human_queue = await repo.human_queue_reminders_between(db, day_start, day_end)
         payload = {
             "date": day,
             "project": project["slug"],
             "category_debt": debt,
+            "human_queue": human_queue,
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,
