@@ -16,6 +16,7 @@ from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.services.finding_identity import finding_uids
+from hub.services.lifecycle import maybe_rollup_parent, repair_stale_parent_completions
 
 
 async def _walk_pair_lifecycle(client: AsyncClient, task_id: int) -> list[str]:
@@ -316,3 +317,97 @@ async def test_second_report_names_the_dispatched_reviewer(
     assert "grok-4.6" in alerts
     assert "bc-cloud-1" in alerts
     assert "сверка расходов" in alerts.lower() or "расход" in alerts
+
+
+# ---------------------------------------------------------------------------
+# Rollup must not close a parent that still has its own work (#1043)
+# ---------------------------------------------------------------------------
+
+
+async def _rollup_node(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    task_type: str,
+    parent_id: int | None,
+    status: str,
+) -> int:
+    return await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status=status,
+        auto_review=False,
+        task_type=task_type,
+        parent_id=parent_id,
+        priority="medium",
+    )
+
+
+async def _feature_with_completed_child(
+    db: aiosqlite.Connection,
+    *,
+    branch: str = "",
+    claimed_by: str = "",
+    parent_status: str = "running",
+) -> tuple[int, int]:
+    feature_id = await _rollup_node(
+        db, title="Parent feature", task_type="feature", parent_id=None, status="open"
+    )
+    child_id = await _rollup_node(
+        db,
+        title="Last child",
+        task_type="task",
+        parent_id=feature_id,
+        status="completed",
+    )
+    await db.execute(
+        "UPDATE tasks SET status=?, branch=?, claimed_by=? WHERE id=?",
+        (parent_status, branch, claimed_by, feature_id),
+    )
+    await db.commit()
+    return feature_id, child_id
+
+
+async def test_rollup_skips_parent_with_its_own_branch(db: aiosqlite.Connection):
+    """AC-2 (#1043): a feature with its own branch stays running after children."""
+    feature_id, child_id = await _feature_with_completed_child(
+        db, branch="task-1016/wave1-rollup", claimed_by="pda_claude"
+    )
+
+    await maybe_rollup_parent(db, child_id)
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "running"
+    tape = [dict(row)["content"] for row in await repo.get_task_updates(db, feature_id)]
+    assert any(
+        "готов к сдаче" in content and "ждёт своего отчёта" in content
+        for content in tape
+    )
+
+
+async def test_repair_sweep_skips_parent_with_its_own_branch(db: aiosqlite.Connection):
+    """AC-3 (#1043): the repair sweep asks the same question as live rollup."""
+    feature_id, _child_id = await _feature_with_completed_child(
+        db, branch="task-1016/wave1-rollup", claimed_by="pda_claude"
+    )
+
+    repaired = await repair_stale_parent_completions(db)
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "running"
+    assert repaired == 0
+
+
+async def test_rollup_still_closes_umbrella_parent(db: aiosqlite.Connection):
+    """AC-4 (#1043): umbrella parents without own work still close (#742)."""
+    feature_id, child_id = await _feature_with_completed_child(db, parent_status="open")
+
+    await maybe_rollup_parent(db, child_id)
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "completed"

@@ -284,6 +284,46 @@ def _children_allow_rollup(children: list[Any]) -> bool:
     return "completed" in statuses
 
 
+def _parent_has_own_work(parent: dict[str, Any]) -> bool:
+    """True when a feature/epic is itself in progress, not only a container (#1043).
+
+    Umbrella parents (#742) have none of these: empty ``claimed_by``,
+    ``claim_session_id``, ``branch``, and no ``pr_number``. A parent that
+    was pair-started or claimed is work of its own — children finishing
+    does not mean that work was reported.
+    """
+    if (parent.get("claimed_by") or "").strip():
+        return True
+    if (parent.get("claim_session_id") or "").strip():
+        return True
+    if (parent.get("branch") or "").strip():
+        return True
+    return bool(parent.get("pr_number"))
+
+
+async def _note_rollup_awaits_own_report(
+    db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
+) -> None:
+    """Write the skip to the task tape so the parent is not silently stuck."""
+    branch = (parent.get("branch") or "").strip() or "—"
+    claimed = (parent.get("claimed_by") or "").strip() or "—"
+    await repo.add_task_update(
+        db,
+        parent_id,
+        "hub",
+        "status",
+        "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
+        f"задачу, потому что у неё есть собственная работа "
+        f"(branch={branch}, claimed_by={claimed}).",
+    )
+    await log_activity(
+        db,
+        "task_updated",
+        f"Task #{parent_id} rollup skipped: parent has its own work, "
+        "awaiting its own report",
+    )
+
+
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     """Auto-complete feature/epic when every direct child is terminal (#742)."""
     row = await repo.get_task(db, child_id)
@@ -304,6 +344,9 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
 
     children = await db_module.get_children(db, parent_id)
     if not _children_allow_rollup(children):
+        return
+    if _parent_has_own_work(parent):
+        await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
 
     if not await repo.transition_status_if(
@@ -339,10 +382,14 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         parent_row = await repo.get_task(db, parent_id)
         if not parent_row:
             continue
+        parent = dict(parent_row)
         children = await db_module.get_children(db, parent_id)
-        if _children_allow_rollup(children):
-            await repo.update_task(db, parent_id, status="completed")
-            repaired += 1
+        if not _children_allow_rollup(children):
+            continue
+        if _parent_has_own_work(parent):
+            continue
+        await repo.update_task(db, parent_id, status="completed")
+        repaired += 1
     if repaired:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
