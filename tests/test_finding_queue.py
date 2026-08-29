@@ -683,3 +683,102 @@ async def test_queue_evidence_never_prechecks_a_radio(
     assert "checked" not in after_fp
     after_wont = page.split('value="wont_fix"')[1][:80]
     assert "checked" not in after_wont
+
+
+async def test_the_detail_is_folded_behind_the_headline(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1050 AC-1: сначала место и суть, проза ревьюера — по запросу.
+
+    Очередь читают заголовками: на семидесяти находках развёрнутый detail
+    превращает страницу в ленту текста, где место находки приходится искать
+    глазами. Свёртка не прячет находку — она перестаёт платить за неё экраном
+    до того, как человек решил, что эта находка ему интересна.
+    """
+    detail = "Развёрнутое рассуждение ревьюера про пул соединений. " * 12
+    await _task(db, 91, "completed", 1)
+    await _report(
+        db,
+        150,
+        91,
+        1,
+        [
+            _finding(
+                "гонка в пуле",
+                locator="lines",
+                start_line=42,
+                end_line=42,
+                line=42,
+                detail=detail,
+            )
+        ],
+    )
+    await db.commit()
+
+    block = _li_for((await client.get("/findings")).text, "гонка в пуле")
+    head, fold, folded = block.partition("<details")
+    assert fold, "деталь ревьюера свёрнута, а не выложена в строку"
+    assert "open" not in folded.split(">", 1)[0], "свёртка закрыта по умолчанию"
+    # Первый экран несёт ровно то, чем находку опознают, не открывая её.
+    assert "high" in head
+    assert "correctness" in head
+    assert "hub/db.py:42" in head
+    assert "гонка в пуле" in head
+    assert detail.strip() not in head, "проза ревьюера не занимает место до клика"
+    assert detail.strip() in folded
+
+
+async def test_the_fold_does_not_swallow_the_evidence(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1050 AC-3: свёртка прячет прозу ревьюера, но не факт касания (#1042).
+
+    Доказательство — то, ради чего очередь читают подряд. Уехав под клик, оно
+    вернуло бы ровно ту цену, которую сняла #1042: сверку коммитов руками. А
+    «ответа нет» под свёрткой читалось бы как «место не тронуто» — пустота,
+    выданная за чистоту (#762).
+    """
+    detail = "Проза ревьюера на несколько строк подряд. " * 8
+    clone = _init_repo(tmp_path / "queue-fold")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue fold keeps the fact")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    await db.execute(
+        "UPDATE machine_reviews SET findings_confirmed=? WHERE task_id=?",
+        (
+            json.dumps(
+                [
+                    {**_FINDING_LINES, "detail": detail},
+                    {**_FOOTER, "detail": detail},
+                    # locator=none: «ответа нет» приходит на ОТДЕЛЬНУЮ находку
+                    # того же отчёта, а не на весь отчёт разом.
+                    {
+                        **_FINDING_LINES,
+                        "title": "без места",
+                        "locator": "none",
+                        "detail": detail,
+                    },
+                ]
+            ),
+            task_id,
+        ),
+    )
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "touch named lines")
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    heads = {
+        title: _li_for(page, title).partition("<details")[0]
+        for title in ("guard drops the flag", "footer leak", "без места")
+    }
+    assert "Место тронуто после отчёта" in heads["guard drops the flag"]
+    assert "touch named lines" in heads["guard drops the flag"]
+    assert "Место не тронуто после отчёта" in heads["footer leak"]
+    assert "Место тронуто после отчёта" not in heads["footer leak"]
+    assert "Ответа нет:" in heads["без места"]
+    assert "Место не тронуто" not in heads["без места"], "пустота не чистота (#762)"
+    for title, head in heads.items():
+        assert detail.strip() not in head, f"деталь «{title}» осталась в первом экране"
