@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hub.mcp_catalog import (  # noqa: E402
     BUDGET_PATH,
+    WORKING_FREEZE,
     catalog_snapshot,
     check_budget,
     format_report,
@@ -76,6 +77,19 @@ def _write_budget(
         "budgets": {
             key: _ceiling(measured[key], headroom_pct) for key in MEASURED_KEYS
         },
+        # #1071: the limit that actually REFUSES a new contract field, published
+        # here because this is the file agents read before planning. The
+        # ceilings above are looser by design — a percentage headroom catches
+        # slow drift — and reading only them is how work gets planned that does
+        # not fit: on 2026-08-29 the file advertised 3374 characters of room
+        # while the freeze left 92.
+        "working_freeze": dict(WORKING_FREEZE),
+        "working_headroom_note": (
+            "working_freeze — предел, который отвергает новое описание; "
+            "budgets — более свободный потолок с процентным запасом. "
+            "Остаток считается от measured, а не от живого каталога. "
+            "Заморозка двигается только ВНИЗ, и это отдельное решение."
+        ),
         "baseline_tools": {
             entry["name"]: entry["total_chars"]
             for entry in sorted(snapshot["tools_list"], key=lambda e: e["name"])

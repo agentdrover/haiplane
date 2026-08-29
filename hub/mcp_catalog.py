@@ -59,6 +59,44 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 BUDGET_PATH = HERE.parent / "docs" / "agent-context" / "mcp-catalog-budget.json"
 
+# The limit that actually BINDS a contract field, and the only one an author
+# needs before planning work (#1071).
+#
+# There are two guards and they are not the same. ``budgets`` in the file is a
+# ceiling with a percentage headroom (10%), which catches slow drift over
+# months. WORKING_FREEZE is tighter and catches growth the same day. Whoever
+# adds a field hits the second one — and until now it lived only inside
+# tests/test_mcp_catalog_budget.py, while docs/agent-context advertised the
+# looser number. On 2026-08-29 that cost a docstring rewrite for 7 characters
+# of room that the budget file said was 3374 (#911).
+#
+# It lives here so both the test and the report read one value, and so
+# ``--update`` can publish it into the file agents read as context. Moving it
+# is a deliberate act: a freeze may only go DOWN, and
+# ``test_no_working_freeze_rises`` pins that.
+WORKING_FREEZE = {
+    "description_chars": 36383,
+    "max_tool_chars": 6404,
+}
+
+
+def working_headroom(path: Path | None = None) -> dict[str, int]:
+    """Room left under each working freeze, from the recorded measurement.
+
+    Derived rather than written down: the distance used to be prose beside the
+    constant ("live 35383 + 1000 working headroom") and was wrong in both
+    halves — the same commit recorded live as 36332, and the real distance from
+    the file's ``measured`` is 324. Nothing checked either, so nothing caught
+    them (#1071).
+    """
+    measured = load_measured(path)
+    return {
+        key: freeze - measured[key]
+        for key, freeze in WORKING_FREEZE.items()
+        if key in measured
+    }
+
+
 # Fields a budget file may set. Anything else is a typo, and a typo in a
 # budget file is a budget that silently never applied.
 # How much of the DECLARED HEADROOM may be eaten before the report starts

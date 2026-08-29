@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from hub.mcp_catalog import (
+    WORKING_FREEZE,
+    working_headroom as catalog_working_headroom,
     BUDGET_KEYS,
     BUDGET_PATH,
     catalog_snapshot,
@@ -22,6 +24,7 @@ from hub.mcp_catalog import (
     format_report,
     load_baseline,
     load_budget,
+    load_measured,
     snapshot_from_tools,
 )
 
@@ -330,13 +333,37 @@ PRE_TRIM_CEILINGS = {
 }
 # Re-frozen 2026-08-28 (#1031) after the second trim: live was 36332 with only
 # 163 characters left under the previous freeze, and one day had just spent 380
-# of them (#1007 +281, #1013 +99). Each freeze sits a WORKING HEADROOM above
-# the measured catalog — 1000 characters here, 200 for the fattest tool — so a
-# field added to a contract has room to land, and a second one has to be paid
-# for by a trim rather than by raising the number. A freeze may only move
-# down: the pre-trim values were 36495 (2026-08-21, live 38130) and 6472.
-FROZEN_DESCRIPTION_CHARS = 36383  # live 35383 + 1000 working headroom
-FROZEN_MAX_TOOL_CHARS = 6404  # live 6204 + 200 working headroom
+# of them (#1007 +281, #1013 +99). A freeze is a WORKING HEADROOM above the
+# measured catalog — so a field added to a contract has room to land, and a
+# second one is paid for by a trim rather than by raising the number. A freeze
+# may only move down: the pre-trim values were 36495 (2026-08-21, live 38130)
+# and 6472.
+#
+# #1071: the headroom is DERIVED, never retyped. It used to be prose beside the
+# constant — "live 35383 + 1000 working headroom" — and the prose was wrong in
+# both halves: the same commit reported live as 36332 (a 949 disagreement three
+# lines apart), and the real distance from the recorded measurement is 324, not
+# 1000. Nothing checked either claim, so nothing caught them.
+#
+# The cost landed on 2026-08-29 (#911). The FIRST contract field to arrive
+# found 49 characters and had to be paid for by rewriting a docstring — while
+# the policy above says the first one lands free and only the second one pays.
+# An author who reads that policy plans work that will not fit.
+#
+# So the freeze stays a pinned literal (a test cannot measure another branch),
+# but the headroom is arithmetic over recorded facts and is reported by the
+# refusal itself. There is no second number left to disagree with the first.
+# The values themselves now live in hub/mcp_catalog.py, next to the loader the
+# report uses, so the number that binds is the number ``--update`` publishes
+# into docs/agent-context — the file an author reads before planning. A copy
+# here would be a second place to edit, and the two would part ways on the
+# first re-freeze.
+FROZEN_DESCRIPTION_CHARS = WORKING_FREEZE["description_chars"]
+FROZEN_MAX_TOOL_CHARS = WORKING_FREEZE["max_tool_chars"]
+# A freeze may only move DOWN. These pin that, the way PRE_TRIM_CEILINGS pins
+# the ceilings: raising a freeze to fit new text is the act the whole guard
+# exists to prevent, and it must not be possible to do it quietly (#1071).
+WORKING_FREEZE_FLOOR = {"description_chars": 36383, "max_tool_chars": 6404}
 PRE_TRIM_INSTRUCTION_PER_TOOL = 179598
 
 
@@ -355,6 +382,29 @@ def test_no_ceiling_rises() -> None:
         )
 
 
+def test_the_declared_working_headroom_is_true() -> None:
+    """AC-1: the promise is arithmetic over recorded facts, not prose.
+
+    The policy above says a freeze sits a working headroom above the measured
+    catalog so a contract field has room to land. That is only a promise if
+    something checks it — #1031 stated it and set a freeze 324 above the
+    recorded measurement while the comment claimed 1000, and no test noticed.
+
+    This does not say WHAT the headroom should be: choosing that is moving a
+    ceiling, which is a deliberate act and not this task's. It says the number
+    is positive and knowable, so the next author reads a fact instead of a
+    sentence somebody typed.
+    """
+    rooms = catalog_working_headroom()
+    for metric, freeze in WORKING_FREEZE.items():
+        room = rooms[metric]
+        assert room > 0, (
+            f"{metric}: the freeze {freeze} sits BELOW the recorded measurement "
+            f"{load_measured()[metric]} — a freeze under the catalog it freezes "
+            "refuses everything, including no change at all"
+        )
+
+
 async def test_description_chars_stay_under_freeze() -> None:
     """AC-3: the docstring trim is real, not a rounding error.
 
@@ -362,7 +412,20 @@ async def test_description_chars_stay_under_freeze() -> None:
     trim, and a name carrying the old figure would be wrong the moment it did.
     """
     snapshot = await catalog_snapshot()
-    assert snapshot["description_chars"] < FROZEN_DESCRIPTION_CHARS
+    live = snapshot["description_chars"]
+    # #1071 (AC-4): the refusal says how much room is left and where the limit
+    # is declared. The previous message named neither, so an author who hit it
+    # went looking for the number by grepping the test suite — measured on
+    # 2026-08-29, that search cost several rewrites of a docstring.
+    assert live < FROZEN_DESCRIPTION_CHARS, (
+        f"catalog descriptions are {live}, over the freeze "
+        f"{FROZEN_DESCRIPTION_CHARS} by {live - FROZEN_DESCRIPTION_CHARS + 1}. "
+        "The freeze is FROZEN_DESCRIPTION_CHARS in "
+        "tests/test_mcp_catalog_budget.py and is the limit that binds — the "
+        "ceiling in docs/agent-context/mcp-catalog-budget.json is looser and "
+        "will not stop you. Pay for the new text with a trim; raising the "
+        "freeze is a separate, deliberate act."
+    )
 
 
 async def test_max_tool_chars_back_under_freeze() -> None:
@@ -428,3 +491,56 @@ async def test_no_empty_tool_descriptions() -> None:
         assert "Args:" in doc, func.__name__
         for arg in args:
             assert f"{arg}:" in doc, f"{func.__name__} stopped describing {arg}"
+
+
+def test_no_working_freeze_rises() -> None:
+    """AC-2: a freeze may only move DOWN.
+
+    The freeze is what stops a contract field from landing on borrowed room, so
+    raising it to fit new text is exactly the act it exists to prevent. Pinned
+    the way PRE_TRIM_CEILINGS pins the ceilings: a literal a change has to walk
+    past on purpose, not a value that follows whatever the catalog became.
+    """
+    for metric, floor in WORKING_FREEZE_FLOOR.items():
+        assert WORKING_FREEZE[metric] <= floor, (
+            f"{metric}: working freeze rose from {floor} to "
+            f"{WORKING_FREEZE[metric]} — pay for new text with a trim, or move "
+            "this floor deliberately and say why"
+        )
+
+
+def test_the_binding_limit_is_readable_where_work_is_planned() -> None:
+    """AC-3: the number that stops you is in the file you read before starting.
+
+    docs/agent-context is the directory agents read as context. It advertised
+    only the percentage ceiling — 3374 characters of room on 2026-08-29 — while
+    the freeze left 92. An author planning a contract field read the number
+    that would not stop them and planned work that did not fit (#911).
+    """
+    doc = json.loads(BUDGET_PATH.read_text(encoding="utf-8"))
+    published = doc.get("working_freeze")
+    assert published == WORKING_FREEZE, (
+        "the budget file must publish the freeze that binds: "
+        f"file says {published}, code says {WORKING_FREEZE}. "
+        "Run scripts/mcp_catalog_budget.py --update after moving a freeze."
+    )
+    assert doc.get("working_headroom_note"), (
+        "the file must say that the freeze, not the ceiling, is what refuses"
+    )
+
+
+def test_measured_records_the_freeze_not_the_present() -> None:
+    """AC-5: measured lagging the live catalog is its MEANING, not a defect.
+
+    It records what the catalog was when the ceiling was set, so "how much of
+    the slack has been spent" is arithmetic over recorded facts. Requiring it
+    to equal the live value would force --update on every change and bring back
+    the churn #829 removed — three rounds of resubmission on #815, none of them
+    about the work. Written as a test because I nearly required the opposite.
+    """
+    measured = load_measured()
+    assert measured, "the file records what the catalog was at the last freeze"
+    # No assertion that it equals the live catalog: that is the point.
+    assert set(measured) >= set(WORKING_FREEZE), (
+        "every freeze needs a recorded measurement to be a distance from"
+    )
