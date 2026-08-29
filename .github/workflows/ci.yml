@@ -57,6 +57,17 @@ jobs:
         id: lint
         run: uv run ruff check hub tests
 
+      # #1066: до этой проверки в линте не было ни одного правила сложности, и
+      # `ruff check` был зелёным всё время, пока submit_for_review рос до 173
+      # операторов. Ledger сегодняшних 36 исключений — в
+      # docs/agent-context/complexity-budget.json; тридцать седьмое нарушение
+      # красит этот шаг. Печатается всегда, а не только при провале: разбивка
+      # по причинам (task / permanent / unclaimed) видна в зелёном прогоне,
+      # иначе долг без задачи тихо перестаёт считаться долгом.
+      - name: Complexity budget
+        id: complexity
+        run: uv run python scripts/complexity_budget.py
+
       - name: Check formatting
         id: format
         run: uv run ruff format --check hub tests
