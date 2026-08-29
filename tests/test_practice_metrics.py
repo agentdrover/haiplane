@@ -457,6 +457,15 @@ async def _report(
     findings = json.dumps(
         [{"title": f"f{i}", "severity": "medium"} for i in range(confirmed)]
     )
+    # The task's own generation moves with the report. In production
+    # hub_submit_for_review bumps it and the report is filed against the value
+    # it just set, so a task sitting at 0 with a report at 1 is a state nothing
+    # produces — and it reads as a SUPERSEDED report to anything that asks
+    # which report is current (#1038).
+    await db.execute(
+        "UPDATE tasks SET submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
     await repo.insert_machine_review(
         db,
         task_id=task_id,

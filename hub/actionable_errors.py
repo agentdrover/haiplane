@@ -581,6 +581,37 @@ def pair_start_session_mismatch_detail(
     )
 
 
+def pair_branch_dirty_detail(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dirty shared hub clone: only a human on the host can clear it (#1040).
+
+    Agents cannot reach that directory. Addressing them is the #966 class of
+    refusal: an unfulfillable hint is worse than none. ``actor_hint`` is
+    declared here so the envelope cannot fall back to ``agent``.
+    """
+    body = dict(payload or {})
+    body["reason"] = "pair_branch_dirty"
+    body["actor_hint"] = "human"
+    body["required_role"] = "human"
+    body.setdefault("suggested_tool", "hub_pair_start")
+    return enrich_error_payload(body)
+
+
+def pair_worktree_dirty_detail(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dirty task worktree: the agent working there can stash it (#1040).
+
+    Same porcelain as ``pair_branch_dirty``, different place — collapsing the
+    two onto one addressee would wake the wrong person. The fallback to
+    ``agent`` happens to be right here; it still has to be declared, or the
+    next undeclared reason inherits a coincidence.
+    """
+    body = dict(payload or {})
+    body["reason"] = "pair_worktree_dirty"
+    body["actor_hint"] = "agent"
+    body["required_role"] = "agent"
+    body.setdefault("suggested_tool", "hub_pair_start")
+    return enrich_error_payload(body)
+
+
 def session_owned_by_other_detail(*, session_id: str) -> dict[str, Any]:
     """409 when register would overwrite another principal's session row (#977).
 

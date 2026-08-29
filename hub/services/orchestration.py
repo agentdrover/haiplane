@@ -301,9 +301,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     coverage_rows = await fetchall(
         db,
         "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
-        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged, "
-        "COALESCE(SUM(json_array_length(mr.findings_confirmed)), 0) AS confirmed, "
-        "COALESCE(SUM(judged.n), 0) AS judged "
+        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged "
         "FROM machine_reviews mr LEFT JOIN ("
         "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
@@ -318,9 +316,26 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
     result["reports_unjudged"] = reports - reports_judged
-    result["confirmed_unjudged"] = max(
-        int(cov.get("confirmed") or 0) - int(cov.get("judged") or 0), 0
-    )
+    # What is actually WAITING, from the same query the queue page reads
+    # (#1038). This used to subtract one sum from another — all confirmed
+    # findings in the window minus all dispositions in it — and that answered a
+    # different question in two ways at once. It counted the findings of
+    # SUPERSEDED reports, which describe code a resubmission has already
+    # replaced and which nobody should be asked to judge; and it let a
+    # judgement filed against a stale report cancel out a live finding, because
+    # totals do not know which finding they came from. The number will read
+    # LOWER than before on the same data. That is the correction, not a
+    # regression: it stopped counting work that does not exist.
+    # Deliberately NOT windowed, unlike every rate above it. Precision is a
+    # flow — how the reports of a period turned out — but "what is waiting" is
+    # a stock, and a backlog does not expire: a finding nobody answered in
+    # April is still unanswered today. Windowing it would hide exactly the
+    # oldest items, and it would also split this number from the queue page it
+    # links to, which shows everything. The page says "за всё время" next to it
+    # so the reader is not told a windowed number by the header.
+    unjudged = await repo.count_unjudged_findings(db)
+    result["confirmed_unjudged"] = unjudged["findings"]
+    result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
         dict(_rates(counts), profile=name)
         for name, counts in sorted(by_profile.items())
@@ -3231,50 +3246,82 @@ async def dispatch_ci_fix(
     await db.commit()
 
 
+@dataclass(frozen=True)
+class ScannedVerdict:
+    """A verdict word found in text, together with what and where it was (#1019).
+
+    The basis travels with the verdict because a string match is evidence, not
+    a decision: whoever has to judge it needs to see the line that matched and
+    where it came from. Returning the bare word made a quotation from a finding
+    and a reviewer's actual conclusion indistinguishable at the call site.
+    """
+
+    verdict: str
+    line: str
+    source: str
+
+
+# Where a scanned verdict came from, in the words a person reads in the alert.
+SCAN_SOURCE_UPDATE = "апдейт ревью"
+SCAN_SOURCE_LOG = "лог ревью-джоба"
+
+
 def extract_review_verdict(
     task_id: int,
     review_job_id: str,
     db_updates: list[dict[str, Any]],
-) -> str | None:
-    """Return 'approved' or 'changes_requested' from task_updates or full dispatch log.
+) -> ScannedVerdict | None:
+    """Scan task_updates, then the dispatch log, for a verdict word.
 
     Search order:
     1. task_updates with kind='review' — scan all lines for verdict
     2. Full dispatch log — scan all lines for the LAST occurrence of a verdict keyword
+
+    The result is a candidate, not a verdict. What the caller may do with it
+    depends on which way it points: ``changes_requested`` returns work to its
+    author and costs a round, ``approved`` would open delivery — see
+    hub/poller.py, where the second one is refused.
     """
     for u in reversed(db_updates):
         if u.get("kind") == "review":
             text = u.get("content", "").strip()
-            verdict = scan_text_for_verdict(text)
-            if verdict:
-                return verdict
+            found = _scan_with_basis(text)
+            if found:
+                verdict, line = found
+                return ScannedVerdict(verdict, line, SCAN_SOURCE_UPDATE)
 
     full_log = plugins.dispatch.job_log_full(review_job_id)
     if full_log:
-        verdict = scan_text_for_verdict(full_log)
-        if verdict:
+        found = _scan_with_basis(full_log)
+        if found:
+            verdict, line = found
             log.info(
                 "Poll: task #%d verdict '%s' extracted from dispatch log",
                 task_id,
                 verdict,
             )
-            return verdict
+            return ScannedVerdict(verdict, line, SCAN_SOURCE_LOG)
 
     return None
 
 
+def _scan_with_basis(text: str) -> tuple[str, str] | None:
+    """``(verdict, the line it was read from)`` for the last match, or None."""
+    found: tuple[str, str] | None = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        line_lower = stripped.lower()
+        if "changes_requested" in line_lower:
+            found = ("changes_requested", stripped)
+        elif line_lower.endswith("approved"):
+            found = ("approved", stripped)
+    return found
+
+
 def scan_text_for_verdict(text: str) -> str | None:
     """Scan text for the last occurrence of APPROVED or CHANGES_REQUESTED."""
-    last_verdict: str | None = None
-    for line in text.split("\n"):
-        line_lower = line.strip().lower()
-        if "changes_requested" in line_lower:
-            last_verdict = "changes_requested"
-        elif (
-            line_lower.rstrip().endswith("approved") or line_lower.strip() == "approved"
-        ):
-            last_verdict = "approved"
-    return last_verdict
+    found = _scan_with_basis(text)
+    return found[0] if found else None
 
 
 async def maybe_destroy_vast(

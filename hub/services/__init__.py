@@ -8,6 +8,7 @@ from hub.services.dashboard import (
     get_project_cards,
     get_epics_enriched,
     get_inbox_data,
+    project_id_for,
     list_activity,
     list_tasks,
 )
@@ -188,6 +189,7 @@ __all__ = [
     "unaddressable_tasks",
     "live_check_view",
     "record_category_check",
+    "project_id_for",
     "record_finding_dispositions",
     "record_steward_judgement",
     "finding_uid",

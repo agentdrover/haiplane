@@ -1,5 +1,8 @@
 {% set undelivered = undelivered if undelivered is defined else [] %}
-{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered|length %}
+{# #1038: не список задач, а счёт находок — они переживают статус задачи и
+   поэтому не собираются ни одним разделом выше. #}
+{% set unjudged_findings = unjudged_findings if unjudged_findings is defined else {"findings": 0, "reports": 0} %}
+{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered|length + (1 if unjudged_findings.findings else 0) %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
 <div class="inbox-filter-bar">
@@ -288,6 +291,30 @@
         </div>
     </article>
     {% endfor %}
+</section>
+{% endif %}
+
+{% if unjudged_findings.findings %}
+<section class="inbox-group inbox-unjudged-findings">
+    <h3 class="inbox-group-title">
+        Находки ждут суждения <span class="inbox-count">{{ unjudged_findings.findings }}</span>
+    </h3>
+    <article class="inbox-item" id="inbox-unjudged-findings">
+        <div class="inbox-item-meta">
+            по {{ unjudged_findings.reports }} отчёт{% if unjudged_findings.reports % 10 == 1 and unjudged_findings.reports % 100 != 11 %}у{% else %}ам{% endif %} текущих сдач
+        </div>
+        <div class="inbox-item-desc">
+            Пока им не названа судьба, precision и resolution rate считать не из
+            чего, а цена находки известна без цены пользы.
+        </div>
+        <div class="inbox-item-actions">
+            {# Фильтр проекта переживает клик: счёт в заголовке уже сужен, и
+               страница обязана отвечать на тот же вопрос, иначе человек жмёт
+               «1» и попадает в список из двадцати одной чужой находки. #}
+            <a href="/findings{% if filter_project %}?project={{ filter_project | urlencode }}{% endif %}"
+               class="btn btn-primary btn-xs">Разобрать</a>
+        </div>
+    </article>
 </section>
 {% endif %}
 

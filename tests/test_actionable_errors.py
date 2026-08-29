@@ -176,3 +176,70 @@ def test_undeclared_reason_warns_instead_of_passing_silently(caplog) -> None:
 
     assert payload["actor_hint"]  # still answers something usable
     assert any("declares neither actor_hint" in r.message for r in caplog.records)
+
+
+def test_pair_branch_dirty_wakes_a_human(caplog) -> None:
+    # The shared hub clone is on the host. An agent cannot stash it, so the
+    # envelope must name a human — and that name must be declared, not the
+    # silent "agent" fallback that #548 made loud for exactly this class.
+    import logging
+
+    from hub.actionable_errors import pair_branch_dirty_detail
+    from hub.integrations.git_ops import PairBranchConflictError
+
+    declared = pair_branch_dirty_detail({"message": "dirty clone", "hint": "stash"})
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        envelope = PairBranchConflictError(
+            "dirty clone",
+            reason="pair_branch_dirty",
+            hint="stash",
+        ).to_detail()
+
+    assert declared["actor_hint"] == "human"
+    assert declared["required_role"] == "human"
+    assert envelope["actor_hint"] == "human"
+    assert envelope["required_role"] == "human"
+    assert not any("declares neither actor_hint" in r.message for r in caplog.records)
+
+
+def test_pair_worktree_dirty_stays_with_the_agent(caplog) -> None:
+    # The task worktree is the agent's own directory. Addressing a human would
+    # park a self-serviceable stash on someone who is not at that path.
+    import logging
+
+    from hub.actionable_errors import pair_worktree_dirty_detail
+    from hub.integrations.git_ops import PairBranchConflictError
+
+    declared = pair_worktree_dirty_detail(
+        {"message": "dirty worktree", "hint": "stash"}
+    )
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        envelope = PairBranchConflictError(
+            "dirty worktree",
+            reason="pair_worktree_dirty",
+            hint="stash",
+        ).to_detail()
+
+    assert declared["actor_hint"] == "agent"
+    assert envelope["actor_hint"] == "agent"
+    assert not any("declares neither actor_hint" in r.message for r in caplog.records)
+
+
+def test_dirty_reasons_no_longer_fall_back(caplog) -> None:
+    # One default cannot serve both places. If this ever sees the same
+    # addressee twice, the declaration has collapsed back into a fallback.
+    import logging
+
+    from hub.actionable_errors import (
+        pair_branch_dirty_detail,
+        pair_worktree_dirty_detail,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        clone = pair_branch_dirty_detail({"message": "clone", "hint": "h"})
+        worktree = pair_worktree_dirty_detail({"message": "wt", "hint": "h"})
+
+    assert clone["actor_hint"] != worktree["actor_hint"]
+    assert clone["reason"] == "pair_branch_dirty"
+    assert worktree["reason"] == "pair_worktree_dirty"
+    assert not any("declares neither actor_hint" in r.message for r in caplog.records)

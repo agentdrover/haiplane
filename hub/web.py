@@ -888,6 +888,10 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         + len(inbox["ci_check_tasks"])
         + len(inbox["fix_requested_tasks"])
         + len(inbox["stale_tasks"])
+        # #1038: находки живут не в статусном списке, а в своём счёте, и без
+        # этой строки верхняя плашка показывала бы «Inbox 0» при непустой
+        # секции ниже — ровно та невидимость, которую задача и убирает.
+        + (1 if inbox.get("unjudged_findings", {}).get("findings") else 0)
         # #897: a completed task with an open PR belongs in the count the owner
         # glances at. Left out of it, the section would be a thing you only see
         # if you already scrolled to where you were not looking.
@@ -1239,19 +1243,103 @@ async def web_finding_dispositions(task_id: int, request: Request):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    # Where to land afterwards. Judging from the queue (#1038) has to return to
+    # the queue — sending a person to the task card after every report would
+    # make them navigate back for each one, which is the cost this page exists
+    # to remove. The value is not a URL from the form: only the two pages that
+    # carry this form may be named, so the field cannot become an open redirect.
+    if str(form.get("return_to") or "") == "queue":
+        # Обратно в очередь — и в ТУ ЖЕ очередь: проект, по которому её
+        # отфильтровали, обязан пережить сохранение, иначе после первого же
+        # отчёта человек оказывается в общем списке. Слаг не берётся как URL:
+        # он подставляется в один известный путь и экранируется.
+        back_project = str(form.get("return_project") or "").strip()
+        back = (
+            f"/findings?project={quote(back_project)}" if back_project else "/findings"
+        )
+    else:
+        back = f"/tasks/{task_id}"
+    # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
+    # поле не шлёт; очередь показывает и ранний отчёт лестницы (#879), у которого
+    # та же генерация, и обязана назвать его — иначе ответ ляжет на новейший.
+    raw_review = str(form.get("review_id") or "").strip()
+    try:
+        review_id = int(raw_review) if raw_review else None
+    except ValueError:
+        raise HTTPException(400, "review_id must be a number") from None
+    # Ограничение диапазона — не педантизм: id вне ширины SQLite INTEGER
+    # доходит до bind и даёт OverflowError, то есть 500 вместо 400. Отказ
+    # должен говорить, что запрос неверен, а не что сломался хаб.
+    if review_id is not None and not 0 < review_id <= 2**63 - 1:
+        raise HTTPException(400, f"review_id {review_id} is out of range")
     if not items:
         # Nothing chosen is not an error and not a judgement: the gate looked
         # and marked nothing, which must leave the report exactly as it was.
-        return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+        return RedirectResponse(back, status_code=303)
     try:
         await services.record_finding_dispositions(
-            db, task_id, items, decided_by=identity.username
+            db, task_id, items, decided_by=identity.username, review_id=review_id
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+    return RedirectResponse(back, status_code=303)
+
+
+@router.get("/findings", response_class=HTMLResponse)
+async def web_findings_queue(request: Request, project: str = Query(default="")):
+    """Every confirmed finding nobody has answered yet (#1038).
+
+    The page exists because the JUDGEMENT was never the expensive part — the
+    form has been in the task card since #876. What was missing is a way to
+    reach it: reports are written while a task is in review, and every inbox
+    section is built from ``list_tasks_by_status``, so once the task completes
+    its findings appear nowhere. Judging them meant remembering which of
+    twenty-eight tasks had reports.
+
+    Grouped by task so a person answers a whole report in one pass, and posting
+    through the same route the task card uses — a second way to record a
+    judgement would be a second thing to keep honest.
+    """
+    db = _db(request)
+    # The project narrows the query, not its result (#627). Arriving here from a
+    # board filtered to one project must not silently widen to every project.
+    project_id = await services.project_id_for(db, project or None)
+    rows = await repo.list_unjudged_findings(db, project_id=project_id)
+    groups: list[dict[str, Any]] = []
+    by_review: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        r = dict(row)
+        review_id = int(r["review_id"])
+        group = by_review.get(review_id)
+        if group is None:
+            group = {
+                "task_id": int(r["task_id"]),
+                "task_title": str(r["task_title"] or ""),
+                "task_status": str(r["task_status"] or ""),
+                "review_id": review_id,
+                "generation": int(r["submission_generation"] or 0),
+                "model": str(r["model"] or ""),
+                "reported_at": str(r["reported_at"] or ""),
+                "findings": [],
+            }
+            by_review[review_id] = group
+            groups.append(group)
+        try:
+            finding = json.loads(str(r["finding"]))
+        except ValueError:
+            # A report whose JSON we cannot read is still a row a person should
+            # see: dropping it here would shrink the queue below the count on
+            # the metrics page and make the two disagree.
+            finding = {}
+        group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    total = sum(len(g["findings"]) for g in groups)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "findings_queue.html",
+        {"groups": groups, "total": total, "project": project or ""},
+    )
 
 
 @router.get("/metrics", response_class=HTMLResponse)

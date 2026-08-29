@@ -49,9 +49,21 @@ latency и размер ответов — на отдельной страни�
             <td>{% if m.machine_reviews.tokens_per_fixed is not none %}{{ m.machine_reviews.tokens_per_fixed }}{% else %}<span class="muted">нет данных</span>{% endif %}
                 <span class="muted">/ по счёту провайдера:
                 {% if m.machine_reviews.provider_tokens_per_fixed is not none %}{{ m.machine_reviews.provider_tokens_per_fixed }}{% else %}нет данных провайдера{% endif %}</span></td></tr>
-        <tr><td>Покрытие петли: отчётов без разметки / находок без ответа</td>
-            <td>{{ m.machine_reviews.dispositions.reports_unjudged }} из {{ m.machine_reviews.reviews }}
-                / {{ m.machine_reviews.dispositions.confirmed_unjudged }} из {{ m.machine_reviews.confirmed_total }}</td></tr>
+        {# #1038: раньше здесь стояло число, которое вело в никуда — чтобы
+           разметить, надо было вспомнить, у каких задач были отчёты, и открыть
+           каждую. Теперь это ссылка на очередь.
+
+           Оба числа взяты из ОДНОГО множества — того же запроса, что рисует
+           очередь: находки ТЕКУЩИХ отчётов без диспозиции, за всё время.
+           Прежняя строка складывала три разных: reports_unjudged считал
+           отчёты окна ВКЛЮЧАЯ пересданные, confirmed_total — их находки, а
+           confirmed_unjudged уже был про одни текущие. Читалось как «1 из 2 /
+           0 ждут суждения», где единица про отчёт, который очередь как раз и
+           прячет. Знаменатели из чужого множества здесь не ставятся вовсе
+           (#518): доли считаются строками выше, у них свои. #}
+        <tr><td>Ждут суждения <span class="muted">(за всё время, по текущим сдачам)</span></td>
+            <td><a href="/findings">{{ m.machine_reviews.dispositions.confirmed_unjudged }} находок</a>
+                <span class="muted">по {{ m.machine_reviews.dispositions.reports_with_unjudged }} отчёт(ам)</span></td></tr>
         <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
         <tr><td>Покрытие: отчётов без токенов / находок в расчёте цены</td>
             <td>{{ m.machine_reviews.reports_without_tokens or 0 }} из {{ m.machine_reviews.reviews }}

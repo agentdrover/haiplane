@@ -480,6 +480,7 @@ async def test_pair_prepare_branch_rejects_dirty_workspace(
     assert detail["workspace_path"] == "/srv/ws"
     assert detail["hostname"] == "hub-server"
     assert "hub_pair_start" in detail["hint"]
+    assert detail["actor_hint"] == "human"
 
 
 # --- pair_branch_unpushed: хаб расшивает сам (#966) --------------------------
@@ -907,6 +908,7 @@ async def test_worktree_reuse_dirty_guard(tmp_path, git_ops):
     assert detail["reason"] == "pair_worktree_dirty"
     assert detail["workspace_path"] == wt
     assert (Path(wt) / "wip.txt").exists()  # data preserved
+    assert detail["actor_hint"] == "agent"
 
 
 async def test_dirty_refusal_names_the_files_and_the_way_out(tmp_path, git_ops):
