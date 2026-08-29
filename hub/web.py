@@ -2314,6 +2314,7 @@ async def web_review_verdict(
     verdict: str = Form(...),
     comments: str = Form(""),
     findings_text: str = Form(""),
+    acknowledge_repeat: str = Form(""),
 ):
     """Submit a review verdict from the task card panel (#321).
 
@@ -2352,6 +2353,10 @@ async def web_review_verdict(
             agent=identity.username,
             comments=comments,
             findings=_parse_findings_form(findings_text),
+            # #1057: the paste that started this happened in THIS form, so the
+            # confirmation has to exist here too — a refusal a human cannot
+            # answer where he typed is a wall, not a check.
+            acknowledge_repeat=bool(acknowledge_repeat),
         )
     except ValidationError as exc:
         errors = exc.errors()

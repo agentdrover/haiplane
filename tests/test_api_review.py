@@ -245,3 +245,137 @@ async def test_review_form_warns_before_an_empty_request_changes(client: AsyncCl
     assert "review-verdict-form" in page, (
         "the guard hangs off the form id; without it the listener matches nothing"
     )
+
+
+# ---- #1057: a verdict is read back to itself before it is written ----
+#
+# 29.08.2026 gave two input errors on one day from the same form. #1042 12:41
+# was a byte-for-byte re-paste of the 12:21 verdict whose complaint the author
+# had already closed; #1041 06:33 was filed CHANGES_REQUESTED over a text
+# opening with the word APPROVED, which the reviewer admitted in his next
+# verdict. The hub took both without a word.
+
+
+async def _verdict(client: AsyncClient, task_id: int, **body):
+    return await client.post(f"/api/tasks/{task_id}/review-verdict", json=body)
+
+
+async def _back_in_review(client: AsyncClient, task_id: int) -> None:
+    """After a recorded verdict the task returns to running — resubmit it."""
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.json()["status"] == "review", resp.text
+
+
+async def test_a_verdict_repeating_the_previous_text_is_refused(client: AsyncClient):
+    """#1057 AC-1: the same words twice, and the second time unannounced."""
+    task_id = await _task_in_review(client, title="Repeat")
+    text = "Сдан 0f4fec5, вершина ветки 4f44311. Пересдайте с вершиной."
+    resp = await _verdict(
+        client, task_id, verdict="changes_requested", comments=text, agent="rev"
+    )
+    assert resp.status_code == 200, resp.text
+    await _back_in_review(client, task_id)
+
+    before = (await client.get(f"/api/tasks/{task_id}")).json()
+    resp = await _verdict(
+        client,
+        task_id,
+        verdict="changes_requested",
+        # The re-paste's only difference from the original, as on #1042.
+        comments=text.replace("\n", "\r\n") + "  ",
+        agent="rev",
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "verdict_repeats_previous"
+    after = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert after["status"] == "review", "a refused verdict does not move the task"
+    assert after["submission_generation"] == before["submission_generation"], (
+        "and does not consume the submission it was refused on"
+    )
+
+
+async def test_a_deliberate_repeat_is_accepted(client: AsyncClient):
+    """#1057 AC-2: saying it twice is right when it was not fixed twice."""
+    task_id = await _task_in_review(client, title="Meant it")
+    text = "Тесты по AC-2 всё ещё красные — тот же дефект, тот же ответ."
+    assert (
+        await _verdict(
+            client, task_id, verdict="changes_requested", comments=text, agent="rev"
+        )
+    ).status_code == 200
+    await _back_in_review(client, task_id)
+
+    resp = await _verdict(
+        client,
+        task_id,
+        verdict="changes_requested",
+        comments=text,
+        agent="rev",
+        acknowledge_repeat=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    verdicts = await _review_updates(client, task_id)
+    assert len(verdicts) == 2, "the repeat is recorded, not swallowed"
+
+
+async def test_a_verdict_contradicting_its_own_text_is_refused(client: AsyncClient):
+    """#1057 AC-3: two outcomes in one call is a typo, not a decision."""
+    task_id = await _task_in_review(client, title="Contradiction")
+
+    resp = await _verdict(
+        client,
+        task_id,
+        verdict="changes_requested",
+        comments="APPROVED. Правка ровно та, что просили.",
+        agent="rev",
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "verdict_contradicts_its_text"
+    assert not await _review_updates(client, task_id), "nothing was written"
+
+    # The mirror case is refused too — this is not an anti-APPROVED rule.
+    resp = await _verdict(
+        client,
+        task_id,
+        verdict="approved",
+        comments="CHANGES_REQUESTED: тесты красные.",
+        agent="rev",
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["reason"] == "verdict_contradicts_its_text"
+
+
+async def test_quoting_the_word_approved_is_not_a_contradiction(client: AsyncClient):
+    """#1057 AC-4: the check reads a declaration, not any occurrence."""
+    task_id = await _task_in_review(client, title="Quoting")
+
+    resp = await _verdict(
+        client,
+        task_id,
+        verdict="changes_requested",
+        comments=(
+            "Разбор прошлой сдачи в силе.\n"
+            "Вердикт APPROVED от 06:33 был ошибкой ввода — здесь это не он.\n"
+            "Блокирует одно: PR разошёлся с develop."
+        ),
+        agent="rev",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(await _review_updates(client, task_id)) == 1
+
+
+async def test_a_verdict_with_no_body_is_not_a_repeat(client: AsyncClient):
+    """A bare APPROVED is the common case and must never trip the check."""
+    task_id = await _task_in_review(client, title="Bare approvals")
+    assert (
+        await _verdict(client, task_id, verdict="approved", agent="rev")
+    ).status_code == 200
+    await _back_in_review(client, task_id)
+
+    resp = await _verdict(client, task_id, verdict="approved", agent="rev")
+
+    assert resp.status_code == 200, resp.text
