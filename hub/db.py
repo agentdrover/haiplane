@@ -1600,6 +1600,46 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "  UNIQUE(task_id, instance, entered_at, rung)"
         ")",
     ),
+    # What the IMPLEMENTER says became of each confirmed finding, recorded at
+    # the moment of resubmission (#911). Deliberately NOT ``finding_dispositions``.
+    #
+    # Those two tables answer different questions and belong to different
+    # actors. A disposition is a HUMAN's judgement of whether the finding was
+    # real — it is the numerator of precision, and #876 makes naming it a human
+    # act. An outcome is the AUTHOR's account of what they DID about it. Writing
+    # the author's account into the dispositions table would be the cheapest
+    # possible way to destroy the metric: ``_disposition_metrics`` selects from
+    # it without filtering ``decided_by``, so every self-reported "fixed" would
+    # count as a human confirming the finding was real, and precision would
+    # start measuring an author's opinion of their own work.
+    #
+    # UNIQUE(review_id, finding_uid): one account per finding per report. A
+    # second pass corrects the first rather than stacking a contradictory row
+    # beside it. Addressed by uid, not by slot — a position belongs to the list,
+    # not to the finding (#1007).
+    (
+        "create_finding_outcomes",
+        "CREATE TABLE IF NOT EXISTS finding_outcomes ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  review_id INTEGER NOT NULL,"
+        "  task_id INTEGER NOT NULL,"
+        "  submission_generation INTEGER NOT NULL,"
+        "  finding_uid TEXT NOT NULL,"
+        "  finding_index INTEGER NOT NULL DEFAULT -1,"
+        "  finding_title TEXT NOT NULL DEFAULT '',"
+        "  outcome TEXT NOT NULL,"
+        "  note TEXT NOT NULL DEFAULT '',"
+        "  linked_task_id INTEGER,"
+        "  reported_by TEXT NOT NULL DEFAULT '',"
+        "  reported_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  UNIQUE(review_id, finding_uid)"
+        ")",
+    ),
+    (
+        "idx_finding_outcomes_task",
+        "CREATE INDEX IF NOT EXISTS idx_finding_outcomes_task "
+        "ON finding_outcomes(task_id, submission_generation)",
+    ),
 ]
 
 

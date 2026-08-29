@@ -1392,6 +1392,68 @@ async def count_unjudged_findings(
     }
 
 
+# --- Finding outcomes: what the AUTHOR did (#911) ---------------------------
+
+
+async def upsert_finding_outcome(
+    db: aiosqlite.Connection,
+    *,
+    review_id: int,
+    task_id: int,
+    submission_generation: int,
+    finding_uid: str,
+    finding_index: int,
+    finding_title: str,
+    outcome: str,
+    note: str,
+    linked_task_id: int | None,
+    reported_by: str,
+) -> None:
+    """Record one finding's fate as its author tells it.
+
+    Separate table from ``finding_dispositions`` and separate on purpose: this
+    is the author's account of what they did, not a human's judgement of
+    whether the finding was real. ``_disposition_metrics`` does not filter by
+    who decided, so a row written here instead of there is the difference
+    between precision meaning something and precision meaning nothing.
+
+    Upsert on ``(review_id, finding_uid)``: a resubmission may correct what the
+    author said last time, and two contradictory accounts of one finding would
+    leave a reader to pick.
+    """
+    await db.execute(
+        "INSERT INTO finding_outcomes (review_id, task_id, submission_generation, "
+        "finding_uid, finding_index, finding_title, outcome, note, linked_task_id, "
+        "reported_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(review_id, finding_uid) DO UPDATE SET "
+        "outcome=excluded.outcome, note=excluded.note, "
+        "linked_task_id=excluded.linked_task_id, "
+        "reported_by=excluded.reported_by, reported_at=datetime('now')",
+        (
+            review_id,
+            task_id,
+            submission_generation,
+            finding_uid,
+            finding_index,
+            finding_title,
+            outcome,
+            note,
+            linked_task_id,
+            reported_by,
+        ),
+    )
+
+
+async def list_finding_outcomes(
+    db: aiosqlite.Connection, review_id: int
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM finding_outcomes WHERE review_id=? ORDER BY finding_index",
+        (review_id,),
+    )
+
+
 # --- Category checks (#878) ------------------------------------------------
 
 
