@@ -1928,9 +1928,21 @@ async def _approved_code_check(
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
 # human". Built from the same enum merge_before_completion prints, so the
 # prefix contract between the two spots of this file cannot silently drift.
+#
+# #1053: a GitHub draft after Hub APPROVED is the same class — nobody has to
+# decide, the hub marks the PR ready and asks again. It is NOT recoverable:
+# there are no new commits, so hub_submit_for_review would stale the verdict
+# (#612) and recreate the one-way door #1030 closed.
+PR_DRAFT_PREFIX = "pr_draft"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
+    PR_DRAFT_PREFIX,
+)
+PR_DRAFT_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: хаб пометит "
+    "PR ready (одобрение в Hub — и есть сигнал ready) и повторит доставку. "
+    "Пересдавать не нужно: новых коммитов нет, пересдача сбросит вердикт (#612)."
 )
 
 # #1030: refusals the executor cures WITHOUT a human — a red CI is fixed by a
@@ -2058,6 +2070,19 @@ async def merge_before_completion(
         ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
         if ci.outcome != CIProbeOutcome.passed:
             return False, f"ci_{ci.outcome.value}: {ci.reason}"
+
+        # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
+        # here is the ready signal. Asking merge_pr first collapses a draft
+        # into merge_failed — a one-way door to needs_decision.
+        if await plugins.git_ops.pr_is_draft(pr_num, repo=workspace, gh_repo=gh_repo):
+            marked = await plugins.git_ops.mark_pr_ready(
+                pr_num, repo=workspace, gh_repo=gh_repo
+            )
+            if not marked:
+                return False, (
+                    f"{PR_DRAFT_PREFIX}: GitHub PR ещё черновик — хаб не смог "
+                    "пометить его ready"
+                )
 
         merged = await plugins.git_ops.merge_pr(
             pr_num,
@@ -2465,16 +2490,22 @@ async def transition_after_agent_done(
                     # for a green CI" names a check that never ran and points
                     # at a PR the gate never established — the shape of hint
                     # #952 removed from the terminal branch, here in the
-                    # patient one.
-                    cause = (
-                        "Это временное состояние, решение человека не требуется: "
-                        "отчитайтесь о готовности снова, когда CI станет зелёным."
-                        if delivery_pr.established
-                        else "Состояние самого PR прочитать не удалось, поэтому "
-                        "про CI тут сказать нечего: отчитайтесь о готовности "
-                        "снова, когда PR станет доступен. Если он недоступен "
-                        "не временно — это вопрос к человеку."
-                    )
+                    # patient one. A draft is a third cause (#1053): CI is
+                    # already green, and resubmitting would stale the verdict.
+                    if detail.startswith(PR_DRAFT_PREFIX):
+                        cause = PR_DRAFT_WAIT_HINT
+                    elif delivery_pr.established:
+                        cause = (
+                            "Это временное состояние, решение человека не требуется: "
+                            "отчитайтесь о готовности снова, когда CI станет зелёным."
+                        )
+                    else:
+                        cause = (
+                            "Состояние самого PR прочитать не удалось, поэтому "
+                            "про CI тут сказать нечего: отчитайтесь о готовности "
+                            "снова, когда PR станет доступен. Если он недоступен "
+                            "не временно — это вопрос к человеку."
+                        )
                     await repo.add_task_update(
                         db,
                         task_id,

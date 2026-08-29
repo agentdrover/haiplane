@@ -353,6 +353,42 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
     assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
 
 
+async def test_pr_is_draft_reads_isDraft(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, '{"isDraft": true}', ""),
+    ) as mock_gh:
+        assert await git_ops.pr_is_draft(185, repo="/ws", gh_repo="owner/repo") is True
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--json") + 1] == "isDraft"
+
+
+async def test_pr_is_draft_treats_silence_as_not_a_draft(
+    git_ops: GitOpsIntegration,
+) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "gh: Not Found"),
+    ):
+        assert await git_ops.pr_is_draft(185, gh_repo="owner/repo") is False
+
+
+async def test_mark_pr_ready_calls_gh_pr_ready(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        assert (
+            await git_ops.mark_pr_ready(185, repo="/ws", gh_repo="owner/repo") is True
+        )
+    args = list(mock_gh.await_args.args)
+    assert args[:2] == ["pr", "ready"]
+    assert args[args.index("--repo") + 1] == "owner/repo"
+
+
 @pytest.mark.parametrize(
     "rc,out,expected",
     [

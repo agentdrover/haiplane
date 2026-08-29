@@ -1409,3 +1409,87 @@ async def test_task_1015_recovers_via_resubmit_not_stale_merge(db, monkeypatch):
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "completed", "работа доехала сама, без рук"
     assert g.merge_pr.await_count == 1, "ровно одна доставка, по новому вердикту"
+
+
+# ---------------------------------------------------------------------------
+# #1053 — черновик GitHub PR после APPROVED не является решением человека
+# ---------------------------------------------------------------------------
+#
+# 29.08.2026, #1043. Человек одобрил ревью. Свип pair-delivery позвал
+# merge_before_completion; gh pr merge отказал черновику; гейт вернул
+# merge_failed; задача ушла в needs_decision. Пометить PR ready позже уже
+# нельзя было: list_pair_tasks_awaiting_delivery выбирает только running.
+# Та же односторонняя дверь, что #1030, но лечится не пересдачей — коммитов
+# нет, пересдача сбросит вердикт (#612). Одобрение в Hub и есть сигнал ready.
+
+
+def _draft_pr(g, *, mark_ready: bool) -> None:
+    """A GitHub draft the hub can (or cannot) convert before merging."""
+    g.pr_is_draft = AsyncMock(return_value=True)
+    g.mark_pr_ready = AsyncMock(return_value=mark_ready)
+
+
+async def test_draft_pr_is_marked_ready_and_delivered(db):
+    # AC-1: одобрение в Hub перевешивает конвенцию Cloud-черновика. Хаб сам
+    # открывает ready PR; чужой --draft не должен звать человека.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    _draft_pr(g, mark_ready=True)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "черновик после APPROVED доставляется, а не откладывается человеку"
+    )
+    g.mark_pr_ready.assert_awaited()
+    g.merge_pr.assert_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_draft_pr_that_cannot_be_marked_ready_stays_on_the_conveyor(db):
+    # AC-2: не смогли снять draft — это ожидание, не решение. Задача остаётся
+    # в running, свип придёт снова. Пересдача тут врёт: коммитов нет.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    _draft_pr(g, mark_ready=False)
+    task_id = await _approved_pair_task(db)
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "неудачный ready — повод повторить, а не звать человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    hint = " ".join(u.get("content") or "" for u in updates)
+    assert "pr_draft" in hint, "причина обязана называться своим именем"
+    assert "hub_submit_for_review" not in hint, (
+        "пересдача сбросит вердикт, хотя код не менялся"
+    )
+    assert "CI станет зелёным" not in hint, (
+        "совет из жёлтого CI здесь указывает не на ту причину"
+    )
+
+
+async def test_a_refused_ready_merge_still_calls_a_human(db):
+    # AC-3: готовый PR, который GitHub всё равно отказал — по-прежнему
+    # терминальный merge_failed. #1053 сужает bucket, не отменяет его.
+    g = _git(CIProbeOutcome.passed, merged=False)
+    g.pr_is_draft = AsyncMock(return_value=False)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert any("merge_failed" in (u.get("content") or "") for u in updates)
+    g.merge_pr.assert_awaited()
