@@ -3076,6 +3076,70 @@ async def last_activity_at(db: aiosqlite.Connection, task_id: int) -> str:
     return str(rows[0]["at"]) if rows else ""
 
 
+async def human_queue_rung_raised(
+    db: aiosqlite.Connection,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+) -> bool:
+    """Has this rung already been rung for this wait (#1020)?
+
+    Scoped to the wait, not the task: ``entered_at`` in the key means a task
+    that comes back to the same status later starts the ladder again, while
+    one that simply keeps standing never hears the same rung twice.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM human_queue_reminders "
+        "WHERE task_id=? AND instance=? AND entered_at=? AND rung=? LIMIT 1",
+        (task_id, instance, entered_at, rung),
+    )
+    return bool(rows)
+
+
+async def record_human_queue_reminder(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+    age_minutes: int,
+    age_estimated: bool = False,
+) -> bool:
+    """Record a rung; False when this wait already had it.
+
+    ``INSERT OR IGNORE`` against the unique key rather than a check-then-write:
+    two poller passes overlapping on a slow database would otherwise both read
+    "not yet raised" and both remind.
+    """
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO human_queue_reminders "
+        "(task_id, instance, entered_at, rung, age_minutes, age_estimated) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, instance, entered_at, rung, int(age_minutes), int(age_estimated)),
+    )
+    await db.commit()
+    return bool(cursor.rowcount)
+
+
+async def human_queue_reminders_between(
+    db: aiosqlite.Connection, start: str, end: str
+) -> list[dict[str, Any]]:
+    """Reminders raised in ``[start, end)`` — what the digest reports (#1020)."""
+    rows = await fetchall(
+        db,
+        "SELECT r.task_id, r.instance, r.rung, r.age_minutes, r.age_estimated, "
+        "       r.created_at, t.title, t.status "
+        "FROM human_queue_reminders r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.created_at >= ? AND r.created_at < ? "
+        "ORDER BY r.age_minutes DESC",
+        (start, end),
+    )
+    return [dict(r) for r in rows]
+
+
 async def stale_rung_raised(
     db: aiosqlite.Connection, task_id: int, status: str, rung: str
 ) -> bool:
