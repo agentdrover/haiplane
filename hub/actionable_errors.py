@@ -747,6 +747,36 @@ def done_report_error_detail(
     )
 
 
+# What a refusal WAS, when the endpoint said it in prose instead of a slug
+# (#882). Every one of these already had a name; the name was simply never
+# derived, so 22 of the first telemetry window's 48 errors were filed under
+# ``api_error`` — a bucket that cannot tell a caller's mistake from a gate
+# refusal from an outage, which is the one distinction the report exists for.
+#
+# The actor differs per class and is not decoration: a 5xx is the hub failing,
+# and waking the agent to fix its own arguments over an outage sends the work
+# to somebody who cannot do it (#1040). ``api_error`` survives for statuses
+# that genuinely do not classify — it stays honest by getting smaller, not by
+# being renamed.
+_STATUS_REASONS: dict[int, tuple[str, str]] = {
+    404: ("not_found", "agent"),
+    409: ("conflict", "agent"),
+    422: ("validation_error", "agent"),
+    429: ("rate_limited", "agent"),
+}
+
+
+def _reason_for_status(status_code: int) -> tuple[str, str]:
+    """Refusal class and whose move it is, from the status alone."""
+    known = _STATUS_REASONS.get(status_code)
+    if known is not None:
+        return known
+    if 500 <= status_code <= 599:
+        return "server_error", "human"
+    # Malformed input is the caller's to fix, so the agent really is next.
+    return "api_error", "agent"
+
+
 def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, Any]:
     """Turn plain-string FastAPI details into actionable payloads."""
     if isinstance(detail, dict) and detail.get("reason"):
@@ -790,13 +820,13 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
                 "suggested_tool": None,
             }
         )
+    reason, actor = _reason_for_status(status_code)
     return enrich_error_payload(
         {
-            "reason": "api_error",
+            "reason": reason,
             "message": msg,
             "hint": msg,
-            # Malformed input is the caller's to fix, so the agent really is next.
-            "actor_hint": "agent",
+            "actor_hint": actor,
             "suggested_tool": None,
             "status_code": status_code,
         }

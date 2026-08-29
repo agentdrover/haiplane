@@ -3632,3 +3632,139 @@ async def test_unknown_argument_is_named_on_echo_json(
     text_payload = json.loads(_call_tool_text(result))
     assert text_payload["unknown_arguments"] == ["limit"]
     assert "message" in text_payload
+
+
+# --- Every refusal explains itself (#882) ------------------------------------
+
+
+def _refusal_probe_arguments(tool: Any) -> dict[str, Any]:
+    """Fill a tool's required arguments with values of the right shape.
+
+    The values are never used: the REST layer refuses before they matter. They
+    exist so the call reaches that layer, which is the only thing this probe
+    is asking about.
+    """
+    import typing
+
+    def sample(annotation: Any) -> Any:
+        origin = typing.get_origin(annotation)
+        if origin is typing.Union or type(origin).__name__ == "UnionType":
+            args = [a for a in typing.get_args(annotation) if a is not type(None)]
+            return sample(args[0]) if args else "x"
+        if annotation is int:
+            return 1
+        if annotation is float:
+            return 1.0
+        if annotation is bool:
+            return False
+        if origin is list:
+            return []
+        if origin is dict:
+            return {}
+        return "x"
+
+    args = {
+        name: sample(field.annotation)
+        for name, field in tool.fn_metadata.arg_model.model_fields.items()
+        if field.is_required()
+    }
+    # Three tools refuse an empty batch of their own accord, before any REST
+    # call. Handed a non-empty one, they go the way of the rest.
+    args.update(
+        {
+            "hub_create_subtasks": {"items": [{"title": "x"}]},
+            "hub_refine_tasks": {"items": [{"task_id": 1, "problem_statement": "p"}]},
+            "hub_refine_task": {"task_id": 1, "problem_statement": "p"},
+            # Without a task id this one answers from the general context path
+            # instead of asking the API about a task.
+            "hub_my_context": {"task_id": 1},
+        }.get(tool.name, {})
+    )
+    return args
+
+
+@pytest.mark.asyncio
+async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
+    """#882 AC-1: every REST tool hands the agent an envelope, not a bare message.
+
+    Enumerated, not sampled — that is the point. Thirty-nine tools caught
+    ``HubApiError`` and twenty-three did not when this was written down; a week
+    later the second number was twenty-five, because the contract was kept by
+    remembering to add a ``try/except`` and somebody did not. So the assertion
+    is over the whole surface: pick every tool whose body calls the REST layer,
+    make that layer refuse, and require the same four fields back from all of
+    them.
+
+    The refusal must also still LOOK like a refusal. These twenty-five raised,
+    and a client that reads only ``isError`` has been trusting that; answering
+    with a successful result instead would have turned every one of them into a
+    silent success (owner's decision, 29.08.2026).
+    """
+    import contextlib
+    import inspect
+    import json as json_mod
+
+    from hub import mcp_server as srv
+
+    refusal = {
+        "reason": "human_decision_required",
+        "message": "task 999 needs a human",
+        "hint": "ask a human to decide",
+    }
+    helpers = [
+        name
+        for name in dir(srv)
+        if name.startswith("_api_") and inspect.iscoroutinefunction(getattr(srv, name))
+    ]
+    assert len(helpers) >= 8, helpers
+
+    manager = srv.mcp._tool_manager
+    rest_tools = []
+    for advertised in await srv.mcp.list_tools():
+        tool = manager.get_tool(advertised.name)
+        if tool is None:
+            continue
+        try:
+            source = inspect.getsource(tool.fn)
+        except OSError:  # pragma: no cover - source always available in tree
+            continue
+        if "_api_" in source:
+            rest_tools.append(tool)
+
+    # A probe that enumerates nothing passes by accident. This surface has
+    # dozens of REST tools; if it ever has a handful, the enumeration broke.
+    assert len(rest_tools) >= 60, len(rest_tools)
+
+    unreached: list[str] = []
+    bare: list[tuple[str, str]] = []
+    for tool in rest_tools:
+
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise srv.HubApiError(dict(refusal))
+
+        boom = AsyncMock(side_effect=refuse)
+        with contextlib.ExitStack() as stack:
+            for helper in helpers:
+                stack.enter_context(patch.object(srv, helper, boom))
+            try:
+                result = await srv.mcp.call_tool(
+                    tool.name, _refusal_probe_arguments(tool)
+                )
+            except Exception as exc:  # the refusal, still raised
+                if not boom.await_count:
+                    unreached.append(tool.name)
+                    continue
+                payload = str(exc)
+            else:
+                if not boom.await_count:
+                    unreached.append(tool.name)
+                    continue
+                structured = getattr(result, "structuredContent", None)
+                payload = json_mod.dumps(structured or str(result), ensure_ascii=False)
+
+        for field in ("human_decision_required", "hint", "actor_hint"):
+            if field not in payload:
+                bare.append((tool.name, field))
+
+    assert not unreached, f"probe never reached REST for: {unreached}"
+    assert not bare, f"refusal reached the agent without its envelope: {bare}"
