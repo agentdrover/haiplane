@@ -336,10 +336,11 @@ def _parse_patch_log(out: str) -> _PatchLog:
         current_sha = sha
         current_path = ""
         for line in rest.splitlines():
-            if line.startswith("+++ "):
-                current_path = _path_from_diff_header(line[4:])
-                if current_path:
-                    files[current_sha].add(current_path)
+            if line.startswith("--- ") or line.startswith("+++ "):
+                parsed_path = _path_from_diff_header(line[4:])
+                if parsed_path:
+                    current_path = parsed_path
+                    files[current_sha].add(parsed_path)
                 continue
             if line.startswith("diff --git "):
                 current_path = ""

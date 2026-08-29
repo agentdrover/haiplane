@@ -506,6 +506,31 @@ async def test_queue_shows_each_finding_its_own_touch_fact(
     assert "исправлено" in page
 
 
+async def test_queue_treats_deleting_the_place_as_a_touch(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """A commit that removes the file still touched the named lines.
+
+    git log -p for a deletion prints +++ /dev/null. Reading the path only from
+    that line would drop the hunk and report «не тронуто» — the opposite fact.
+    """
+    clone = _init_repo(tmp_path / "queue-deleted")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue deleted file")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    (clone / _FILE).unlink()
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "remove the file")
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    block = _li_for(page, "guard drops the flag")
+    assert "Место тронуто после отчёта" in block
+    assert "remove the file" in block
+    assert "Место не тронуто после отчёта" not in block
+
+
 async def test_queue_git_runs_once_per_report_not_per_finding(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
