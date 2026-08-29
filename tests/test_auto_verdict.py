@@ -522,3 +522,43 @@ async def test_unknown_ceiling_value_is_strict(
     assert body["review_verdict"] is None
     feed = [u["content"] for u in body["updates"] or []]
     assert any("путь закрыт" in c for c in feed)
+
+
+async def test_no_class_blocks_verdict_when_diff_gives_no_signal(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-1 (#838): lock-only diff without a stored class stays with the human."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client, db, "spike-lock-noclass", {"verdict": "auto"}, areas=["uv.lock"]
+    )
+    await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
+    await db.commit()
+
+    await _post_review(client, task_id)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+    feed = [u["content"] for u in body["updates"] or []]
+    held = [c for c in feed if "не вычислен" in c]
+    assert held, "the feed must name the missing class, not stay silent"
+
+
+async def test_lock_only_diff_with_class_still_approves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-2 (#838): the same lock-only diff auto-approves when a class is stored."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(
+        client, db, "spike-lock-class", {"verdict": "auto"}, areas=["uv.lock"]
+    )
+    stored = (await client.get(f"/api/tasks/{task_id}")).json()["risk_class"]
+    assert stored, "the probe needs a computed class, not a lock-file signal"
+
+    await _post_review(client, task_id)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] == "approved"
+    verdicts = await _events(db, "review_verdict_recorded", task_id)
+    assert verdicts and verdicts[-1]["actor"] == "policy"
