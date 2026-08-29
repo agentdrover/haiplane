@@ -1608,15 +1608,13 @@ async def hub_submit_for_review(
     branch: str = "",
     model: str = "",
     accept_areas: bool = False,
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    This does NOT complete the task and you do not write the verdict — the
+    This does NOT complete the task, and the verdict is not yours: the
     reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Moves a running pair task to status=review and bumps the submission
-    generation, invalidating any earlier APPROVED. After the verdict it returns
-    to running: APPROVED means take the done path, CHANGES_REQUESTED means fix
-    and resubmit.
+    Bumps the generation, invalidating any earlier APPROVED.
 
     Args:
         task_id: The running pair task ID
@@ -1624,14 +1622,17 @@ async def hub_submit_for_review(
         summary: Short note on what is being submitted
         branch: The branch you actually worked in, checked against the
             canonical name pair-start gave you; a mismatch is refused naming
-            both. Omitting it skips the check — your report, not the hub's
-            observation (#533).
-        model: The model that wrote this submission (#758) — a declaration,
-            not a proof. The auto-verdict's diversity rule needs it: empty
-            keeps the verdict with the human.
+            both. Omitting it skips the check — reported, not observed (#533).
+        model: The model that wrote this submission (#758) — declared, not
+            proven. The diversity rule needs it: empty keeps the verdict with
+            the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
-            affected_areas (#890), as a visible event. Nothing widens without
-            it, nothing hides with it.
+            affected_areas (#890), visibly.
+        finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
+            what became of the findings this resubmission was sent back over
+            (#911). outcome: fixed | false_positive | wont_fix | deferred; all
+            but fixed owe a note. The last two leave a defect draft unless
+            linked_task_id names existing work.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -1646,6 +1647,8 @@ async def hub_submit_for_review(
         body["model"] = model
     if accept_areas:
         body["accept_areas"] = True
+    if finding_outcomes:
+        body["finding_outcomes"] = finding_outcomes
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:

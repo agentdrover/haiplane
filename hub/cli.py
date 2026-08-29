@@ -423,6 +423,15 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
         body["agent"] = args.agent
     if args.summary:
         body["summary"] = args.summary
+    raw_outcomes = getattr(args, "finding_outcomes", "") or ""
+    if raw_outcomes.strip():
+        try:
+            body["finding_outcomes"] = json.loads(raw_outcomes)
+        except ValueError as exc:
+            # Refusing here beats sending nothing: a submission that silently
+            # dropped the outcomes would look like an author who never answered.
+            print(f"--finding-outcomes is not valid JSON: {exc}", file=sys.stderr)
+            return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
     return 0
@@ -1522,6 +1531,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review.add_argument("--agent", default="", help="Submitting agent name")
     p_submit_review.add_argument(
         "--summary", default="", help="Short note on what is being submitted"
+    )
+    p_submit_review.add_argument(
+        "--finding-outcomes",
+        default="",
+        help=(
+            "JSON list of what became of the previous submission's confirmed "
+            'findings (#911): [{"finding_uid": "...", "outcome": '
+            '"fixed|false_positive|wont_fix|deferred", "note": "..."}]. '
+            "Everything but fixed owes a note."
+        ),
     )
     p_submit_review.set_defaults(func=cmd_submit_review)
 

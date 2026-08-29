@@ -617,6 +617,12 @@ class TaskSubmitReview(BaseModel):
     # own scope. Explicit on purpose: the hub never widens the field on its
     # own, because a field that always matches the diff is nothing to compare.
     accept_areas: bool = False
+    # #911: what became of the findings this resubmission was sent back over.
+    # Sent with the submission rather than as a separate call because the two
+    # are one act: "here is the new work, and here is what happened to what you
+    # found in the old". A separate endpoint would let the submission land
+    # without the account, which is the silence being removed.
+    finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
 
 
 class ReviewFinding(BaseModel):
@@ -2236,6 +2242,58 @@ class FindingDisposition(str, Enum):
     fixed = "fixed"
     false_positive = "false_positive"
     wont_fix = "wont_fix"
+
+
+class FindingOutcome(str, Enum):
+    """What the AUTHOR did about a confirmed finding, said at resubmission (#911).
+
+    A different question from :class:`FindingDisposition`, asked of a different
+    actor. The disposition answers "was this finding REAL" and only a human may
+    answer it (#876) — it is the numerator of precision. The outcome answers
+    "what did you DO about it", and only the author can answer that. The two
+    are stored apart for exactly that reason: an author's account counted as a
+    judgement would turn precision into self-assessment.
+
+    ``wont_fix`` and ``deferred`` both mean "the defect is there and this
+    submission does not fix it", and both leave a defect draft behind. They are
+    kept apart because the sentence a reader needs is different: ``wont_fix``
+    says we looked and chose to live with it, ``deferred`` says we intend to
+    fix it elsewhere. A draft that does not say which of the two it is asks its
+    reader to guess at the author's intent.
+    """
+
+    fixed = "fixed"
+    false_positive = "false_positive"
+    wont_fix = "wont_fix"
+    deferred = "deferred"
+
+
+class FindingOutcomeItem(BaseModel):
+    """One finding closed by its author, addressed by ``finding_uid`` (#1007)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_uid: str = Field(..., min_length=1, max_length=64)
+    outcome: FindingOutcome
+    note: str = Field("", max_length=2000)
+    linked_task_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _unfixed_findings_owe_a_reason(self) -> "FindingOutcomeItem":
+        """Everything but ``fixed`` carries one line of why.
+
+        "Fixed" is checkable — the diff is right there. The other three are
+        claims nobody can verify from the code, and a claim without a reason is
+        the silence this whole feature exists to remove: it closes the row and
+        tells the next reader nothing.
+        """
+        if self.outcome is not FindingOutcome.fixed and not self.note.strip():
+            raise ValueError(
+                f"outcome '{self.outcome.value}' needs one line of why: "
+                "'fixed' is visible in the diff, the others are only visible "
+                "in what you say about them"
+            )
+        return self
 
 
 class FindingDispositionItem(BaseModel):

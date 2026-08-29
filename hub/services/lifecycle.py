@@ -40,6 +40,7 @@ from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
 from hub.mcp_envelope import enrich_error_payload
+from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.outcomes import outcome_status_for_task
@@ -1808,6 +1809,38 @@ async def submit_for_review(
                 "Это не значит, что расхождений нет."
             )
 
+    # #911: what became of the findings the PREVIOUS submission was sent back
+    # over. Placed with the other pre-transition gates for the same reason they
+    # are here — a refusal has to happen while there is still something to
+    # refuse — and before the paid layers, because it costs one indexed read.
+    #
+    # The generation asked about is the CURRENT one, before the bump below: the
+    # report for the submission being made does not exist yet. On a first
+    # submission there are no reports and the gate is silent, which is the
+    # point — it asks only where an answer is owed.
+    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
+    outcome_note = ""
+    outcome_writes: list[Any] = []
+    outcome_generation = int(task.get("submission_generation") or 0)
+    if outcome_mode != "off":
+        open_items = await finding_outcome.open_findings(
+            db, task_id, outcome_generation
+        )
+        try:
+            outcome_writes, still_open = finding_outcome.plan_outcomes(
+                open_items, body.finding_outcomes
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if still_open:
+            if outcome_mode == "require":
+                raise HTTPException(422, finding_outcome.refusal_text(still_open))
+            outcome_note = (
+                f"Исходы находок: НЕ названы для {len(still_open)} "
+                "подтверждённых находок предыдущей сдачи. Режим проверки — "
+                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
+            )
+
     # #855: the cheap deterministic layer, on the diff this submission already
     # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
     # paid reviewer for a measured reason: over 30 days the harness confirmed
@@ -1939,6 +1972,28 @@ async def submit_for_review(
                 f"Task #{task_id} left running state during submit; retry from "
                 "its current status",
             )
+        # #911: only now, past every gate that could still refuse. The write
+        # goes to the process-wide connection, and a refusal after it would
+        # leave the author's outcomes recorded for a submission that never
+        # happened — their corrected retry would then be told the finding is
+        # already closed. Written BEFORE the bump so the rows belong to the
+        # generation they answer, not to the one starting here.
+        outcome_drafts: list[int] = []
+        if outcome_writes:
+            outcome_drafts = await finding_outcome.apply_outcomes(
+                db,
+                task_id,
+                outcome_generation,
+                outcome_writes,
+                reported_by=(body.agent or task.get("assigned_agent") or ""),
+            )
+        if outcome_drafts:
+            outcome_note = (
+                (outcome_note + " " if outcome_note else "")
+                + f"Исходы находок: заведено дефект-драфтов {len(outcome_drafts)} — "
+                + ", ".join(f"#{i}" for i in outcome_drafts)
+                + ". Находка, которую не чинят, остаётся работой, а не исчезает."
+            )
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -2047,7 +2102,7 @@ async def submit_for_review(
         # leave the reader with a single list of what was checked. The wording
         # of each line is preserved verbatim, so anything that read the old
         # alerts still finds its phrase.
-        report_lines = [ln for ln in ([surface_note] + rule_lines) if ln]
+        report_lines = [ln for ln in ([surface_note, outcome_note] + rule_lines) if ln]
         report_lines += unchecked_lines
         if report_lines:
             # Only now is "what ran and found nothing" worth printing: inside

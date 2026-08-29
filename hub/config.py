@@ -96,6 +96,10 @@ SDD_SURFACES = env_get("SDD_SURFACES", "warn")
 # tokens each, and 61% of its raw findings were rejected — two thirds of the
 # budget spent on noise a rule cannot produce.
 SUBMIT_RULES = env_get("SUBMIT_RULES", "warn")
+# #911: does a resubmission have to say what became of the findings it was sent
+# back over? Default warn, like every gate that asks the author for something
+# new: a rule that starts by refusing work teaches people to route around it.
+FINDING_OUTCOME = env_get("FINDING_OUTCOME", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved
