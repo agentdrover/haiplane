@@ -745,9 +745,13 @@ class CallSiteSection(BaseModel):
 class ACLocatorResolution(BaseModel):
     """Whether a verifiable_by=test AC's locator resolves to a real test (#506).
 
-    ``status`` is ``resolvable`` (test found by collection), ``missing`` (valid
-    locator but no such test, or no valid locator at all), or ``unknown`` (test
-    collection could not run in this environment — never a false ``missing``).
+    ``status`` is ``resolvable`` (the test exists), ``missing`` (valid locator
+    but no such test or no such file, or no valid locator at all),
+    ``unparseable`` (the file is there but could not be read as Python), or
+    ``unknown`` — nothing could be looked at, which is never a false
+    ``missing``. ``reason`` says HOW it was answered (#764): collection proves
+    pytest would run the test; reading the file at the submitted commit proves
+    only that a function by that name is written there.
     """
 
     ac_id: str
