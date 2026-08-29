@@ -173,6 +173,10 @@ async def test_missing_run_within_window_keeps_task_running(
 
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "running"
+    assert task["ci_check_started_at"], (
+        "the window is measured from this stamp; without it every later "
+        "done report treats elapsed as 0 and the task waits forever"
+    )
     g.merge_pr.assert_not_awaited()
     events = [dict(e) for e in await repo.list_events(db, since=0)]
     assert not any(
