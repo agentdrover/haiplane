@@ -2544,6 +2544,41 @@ async def test_ladder_three_steps(db):
     assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h", "72h", "168h"]
 
 
+async def test_rung_is_part_of_the_dedup_key(db):
+    """#1016: the per-rung dedup, asked without moving the wait's own stamp.
+
+    Found by the wave's mutation pass. ``test_ladder_three_steps`` grows the
+    age the only way a test can without a clock — by rewriting
+    ``status_entered_at`` — so each of its three rungs lands under a DIFFERENT
+    stamp, and the key it actually exercises is (task, instance, entered_at).
+    A dedup that dropped ``rung`` from the key entirely — the "one alert
+    forever" shape #1020 was written to remove — keeps all four G3 tests
+    green. In production the stamp is fixed and only ``now`` moves, so that is
+    the case with no coverage at all.
+
+    This asks it directly: one wait, one stamp, the rung already rung and the
+    next one still owed.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+    await _sweep_human_queue(db)
+
+    rows = await fetchall(
+        db,
+        "SELECT instance, entered_at, rung FROM human_queue_reminders "
+        "WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    # Instance and stamp are read back from the row the sweep wrote, not
+    # guessed here: the point is the key the code uses, not one we restate.
+    assert [r["rung"] for r in rows] == ["24h"]
+    instance, stamp = rows[0]["instance"], rows[0]["entered_at"]
+
+    assert await repo.human_queue_rung_raised(db, task_id, instance, stamp, "24h")
+    assert not await repo.human_queue_rung_raised(db, task_id, instance, stamp, "72h")
+
+
 async def test_reminder_ladder_restarts_after_a_new_wait(db):
     """#1020: coming back to the same status is a new wait, not a rung already rung.
 

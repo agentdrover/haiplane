@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haiplane Hub — карта реализованных workflow (база для аудита)</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --surface: #1a2332;
+    --surface2: #131c28;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --warn: #d29922;
+    --ok: #3fb950;
+    --bad: #f85149;
+    --purple: #bc8cff;
+    --border: #30363d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 5rem;
+  }
+  h1 { font-size: 1.65rem; margin-bottom: 0.2rem; }
+  h2 {
+    font-size: 1.2rem; margin-top: 2.75rem;
+    border-bottom: 1px solid var(--border); padding-bottom: 0.35rem;
+  }
+  h3 { font-size: 1.02rem; color: var(--accent); margin-top: 1.6rem; }
+  h4 { font-size: 0.95rem; color: var(--purple); margin-top: 1.1rem; margin-bottom: 0.3rem; }
+  p, li, td, th { color: var(--muted); }
+  strong, b { color: var(--text); }
+  a { color: var(--accent); }
+  code {
+    background: var(--surface); padding: 0.1em 0.35em;
+    border-radius: 4px; font-size: 0.88em; color: #cdd9e5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  pre {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.9rem 1rem; overflow-x: auto;
+    font-size: 0.85rem; line-height: 1.45; color: #cdd9e5;
+  }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.86rem; }
+  th, td { border: 1px solid var(--border); padding: 0.45rem 0.6rem; vertical-align: top; text-align: left; }
+  th { background: var(--surface); color: var(--text); font-weight: 600; }
+  tbody tr:nth-child(even) { background: #131a24; }
+  .lede { color: var(--muted); font-size: 0.95rem; }
+  .meta {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.8rem 1rem; font-size: 0.85rem; margin: 1.2rem 0 0;
+  }
+  .meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+  .meta dt { color: var(--text); font-weight: 600; }
+  .meta dd { margin: 0; color: var(--muted); }
+  nav.toc {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.9rem 1.1rem; margin: 1.5rem 0 0;
+    columns: 2; column-gap: 2rem;
+  }
+  nav.toc ol { margin: 0; padding-left: 1.2rem; font-size: 0.87rem; }
+  nav.toc li { margin: 0.15rem 0; break-inside: avoid; }
+  .badge {
+    display: inline-block; font-size: 0.72rem; padding: 0.12em 0.5em;
+    border-radius: 4px; font-weight: 600; white-space: nowrap;
+  }
+  .b-human { background: #9e6a0333; color: var(--warn); }
+  .b-agent { background: #58a6ff33; color: var(--accent); }
+  .b-machine { background: #23863633; color: var(--ok); }
+  .b-ci { background: #bc8cff33; color: var(--purple); }
+  .b-final { background: #30363d; color: var(--muted); }
+  .b-off { background: #f8514922; color: var(--bad); }
+  .card {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem; margin: 1rem 0;
+  }
+  .card.warn { border-left-color: var(--warn); }
+  .card.bad { border-left-color: var(--bad); }
+  .card.ok { border-left-color: var(--ok); }
+  .card p:first-child { margin-top: 0; }
+  .card p:last-child { margin-bottom: 0; }
+  .flow { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.9rem 0; font-size: 0.83rem; }
+  .flow .node {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.28rem 0.55rem; color: var(--text); white-space: nowrap;
+  }
+  .flow .node.h { border-color: var(--warn); }
+  .flow .node.a { border-color: var(--accent); }
+  .flow .node.m { border-color: var(--ok); }
+  .flow .node.x { border-color: var(--bad); }
+  .flow .arr { color: var(--muted); }
+  .src { font-size: 0.8rem; color: #6e7681; margin-top: 0.4rem; }
+  .src code { background: transparent; padding: 0; color: #6e7681; }
+  ul.tight li { margin: 0.2rem 0; }
+  .gap-id { color: var(--warn); font-weight: 600; font-family: ui-monospace, monospace; }
+  .gap {
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.8rem 1.1rem 0.9rem; margin: 1.1rem 0; background: var(--surface2);
+  }
+  .gap h4 { margin-top: 0; margin-bottom: 0.35rem; }
+  .gap .obs { margin: 0 0 0.7rem; }
+  dl.rr {
+    margin: 0; display: grid; grid-template-columns: max-content 1fr;
+    gap: 0.4rem 0.9rem; font-size: 0.87rem;
+  }
+  dl.rr dt { font-weight: 600; white-space: nowrap; }
+  dl.rr dt.risk { color: var(--warn); }
+  dl.rr dt.cost { color: var(--bad); }
+  dl.rr dt.fix { color: var(--ok); }
+  dl.rr dt.done { color: var(--ok); }
+  dl.rr dd { margin: 0; color: var(--muted); }
+  dl.rr dd.done { color: var(--text); }
+  .b-p1 { background: #f8514933; color: var(--bad); }
+  .b-p2 { background: #d2992233; color: var(--warn); }
+  .b-p3 { background: #30363d; color: var(--muted); }
+  .b-done { background: #3fb95033; color: var(--ok); }
+  .b-wip { background: #58a6ff33; color: var(--accent); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 760px) {
+    nav.toc { columns: 1; }
+    .two-col { grid-template-columns: 1fr; }
+    dl.rr { grid-template-columns: 1fr; gap: 0.15rem; }
+    dl.rr dt { margin-top: 0.45rem; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Haiplane Hub — карта реализованных workflow</h1>
+<p class="lede">Что хаб <strong>фактически</strong> делает: статусы, переходы, гейты, автопилоты, сторожа и фоновые развёртки — собрано из кода, а не из проектной документации. Документ создан как база для аудита процесса: каждый блок называет триггер, шаги, точки отказа и место в коде, чтобы пробел можно было показать пальцем.</p>
+
+<div class="meta">
+  <dl>
+    <dt>Источник истины</dt><dd>ветка <code>origin/develop</code>, коммит <code>f11ee6c</code> (рабочая ветка <code>task-851/cli-coverage</code> отстаёт от неё на 124 коммита — карта строилась по develop)</dd>
+    <dt>Дата сборки</dt><dd>28.08.2026</dd>
+    <dt>Ключевые файлы</dt><dd><code>hub/models.py</code>, <code>hub/lifecycle_matrix.py</code>, <code>hub/workflow_reference.py</code>, <code>hub/services/lifecycle.py</code>, <code>hub/services/orchestration.py</code>, <code>hub/poller.py</code>, <code>hub/services/*.py</code></dd>
+    <dt>Поверхности</dt><dd>REST (<code>hub/app.py</code>, ~100 маршрутов) · Web/HTMX (<code>hub/web.py</code>) · CLI <code>oc-hub</code> (<code>hub/cli.py</code>, ~60 команд) · MCP (<code>hub/mcp_server.py</code>, ~68 инструментов)</dd>
+    <dt>Статус документа</dt><dd>описательный. Последний раздел — <em>кандидаты в пробелы</em>: наблюдения и вопросы к аудиту, не приговоры.</dd>
+  </dl>
+</div>
+
+<nav class="toc">
+  <ol>
+    <li><a href="#model">Доменная модель и акторы</a></li>
+    <li><a href="#states">Статусы и матрица владения</a></li>
+    <li><a href="#transitions">Полная таблица переходов</a></li>
+    <li><a href="#w1">W1 · Постановка и DoR</a></li>
+    <li><a href="#w2">W2 · Path A: headless dispatch</a></li>
+    <li><a href="#w3">W3 · Path B: pair mode</a></li>
+    <li><a href="#w4">W4 · Chat-pair: облачный исполнитель</a></li>
+    <li><a href="#w5">W5 · Universal Review Gate</a></li>
+    <li><a href="#w6">W6 · Machine review и автовердикт</a></li>
+    <li><a href="#w7">W7 · CI-конвейер и fix-циклы</a></li>
+    <li><a href="#w8">W8 · Доставка, релиз, прод</a></li>
+    <li><a href="#w9">W9 · Decision gate и оверрайды</a></li>
+    <li><a href="#w10">W10 · Вопросы, сообщения, сессии, события</a></li>
+    <li><a href="#w11">W11 · Предложения: задачи, проекты, скиллы</a></li>
+    <li><a href="#w12">W12 · Доказательства и метрики</a></li>
+    <li><a href="#w13">W13 · Сторожа репозитория</a></li>
+    <li><a href="#w14">W14 · Иерархия, rollup, жизненный цикл записи</a></li>
+    <li><a href="#poller">Фоновые циклы: что и с какой частотой</a></li>
+    <li><a href="#switches">Переключатели режимов</a></li>
+    <li><a href="#gaps">Кандидаты в пробелы — вопросы к аудиту</a></li>
+  </ol>
+</nav>
+
+<h2 id="model">1. Доменная модель и акторы</h2>
+
+<p>Единица работы — <strong>задача</strong>. Иерархия строгая: <code>epic → feature → task → subtask</code> (<code>HIERARCHY_RULES</code>). Epic и feature структурируют, но не исполняются: они не уходят агенту и не проходят автоматическое ревью.</p>
+
+<table>
+  <thead><tr><th>Актор</th><th>Кто это</th><th>Чем ходит</th><th>Что может только он</th></tr></thead>
+  <tbody>
+    <tr><td><span class="badge b-human">human</span></td><td>владелец / техлид</td><td>Web UI, CLI, REST с human-токеном</td><td><code>hub_approve_task</code>, <code>hub_reject_task</code>, <code>hub_decide_task</code>, <code>hub_force_complete_task</code>, <code>hub_answer_question</code>, <code>hub_start_task</code></td></tr>
+    <tr><td><span class="badge b-agent">agent</span></td><td>исполнитель / ревьюер / аналитик</td><td>MCP, REST с agent-токеном</td><td>claim, pair_start, updates, submit-for-review, submit_review, report_done</td></tr>
+    <tr><td><span class="badge b-machine">hub</span></td><td>поллер и сервисный слой</td><td>внутренние вызовы</td><td>дедлайны, эскалации, мержи, релизы, ретеншен</td></tr>
+    <tr><td><span class="badge b-ci">ci</span></td><td>GitHub Actions</td><td>REST: <code>/api/tasks/{id}/ci-run-report</code>, <code>/api/deploys</code></td><td>отчёт о прогоне и о деплое</td></tr>
+    <tr><td><span class="badge b-machine">policy</span></td><td>автопилот гейтов</td><td>записывается как <code>actor=policy</code></td><td>автоодобрение драфта, автовердикт APPROVED</td></tr>
+  </tbody>
+</table>
+
+<div class="card">
+  <p><strong>Один инвариант держит всё остальное.</strong> Хаб — не оболочка над git и CI, а конечный автомат над ними: любое изменение состояния задачи проходит через сервисный слой, поэтому REST, MCP, CLI и поллер получают один и тот же ответ. MCP объявлен проекцией REST, а не отдельным бизнес-слоем.</p>
+</div>
+
+<h2 id="states">2. Статусы и матрица владения</h2>
+
+<p>13 статусов (<code>TaskStatus</code>), из них 3 терминальных. Каждый нетерминальный <em>экземпляр</em> жизненного цикла (статус + дискриминатор) имеет ровно одну политику в <code>hub/lifecycle_matrix.py</code>: владельца, следующего актора, поверхность и дедлайн. Инвариант матрицы: у machine-политики дедлайн обязателен, у human/agent_queue — запрещён.</p>
+
+<table>
+  <thead><tr><th>Экземпляр</th><th>Владелец</th><th>Следующий</th><th>Поверхность</th><th>Дедлайн</th><th>Эскалация</th></tr></thead>
+  <tbody>
+    <tr><td><code>draft</code></td><td><span class="badge b-human">human</span></td><td>человек</td><td>inbox:drafts</td><td>—</td><td>— (только stale-alert через 240 мин, если DoR не пройден)</td></tr>
+    <tr><td><code>needs_info</code></td><td><span class="badge b-human">human</span></td><td>человек</td><td>inbox:questions</td><td>—</td><td>— (alert 480 мин)</td></tr>
+    <tr><td><code>needs_decision</code></td><td><span class="badge b-human">human</span></td><td>человек</td><td>inbox:decisions</td><td>—</td><td>—</td></tr>
+    <tr><td><code>review:client</code></td><td><span class="badge b-human">human</span></td><td>человек/ревьюер</td><td>inbox:review</td><td>—</td><td>— (alert 120 мин)</td></tr>
+    <tr><td><code>open</code></td><td><span class="badge b-agent">agent_queue</span></td><td>агент</td><td>доска</td><td>—</td><td>—</td></tr>
+    <tr><td><code>running:pair</code></td><td><span class="badge b-agent">agent_queue</span></td><td>агент</td><td>stale-alert</td><td>—</td><td>— (alert 30 мин)</td></tr>
+    <tr><td><code>claimed</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>240 мин</td><td>→ <code>open</code> (<code>claim_lease_expired</code>)</td></tr>
+    <tr><td><code>running:headless</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>360 мин</td><td>→ <code>needs_decision</code> (<code>running_deadline</code>)</td></tr>
+    <tr><td><code>review:headless</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>180 мин</td><td>→ <code>needs_decision</code> (<code>review_deadline</code>)</td></tr>
+    <tr><td><code>fix_requested</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>180 мин</td><td>→ <code>needs_decision</code> (<code>fix_deadline</code>)</td></tr>
+    <tr><td><code>ci_check</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>180 мин</td><td>→ <code>needs_decision</code> (<code>ci_check_deadline</code>)</td></tr>
+    <tr><td><code>pending_report</code></td><td><span class="badge b-machine">machine</span></td><td>hub</td><td>watchdog</td><td>120 мин</td><td>→ <code>needs_decision</code> (<code>pending_report_deadline</code>)</td></tr>
+    <tr><td><code>completed</code> / <code>failed</code> / <code>rejected</code></td><td colspan="5"><span class="badge b-final">терминальные</span> — из матрицы исключены</td></tr>
+  </tbody>
+</table>
+
+<p class="src">Источник: <code>hub/lifecycle_matrix.py</code> (LIFECYCLE_MATRIX), пороги — <code>hub/config.py</code>.</p>
+
+<h3>Общая форма конвейера</h3>
+<div class="flow">
+  <span class="node h">draft</span><span class="arr">→</span>
+  <span class="node a">open</span><span class="arr">→</span>
+  <span class="node a">claimed</span><span class="arr">→</span>
+  <span class="node a">running</span><span class="arr">→</span>
+  <span class="node m">ci_check</span><span class="arr">→</span>
+  <span class="node a">review</span><span class="arr">→</span>
+  <span class="node m">merge</span><span class="arr">→</span>
+  <span class="node">completed</span>
+</div>
+<div class="flow">
+  <span class="arr">боковые ветки:</span>
+  <span class="node h">needs_info</span>
+  <span class="node h">needs_decision</span>
+  <span class="node m">fix_requested</span>
+  <span class="node m">pending_report</span>
+  <span class="node x">failed</span>
+  <span class="node x">rejected</span>
+</div>
+
+<h2 id="transitions">3. Полная таблица переходов</h2>
+
+<p>Две таблицы намеренно разделены. Первая — <strong>декларативная</strong>: <code>LIFECYCLE_TRANSITIONS</code> в <code>hub/workflow_reference.py</code>, ровно то, что хаб отдаёт агентам в <code>hub_my_context(mode=full)</code>. Вторая — <strong>фактические переходы, которых в декларации нет</strong>; они существуют в коде и наблюдаемы в проде. Расхождение между таблицами — первый предмет аудита.</p>
+
+<h3>3.1 Декларированные переходы (то, что читает агент)</h3>
+<table>
+  <thead><tr><th>Из</th><th>В</th><th>Инструмент</th><th>Актор</th><th>Гейт</th></tr></thead>
+  <tbody>
+    <tr><td>draft</td><td>open</td><td><code>hub_approve_task</code></td><td><span class="badge b-human">human</span></td><td>DoR</td></tr>
+    <tr><td>draft</td><td>rejected</td><td><code>hub_reject_task</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
+    <tr><td>open</td><td>claimed</td><td><code>hub_claim_task</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>open</td><td>running</td><td><code>hub_start_task</code></td><td><span class="badge b-human">human</span></td><td>план обязателен</td></tr>
+    <tr><td>open</td><td>running</td><td><code>hub_pair_start</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>claimed</td><td>running</td><td><code>hub_pair_start</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>claimed</td><td>open</td><td><code>hub_release_task</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>claimed</td><td>open</td><td><code>chat_pair_reaper</code></td><td><span class="badge b-ci">ci</span></td><td>TTL сессии</td></tr>
+    <tr><td>running</td><td>open</td><td><code>chat_pair_reaper</code></td><td><span class="badge b-ci">ci</span></td><td>TTL сессии</td></tr>
+    <tr><td>running</td><td>review</td><td><code>hub_submit_for_review</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>review</td><td>running</td><td><code>hub_submit_review</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>running</td><td>completed</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>running</td><td>review</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>running</td><td>ci_check</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>running</td><td>needs_decision</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>running</td><td>needs_info</td><td><code>hub_ask_question</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>needs_info</td><td>open</td><td><code>hub_answer_question</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
+    <tr><td>running</td><td>pending_report</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
+    <tr><td>pending_report</td><td>review</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>pending_report</td><td>completed</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
+    <tr><td>ci_check</td><td>review</td><td><code>ci_poller</code></td><td><span class="badge b-ci">ci</span></td><td>CI</td></tr>
+    <tr><td>needs_decision</td><td>completed</td><td><code>hub_decide_task</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
+    <tr><td>needs_decision</td><td>fix_requested</td><td><code>hub_decide_task</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
+  </tbody>
+</table>
+
+<h3>3.2 Фактические переходы, отсутствующие в декларации</h3>
+<p>Собраны чтением <code>hub/poller.py</code>, <code>hub/services/orchestration.py</code>, <code>hub/services/lifecycle.py</code>, <code>hub/services/auto_approve.py</code>, <code>hub/services/chat_pair.py</code>.</p>
+<table>
+  <thead><tr><th>Из</th><th>В</th><th>Кто/что</th><th>Причина</th><th>Код</th></tr></thead>
+  <tbody>
+    <tr><td>draft</td><td>open</td><td><span class="badge b-machine">policy</span></td><td>автоодобрение низкого класса риска</td><td><code>auto_approve.maybe_auto_approve</code></td></tr>
+    <tr><td>draft</td><td>rejected/удалено</td><td><span class="badge b-agent">agent</span></td><td><code>hub_withdraw_own_draft</code> — автор отзывает свой драфт</td><td><code>lifecycle.withdraw_own_draft</code></td></tr>
+    <tr><td>running</td><td>failed</td><td><span class="badge b-machine">hub</span></td><td>dispatch-джоб завершился с ошибкой</td><td><code>poller._sweep_running_dispatch</code></td></tr>
+    <tr><td>running</td><td>needs_decision</td><td><span class="badge b-machine">hub</span></td><td>blocker в апдейтах; провал checkout; commit-scope; branch mismatch; merge gate</td><td><code>orchestration.transition_after_agent_done</code></td></tr>
+    <tr><td>review</td><td>needs_decision</td><td><span class="badge b-machine">hub</span></td><td><code>review_job_failed</code>, <code>no_clear_verdict</code>, <code>arbitration_finished</code>, <code>merge_failed</code>, <code>ci_failed</code></td><td><code>poller._sweep_review</code></td></tr>
+    <tr><td>review</td><td>completed</td><td><span class="badge b-machine">hub</span></td><td>headless APPROVED → CI зелёный → PR влит</td><td><code>poller._deliver_approved_review</code></td></tr>
+    <tr><td>review</td><td>fix_requested</td><td><span class="badge b-machine">hub</span></td><td>CHANGES_REQUESTED в headless-ветке → <code>dispatch_fix</code></td><td><code>orchestration.dispatch_fix</code></td></tr>
+    <tr><td>review</td><td>review (арбитр)</td><td><span class="badge b-machine">hub</span></td><td>исчерпан бюджет review-циклов → <code>dispatch_arbiter</code></td><td><code>orchestration.dispatch_arbiter</code></td></tr>
+    <tr><td>running (pair)</td><td>completed</td><td><span class="badge b-machine">hub</span></td><td>агент не вернулся: одобренная pair-задача доставлена поллером</td><td><code>poller._deliver_pair_task</code></td></tr>
+    <tr><td>fix_requested</td><td>running</td><td><span class="badge b-machine">hub</span></td><td>fix-джоб принят диспетчером</td><td><code>orchestration.dispatch_fix</code></td></tr>
+    <tr><td>ci_check</td><td>needs_decision</td><td><span class="badge b-machine">hub</span></td><td>нет PR после 3 попыток; исчерпан лимит CI-fix циклов</td><td><code>poller._sweep_ci_check</code></td></tr>
+    <tr><td>ci_check</td><td>running</td><td><span class="badge b-machine">hub</span></td><td>красный CI → <code>dispatch_ci_fix</code> (до <code>MAX_CI_FIX_CYCLES</code>=3)</td><td><code>orchestration.dispatch_ci_fix</code></td></tr>
+    <tr><td>claimed</td><td>open</td><td><span class="badge b-machine">hub</span></td><td>истёк claim lease (240 мин)</td><td><code>poller._sweep_expired_claims</code></td></tr>
+    <tr><td>любой machine-статус</td><td>needs_decision</td><td><span class="badge b-machine">hub</span></td><td>дедлайн из матрицы владения</td><td><code>poller._sweep_machine_deadlines</code></td></tr>
+    <tr><td>running/claimed</td><td>open</td><td><span class="badge b-machine">hub</span></td><td>истекла implementer-сессия chat-pair</td><td><code>chat_pair.release_expired_implementer_tasks</code></td></tr>
+    <tr><td>любой нетерминальный</td><td>completed</td><td><span class="badge b-human">human</span></td><td><code>force_complete</code> — аудируемый оверрайд</td><td><code>lifecycle.force_complete_task</code></td></tr>
+    <tr><td>дети завершены</td><td>parent completed</td><td><span class="badge b-machine">hub</span></td><td>rollup родителя (feature/epic)</td><td><code>lifecycle.maybe_rollup_parent</code></td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2 id="w1">W1 · Постановка и Definition of Ready</h2>
+
+<div class="flow">
+  <span class="node a">create/propose</span><span class="arr">→</span>
+  <span class="node">draft</span><span class="arr">→</span>
+  <span class="node a">refine · AC · risks</span><span class="arr">→</span>
+  <span class="node m">readiness recalc</span><span class="arr">→</span>
+  <span class="node m">dor_passed</span><span class="arr">→</span>
+  <span class="node h">approve</span><span class="arr">|</span>
+  <span class="node m">policy auto-approve</span><span class="arr">→</span>
+  <span class="node a">open</span>
+</div>
+
+<h4>Триггеры входа</h4>
+<ul class="tight">
+  <li><code>hub_create_task</code> / <code>POST /api/tasks</code> / <code>oc-hub task</code> / форма Web UI. Работа, созданная <strong>агентом</strong>, всегда стартует как <code>draft</code> — включая эпики и фичи. Человеческие epic/feature создаются сразу <code>open</code>.</li>
+  <li><code>hub_propose_task</code> — тонкая обёртка того же пути (source=agent).</li>
+  <li><code>hub_create_subtasks</code> — массовое создание под родителем, с сериализацией записи (<code>get_write_lock</code>).</li>
+  <li>Идемпотентность создания через <code>client_request_id</code> (<code>services/task_idempotency.py</code>); конфликт → <code>idempotency_conflict</code>.</li>
+</ul>
+
+<h4>DoR: профили по work_type</h4>
+<p>Гейт детерминированный, без LLM. Набор обязательных проверок табличный (<code>DOR_REQUIRED_BY_WORK_TYPE</code>); неизвестный work_type падает в строгий профиль <code>feature</code>.</p>
+<table>
+  <thead><tr><th>work_type</th><th>Обязательные проверки</th></tr></thead>
+  <tbody>
+    <tr><td><code>feature</code></td><td>affected_areas, user_story, problem_statement, business_value, scope_in, acceptance_criteria, validation_commands, size, wip_tag</td></tr>
+    <tr><td><code>bug</code></td><td>то же минус user_story</td></tr>
+    <tr><td><code>refactor</code></td><td>то же минус user_story и business_value</td></tr>
+    <tr><td><code>chore</code></td><td>scope_in, validation_commands, size</td></tr>
+    <tr><td><code>docs</code></td><td>scope_in, size</td></tr>
+    <tr><td><code>spike</code></td><td>problem_statement, acceptance_criteria, size</td></tr>
+    <tr><td><code>incident</code></td><td>affected_areas, problem_statement, acceptance_criteria, validation_commands</td></tr>
+  </tbody>
+</table>
+<p>Три проверки — <code>has_outcome_hypothesis</code>, <code>has_redesign_decision</code>, <code>has_agent_fit</code> — <strong>advisory</strong>: видны в таблице, дают рекомендацию, но не стоят баллов и спрашиваются только у профиля <code>feature</code>.</p>
+
+<h4>Readiness</h4>
+<p>Отдельный от DoR детерминированный балл 0..100: штраф за каждую непройденную проверку (required дороже optional) плюс штраф за риски по severity. Балл не заменяет обязательные проверки: approve смотрит на <code>missing_required</code>, а не на балл.</p>
+
+<h4>Переходы и отказы</h4>
+<table>
+  <thead><tr><th>Событие</th><th>Результат</th></tr></thead>
+  <tbody>
+    <tr><td><code>approve</code> при непройденном DoR без <code>force</code></td><td>HTTP 422 <code>dor_failed</code></td></tr>
+    <tr><td><code>approve</code> с <code>force=true</code></td><td>переход разрешён, пишется alert-update и запись в activity log (audited human override). Паритет: MCP / REST / CLI / Web</td></tr>
+    <tr><td>гонка двух approve</td><td>HTTP 409 — переход атомарный (<code>transition_status_if</code>)</td></tr>
+    <tr><td><code>approve</code> не из <code>draft</code></td><td>отказ: одобрение валидно только из draft</td></tr>
+    <tr><td><code>approve(run=True)</code></td><td>одобрение + немедленный dispatch (path A)</td></tr>
+    <tr><td>batch approve</td><td><code>POST /api/tasks/batch-approve</code>; задачи, не проходящие DoR, тихо пропускаются</td></tr>
+  </tbody>
+</table>
+
+<h4>Автопилот DoR (<span class="badge b-off">по умолчанию выключен</span>)</h4>
+<p><code>maybe_auto_approve</code> вызывается из воронки пересчёта readiness — единственного места, где <code>dor_passed</code> становится true, поэтому все пути (refine, bulk refine, мутации AC/рисков) приходят сюда. Чтобы драфт уехал в <code>open</code> без человека, нужно совпадение <em>четырёх</em> условий:</p>
+<ol class="tight">
+  <li>глобальный ключ <code>HAIPLANE_AUTO_APPROVE_MAX_CLASS</code> ∈ {r0, r1} (по умолчанию <code>off</code>; любое неизвестное значение = off);</li>
+  <li>у проекта <code>gate_policy.dor = auto</code> (дефолтный проект такое значение хранить не может);</li>
+  <li>класс риска <strong>вычислен</strong> из <code>affected_areas</code> и не выше действующего потолка (проектный потолок может только понизить глобальный);</li>
+  <li>задача не трогает «лестницу» — <code>LADDER_SURFACES</code>: risk_class, auto_approve, auto_verdict, lifecycle, config, auth, <code>docs/agent-context/</code>, <code>docs/repository-rules.md</code>, <code>.github/</code>.</li>
+</ol>
+<p>Отказ всегда молчаливый (драфт просто ждёт человека). Успех — не молчаливый: апдейт с признаками и событие <code>task_approved</code> с <code>actor=policy</code>.</p>
+<p class="src">Код: <code>services/dor.py</code>, <code>services/readiness.py</code>, <code>services/recommendations.py</code>, <code>services/refinement.py</code>, <code>services/auto_approve.py</code>, <code>services/risk_class.py</code>, <code>lifecycle.approve_task</code>.</p>
+
+<h2 id="w2">W2 · Path A — headless dispatch</h2>
+
+<div class="flow">
+  <span class="node h">hub_start_task(plan)</span><span class="arr">→</span>
+  <span class="node m">dispatch job</span><span class="arr">→</span>
+  <span class="node a">running:headless</span><span class="arr">→</span>
+  <span class="node m">poller sync</span><span class="arr">→</span>
+  <span class="node m">done-конвейер</span>
+</div>
+
+<h4>Шаги</h4>
+<ol class="tight">
+  <li><strong>Гейт плана.</strong> <code>hub_start_task</code> требует план — в теле вызова или отдельным update с <code>Plan:</code>. Инструмент human-only.</li>
+  <li><code>dispatch_task</code> создаёт ветку <code>task-&lt;id&gt;/&lt;slug&gt;</code> через git-ops плагин и запускает джоб; в задаче появляется <code>job_id</code> и <code>assigned_agent</code>. Неготовый воркспейс → <code>dispatch_workspace_not_ready</code>.</li>
+  <li>Поллер каждые 30 с читает статус джоба (<code>_sweep_running_dispatch</code>).</li>
+</ol>
+
+<h4>Что делает поллер с завершившимся джобом</h4>
+<table>
+  <thead><tr><th>Состояние</th><th>Действие</th></tr></thead>
+  <tbody>
+    <tr><td>джоб пропал</td><td>первый раз — ставит метку <code>job_missing_since</code>; после <code>MISSING_JOB_GRACE_MINUTES</code> (5) → <code>needs_decision</code> (<code>dispatch_job_missing</code>)</td></tr>
+    <tr><td>джоб <code>failed</code></td><td>задача → <code>failed</code>, сохраняются exit_code и result_text</td></tr>
+    <tr><td>есть update kind=blocker</td><td>→ <code>needs_decision</code> (<code>blocker_reported</code>)</td></tr>
+    <tr><td>джоб <code>completed</code>, done-отчёта нет</td><td>синтетический done из последнего текста в логе джоба (<code>_extract_agent_summary</code>)</td></tr>
+    <tr><td>иначе</td><td>общий пост-done переход <code>transition_after_agent_done</code> (см. W5)</td></tr>
+  </tbody>
+</table>
+<p>После терминального исхода вызывается <code>maybe_destroy_vast</code> — снос арендованной GPU-машины, если интеграция включена.</p>
+
+<h2 id="w3">W3 · Path B — pair mode</h2>
+
+<div class="flow">
+  <span class="node a">hub_claim_task</span><span class="arr">→</span>
+  <span class="node">claimed</span><span class="arr">→</span>
+  <span class="node a">hub_pair_start</span><span class="arr">→</span>
+  <span class="node a">running:pair</span><span class="arr">→</span>
+  <span class="node a">submit_for_review</span><span class="arr">|</span>
+  <span class="node a">report_done</span>
+</div>
+
+<h4>Отличия от path A</h4>
+<ul class="tight">
+  <li><code>job_id</code> пустой — именно это делает экземпляр <code>running:pair</code> и снимает с задачи machine-дедлайн.</li>
+  <li>Ветку создаёт хаб, <strong>коммиты — ответственность разработчика</strong>. Поле <code>branch</code> — истина для имени, не для содержимого.</li>
+  <li><code>claim</code> держит лизинг 240 мин: не начал pair — задача сама вернётся в <code>open</code>.</li>
+  <li>Воркспейс: <code>HAIPLANE_WORKTREE_PER_TASK=1</code> включает отдельный worktree на задачу. Pair-start может сам переключиться с <strong>чистой и запушенной</strong> <code>task-N/*</code> ветки; грязная или незапушенная чужая ветка блокирует старт (422).</li>
+  <li>После submit-for-review / report-done / release хаб best-effort возвращает воркспейс на базовую ветку, а при CHANGES_REQUESTED — обратно на ветку задачи.</li>
+</ul>
+
+<div class="card warn">
+  <p><strong>Известная острая грань.</strong> Git-ops при создании ветки делает <code>checkout base</code>, а при грязном worktree — <code>git checkout .</code> и <code>git clean -fd</code>. Незакоммиченная работа в общем локальном клоне может быть потеряна. Это описано в документации как чек-лист, а не как проверка в коде.</p>
+</div>
+
+<h2 id="w4">W4 · Chat-pair — облачный исполнитель по одноразовому коду</h2>
+
+<p>Канал для сред, которые не умеют подключать кастомный MCP (Cursor на iOS, cursor.com/agents): вместо долгоживущего токена в переписке — одноразовый код, который меняется на короткую сессию.</p>
+
+<div class="flow">
+  <span class="node h">issue_code (UI)</span><span class="arr">→</span>
+  <span class="node">AH-XXXXYYYY, TTL 300 c</span><span class="arr">→</span>
+  <span class="node a">redeem</span><span class="arr">→</span>
+  <span class="node a">session token, TTL 7200 c</span><span class="arr">→</span>
+  <span class="node a">работа по задаче</span><span class="arr">→</span>
+  <span class="node m">reaper → open</span>
+</div>
+
+<table>
+  <thead><tr><th>Свойство</th><th>Реализация</th></tr></thead>
+  <tbody>
+    <tr><td>два вида кода</td><td><code>intake</code> (постановка) и <code>implementer</code> (привязан к конкретной <code>open</code>-задаче); выпуск одного не гасит другой</td></tr>
+    <tr><td>секреты</td><td>в открытом виде существуют ровно один раз — в ответе на выпуск; в БД только SHA-256</td></tr>
+    <tr><td>права</td><td>фиксированный набор <code>CHAT_PAIR_PERMS</code> / <code>CHAT_PAIR_IMPLEMENTER_PERMS</code>, никогда не права выдавшего (обычно admin)</td></tr>
+    <tr><td>маршруты</td><td>дополнительно ограничены deny-by-default allowlist в <code>hub/auth.py</code></td></tr>
+    <tr><td>отказы redeem</td><td>неизвестный / уже потраченный / истёкший — один и тот же ответ (защита от перебора); отдельный rate-limiter, не общий с веб-логином</td></tr>
+    <tr><td>реaper</td><td>мёртвая implementer-сессия возвращает привязанную <code>running</code>/<code>claimed</code> задачу в <code>open</code>; живая сестринская сессия этому мешает; headless-строки (<code>job_id</code>) не трогаются</td></tr>
+  </tbody>
+</table>
+<p class="src">Код: <code>services/chat_pair.py</code>, <code>hub/auth.py</code>, шаблон <code>templates/chat_pair.html</code>.</p>
+
+<h2 id="w5">W5 · Universal Review Gate</h2>
+
+<div class="card ok">
+  <p><strong>Серверное правило, а не конвенция клиента.</strong> Ни один нормальный путь не завершает задачу, пока у <em>текущего сабмишена</em> нет вердикта APPROVED. Правило живёт в <code>completion_requires_review</code> в общем сервисном слое, поэтому одинаково действует в REST, MCP, CLI и поллере. Явный опт-аут — <code>auto_review=false</code> (дефолт у subtask). Человеческие оверрайды (<code>decide accept</code>, <code>force_complete</code>) обходят гейт сознательно и остаются в аудите.</p>
+</div>
+
+<h4>Механика поколений</h4>
+<p>Каждая сдача увеличивает <code>submission_generation</code>. Вердикт привязан к поколению: пересдача автоматически «протухляет» прежний APPROVED. Завершение одобренной работы <strong>не</strong> увеличивает поколение — иначе оно аннулировало бы то самое одобрение, которое его разрешает.</p>
+
+<h4>Две дорожки, не одна цепочка</h4>
+<div class="two-col">
+  <div class="card">
+    <p><strong>Автор:</strong> <code>hub_submit_for_review</code> (pair) или <code>hub_report_done</code> → ждёт (<code>awaiting=review</code>). После APPROVED задача возвращается в <code>running</code> → <code>hub_report_done</code> → <code>completed</code>.</p>
+  </div>
+  <div class="card">
+    <p><strong>Ревьюер (другой агент):</strong> <code>hub_get_review_brief</code> → <code>hub_submit_review</code>. Вердикт от исполнителя задачи отклоняется сервером (<code>ensure_reviewer_independence</code>); опт-аут для solo — <code>HAIPLANE_REVIEW_SELF_APPROVE=allow</code>, и тогда факт self-approve пишется на строку задачи и в лог как предупреждение.</p>
+  </div>
+</div>
+
+<h4>Что происходит внутри <code>submit_for_review</code> — по порядку</h4>
+<ol class="tight">
+  <li>Валидность: только pair <code>running</code>. Headless-задача получает 400 («сдаётся своим done-отчётом»).</li>
+  <li><strong>Сверка ветки</strong> (#533): заявленная ветка ≠ каноническая → 409 <code>branch_mismatch</code>. Это сравнение <em>отчёта</em>, а не наблюдения: у хаба нет рабочей копии проекта.</li>
+  <li><strong>Разрешение диффа</strong> — один раз, до write-lock; питает и проверку поверхностей, и пересчёт класса риска.</li>
+  <li><strong>Гейт поверхностей</strong> (<code>SDD_SURFACES</code>, дефолт warn): дифф трогает файлы вне <code>affected_areas</code> → в режиме <code>require</code> 422; можно признать фактический объём на сдаче (<code>accept_areas</code>) — тогда области дописываются в той же транзакции и пишется видимое событие роста объёма.</li>
+  <li><strong>Дешёвые правила по диффу</strong> (<code>SUBMIT_RULES</code>, дефолт warn): «код меняется, тесты не трогаются» (в <code>require</code> — 422); «баг правит только тесты» — только отмечается, никогда не отказ.</li>
+  <li><strong>Пин коммита</strong>: вершина ветки записывается в <code>submission_sha</code>. Не удалось — сдача проходит, но «НЕ закреплено» пишется явно.</li>
+  <li><strong>Усыновление отчёта CI</strong>: если CI уже прогнал этот коммит, отчёт становится текущим для этого поколения.</li>
+  <li><strong>Поиск PR</strong>: pair-поток сам не заполняет <code>pr_number</code> — хаб ищет PR по ветке, чтобы гейт доставки имел на что опереться.</li>
+  <li>Транзакция: <code>running → review</code> (условно, иначе 409), <code>review_job_id=NULL</code> (клиентское ревью), новое поколение, класс риска, единый «Отчёт проверок на сдаче».</li>
+  <li>Пост-фактум, не блокируя: детект стека веток (advisory), диспетчеризация кросс-модельного ревью, подсказка о требуемом machine-review, <code>wait_baseline</code> для ожидания вердикта.</li>
+</ol>
+
+<h4>Review brief — что видит ревьюер</h4>
+<p>Один вызов собирает: acceptance criteria, scope, validation commands, review checklist, ветку/PR с advisory-командой диффа, последний отчёт разработчика, а также блоки доказательств: результаты AC-тестов, резолвинг локаторов, отчёт CI по закреплённому sha, свежесть утверждений, места вызова, live-check. Верхний блок <code>evidence_coverage</code> подводит итог: сколько блоков дали сигнал, что не отработало и почему.</p>
+<p>База диффа берётся из <code>default_branch</code> проекта и имеет <strong>три</strong> состояния, которые никогда не схлопываются: <code>resolved</code>, <code>unresolved</code> (смотрели — ветки нет; тогда команда не выдаётся вовсе, на её месте стоит причина) и <code>unverified</code> (смотреть было негде).</p>
+
+<h4>Вердикт: <code>hub_submit_review</code></h4>
+<table>
+  <thead><tr><th>Проверка</th><th>Поведение</th></tr></thead>
+  <tbody>
+    <tr><td>сабмишена не было</td><td>400</td></tr>
+    <tr><td>CHANGES_REQUESTED, но все находки out_of_scope</td><td>422 <code>changes_requested_requires_in_scope_finding</code></td></tr>
+    <tr><td>machine-review обязателен (<code>MACHINE_REVIEW=require</code>)</td><td>422 — <strong>только для APPROVED</strong>; отклонить работу можно всегда</td></tr>
+    <tr><td>AC-тесты не зелёные (<code>SDD_AC_TESTS=require</code>)</td><td>422 <code>ac_tests_not_green</code> — тоже только для APPROVED</td></tr>
+    <tr><td>ветка ушла из-под одобрения</td><td>вердикт записывается для закреплённого коммита, поколение увеличивается (одобрение протухает), задача возвращается в <code>running</code> с явным «КОД УШЁЛ ИЗ-ПОД ОДОБРЕНИЯ»</td></tr>
+    <tr><td>сверку сделать не удалось</td><td>записывается «сверка НЕ проводилась» — молчание запрещено</td></tr>
+    <tr><td>CHANGES_REQUESTED</td><td><code>review_cycle++</code>, воркспейс возвращается на ветку задачи</td></tr>
+    <tr><td>out_of_scope без <code>linked_task_id</code></td><td>неблокирующее предупреждение; опционально — автосоздание драфтов-follow-up с обратной ссылкой (дедуп по id находки)</td></tr>
+  </tbody>
+</table>
+
+<div class="card">
+  <p><strong>Маршрутизация находок.</strong> <code>in_scope</code> закрывается только пересдачей <em>той же</em> задачи на <em>той же</em> ветке. Параллельные задачи под in-scope находки запрещены (инцидент #392). <code>out_of_scope</code> уходит в отдельные задачи и никогда не блокирует вердикт.</p>
+</div>
+
+<h4>Общий пост-done переход (<code>transition_after_agent_done</code>)</h4>
+<p>Единственная воронка для headless-поллера и pair-режима:</p>
+<pre>done-отчёт есть?
+├─ нет ─────────────────────────────────► pending_report
+└─ да
+   ├─ гейт ревью удовлетворён (auto_review=off ИЛИ APPROVED текущего поколения)
+   │   ├─ у задачи есть PR (pair) → merge_before_completion
+   │   │     ├─ отказ ──────────────────► needs_decision (reason=merge_gate)
+   │   │     └─ успех → open_release_for_task (best effort) → completed
+   │   └─ PR нет ───────────────────────► completed
+   └─ гейт не удовлетворён → поколение++
+       ├─ auto_review И бюджет циклов не исчерпан И есть branch
+       │   └─ git-хвост: checkout → commit-scope → auto_commit → squash → push → create_pr
+       │        ├─ checkout не удался ───► needs_decision (done_checkout_failed)
+       │        ├─ файлы вне области, режим require ─► needs_decision (commit_scope_violation)
+       │        ├─ HEAD не на той ветке ─► needs_decision (done_branch_mismatch)
+       │        └─ иначе ────────────────► ci_check
+       ├─ бюджет review-циклов исчерпан ─► needs_decision (review_cycle_limit)
+       └─ иначе ─────────────────────────► review (клиентское, с инструкцией как получить вердикт)</pre>
+
+<h2 id="w6">W6 · Machine review, кросс-модельная диспетчеризация и автовердикт</h2>
+
+<h4>Machine review</h4>
+<p><code>hub_submit_machine_review</code> кладёт отчёт многоагентного прогона: <code>raw_count</code>, <code>findings_confirmed</code>, <code>findings_rejected</code>, <code>unresolved</code>, <code>incomplete</code>, <code>lost_dimensions</code>, потраченные токены, модель. Отчёт привязан к поколению сабмишена. Режим <code>HAIPLANE_MACHINE_REVIEW</code>: <code>warn</code> (дефолт — только показывает разрыв) или <code>require</code> (блокирует APPROVED без свежего отчёта).</p>
+
+<h4>Кто вызывает ревьюера</h4>
+<p>Не исполнитель. При <code>gate_policy.review = dispatch</code> хаб сам ставит облачный прогон (Cursor cloud agent) на ветку сабмишена, с моделью <strong>другого семейства</strong>, под выделенным ревьюер-принципалом и с явным запретом на запись.</p>
+
+<h4>Лестница профилей</h4>
+<table>
+  <thead><tr><th>Профиль</th><th>Когда</th><th>Бюджет</th></tr></thead>
+  <tbody>
+    <tr><td><code>lite</code></td><td>дефолт</td><td><code>REVIEW_LITE_TOKEN_BUDGET</code> = 40k</td></tr>
+    <tr><td><code>deep</code></td><td>класс риска ≥ R3; процессные поверхности в добавленных строках (не в комментариях); технический профиль рисков; не удалось прочитать дифф</td><td><code>REVIEW_TOKEN_BUDGET</code> = 300k</td></tr>
+    <tr><td>top-up</td><td>дешёвый прогон сам объявил <code>incomplete</code> → один тяжёлый догон</td><td>потолок <code>REVIEW_LADDER_MAX_STEPS</code> = 2 прогона на сабмишен</td></tr>
+  </tbody>
+</table>
+<p>Промпт ревьюера включает точную команду диффа с исключением сгенерированных файлов, дельту относительно прошлого поколения, список подтверждённых ранее находок для проверки закрытия, потолок 800 строк на файл и требование объявить непрочитанное в <code>lost_dimensions</code>.</p>
+
+<h4>Автовердикт (<span class="badge b-off">по умолчанию выключен</span>)</h4>
+<p><code>maybe_auto_verdict</code> вызывается после приземления machine-review. Отказы делятся на два класса, и это разделение — суть механизма.</p>
+<div class="two-col">
+  <div class="card bad">
+    <p><strong>Триггеры эскалации — никогда не молча</strong> (alert + событие <code>verdict_escalated</code>):</p>
+    <ul class="tight">
+      <li>security-находка в любом статусе;</li>
+      <li>перерасход токен-бюджета ревью;</li>
+      <li>расхождение ревьюеров: сестринский отчёт того же поколения нёс confirmed-находки;</li>
+      <li>монокультура: код и ревью одного семейства моделей.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <p><strong>Молчаливые отказы — человеческий гейт просто стоит:</strong></p>
+    <ul class="tight">
+      <li>есть confirmed / unresolved / <code>incomplete</code>;</li>
+      <li><code>raw_count = 0</code> без доказанного расхода токенов (пустота ≠ отсутствие находок), а доказанная пустота — только до класса <code>PROVEN_EMPTY_MAX_CLASS</code> (r1);</li>
+      <li>нет пина коммита; CI не <code>pass</code> по этому коммиту; вершина ветки сдвинулась;</li>
+      <li>дифф вышел за объявленные области или поднял класс риска;</li>
+      <li>любая из деклараций моделей отсутствует (отсутствие данных — не разнородность).</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="w7">W7 · CI-конвейер и fix-циклы</h2>
+
+<div class="flow">
+  <span class="node m">ci_check</span><span class="arr">→</span>
+  <span class="node m">push + create PR</span><span class="arr">→</span>
+  <span class="node m">grace 180 c</span><span class="arr">→</span>
+  <span class="node m">probe</span><span class="arr">→</span>
+  <span class="node a">review</span><span class="arr">|</span>
+  <span class="node m">ci fix</span><span class="arr">|</span>
+  <span class="node h">needs_decision</span>
+</div>
+
+<table>
+  <thead><tr><th>Исход пробы CI</th><th>Действие</th></tr></thead>
+  <tbody>
+    <tr><td><code>pending</code></td><td>ждать, вернуться следующим циклом</td></tr>
+    <tr><td><code>unavailable</code></td><td>пробу прочитать не удалось: диагностика в лог, ретрай; страховка — дедлайн <code>ci_check</code> 180 мин</td></tr>
+    <tr><td><code>absent</code> (у PR нет проверок вовсе)</td><td>это определённый ответ, а не ожидание: конвейер CI пропускается, сразу <code>dispatch_review</code></td></tr>
+    <tr><td><code>passed</code></td><td><code>dispatch_review</code></td></tr>
+    <tr><td><code>failed</code>, циклов &lt; <code>MAX_CI_FIX_CYCLES</code> (3)</td><td>вытянуть логи падения → <code>dispatch_ci_fix</code></td></tr>
+    <tr><td><code>failed</code>, лимит исчерпан</td><td>→ <code>needs_decision</code> (<code>ci_fix_cycle_limit</code>)</td></tr>
+    <tr><td>PR создать не удалось</td><td>3 попытки (<code>MAX_CI_NO_PR_ATTEMPTS</code>), затем → <code>needs_decision</code></td></tr>
+  </tbody>
+</table>
+
+<h4>Ревью-цикл в headless-ветке</h4>
+<ol class="tight">
+  <li>Приоритет у <strong>структурного</strong> вердикта, привязанного к текущему поколению; текстовое сканирование апдейтов и лога джоба — legacy-фолбэк.</li>
+  <li><code>approved</code> → проба CI на PR → мерж → запись <code>pipeline_merge</code> с SHA мержа → уборка воркспейса → общий пост-done переход (без бампа поколения).</li>
+  <li><code>approved</code>, но PR не влит (красный CI или отказ мержа) → <strong>blocker</strong> и <code>needs_decision</code>: одобрение — не доставка.</li>
+  <li><code>changes_requested</code> → если бюджет циклов цел, <code>dispatch_fix</code>; если исчерпан — <code>dispatch_arbiter</code>.</li>
+  <li>Вердикта нет вовсе → <code>needs_decision</code> (<code>no_clear_verdict</code>). Джоб ревью упал → <code>needs_decision</code> (<code>review_job_failed</code>): упавший ревьюер никогда не завершает задачу.</li>
+  <li>Арбитр завершается <strong>хабом</strong>, а не добровольным апдейтом агента: любой терминальный исход арбитражного джоба → <code>needs_decision</code> с выжимкой; свободнотекстовое APPROVED от арбитра ничего не автозавершает.</li>
+</ol>
+
+<h2 id="w8">W8 · Доставка, релиз и продакшн</h2>
+
+<h4>Гейт доставки (<code>merge_before_completion</code>)</h4>
+<ol class="tight">
+  <li><code>pipeline_merge_recorded</code> → «уже доставлено» (доставка ровно один раз; повторный мерж GitHub отверг бы и это перевело бы доставленную задачу в needs_decision).</li>
+  <li>Сверка «код не ушёл из-под одобрения» — <em>до</em> пробы CI (дешевле на один сетевой вызов).</li>
+  <li>Проба CI: не <code>passed</code> → отказ с кодом <code>ci_&lt;outcome&gt;</code>.</li>
+  <li>Мерж → чтение SHA именно этого PR (не вершины ветки — её мог сдвинуть кто угодно) → запись в <code>pipeline_merges</code> (это то, по чему drift guard отличает свою доставку от чужой).</li>
+  <li>Уборка после мержа (<code>pull base</code>, удаление ветки) — не доставка: провал логируется, задачу не валит.</li>
+  <li>Любое исключение превращается в причину, а не в 500: done-отчёт не должен падать из-за моргнувшего GitHub.</li>
+</ol>
+<p><strong>Временные состояния отделены от решений:</strong> <code>ci_pending</code> и <code>ci_unavailable</code> (<code>TRANSIENT_GATE_PREFIXES</code>) — это ожидание, поллер вернётся; сообщение об ожидании пишется один раз, а не каждые 30 секунд.</p>
+
+<h4>Доставка pair-задачи без агента</h4>
+<p><code>_sweep_pair_delivery</code>: одобренная pair-задача, чей агент не вернулся, доставляется поллером. Ничего не ослабляется — тот же <code>merge_before_completion</code> с теми же отказами; меняется только триггер: состояние вместо вызова. Задача завершается с явной записью «Доставлено хабом без отчёта агента».</p>
+
+<h4>Релизная политика develop → main</h4>
+<ul class="tight">
+  <li>При <code>gate_policy.release = auto</code> после каждой доставки открывается/обновляется релизный PR (<code>open_release_for_task</code>), best-effort: не удалось — причина в лог, done-отчёт не падает.</li>
+  <li>Тело релизного PR перечисляет <strong>все</strong> задачи диапазона: релиз несёт develop целиком, и записка, называющая одну задачу из трёх, — запись, которая врёт.</li>
+  <li>Поллер мержит готовый релизный PR, как только CI зелёный. Красный/отсутствующий CI сообщается один раз на причину; если стойло держится <code>RELEASE_STALL_CYCLES</code> (3) циклов — запись в activity feed.</li>
+  <li>Порядок задач между собой политика не понимает — до first-class <code>depends_on</code> это конвейер, поэтому дефолт политики <code>manual</code>.</li>
+  <li>Проект, у которого <code>default_branch == release_base</code> (доставка прямо в main), релизного PR не открывает.</li>
+</ul>
+
+<h4>Дошло ли до прода</h4>
+<table>
+  <thead><tr><th>Сущность</th><th>Кто пишет</th><th>Что означает</th></tr></thead>
+  <tbody>
+    <tr><td><code>pipeline_merges</code></td><td>хаб</td><td>мерж, который выполнил сам хаб</td></tr>
+    <tr><td><code>releases</code> / <code>POST /api/deploys</code></td><td>CI</td><td>деплой, о котором отчитался пайплайн</td></tr>
+    <tr><td><code>delivery_state</code></td><td>сервис</td><td>сравнение двух: <code>in_prod</code> / <code>not_in_prod</code> / <code>unknown</code></td></tr>
+    <tr><td><code>prod_state</code> / <code>hub_prod_state</code></td><td>сервис</td><td>тот же вопрос ко всей доске сразу</td></tr>
+    <tr><td><code>_sweep_delivery_discrepancies</code></td><td>поллер (раз в <code>DELIVERY_SCAN_MINUTES</code> = 15)</td><td>completed-задачи с открытым PR → событие <code>completed_without_delivery</code></td></tr>
+  </tbody>
+</table>
+
+<h2 id="w9">W9 · Decision gate и человеческие оверрайды</h2>
+
+<p><code>needs_decision</code> — единственный «человеческий» тупик, куда сходятся все нештатные исходы. Полный список причин (payload <code>reason</code> в событии):</p>
+<table>
+  <thead><tr><th>Причина</th><th>Откуда</th></tr></thead>
+  <tbody>
+    <tr><td><code>blocker_reported</code></td><td>агент оставил update kind=blocker</td></tr>
+    <tr><td><code>dispatch_job_missing</code> / <code>review_job_missing</code></td><td>джоб исчез дольше грейса (5 мин)</td></tr>
+    <tr><td><code>review_job_failed</code></td><td>джоб ревью упал без вердикта</td></tr>
+    <tr><td><code>no_clear_verdict</code></td><td>ревью завершилось без APPROVED/CHANGES_REQUESTED</td></tr>
+    <tr><td><code>arbitration_finished</code> / <code>arbiter_job_failed</code> / <code>arbiter_dispatch_ambiguous</code> / <code>arbiter_dispatch_failed</code></td><td>фаза арбитража</td></tr>
+    <tr><td><code>review_cycle_limit</code> / <code>ci_fix_cycle_limit</code></td><td>исчерпаны бюджеты циклов</td></tr>
+    <tr><td><code>merge_gate</code> / <code>merge_failed</code> / <code>ci_failed</code> / <code>delivery_pr_missing</code></td><td>гейт доставки</td></tr>
+    <tr><td><code>done_checkout_failed</code> / <code>done_branch_mismatch</code> / <code>commit_scope_violation</code></td><td>git-хвост done-конвейера</td></tr>
+    <tr><td><code>dispatch_workspace_not_ready</code> / <code>fix_dispatch_failed</code> / <code>ci_fix_dispatch_failed</code> / <code>review_dispatch_failed</code></td><td>диспетчеризация</td></tr>
+    <tr><td><code>running_deadline</code>, <code>review_deadline</code>, <code>fix_deadline</code>, <code>ci_check_deadline</code>, <code>pending_report_deadline</code></td><td>матрица дедлайнов</td></tr>
+    <tr><td><code>wait_needs_deadline</code> / <code>wait_deadline_in_past</code></td><td>объявление ожидания (<code>declare_wait</code>)</td></tr>
+  </tbody>
+</table>
+
+<h4>Выходы</h4>
+<ul class="tight">
+  <li><code>hub_decide_task action=accept</code> → <code>completed</code> (осознанный обход гейта, пишется решение; опционально сохраняется в notes и попадает в <code>hub_list_decisions</code>).</li>
+  <li><code>hub_decide_task action=rework</code> → <code>fix_requested</code>.</li>
+  <li><code>hub_force_complete_task</code> — аудируемый оверрайд для <code>task</code>/<code>subtask</code>: разрешён из любого нетерминального статуса, если за <code>job_id</code>/<code>review_job_id</code> не стоит <em>активный</em> джоб (иначе 409; пропавшие/терминальные джобы аудируются и допускаются). Непустой комментарий обязателен для всех активных состояний кроме <code>pending_report</code>/<code>claimed</code>. Терминальные задачи и epic/feature с незавершёнными потомками отклоняются.</li>
+</ul>
+
+<h2 id="w10">W10 · Вопросы, сообщения, сессии, события</h2>
+
+<h4>Вопрос агента</h4>
+<p><code>hub_ask_question</code> (<code>running → needs_info</code>) → человек отвечает <code>hub_answer_question</code> (human-token) → <code>needs_info → open</code>. Инструмент ответа human-only; stale-alert через 480 мин, но <strong>автоперехода нет</strong> — вопрос ждёт человека сколько угодно.</p>
+
+<h4>Реестр сессий и почта между агентами</h4>
+<ul class="tight">
+  <li><code>hub_session_register</code> / <code>hub_session_heartbeat</code> / <code>hub_sessions</code>: сессия становится адресом. Состояние <code>online</code>/<code>offline</code> по возрасту heartbeat (<code>SESSION_TTL_MINUTES</code> = 10), ретеншен 14 дней.</li>
+  <li><code>hub_send_message</code> / <code>hub_inbox</code>: адресация по <code>session</code> / <code>agent</code> / <code>task</code> / <code>project</code>, виды <code>note</code>/<code>question</code>/<code>answer</code>/<code>handoff</code>/<code>claim_request</code>, лимит 4000 символов и 30 сообщений/мин, ретеншен 14 дней.</li>
+  <li><strong>Инвариант канала:</strong> сообщение — это данные, никогда не команда. Ни одна функция модуля не вызывает переход жизненного цикла.</li>
+  <li><code>unaddressable_tasks</code> — задачи, у которых нет живого адресата.</li>
+</ul>
+
+<h4>Событийный цикл «человек нажал кнопку → агент продолжил»</h4>
+<p><code>hub_wait_events(since, wait, kinds)</code> — long-poll поверх <code>GET /api/events</code> (до 60 c). Курсор возвращается всегда, пустой ответ нормален. Лента — канал уведомлений, а не архив: события старше 14 дней вычищаются, история живёт в <code>activity_log</code>. Дополнительно <code>hub_declare_wait</code> фиксирует, чего именно ждёт агент и до какого срока (объявление без дедлайна или с прошедшим сроком отклоняется).</p>
+<p>Виды событий: <code>task_approved</code>, <code>task_rejected</code>, <code>task_completed</code>, <code>task_decided</code>, <code>needs_decision</code>, <code>claim_expired</code>, <code>review_verdict_recorded</code>, <code>review_dispatched</code>, <code>machine_review_completed</code>, <code>verdict_escalated</code>, <code>question_answered</code>, <code>message_posted</code>, <code>digest_created</code>, <code>audit_result</code>, <code>base_branch_drift</code>, <code>completed_without_delivery</code>, <code>chat_pair_implementer_expired</code>, <code>project_provisioned</code>, <code>project_activated</code>, <code>skill_activated</code>, <code>category_check_recorded</code>.</p>
+
+<h2 id="w11">W11 · Предложения: задачи, проекты, скиллы</h2>
+
+<table>
+  <thead><tr><th>Объект</th><th>Агент</th><th>Человек</th><th>Замечание</th></tr></thead>
+  <tbody>
+    <tr><td>задача</td><td><code>hub_propose_task</code> → <code>draft</code></td><td><code>approve</code> / <code>approve+run</code> / <code>reject</code> / <code>force approve</code></td><td>драфт не исполняется автоматически; автор может отозвать свой драфт</td></tr>
+    <tr><td>проект</td><td><code>hub_propose_project</code></td><td><code>hub_create_project</code>, активация, <code>hub_provision_project</code></td><td>режим <code>ALLOW_AGENT_PROJECTS</code> (дефолт <code>propose</code>); provision трогает ФС и git-креды сервера — агентские токены получают 403</td></tr>
+    <tr><td>скилл</td><td><code>hub_propose_skill</code> → новая версия в статусе draft</td><td>активация версии через UI/PATCH</td><td>активная версия не меняется до решения человека; событие <code>skill_activated</code></td></tr>
+  </tbody>
+</table>
+<div class="card warn">
+  <p>Старый API предложений (<code>/api/proposals*</code>) — deprecated-совместимость поверх задач. <code>POST /api/proposals/{id}/action</code> с <code>action=approved</code> дёргает <code>approve_task(run=True)</code>, то есть <em>одобряет и сразу диспетчеризует</em>; маршрут закрыт human-гейтом именно поэтому.</p>
+</div>
+
+<h2 id="w12">W12 · Доказательства и метрики</h2>
+
+<table>
+  <thead><tr><th>Механизм</th><th>Что фиксирует</th><th>Режим</th></tr></thead>
+  <tbody>
+    <tr><td>Локаторы AC (<code>test_ref</code>)</td><td>pytest nodeid у критерия с <code>verifiable_by=test</code></td><td><code>SDD_AC_LOCATOR</code> (дефолт <code>off</code>)</td></tr>
+    <tr><td>Существование теста</td><td><code>pytest --collect-only</code>: resolvable / missing / unknown</td><td>best-effort, попадает в brief</td></tr>
+    <tr><td>Прогон AC-тестов</td><td>pass/fail на критерий, штамп текущего поколения</td><td><code>SDD_AC_TESTS</code> (дефолт <code>warn</code>)</td></tr>
+    <tr><td>Отчёт прогона CI</td><td><code>POST /api/tasks/{id}/ci-run-report</code>: результаты AC + validation по конкретному sha; усыновляется сдачей</td><td><code>SDD_VALIDATION</code> (дефолт <code>warn</code>)</td></tr>
+    <tr><td>Свежесть утверждений</td><td>что доставили в этих областях с момента написания постановки</td><td>блок brief</td></tr>
+    <tr><td>Места вызова</td><td>где ещё зовётся изменённая функция и трогает ли их дифф</td><td>блок brief</td></tr>
+    <tr><td>Карта изменений</td><td>какие изменения принадлежат какому критерию — и какие ничьи</td><td>блок brief</td></tr>
+    <tr><td>Live check</td><td>кто-то наблюдал работу <em>после</em> выката: <code>done</code> / <code>not_applicable</code> / <code>unknown</code></td><td><code>hub_record_live_check</code></td></tr>
+    <tr><td>Outcome debt</td><td>гипотезы <code>outcome_metric</code>, у которых наступил срок, и ответы на них</td><td><code>hub_outcome_debt</code> / <code>hub_answer_outcome</code></td></tr>
+    <tr><td>Диспозиция находок</td><td>чем находка оказалась после взгляда человека (<code>fixed</code>/<code>wont_fix</code>/…)</td><td>единственная внешняя мера качества ревью</td></tr>
+    <tr><td>Дайджест автопилота</td><td>один на проект в сутки активности: что политика одобрила, что эскалировала, что доставлено + детерминированная ~10% выборка на человеческую проверку</td><td><code>services/digest.py</code>, <code>/digests</code></td></tr>
+    <tr><td>Practice metrics</td><td>долг по категориям, повторяющиеся категории, стоимость подтверждённой находки в токенах, метрики человеческих гейтов и сбежавших дефектов</td><td><code>hub_practice_metrics</code></td></tr>
+    <tr><td>MCP-телеметрия</td><td>вызовы MCP: только метаданные, без аргументов, токенов и тел ответов; бюджет размера каталога проверяется в CI</td><td><code>MCP_TELEMETRY</code> (вкл. по умолчанию), ретеншен 120 дней</td></tr>
+  </tbody>
+</table>
+
+<h2 id="w13">W13 · Сторожа репозитория</h2>
+
+<table>
+  <thead><tr><th>Сторож</th><th>Вопрос</th><th>Частота / режим</th></tr></thead>
+  <tbody>
+    <tr><td>Drift guard</td><td>какие коммиты попали в базовую ветку <strong>мимо</strong> конвейера мержей</td><td>раз в 15 мин; «не смог проверить» логируется явно, а не молчит</td></tr>
+    <tr><td>Red base watch</td><td>красная ли CI самой базовой ветки и что в неё приехало</td><td>раз в 3 мин; объявляется только новая, ещё не объявленная поломка</td></tr>
+    <tr><td>Pre-push hook arming</td><td>у каждого воркспейса проставлен хук защиты веток проекта</td><td>на старте сервера (единственный момент, когда хаб трогает все воркспейсы)</td></tr>
+    <tr><td>Commit-scope gate</td><td>в коммит задачи уходят файлы вне <code>affected_areas</code></td><td><code>COMMIT_SCOPE</code> (дефолт <code>warn</code>); нет объявленной области → проверка не выполнялась, и это пишется явно</td></tr>
+    <tr><td>Surface check</td><td>дифф сдачи против объявленных областей</td><td><code>SDD_SURFACES</code> (дефолт <code>warn</code>)</td></tr>
+    <tr><td>Submit rules</td><td>код меняется без тестов; баг правит только тесты</td><td><code>SUBMIT_RULES</code> (дефолт <code>warn</code>)</td></tr>
+    <tr><td>Branch stacking</td><td>ветка несёт коммиты другой незамерженной ветки задачи</td><td>advisory: alert + подсказка, никогда не отказ</td></tr>
+  </tbody>
+</table>
+<div class="card">
+  <p><strong>Почему «заметить» вместо «запретить».</strong> Репозиторий приватный на бесплатном плане GitHub: branch protection и rulesets недоступны, серверная сторона не может отказать в прямом пуше в main/develop, а клиентский хук обходится через <code>--no-verify</code>. Drift guard — сознательная замена невозможного «предотвратить» на достижимое «заметить».</p>
+</div>
+
+<h2 id="w14">W14 · Иерархия, rollup и жизненный цикл записи</h2>
+<ul class="tight">
+  <li><strong>Rollup:</strong> завершение последнего дочернего <code>task</code> под <code>feature</code> (или последней <code>feature</code> под <code>epic</code>) автозавершает родителя, если все сиблинги <code>completed</code>. Идемпотентно; отдельная функция <code>repair_stale_parent_completions</code> чинит пропущенные случаи.</li>
+  <li><strong>Зависимости:</strong> <code>hub_add_dependency</code> / <code>hub_remove_dependency</code> / <code>hub_list_dependencies</code>; порядок дорожной карты живёт в <code>depends_on</code>. Релизная политика их <em>не</em> учитывает (см. W8).</li>
+  <li><strong>Готовность дерева:</strong> <code>hub_readiness_tree</code> — DoR/readiness по всему поддереву.</li>
+  <li><strong>Архив/восстановление/удаление:</strong> <code>archive</code> (скрыть из доски), <code>unarchive</code>, <code>delete_task_tree</code> (каскад). <code>withdraw_own_draft</code> — автор отзывает собственный драфт.</li>
+  <li><strong>Порядок:</strong> <code>reorder_task</code> (PATCH) — позиция в очереди.</li>
+  <li><strong>Сериализация записи:</strong> <code>get_write_lock</code> накрывает refinement/AC, массовое создание подзадач и пути завершения (done-flow, force_complete). Это <em>не</em> полный per-connection commit lock — широкая сериализация числится в закалочных работах.</li>
+</ul>
+
+<h2 id="poller">15. Фоновые циклы: что и с какой частотой</h2>
+
+<p>Главный цикл — 30 c. Порядок развёрток нагружен смыслом: расчёт ревью идёт до релизной политики, чтобы мерж, полученный на этом проходе, на этом же проходе и уехал в релиз. Каждая развёртка падает в одиночку — общий <code>try</code> лишь доказывает, что цикл не умирает; изоляция по задаче живёт в <code>_task_isolation</code>.</p>
+<pre>каждые 30 c  →  1. _sweep_running_dispatch        синхронизация headless-джобов
+                2. _sweep_review                  вердикты, арбитр, мерж одобренного
+                3. _sweep_pair_delivery           доставка одобренной pair-задачи без агента
+                4. _sweep_ci_check                PR, грейс 180 c, проба CI, fix-циклы
+                5. _sweep_stale_running           alert: running без апдейтов 30 мин
+                6. _sweep_stale_statuses          alert: review 120 / claimed 240 / needs_info 480 /
+                                                  ci_check 60 / fix_requested 60 / pending_report 30
+                7. _sweep_unrefined_drafts        alert: draft без DoR 240 мин (с missing_required)
+                8. _sweep_autopilot_digests       дайджест на проект в сутки
+                9. _sweep_delivery_discrepancies  раз в 15 мин: completed с открытым PR
+               10. _sweep_review_dispatches       расчёт облачных ревью-прогонов
+               11. _sweep_expired_claims          claim lease 240 мин → open
+               12. _sweep_machine_deadlines       матрица дедлайнов → needs_decision
+               13. _sweep_stale_arbiter           «диспетчеризую» дольше 15 мин → needs_decision
+               14. _sweep_events_retention        лента: 14 дней
+               15. _sweep_sessions_retention      сессии: 14 дней
+               16. _sweep_release_policy          develop→main по политике; стойло 3 цикла → в feed
+               17. _sweep_messages_retention      сообщения: 14 дней
+               18. _sweep_mcp_retention           MCP-телеметрия: 120 дней
+
+каждые 3 мин  →  _red_base_watch                  красная ли CI базовой ветки
+каждые 15 мин →  _drift_watch                     коммиты мимо конвейера
+каждый час    →  _session_reaper                  протухшие браузерные сессии + чистка rate-limiter
+на старте     →  arm_workspace_hooks              pre-push хук во всех воркспейсах</pre>
+
+<h2 id="switches">16. Переключатели режимов</h2>
+
+<p>Почти вся «строгость» процесса — рантайм-настройка. Столбец «по умолчанию» показывает, что реально действует на свежей установке.</p>
+<table>
+  <thead><tr><th>Переменная</th><th>Значения</th><th>По умолчанию</th><th>Что делает в дефолте</th></tr></thead>
+  <tbody>
+    <tr><td><code>HAIPLANE_AUTO_APPROVE_MAX_CLASS</code></td><td>off / r0 / r1</td><td><span class="badge b-off">off</span></td><td>оба автопилота (DoR и вердикт) выключены глобально</td></tr>
+    <tr><td><code>HAIPLANE_MACHINE_REVIEW</code></td><td>warn / require</td><td><span class="badge b-off">warn</span></td><td>разрыв показывается, APPROVED не блокируется</td></tr>
+    <tr><td><code>HAIPLANE_SDD_AC_TESTS</code></td><td>off / warn / require</td><td><span class="badge b-off">warn</span></td><td>красные AC-тесты не мешают одобрению</td></tr>
+    <tr><td><code>HAIPLANE_SDD_AC_LOCATOR</code></td><td>off / warn / require</td><td><span class="badge b-off">off</span></td><td>локаторы тестов не требуются</td></tr>
+    <tr><td><code>HAIPLANE_SDD_VALIDATION</code></td><td>off / warn / require</td><td><span class="badge b-off">warn</span></td><td>отсутствие отчёта о прогоне не блокирует</td></tr>
+    <tr><td><code>HAIPLANE_SDD_SURFACES</code></td><td>off / warn / require</td><td><span class="badge b-off">warn</span></td><td>дифф вне объявленных областей — только запись</td></tr>
+    <tr><td><code>HAIPLANE_SUBMIT_RULES</code></td><td>off / warn / require</td><td><span class="badge b-off">warn</span></td><td>код без тестов проходит сдачу</td></tr>
+    <tr><td><code>HAIPLANE_COMMIT_SCOPE</code></td><td>off / warn / require</td><td><span class="badge b-off">warn</span></td><td>чужие файлы уезжают в коммит задачи с пометкой</td></tr>
+    <tr><td><code>HAIPLANE_REVIEW_SELF_APPROVE</code></td><td>forbid / allow</td><td><span class="badge b-machine">forbid</span></td><td>исполнитель не может одобрить себя</td></tr>
+    <tr><td><code>ALLOW_AGENT_PROJECTS</code></td><td>propose / …</td><td>propose</td><td>агент предлагает проект, не создаёт</td></tr>
+    <tr><td><code>MAX_REVIEW_CYCLES</code> / <code>MAX_CI_FIX_CYCLES</code></td><td>число</td><td>3 / 3</td><td>после — арбитр / needs_decision</td></tr>
+    <tr><td><code>REVIEW_TOKEN_BUDGET</code> / <code>REVIEW_LITE_TOKEN_BUDGET</code></td><td>число</td><td>300000 / 40000</td><td>потолки профилей ревью</td></tr>
+    <tr><td><code>HAIPLANE_PROVEN_EMPTY_MAX_CLASS</code></td><td>класс</td><td>r1</td><td>до какого класса «доказанно пустое» ревью годится для автовердикта</td></tr>
+    <tr><td>дедлайны / stale-пороги</td><td>минуты</td><td>см. §2 и §15</td><td>—</td></tr>
+    <tr><td>gate_policy проекта</td><td><code>dor</code>, <code>verdict</code>, <code>review</code>, <code>release</code>, <code>dor_max_class</code></td><td>всё ручное</td><td>проект может только <em>понизить</em> глобальный потолок, не поднять</td></tr>
+  </tbody>
+</table>
+
+<div class="card warn">
+  <p><strong>Что реально включено на проде</strong> (прочитано у самого хаба через <code>hub_my_context</code>, инстанс <code>vm-5c8197</code>, 28.08.2026). Столбец «по умолчанию» выше — это дефолт <em>кода</em>; действующая конфигурация отличается, и разница меняет чтение разделов W1 и W6:</p>
+  <ul class="tight">
+    <li><code>auto_approve_max_class = r1</code> — автопилоты <strong>включены</strong>, а не выключены: и автоодобрение драфта, и автовердикт разрешены до класса R1. Это тот самый глобальный kill-switch, и он снят.</li>
+    <li><code>sdd_ac_locator = require</code> — единственный блокирующий гейт из семи.</li>
+    <li><code>sdd_ac_tests</code>, <code>sdd_validation</code>, <code>submit_rules</code>, <code>machine_review</code> — все в <code>warn</code>.</li>
+    <li><code>worktree_per_task = true</code> — то есть смягчение <a href="#g12">G12</a> на проде действует, но остаётся настройкой, а не свойством кода.</li>
+  </ul>
+  <p>Проект <code>default</code> (сам хаб) при этом держит <code>gate_policy: dor=human, verdict=human</code>, поэтому автопилоты до собственных задач хаба не дотягиваются — их сдерживает политика проекта, а не глобальный ключ. На <code>calc-kids</code> и <code>spike-bo</code> стоит <code>dor=auto, verdict=auto</code>: там автопилот работает в полную силу.</p>
+</div>
+
+<h2 id="gaps">17. Кандидаты в пробелы — вопросы к аудиту</h2>
+
+<p class="lede">Ниже — наблюдения, собранные при чтении кода. Это <strong>не</strong> подтверждённые дефекты: часть может быть сознательным решением. У каждого — риск (как именно ломается), последствие (чего стоит) и рекомендация (что сделать). Приоритет и усилие — оценка автора карты, а не решение владельца.</p>
+
+<p class="lede">Колонка «Статус» ведётся с 29.08.2026 (волна 1, задача #1016). <strong>Закрыто</strong> означает не «правка написана», а «поведение закреплено тестом, который краснеет при откате этой правки» — мутационная проверка сделана поимённо и её результат записан в карточке находки. Всё, что не помечено, остаётся открытым: карта не превращает молчание в закрытие.</p>
+
+<table>
+  <thead><tr><th>ID</th><th>Что ломается</th><th>Приоритет</th><th>Усилие</th><th>Статус</th></tr></thead>
+  <tbody>
+    <tr><td><a href="#g12">G12</a></td><td><code>git clean -fd</code> в общем клоне уничтожает незакоммиченную работу</td><td><span class="badge b-p1">P1</span></td><td>S</td><td><span class="badge b-done">закрыто</span> #1017, #1040</td></tr>
+    <tr><td><a href="#g7">G7</a></td><td>синтетический done из лога открывает конвейер доставки</td><td><span class="badge b-p1">P1</span></td><td>S</td><td><span class="badge b-done">закрыто</span> #1018</td></tr>
+    <tr><td><a href="#g6">G6</a></td><td>вердикт, найденный сканированием текста, завершает задачу</td><td><span class="badge b-p1">P1</span></td><td>S</td><td><span class="badge b-done">закрыто</span> #1019</td></tr>
+    <tr><td><a href="#g3">G3</a></td><td>человеческие очереди стоят без часов и без повторного сигнала</td><td><span class="badge b-p1">P1</span></td><td>M</td><td><span class="badge b-done">закрыто</span> #1020</td></tr>
+    <tr><td><a href="#g5">G5</a></td><td>две реализации доставки расходятся в политике</td><td><span class="badge b-p2">P2</span></td><td>M</td><td>открыто</td></tr>
+    <tr><td><a href="#g9">G9</a></td><td>ветка сдачи проверяется по отчёту клиента, а не наблюдением</td><td><span class="badge b-p2">P2</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g1">G1</a></td><td>карта переходов, которую читает агент, неполна</td><td><span class="badge b-p2">P2</span></td><td>M</td><td>открыто</td></tr>
+    <tr><td><a href="#g4">G4</a></td><td>реальная строгость процесса живёт в дропине, а не в репозитории</td><td><span class="badge b-p2">P2</span></td><td>M</td><td>открыто</td></tr>
+    <tr><td><a href="#g15">G15</a></td><td>основания решений вычищаются раньше, чем случается разбор</td><td><span class="badge b-p2">P2</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g8">G8</a></td><td>релиз не читает <code>depends_on</code>, который уже есть</td><td><span class="badge b-p2">P2</span></td><td>M</td><td>открыто</td></tr>
+    <tr><td><a href="#g11">G11</a></td><td>гейт плана обходится сменой инструмента старта</td><td><span class="badge b-p3">P3</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g13">G13</a></td><td>тихие отказы автопилота не считаются — расширять его не на чем</td><td><span class="badge b-p3">P3</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g2">G2</a></td><td><code>fix_requested</code> — статус без объявленного выхода</td><td><span class="badge b-p3">P3</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g10">G10</a></td><td>deprecated-маршрут одобряет и диспетчеризует одним вызовом</td><td><span class="badge b-p3">P3</span></td><td>S</td><td>открыто</td></tr>
+    <tr><td><a href="#g14">G14</a></td><td>возраст ветки не виден ревьюеру</td><td><span class="badge b-p3">P3</span></td><td>S</td><td>открыто</td></tr>
+  </tbody>
+</table>
+
+<div class="gap" id="g1">
+<h4><span class="gap-id">G1</span> Карта переходов, которую читает агент, беднее реальной <span class="badge b-p2">P2</span></h4>
+<p class="obs"><code>LIFECYCLE_TRANSITIONS</code> не содержит ни одного из переходов §3.2: нет <code>review→needs_decision</code>, <code>ci_check→needs_decision</code>, <code>running→failed</code>, <code>review→completed</code>, дедлайновых эскалаций, rollup родителя, доставки поллером. Агент, следующий карте, не знает половины состояний, в которых может оказаться его задача.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Агент, оказавшийся в незадекларированном состоянии, не имеет в карте следующего шага. Дальше два поведения, оба плохие: повторять последний инструмент до отказа или додумывать переход (<code>report_done</code> из <code>needs_decision</code>). Карта к тому же цитируется агентом человеку — неверная версия расходится в чаты и постановки.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Задача стоит до ручного обхода доски: в человеческих статусах alert пишется один раз (см. <a href="#g3">G3</a>), так что второго сигнала не будет. Токены на невалидные попытки MCP-телеметрия считает как обычные вызовы — цена этих циклов не видна ни в одном отчёте.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Сделать таблицу производной от кода, а не параллельным списком. Минимальный шаг — тест полноты: собрать все места записи статуса (<code>update_task(status=…)</code>, <code>transition_status_if</code>) и потребовать, чтобы каждая пара <code>(from,to)</code> имела строку в таблице либо явную отметку «внутренний». Приём уже работает в проекте: тест покрытия <code>lifecycle_matrix</code> ломается при добавлении нового статуса.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g2">
+<h4><span class="gap-id">G2</span> <code>fix_requested</code> — статус без объявленного выхода <span class="badge b-p3">P3</span></h4>
+<p class="obs">В декларации есть вход (<code>needs_decision → fix_requested</code>) и нет ни одного исходящего перехода. Фактический выход — <code>dispatch_fix</code> → <code>running</code>, плюс дедлайн 180 мин → <code>needs_decision</code>.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Диспетчер недоступен — задача садится в статус, из которого ни агент (нет перехода в карте), ни человек (в UI нет кнопки, в отличие от <code>needs_decision</code>) не имеют нормального выхода. Остаётся дедлайн.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>До трёх часов простоя на каждый сбой диспетчеризации, невидимого до срабатывания дедлайна. <code>force_complete</code> здесь не выход: он требует комментария и завершает задачу, которую нужно было доработать.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Выбрать одно из двух. Либо признать статус полноценным: добавить <code>fix_requested → running</code> в декларацию и кнопку «вернуть в работу» в карточку. Либо признать его чисто транзитным и схлопнуть в <code>running</code> с пометкой причины — тогда из матрицы уходит целый экземпляр вместе со своим дедлайном и stale-порогом. Второе дешевле в поддержке.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g3">
+<h4><span class="gap-id">G3</span> Человеческие тупики без срока годности <span class="badge b-p1">P1</span></h4>
+<p class="obs">По инварианту матрицы у human-экземпляров дедлайна быть не должно. Следствие: <code>needs_decision</code>, <code>needs_info</code>, <code>review:client</code> и <code>draft</code> могут стоять неограниченно долго — есть только alert, и он пишется <strong>один раз</strong> (дедуп по <code>has_stale_alert</code>).</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Вся машинерия сроков накрывает machine-статусы — те, что и так шумят и всё равно эскалируют сами. Статусы, где работа реально стоит, не имеют ни часов, ни повторного напоминания. Единственный детектор — глаза человека на дашборде, то есть ровно тот ресурс, дефицит которого создал очередь.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Классический отказ: работа сделана, ждёт одного клика, стоит неделями. Для <code>needs_info</code> хуже — агент уже потратил бюджет и контекст, и к моменту ответа его сессия мертва: ответ придётся дублировать в новую сессию, а часть контекста восстанавливать заново. Метрика «время до доставки» при этом деградирует незаметно, потому что задача формально жива.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Эскалировать по возрасту, а не по статусу: лестница напоминаний 24ч / 72ч / 7д для всех human-owned экземпляров, с записью в activity feed и строкой в дайджест. Механика уже написана — <code>_STALE_LADDER_MINUTES</code> применяется к <code>running</code>. Инвариант матрицы не нарушается: меняется громкость, а не владелец и не статус.</dd>
+  <dt class="done">Закрыто</dt>
+  <dd class="done">Задача <strong>#1020</strong>, ровно рекомендованным способом: лестница 24/72/168 ч для human-owned экземпляров матрицы, напоминание в events и activity feed плюс строка в дайджест, статус и владелец не меняются. Дедуп — по ступени, в отдельной таблице <code>human_queue_reminders</code> с ключом (задача, экземпляр, отметка входа, ступень): ключ включает отметку входа, поэтому повторный вход в тот же статус начинает лестницу заново. Тесты: <code>tests/test_poller.py::test_human_owned_reminder_ladder</code>, <code>::test_reminder_dedup_per_step</code>, <code>::test_ladder_three_steps</code>, <code>::test_reminder_ladder_restarts_after_a_new_wait</code>, <code>::test_rung_is_part_of_the_dedup_key</code>, <code>tests/test_autopilot_digest.py::test_digest_lists_waiting_human_queue</code>.
+  <br><br>Тест <code>::test_rung_is_part_of_the_dedup_key</code> дописан этой волной, а не задачей #1020, и вот почему это стоит помнить. Мутационная проверка роллапа показала, что дедуп можно вернуть к прежней форме «одно напоминание навсегда» — убрать ступень из ключа — и все четыре теста G3 останутся зелёными. Причина в фикстуре: возраст в них растёт единственным доступным тесту способом, переписыванием <code>status_entered_at</code>, поэтому каждая ступень попадает под СВОЮ отметку и ключ проверяется без ступени. В проде отметка неподвижна, а движется <code>now</code> — то есть ровно тот случай был не покрыт. Новый тест спрашивает про ключ напрямую: одно ожидание, одна отметка, ступень уже прозвучавшая и ступень ещё должная.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g4">
+<h4><span class="gap-id">G4</span> Почти все гейты качества по умолчанию в <code>warn</code> <span class="badge b-p2">P2</span></h4>
+<p class="obs">Шесть из семи проверок сдачи (§16) в дефолте только пишут строку. На проде <code>AC_LOCATOR=require</code>, остальные два SDD-гейта в <code>warn</code>.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Строгость процесса определяется дроп-ином на машине, а не репозиторием: конфигурация не проходит ревью и не воспроизводится при переустановке — дефолты молча вернутся в <code>warn</code>. Отдельно: гейт, годами стоящий в <code>warn</code>, не отлажен, и перевод в <code>require</code> даст волну ложных отказов, почти гарантируя откат обратно.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Система выглядит строгой в коде и в документации, а работает мягко. Любое утверждение вида «у нас есть гейт на X» неверно без проверки конкретного инстанса — включая утверждения, которые сам хаб отдаёт агентам в контексте.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Три шага, каждый дешёвый. (1) Показать эффективные режимы одним экраном в <code>hub_health</code> и на дашборде — «какая строгость сейчас». (2) Для каждого <code>warn</code>-гейта посчитать по отчётам сдачи за 30 дней, сколько сдач он бы отклонил; решение о переводе в <code>require</code> принимать на этом числе, а не на ощущении. (3) Зафиксировать целевую конфигурацию в репозитории и проверять на старте, что фактическая совпадает, — расхождение в лог.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g5">
+<h4><span class="gap-id">G5</span> Два независимых места мержа <span class="badge b-p2">P2</span></h4>
+<p class="obs">Доставка выполняется и в <code>poller._deliver_approved_review</code> (headless), и в <code>orchestration.merge_before_completion</code> (pair + поллер доставки). Логика похожа, но не общая: проба CI, запись <code>pipeline_merge</code>, уборка воркспейса продублированы.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Правку политики доставки внесут в одно место. Пути уже разошлись: <code>merge_before_completion</code> умеет «уже доставлено» через <code>pipeline_merge_recorded</code> и сверку «код не ушёл из-под одобрения», headless-ветка строит свою последовательность. Каждая следующая защита будет добавляться туда, где произошёл инцидент.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Headless- и pair-задачи доставляются по разным правилам, и разница обнаруживается инцидентом, а не тестом. Это ровно тот класс, из которого выросли #363 и #605 — оба про «задача completed, работа не в базовой ветке».</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Свести <code>_deliver_approved_review</code> на <code>merge_before_completion</code>, оставив в поллере только решение о том, что делать с отказом, — так уже сделано в <code>_deliver_pair_task</code>, образец есть рядом. Проверяемый признак готовности: в кодовой базе ровно один вызов <code>merge_pr</code>.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g6">
+<h4><span class="gap-id">G6</span> Вердикт из свободного текста как рабочий фолбэк <span class="badge b-p1">P1</span></h4>
+<p class="obs"><code>extract_review_verdict</code> / <code>scan_text_for_verdict</code> вытаскивают APPROVED/CHANGES_REQUESTED сканированием апдейтов и лога джоба, когда структурного вердикта нет. Путь помечен как legacy, но живой.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Сканирование находит слово в тексте, который вердиктом не является: в цитате находки, в плане, в чужом сообщении, в куске диффа, попавшем в лог. Порог срабатывания — совпадение строки; последствие срабатывания — открытие пути доставки.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Доставка по вердикту, которого никто не выносил. Это единственное место, где Universal Review Gate обходится не человеком и не политикой, а случайностью текста, — то есть обход, который не остаётся в аудите как обход, в отличие от <code>force_complete</code> и <code>decide accept</code>.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Сначала измерить: по событиям <code>review_verdict_recorded</code> видно соотношение persisted и scanned. Если доля мала — выключить за флагом с дефолтом <code>off</code>; если велика — чинить клиента, который не умеет <code>hub_submit_review</code>, а не оставлять сканер. Промежуточный шаг на час: вердикт, полученный сканированием, не завершает задачу, а отправляет её в <code>needs_decision</code> с процитированным основанием.</dd>
+  <dt class="done">Закрыто</dt>
+  <dd class="done">Задача <strong>#1019</strong>: сканированный APPROVED больше не вердикт — задача уходит в <code>needs_decision</code> с собственной причиной <code>scanned_approval_not_a_verdict</code>, вердикт не записывается, мерж не запускается, а алерт цитирует строку, принятую за вердикт, и называет источник. Отдельная причина, а не общая — обход обязан оставаться в аудите КАК обход, ради чего находка и заводилась. Сканированный CHANGES_REQUESTED оставлен рабочим: он возвращает работу, а не открывает доставку. Тесты: <code>tests/test_poller.py::test_scanned_verdict_does_not_complete</code>, <code>::test_scanned_verdict_quotes_its_basis</code>, <code>::test_poll_uses_persisted_verdict_without_text_scan</code>. Мутация «вернуть сканированному APPROVED права вердикта» роняет первые два.
+  <br><br>Замер до правки: <strong>0 из 337</strong> вердиктов за 30 дней пришли сканированием. Считать пришлось обходными путями, и это стоит держать в виду при следующем разборе: событие <code>review_verdict_recorded</code> НЕ несёт источника вердикта, то есть метрика, ради которой оно бы читалось, из него не считается вовсе.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g7">
+<h4><span class="gap-id">G7</span> Синтетический done-отчёт из лога джоба <span class="badge b-p1">P1</span></h4>
+<p class="obs">Если headless-джоб завершился без done-отчёта, поллер берёт последний длинный текст из лога и записывает его как <code>kind=done</code>. Дальше этот текст неотличим от настоящего отчёта агента и открывает весь пост-done конвейер.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Агент, упавший на середине или упёршийся в лимит, «отчитывается» своим последним рассуждением. Отбор — по длине строки, а не по смыслу: критерий не отличает отчёт о работе от размышления о том, что делать дальше. Дальше открывается git-хвост: commit, squash, push, create PR.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Незаконченная работа уезжает в PR и на ревью. Цена одного такого случая — прогон ревьюера (до 300k токенов профиля <code>deep</code>) по заведомо неготовому коду, плюс мусор в базовой ветке, если дальше сработает автомерж. Комбинация с <a href="#g9">G9</a> опаснее: не та ветка плюс неподтверждённый отчёт дают зелёное ревью по чужому коду.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Не запрещать синтетику, а лишить её прав настоящего отчёта: пометить отдельным полем и маршрутизировать в <code>pending_report</code> — статус ровно для этого и существует («работа кончилась, нормального отчёта нет»). Одна ветка в <code>_sweep_running_dispatch</code>; человек увидит задачу в инбоксе вместо PR на ревью.</dd>
+  <dt class="done">Закрыто</dt>
+  <dd class="done">Задача <strong>#1018</strong>, ровно рекомендованным способом: колонка <code>task_updates.agent_claimed</code> (дефолт 1, чтобы история не переосмысливалась), транскрипция пишется с <code>agent_claimed=0</code>, а <code>has_done_updates</code> считает только заявленные отчёты. Тесты: <code>tests/test_poller.py::test_synthetic_done_routes_to_pending_report</code>, <code>::test_synthetic_done_is_flagged_in_db</code>, <code>::test_real_done_report_still_reaches_ci_check</code>. Мутация «вернуть транскрипции права отчёта» (<code>agent_claimed=True</code>) роняет первые два; третий остаётся зелёным — он сторожит отсутствие регрессии на настоящем отчёте, и это верно.
+  <br><br>Замер до правки: <strong>ноль</strong> срабатываний за 30 дней по трём независимым источникам (нет строк <code>kind=done</code> от константы поллера; ни одной задачи с <code>job_id</code> за период; ноль строк в логе прода). Путь был спящим — правка профилактическая, до включения headless.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g8">
+<h4><span class="gap-id">G8</span> Релиз не понимает порядок задач <span class="badge b-p2">P2</span></h4>
+<p class="obs">Сказано прямо в коде: до first-class <code>depends_on</code> релизная политика — «тупой конвейер», поэтому её дефолт <code>manual</code>. Но <code>depends_on</code> в хабе уже есть (W14) и в релизе не читается.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Релиз несёт develop целиком и берёт с собой работу других сессий. Два изменения с обязательным порядком уезжают одним релизом, и порядок их применения на проде определяется тем, как легли коммиты. Прецедент записан в самом коде: #806 и #807 должны были ехать в определённом порядке и поехали правильно «по случайности».</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Отказ проявляется на проде, а не в CI: обе задачи по отдельности зелёные, ломается их композиция. Диагностика тяжёлая — релиз выглядит как одно событие, а причина в паре внутри него.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Не сортировать, а отказываться — это дешевле и закрывает основной риск. Перед мержем релизного PR проверить, что в диапазоне нет пары задач, связанных <code>depends_on</code>, где зависимая доставлена раньше своей зависимости; при нарушении не мержить и написать причину (механика «сказать один раз» для стойла уже есть). Полноценную сортировку оставить на момент, когда зависимости станут обязательными.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g9">
+<h4><span class="gap-id">G9</span> Сверка ветки — отчёт, а не наблюдение <span class="badge b-p2">P2</span></h4>
+<p class="obs"><code>submit_for_review</code> сравнивает <em>заявленную</em> клиентом ветку с канонической. У хаба на проде нет рабочей копии проекта (в воркспейсе <code>.placeholder</code>), поэтому клиент, назвавший правильную ветку и сидящий в другой, проходит. Это записано в коде и в политике теми же словами.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Проверка ловит «забыл переключиться» и не ловит ничего сложнее. Вся конструкция сравнивает две декларации клиента между собой — независимого источника в ней нет, хотя рядом уже есть код, который ходит в remote (<code>resolve_branch_tip</code>).</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Ревью и CI смотрят ветку, в которой нужной работы нет. Пин <code>submission_sha</code> закрывает вопрос «код не менялся после сдачи», но не вопрос «это вообще та ветка»: пин честно фиксирует вершину не той ветки. Вердикт при этом получается валидным по всем признакам системы.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Добавить один независимый вопрос к remote на сдаче: существует ли заявленная ветка на origin и отличается ли её вершина от базовой (то есть есть ли в ней вообще работа). Это не гарантия, но переводит проверку из класса «верим отчёту» в класс «спросили источник» — та же граница, которую документ уже проводит для CI и диффа.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g10">
+<h4><span class="gap-id">G10</span> Deprecated API предложений всё ещё одобряет-и-запускает <span class="badge b-p3">P3</span></h4>
+<p class="obs"><code>POST /api/proposals/{id}/action</code> с <code>action=approved</code> вызывает <code>approve_task(run=True)</code> — одобрение и немедленный dispatch одним вызовом. Маршрут закрыт human-гейтом, но остаётся живым альтернативным путём в <code>running</code> мимо явного гейта плана.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Единственный путь в <code>running</code>, где план не спрашивается вообще. Human-токен здесь слабая защита: человек с токеном — это ровно тот, кто ходит скриптом, а скрипт написан по старому контракту и не знает про план.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Задача уходит агенту без плана и без явного решения о старте; расхождение с описанным процессом обнаружится не как ошибка, а как задача, которая «почему-то уже бежит».</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Посмотреть по MCP-телеметрии и access-логу, были ли вызовы за 90 дней. Не было — удалить маршрут: он deprecated и не является внешним контрактом. Были — снять <code>run=True</code>, оставив только одобрение, и назвать в ответе инструмент для старта.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g11">
+<h4><span class="gap-id">G11</span> Два пути в <code>running</code> с разной строгостью <span class="badge b-p3">P3</span></h4>
+<p class="obs"><code>hub_start_task</code> — human-only и требует план. <code>hub_pair_start</code> — агентский и плана в теле не требует (план ожидается update-ом).</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Гейт стоит на инструменте, а не на переходе. Агент выбирает <code>pair_start</code> — не в обход правила, а потому что это его штатный путь, — и требование плана просто не встречается на дороге.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Правило существует в документации и применяется к пути, которым ходят реже: pair — основной режим работы почти всех сессий. Де-факто гейт плана не действует, при этом описан как один из шести обязательных человеческих гейтов.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Решить, правило это или свойство инструмента, и привести систему в соответствие с решением. Если правило — проверять наличие <code>Plan:</code> в <code>pair_start</code> тем же кодом, что в <code>start_task</code> (проверка написана, вопрос в вызове). Если не правило — убрать требование из <code>start_task</code> и из перечня гейтов, чтобы документация не описывала несуществующий контроль.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g12">
+<h4><span class="gap-id">G12</span> Уборка воркспейса и потеря незакоммиченного <span class="badge b-p1">P1</span></h4>
+<p class="obs"><code>git checkout . &amp;&amp; git clean -fd</code> при грязном worktree описан в документации как риск для человека, а не как проверка в коде. С <code>HAIPLANE_WORKTREE_PER_TASK=1</code> риск меньше, но флаг не обязателен.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Единственный в системе разрушительный побочный эффект, защищённый чек-листом, а не кодом. <code>clean -fd</code> удаляет и неотслеживаемые файлы, то есть ровно то, что ещё не попало ни в один коммит и не восстанавливается из git вообще.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Необратимая потеря работы человека, срабатывающая в момент, когда он просит хаб начать pair-сессию, — то есть в обычном, а не в исключительном сценарии. Асимметрия с остальной системой полная: доставку хаб не выполняет без пробы CI, а очистку рабочего каталога выполняет без подтверждения.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>По умолчанию отказывать при грязном worktree (422 с текстом «закоммитьте или спрячьте изменения»), очистку оставить за явным флагом вызова. Механика отказа уже есть — <code>pair_start</code> отказывает на грязной <em>чужой</em> ветке; нужно распространить её на свой клон. Более дешёвая альтернатива на сегодня: включить <code>HAIPLANE_WORKTREE_PER_TASK</code> по умолчанию, чтобы ветка задачи не делила каталог с работой человека.</dd>
+  <dt class="done">Закрыто</dt>
+  <dd class="done">Задачи <strong>#1017</strong> (отказ называет файлы и даёт команду, которая работу сохраняет) и <strong>#1040</strong> (отказ адресован тому, кто может его снять: общий клон — человеку, worktree задачи — агенту). Тесты: <code>tests/test_git_ops.py::test_dirty_refusal_names_the_files_and_the_way_out</code>, <code>::test_shared_clone_refusal_names_the_files</code>, <code>::test_dirty_refusal_counts_the_files_it_does_not_name</code>, <code>tests/test_actionable_errors.py::test_pair_branch_dirty_wakes_a_human</code>, <code>::test_pair_worktree_dirty_stays_with_the_agent</code>, <code>::test_dirty_reasons_no_longer_fall_back</code>. Мутации: убрать имена файлов из отказа — краснеют первые два; свести обоих адресатов к одному — краснеют последние два.
+  <br><br>Уточнение к самому наблюдению, найденное при закрытии: разрушительной команды в коде уже нет вовсе — <code>git clean</code> не вызывается ни из одного места <code>hub/</code>, строка <code>clean -fd</code> осталась только в комментарии, объясняющем прежнюю форму. Отказ при грязном дереве (<code>#361 I2</code>) появился раньше этого аудита, и карта на момент чтения описывала G12 строже, чем было в коде. Проверено мутацией: отключение самой проверки в <code>create_branch</code> НЕ роняет <code>::test_create_branch_refuses_dirty_workspace_instead_of_cleaning</code> — обещание теста («файлы на месте») держит отсутствие команды, а не эта проверка. То есть у G12 два слоя, и тестом закреплён верхний.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g13">
+<h4><span class="gap-id">G13</span> Наблюдаемость самих автопилотов <span class="badge b-p3">P3</span></h4>
+<p class="obs">Автоодобрение пишет апдейт и событие; автовердикт эскалирует громко, а отказывает молча — «человеческий гейт просто стоит». Дайджест видит только активность, а не тихие отказы (кроме случая потолка «доказанной пустоты», который пишется отдельно).</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Молчаливый отказ — правильное поведение (человеческий гейт и так на месте), но он не оставляет следа. Ответ на «почему эта задача не автоодобрилась» требует восстановления по двум конфигам, политике проекта и классу риска — вручную и задним числом.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Автопилот, поведение которого непрозрачно, не расширяют — его опасаются включать. Это прямо тормозит эпик #736: решение о расширении полосы должно приниматься по данным, а данные о том, что именно и как часто удерживает полосу, не собираются.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Считать причины тихих отказов, не поднимая громкость: счётчик по основаниям в дайджест — «не автоодобрено: класс выше потолка — 12, лестница — 3, нет пина коммита — 5, нет декларации модели — 7». Это ровно та статистика, на которой принимается следующее решение о полосе, и сейчас она теряется каждым вызовом.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g14">
+<h4><span class="gap-id">G14</span> Расхождение ветки разработки и продакшна <span class="badge b-p3">P3</span></h4>
+<p class="obs">Рабочая ветка <code>task-851/cli-coverage</code> отстаёт от <code>develop</code> на 124 коммита; часть инструментов, которые прод уже публикует по MCP (например <code>hub_declare_wait</code>), в ней отсутствует.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Ревью такой ветки судит о системе, которой уже нет: тесты зелёные против старого контракта, дифф читается против устаревшей базы. Возраст ветки нигде не показан — ни в карточке задачи, ни в review brief рядом с командой диффа.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Мерж даёт либо конфликты (заметно и дёшево), либо тихую регрессию — возврат старого поведения в файлах, которые не конфликтуют. Второе не ловится ни CI, ни ревью, потому что и то и другое смотрело на согласованную внутри себя старую картину.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Показывать возраст ветки в review brief рядом с <code>diff_command</code>: «отстаёт от базы на N коммитов / M дней». Данные уже добываются — <code>release_range</code> и <code>branch_diff</code> ходят туда же. Блокировать не нужно: достаточно, чтобы цифра попалась ревьюеру до того, как он начнёт читать дифф.</dd>
+</dl>
+</div>
+
+<div class="gap" id="g15">
+<h4><span class="gap-id">G15</span> Ретеншен ленты против аудита <span class="badge b-p2">P2</span></h4>
+<p class="obs">События живут 14 дней, сообщения 14, сессии 14, MCP-телеметрия 120. История «что решил хаб» остаётся в <code>activity_log</code>, но структурные payload'ы событий (в том числе <code>reason</code> эскалаций) исчезают.</p>
+<dl class="rr">
+  <dt class="risk">Риск</dt>
+  <dd>Вычищается именно структура — <code>reason</code> эскалации, основания автовердикта, <code>via</code> у завершения. Остаётся проза в <code>activity_log</code>, по которой можно прочитать историю, но нельзя её посчитать. Горизонт 14 дней короче типичного срока обнаружения процессных дефектов.</dd>
+  <dt class="cost">Последствие</dt>
+  <dd>Инцидент, замеченный через месяц («почему эта задача считается доставленной»), разбирается по тексту, а не по фактам. Отдельно: отчёты с окном 90 дней частично опираются на данные, которых уже нет, то есть отвечают на меньшем интервале, чем заявляют, — и это не видно в самом отчёте.</dd>
+  <dt class="fix">Рекомендация</dt>
+  <dd>Развести уведомление и журнал решений. Лента уведомлений может жить 14 дней. События, которые меняют статус или несут основание (<code>needs_decision</code>, <code>verdict_escalated</code>, <code>task_approved</code> с <code>actor=policy</code>, <code>completed_without_delivery</code>, <code>claim_expired</code>), должны переживать окно самого длинного отчёта — то есть не меньше 120 дней, как MCP-телеметрия. Дешёвый вариант первым шагом: не удалять события с непустым <code>reason</code>.</dd>
+</dl>
+</div>
+
+<div class="card">
+  <p><strong>Что бы я делал в первую очередь.</strong> Четыре P1 закрывают разные классы: <a href="#g12">G12</a> — единственная необратимая потеря данных; <a href="#g7">G7</a> и <a href="#g6">G6</a> — два места, где конвейер доставки открывается текстом, который никто не заявлял как решение; <a href="#g3">G3</a> — единственный класс простоя, который сейчас не замечает никто, кроме человека, у которого и так нет времени. Три из четырёх — правки на несколько десятков строк: это не большая работа, это невыбранная работа.</p>
+  <p><strong>Что из этого сделано (29.08.2026, волна 1 — #1016).</strong> Все четыре P1 закрыты и закреплены тестами: G12 (#1017, #1040), G7 (#1018), G6 (#1019), G3 (#1020). Два замера, сделанные до правок, стоит запомнить отдельно от самих правок: и синтетический done-отчёт, и сканированный вердикт срабатывали <strong>ноль</strong> раз за 30 дней. Оба входа были реальны по коду и спящими по факту — их закрыли до того, как включат headless-путь, а не после того, как он что-то увёз. Обратная сторона: обе цифры пришлось добывать обходными путями, потому что ни одно событие не несёт источника вердикта и не отличает заявленный отчёт от транскрипции — до волны 1 этого различия в данных не существовало вовсе.</p>
+  <p><strong>Чему научила сама проверка.</strong> Роллап не пересказывал отчёты, а откатывал каждую правку и смотрел, краснеет ли её тест. Две вещи всплыли только так, и обе — не про код, а про то, что мы считаем доказательством. У G12 разрушительной команды в коде уже нет вовсе, поэтому тест держится не той проверкой, которую охраняет. У G3 все четыре теста переживали возврат дедупа к прежней форме, потому что фикстура растила возраст переписыванием отметки входа — то есть проверяла не тот ключ. Правки были верными в обоих случаях; неверными были основания считать их проверенными. Мутационный проход на сдаче волны — дешёвый способ поймать это до того, как зелёный прогон станет аргументом.</p>
+</div>
+
+<hr>
+<p class="src">Документ описателен и построен чтением кода на <code>origin/develop@f11ee6c</code>. При внесении в репозиторий (29.08.2026) в нём заменено одно имя: переменная окружения ребрендинга — <code>HAIPLANE_WORKTREE_PER_TASK</code>, прежний префикс хаб больше не читает. Наблюдения не редактировались; всё, что изменилось по существу, стоит в карточках находок под «Закрыто». Смежные материалы: <a href="software-development-workflow.md">software-development-workflow.md</a> (замысел процесса), <a href="task-workflow.html">task-workflow.html</a> (pair path B), <a href="agent-context/invariants.md">agent-context/invariants.md</a> (жёсткие правила), <a href="workspace-safety-policy.md">workspace-safety-policy.md</a> (границы работы с git).</p>
+
+</body>
+</html>
