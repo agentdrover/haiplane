@@ -31,6 +31,8 @@ human gate:
 - the branch tip still stands where it was submitted;
 - the actual diff stays inside declared areas and does not raise the
   risk class (#550/#583, recomputed here, not trusted from the feed).
+  A missing stored class refuses even when the filtered diff is empty
+  (#838) — no signal from the paths is not permission to skip the class.
 """
 
 from __future__ import annotations
@@ -356,9 +358,22 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         await risk_map_for_task(db, task_id),
     )
     stored_raw = (task.get("risk_class") or "").strip()
+    if not stored_raw:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            (
+                "Автовердикт НЕ вынесен: класс риска задачи не вычислен. "
+                "Без класса сверка радиуса сдачи невозможна, даже когда дифф "
+                "сам сигнала не дал. Вердикт остаётся человеку."
+            ),
+            author_kind="hub",
+        )
+        await db.commit()
+        return False
     if diff_class is not None:
-        if not stored_raw:
-            return False
         order = list(RiskClass)
         if order.index(diff_class) > order.index(RiskClass(stored_raw)):
             return False
