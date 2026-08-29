@@ -758,7 +758,13 @@ def done_report_error_detail(
 # to somebody who cannot do it (#1040). ``api_error`` survives for statuses
 # that genuinely do not classify — it stays honest by getting smaller, not by
 # being renamed.
+# 400 is here because the hub actually raises it: seven times in hub/app.py
+# alone, always with a prose detail, which made it the largest single class of
+# refusal still landing in ``api_error``. It was found by listing the statuses
+# the code really emits rather than the ones a mapping usually names — the
+# first draft of this table omitted it for exactly that reason.
 _STATUS_REASONS: dict[int, tuple[str, str]] = {
+    400: ("bad_request", "agent"),
     404: ("not_found", "agent"),
     409: ("conflict", "agent"),
     422: ("validation_error", "agent"),

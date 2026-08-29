@@ -488,8 +488,25 @@ def test_envelope_reason_accepts_only_slugs() -> None:
     from hub.mcp_server import HubApiError
     from hub.services import mcp_telemetry as telemetry
 
-    prose = HubApiError({"reason": "task 42 assigned to somebody", "message": "x"})
-    assert telemetry._exception_reason(prose) == "hub_api_error"
+    class HTTPStatusError(Exception):
+        pass
 
-    missing = HubApiError({"message": "no reason at all"})
-    assert telemetry._exception_reason(missing) == "hub_api_error"
+    def as_it_arrives(payload: dict[str, str]) -> Exception:
+        """The chain a real refusal travels: ToolError → HubApiError → transport.
+
+        Asserting on a bare ``HubApiError`` would prove nothing about this
+        fix: its own type already classifies as ``hub_api_error``, so the
+        expected value would be identical with or without the envelope lookup.
+        Only the wrapped shape tells the two apart.
+        """
+        refusal = HubApiError(payload)
+        refusal.__cause__ = HTTPStatusError()
+        wrapped = Exception("Error executing tool hub_refine_task: x")
+        wrapped.__cause__ = refusal
+        return wrapped
+
+    prose = as_it_arrives({"reason": "task 42 assigned to somebody", "message": "x"})
+    assert telemetry._exception_reason(prose) == "http_status_error"
+
+    missing = as_it_arrives({"message": "no reason at all"})
+    assert telemetry._exception_reason(missing) == "http_status_error"

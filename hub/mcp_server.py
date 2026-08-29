@@ -230,6 +230,19 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
     msg = _strip_internal_urls(str(payload.get("message", payload.get("hint", ""))))
     if msg:
         payload["message"] = msg
+    # ``hint`` carries the same server prose as ``message`` and was never
+    # cleaned, so the loopback address the stripper exists to remove survived
+    # in it. That mattered little while only ``message`` was shown; #882 hands
+    # the whole envelope to the agent, which would have widened an existing
+    # leak from the tools that format it themselves to every tool there is.
+    # Cleaning it here fixes both halves at once, and an empty result is
+    # discarded the way it is for ``message``: a hint stripped down to nothing
+    # is worse than one that still says something.
+    hint = payload.get("hint")
+    if isinstance(hint, str) and hint:
+        cleaned_hint = _strip_internal_urls(hint)
+        if cleaned_hint:
+            payload["hint"] = cleaned_hint
     return payload
 
 

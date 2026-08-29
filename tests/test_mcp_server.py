@@ -3637,6 +3637,24 @@ async def test_unknown_argument_is_named_on_echo_json(
 # --- Every refusal explains itself (#882) ------------------------------------
 
 
+def _envelope_of(text: str) -> Any:
+    """The refusal envelope carried inside a tool's answer, whatever wrapped it.
+
+    A raised refusal reaches the caller as ``Error executing tool <name>:
+    {json}``; a returned one is the JSON alone. Both are parsed back into an
+    object so the assertions can look at keys instead of hunting substrings.
+    """
+    import json as json_mod
+
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        return json_mod.loads(text[start:])
+    except ValueError:
+        return None
+
+
 def _refusal_probe_arguments(tool: Any) -> dict[str, Any]:
     """Fill a tool's required arguments with values of the right shape.
 
@@ -3702,7 +3720,6 @@ async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
     """
     import contextlib
     import inspect
-    import json as json_mod
 
     from hub import mcp_server as srv
 
@@ -3719,21 +3736,45 @@ async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
     assert len(helpers) >= 8, helpers
 
     manager = srv.mcp._tool_manager
-    rest_tools = []
-    for advertised in await srv.mcp.list_tools():
-        tool = manager.get_tool(advertised.name)
-        if tool is None:
-            continue
+    advertised_tools = [
+        tool
+        for tool in (manager.get_tool(t.name) for t in await srv.mcp.list_tools())
+        if tool is not None
+    ]
+    sources: dict[str, str] = {}
+    for tool in advertised_tools:
         try:
-            source = inspect.getsource(tool.fn)
+            sources[tool.name] = inspect.getsource(tool.fn)
         except OSError:  # pragma: no cover - source always available in tree
             continue
-        if "_api_" in source:
-            rest_tools.append(tool)
+
+    # Reaching REST is a question about what a tool DOES, not about which
+    # words its own body happens to contain. Asking the narrow version of the
+    # question — "is '_api_' in this function?" — quietly excused
+    # hub_approve_proposal and hub_reject_proposal, two deprecated aliases
+    # whose whole body delegates to a tool that does call REST. So the
+    # relation is closed over delegation until it stops growing.
+    reaches = {name for name, src in sources.items() if "_api_" in src}
+    while True:
+        grown = {
+            name
+            for name, src in sources.items()
+            if name not in reaches and any(other in src for other in reaches)
+        }
+        if not grown:
+            break
+        reaches |= grown
+
+    rest_tools = [tool for tool in advertised_tools if tool.name in reaches]
 
     # A probe that enumerates nothing passes by accident. This surface has
     # dozens of REST tools; if it ever has a handful, the enumeration broke.
     assert len(rest_tools) >= 60, len(rest_tools)
+    # The two that only the transitive question finds. Named, so that losing
+    # them silently is not an option: without the closure above this test
+    # claimed the whole surface while skipping them.
+    for delegating in ("hub_approve_proposal", "hub_reject_proposal"):
+        assert delegating in reaches, delegating
 
     unreached: list[str] = []
     bare: list[tuple[str, str]] = []
@@ -3754,17 +3795,67 @@ async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
                 if not boom.await_count:
                     unreached.append(tool.name)
                     continue
-                payload = str(exc)
+                envelope = _envelope_of(str(exc))
             else:
                 if not boom.await_count:
                     unreached.append(tool.name)
                     continue
-                structured = getattr(result, "structuredContent", None)
-                payload = json_mod.dumps(structured or str(result), ensure_ascii=False)
+                # The text is where the flat envelope lives in BOTH shapes: a
+                # tool whose success is a string gets ``structuredContent``
+                # ``{"result": "<that string>"}``, so reading structured
+                # first would hand back the wrapper and miss the refusal
+                # entirely.
+                envelope = _envelope_of(_call_tool_text(result))
+                if not isinstance(envelope, dict) or "reason" not in envelope:
+                    envelope = _call_tool_structured(result)
 
-        for field in ("human_decision_required", "hint", "actor_hint"):
-            if field not in payload:
-                bare.append((tool.name, field))
+        # Fields are read as KEYS with their values, not searched for as
+        # substrings. Substring matching passed this check for the wrong
+        # reason: "hint" is inside "actor_hint", so the hint text could have
+        # vanished entirely and the probe would still have called it present.
+        if not isinstance(envelope, dict):
+            bare.append((tool.name, "envelope is not an object"))
+            continue
+        if envelope.get("reason") != refusal["reason"]:
+            bare.append((tool.name, f"reason={envelope.get('reason')!r}"))
+        if envelope.get("hint") != refusal["hint"]:
+            bare.append((tool.name, f"hint={envelope.get('hint')!r}"))
+        if not envelope.get("actor_hint"):
+            bare.append((tool.name, "actor_hint missing"))
 
     assert not unreached, f"probe never reached REST for: {unreached}"
     assert not bare, f"refusal reached the agent without its envelope: {bare}"
+
+
+def test_refusal_hint_is_stripped_like_its_message() -> None:
+    """The envelope must not smuggle out what the message had cleaned (#882).
+
+    ``_parse_api_error`` sanitised ``message`` and left ``hint`` alone, which
+    cost nothing while ``hint`` was only ever read by tools that format the
+    envelope themselves. Handing the whole envelope to every tool would have
+    turned that into a wider leak — found by this task's own machine review,
+    reproduced by running it.
+    """
+    from hub import mcp_server as srv
+
+    class _Resp:
+        def __init__(self, detail: str) -> None:
+            self._detail = detail
+
+        def json(self) -> dict[str, str]:
+            return {"detail": self._detail}
+
+    leaky = "upstream refused for url 'http://127.0.0.1:8080/api/tasks/42' — retry"
+    payload = srv._parse_api_error(_Resp(leaky), 500)
+
+    assert "127.0.0.1" not in payload["message"]
+    assert "127.0.0.1" not in payload["hint"]
+
+    # ...and in the whole envelope, which is what the agent now receives. The
+    # check is for the leaked PATH, not for the loopback host on its own: the
+    # envelope also carries this installation's own ``base_url`` as an echo
+    # field, and on a local hub that is legitimately a loopback address. The
+    # defect was a server-side URL arriving inside prose, not the hub stating
+    # where it lives.
+    envelope = srv._format_hub_api_error(srv.HubApiError(payload))
+    assert "/api/tasks/42" not in envelope
