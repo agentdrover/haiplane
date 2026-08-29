@@ -53,6 +53,7 @@ Three more decisions matter here:
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -70,24 +71,42 @@ BUDGET_PATH = HERE.parent / "docs" / "agent-context" / "mcp-catalog-budget.json"
 # looser number. On 2026-08-29 that cost a docstring rewrite for 7 characters
 # of room that the budget file said was 3374 (#911).
 #
-# It lives here so both the test and the report read one value, and so
-# ``--update`` can publish it into the file agents read as context. Moving it
-# is a deliberate act: a freeze may only go DOWN, and
-# ``test_no_working_freeze_rises`` pins that.
+# It lives here so the test, the report and the published file read ONE value.
+# Moving it is a deliberate act: a freeze may only go DOWN, and the history in
+# tests/test_mcp_catalog_budget.py (``WORKING_FREEZE_HISTORY``) is what pins
+# the direction — ``test_a_freeze_never_moves_up`` reads it, and
+# ``test_the_freeze_history_records_the_current_value`` stops the history from
+# being left behind. An earlier draft of this comment named a test that did
+# not exist, which is the same defect this task is about: a promise in prose
+# with nothing behind it.
 WORKING_FREEZE = {
     "description_chars": 36383,
     "max_tool_chars": 6404,
 }
 
+# WHERE THE BINDING LIMIT IS DECLARED. One string, so the refusal, the report
+# and the published note cannot drift into naming different places — the
+# refusal used to send authors to a constant in the test file, which is both
+# the wrong place now and an editable alias: raising it there would have
+# detached the live check from this value without a single test going red.
+FREEZE_SOURCE = (
+    "WORKING_FREEZE in hub/mcp_catalog.py, published as 'working_freeze' in "
+    "docs/agent-context/mcp-catalog-budget.json"
+)
 
-def working_headroom(path: Path | None = None) -> dict[str, int]:
-    """Room left under each working freeze, from the recorded measurement.
 
+def declared_headroom(path: Path | None = None) -> dict[str, int]:
+    """The slack a freeze was GIVEN: freeze minus the recorded measurement.
+
+    Answers "how much of the working headroom has been spent since the freeze
+    was set", so it deliberately does not move when the live catalog does.
     Derived rather than written down: the distance used to be prose beside the
     constant ("live 35383 + 1000 working headroom") and was wrong in both
-    halves — the same commit recorded live as 36332, and the real distance from
-    the file's ``measured`` is 324. Nothing checked either, so nothing caught
-    them (#1071).
+    halves — the same commit recorded live as 36332, and the real distance
+    from the file's ``measured`` is 324. Nothing checked either, so nothing
+    caught them (#1071).
+
+    NOT the number to plan work by. That is :func:`room_left`.
     """
     measured = load_measured(path)
     return {
@@ -95,6 +114,40 @@ def working_headroom(path: Path | None = None) -> dict[str, int]:
         for key, freeze in WORKING_FREEZE.items()
         if key in measured
     }
+
+
+def room_left(snapshot: Mapping[str, Any]) -> dict[str, int]:
+    """Characters an author may still add before the freeze refuses — from LIVE.
+
+    The number that will actually stop you, and therefore the one to plan by.
+    Keeping only :func:`declared_headroom` would have repeated this task's own
+    defect one order of magnitude smaller: an author reading 324 while the
+    live catalog leaves 92 plans a field that does not fit, exactly as reading
+    the file's 3374 did on #911.
+    """
+    return {key: freeze - int(snapshot[key]) for key, freeze in WORKING_FREEZE.items()}
+
+
+def freeze_refusal(metric: str, live: int) -> str:
+    """The one refusal text, shared by the test that fails and the report.
+
+    Says what binds, by how much it was missed, where the number is declared
+    and what to do — and warns off ``--update``, which is a full re-freeze:
+    it rewrites ``measured`` to the live catalog, recomputes the percentage
+    ceilings from it (RAISING them when the catalog has grown) and rewrites
+    ``baseline_tools``.
+    """
+    freeze = WORKING_FREEZE[metric]
+    return (
+        f"{metric}: the catalog is {live}, over the working freeze {freeze} by "
+        f"{live - freeze + 1}. This is the limit that binds — the 'budgets' "
+        "ceiling carries a percentage headroom, catches slow drift and will "
+        f"NOT stop you today. Declared in {FREEZE_SOURCE}. Pay for the new "
+        "text with a trim; lowering the freeze after a trim is a deliberate "
+        "act that adds a line to WORKING_FREEZE_HISTORY. Do NOT reach for "
+        "--update: it re-freezes measured, the percentage ceilings and "
+        "baseline_tools all at once."
+    )
 
 
 # Fields a budget file may set. Anything else is a typo, and a typo in a
@@ -334,6 +387,20 @@ def format_report(result: dict[str, Any], *, limit: int = 15) -> str:
         f"client behaviour; a client repeating it per tool would pay "
         f"{snap['model_visible_chars_if_instruction_per_tool']})"
     )
+    freeze_rows = room_left(snap)
+    lines.append(
+        "Working freeze — the limit that BINDS (the ceilings below are looser "
+        "by design):"
+    )
+    for metric in sorted(freeze_rows):
+        left = freeze_rows[metric]
+        state = f"{left} left" if left > 0 else f"OVER by {1 - left}"
+        lines.append(
+            f"   {metric}: {snap[metric]} / {WORKING_FREEZE[metric]} ({state})"
+        )
+    over = [m for m, left in freeze_rows.items() if left <= 0]
+    for metric in sorted(over):
+        lines.append(freeze_refusal(metric, int(snap[metric])))
     if result["unknown_budget_keys"]:
         lines.append(
             "Unknown budget keys (a typo here is a budget that never applied): "

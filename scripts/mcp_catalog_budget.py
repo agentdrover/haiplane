@@ -85,13 +85,15 @@ def _write_budget(
         # while the freeze left 92.
         "working_freeze": dict(WORKING_FREEZE),
         "working_headroom_note": (
-            "ЧИТАЙ ЭТО ПЕРЕД ТЕМ, КАК ДОБАВЛЯТЬ ОПИСАНИЕ. Отвергает новое "
-            "описание working_freeze, а не budgets: budgets — потолок с "
-            "процентным запасом, он ловит долгий дрейф и НЕ остановит вас "
-            "сегодня. Остаток считается от measured (состояние на момент "
-            "последней заморозки), а не от живого каталога. Заморозка "
-            "двигается только вниз, и это отдельное решение: новое описание "
-            "оплачивается подрезкой. Источник обоих чисел — "
+            "ЧИТАЙ ЭТО ПЕРЕД ТЕМ, КАК ДОБАВЛЯТЬ ОПИСАНИЕ. Новое описание "
+            "отвергает working_freeze, а не budgets: budgets — потолок с "
+            "процентным запасом, он ловит долгий дрейф и сегодня вас НЕ "
+            "остановит. Планируйте по остатку от ЖИВОГО каталога, а не по "
+            "разности с measured: measured — состояние на момент последней "
+            "заморозки, и разность с ним больше живого остатка. Живой остаток "
+            "печатает scripts/mcp_catalog_budget.py первой же секцией. "
+            "Заморозка двигается только вниз, это отдельное решение, и новое "
+            "описание оплачивается подрезкой. Источник обоих чисел — "
             "hub/mcp_catalog.py; --update переписывает measured, budgets и "
             "baseline_tools целиком, это полная перезаморозка, а не правка "
             "одного ключа."
@@ -144,7 +146,14 @@ async def main() -> int:
             args.headroom_pct if args.headroom_pct is not None else existing_headroom
         )
         _write_budget(snapshot, path, args.measured_at or existing_stamp, headroom)
-        print(f"Ceilings set in {path}: measured catalog + {headroom}% headroom")
+        print(
+            f"FULL RE-FREEZE of {path}. Rewritten from the live catalog: "
+            f"measured, the percentage ceilings (+{headroom}% headroom), "
+            "baseline_tools and measured_at. Copied from hub/mcp_catalog.py: "
+            "working_freeze. If you only meant to republish the working "
+            "freeze, edit that one key instead — this run also moved the "
+            "ceilings, and when the catalog has grown they moved UP."
+        )
         return 0
 
     budgets = load_budget(path)

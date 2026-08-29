@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from hub.mcp_catalog import (
+    FREEZE_SOURCE,
     WORKING_FREEZE,
-    working_headroom as catalog_working_headroom,
     BUDGET_KEYS,
     BUDGET_PATH,
     catalog_snapshot,
@@ -25,6 +25,9 @@ from hub.mcp_catalog import (
     load_baseline,
     load_budget,
     load_measured,
+    declared_headroom,
+    freeze_refusal,
+    room_left,
     snapshot_from_tools,
 )
 
@@ -358,26 +361,51 @@ PRE_TRIM_CEILINGS = {
 # into docs/agent-context — the file an author reads before planning. A copy
 # here would be a second place to edit, and the two would part ways on the
 # first re-freeze.
-FROZEN_DESCRIPTION_CHARS = WORKING_FREEZE["description_chars"]
-FROZEN_MAX_TOOL_CHARS = WORKING_FREEZE["max_tool_chars"]
-# History of the working freezes, newest first. NOT a guard, and saying so is
-# the point: a literal pin only catches a rise above the value someone typed
-# once, so after the first legitimate trim to 36000 a later rise to 36300 walks
-# straight past it. A test on a branch cannot read what develop holds, so
-# "only down" is a REVIEW-TIME rule, not something asserted here — claiming
-# otherwise would be a guard that guards nothing, which is worse than an
-# honest list (#1071).
+# No local aliases for the freeze values. A name here is a place an author can
+# raise when the refusal points at it — and the live checks would follow the
+# alias while the published file and the history stayed green (#1071 review).
+# The tests read WORKING_FREEZE directly, so there is exactly one editable
+# place and every guard watches it.
+# History of the working freezes, newest first. The earlier draft of this
+# comment declared "only down" unenforceable because a test cannot read what
+# develop holds — and that was wrong twice over: the history itself carries the
+# earlier values, so the direction IS readable here, and I had already tried to
+# raise the freeze to 37059 on this very task. A list that records the past and
+# a test that reads it turn a review-time hope into a red test.
 #
-# What IS enforced: the live catalog must sit under the freeze
-# (test_description_chars_stay_under_freeze), and the file agents read must
-# publish the same freeze the code uses (test_the_binding_limit_is_readable_
-# where_work_is_planned). A change to a freeze therefore shows up in the diff
-# in two places at once, which is what a reviewer needs to see the direction.
+# Raising a freeze therefore takes three consistent edits (the constant, this
+# list, the published file) and still fails: the new entry would sit above its
+# predecessor. Lowering after a trim takes the same three and passes.
 WORKING_FREEZE_HISTORY = [
     ("2026-08-28", "#1031", {"description_chars": 36383, "max_tool_chars": 6404}),
     ("2026-08-21", "#988", {"description_chars": 36495, "max_tool_chars": 6472}),
 ]
 PRE_TRIM_INSTRUCTION_PER_TOOL = 179598
+
+
+def test_a_freeze_never_moves_up() -> None:
+    """A freeze may only go DOWN, and now that is a red test, not a hope.
+
+    I claimed in the first round that a branch cannot check this because it
+    cannot read develop — then, on this very task, raised the freeze to 37059
+    to make an old promise add up and caught it by hand. The history makes the
+    earlier values readable right here: a rise has to appear as an entry above
+    a smaller predecessor, and this test refuses it.
+    """
+    for (newer_date, newer_task, newer), (older_date, older_task, older) in zip(
+        WORKING_FREEZE_HISTORY, WORKING_FREEZE_HISTORY[1:]
+    ):
+        assert newer_date > older_date, (
+            f"history is newest-first: {newer_date} ({newer_task}) is not "
+            f"after {older_date} ({older_task})"
+        )
+        for metric, value in newer.items():
+            assert value <= older[metric], (
+                f"{metric}: the freeze rose from {older[metric]} "
+                f"({older_task}) to {value} ({newer_task}). A freeze may only "
+                "move down — pay for new text with a trim, not by raising the "
+                "limit that refuses it."
+            )
 
 
 def test_no_ceiling_rises() -> None:
@@ -395,27 +423,111 @@ def test_no_ceiling_rises() -> None:
         )
 
 
+# The slack each freeze was given, pinned. Not a ceiling and not a limit: a
+# record of the distance between the freeze and the measurement it was set
+# against, so a re-freeze has to state in the diff how much room it created.
+# The prose used to claim 1000 while the truth was 324, and nothing noticed
+# (#1071).
+DECLARED_WORKING_HEADROOM = {"description_chars": 324, "max_tool_chars": 82}
+
+
 def test_the_declared_working_headroom_is_true() -> None:
     """AC-1: the promise is arithmetic over recorded facts, not prose.
 
-    The policy above says a freeze sits a working headroom above the measured
-    catalog so a contract field has room to land. That is only a promise if
-    something checks it — #1031 stated it and set a freeze 324 above the
-    recorded measurement while the comment claimed 1000, and no test noticed.
-
-    This does not say WHAT the headroom should be: choosing that is moving a
-    ceiling, which is a deliberate act and not this task's. It says the number
-    is positive and knowable, so the next author reads a fact instead of a
-    sentence somebody typed.
+    An earlier version of this test asserted only that the headroom was
+    positive — true before the change too (36383 > 36059), true if the freeze
+    were raised to 40000, and true if it were dropped to measured + 1, which
+    would remove the working headroom the freeze exists to provide. It watched
+    nothing move.
     """
-    rooms = catalog_working_headroom()
+    assert declared_headroom() == DECLARED_WORKING_HEADROOM, (
+        "the recorded slack changed: a re-freeze must say so here, in the "
+        "diff, alongside the new value and its history entry"
+    )
+
+
+async def test_the_number_to_plan_by_is_the_live_one() -> None:
+    """The two rooms are different questions, and only one of them stops you.
+
+    Publishing just the declared slack would repeat this task's own defect one
+    order of magnitude smaller: 324 recorded against 92 live. #911 planned by
+    the file's 3374 and was refused at 92; an author planning by 324 is refused
+    the same way, just later.
+    """
+    snapshot = await catalog_snapshot()
+    assert room_left(snapshot) == {
+        metric: freeze - snapshot[metric] for metric, freeze in WORKING_FREEZE.items()
+    }
+    # The distinguishing property, and the reason both functions exist: the
+    # planning number follows the catalog, the recorded slack does not. Shown
+    # with a catalog that is not the live one, so neither side can be the same
+    # arithmetic read twice — an earlier version compared working_headroom()
+    # against its own formula and was true by construction.
+    grown = {**snapshot, **{m: snapshot[m] + 50 for m in WORKING_FREEZE}}
+    assert room_left(grown) == {m: r - 50 for m, r in room_left(snapshot).items()}
+    assert declared_headroom() == DECLARED_WORKING_HEADROOM, (
+        "the recorded slack must not move when the live catalog does"
+    )
+    note = str(
+        json.loads(BUDGET_PATH.read_text(encoding="utf-8")).get("working_headroom_note")
+        or ""
+    )
+    assert "ЖИВОГО" in note, "the note must send the author to the live number"
+
+
+def test_the_refusal_names_the_headroom_and_its_source() -> None:
+    """AC-4: the message an author actually sees tells them where to go.
+
+    This test did not exist when the criterion claimed it did. The refusal it
+    now covers used to name a constant in this very file as "the limit that
+    binds" and told the reader that the budget file "is looser and will not
+    stop you" — after the freeze had moved to hub/mcp_catalog.py and was being
+    published into that file. Following it meant raising an alias here, which
+    would have detached the live check from the value every other guard
+    watches, with nothing going red.
+    """
+    message = freeze_refusal(
+        "description_chars", WORKING_FREEZE["description_chars"] + 7
+    )
+    assert FREEZE_SOURCE in message, (
+        "the refusal must say where the limit is declared — an author who is "
+        "not told goes looking for it by grepping the test suite, which is the "
+        "search this task exists to end"
+    )
+    assert "hub/mcp_catalog.py" in message and "working_freeze" in message
+    assert "by 8" in message, (
+        "say by how much, so the author knows what a trim must buy"
+    )
+    assert "trim" in message, "say what to do: pay with a trim, do not raise the limit"
+    assert "--update" in message, (
+        "warn off --update: it re-freezes measured, the ceilings and "
+        "baseline_tools at once, and raises the ceilings when the catalog grew"
+    )
+
+
+async def test_the_report_leads_with_the_limit_that_binds() -> None:
+    """AC-3, second half: the command an author runs must show the right number.
+
+    Publishing the freeze into the budget file was not enough. The documented
+    command is scripts/mcp_catalog_budget.py, and its report listed only the
+    percentage ceilings — "description_chars: 36291 / 39665 (3374 left)". That
+    is the number that misled #911, printed by the tool an agent is told to
+    run, while the 92 that would refuse the work appeared nowhere.
+    """
+    snapshot = await catalog_snapshot()
+    report = format_report(
+        check_budget(snapshot, load_budget(), load_baseline(), load_measured())
+    )
+    assert "Working freeze" in report, "the binding limit must appear at all"
     for metric, freeze in WORKING_FREEZE.items():
-        room = rooms[metric]
-        assert room > 0, (
-            f"{metric}: the freeze {freeze} sits BELOW the recorded measurement "
-            f"{load_measured()[metric]} — a freeze under the catalog it freezes "
-            "refuses everything, including no change at all"
+        left = freeze - snapshot[metric]
+        assert f"{metric}: {snapshot[metric]} / {freeze} ({left} left)" in report, (
+            f"the report must print the live room under the freeze for {metric}"
         )
+    assert report.index("Working freeze") < report.index("Headroom left under"), (
+        "the binding limit comes FIRST: a reader who stops at the first "
+        "number should stop at the one that refuses, not at the looser ceiling"
+    )
 
 
 async def test_description_chars_stay_under_freeze() -> None:
@@ -430,14 +542,8 @@ async def test_description_chars_stay_under_freeze() -> None:
     # is declared. The previous message named neither, so an author who hit it
     # went looking for the number by grepping the test suite — measured on
     # 2026-08-29, that search cost several rewrites of a docstring.
-    assert live < FROZEN_DESCRIPTION_CHARS, (
-        f"catalog descriptions are {live}, over the freeze "
-        f"{FROZEN_DESCRIPTION_CHARS} by {live - FROZEN_DESCRIPTION_CHARS + 1}. "
-        "The freeze is FROZEN_DESCRIPTION_CHARS in "
-        "tests/test_mcp_catalog_budget.py and is the limit that binds — the "
-        "ceiling in docs/agent-context/mcp-catalog-budget.json is looser and "
-        "will not stop you. Pay for the new text with a trim; raising the "
-        "freeze is a separate, deliberate act."
+    assert live < WORKING_FREEZE["description_chars"], freeze_refusal(
+        "description_chars", live
     )
 
 
@@ -448,9 +554,16 @@ async def test_max_tool_chars_back_under_freeze() -> None:
     characters left, which the report already flagged as "decide now".
     """
     snapshot = await catalog_snapshot()
-    assert snapshot["max_tool_chars"] <= FROZEN_MAX_TOOL_CHARS
+    fattest = snapshot["max_tool_chars"]
+    # Same refusal as the description check: a bare assert here would have
+    # printed a number and no way to act on it, and the author would have gone
+    # looking for the limit by grepping the tests — the search this task exists
+    # to end (#1071 review).
+    assert fattest <= WORKING_FREEZE["max_tool_chars"], freeze_refusal(
+        "max_tool_chars", fattest
+    )
     budgets = load_budget()
-    spent = snapshot["max_tool_chars"] / budgets["max_tool_chars"]
+    spent = fattest / budgets["max_tool_chars"]
     assert spent < 0.95, f"still {spent:.1%} of the ceiling"
 
 
@@ -551,7 +664,7 @@ def test_the_binding_limit_is_readable_where_work_is_planned() -> None:
     )
 
 
-def test_measured_records_the_freeze_not_the_present() -> None:
+def test_measured_records_the_freeze_not_the_present(tmp_path: Path) -> None:
     """AC-5: measured lagging the live catalog is its MEANING, not a defect.
 
     It records what the catalog was when the ceiling was set, so "how much of
@@ -570,7 +683,18 @@ def test_measured_records_the_freeze_not_the_present() -> None:
     # test that only checked "measured is non-empty" stayed green in exactly
     # the state this docstring says must be allowed — measured equal to live —
     # and in the state it must not, measured recomputed per change.
-    room = catalog_working_headroom()
+    # Proven with a SECOND budget file rather than by restating the formula:
+    # the previous version asserted room == freeze - measured while room was
+    # defined as freeze - measured, so both sides came from one source and it
+    # would have stayed green in the state this docstring forbids.
+    other = tmp_path / "budget.json"
+    doc = json.loads(BUDGET_PATH.read_text(encoding="utf-8"))
+    doc["measured"] = {**doc["measured"], "description_chars": 30000}
+    other.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    assert declared_headroom(other)["description_chars"] == (
+        WORKING_FREEZE["description_chars"] - 30000
+    ), "the slack is read from the recorded measurement, not from anywhere else"
+    room = declared_headroom()
     for metric, freeze in WORKING_FREEZE.items():
         assert room[metric] == freeze - measured[metric], (
             f"{metric}: headroom must be freeze minus RECORDED measurement, "
