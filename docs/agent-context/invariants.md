@@ -33,7 +33,10 @@ These are the rules most likely to be broken by “small” changes.
   task on the SAME branch — pushing commits alone does not re-trigger review.
   A review of task A never sees task B's branch; do not base new task branches
   on unmerged branches under review (see `docs/repository-rules.md`,
-  «Жизненный цикл ветки задачи»).
+  «Жизненный цикл ветки задачи»). The stacking *advisory* (#438) judges
+  pushed refs (`_resolve_ref_remote_first`): a stale local `develop` in the
+  hub clone must not invent a stack or tell the implementer to merge another
+  task's unreviewed branch (#1046).
 - Finding routing (#435, #437): `in_scope` findings are closed ONLY via a
   resubmit of the same task on the same branch (`changes_requested` →
   `running` → fix → `hub_submit_for_review`). Never spawn parallel tasks for
