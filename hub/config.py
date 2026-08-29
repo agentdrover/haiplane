@@ -183,6 +183,20 @@ STALE_CI_CHECK_MINUTES = int(env_get("STALE_CI_CHECK_MINUTES", "60"))
 STALE_FIX_REQUESTED_MINUTES = int(env_get("STALE_FIX_REQUESTED_MINUTES", "60"))
 STALE_PENDING_REPORT_MINUTES = int(env_get("STALE_PENDING_REPORT_MINUTES", "30"))
 
+# The human queue's ladder (#1020): a day, three days, a week. Every other
+# deadline in this file watches a machine, which escalates on its own; the
+# statuses where work actually waits — draft, needs_info, needs_decision,
+# client review — had no clock at all, so their only detector was a person
+# noticing on the board, which is the very resource the queue is short of.
+# Three rungs in a week is the whole budget: a reminder that speaks on every
+# pass becomes the background nobody reads, which is how the single lifetime
+# alert it replaces already failed.
+HUMAN_QUEUE_LADDER_MINUTES: tuple[tuple[int, str], ...] = (
+    (int(env_get("HUMAN_QUEUE_RUNG_1_MINUTES", "1440")), "24h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_2_MINUTES", "4320")), "72h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_3_MINUTES", "10080")), "168h"),
+)
+
 # Bounded recovery (#417): a headless dispatch/review job that stays missing
 # past the grace escalates to needs_decision; a claim held past the lease is
 # auto-released back to open. Both decisions read persisted timestamps so a

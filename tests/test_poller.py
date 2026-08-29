@@ -2444,3 +2444,134 @@ async def test_real_done_report_still_reaches_ci_check(mock_sleep, db):
 
     assert dict(await repo.get_task(db, task_id))["status"] != "pending_report"
     assert await repo.has_done_updates(db, task_id)
+
+
+# --- #1020: the human queue gets hours -------------------------------------
+#
+# Every clock in the poller above watches a machine, which escalates by
+# itself. The statuses where work actually waits had one lifetime alert and
+# then silence, so a task could stand for a month (production #404 has stood
+# in needs_info since 20 July) with nothing but a person's eye on the board to
+# find it — the very resource the queue is short of.
+
+
+async def _waiting_task(db, *, status="needs_decision", hours=25) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=f"Waiting in {status}",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status=status,
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await _set_wait_age(db, task_id, hours)
+    return task_id
+
+
+async def _set_wait_age(db, task_id: int, hours: int) -> None:
+    await db.execute(
+        "UPDATE tasks SET status_entered_at = datetime('now', ?) WHERE id=?",
+        (f"-{hours} hours", task_id),
+    )
+    await db.commit()
+
+
+async def _reminders(db, task_id: int) -> list[dict]:
+    rows = await fetchall(
+        db,
+        "SELECT rung, age_minutes FROM human_queue_reminders "
+        "WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_human_owned_reminder_ladder(db):
+    """#1020 AC-1: past 24h the queue speaks once, and says what it waits for."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+
+    await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h"]
+    events = await _events_for(db, task_id, "human_queue_reminder")
+    assert len(events) == 1
+    payload = str(events[0]["payload"])
+    assert "hub_decide_task" in payload  # the action, not just the age
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "needs_decision"  # volume only: nothing moved
+
+
+async def test_reminder_dedup_per_step(db):
+    """#1020 AC-2: dozens of passes inside one rung stay silent.
+
+    The alert this replaces deduped on "has any alert at all", which is why a
+    task that went quiet for a week never got a second word (#443). Dedup here
+    is per RUNG, so silence still climbs.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_info", hours=30)
+
+    for _ in range(12):
+        await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h"]
+    assert len(await _events_for(db, task_id, "human_queue_reminder")) == 1
+
+
+async def test_ladder_three_steps(db):
+    """#1020 AC-3: a day, three days, a week — three reminders, each its own."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="draft", hours=25)
+    await _sweep_human_queue(db)
+
+    await _set_wait_age(db, task_id, 73)
+    await _sweep_human_queue(db)
+
+    await _set_wait_age(db, task_id, 169)
+    await _sweep_human_queue(db)
+    await _sweep_human_queue(db)  # a fourth pass adds nothing
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h", "72h", "168h"]
+
+
+async def test_reminder_ladder_restarts_after_a_new_wait(db):
+    """#1020: coming back to the same status is a new wait, not a rung already rung.
+
+    Keyed on the task alone, a task that was decided and later returned to the
+    queue would inherit its old ladder and never be heard from again.
+    """
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="needs_decision", hours=25)
+    await _sweep_human_queue(db)
+
+    await repo.update_task(db, task_id, status="running")
+    await repo.update_task(db, task_id, status="needs_decision")
+    # A different age, because the stamp IS the identity of a wait and sqlite
+    # keeps it to the second: re-entering the status in production stamps the
+    # current second, which is never the backdated one above.
+    await _set_wait_age(db, task_id, 26)
+    await _sweep_human_queue(db)
+
+    assert [r["rung"] for r in await _reminders(db, task_id)] == ["24h", "24h"]
+
+
+async def test_machine_owned_queue_is_not_reminded(db):
+    """#1020: the ladder is for people. ci_check escalates on its own clock."""
+    from hub.poller import _sweep_human_queue
+
+    task_id = await _waiting_task(db, status="ci_check", hours=200)
+
+    await _sweep_human_queue(db)
+
+    assert await _reminders(db, task_id) == []
