@@ -18,6 +18,8 @@ from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
     changes_requested_requires_content_detail,
+    verdict_contradicts_its_text_detail,
+    verdict_repeats_previous_detail,
     claim_without_session_detail,
     done_report_error_detail,
     hierarchy_error_detail,
@@ -36,6 +38,7 @@ from hub.db import (
     structured_fields_from_row,
 )
 from hub.integrations.registry import plugins
+from hub.services import verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
@@ -2354,6 +2357,13 @@ async def create_drafts_for_out_of_scope_findings(
     return created
 
 
+async def _previous_verdict_update(db: Any, task_id: int) -> dict | None:
+    """The last verdict recorded on this task, or None when there is none (#1057)."""
+    rows = await repo.get_task_updates(db, task_id)
+    verdicts = [dict(r) for r in rows if dict(r).get("kind") == "review"]
+    return verdicts[-1] if verdicts else None
+
+
 async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2423,6 +2433,31 @@ async def record_review_verdict(
         and not body.comments.strip()
     ):
         raise HTTPException(422, detail=changes_requested_requires_content_detail())
+
+    # #1057: the same gate, two more things it can see. Both refusals happen
+    # here, before any write, so a rejected verdict leaves the task in review
+    # with its submission generation untouched — the property #1010 established
+    # and the reason these checks belong beside it rather than in the caller.
+    body_text = verdict_text.verdict_body(
+        body.comments, [f.message for f in body.findings]
+    )
+    declared = verdict_text.declared_outcome(body_text)
+    if declared and declared != body.verdict.value:
+        raise HTTPException(
+            422,
+            detail=verdict_contradicts_its_text_detail(body.verdict.value, declared),
+        )
+    if body_text.strip() and not body.acknowledge_repeat:
+        previous = await _previous_verdict_update(db, task_id)
+        if previous is not None:
+            said_before = verdict_text.fingerprint(
+                verdict_text.previous_verdict_body(previous["content"])
+            )
+            if said_before and said_before == verdict_text.fingerprint(body_text):
+                raise HTTPException(
+                    422,
+                    detail=verdict_repeats_previous_detail(str(previous["created_at"])),
+                )
 
     if body.verdict.value == "changes_requested" and body.findings:
         if all(f.scope == FindingScope.out_of_scope for f in body.findings):

@@ -1010,6 +1010,13 @@
                         править: одной строки в комментариях достаточно, находки
                         необязательны.
                     </p>
+                    {# #1057: повтор прошлого вердикта слово в слово хаб
+                       отклоняет. Повтор законен, когда дефект не починен, —
+                       тогда ревьюер отмечает это здесь и отправляет снова. #}
+                    <label class="task-action-label" for="review-ack-repeat">
+                        <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1">
+                        повторяю прошлый вердикт намеренно
+                    </label>
                     <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
                 </form>
                 <script>
