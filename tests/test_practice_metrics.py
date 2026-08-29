@@ -1528,3 +1528,68 @@ async def test_no_data_does_not_move_precision(db: aiosqlite.Connection):
     assert after["reports_counted"] == before["reports_counted"], (
         "пустые прогоны не попали и в знаменатель покрытия"
     )
+
+
+async def test_a_partly_judged_report_is_not_covered(db: aiosqlite.Connection):
+    """«Разобран» значит, что ответ есть у КАЖДОЙ находки, а не у первой.
+
+    При слабом правиле отчёт из трёх находок с одной диспозицией читался как
+    полностью покрытый, и страница могла показать «90 из 90 разобрано» рядом с
+    очередью на 180 неотвеченных находок.
+    """
+    task_id = await _task(db, title="разобран наполовину")
+    await _report(db, task_id, confirmed=3)
+    row = await repo.get_latest_machine_review(db, task_id)
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=int(dict(row)["id"]),
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_uid="uid-0",
+        finding_title="первая",
+        disposition="fixed",
+        note="",
+        decided_by="denis",
+    )
+    await db.commit()
+
+    disp = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+    assert disp["reports_counted"] == 1
+    assert disp["reports_judged"] == 0, "одна диспозиция из трёх — это не разбор"
+    assert disp["reports_unjudged"] == 1
+
+
+async def test_a_superseded_report_is_not_in_the_denominator(
+    db: aiosqlite.Connection,
+):
+    """Отчёт пересданной генерации судить НЕЛЬЗЯ — и требовать его нельзя.
+
+    Очередь его не показывает, а record_finding_dispositions отвергает (#1038).
+    Оставленный в знаменателе, он превращается в единицу, которую невозможно
+    закрыть: «1 из 2» навсегда. Тот же класс, что пустой прогон.
+    """
+    task_id = await _task(db, title="пересдана")
+    await _report(db, task_id, confirmed=5)
+    # Задача ушла вперёд: отчёт генерации 1 стал устаревшим.
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await db.commit()
+
+    disp = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+    assert disp["reports_counted"] == 0, (
+        "устаревший отчёт не попадает в знаменатель, который просят закрыть"
+    )
+    assert disp["reports_unjudged"] == 0
+
+
+async def test_an_empty_window_prints_zero_not_a_blank(client: AsyncClient):
+    """Пустое окно печатает нули, а не пустые клетки.
+
+    SUM по пустому набору — это SQL NULL, а не ноль, и Jinja печатает None
+    пустой строкой: « из 0». Раньше это пряталось за прочерком, который убрали
+    в этой же задаче, — то есть исправление одной честности вскрыло другую.
+    """
+    page = (await client.get("/metrics")).text
+    start = page.index("Без данных")
+    row = page[start : page.index("</tr>", start)]
+    assert "0 из 0" in row, f"пустое окно печатает нули, а не пустоту: {row!r}"

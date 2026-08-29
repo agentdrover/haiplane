@@ -298,40 +298,53 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # many confirmed findings are still waiting for an answer. Without these a
     # precision of 1.0 over two findings out of ninety reads like a verdict on
     # the harness.
-    # #912: only reports that HAVE something to judge. A run that produced no
-    # candidates, no findings and no tokens is not an unjudged report — there
-    # was nothing to judge, and counting it as one makes the habit look far
-    # worse than it is. Measured on the live window when this was written: 151
-    # reports, 61 of them empty, so coverage read "0 of 151" where the honest
-    # denominator was 90. "0 of 90" is a reproach; "0 of 151" is noise a
-    # reproach hides inside.
+    # #912: coverage of the judging loop, over the reports a person COULD
+    # judge. Three exclusions, and each one is a report that would sit in the
+    # denominator forever:
     #
-    # The predicate is REPORT_HAS_EVIDENCE_SQL, not a copy of it: the same
-    # fragment already decides ``reviews`` and ``no_data_reports``, and two
-    # definitions of "a report with data" would drift into two answers.
+    # * no evidence at all — a run that produced no candidates, no findings and
+    #   no tokens has nothing to judge (REPORT_HAS_EVIDENCE_SQL, #841);
+    # * evidence but zero confirmed findings — the harness ran and refuted
+    #   everything, which is a fine outcome and still leaves nothing to answer;
+    # * a SUPERSEDED report — the queue does not show it and
+    #   ``record_finding_dispositions`` refuses it (#1038), so counting it as
+    #   unjudged asks for an answer the hub itself forbids.
+    #
+    # This is deliberately NOT ``reviews``: that counts every report with
+    # evidence in the window, including superseded ones and ones that confirmed
+    # nothing. The two answer different questions, so they are computed
+    # separately and named separately — the earlier version of this change
+    # reused ``reviews`` and quietly put unjudgeable reports in a denominator
+    # a person is asked to close.
+    #
+    # "Judged" means EVERY confirmed finding of the report has an answer, not
+    # "at least one does". With the weaker rule a report of three findings and
+    # one disposition read as fully covered, so the page could show "90 of 90
+    # judged" next to a queue holding 180 unanswered findings.
     coverage_rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
-        "SUM(CASE WHEN judged.n > 0 THEN 1 ELSE 0 END) AS reports_judged "
-        "FROM machine_reviews mr LEFT JOIN ("
-        "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
+        "SELECT COUNT(*) AS reports_counted, "  # nosec B608 - constant fragment
+        "COALESCE(SUM(CASE WHEN COALESCE(judged.n, 0) >= "
+        "json_array_length(mr.findings_confirmed) THEN 1 ELSE 0 END), 0) "
+        "AS reports_judged "
+        "FROM machine_reviews mr "
+        "JOIN tasks t ON t.id = mr.task_id "
+        "AND t.submission_generation = mr.submission_generation "
+        "LEFT JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
-        f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL}",
+        f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL} "
+        "AND json_array_length(mr.findings_confirmed) > 0",
         (since,),
     )
     cov = dict(coverage_rows[0]) if coverage_rows else {}
-    reports = int(cov.get("reports") or 0)
+    reports_counted = int(cov.get("reports_counted") or 0)
     reports_judged = int(cov.get("reports_judged") or 0)
     result = _rates(overall)
+    result["reports_counted"] = reports_counted
     result["reports_judged"] = reports_judged
-    # The denominator travels WITH the two numbers derived from it, so a reader
-    # never has to guess which population "0 judged" was out of, and a later
-    # change to the predicate cannot move one of the three and leave the others
-    # (#518).
-    result["reports_counted"] = reports
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
-    result["reports_unjudged"] = reports - reports_judged
+    result["reports_unjudged"] = reports_counted - reports_judged
     # What is actually WAITING, from the same query the queue page reads
     # (#1038). This used to subtract one sum from another — all confirmed
     # findings in the window minus all dispositions in it — and that answered a
@@ -529,8 +542,14 @@ async def practice_metrics(
         # and no figure moves silently: the 90-day window read on 2026-08-21
         # held 103 rows, at least 60 of them the v7 batch.
         f"SELECT COUNT(*) AS reports_total, "  # nosec B608 - fragment is a module constant, values stay params
-        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END) AS reviews, "
-        f"SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END) "
+        # COALESCE, like every aggregate below: SUM over an EMPTY window is SQL
+        # NULL, not zero, and a NULL reaching the page renders as an empty cell
+        # — " из 0" where "0 из 0" is the answer. The neighbours were already
+        # coalesced; these two were the pair that still leaked, and it only
+        # showed once the page stopped hiding zero behind a dash (#912).
+        f"COALESCE(SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 1 ELSE 0 END), 0) "
+        "AS reviews, "
+        f"COALESCE(SUM(CASE WHEN {REPORT_HAS_EVIDENCE_SQL} THEN 0 ELSE 1 END), 0) "
         "AS no_data_reports, "
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
