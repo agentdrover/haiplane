@@ -301,3 +301,33 @@ def current_ac_test_results(rows: Any, generation: int) -> list[dict]:
             }
         )
     return out
+
+
+def describe_recorded_results(recorded: Any) -> str:
+    """Say what the recorded AC results ARE, not how many rows there are (#1056).
+
+    The submission report used to print ``len(ac_recorded)`` — five results
+    that all said ``not_found`` and five that all passed came out as the same
+    sentence, "5 AC result(s)". On #1042 that sentence stood in the feed while
+    not one of the five locators resolved, and two verdicts in a row were
+    written without the fact ever being mentioned. A count is not an outcome,
+    and the rule the hub enforces on agent reports (#762: an absent answer is
+    never a clean one) binds the hub's own lines too.
+
+    Names the outcome, never grades the work: "none of 5 resolved" is a fact
+    about locators, not a judgement about the submission.
+    """
+    rows = [dict(r) for r in recorded or []]
+    total = len(rows)
+    if not total:
+        return "AC: none reported"
+    not_found = sum(1 for r in rows if r.get("status") == NOT_FOUND)
+    failing = sum(1 for r in rows if r.get("status") == FAIL)
+    resolved = total - not_found
+    if resolved == 0:
+        head = f"AC: none of {total} resolved ({total} {NOT_FOUND})"
+    elif not_found == 0:
+        head = f"AC: all {total} resolved"
+    else:
+        head = f"AC: {resolved} of {total} resolved ({not_found} {NOT_FOUND})"
+    return f"{head}, {failing} failing" if failing else head
