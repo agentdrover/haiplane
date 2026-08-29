@@ -2121,10 +2121,16 @@ async def submit_for_review(
             # is bound to the sha.
             content += f" Branch tip NOT pinned: {sha_reason}."
         if adopted:
-            ac_count = len(adopted.get("ac_recorded") or [])
+            # #1056: the count used to stand here, so five not_found results
+            # printed exactly like five passing ones. The reader of the feed —
+            # the human at the gate — got "5 AC result(s)" as if it were
+            # evidence. What is printed now is the outcome.
+            from hub.services.ac_tests import describe_recorded_results
+
+            ac_phrase = describe_recorded_results(adopted.get("ac_recorded"))
             v_status = adopted.get("validation_status") or "—"
             content += (
-                f" CI run report adopted for this commit: {ac_count} AC result(s), "
+                f" CI run report adopted for this commit: {ac_phrase}, "
                 f"validation {v_status}."
             )
         if risk_note:
