@@ -1489,7 +1489,17 @@ async def _deliver_pair_task(db, task: dict) -> None:
         # Said once, not once per cycle: a line every thirty seconds is how a
         # real signal gets muted (#534).
         if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
-            await _note_pair_delivery_wait(db, task_id, pr_num, detail)
+            await _note_pair_delivery_wait(
+                db,
+                task_id,
+                pr_num,
+                detail,
+                hint=(
+                    services.PR_DRAFT_WAIT_HINT
+                    if detail.startswith(services.PR_DRAFT_PREFIX)
+                    else ""
+                ),
+            )
             return
         reason = "merge_gate"
         if detail.startswith(services.RECOVERABLE_GATE_PREFIXES):

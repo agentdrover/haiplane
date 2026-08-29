@@ -2773,6 +2773,71 @@ class GitOpsIntegration:
             return ""
         return str(data.get("state") or "").lower()
 
+    async def pr_is_draft(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Whether GitHub still treats this PR as a draft (#1053).
+
+        A Cloud Agent opens PRs as drafts by default. Hub ``create_pr`` never
+        does. ``gh pr merge`` refuses a draft with the same boolean
+        ``merge_pr`` already returns for a conflict or a revoked token, and
+        that boolean used to send the task to ``needs_decision``. False here
+        means "not a draft or could not look" — same #498 rule as the other
+        readers: silence is not an accusation, and the merge call still runs.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "isDraft",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            log.info(
+                "PR #%d draft probe unavailable: %s",
+                pr_number,
+                (err or "gh молчит").strip()[:200],
+            )
+            return False
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return False
+        return bool(data.get("isDraft"))
+
+    async def mark_pr_ready(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Convert a draft PR to ready. Hub approval is the ready signal (#1053)."""
+        rc, _, err = await _gh(
+            "pr",
+            "ready",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            log.info("Marked PR #%d ready", pr_number)
+            return True
+        log.warning(
+            "Failed to mark PR #%d ready: %s",
+            pr_number,
+            (err or "").strip()[:200],
+        )
+        return False
+
     async def _pr_absent_or_unknown(
         self, pr_number: int, repo: str | None, gh_repo: str | None
     ) -> str:
