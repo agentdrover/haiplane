@@ -497,3 +497,93 @@ async def test_rollup_still_closes_umbrella_parent(db: aiosqlite.Connection):
 
     parent = dict(await repo.get_task(db, feature_id))
     assert parent["status"] == "completed"
+
+
+# ---- #1054: resubmitting the same pair task from review ----
+#
+# On #1042 the author found a defect in his own submission and had no legal
+# move: submit-for-review refused from review, so the choice was silence — and
+# a gate that merges the branch tip — or asking the reviewer to look past the
+# submission. The task waited for someone else's CHANGES_REQUESTED.
+
+
+async def _pair_task_in_review(client: AsyncClient, title: str) -> int:
+    task_id = (await client.post("/api/tasks", json={"title": title})).json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: do it"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.json()["status"] == "review", resp.text
+    return task_id
+
+
+async def test_pair_task_resubmits_from_review(client: AsyncClient):
+    """#1054 AC-1: the follow-up commit is bound to a submission of its own."""
+    task_id = await _pair_task_in_review(client, "Resubmit")
+    before = (await client.get(f"/api/tasks/{task_id}")).json()
+
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    assert resp.status_code == 200, resp.text
+    after = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert after["status"] == "review", "it stays under review, it does not leave it"
+    assert after["submission_generation"] == before["submission_generation"] + 1, (
+        "a new submission is a new generation, or no verdict can tell them apart"
+    )
+
+
+async def test_resubmission_from_review_names_what_it_replaced(
+    client: AsyncClient, monkeypatch
+):
+    """#1054 AC-3: a reviewer mid-read is told, not left to notice."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Git(NoopGitOps):
+        tip = "first-tip"
+
+        async def fetch_base(self, repo: str, base: str):
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return self.tip
+
+    git = _Git()
+    monkeypatch.setattr(plugins, "git_ops", git)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+
+    task_id = await _pair_task_in_review(client, "Named replacement")
+    git.tip = "second-tip"
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    updates = (await client.get(f"/api/tasks/{task_id}")).json()["updates"]
+    line = [u["content"] for u in updates if "Submitted for review" in u["content"]][-1]
+    assert "Пересдача из review" in line
+    assert "first-tip" in line, "the submission being replaced is named"
+    assert "second-tip" in line, "and so is the one replacing it"
+
+
+async def test_headless_task_is_still_refused_from_review(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1054 AC-4: the opening is for the pair path only."""
+    task_id = await _pair_task_in_review(client, "Headless")
+    await repo.update_task(db, task_id, job_id="job-42")
+    await db.commit()
+
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+
+    assert resp.status_code == 400, resp.text
+    assert "headless" in resp.text

@@ -1757,11 +1757,25 @@ async def submit_for_review(
 ) -> TaskView:
     """Submit the current work of a pair task for client-driven review (#305).
 
-    Valid only from pair ``running`` (no ``job_id``): headless tasks are
-    submitted by their done report and reviewed by the poller conveyor.
-    Bumps the submission generation — which invalidates any APPROVED verdict
-    recorded for earlier work — and moves the task into ``status=review``
-    with no ``review_job_id``, marking the review as client-driven.
+    Valid from pair ``running`` and, since #1054, from pair ``review`` as
+    well (never with a ``job_id``: headless tasks are submitted by their done
+    report and reviewed by the poller conveyor). Bumps the submission
+    generation — which invalidates any verdict recorded for earlier work —
+    and leaves the task in ``status=review`` with no ``review_job_id``,
+    marking the review as client-driven.
+
+    #1054: resubmitting from ``review`` used to be refused, and the refusal
+    had no third move behind it. An author who found a defect in his own
+    submission — #1042 on 29.08, a parser that read a deleted file as an
+    untouched one — could either say nothing, and let the gate merge a branch
+    tip no verdict had read (exactly what #612 and #1019 exist to prevent), or
+    ask the reviewer to look past the submission at the tip, which is the same
+    breach by hand. The task stood until someone else's CHANGES_REQUESTED
+    returned it to running. The invariant that makes the transition safe was
+    already in place: a verdict is bound to the generation it was written for
+    (repository.record_review_verdict binds it in SQL) and only the current
+    generation counts, so the bump here retires the previous verdict rather
+    than smuggling work past it.
     """
     row = await repo.get_task(db, task_id)
     if not row:
@@ -1769,18 +1783,21 @@ async def submit_for_review(
     task = dict(row)
     body = body or TaskSubmitReview()
 
-    if task["status"] != "running" or task.get("job_id"):
-        if task.get("job_id"):
-            raise HTTPException(
-                400,
-                "headless tasks are submitted for review by their done report; "
-                "submit-for-review is only for pair tasks without a dispatch job",
-            )
+    if task.get("job_id"):
         raise HTTPException(
             400,
-            f"can only submit running pair tasks for review, "
+            "headless tasks are submitted for review by their done report; "
+            "submit-for-review is only for pair tasks without a dispatch job",
+        )
+    if task["status"] not in ("running", "review"):
+        raise HTTPException(
+            400,
+            f"can only submit running or under-review pair tasks for review, "
             f"current status: {task['status']}",
         )
+    # #1054: what this submission replaces, read before anything is written.
+    resubmitted_from_review = task["status"] == "review"
+    replaced_sha = (task.get("submission_sha") or "").strip()
 
     # #533: the task records a canonical branch; the client reports the one it
     # worked in. A mismatch means the hub, CI and the reviewer are looking at
@@ -2030,12 +2047,15 @@ async def submit_for_review(
 
     async with get_write_lock(db):
         if not await repo.transition_status_if(
-            db, task_id, expected_from="running", new_status="review"
+            db,
+            task_id,
+            expected_from=task["status"],
+            new_status="review",
         ):
             raise HTTPException(
                 409,
-                f"Task #{task_id} left running state during submit; retry from "
-                "its current status",
+                f"Task #{task_id} left {task['status']} state during submit; "
+                "retry from its current status",
             )
         # #911: only now, past every gate that could still refuse. The write
         # goes to the process-wide connection, and a refusal after it would
@@ -2120,6 +2140,16 @@ async def submit_for_review(
             # sentence (seen on #725 and #763). It belongs to the sha, so it
             # is bound to the sha.
             content += f" Branch tip NOT pinned: {sha_reason}."
+        if resubmitted_from_review:
+            # #1054: someone may be reading the previous submission right now.
+            # Both commits are named, so what he is looking at and what
+            # replaced it are in the feed rather than in his assumptions.
+            replaced = replaced_sha[:12] if replaced_sha else "—"
+            content += (
+                f" Пересдача из review: сдача {replaced} заменена на "
+                f"{submission_sha[:12] if submission_sha else '—'}; вердикт "
+                "по заменённой сдаче больше не текущий."
+            )
         if adopted:
             ac_count = len(adopted.get("ac_recorded") or [])
             v_status = adopted.get("validation_status") or "—"
