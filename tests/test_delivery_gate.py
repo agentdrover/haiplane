@@ -157,11 +157,13 @@ async def test_missing_run_within_window_keeps_task_running(
 ) -> None:
     # #1041 AC-1: workflows exist, this SHA has no run yet, the grace window
     # has not elapsed — delivery waits. needs_decision would turn a GitHub
-    # registration lag into a human chore.
+    # registration lag into a human chore. The stand-in is not hex: detect-secrets
+    # treats hex high-entropy strings as secrets and that scan is the same CI
+    # job the delivery gate reads.
     g = _git(CIProbeOutcome.passed, merged=True)
     g.check_pr_ci = AsyncMock(
         return_value=CIProbeResult(
-            CIProbeOutcome.missing_run, "no_workflow_runs", details="abc123def456"
+            CIProbeOutcome.missing_run, "no_workflow_runs", details="head-sha-not-hex"
         )
     )
     plugins.git_ops = g
@@ -187,7 +189,7 @@ async def test_missing_run_after_window_escalates_with_named_fact(
     g = _git(CIProbeOutcome.passed, merged=True)
     g.check_pr_ci = AsyncMock(
         return_value=CIProbeResult(
-            CIProbeOutcome.missing_run, "no_workflow_runs", details="abc123def456"
+            CIProbeOutcome.missing_run, "no_workflow_runs", details="head-sha-not-hex"
         )
     )
     plugins.git_ops = g
@@ -208,4 +210,4 @@ async def test_missing_run_after_window_escalates_with_named_fact(
     body = " ".join(u.get("content") or "" for u in updates)
     assert "ci_absent: no_workflow_runs" not in body
     assert "workflow есть" in body
-    assert "abc123def456" in body
+    assert "head-sha-not-hex" in body

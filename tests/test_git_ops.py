@@ -2003,7 +2003,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
     branch that today returns absent (empty checks / empty runs) — never on
     a probe that already has a check set.
     """
-    sha = "cafebabedeadbeef"
+    sha = "pr-head-oid-stand-in"
 
     with patch(
         "hub.integrations.git_ops._gh",

@@ -941,7 +941,9 @@ async def test_missing_run_does_not_skip_ci(mock_sleep, db):
     mock_git = NoopGitOps()
     mock_git.check_pr_ci = AsyncMock(
         return_value=CIProbeResult(
-            CIProbeOutcome.missing_run, "no_workflow_runs", details="deadbeefcafebabe"
+            CIProbeOutcome.missing_run,
+            "no_workflow_runs",
+            details="poller-head-sha-stand-in",
         )
     )
     plugins.git_ops = mock_git
@@ -955,7 +957,7 @@ async def test_missing_run_does_not_skip_ci(mock_sleep, db):
     assert row["status"] == "needs_decision"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     body = " ".join(u.get("content") or "" for u in updates)
-    assert "deadbeefcafebabe" in body
+    assert "poller-head-sha-stand-in" in body
     assert "не проверялся" in body.lower() or "прогона" in body
 
 
