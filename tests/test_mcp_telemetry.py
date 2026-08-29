@@ -451,3 +451,45 @@ async def test_retention_prunes_only_what_is_past_the_horizon(db):
 
     assert removed == 1
     assert [row["tool"] for row in await _events(db)] == ["b"]
+
+
+def test_error_reason_prefers_hub_envelope_over_transport() -> None:
+    """#882 AC-2: the hub said why; the column must not say 'http_status_error'.
+
+    A refusal reaches telemetry as ``ToolError(...) from HubApiError(...) from
+    HTTPStatusError``. Classifying by root type walks straight past the answer
+    to the transport underneath it — 12 of the first window's 48 errors were
+    filed that way, none naming a cause.
+    """
+    from hub.mcp_server import HubApiError
+    from hub.services import mcp_telemetry as telemetry
+
+    class HTTPStatusError(Exception):
+        pass
+
+    refusal = HubApiError({"reason": "human_decision_required", "message": "gate"})
+    refusal.__cause__ = HTTPStatusError()
+    wrapped = Exception("Error executing tool hub_refine_task: gate")
+    wrapped.__cause__ = refusal
+
+    assert telemetry._exception_reason(wrapped) == "human_decision_required"
+    # ...and the transport is still what is written when nobody said why.
+    assert telemetry._exception_reason(HTTPStatusError()) == "http_status_error"
+
+
+def test_envelope_reason_accepts_only_slugs() -> None:
+    """A payload is hub-produced, but this column takes slugs from nobody.
+
+    ``error_reason`` is the one field an argument value could reach storage
+    through, so the shape is checked rather than the source trusted: a message
+    that happens to sit under ``reason`` falls back to the type, it does not
+    become a key.
+    """
+    from hub.mcp_server import HubApiError
+    from hub.services import mcp_telemetry as telemetry
+
+    prose = HubApiError({"reason": "task 42 assigned to somebody", "message": "x"})
+    assert telemetry._exception_reason(prose) == "hub_api_error"
+
+    missing = HubApiError({"message": "no reason at all"})
+    assert telemetry._exception_reason(missing) == "hub_api_error"

@@ -1428,3 +1428,168 @@ async def test_override_window_is_seven_days(db: aiosqlite.Connection):
     assert row["applied"] == 2
     assert row["overridden_by_human"] == 1
     assert row["escalated"] == 0
+
+
+# --- #912: пустой прогон не портит знаменатель суждений ----------------------
+
+
+async def test_no_data_reports_excluded_from_precision(db: aiosqlite.Connection):
+    """AC-1: отчёт, где судить нечего, не считается несуждённым.
+
+    Прогон без кандидатов, без находок и без токенов — это не «отчёт, который
+    никто не разобрал». Разбирать в нём нечего, и знаменатель, включающий его,
+    делает привычку хуже, чем она есть. На живом окне в момент написания: 151
+    отчёт, из них 61 пустой, покрытие читалось «0 из 151» там, где честный
+    знаменатель 90.
+    """
+    judged = await _task(db, title="есть что судить")
+    await _judged(db, judged, ["fixed"])
+    silent = await _task(db, title="есть находки, никто не разобрал")
+    await _report(db, silent, confirmed=3)
+    empty_one = await _task(db, title="пустой прогон 1")
+    await _report(db, empty_one, confirmed=0, tokens_spent=None)
+    empty_two = await _task(db, title="пустой прогон 2")
+    await _report(db, empty_two, confirmed=0, tokens_spent=None)
+    await db.commit()
+
+    mr = (await practice_metrics(db))["machine_reviews"]
+    disp = mr["dispositions"]
+
+    assert mr["no_data_reports"] == 2, "пустые прогоны никуда не делись"
+    assert disp["reports_counted"] == 2, "в знаменателе только те, где есть что судить"
+    assert disp["reports_judged"] == 1
+    assert disp["reports_unjudged"] == 1, (
+        "несуждённый ровно один — второй отчёт с находками; "
+        "пустые прогоны в это число не входят"
+    )
+
+
+async def test_unjudged_window_states_itself(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2: пустые прогоны названы отдельно, а не спрятаны и не смешаны.
+
+    И ноль печатается нулём. Прочерк читается как «неизвестно», тогда как это
+    известная величина: посчитали, и их нет. Счётчик, исчезающий при нуле, учит
+    читателя, что такого не бывает — ровно то, о чём предупреждает условие
+    пересмотра этой задачи.
+    """
+    with_data = await _task(db, title="с находками")
+    await _report(db, with_data, confirmed=2)
+    await db.commit()
+
+    def _row(page: str, label: str) -> str:
+        """Содержимое ИМЕННО этой строки таблицы.
+
+        Проверять подстроку по всей странице нельзя: «0 из 1» встречается и в
+        соседней строке покрытия, поэтому утверждение проходило бы через неё и
+        молчало о том, ради чего написано.
+        """
+        start = page.index(label)
+        return page[start : page.index("</tr>", start)]
+
+    # Сначала состояние БЕЗ пустых прогонов: именно здесь прочерк и прячется.
+    page = (await client.get("/metrics")).text
+    assert "0 из 1" in _row(page, "Без данных"), "ноль напечатан нулём, не прочерком"
+
+    empty = await _task(db, title="пустой")
+    await _report(db, empty, confirmed=0, tokens_spent=None)
+    await db.commit()
+
+    page = (await client.get("/metrics")).text
+    assert "1 из 2" in _row(page, "Без данных"), "пустые названы рядом с общим числом"
+    assert "0 из 1" in _row(page, "Разобрано отчётов"), (
+        "знаменатель покрытия — только отчёты с данными"
+    )
+
+
+async def test_no_data_does_not_move_precision(db: aiosqlite.Connection):
+    """AC-3: presence пустых прогонов не двигает precision и resolution_rate.
+
+    Проверяется сравнением ДВУХ прогонов на одних и тех же суждениях: без
+    пустых отчётов и с ними. Утверждение «precision равна 1.0» было бы верно и
+    при сломанном расчёте, если суждение всего одно; сравнение двух состояний
+    ловит именно вклад пустых.
+    """
+    task_id = await _task(db, title="суждения")
+    await _judged(db, task_id, ["fixed", "false_positive"])
+    await db.commit()
+    before = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+
+    for i in range(3):
+        empty = await _task(db, title=f"пустой {i}")
+        await _report(db, empty, confirmed=0, tokens_spent=None)
+    await db.commit()
+    after = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+
+    assert before["precision"] == after["precision"]
+    assert before["resolution_rate"] == after["resolution_rate"]
+    assert before["judged"] == after["judged"] == 2
+    assert after["reports_counted"] == before["reports_counted"], (
+        "пустые прогоны не попали и в знаменатель покрытия"
+    )
+
+
+async def test_a_partly_judged_report_is_not_covered(db: aiosqlite.Connection):
+    """«Разобран» значит, что ответ есть у КАЖДОЙ находки, а не у первой.
+
+    При слабом правиле отчёт из трёх находок с одной диспозицией читался как
+    полностью покрытый, и страница могла показать «90 из 90 разобрано» рядом с
+    очередью на 180 неотвеченных находок.
+    """
+    task_id = await _task(db, title="разобран наполовину")
+    await _report(db, task_id, confirmed=3)
+    row = await repo.get_latest_machine_review(db, task_id)
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=int(dict(row)["id"]),
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_uid="uid-0",
+        finding_title="первая",
+        disposition="fixed",
+        note="",
+        decided_by="denis",
+    )
+    await db.commit()
+
+    disp = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+    assert disp["reports_counted"] == 1
+    assert disp["reports_judged"] == 0, "одна диспозиция из трёх — это не разбор"
+    assert disp["reports_unjudged"] == 1
+
+
+async def test_a_superseded_report_is_not_in_the_denominator(
+    db: aiosqlite.Connection,
+):
+    """Отчёт пересданной генерации судить НЕЛЬЗЯ — и требовать его нельзя.
+
+    Очередь его не показывает, а record_finding_dispositions отвергает (#1038).
+    Оставленный в знаменателе, он превращается в единицу, которую невозможно
+    закрыть: «1 из 2» навсегда. Тот же класс, что пустой прогон.
+    """
+    task_id = await _task(db, title="пересдана")
+    await _report(db, task_id, confirmed=5)
+    # Задача ушла вперёд: отчёт генерации 1 стал устаревшим.
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await db.commit()
+
+    disp = (await practice_metrics(db))["machine_reviews"]["dispositions"]
+    assert disp["reports_counted"] == 0, (
+        "устаревший отчёт не попадает в знаменатель, который просят закрыть"
+    )
+    assert disp["reports_unjudged"] == 0
+
+
+async def test_an_empty_window_prints_zero_not_a_blank(client: AsyncClient):
+    """Пустое окно печатает нули, а не пустые клетки.
+
+    SUM по пустому набору — это SQL NULL, а не ноль, и Jinja печатает None
+    пустой строкой: « из 0». Раньше это пряталось за прочерком, который убрали
+    в этой же задаче, — то есть исправление одной честности вскрыло другую.
+    """
+    page = (await client.get("/metrics")).text
+    start = page.index("Без данных")
+    row = page[start : page.index("</tr>", start)]
+    assert "0 из 0" in row, f"пустое окно печатает нули, а не пустоту: {row!r}"

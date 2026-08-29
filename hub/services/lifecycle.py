@@ -43,6 +43,7 @@ from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
+from hub.services.review_evidence import inflight_verdict_note
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -2499,6 +2500,7 @@ async def record_review_verdict(
     # reason: both are questions about what the approver may not have seen,
     # and neither may hold the write lock while it answers.
     undisposed_note = ""
+    inflight_note = ""
     if body.verdict.value == "approved":
         from hub.services.review_evidence import (
             attach_dispositions,
@@ -2515,6 +2517,15 @@ async def record_review_verdict(
             )
             await attach_dispositions(db, mr_view)
             undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+
+        has_current_report = False
+        if mr_row is not None:
+            has_current_report = int(mr_row["submission_generation"] or 0) == (
+                task.get("submission_generation") or 0
+            )
+        inflight_note = await inflight_verdict_note(
+            db, task, has_current_report=has_current_report
+        )
 
     # Auto-draft follow-ups BEFORE persisting the verdict so the created
     # ids land in the stored findings (create_task commits on its own, so
@@ -2549,6 +2560,8 @@ async def record_review_verdict(
             content += f"\n{sha_note}"
         if undisposed_note:
             content += f"\n{undisposed_note}"
+        if inflight_note:
+            content += f"\n{inflight_note}"
         if self_approved:
             content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
             log.warning(
@@ -2679,6 +2692,12 @@ async def record_review_verdict(
             f"{view.lifecycle_hint}\n{undisposed_note}"
             if view.lifecycle_hint
             else undisposed_note
+        )
+    if inflight_note:
+        view.lifecycle_hint = (
+            f"{view.lifecycle_hint}\n{inflight_note}"
+            if view.lifecycle_hint
+            else inflight_note
         )
     return view
 

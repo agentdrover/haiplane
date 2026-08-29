@@ -36,10 +36,13 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from hub import config
+from hub import repository as repo_module
 from hub.integrations.registry import plugins
+from hub.models import ReviewInFlight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from hub.models import ReviewReport
@@ -587,6 +590,68 @@ def undisposed_note(confirmed: int, undisposed: int) -> str:
         f"{confirmed} подтверждённых, из них {undisposed} без диспозиции — "
         "никто не сказал, чем они оказались. Вердикт записан; находки "
         "остаются неотвеченными."
+    )
+
+
+def _parse_dispatch_created(raw: str) -> datetime:
+    text = (raw or "").strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return datetime.now(UTC)
+
+
+def inflight_headline(dispatch: dict[str, Any], *, now: datetime | None = None) -> str:
+    """One line: model, profile, elapsed, grace — the four facts #1027 named."""
+    now = now or datetime.now(UTC)
+    created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
+    elapsed = max(0, int((now - created).total_seconds() // 60))
+    grace = created + timedelta(minutes=config.CURSOR_REVIEW_GRACE_MINUTES)
+    model = (dispatch.get("model") or "").strip() or "не заявлена"
+    profile = (dispatch.get("profile") or "").strip() or "не заявлен"
+    return (
+        f"ревью в полёте: {model}, профиль {profile}, идёт {elapsed} мин, "
+        f"grace до {grace.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+
+async def inflight_view(db, task_row: dict[str, Any]) -> ReviewInFlight | None:
+    """Active dispatch of the current submission, or None (#1027)."""
+    task_id = int(task_row["id"])
+    generation = int(task_row.get("submission_generation") or 0)
+    row = await repo_module.get_review_dispatch_for_generation(db, task_id, generation)
+    if row is None:
+        return None
+    dispatch = dict(row)
+    if dispatch.get("status") != "active":
+        return None
+    headline = inflight_headline(dispatch)
+    created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
+    grace = created + timedelta(minutes=config.CURSOR_REVIEW_GRACE_MINUTES)
+    elapsed = max(0, int((datetime.now(UTC) - created).total_seconds() // 60))
+    return ReviewInFlight(
+        model=(dispatch.get("model") or "").strip(),
+        profile=(dispatch.get("profile") or "").strip(),
+        elapsed_minutes=elapsed,
+        grace_until=grace.strftime("%Y-%m-%d %H:%M"),
+        headline=headline,
+    )
+
+
+async def inflight_verdict_note(
+    db, task_row: dict[str, Any], *, has_current_report: bool
+) -> str:
+    """Caveat for an approval that did not wait for the hub-called review."""
+    if has_current_report:
+        return ""
+    view = await inflight_view(db, task_row)
+    if view is None:
+        return ""
+    return (
+        "одобрено, не дождавшись вызванного ревью: по этой сдаче ещё идёт "
+        f"диспетчерский прогон ({view.headline}). Вердикт записан."
     )
 
 

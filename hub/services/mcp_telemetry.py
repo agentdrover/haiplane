@@ -99,6 +99,36 @@ def normalize_reason(value: Any) -> str:
     return UNCLASSIFIED_REASON
 
 
+def _envelope_reason(exc: BaseException) -> str | None:
+    """The hub's OWN reason for a refusal, when the exception carries one (#882).
+
+    An exception raised out of a REST call knows exactly why the hub refused —
+    the slug sits in its payload — but it reaches this module wrapped in the
+    SDK's ``ToolError``, whose type says only "a tool failed". Classifying by
+    type therefore writes down the transport and throws the answer away: 12 of
+    the first window's 48 errors were logged as ``http_status_error``, and not
+    one of them named a cause.
+
+    The exception class is not imported. It lives in ``hub.mcp_server``, which
+    imports this module, so importing it back would be a cycle; the payload is
+    read by shape instead, which also covers any later error type carrying the
+    same envelope. The slug is still passed through ``_REASON_RE`` — a payload
+    is hub-produced, but this column accepts only slugs no matter who wrote
+    them, and a message never becomes one by arriving in a dict.
+    """
+    node: BaseException | None = exc
+    for _ in range(4):
+        if node is None:
+            break
+        payload = getattr(node, "payload", None)
+        if isinstance(payload, dict):
+            reason = payload.get("reason")
+            if isinstance(reason, str) and _REASON_RE.match(reason):
+                return reason
+        node = node.__cause__
+    return None
+
+
 def _exception_reason(exc: BaseException) -> str:
     """Classify by exception type. The message is deliberately not read.
 
@@ -112,7 +142,13 @@ def _exception_reason(exc: BaseException) -> str:
     becomes ``http_status_error``, not ``h_t_t_p_status_error`` (#809). Both
     spellings group calls equally well; only one of them can be read in a
     report, and being read is what this column is for.
+
+    A reason the hub itself produced beats the type every time, so the envelope
+    is consulted first (#882); the type is what is left when nobody said why.
     """
+    envelope = _envelope_reason(exc)
+    if envelope is not None:
+        return envelope
     root = exc
     for _ in range(3):
         cause = root.__cause__

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hub import brand, config
@@ -52,7 +53,7 @@ from hub.mcp_structured import (
 
 # FastMCP defaults to localhost-only Host/Origin allowlists when host=127.0.0.1.
 # The hub mounts streamable HTTP under the main FastAPI app, so clients send the
-# public Host (e.g. agenthai.ru) — the SDK default rejects them with 421. Disable
+# public Host (any non-loopback name) — the SDK default rejects them with 421. Disable
 # MCP-layer rebinding checks here; AuthMiddleware + TLS cover remote access.
 class InstrumentedFastMCP(FastMCP):
     """FastMCP that records what each tool call cost (#780, epic #776).
@@ -73,6 +74,20 @@ class InstrumentedFastMCP(FastMCP):
     a successful no-op. Names only — never values. The call still succeeds:
     ``extra="forbid"`` would 422 live sessions holding a stale ``tools/list``
     (#899).
+
+    A refusal keeps its envelope here too (#882). The tools that catch
+    ``HubApiError`` themselves answer with ``reason``/``hint``/``actor_hint``;
+    the twenty-five that do not used to lose all three to the SDK's wrapper.
+    They are given back on this same funnel, for the same reason the
+    measurement lives here: a contract that depends on each author remembering
+    is a contract that erodes, and this one eroded by two tools in one week.
+
+    What does NOT change is the shape of the failure. The refusal is still
+    raised, still a ``ToolError``, so a client that reads ``isError`` sees
+    exactly what it saw before — only the text goes from a bare message to the
+    flat envelope. Answering these with a successful result instead would have
+    made every one of the twenty-five look like a success to such a client
+    (owner's decision, 29.08.2026).
     """
 
     def _declared_argument_names(self, name: str) -> set[str] | None:
@@ -107,7 +122,10 @@ class InstrumentedFastMCP(FastMCP):
                 principal_role=role,
                 unknown_arg_count=len(discarded),
             )
-            raise
+            refusal = _hub_api_error_in(exc)
+            if refusal is None:
+                raise
+            raise ToolError(_format_hub_api_error(refusal)) from exc
         result = attach_unknown_arguments(result, discarded)
         await record_call(
             tool=name,
@@ -163,6 +181,33 @@ class HubApiError(Exception):
 
     def as_json(self) -> str:
         return json.dumps(self.payload, ensure_ascii=False)
+
+
+def _hub_api_error_in(exc: BaseException) -> HubApiError | None:
+    """Find the hub's own refusal inside whatever the SDK wrapped it in (#882).
+
+    Twenty-five of the tools that call the REST API do not catch
+    ``HubApiError``, so it leaves them as ``ToolError(f"Error executing tool
+    {name}: {e}")``: the agent is told WHAT went wrong and never what to do,
+    while ``reason``, ``hint`` and ``actor_hint`` sit intact one link down the
+    ``__cause__`` chain. The list is not stable either — it was 23 when this
+    was written down and 25 a week later, because a contract kept by adding a
+    ``try/except`` to each new tool is kept only until somebody forgets.
+
+    Hence the search rather than twenty-five edits: the funnel in
+    ``call_tool`` closes it for every tool at once, including the five whose
+    success is a typed model and cannot carry an envelope string at all.
+    The chain is walked, not just its head, and bounded so a pathological
+    cause cycle cannot spin here.
+    """
+    node: BaseException | None = exc
+    for _ in range(4):
+        if node is None:
+            return None
+        if isinstance(node, HubApiError):
+            return node
+        node = node.__cause__
+    return None
 
 
 def _strip_internal_urls(text: str) -> str:

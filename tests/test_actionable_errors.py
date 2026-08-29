@@ -243,3 +243,42 @@ def test_dirty_reasons_no_longer_fall_back(caplog) -> None:
     assert clone["reason"] == "pair_branch_dirty"
     assert worktree["reason"] == "pair_worktree_dirty"
     assert not any("declares neither actor_hint" in r.message for r in caplog.records)
+
+
+def test_string_detail_reason_derived_from_status() -> None:
+    """#882 AC-3: a prose detail still says WHICH kind of refusal it was.
+
+    Before this, every string detail except 403 landed on ``api_error`` — 22 of
+    the first telemetry window's 48 errors — and that bucket cannot separate a
+    caller's mistake from a gate refusal from an outage, which is the single
+    distinction the report is read for.
+    """
+    cases = {
+        404: "not_found",
+        409: "conflict",
+        422: "validation_error",
+        429: "rate_limited",
+        500: "server_error",
+        503: "server_error",
+    }
+    for status, expected in cases.items():
+        payload = normalize_api_error_detail("something went wrong", status_code=status)
+        assert payload["reason"] == expected, status
+        assert payload["message"] == "something went wrong"
+        assert payload["status_code"] == status
+
+    # An outage is not the agent's to fix; waking it to re-check its arguments
+    # sends the work to somebody who cannot do it.
+    assert normalize_api_error_detail("boom", status_code=500)["actor_hint"] == "human"
+    assert normalize_api_error_detail("bad", status_code=422)["actor_hint"] == "agent"
+
+    # api_error survives, but only where the status genuinely does not classify.
+    odd = normalize_api_error_detail("teapot", status_code=418)
+    assert odd["reason"] == "api_error"
+
+    # A detail that already carries a slug keeps it: existing reasons stay
+    # comparable across the report's history.
+    structured = normalize_api_error_detail(
+        {"reason": "self_review_forbidden", "message": "no"}, status_code=409
+    )
+    assert structured["reason"] == "self_review_forbidden"

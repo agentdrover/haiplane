@@ -598,6 +598,11 @@
 
                 {% elif task.status.value == 'review' and not task.review_job_id %}
                 <div class="task-action-state task-action-state--danger">Review Required</div>
+                {% if review_in_flight %}
+                <div class="task-action-note task-action-note--warning">
+                    {{ review_in_flight.headline }}
+                </div>
+                {% endif %}
 
                 {# #823: доказательства выше пересказа. Всё, что ниже, уже
                    считалось для ревью-брифа и доставалось только агенту-
@@ -607,6 +612,9 @@
                    здесь читается как «проверено, чисто». #}
                 {% if evidence %}
                 <div class="task-action-note">
+                    {% if evidence.review_in_flight %}
+                    <div class="task-action-note--warning">{{ evidence.review_in_flight.headline }}</div>
+                    {% endif %}
                     <strong>Проверено по этой сдаче:</strong>
                     <span class="badge badge--xs badge-{{ 'failed' if evidence.evidence_coverage.state == 'none' else ('pending' if evidence.evidence_coverage.state == 'partial' else 'test') }}">{{ evidence.evidence_coverage.state }}</span>
                     {{ evidence.evidence_coverage.headline }}
