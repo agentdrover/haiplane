@@ -3668,6 +3668,7 @@ async def test_pair_start_conflict_returns_structured_detail(db: aiosqlite.Conne
     assert detail["workspace_path"] == "/var/lib/haiplane-hub/workspaces/_default"
     assert detail["hostname"] == "agenthai"
     assert "hub_pair_start" in detail["hint"]
+    assert detail["actor_hint"] == "human"
 
 
 # --- project binding at epic creation (#346) ---

@@ -15,6 +15,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from hub.actionable_errors import (
+    pair_branch_dirty_detail,
+    pair_worktree_dirty_detail,
+)
 from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
 from hub.integrations.protocols import (
     CIProbeOutcome,
@@ -93,6 +97,10 @@ class PairBranchConflictError(Exception):
             payload["hostname"] = self.hostname
         if self.suggested_tool:
             payload["suggested_tool"] = self.suggested_tool
+        if self.reason == "pair_branch_dirty":
+            return pair_branch_dirty_detail(payload)
+        if self.reason == "pair_worktree_dirty":
+            return pair_worktree_dirty_detail(payload)
         return enrich_error_payload(payload)
 
 
