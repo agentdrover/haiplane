@@ -4442,6 +4442,83 @@ async def test_worktree_mode_off_uses_legacy(db: aiosqlite.Connection, monkeypat
     prep_wt.assert_not_awaited()  # legacy branch-switching path, not worktrees
 
 
+# --- #1045: cleanup must call pair_remove_worktree with its real signature ---
+
+
+def _strict_remove(recorder: list):
+    """Same parameters as GitOpsIntegration.pair_remove_worktree — no **kwargs."""
+
+    async def pair_remove_worktree(task_id: int, *, repo: str | None = None) -> bool:
+        recorder.append({"task_id": task_id, "repo": repo})
+        return True
+
+    return pair_remove_worktree
+
+
+async def test_restore_does_not_pass_base_branch_into_remove(db, monkeypatch):
+    # AC-2: local_kw несёт base_branch (нужен pair_restore_workspace_base),
+    # а pair_remove_worktree его не принимает. AsyncMock это прячет.
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration as orch
+
+    monkeypatch.setenv("HAIPLANE_WORKTREE_PER_TASK", "1")
+    seen: list[dict] = []
+    g = NoopGitOps()
+    g.pair_remove_worktree = _strict_remove(seen)
+    plugins.git_ops = g
+
+    async def ctx(_db, _task_id):
+        return {"repo": "/ws/proj", "base_branch": "develop", "gh_repo": "o/r"}
+
+    monkeypatch.setattr(orch, "project_git_context", ctx)
+
+    tv = await services.create_task(db, TaskCreate(title="Cleanup signature"))
+    await orch.restore_pair_workspace_base(db, tv.id)
+
+    assert seen == [{"task_id": tv.id, "repo": "/ws/proj"}], (
+        "уборка должна получить только task_id и repo, не base_branch"
+    )
+
+
+async def test_failed_worktree_cleanup_is_named_on_the_task(db, monkeypatch):
+    # AC-3: TypeError (и любой другой отказ) больше не исчезает в except.
+    # Сдача не ломается — только запись в ленту.
+    from hub.services import lifecycle as life
+    from hub.services import orchestration as orch
+
+    async def boom(_db, task_id):
+        raise TypeError(
+            "pair_remove_worktree() got an unexpected keyword argument 'base_branch'"
+        )
+
+    monkeypatch.setattr(orch, "restore_pair_workspace_base", boom)
+    monkeypatch.setattr(life, "restore_pair_workspace_base", boom)
+
+    tv = await services.create_task(db, TaskCreate(title="Visible cleanup fail"))
+    await life._try_restore_pair_workspace(db, tv.id)
+
+    task = dict(await repo.get_task(db, tv.id))
+    assert task["status"] != "failed", "уборка не должна ломать задачу"
+    updates = [dict(u) for u in await repo.get_task_updates(db, tv.id)]
+    text = " ".join(u.get("content") or "" for u in updates)
+    assert "base_branch" in text or "worktree" in text.lower() or "уборк" in text, (
+        "причина отказа обязана быть в ленте, не только в логе"
+    )
+
+
+def test_pair_remove_worktree_signature_has_no_base_branch():
+    # Дублёр боевой сигнатуры: если кто-то добавит **kwargs на реализацию,
+    # вызов с лишним ключом снова станет невидимым.
+    import inspect
+
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    params = inspect.signature(GitOpsIntegration.pair_remove_worktree).parameters
+    assert "base_branch" not in params
+    assert set(params) - {"self"} == {"task_id", "repo"}
+
+
 async def _wt_done_task(db, *, job_id):
     task_id = await repo.create_task(
         db,

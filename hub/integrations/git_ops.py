@@ -575,7 +575,12 @@ async def _reject_broken_files(repo: str) -> list[str]:
 
 
 async def _resolve_ref(name: str, repo: str) -> str | None:
-    """Resolve a branch name to a commit sha, falling back to origin/<name>."""
+    """Resolve a branch name to a commit sha, falling back to origin/<name>.
+
+    Local-first is for "does this clone have the ref?". Do not use it for a
+    comparison the hub will judge — a leftover checkout can trail origin
+    (#762, #1046). Those callers use ``_resolve_ref_remote_first``.
+    """
     for ref in (name, f"origin/{name}"):
         rc, out, _ = await _git(
             "rev-parse",
@@ -689,17 +694,21 @@ class GitOpsIntegration:
         Merge-base analysis against ``base_branch``: ``other_branch`` owns the
         commits reachable from it but not from base; if ``branch`` contains
         any of them, the branches are stacked and ``branch`` cannot be
-        verified against base independently. Best-effort: unresolvable refs
-        or any git failure return False (advisory check, never an error).
+        verified against base independently. Refs are resolved remote-first
+        (#1046 / #762): a stale local develop must not invent a stack.
+        Best-effort: unresolvable refs or any git failure return False
+        (advisory check, never an error).
         """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
                 return False
         repo = repo or _repo_root()
-        head = await _resolve_ref(branch, repo)
-        other = await _resolve_ref(other_branch, repo)
-        base = await _resolve_ref(_resolve_base(base_branch), repo)
+        # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
+        # local develop turn independent branches into a false stack.
+        head = await _resolve_ref_remote_first(branch, repo)
+        other = await _resolve_ref_remote_first(other_branch, repo)
+        base = await _resolve_ref_remote_first(_resolve_base(base_branch), repo)
         if not (head and other and base):
             return False
 
@@ -1295,6 +1304,22 @@ class GitOpsIntegration:
         """
         rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
         return out if rc == 0 else None
+
+    async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
+        """Every path in the tree of ``ref``; ``None`` when it could not be read.
+
+        The distinction file_at_ref deliberately collapses is the one the AC
+        locator check needs (#764): a file the submission never added is
+        ``missing`` and a file that could not be read is ``unknown``, and
+        turning the second into the first is exactly the false accusation
+        #506 forbids. Knowing the tree tells the two apart in one call.
+        """
+        rc, out, _ = await _git(
+            "ls-tree", "-r", "--name-only", ref, repo=repo, check=False
+        )
+        if rc != 0:
+            return None
+        return {line.strip() for line in out.splitlines() if line.strip()}
 
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
@@ -2854,6 +2879,71 @@ class GitOpsIntegration:
         except json.JSONDecodeError:
             return ""
         return str(data.get("state") or "").lower()
+
+    async def pr_is_draft(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Whether GitHub still treats this PR as a draft (#1053).
+
+        A Cloud Agent opens PRs as drafts by default. Hub ``create_pr`` never
+        does. ``gh pr merge`` refuses a draft with the same boolean
+        ``merge_pr`` already returns for a conflict or a revoked token, and
+        that boolean used to send the task to ``needs_decision``. False here
+        means "not a draft or could not look" — same #498 rule as the other
+        readers: silence is not an accusation, and the merge call still runs.
+        """
+        rc, out, err = await _gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            "--json",
+            "isDraft",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            log.info(
+                "PR #%d draft probe unavailable: %s",
+                pr_number,
+                (err or "gh молчит").strip()[:200],
+            )
+            return False
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return False
+        return bool(data.get("isDraft"))
+
+    async def mark_pr_ready(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Convert a draft PR to ready. Hub approval is the ready signal (#1053)."""
+        rc, _, err = await _gh(
+            "pr",
+            "ready",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            log.info("Marked PR #%d ready", pr_number)
+            return True
+        log.warning(
+            "Failed to mark PR #%d ready: %s",
+            pr_number,
+            (err or "").strip()[:200],
+        )
+        return False
 
     async def _pr_absent_or_unknown(
         self, pr_number: int, repo: str | None, gh_repo: str | None

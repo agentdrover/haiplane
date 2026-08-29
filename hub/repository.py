@@ -1392,6 +1392,68 @@ async def count_unjudged_findings(
     }
 
 
+# --- Finding outcomes: what the AUTHOR did (#911) ---------------------------
+
+
+async def upsert_finding_outcome(
+    db: aiosqlite.Connection,
+    *,
+    review_id: int,
+    task_id: int,
+    submission_generation: int,
+    finding_uid: str,
+    finding_index: int,
+    finding_title: str,
+    outcome: str,
+    note: str,
+    linked_task_id: int | None,
+    reported_by: str,
+) -> None:
+    """Record one finding's fate as its author tells it.
+
+    Separate table from ``finding_dispositions`` and separate on purpose: this
+    is the author's account of what they did, not a human's judgement of
+    whether the finding was real. ``_disposition_metrics`` does not filter by
+    who decided, so a row written here instead of there is the difference
+    between precision meaning something and precision meaning nothing.
+
+    Upsert on ``(review_id, finding_uid)``: a resubmission may correct what the
+    author said last time, and two contradictory accounts of one finding would
+    leave a reader to pick.
+    """
+    await db.execute(
+        "INSERT INTO finding_outcomes (review_id, task_id, submission_generation, "
+        "finding_uid, finding_index, finding_title, outcome, note, linked_task_id, "
+        "reported_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(review_id, finding_uid) DO UPDATE SET "
+        "outcome=excluded.outcome, note=excluded.note, "
+        "linked_task_id=excluded.linked_task_id, "
+        "reported_by=excluded.reported_by, reported_at=datetime('now')",
+        (
+            review_id,
+            task_id,
+            submission_generation,
+            finding_uid,
+            finding_index,
+            finding_title,
+            outcome,
+            note,
+            linked_task_id,
+            reported_by,
+        ),
+    )
+
+
+async def list_finding_outcomes(
+    db: aiosqlite.Connection, review_id: int
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM finding_outcomes WHERE review_id=? ORDER BY finding_index",
+        (review_id,),
+    )
+
+
 # --- Category checks (#878) ------------------------------------------------
 
 
@@ -3187,6 +3249,70 @@ async def last_activity_at(db: aiosqlite.Connection, task_id: int) -> str:
         (task_id,),
     )
     return str(rows[0]["at"]) if rows else ""
+
+
+async def human_queue_rung_raised(
+    db: aiosqlite.Connection,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+) -> bool:
+    """Has this rung already been rung for this wait (#1020)?
+
+    Scoped to the wait, not the task: ``entered_at`` in the key means a task
+    that comes back to the same status later starts the ladder again, while
+    one that simply keeps standing never hears the same rung twice.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM human_queue_reminders "
+        "WHERE task_id=? AND instance=? AND entered_at=? AND rung=? LIMIT 1",
+        (task_id, instance, entered_at, rung),
+    )
+    return bool(rows)
+
+
+async def record_human_queue_reminder(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    instance: str,
+    entered_at: str,
+    rung: str,
+    age_minutes: int,
+    age_estimated: bool = False,
+) -> bool:
+    """Record a rung; False when this wait already had it.
+
+    ``INSERT OR IGNORE`` against the unique key rather than a check-then-write:
+    two poller passes overlapping on a slow database would otherwise both read
+    "not yet raised" and both remind.
+    """
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO human_queue_reminders "
+        "(task_id, instance, entered_at, rung, age_minutes, age_estimated) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, instance, entered_at, rung, int(age_minutes), int(age_estimated)),
+    )
+    await db.commit()
+    return bool(cursor.rowcount)
+
+
+async def human_queue_reminders_between(
+    db: aiosqlite.Connection, start: str, end: str
+) -> list[dict[str, Any]]:
+    """Reminders raised in ``[start, end)`` — what the digest reports (#1020)."""
+    rows = await fetchall(
+        db,
+        "SELECT r.task_id, r.instance, r.rung, r.age_minutes, r.age_estimated, "
+        "       r.created_at, t.title, t.status "
+        "FROM human_queue_reminders r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.created_at >= ? AND r.created_at < ? "
+        "ORDER BY r.age_minutes DESC",
+        (start, end),
+    )
+    return [dict(r) for r in rows]
 
 
 async def stale_rung_raised(

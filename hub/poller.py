@@ -1108,6 +1108,112 @@ async def _sweep_unrefined_drafts(db) -> None:
             )
 
 
+# What each human-owned instance is actually waiting for. The age alone does
+# not tell a person what to do with the task — and "someone should look at
+# this" is what the single lifetime alert already said, to no effect.
+_HUMAN_QUEUE_ACTIONS: dict[str, str] = {
+    "draft": "черновик ждёт одобрения или отклонения (hub_approve_task / hub_reject_task)",
+    "needs_info": "агент ждёт ответа на вопрос (hub_answer_question)",
+    "needs_decision": "задача ждёт решения человека (hub_decide_task)",
+    "review:client": "сдача ждёт вердикта ревьюера (hub_submit_review)",
+}
+
+
+def _human_queue_rows_sql(policy) -> tuple[str, tuple]:
+    """Rows in this human-owned instance, oldest wait first."""
+    sql = (
+        "SELECT id, title, status, status_entered_at, updated_at "
+        "FROM tasks WHERE status=? AND archived=0"
+    )
+    params: tuple = (policy.status,)
+    if policy.discriminator == "client":
+        # review:client is the half of review that waits on a person; the
+        # headless half is the conveyor's own and escalates by deadline.
+        sql += " AND (review_job_id IS NULL OR review_job_id='')"
+    return sql + " ORDER BY status_entered_at ASC", params
+
+
+async def _sweep_human_queue(db) -> None:
+    """The human queue gets hours (#1020): 24h / 72h / 168h, one rung each.
+
+    Volume only. Status, owner and next actor are untouched — the matrix's
+    invariant is that a human-owned instance never auto-transitions, and a
+    reminder is not a deadline. The reminder goes to the events feed and the
+    activity log, NOT to the task's own updates: that feed is the story of the
+    work, and an alarm clock ringing in it three times a week would be read as
+    part of the work.
+    """
+    for policy in lifecycle_matrix.human_owned_policies():
+        sql, params = _human_queue_rows_sql(policy)
+        rows = await fetchall(db, sql, params)
+        for row in rows:
+            with _task_isolation("human queue", dict(row).get("id")):
+                await _human_queue_tick(db, dict(row), policy)
+
+
+async def _human_queue_tick(db, task: dict, policy) -> None:
+    task_id = task["id"]
+    entered_at = str(task.get("status_entered_at") or "")
+    estimated = not entered_at
+    if estimated:
+        # #416 backfilled this column for every row, so this is a guard, not a
+        # path anyone is expected to walk. It says so out loud rather than
+        # presenting a guess as a measurement.
+        entered_at = str(task.get("updated_at") or "")
+    age = _silence_minutes(entered_at)
+    if age is None:
+        return
+
+    due = [label for gate, label in config.HUMAN_QUEUE_LADDER_MINUTES if age >= gate]
+    if not due:
+        return
+    rung = due[-1]
+    if await repo.human_queue_rung_raised(
+        db, task_id, policy.instance, entered_at, rung
+    ):
+        return
+    if not await repo.record_human_queue_reminder(
+        db,
+        task_id=task_id,
+        instance=policy.instance,
+        entered_at=entered_at,
+        rung=rung,
+        age_minutes=int(age),
+        age_estimated=estimated,
+    ):
+        return  # another pass got there first
+
+    action = _HUMAN_QUEUE_ACTIONS.get(policy.instance, "задача ждёт человека")
+    age_text = _age_phrase(age) + (" (возраст оценочный)" if estimated else "")
+    await repo.insert_event(
+        db,
+        kind="human_queue_reminder",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "instance": policy.instance,
+            "rung": rung,
+            "age_minutes": int(age),
+            "age_estimated": estimated,
+            "surface": policy.surface,
+            "action": action,
+        },
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "human_queue_reminder",
+        f"Task #{task_id} ждёт человека {age_text} [рубеж {rung}]: {action}"[:200],
+    )
+    log.warning(
+        "Poll: task #%d waiting on a human in %s for %s (%s)",
+        task_id,
+        policy.instance,
+        age_text,
+        rung,
+    )
+
+
 async def _sweep_autopilot_digests(db) -> None:
     # Autopilot digests (#739): one per project per UTC day of
     # autopilot activity. Idempotent via the UNIQUE key, so every
@@ -1414,7 +1520,17 @@ async def _deliver_pair_task(db, task: dict) -> None:
         # Said once, not once per cycle: a line every thirty seconds is how a
         # real signal gets muted (#534).
         if detail.startswith(services.TRANSIENT_GATE_PREFIXES):
-            await _note_pair_delivery_wait(db, task_id, pr_num, detail)
+            await _note_pair_delivery_wait(
+                db,
+                task_id,
+                pr_num,
+                detail,
+                hint=(
+                    services.PR_DRAFT_WAIT_HINT
+                    if detail.startswith(services.PR_DRAFT_PREFIX)
+                    else ""
+                ),
+            )
             return
         reason = "merge_gate"
         if detail.startswith(services.RECOVERABLE_GATE_PREFIXES):
@@ -1645,6 +1761,7 @@ async def _poll_running_tasks(app: FastAPI) -> None:
             await _sweep_stale_running(db)
             await _sweep_stale_statuses(db)
             await _sweep_unrefined_drafts(db)
+            await _sweep_human_queue(db)
             await _sweep_autopilot_digests(db)
             await _sweep_delivery_discrepancies(db)
             await _sweep_review_dispatches(db)

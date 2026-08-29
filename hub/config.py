@@ -96,6 +96,10 @@ SDD_SURFACES = env_get("SDD_SURFACES", "warn")
 # tokens each, and 61% of its raw findings were rejected — two thirds of the
 # budget spent on noise a rule cannot produce.
 SUBMIT_RULES = env_get("SUBMIT_RULES", "warn")
+# #911: does a resubmission have to say what became of the findings it was sent
+# back over? Default warn, like every gate that asks the author for something
+# new: a rule that starts by refusing work teaches people to route around it.
+FINDING_OUTCOME = env_get("FINDING_OUTCOME", "warn")
 # Auto-approval of low-risk drafts (#584): 'off' (default) — every draft waits
 # for a human, today's behavior in full; 'r0' / 'r1' — a DoR-passed draft
 # whose DERIVED risk class (#582) is at or below the named class is approved
@@ -186,6 +190,20 @@ STALE_NEEDS_INFO_MINUTES = int(env_get("STALE_NEEDS_INFO_MINUTES", "480"))
 STALE_CI_CHECK_MINUTES = int(env_get("STALE_CI_CHECK_MINUTES", "60"))
 STALE_FIX_REQUESTED_MINUTES = int(env_get("STALE_FIX_REQUESTED_MINUTES", "60"))
 STALE_PENDING_REPORT_MINUTES = int(env_get("STALE_PENDING_REPORT_MINUTES", "30"))
+
+# The human queue's ladder (#1020): a day, three days, a week. Every other
+# deadline in this file watches a machine, which escalates on its own; the
+# statuses where work actually waits — draft, needs_info, needs_decision,
+# client review — had no clock at all, so their only detector was a person
+# noticing on the board, which is the very resource the queue is short of.
+# Three rungs in a week is the whole budget: a reminder that speaks on every
+# pass becomes the background nobody reads, which is how the single lifetime
+# alert it replaces already failed.
+HUMAN_QUEUE_LADDER_MINUTES: tuple[tuple[int, str], ...] = (
+    (int(env_get("HUMAN_QUEUE_RUNG_1_MINUTES", "1440")), "24h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_2_MINUTES", "4320")), "72h"),
+    (int(env_get("HUMAN_QUEUE_RUNG_3_MINUTES", "10080")), "168h"),
+)
 
 # Bounded recovery (#417): a headless dispatch/review job that stays missing
 # past the grace escalates to needs_decision; a claim held past the lease is

@@ -40,6 +40,7 @@ from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
 from hub.mcp_envelope import enrich_error_payload
+from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.outcomes import outcome_status_for_task
@@ -194,12 +195,29 @@ async def _try_restore_pair_workspace(
         return
     try:
         await restore_pair_workspace_base(db, task_id)
-    except Exception:
+    except Exception as exc:
         log.warning(
             "Failed to restore pair workspace base for task #%s",
             task_id,
             exc_info=True,
         )
+        # #1045: the TypeError from a signature mismatch lived only in this
+        # stack. The feed is what a person (or the next agent) reads.
+        try:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Уборка worktree не удалась: {exc}. Сдача не прервана.",
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001 - naming the failure must not fail the caller
+            log.warning(
+                "could not record worktree cleanup failure for task #%s",
+                task_id,
+                exc_info=True,
+            )
 
 
 async def _try_switch_pair_workspace_to_task(
@@ -267,6 +285,46 @@ def _children_allow_rollup(children: list[Any]) -> bool:
     return "completed" in statuses
 
 
+def _parent_has_own_work(parent: dict[str, Any]) -> bool:
+    """True when a feature/epic is itself in progress, not only a container (#1043).
+
+    Umbrella parents (#742) have none of these: empty ``claimed_by``,
+    ``claim_session_id``, ``branch``, and no ``pr_number``. A parent that
+    was pair-started or claimed is work of its own — children finishing
+    does not mean that work was reported.
+    """
+    if (parent.get("claimed_by") or "").strip():
+        return True
+    if (parent.get("claim_session_id") or "").strip():
+        return True
+    if (parent.get("branch") or "").strip():
+        return True
+    return bool(parent.get("pr_number"))
+
+
+async def _note_rollup_awaits_own_report(
+    db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
+) -> None:
+    """Write the skip to the task tape so the parent is not silently stuck."""
+    branch = (parent.get("branch") or "").strip() or "—"
+    claimed = (parent.get("claimed_by") or "").strip() or "—"
+    await repo.add_task_update(
+        db,
+        parent_id,
+        "hub",
+        "status",
+        "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
+        f"задачу, потому что у неё есть собственная работа "
+        f"(branch={branch}, claimed_by={claimed}).",
+    )
+    await log_activity(
+        db,
+        "task_updated",
+        f"Task #{parent_id} rollup skipped: parent has its own work, "
+        "awaiting its own report",
+    )
+
+
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     """Auto-complete feature/epic when every direct child is terminal (#742)."""
     row = await repo.get_task(db, child_id)
@@ -287,6 +345,9 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
 
     children = await db_module.get_children(db, parent_id)
     if not _children_allow_rollup(children):
+        return
+    if _parent_has_own_work(parent):
+        await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
 
     if not await repo.transition_status_if(
@@ -322,10 +383,14 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         parent_row = await repo.get_task(db, parent_id)
         if not parent_row:
             continue
+        parent = dict(parent_row)
         children = await db_module.get_children(db, parent_id)
-        if _children_allow_rollup(children):
-            await repo.update_task(db, parent_id, status="completed")
-            repaired += 1
+        if not _children_allow_rollup(children):
+            continue
+        if _parent_has_own_work(parent):
+            continue
+        await repo.update_task(db, parent_id, status="completed")
+        repaired += 1
     if repaired:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
@@ -1808,6 +1873,38 @@ async def submit_for_review(
                 "Это не значит, что расхождений нет."
             )
 
+    # #911: what became of the findings the PREVIOUS submission was sent back
+    # over. Placed with the other pre-transition gates for the same reason they
+    # are here — a refusal has to happen while there is still something to
+    # refuse — and before the paid layers, because it costs one indexed read.
+    #
+    # The generation asked about is the CURRENT one, before the bump below: the
+    # report for the submission being made does not exist yet. On a first
+    # submission there are no reports and the gate is silent, which is the
+    # point — it asks only where an answer is owed.
+    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
+    outcome_note = ""
+    outcome_writes: list[Any] = []
+    outcome_generation = int(task.get("submission_generation") or 0)
+    if outcome_mode != "off":
+        open_items = await finding_outcome.open_findings(
+            db, task_id, outcome_generation
+        )
+        try:
+            outcome_writes, still_open = finding_outcome.plan_outcomes(
+                open_items, body.finding_outcomes
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if still_open:
+            if outcome_mode == "require":
+                raise HTTPException(422, finding_outcome.refusal_text(still_open))
+            outcome_note = (
+                f"Исходы находок: НЕ названы для {len(still_open)} "
+                "подтверждённых находок предыдущей сдачи. Режим проверки — "
+                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
+            )
+
     # #855: the cheap deterministic layer, on the diff this submission already
     # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
     # paid reviewer for a measured reason: over 30 days the harness confirmed
@@ -1939,6 +2036,28 @@ async def submit_for_review(
                 f"Task #{task_id} left running state during submit; retry from "
                 "its current status",
             )
+        # #911: only now, past every gate that could still refuse. The write
+        # goes to the process-wide connection, and a refusal after it would
+        # leave the author's outcomes recorded for a submission that never
+        # happened — their corrected retry would then be told the finding is
+        # already closed. Written BEFORE the bump so the rows belong to the
+        # generation they answer, not to the one starting here.
+        outcome_drafts: list[int] = []
+        if outcome_writes:
+            outcome_drafts = await finding_outcome.apply_outcomes(
+                db,
+                task_id,
+                outcome_generation,
+                outcome_writes,
+                reported_by=(body.agent or task.get("assigned_agent") or ""),
+            )
+        if outcome_drafts:
+            outcome_note = (
+                (outcome_note + " " if outcome_note else "")
+                + f"Исходы находок: заведено дефект-драфтов {len(outcome_drafts)} — "
+                + ", ".join(f"#{i}" for i in outcome_drafts)
+                + ". Находка, которую не чинят, остаётся работой, а не исчезает."
+            )
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -2047,7 +2166,7 @@ async def submit_for_review(
         # leave the reader with a single list of what was checked. The wording
         # of each line is preserved verbatim, so anything that read the old
         # alerts still finds its phrase.
-        report_lines = [ln for ln in ([surface_note] + rule_lines) if ln]
+        report_lines = [ln for ln in ([surface_note, outcome_note] + rule_lines) if ln]
         report_lines += unchecked_lines
         if report_lines:
             # Only now is "what ran and found nothing" worth printing: inside

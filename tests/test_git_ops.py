@@ -360,6 +360,42 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
     assert mock_gh.await_args.kwargs.get("repo") == "/ws/proj"
 
 
+async def test_pr_is_draft_reads_isDraft(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, '{"isDraft": true}', ""),
+    ) as mock_gh:
+        assert await git_ops.pr_is_draft(185, repo="/ws", gh_repo="owner/repo") is True
+    args = list(mock_gh.await_args.args)
+    assert args[args.index("--json") + 1] == "isDraft"
+
+
+async def test_pr_is_draft_treats_silence_as_not_a_draft(
+    git_ops: GitOpsIntegration,
+) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "gh: Not Found"),
+    ):
+        assert await git_ops.pr_is_draft(185, gh_repo="owner/repo") is False
+
+
+async def test_mark_pr_ready_calls_gh_pr_ready(git_ops: GitOpsIntegration) -> None:
+    with patch(
+        "hub.integrations.git_ops._gh",
+        new_callable=AsyncMock,
+        return_value=(0, "", ""),
+    ) as mock_gh:
+        assert (
+            await git_ops.mark_pr_ready(185, repo="/ws", gh_repo="owner/repo") is True
+        )
+    args = list(mock_gh.await_args.args)
+    assert args[:2] == ["pr", "ready"]
+    assert args[args.index("--repo") + 1] == "owner/repo"
+
+
 @pytest.mark.parametrize(
     "rc,out,expected",
     [
@@ -2422,3 +2458,83 @@ async def test_release_range_is_empty_on_refusal_or_empty_range(
 
     with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=empty)):
         assert await git_ops.release_range("main", "develop") == []
+
+
+# --- #1046: stack advisory must judge origin refs, not a stale local base ---
+
+_STALE_BASE = "stalebase01"
+_FRESH_BASE = "freshbase02"
+_HEAD_SHA = "headsha0003"
+_OTHER_SHA = "othersha004"
+
+
+def _stack_ref_git(*, real_stack_on_origin: bool):
+    """Local develop is stale; origin/develop is current.
+
+    Against the stale local base, two independent branches share the
+    fresh-base commits and look stacked. Against origin/develop they
+    do not — unless ``real_stack_on_origin`` (head really contains
+    other's unique-vs-origin-base commits).
+    """
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args and args[0] == "rev-parse" and "--verify" in args:
+            table = {
+                "develop^{commit}": _STALE_BASE,
+                "origin/develop^{commit}": _FRESH_BASE,
+                "task-1046/fix^{commit}": _HEAD_SHA,
+                "origin/task-1046/fix^{commit}": _HEAD_SHA,
+                "task-1042/other^{commit}": _OTHER_SHA,
+                "origin/task-1042/other^{commit}": _OTHER_SHA,
+            }
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args and args[0] == "rev-list" and "--count" in args:
+            other = args[2]
+            negated = [a[1:] for a in args[3:] if a.startswith("^")]
+            base = negated[0]
+            head = negated[1] if len(negated) > 1 else None
+            if other == _OTHER_SHA and base == _STALE_BASE:
+                total, excluded = 2, 1
+            elif other == _OTHER_SHA and base == _FRESH_BASE:
+                total, excluded = (3, 1) if real_stack_on_origin else (1, 1)
+            else:
+                total, excluded = 0, 0
+            return (0, str(total if head is None else excluded), "")
+        return (0, "", "")
+
+    return fake_git
+
+
+async def test_stacking_judges_pushed_refs_not_stale_local_ones(
+    git_ops: GitOpsIntegration,
+) -> None:
+    # AC-2: local develop lags origin; the submitted branch carries the
+    # fresh base. Other's commits already landed in origin/develop.
+    with patch(
+        "hub.integrations.git_ops._git",
+        side_effect=_stack_ref_git(real_stack_on_origin=False),
+    ):
+        stacked = await git_ops.branch_contains_unmerged_commits_of(
+            "task-1046/fix",
+            "task-1042/other",
+            base_branch="develop",
+            repo="/tmp/repo",
+        )
+    assert stacked is False
+
+
+async def test_real_stack_is_still_detected(git_ops: GitOpsIntegration) -> None:
+    # AC-3: a branch actually cut from another unmerged task still stacks
+    # when judged on origin refs (#438).
+    with patch(
+        "hub.integrations.git_ops._git",
+        side_effect=_stack_ref_git(real_stack_on_origin=True),
+    ):
+        stacked = await git_ops.branch_contains_unmerged_commits_of(
+            "task-1046/fix",
+            "task-1042/other",
+            base_branch="develop",
+            repo="/tmp/repo",
+        )
+    assert stacked is True

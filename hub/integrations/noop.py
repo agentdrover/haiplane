@@ -157,6 +157,23 @@ class NoopGitOps:
         """
         return ""
 
+    async def pr_is_draft(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """No GitHub — "not a draft". Ignorance is not an accusation (#498)."""
+        return False
+
+    async def mark_pr_ready(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        return False
+
     async def release_range(
         self,
         base: str,
@@ -202,6 +219,10 @@ class NoopGitOps:
 
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
         """No git here — there is no rules file to read (#873)."""
+        return None
+
+    async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
+        """No git here — "could not look", never "the submission lacks it" (#764)."""
         return None
 
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
