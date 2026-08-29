@@ -34,7 +34,7 @@ def hub_base_url() -> str:
 
 
 def hub_instance_label(base_url: str | None = None) -> InstanceLabel:
-    """Map base URL host to prod|local (agenthai.ru vs loopback)."""
+    """Map base URL host to prod|local (public host vs loopback)."""
     url = base_url or hub_base_url()
     host = (urlparse(url).hostname or "").lower()
     if host in ("127.0.0.1", "localhost", "::1"):

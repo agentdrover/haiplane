@@ -10,7 +10,7 @@
     },
     "haiplane-hub": {
       "type": "streamable-http",
-      "url": "https://agenthai.ru/mcp",
+      "url": "https://your-hub.example/mcp",
       "headers": {
         "Authorization": "Bearer ${env:HAIPLANE_HUB_MCP_TOKEN}",
         "Accept": "application/json, text/event-stream"
