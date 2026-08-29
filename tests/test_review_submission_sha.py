@@ -290,3 +290,39 @@ async def test_changes_requested_path_is_unchanged(
     task = (await client.get(f"/api/tasks/{task_id}")).json()
     assert task["status"] == "running"
     assert task["review_verdict"] == "changes_requested"
+
+
+# ---- #1054: the author's own follow-up has a legal way to the verdict ----
+
+
+async def test_old_approval_does_not_cover_a_resubmission(
+    client: AsyncClient, git, monkeypatch
+):
+    """#1054 AC-2: the generation bump retires the verdict, and it is proven.
+
+    The whole transition rests on this: if an APPROVED written for the
+    previous submission survived the resubmission, opening review→review
+    would hand the delivery gate a commit nobody judged — the breach the
+    refusal was standing in for.
+    """
+    _patch_workspace(monkeypatch)
+    handle = git("first-tip")
+    task_id = await _submitted_task(client)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+
+    handle.tip = "follow-up-tip"
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+
+    task = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert task["submission_sha"] == "follow-up-tip"
+    assert task["review_approved_current"] is False, (
+        "an approval written for the previous commit may not cover this one"
+    )
+    assert task["latest_review"]["is_current"] is False
