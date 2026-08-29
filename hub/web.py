@@ -41,7 +41,8 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
-from hub.services.finding_evidence import evidence_for_findings
+from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
+from hub.services.finding_identity import finding_uids
 from hub.version import get_app_version
 from hub.models import (
     FindingDisposition,
@@ -1334,6 +1335,17 @@ async def web_findings_queue(request: Request, project: str = Query(default=""))
             # the metrics page and make the two disagree.
             finding = {}
         group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    for group in groups:
+        payload = [item["f"] for item in group["findings"]]
+        by_uid = await evidence_for_report(
+            db,
+            int(group["task_id"]),
+            payload,
+            generation=int(group["generation"]),
+        )
+        for item, uid in zip(group["findings"], finding_uids(payload), strict=True):
+            item["evidence"] = by_uid.get(uid)
+            item["uid"] = uid
     total = sum(len(g["findings"]) for g in groups)
     return TEMPLATES.TemplateResponse(
         request,
