@@ -544,3 +544,136 @@ async def test_unknown_check_outcome_is_refused(client: AsyncClient, db):
 
     with pytest.raises(ValueError, match="unknown check outcome"):
         await _report_checks(client, db, task_id, {"lint": "probably"})
+
+
+# --- #764: the locator block stops saying "unavailable" ---------------------
+#
+# Every brief read on production reported `unknown` for every criterion, nine
+# days running, while pytest ran fine in the task's own worktree. The hub was
+# looking in the shared clone, which worktree-per-task leaves on the base
+# branch for every task — so the HEAD guard never matched and collection was
+# never attempted. Not one line in the log said so, because it never got that
+# far.
+
+
+class _RealFiles(NoopGitOps):
+    """Real git reads only: the tree of a ref and a file out of it."""
+
+    async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().file_at_ref(repo, ref, path)
+
+    async def files_at_ref(self, repo: str, ref: str):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().files_at_ref(repo, ref)
+
+
+async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -> int:
+    task_id = await _project_with(db, client, workspace, "main")
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                    "test_ref": locator,
+                }
+            ]
+        },
+    )
+    return task_id
+
+
+async def test_locator_resolves_in_the_tasks_own_worktree(
+    db, client: AsyncClient, workspace, monkeypatch
+):
+    """#764 AC-1: collection is attempted where the task's branch lives.
+
+    The shared clone sits on the base branch — that is the normal state under
+    worktree-per-task, not an accident — so a check that only ever looked
+    there could not have resolved anything.
+    """
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    looked_in: list[str] = []
+
+    async def _fake_collect(path):
+        looked_in.append(path)
+        return {"tests/test_a.py::test_ok"}
+
+    monkeypatch.setattr(
+        "hub.services.review_brief.collect_test_nodeids", _fake_collect
+    )
+    monkeypatch.setattr(
+        "hub.services.orchestration.live_pair_worktree_info",
+        lambda _db, _tid: _awaitable(("worktree", "/tmp/wt/task-42")),
+    )
+
+    class _OnBranch(_RealFiles):
+        async def current_branch(self, repo: str | None = None) -> str:
+            return "task-42/work" if repo == "/tmp/wt/task-42" else "main"
+
+    plugins.git_ops = _OnBranch()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    assert looked_in == ["/tmp/wt/task-42"], "collection must run where the code is"
+    assert brief["locator_resolution"][0]["status"] == "resolvable"
+
+
+async def test_no_readable_tree_reports_unknown_not_missing(
+    db, client: AsyncClient, workspace
+):
+    """#764 AC-4: "could not look" is never dressed up as "not there".
+
+    A missing locator is an accusation about the author's work. Making it on
+    the strength of a failed read would be the same defect this task fixes,
+    pointed the other way.
+    """
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    await repo.update_task(db, task_id, submission_sha="0" * 40)
+    await db.commit()
+    plugins.git_ops = _RealFiles()  # real reads against a sha that is not there
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    resolution = brief["locator_resolution"][0]
+    assert resolution["status"] == "unknown"
+    assert resolution["reason"]
+
+
+async def test_a_locator_naming_a_file_the_submission_lacks_is_missing(
+    db, client: AsyncClient, workspace
+):
+    """#764: the commonest way a locator dies — the file was never written.
+
+    Both of my own cards yesterday named files that do not exist in the
+    repository at all (tests/test_digest.py, tests/test_lifecycle_matrix.py),
+    and nothing said a word.
+    """
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/never_written.py::test_ok"
+    )
+    plugins.git_ops = _RealFiles()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    resolution = brief["locator_resolution"][0]
+    assert resolution["status"] == "missing"
+    assert "tests/never_written.py" in resolution["reason"]
+
+
+def _awaitable(value):
+    async def _coro():
+        return value
+
+    return _coro()

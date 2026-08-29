@@ -1296,6 +1296,22 @@ class GitOpsIntegration:
         rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
         return out if rc == 0 else None
 
+    async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
+        """Every path in the tree of ``ref``; ``None`` when it could not be read.
+
+        The distinction file_at_ref deliberately collapses is the one the AC
+        locator check needs (#764): a file the submission never added is
+        ``missing`` and a file that could not be read is ``unknown``, and
+        turning the second into the first is exactly the false accusation
+        #506 forbids. Knowing the tree tells the two apart in one call.
+        """
+        rc, out, _ = await _git(
+            "ls-tree", "-r", "--name-only", ref, repo=repo, check=False
+        )
+        if rc != 0:
+            return None
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
 

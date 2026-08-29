@@ -10,6 +10,7 @@ hole. Best-effort: when the workspace or pytest is unavailable the status is
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 from typing import Any
@@ -22,6 +23,13 @@ log = logging.getLogger("hub")
 RESOLVABLE = "resolvable"
 MISSING = "missing"
 UNKNOWN = "unknown"
+UNPARSEABLE = "unparseable"
+
+# How a locator was resolved. The two are not equally strong and the brief says
+# which one answered: collection proves pytest can actually run the test;
+# reading the file proves only that a function by that name is written there.
+BY_COLLECTION = "test found by collection"
+BY_SOURCE = "test found in the file, read without running it"
 
 _COLLECT_TIMEOUT = 90
 
@@ -89,11 +97,87 @@ def _base_nodeids(collected: set[str]) -> set[str]:
     return {c.split("[", 1)[0] for c in collected if "[" in c}
 
 
-def resolve_ac_locators(acs: Any, collected: set[str] | None) -> list[dict]:
-    """Resolution status for each verifiable_by=test AC against ``collected`` (#506).
+def _wanted_name(nodeid: str) -> str:
+    """The test's own name: the last segment, minus any ``[param]`` suffix."""
+    return nodeid.split("::")[-1].split("[", 1)[0]
+
+
+def _defines_test(tree: ast.AST, name: str) -> int | None:
+    """Line where ``name`` is defined as a function anywhere in ``tree``.
+
+    Walks the whole tree rather than the module's top level, which is what
+    makes ``Class::method`` nodeids resolve without the resolver having to know
+    the class shape. It answers existence and nothing more — a name found here
+    says a function is written, not that pytest would collect it.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name == name
+        ):
+            return node.lineno
+    return None
+
+
+def locator_files(acs: Any) -> list[str]:
+    """The distinct files the test-AC locators name, for a caller to fetch."""
+    files: list[str] = []
+    for ac in acs:
+        if _verifiable_by(ac) != "test":
+            continue
+        parsed = parse_test_locator(getattr(ac, "test_ref", None))
+        if parsed and parsed[0] not in files:
+            files.append(parsed[0])
+    return files
+
+
+def resolve_locator_absent_file(nodeid: str) -> tuple[str, str]:
+    """The submission contains no such file — a fact, not a failure to look."""
+    rel = nodeid.split("::", 1)[0]
+    return MISSING, f"the submission contains no file {rel}"
+
+
+def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
+    """``(status, reason)`` from the file's own text — no imports, no pytest (#764).
+
+    The fallback for when collection cannot run: the project's dependencies are
+    not installed, or — the ordinary case at review time — no working tree
+    holds the submitted branch at all, because submit removes the task's
+    worktree. ``text`` is the file as of the submitted commit; ``None`` means
+    it could not be read, which is ``unknown`` and never ``missing``.
+    """
+    rel = nodeid.split("::", 1)[0]
+    if text is None:
+        return UNKNOWN, f"could not read {rel} at the submitted commit"
+    try:
+        tree = ast.parse(text, filename=rel)
+    except (SyntaxError, ValueError) as exc:
+        # Distinct from missing on purpose: "I could not read this" and "the
+        # test is not there" are different facts, and a blanket unknown for
+        # both is what taught reviewers to skip this block.
+        return UNPARSEABLE, f"could not parse {rel}: {type(exc).__name__}"
+    name = _wanted_name(nodeid)
+    line = _defines_test(tree, name)
+    if line is None:
+        return MISSING, f"{rel} defines no test named {name}"
+    return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
+
+
+def resolve_ac_locators(
+    acs: Any,
+    collected: set[str] | None,
+    sources: dict[str, str | None] | None = None,
+    absent_files: set[str] | None = None,
+) -> list[dict]:
+    """Resolution status for each verifiable_by=test AC (#506, #764).
 
     ``collected`` is the set of existing nodeids, or ``None`` when collection
-    could not run (→ ``unknown``). Non-test AC are skipped — they need no test.
+    could not run — and that is where ``sources`` takes over: the text of each
+    file named by a locator, as of the submitted commit, read with git and
+    parsed with ast, needing none of the project's dependencies. A file the
+    caller could not read maps to ``None`` and stays ``unknown``, because
+    "could not check" must never be reported as "checked and clean". Non-test
+    AC are skipped — they need no test.
     """
     resolutions: list[dict] = []
     bases = _base_nodeids(collected) if collected else set()
@@ -104,10 +188,14 @@ def resolve_ac_locators(acs: Any, collected: set[str] | None) -> list[dict]:
         parsed = parse_test_locator(locator)
         if parsed is None:
             status, reason = MISSING, "no valid pytest locator in test_ref"
+        elif collected is None and parsed[0] in (absent_files or set()):
+            status, reason = resolve_locator_absent_file(parsed[1])
         elif collected is None:
-            status, reason = UNKNOWN, "test collection unavailable in this environment"
+            status, reason = resolve_locator_in_source(
+                (sources or {}).get(parsed[0]), parsed[1]
+            )
         elif parsed[1] in collected or parsed[1] in bases:
-            status, reason = RESOLVABLE, "test found by collection"
+            status, reason = RESOLVABLE, BY_COLLECTION
         else:
             status, reason = MISSING, "locator does not match any collected test"
         resolutions.append(
