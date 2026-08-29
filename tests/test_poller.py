@@ -909,6 +909,59 @@ async def test_ci_absent_dispatches_review(mock_sleep, db):
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_repo_without_workflows_still_skips_ci(mock_sleep, db):
+    # #1041 AC-3: a repository with no workflows at all keeps today's conveyor
+    # — skip CI, dispatch review. missing_run must not steal this path.
+    task_id = await _make_ci_task(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "rev-1"})
+    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.absent, "no_workflow_runs")
+    )
+    plugins.git_ops = mock_git
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review"
+    mock_dispatch.submit_task.assert_awaited()
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
+async def test_missing_run_does_not_skip_ci(mock_sleep, db):
+    # #1041 AC-4: workflows exist, this SHA has no run. After the grace window
+    # that is "the code was not checked", not "nothing to check — go to review".
+    task_id = await _make_ci_task(db)
+    mock_dispatch = NoopDispatch()
+    mock_dispatch.submit_task = AsyncMock(return_value={"job_id": "rev-1"})
+    plugins.dispatch = mock_dispatch
+    mock_git = NoopGitOps()
+    mock_git.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(
+            CIProbeOutcome.missing_run,
+            "no_workflow_runs",
+            details="poller-head-sha-stand-in",
+        )
+    )
+    plugins.git_ops = mock_git
+
+    with pytest.raises(_BreakLoop):
+        await _poll_running_tasks(_make_app(db))
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] != "review"
+    mock_dispatch.submit_task.assert_not_awaited()
+    assert row["status"] == "needs_decision"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "poller-head-sha-stand-in" in body
+    assert "не проверялся" in body.lower() or "прогона" in body
+
+
+@patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
 async def test_ci_pending_stays_in_ci_check(mock_sleep, db):
     # AC-3 (#419): pending within the deadline keeps the task in ci_check with
     # no escalation and no duplicate alert.

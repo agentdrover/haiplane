@@ -20,14 +20,15 @@ class CIProbeOutcome(str, Enum):
 
     The old string return collapsed running checks, an empty check set, a gh
     error and unparseable output all into ``pending`` — the single biggest
-    CI dead-end. These five outcomes keep them distinct so the poller can
+    CI dead-end. These outcomes keep them distinct so the poller can
     branch on a typed value, never on free-form text.
     """
 
     passed = "pass"
     failed = "fail"
     pending = "pending"  # checks exist and are still running
-    absent = "absent"  # the PR has no checks at all → skip the conveyor
+    absent = "absent"  # the repo has no workflows / the PR has no checks at all
+    missing_run = "missing_run"  # workflows exist, but this SHA has no run yet
     unavailable = "unavailable"  # gh error / invalid JSON / unknown state
 
 

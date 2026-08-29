@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -301,11 +302,17 @@ async def test_check_pr_ci_typed_outcomes(
     # AC-1 (#419): every observable gh response maps to a distinct outcome with
     # a stable, non-empty reason — running checks, an empty set, a gh error and
     # unparseable output are no longer all "pending".
-    with patch(
-        "hub.integrations.git_ops._gh",
-        new_callable=AsyncMock,
-        return_value=(rc, out, "boom" if rc else ""),
-    ):
+    err = "boom" if rc else ""
+    if out == "[]":
+        gh_patch: dict = {
+            "side_effect": _gh_router(
+                checks=(rc, out, err),
+                workflows=(0, _workflows_json(count=0), ""),
+            )
+        }
+    else:
+        gh_patch = {"new_callable": AsyncMock, "return_value": (rc, out, err)}
+    with patch("hub.integrations.git_ops._gh", **gh_patch):
         result = await git_ops.check_pr_ci(42)
     assert result.outcome.value == expected_outcome
     assert result.reason == expected_reason
@@ -327,7 +334,7 @@ async def test_check_pr_ci_targets_project_repo(git_ops: GitOpsIntegration, gh_r
     with patch(
         "hub.integrations.git_ops._gh",
         new_callable=AsyncMock,
-        return_value=(0, "[]", ""),
+        return_value=(0, '[{"name": "CI", "state": "SUCCESS"}]', ""),
     ) as mock_gh:
         await git_ops.check_pr_ci(7, repo="/ws/proj", gh_repo=gh_repo)
 
@@ -1893,7 +1900,7 @@ async def test_branch_diff_paths_reads_non_ascii_and_reports_unknown(
 # ---- CI probe fallback (#606): the eye GitHub's token picker put out ----
 
 
-def _gh_router(*, checks, view=None, runs=None):
+def _gh_router(*, checks, view=None, runs=None, workflows=None):
     """A _gh double that answers by the gh subcommand it was asked."""
 
     async def route(*args, **kwargs):
@@ -1901,6 +1908,10 @@ def _gh_router(*, checks, view=None, runs=None):
             return checks
         if args[0] == "pr" and args[1] == "view":
             return view if view is not None else (1, "", "no view stub")
+        if args[0] == "api" and "actions/workflows" in args[1]:
+            if workflows is None:
+                raise AssertionError(f"workflows listed off the absent branch: {args}")
+            return workflows
         if args[0] == "api" and "actions/runs" in args[1]:
             return runs if runs is not None else (1, "", "no runs stub")
         raise AssertionError(f"unexpected gh call: {args}")
@@ -1909,9 +1920,7 @@ def _gh_router(*, checks, view=None, runs=None):
 
 
 def _runs_json(*runs: tuple[str, str]) -> str:
-    import json as _json
-
-    return _json.dumps(
+    return json.dumps(
         {
             "workflow_runs": [
                 {"name": "CI", "status": s, "conclusion": c} for s, c in runs
@@ -1957,12 +1966,16 @@ async def test_workflow_fallback_maps_every_outcome(git_ops: GitOpsIntegration):
         ),
     ]
     for runs_payload, expected in cases:
+        extra: dict = {}
+        if runs_payload == '{"workflow_runs": []}':
+            extra["workflows"] = (0, _workflows_json(count=0), "")
         with patch(
             "hub.integrations.git_ops._gh",
             side_effect=_gh_router(
                 checks=(1, "", "denied"),
                 view=(0, '{"headRefOid": "abc"}', ""),
                 runs=(0, runs_payload, ""),
+                **extra,
             ),
         ):
             result = await git_ops.check_pr_ci(7)
@@ -2007,6 +2020,92 @@ async def test_fallback_is_not_consulted_when_checks_work(
 
     assert result.outcome == CIProbeOutcome.passed
     assert result.reason == "checks_passed"
+    assert calls == [("pr", "checks")]
+
+
+def _workflows_json(*, count: int) -> str:
+    items = [
+        {"id": i, "name": f"wf-{i}", "state": "active"} for i in range(1, count + 1)
+    ]
+    return json.dumps({"total_count": count, "workflows": items})
+
+
+async def test_probe_separates_no_workflows_from_no_run_for_sha(
+    git_ops: GitOpsIntegration,
+):
+    """#1041 AC-5: the two facts that used to share absent.
+
+    Listing workflows is an extra GitHub call and must happen only on the
+    branch that today returns absent (empty checks / empty runs) — never on
+    a probe that already has a check set.
+    """
+    sha = "pr-head-oid-stand-in"
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(0, "[]", ""),
+            view=(0, json.dumps({"headRefOid": sha}), ""),
+            workflows=(0, _workflows_json(count=0), ""),
+        ),
+    ) as mock_gh:
+        none = await git_ops.check_pr_ci(7, gh_repo="owner/none")
+    assert none.outcome == CIProbeOutcome.absent
+    listed = [
+        c.args[1]
+        for c in mock_gh.await_args_list
+        if c.args and c.args[0] == "api" and "actions/workflows" in c.args[1]
+    ]
+    assert listed, "empty checks must list workflows to tell the two absents apart"
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(0, "[]", ""),
+            view=(0, json.dumps({"headRefOid": sha}), ""),
+            workflows=(0, _workflows_json(count=1), ""),
+        ),
+    ):
+        waiting = await git_ops.check_pr_ci(7, gh_repo="owner/has-ci")
+    assert waiting.outcome == CIProbeOutcome.missing_run
+    assert waiting.details == sha
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(1, "", "denied"),
+            view=(0, json.dumps({"headRefOid": sha}), ""),
+            runs=(0, '{"workflow_runs": []}', ""),
+            workflows=(0, _workflows_json(count=1), ""),
+        ),
+    ):
+        via_runs = await git_ops.check_pr_ci(7)
+    assert via_runs.outcome == CIProbeOutcome.missing_run
+    assert via_runs.details == sha
+
+    with patch(
+        "hub.integrations.git_ops._gh",
+        side_effect=_gh_router(
+            checks=(1, "", "denied"),
+            view=(0, json.dumps({"headRefOid": sha}), ""),
+            runs=(0, '{"workflow_runs": []}', ""),
+            workflows=(0, _workflows_json(count=0), ""),
+        ),
+    ):
+        no_wf = await git_ops.check_pr_ci(7)
+    assert no_wf.outcome == CIProbeOutcome.absent
+
+    calls: list[tuple] = []
+
+    async def only_checks(*args, **kwargs):
+        calls.append(args[:2])
+        if args[0] == "pr" and args[1] == "checks":
+            return (0, '[{"name": "CI", "state": "SUCCESS"}]', "")
+        raise AssertionError(f"extra GitHub call on a working checks path: {args}")
+
+    with patch("hub.integrations.git_ops._gh", side_effect=only_checks):
+        green = await git_ops.check_pr_ci(7)
+    assert green.outcome == CIProbeOutcome.passed
     assert calls == [("pr", "checks")]
 
 
