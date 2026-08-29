@@ -1426,5 +1426,20 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             f"статусом {run.get('status')}, machine-review актуальной "
             "генерации отсутствует. Вердикт остаётся человеку (#757).",
         )
+        task_row = await repo.get_task(db, task_id)
+        task_status = dict(task_row)["status"] if task_row else ""
+        if task_status != "review":
+            await repo.insert_event(
+                db,
+                kind="review_dispatch_failed",
+                task_id=task_id,
+                actor="hub",
+                payload={
+                    "dispatch_id": dispatch["id"],
+                    "model": dispatch.get("model") or "",
+                    "run_status": run.get("status"),
+                    "task_status": task_status,
+                },
+            )
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()

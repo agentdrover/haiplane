@@ -262,6 +262,39 @@ async def test_finished_run_without_report_alerts_once(
     assert len([u for u in updates if "отчёт НЕ сдан" in u["content"]]) == 1
 
 
+async def test_failed_dispatch_emits_event_for_closed_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1027): a miss after the task left review is visible in the event feed."""
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-closed"}, "run": {"id": "run-closed"}}
+    )
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-closed-task")
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+
+    async def _finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _finished)
+
+    await sweep_review_dispatches(db)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "отчёт НЕ сдан" in u["content"]]
+    events = [
+        dict(e)
+        for e in await repo.list_events(
+            db, since=0, kinds=["review_dispatch_failed"], limit=50
+        )
+        if e["task_id"] == task_id
+    ]
+    assert events, "the miss must reach the feed, not only the closed task's tape"
+
+
 async def test_missing_usage_leaves_dispatch_tokens_null(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):

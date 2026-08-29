@@ -736,6 +736,32 @@ async def test_review_panel_visible_for_client_driven_review(client: AsyncClient
     assert 'name="verdict" value="changes_requested"' in resp.text
 
 
+async def test_task_page_shows_review_in_flight(client: AsyncClient, db):
+    """AC-1 (#1027): the card names the in-flight dispatch, not just that a review is due."""
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    row = dict(await repo_module.get_task(db, task_id))
+    await repo_module.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=int(row["submission_generation"] or 0),
+        agent_id="bc-inflight",
+        run_id="run-inflight",
+        model="grok-4.6",
+        profile="lite",
+    )
+    await db.commit()
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "ревью в полёте" in page.text
+    assert "grok-4.6" in page.text
+    assert "lite" in page.text
+    assert "идёт" in page.text
+    assert "grace" in page.text
+
+
 async def test_review_panel_hidden_for_headless_review(client: AsyncClient, db):
     from hub import repository as repo_module
 
