@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 import logging
 import time
@@ -126,12 +127,14 @@ async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
 
 @contextlib.contextmanager
 def _task_isolation(stage: str, task_id: Any) -> Iterator[None]:
-    """One task's failure must not skip the rest of the tick (#363 I5).
+    """One task's failure must not skip the rest of the sweep (#363 I5).
 
-    The whole sweep sits inside a single ``try/except Exception``, so any
+    The whole sweep used to sit inside a single ``try/except Exception``, so any
     exception — a timed-out git call was the reported cause — abandoned every
     later stage of that tick: review, ci_check, stale sweeps, claim expiry. And
-    it did so again every tick until the cause cleared.
+    it did so again every tick until the cause cleared. This wrapper stops that
+    at the level of one task; the per-sweep wrapper in ``_poll_running_tasks``
+    stops it at the level of one sweep (#1069).
 
     Swallowing here is deliberate and narrow. The poller re-reads state from the
     database on every tick and is idempotent by design, so a task skipped once
@@ -1740,40 +1743,70 @@ async def _sweep_mcp_retention(db) -> None:
         )
 
 
-async def _poll_running_tasks(app: FastAPI) -> None:
-    """Background loop: one pass = the sweeps below, in this exact order.
+@dataclass(frozen=True)
+class Sweep:
+    """One sweep in the tick: a name for the log and the coroutine to run."""
 
-    The order is load-bearing and is the order the original 990-line body
-    executed (#850): e.g. review settlement runs before the release-policy
-    sweep, so a merge this pass produced is released this pass. Each sweep
-    owns one lifecycle concern and fails alone: the shared try only proves
-    the loop never dies, isolation per task lives in _task_isolation.
+    name: str
+    run: Callable[[Any], Awaitable[None]]
+
+
+# The tick, in this exact order (#1069). The order is load-bearing and is the
+# order the original 990-line body executed (#850): e.g. review settlement runs
+# before the release-policy sweep, so a merge this pass produced is released
+# this pass. It used to be twenty consecutive calls in the loop body, held in
+# place by nobody moving a line; here it is declared, and pinned by
+# test_the_sweep_order_is_pinned.
+SWEEPS: tuple[Sweep, ...] = (
+    Sweep("running_dispatch", _sweep_running_dispatch),
+    Sweep("review", _sweep_review),
+    Sweep("pair_delivery", _sweep_pair_delivery),
+    Sweep("ci_check", _sweep_ci_check),
+    Sweep("stale_running", _sweep_stale_running),
+    Sweep("stale_statuses", _sweep_stale_statuses),
+    Sweep("unrefined_drafts", _sweep_unrefined_drafts),
+    Sweep("human_queue", _sweep_human_queue),
+    Sweep("autopilot_digests", _sweep_autopilot_digests),
+    Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
+    Sweep("review_dispatches", _sweep_review_dispatches),
+    Sweep("expired_claims", _sweep_expired_claims),
+    Sweep("machine_deadlines", _sweep_machine_deadlines),
+    Sweep("stale_arbiter", _sweep_stale_arbiter),
+    Sweep("events_retention", _sweep_events_retention),
+    Sweep("stale_worktrees", _sweep_stale_worktrees),
+    Sweep("sessions_retention", _sweep_sessions_retention),
+    Sweep("release_policy", _sweep_release_policy),
+    Sweep("messages_retention", _sweep_messages_retention),
+    Sweep("mcp_retention", _sweep_mcp_retention),
+)
+
+
+async def _poll_running_tasks(app: FastAPI) -> None:
+    """Background loop: one pass = every sweep in ``SWEEPS``, in that order.
+
+    Failure is isolated on two levels, and both are code, not a promise. One
+    task's failure inside a sweep is swallowed by ``_task_isolation``; a whole
+    sweep's failure — an exception in the query that picks the rows, which
+    never reaches ``_task_isolation`` — is swallowed here, by name, so the
+    remaining sweeps of this tick still run (#1069). Before that, a single
+    timed-out call in the second sweep cost the eighteen after it, every tick
+    until the cause cleared.
+
+    The outer ``try`` covers only what is outside the sweeps (reading the
+    connection off ``app.state``) and proves the loop itself never dies.
+    ``CancelledError`` derives from ``BaseException`` and is caught by neither,
+    so shutdown still stops the loop at once.
     """
     while True:
         await asyncio.sleep(POLL_INTERVAL)
         try:
             db = app.state.db
 
-            await _sweep_running_dispatch(db)
-            await _sweep_review(db)
-            await _sweep_pair_delivery(db)
-            await _sweep_ci_check(db)
-            await _sweep_stale_running(db)
-            await _sweep_stale_statuses(db)
-            await _sweep_unrefined_drafts(db)
-            await _sweep_human_queue(db)
-            await _sweep_autopilot_digests(db)
-            await _sweep_delivery_discrepancies(db)
-            await _sweep_review_dispatches(db)
-            await _sweep_expired_claims(db)
-            await _sweep_machine_deadlines(db)
-            await _sweep_stale_arbiter(db)
-            await _sweep_events_retention(db)
-            await _sweep_stale_worktrees(db)
-            await _sweep_sessions_retention(db)
-            await _sweep_release_policy(db)
-            await _sweep_messages_retention(db)
-            await _sweep_mcp_retention(db)
+            for sweep in SWEEPS:
+                try:
+                    await sweep.run(db)
+                except Exception:
+                    log.exception("Poll: sweep %s failed — tick continues", sweep.name)
         except Exception:
             log.exception("Poll error")
 
