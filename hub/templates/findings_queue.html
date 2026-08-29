@@ -49,6 +49,19 @@
                 {% if item.f.detail %}
                 <div class="inbox-item-desc">{{ item.f.detail }}</div>
                 {% endif %}
+                {% set ev = item.evidence %}
+                {% if ev %}
+                <span class="muted">
+                    {% if ev.outcome == 'touched' %}
+                    Место тронуто после отчёта:{% for c in ev.commits %}
+                    {{ c.short }} {{ c.subject }}{% endfor %}
+                    {% elif ev.outcome == 'untouched' %}
+                    Место не тронуто после отчёта
+                    {% else %}
+                    Ответа нет: {{ ev.reason_label }}
+                    {% endif %}
+                </span>
+                {% endif %}
                 <label><input type="radio" name="disposition-{{ item.index }}"
                     value="fixed"> исправлено</label>
                 <label><input type="radio" name="disposition-{{ item.index }}"

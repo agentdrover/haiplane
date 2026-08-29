@@ -17,6 +17,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.integrations.git_ops import _git
 from hub.models import FindingLocator
+from hub.services.finding_identity import finding_uids
 from hub.services.orchestration import project_git_context
 
 OUTCOME_TOUCHED = "touched"
@@ -159,6 +160,286 @@ async def evidence_for_findings(
         evidence = await finding_touch_evidence(db, task_id, row, generation=generation)
         out.append(evidence.as_dict())
     return out
+
+
+async def evidence_for_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    findings: list[dict[str, Any]],
+    *,
+    generation: int,
+) -> dict[str, dict[str, Any]]:
+    """Touch evidence for one report, keyed by ``finding_uid``.
+
+    One ``git log`` covers every placed finding in the report. The card still
+    walks findings one by one; the queue cannot — a call per finding is what
+    would make /findings unusable at the live size (#1042). Address by uid,
+    not by position (#1007). Never writes a disposition (#876).
+    """
+    rows = [f if isinstance(f, dict) else {} for f in findings]
+    uids = finding_uids(rows)
+    out: dict[str, dict[str, Any]] = {}
+    placed: list[tuple[str, dict[str, Any]]] = []
+    for uid, row in zip(uids, rows, strict=True):
+        locator = _finding_locator(row)
+        if locator == FindingLocator.none.value:
+            out[uid] = _unknown(REASON_LOCATOR_NONE).as_dict()
+            continue
+        if not locator:
+            out[uid] = _unknown(REASON_LOCATOR_MISSING).as_dict()
+            continue
+        placed.append((uid, row))
+
+    if not placed:
+        return out
+
+    shared = await _shared_lookup(db, task_id, generation)
+    if isinstance(shared, TouchEvidence):
+        blob = shared.as_dict()
+        for uid, _row in placed:
+            out[uid] = blob
+        return out
+
+    clone, baseline, tip = shared
+    paths: list[str] = []
+    seen_paths: set[str] = set()
+    for uid, row in placed:
+        path = (row.get("file") or "").strip()
+        locator = _finding_locator(row)
+        if locator == FindingLocator.lines.value:
+            start = row.get("start_line")
+            if start is None:
+                start = row.get("line")
+            end = row.get("end_line")
+            if end is None:
+                end = start
+            if not path or start is None or end is None:
+                out[uid] = _unknown(REASON_LOCATOR_MISSING).as_dict()
+                continue
+        elif not path:
+            out[uid] = _unknown(REASON_LOCATOR_MISSING).as_dict()
+            continue
+        if path not in seen_paths:
+            seen_paths.add(path)
+            paths.append(path)
+
+    still = [(uid, row) for uid, row in placed if uid not in out]
+    if not still:
+        return out
+    if not paths:
+        for uid, _row in still:
+            out[uid] = _unknown(REASON_LOCATOR_MISSING).as_dict()
+        return out
+
+    parsed = await _log_hunks(clone, baseline, tip, paths)
+    if parsed is None:
+        blob = _unknown(REASON_GIT_FAILED).as_dict()
+        for uid, _row in still:
+            out[uid] = blob
+        return out
+
+    for uid, row in still:
+        commits = _commits_for_finding(row, parsed)
+        if commits is None:
+            out[uid] = _unknown(REASON_LINES_UNAVAILABLE).as_dict()
+            continue
+        if commits:
+            out[uid] = TouchEvidence(
+                outcome=OUTCOME_TOUCHED, commits=tuple(commits)
+            ).as_dict()
+        else:
+            out[uid] = TouchEvidence(outcome=OUTCOME_UNTOUCHED).as_dict()
+    return out
+
+
+async def _shared_lookup(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str, str] | TouchEvidence:
+    ctx = await project_git_context(db, task_id)
+    clone = (ctx.get("repo") or "").strip()
+    if not clone:
+        return _unknown(REASON_NO_CLONE)
+
+    pinned = await repo.get_submission(db, task_id, generation)
+    baseline = ((pinned["sha"] if pinned is not None else "") or "").strip()
+    if not baseline:
+        return _unknown(REASON_SHA_MISSING)
+
+    task = await repo.get_task(db, task_id)
+    tip = await _resolve_tip(clone, dict(task) if task is not None else {})
+    if not tip:
+        return _unknown(REASON_TIP_MISSING)
+
+    exists = await _commit_exists(clone, baseline)
+    if exists is None:
+        return _unknown(REASON_GIT_FAILED)
+    if exists is False:
+        return _unknown(REASON_SHA_MISSING)
+    return clone, baseline, tip
+
+
+@dataclass(frozen=True)
+class _Hunk:
+    path: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+
+
+@dataclass
+class _PatchLog:
+    commits: list[TouchCommit]
+    hunks: dict[str, list[_Hunk]]
+    files: dict[str, set[str]]
+
+
+async def _log_hunks(
+    clone: str, since: str, until: str, paths: list[str]
+) -> _PatchLog | None:
+    rc, out, _ = await _git(
+        "log",
+        "--format=%x1e%H%x09%s",
+        "-p",
+        "-U0",
+        f"{since}..{until}",
+        "--",
+        *paths,
+        repo=clone,
+        check=False,
+    )
+    if rc != 0:
+        return None
+    return _parse_patch_log(out)
+
+
+def _parse_patch_log(out: str) -> _PatchLog:
+    commits: list[TouchCommit] = []
+    hunks: dict[str, list[_Hunk]] = {}
+    files: dict[str, set[str]] = {}
+    current_sha = ""
+    current_path = ""
+    for raw_record in (out or "").split("\x1e"):
+        record = raw_record.strip("\n")
+        if not record:
+            continue
+        header, _, rest = record.partition("\n")
+        if "\t" not in header:
+            continue
+        sha, subject = header.split("\t", 1)
+        sha = sha.strip()
+        if not sha:
+            continue
+        commits.append(TouchCommit(sha=sha, subject=subject.strip()))
+        hunks[sha] = []
+        files[sha] = set()
+        current_sha = sha
+        current_path = ""
+        for line in rest.splitlines():
+            if line.startswith("--- ") or line.startswith("+++ "):
+                parsed_path = _path_from_diff_header(line[4:])
+                if parsed_path:
+                    current_path = parsed_path
+                    files[current_sha].add(parsed_path)
+                continue
+            if line.startswith("diff --git "):
+                current_path = ""
+                continue
+            if not line.startswith("@@ ") or not current_sha:
+                continue
+            parsed = _parse_hunk_header(line)
+            if parsed is None or not current_path:
+                continue
+            old_start, old_count, new_start, new_count = parsed
+            hunks[current_sha].append(
+                _Hunk(current_path, old_start, old_count, new_start, new_count)
+            )
+    return _PatchLog(commits=commits, hunks=hunks, files=files)
+
+
+def _path_from_diff_header(raw: str) -> str:
+    token = raw.strip().split("\t", 1)[0]
+    if token in {"/dev/null", "nul"}:
+        return ""
+    if token.startswith("b/") or token.startswith("a/"):
+        return token[2:]
+    return token
+
+
+def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
+    body = line.strip()
+    if not body.startswith("@@"):
+        return None
+    parts = body.split("@@")
+    if len(parts) < 2:
+        return None
+    span = parts[1].strip()
+    tokens = span.split()
+    if len(tokens) < 2:
+        return None
+    old = _parse_span(tokens[0], prefix="-")
+    new = _parse_span(tokens[1], prefix="+")
+    if old is None or new is None:
+        return None
+    return old[0], old[1], new[0], new[1]
+
+
+def _parse_span(token: str, *, prefix: str) -> tuple[int, int] | None:
+    if not token.startswith(prefix):
+        return None
+    body = token[len(prefix) :]
+    if "," in body:
+        start_s, count_s = body.split(",", 1)
+        try:
+            return int(start_s), int(count_s)
+        except ValueError:
+            return None
+    try:
+        return int(body), 1
+    except ValueError:
+        return None
+
+
+def _hunk_overlaps(hunk: _Hunk, start: int, end: int) -> bool:
+    lo, hi = (start, end) if start <= end else (end, start)
+
+    def _span(at: int, count: int) -> tuple[int, int]:
+        if count <= 0:
+            return at, at
+        return at, at + count - 1
+
+    old_lo, old_hi = _span(hunk.old_start, hunk.old_count)
+    new_lo, new_hi = _span(hunk.new_start, hunk.new_count)
+    return (old_lo <= hi and lo <= old_hi) or (new_lo <= hi and lo <= new_hi)
+
+
+def _commits_for_finding(
+    row: dict[str, Any], parsed: _PatchLog
+) -> list[TouchCommit] | None:
+    path = (row.get("file") or "").strip()
+    locator = _finding_locator(row)
+    matched: list[TouchCommit] = []
+    if locator == FindingLocator.lines.value:
+        start = row.get("start_line")
+        if start is None:
+            start = row.get("line")
+        end = row.get("end_line")
+        if end is None:
+            end = start
+        if start is None or end is None:
+            return None
+        start_i, end_i = int(start), int(end)
+        for commit in parsed.commits:
+            if any(
+                hunk.path == path and _hunk_overlaps(hunk, start_i, end_i)
+                for hunk in parsed.hunks.get(commit.sha, ())
+            ):
+                matched.append(commit)
+        return matched
+    for commit in parsed.commits:
+        if path in parsed.files.get(commit.sha, ()):
+            matched.append(commit)
+    return matched
 
 
 async def _resolve_tip(clone: str, task: dict[str, Any]) -> str:

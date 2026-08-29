@@ -11,18 +11,33 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 from httpx import AsyncClient
 
+from hub import repository as repo
 from hub.repository import (
     count_unjudged_findings,
     list_finding_dispositions,
     list_unjudged_findings,
 )
+from hub.services import finding_evidence as fe
 from hub.services.finding_disposition import record_finding_dispositions
 from hub.models import FindingDisposition, FindingDispositionItem
+from hub.services.finding_identity import finding_uids
 from hub.services.orchestration import practice_metrics
+from tests.test_finding_evidence import (
+    _FILE,
+    _FINDING_LINES,
+    _git as _repo_git,
+    _init_repo,
+    _report_on,
+    _sha,
+    _task_on_clone,
+    _write_numbered,
+)
 
 
 def _finding(title: str, **over) -> dict:
@@ -432,3 +447,239 @@ async def test_the_backlog_is_not_windowed(db: aiosqlite.Connection):
     assert metrics["machine_reviews"]["dispositions"]["confirmed_unjudged"] == 1, (
         "находка старше окна всё ещё ждёт ответа и обязана считаться"
     )
+
+
+def _li_for(page: str, title: str) -> str:
+    for chunk in page.split("<li>"):
+        if title in chunk:
+            return chunk.split("</li>", 1)[0]
+    raise AssertionError(f"finding {title!r} is not on the page")
+
+
+_FOOTER = {
+    **_FINDING_LINES,
+    "title": "footer leak",
+    "start_line": 18,
+    "end_line": 19,
+    "line": 18,
+}
+
+
+async def _current_generation(
+    db: aiosqlite.Connection, task_id: int, generation: int = 1
+) -> None:
+    # _task_on_clone leaves submission_generation at 0; the queue only shows
+    # findings whose report generation matches the task's current one.
+    await repo.update_task(db, task_id, submission_generation=generation)
+
+
+async def test_queue_shows_each_finding_its_own_touch_fact(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1042 AC-1: the queue names a touch of the place, not a fix.
+
+    The card already shows this. The person who judges in bulk never opened
+    the card, so the same fact has to stand next to each finding here.
+    """
+    clone = _init_repo(tmp_path / "queue-touch")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue mixed facts")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    await db.execute(
+        "UPDATE machine_reviews SET findings_confirmed=? WHERE task_id=?",
+        (json.dumps([_FINDING_LINES, _FOOTER]), task_id),
+    )
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "touch named lines")
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    assert page.count("guard drops the flag") == 1
+    touched = _li_for(page, "guard drops the flag")
+    untouched = _li_for(page, "footer leak")
+    assert "Место тронуто после отчёта" in touched
+    assert "touch named lines" in touched
+    assert "Место не тронуто после отчёта" in untouched
+    assert "исправление дефекта" not in page.lower()
+    assert "исправлено" in page
+
+
+async def test_queue_treats_deleting_the_place_as_a_touch(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """A commit that removes the file still touched the named lines.
+
+    git log -p for a deletion prints +++ /dev/null. Reading the path only from
+    that line would drop the hunk and report «не тронуто» — the opposite fact.
+    """
+    clone = _init_repo(tmp_path / "queue-deleted")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue deleted file")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    (clone / _FILE).unlink()
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "remove the file")
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    block = _li_for(page, "guard drops the flag")
+    assert "Место тронуто после отчёта" in block
+    assert "remove the file" in block
+    assert "Место не тронуто после отчёта" not in block
+
+
+async def test_queue_git_runs_once_per_report_not_per_finding(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1042 AC-2: the git COUNTER, not a story about how git ought to work.
+
+    Three reports, several findings each. A call per finding would make the
+    page unusable at the live queue size (47 findings). One log per report
+    is the budget this page is allowed to spend.
+    """
+    clone = _init_repo(tmp_path / "queue-budget")
+    baseline = _sha(clone)
+    counts = (2, 3, 4)
+    for n, count in enumerate(counts, start=1):
+        findings = [
+            {**_FINDING_LINES, "title": f"rep{n}-f{i}", "start_line": 5, "line": 5}
+            for i in range(count)
+        ]
+        task_id = await _task_on_clone(db, clone, title=f"queue-budget-{n}")
+        await repo.record_submission(
+            db, task_id=task_id, generation=1, sha=baseline, base_branch="main"
+        )
+        await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            findings_confirmed=json.dumps(findings),
+            incomplete=False,
+        )
+        await _current_generation(db, task_id)
+    await db.commit()
+
+    real_git = fe._git
+    calls: list[tuple] = []
+
+    async def wrapped(*args, **kwargs):
+        calls.append(args)
+        return await real_git(*args, **kwargs)
+
+    with patch.object(fe, "_git", wrapped):
+        page = await client.get("/findings")
+    assert page.status_code == 200
+    logs = [c for c in calls if c and c[0] == "log"]
+    assert len(logs) == len(counts), (
+        f"git log must run once per report, not once per finding "
+        f"(reports={len(counts)}, findings={sum(counts)}, logs={len(logs)})"
+    )
+
+
+async def test_queue_evidence_follows_uid_not_position(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1042 AC-3: reversing the report must not swap the facts (#1007).
+
+    Positional attach is what the card still does. A second site that keyed
+    by index would reintroduce the addressing #1007 retired.
+    """
+    clone = _init_repo(tmp_path / "queue-uid")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue uid stitch")
+    ordered = [_FINDING_LINES, _FOOTER]
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    await db.execute(
+        "UPDATE machine_reviews SET findings_confirmed=? WHERE task_id=?",
+        (json.dumps(ordered), task_id),
+    )
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "touch named lines")
+    await db.commit()
+
+    uids_fwd = finding_uids(ordered)
+    uids_rev = finding_uids(list(reversed(ordered)))
+    assert uids_fwd[0] == uids_rev[1]
+    assert uids_fwd[1] == uids_rev[0]
+
+    await db.execute(
+        "UPDATE machine_reviews SET findings_confirmed=? WHERE task_id=?",
+        (json.dumps(list(reversed(ordered))), task_id),
+    )
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    touched = _li_for(page, "guard drops the flag")
+    untouched = _li_for(page, "footer leak")
+    assert "Место тронуто после отчёта" in touched
+    assert "Место не тронуто после отчёта" in untouched
+    assert "Место тронуто после отчёта" not in untouched
+    assert "Место не тронуто после отчёта" not in touched
+
+
+async def test_queue_unknown_is_never_untouched(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1042 AC-4: no clone / missing sha stay «ответа нет», never untouched (#762)."""
+    clone = _init_repo(tmp_path / "queue-unknown")
+    baseline = _sha(clone)
+
+    no_clone_id = await _task_on_clone(db, clone, title="queue no clone")
+    await _report_on(db, no_clone_id, generation=1, sha=baseline)
+    await _current_generation(db, no_clone_id)
+    empty = await repo.create_project(
+        db, slug="queue-empty-ws", name="empty", workspace_path="", status="active"
+    )
+    await repo.update_task(db, no_clone_id, project_id=empty)
+
+    no_sha_id = await _task_on_clone(db, clone, title="queue no sha")
+    await repo.insert_machine_review(
+        db,
+        task_id=no_sha_id,
+        submission_generation=1,
+        findings_confirmed=json.dumps([{**_FINDING_LINES, "title": "no-sha-finding"}]),
+        incomplete=False,
+    )
+    await _current_generation(db, no_sha_id)
+    await db.commit()
+
+    page = await client.get("/findings")
+    assert page.status_code == 200
+    body = page.text
+    assert "guard drops the flag" in body
+    assert "no-sha-finding" in body
+    assert "Ответа нет:" in body
+    assert "Место не тронуто после отчёта" not in body
+
+
+async def test_queue_evidence_never_prechecks_a_radio(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1042 AC-5: even a touched place is not a disposition (#876)."""
+    clone = _init_repo(tmp_path / "queue-no-decide")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="queue fact is not a verdict")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await _current_generation(db, task_id)
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "touch the lines")
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    assert "Место тронуто после отчёта" in page
+    review = await repo.get_latest_machine_review(db, task_id)
+    stored = await repo.list_finding_dispositions(db, int(review["id"]))
+    assert stored == []
+    assert 'value="fixed"' in page
+    after_fixed = page.split('value="fixed"')[1][:80]
+    assert "checked" not in after_fixed
+    after_fp = page.split('value="false_positive"')[1][:80]
+    assert "checked" not in after_fp
+    after_wont = page.split('value="wont_fix"')[1][:80]
+    assert "checked" not in after_wont
