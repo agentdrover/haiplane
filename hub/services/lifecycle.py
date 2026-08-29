@@ -194,12 +194,29 @@ async def _try_restore_pair_workspace(
         return
     try:
         await restore_pair_workspace_base(db, task_id)
-    except Exception:
+    except Exception as exc:
         log.warning(
             "Failed to restore pair workspace base for task #%s",
             task_id,
             exc_info=True,
         )
+        # #1045: the TypeError from a signature mismatch lived only in this
+        # stack. The feed is what a person (or the next agent) reads.
+        try:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Уборка worktree не удалась: {exc}. Сдача не прервана.",
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001 - naming the failure must not fail the caller
+            log.warning(
+                "could not record worktree cleanup failure for task #%s",
+                task_id,
+                exc_info=True,
+            )
 
 
 async def _try_switch_pair_workspace_to_task(
