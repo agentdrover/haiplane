@@ -298,6 +298,17 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # many confirmed findings are still waiting for an answer. Without these a
     # precision of 1.0 over two findings out of ninety reads like a verdict on
     # the harness.
+    # #912: only reports that HAVE something to judge. A run that produced no
+    # candidates, no findings and no tokens is not an unjudged report — there
+    # was nothing to judge, and counting it as one makes the habit look far
+    # worse than it is. Measured on the live window when this was written: 151
+    # reports, 61 of them empty, so coverage read "0 of 151" where the honest
+    # denominator was 90. "0 of 90" is a reproach; "0 of 151" is noise a
+    # reproach hides inside.
+    #
+    # The predicate is REPORT_HAS_EVIDENCE_SQL, not a copy of it: the same
+    # fragment already decides ``reviews`` and ``no_data_reports``, and two
+    # definitions of "a report with data" would drift into two answers.
     coverage_rows = await fetchall(
         db,
         "SELECT COUNT(*) AS reports, "  # nosec B608 - constant fragment
@@ -305,7 +316,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "FROM machine_reviews mr LEFT JOIN ("
         "SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
-        "WHERE mr.created_at >= datetime('now', ?)",
+        f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL}",
         (since,),
     )
     cov = dict(coverage_rows[0]) if coverage_rows else {}
@@ -313,6 +324,11 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     reports_judged = int(cov.get("reports_judged") or 0)
     result = _rates(overall)
     result["reports_judged"] = reports_judged
+    # The denominator travels WITH the two numbers derived from it, so a reader
+    # never has to guess which population "0 judged" was out of, and a later
+    # change to the predicate cannot move one of the three and leave the others
+    # (#518).
+    result["reports_counted"] = reports
     # Never a share: "0 of 90 judged" and "90 of 90 judged" are the states a
     # reader needs, and a percentage hides which one this is.
     result["reports_unjudged"] = reports - reports_judged

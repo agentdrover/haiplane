@@ -19,7 +19,10 @@ latency и размер ответов — на отдельной страни�
         <tr><td>Без данных
             <span class="muted">(ноль кандидатов, ноль находок, ноль токенов —
             отчёт есть, исполнения не видно)</span></td>
-            <td>{% if m.machine_reviews.no_data_reports %}{{ m.machine_reviews.no_data_reports }} из {{ m.machine_reviews.reports_total }}{% else %}—{% endif %}</td></tr>
+            {# #912: ноль печатается нулём. Прочерк читается как «неизвестно»,
+               а это известная величина — мы посчитали и их нет. Счётчик,
+               исчезающий при нуле, учит читателя, что такого не бывает. #}
+            <td>{{ m.machine_reviews.no_data_reports }} из {{ m.machine_reviews.reports_total }}</td></tr>
         <tr><td>Findings: raw → confirmed / rejected</td>
             <td>{{ m.machine_reviews.raw_total }} → {{ m.machine_reviews.confirmed_total }} / {{ m.machine_reviews.rejected_total }}</td></tr>
         <tr><td>Filtration rate (отсев шума)</td>
@@ -64,6 +67,13 @@ latency и размер ответов — на отдельной страни�
         <tr><td>Ждут суждения <span class="muted">(за всё время, по текущим сдачам)</span></td>
             <td><a href="/findings">{{ m.machine_reviews.dispositions.confirmed_unjudged }} находок</a>
                 <span class="muted">по {{ m.machine_reviews.dispositions.reports_with_unjudged }} отчёт(ам)</span></td></tr>
+        {# #912: покрытие вернулось на страницу после того, как #1038 снял
+           прежнюю строку, складывавшую три разных множества. Здесь оба числа
+           из ОДНОГО: отчёты окна, у которых есть что судить. Пустые прогоны в
+           знаменатель не входят — «0 из 90» это упрёк, «0 из 151» это шум, в
+           котором упрёк не виден. #}
+        <tr><td>Разобрано отчётов <span class="muted">(из тех, где есть что судить)</span></td>
+            <td>{{ m.machine_reviews.dispositions.reports_judged }} из {{ m.machine_reviews.dispositions.reports_counted }}</td></tr>
         <tr><td>Duration total</td><td>{{ (m.machine_reviews.duration_ms_total / 1000) | round(1) }}s</td></tr>
         <tr><td>Покрытие: отчётов без токенов / находок в расчёте цены</td>
             <td>{{ m.machine_reviews.reports_without_tokens or 0 }} из {{ m.machine_reviews.reviews }}
