@@ -193,6 +193,17 @@ jobs:
             format=${{ steps.format.outcome }},
             types=${{ steps.types.outcome }},
             tests=${{ steps.tests.outcome }}
+          # #1081: the same outcomes keyed by the COMMAND, not the step name, so
+          # a validation command this job already ran is not run a second time.
+          # Measured before this: the reporter step equalled the Test step
+          # (236-333s) purely because task cards declare the suite here. These
+          # strings must stay byte-identical to the run: lines above — a drifted
+          # copy silently stops matching and the duplicate run comes back.
+          ran-commands: |
+            ${{ steps.lint.outcome }} uv run ruff check hub tests
+            ${{ steps.format.outcome }} uv run ruff format --check hub tests
+            ${{ steps.types.outcome }} uv run mypy hub
+            ${{ steps.tests.outcome }} uv run pytest -q -n auto
 
       # #611: the audit no longer decides whether anything ships. The delivery
       # gate (#605/#606) reads THIS job, so a new advisory used to stop delivery

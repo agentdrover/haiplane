@@ -20,7 +20,10 @@ nothing and say so),
 GITHUB_HEAD_REF / GITHUB_REF_NAME, GITHUB_SHA, and
 HAIPLANE_HUB_CI_PYTEST (#761: how to run the AC tests, default ``uv run
 pytest`` — this repository's own way, and exactly what a satellite repository
-with different tooling has to be able to change).
+with different tooling has to be able to change),
+HAIPLANE_HUB_CI_RAN (#1081: the commands this job already executed, one
+``<outcome> <command>`` per line — what they prove is not executed a second
+time; absent ⇒ nothing is reused and every command runs as before).
 """
 
 from __future__ import annotations
@@ -226,8 +229,125 @@ def parse_checks(raw: str) -> dict[str, str]:
     return checks
 
 
-def run_validation(commands: list[str]) -> tuple[str, str, str]:
-    """(status, log_tail, reason) for the task's validation_commands."""
+# Flags that provably do not change WHICH tests run — the only differences
+# allowed before two pytest invocations count as the same assertion (#1081).
+# Closed on purpose: an unrecognised flag makes the commands non-equivalent and
+# the validation command is executed. Equivalence is proven, never assumed.
+_NON_SELECTING_FLAGS = {
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "-s",
+    "--no-header",
+    "--no-summary",
+    "--color",
+    "--tb",
+    "-r",
+    "-p",
+    "-n",
+    "--numprocesses",
+    "--dist",
+}
+
+
+def parse_ran_commands(raw: str) -> dict[str, str]:
+    """``"success uv run pytest -q"`` lines → ``{command: "pass"}`` (#1081).
+
+    The job already ran these; the reporter is told WHAT was run, not only how
+    it ended, because "lint=success" cannot be matched against a task's
+    ``uv run ruff check hub tests``. Silence in, silence out: an unparsable or
+    outcome-less line contributes nothing, and an empty map simply means
+    nothing can be reused.
+    """
+    ran: dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        head, _, command = line.strip().partition(" ")
+        command = command.strip()
+        mapped = _OUTCOME_MAP.get(head.strip().lower())
+        if command and mapped:
+            ran[command] = mapped
+    return ran
+
+
+def _selection_key(command: str) -> tuple | None:
+    """What this pytest invocation SELECTS, or None when that cannot be told.
+
+    Two commands with the same key run the same tests, so a green outcome for
+    one is a green outcome for the other. Everything that narrows or reorders
+    the run — positional arguments, ``-k``, ``-m``, ``--ignore``,
+    ``--deselect``, ``--maxfail``, ``--lf``/``--ff`` — is part of the key.
+    Anything not recognised returns None, which means "not proven equivalent".
+    """
+    try:
+        argv = shlex.split(command, comments=True)
+    except ValueError:
+        return None
+    if "pytest" not in argv:
+        return None
+    rest = argv[argv.index("pytest") + 1 :]
+    prefix = tuple(argv[: argv.index("pytest") + 1])
+    selecting: list[str] = []
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if not token.startswith("-"):
+            selecting.append(token)  # a path or nodeid narrows the run
+            i += 1
+            continue
+        name = token.split("=", 1)[0]
+        if name not in _NON_SELECTING_FLAGS:
+            return None  # unknown flag: cannot prove it does not select
+        # A whitelisted flag may carry its value in the next token; skip it
+        # only when it is not itself an option.
+        if "=" not in token and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+            if name in {
+                "-n",
+                "--numprocesses",
+                "--dist",
+                "-p",
+                "--tb",
+                "--color",
+                "-r",
+            }:
+                i += 1
+        i += 1
+    return prefix, tuple(sorted(selecting))
+
+
+def already_proven(command: str, ran: dict[str, str]) -> tuple[str, str] | None:
+    """(outcome, the command that proved it) when the job already ran this.
+
+    Exact string equality first — that covers ruff, mypy and any non-pytest
+    command verbatim. Only then selection-equivalence, and only for pytest:
+    the job runs ``uv run pytest -q -n auto`` while task cards declare
+    ``uv run pytest -q``, which is the same assertion about the same tree
+    differing solely in worker count (#1081).
+    """
+    command = command.strip()
+    if command in ran:
+        return ran[command], command
+    key = _selection_key(command)
+    if key is None:
+        return None
+    for candidate, outcome in ran.items():
+        if _selection_key(candidate) == key:
+            return outcome, candidate
+    return None
+
+
+def run_validation(
+    commands: list[str], ran: dict[str, str] | None = None
+) -> tuple[str, str, str]:
+    """(status, log_tail, reason) for the task's validation_commands.
+
+    ``ran`` names the commands this job already executed, with their outcomes.
+    Anything it proves is not executed a second time: the reporter runs in the
+    same job that just ran the suite, and re-running it cost as much as the
+    tests themselves — measured 236-333s per run before this (#1081). What it
+    does not prove is executed exactly as before; a saving that skipped
+    evidence would be worse than the cost it saves.
+    """
     if not commands:
         return "skipped", "", "у задачи нет validation_commands"
     prose = [c for c in commands if not is_command(c)]
@@ -239,8 +359,22 @@ def run_validation(commands: list[str]) -> tuple[str, str, str]:
             f"которые не являются командами ({len(prose)} из {len(commands)}), "
             f"например {prose[0][:120]!r}",
         )
+    ran = ran or {}
     logs: list[str] = []
     for cmd in commands:
+        proven = already_proven(cmd, ran)
+        if proven is not None:
+            outcome, by = proven
+            log(
+                f"validation {cmd!r}: not re-run — this job already ran "
+                f"{by!r} with outcome {outcome}"
+            )
+            logs.append(
+                f"$ {cmd}\n[not re-run: this job already ran {by!r} → {outcome}]"
+            )
+            if outcome == "fail":
+                return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
+            continue
         try:
             proc = subprocess.run(  # nosec B602 - the task's own declared commands, run in a disposable CI runner
                 cmd,
@@ -298,7 +432,12 @@ def main() -> int:
         for ac_id, nodeid in nodeid_by_ac.items()
     }
 
-    v_status, v_log, v_reason = run_validation(task.get("validation_commands") or [])
+    ran = parse_ran_commands(env_get("HUB_CI_RAN"))
+    if ran:
+        log(f"this job already ran {len(ran)} command(s); their outcomes can be reused")
+    v_status, v_log, v_reason = run_validation(
+        task.get("validation_commands") or [], ran
+    )
 
     checks = parse_checks(env_get("HUB_CI_CHECKS"))
     if checks:
