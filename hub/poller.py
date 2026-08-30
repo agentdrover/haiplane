@@ -15,6 +15,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
 from hub.integrations.protocols import CIProbeOutcome
@@ -81,6 +82,31 @@ def _seconds_since(iso_ts: str | None) -> float | None:
     except ValueError:
         return None
     return (datetime.now(UTC) - started).total_seconds()
+
+
+@contextlib.asynccontextmanager
+async def _own_connection(app: FastAPI):
+    """Своё соединение фоновому циклу — не то, которым отвечают на запросы (#1065).
+
+    Раньше поллер делил общее соединение с обработчиками, и его commit
+    фиксировал их незакоммиченное ровно так же, как их commit — его. Циклов
+    четыре, соединений теперь четыре: цикл внутри себя последователен, так что
+    одного на цикл достаточно, а открывать его на каждый тик значило бы
+    платить за открытие раз в несколько секунд без всякой пользы.
+
+    Без DSN (так поднимают приложение тесты, инжектируя готовое соединение)
+    отдаётся app.state.db — подсовывать циклу нечего, и притворяться, что
+    соединение своё, было бы хуже, чем сказать правду вызывающему.
+    """
+    dsn = getattr(app.state, "dsn", None)
+    if not dsn:
+        yield app.state.db
+        return
+    conn = await db_connect(dsn)
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
 
 async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
@@ -1749,33 +1775,37 @@ async def _poll_running_tasks(app: FastAPI) -> None:
     owns one lifecycle concern and fails alone: the shared try only proves
     the loop never dies, isolation per task lives in _task_isolation.
     """
-    while True:
-        await asyncio.sleep(POLL_INTERVAL)
-        try:
-            db = app.state.db
+    async with _own_connection(app) as db:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
+            try:
+                await _poll_once(db)
+            except Exception:
+                log.exception("Poll error")
 
-            await _sweep_running_dispatch(db)
-            await _sweep_review(db)
-            await _sweep_pair_delivery(db)
-            await _sweep_ci_check(db)
-            await _sweep_stale_running(db)
-            await _sweep_stale_statuses(db)
-            await _sweep_unrefined_drafts(db)
-            await _sweep_human_queue(db)
-            await _sweep_autopilot_digests(db)
-            await _sweep_delivery_discrepancies(db)
-            await _sweep_review_dispatches(db)
-            await _sweep_expired_claims(db)
-            await _sweep_machine_deadlines(db)
-            await _sweep_stale_arbiter(db)
-            await _sweep_events_retention(db)
-            await _sweep_stale_worktrees(db)
-            await _sweep_sessions_retention(db)
-            await _sweep_release_policy(db)
-            await _sweep_messages_retention(db)
-            await _sweep_mcp_retention(db)
-        except Exception:
-            log.exception("Poll error")
+
+async def _poll_once(db) -> None:
+    """Один проход конвейера. Порядок несущий — см. докстроку цикла выше."""
+    await _sweep_running_dispatch(db)
+    await _sweep_review(db)
+    await _sweep_pair_delivery(db)
+    await _sweep_ci_check(db)
+    await _sweep_stale_running(db)
+    await _sweep_stale_statuses(db)
+    await _sweep_unrefined_drafts(db)
+    await _sweep_human_queue(db)
+    await _sweep_autopilot_digests(db)
+    await _sweep_delivery_discrepancies(db)
+    await _sweep_review_dispatches(db)
+    await _sweep_expired_claims(db)
+    await _sweep_machine_deadlines(db)
+    await _sweep_stale_arbiter(db)
+    await _sweep_events_retention(db)
+    await _sweep_stale_worktrees(db)
+    await _sweep_sessions_retention(db)
+    await _sweep_release_policy(db)
+    await _sweep_messages_retention(db)
+    await _sweep_mcp_retention(db)
 
 
 def _extract_agent_summary(full_log: str | None) -> str:
@@ -1830,50 +1860,55 @@ SESSION_CLEANUP_INTERVAL = 3600  # 1 hour
 
 async def _session_reaper(app: FastAPI) -> None:
     """Periodically purge expired browser sessions and clean up the login rate limiter."""
-    while True:
-        await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+    async with _own_connection(app) as db:
+        while True:
+            await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+            try:
+                await _reap_sessions_once(db)
+            except Exception:
+                log.exception("Session reaper error")
+
+
+async def _reap_sessions_once(db) -> None:
+    """Один проход жатвы сессий."""
+    cursor = await db.execute(
+        "DELETE FROM browser_sessions WHERE expires_at < datetime('now') "
+        "OR revoked_at IS NOT NULL"
+    )
+    deleted = cursor.rowcount
+    await db.commit()
+    if deleted:
+        log.info("Session reaper: removed %d expired/revoked sessions", deleted)
+
+    # Chat-pair rows die on the same hourly cycle (#961): the channel
+    # is minutes-to-hours long, so a table that only ever grew would be
+    # an archive of dead secrets' hashes.
+    from hub.services import orchestration
+    from hub.services.chat_pair import (
+        chat_pair_limiter,
+        purge_expired,
+        release_expired_implementer_tasks,
+    )
+
+    released = await release_expired_implementer_tasks(db)
+    purged = await purge_expired(db)
+    for task_id in released:
         try:
-            db = app.state.db
-            cursor = await db.execute(
-                "DELETE FROM browser_sessions WHERE expires_at < datetime('now') "
-                "OR revoked_at IS NOT NULL"
-            )
-            deleted = cursor.rowcount
-            await db.commit()
-            if deleted:
-                log.info("Session reaper: removed %d expired/revoked sessions", deleted)
-
-            # Chat-pair rows die on the same hourly cycle (#961): the channel
-            # is minutes-to-hours long, so a table that only ever grew would be
-            # an archive of dead secrets' hashes.
-            from hub.services import orchestration
-            from hub.services.chat_pair import (
-                chat_pair_limiter,
-                purge_expired,
-                release_expired_implementer_tasks,
-            )
-
-            released = await release_expired_implementer_tasks(db)
-            purged = await purge_expired(db)
-            for task_id in released:
-                try:
-                    await orchestration.restore_pair_workspace_base(db, task_id)
-                except Exception:
-                    log.warning(
-                        "Session reaper: workspace restore after implementer "
-                        "expiry of #%d failed",
-                        task_id,
-                        exc_info=True,
-                    )
-            if purged:
-                log.info("Session reaper: removed %d chat-pair rows", purged)
-
-            from hub.auth import login_limiter
-
-            login_limiter._cleanup()
-            chat_pair_limiter._cleanup()
+            await orchestration.restore_pair_workspace_base(db, task_id)
         except Exception:
-            log.exception("Session reaper error")
+            log.warning(
+                "Session reaper: workspace restore after implementer "
+                "expiry of #%d failed",
+                task_id,
+                exc_info=True,
+            )
+    if purged:
+        log.info("Session reaper: removed %d chat-pair rows", purged)
+
+    from hub.auth import login_limiter
+
+    login_limiter._cleanup()
+    chat_pair_limiter._cleanup()
 
 
 DRIFT_CHECK_INTERVAL = 900  # 15 minutes
@@ -1893,21 +1928,23 @@ async def _drift_watch(app: FastAPI) -> None:
     """
     from hub.services import drift_guard
 
-    while True:
-        await asyncio.sleep(DRIFT_CHECK_INTERVAL)
-        try:
-            reports = await drift_guard.check_all_projects(app.state.db)
-            for report in reports:
-                if report.status == "unknown":
-                    # Never silent: "could not check" is a state an operator
-                    # has to be able to see, not an absence of news.
-                    log.warning(
-                        "drift check skipped for %s: %s",
-                        report.project_slug,
-                        report.reason,
-                    )
-        except Exception:
-            log.exception("Drift watch error")
+    async with _own_connection(app) as db:
+        while True:
+            await asyncio.sleep(DRIFT_CHECK_INTERVAL)
+            try:
+                reports = await drift_guard.check_all_projects(db)
+                for report in reports:
+                    if report.status == "unknown":
+                        # Never silent: "could not check" is a state an
+                        # operator has to be able to see, not an absence of
+                        # news.
+                        log.warning(
+                            "drift check skipped for %s: %s",
+                            report.project_slug,
+                            report.reason,
+                        )
+            except Exception:
+                log.exception("Drift watch error")
 
 
 async def arm_workspace_hooks(db) -> list[tuple[str, str]]:
@@ -1969,18 +2006,21 @@ async def _red_base_watch(app: FastAPI) -> None:
     """
     from hub.services import red_base
 
-    while True:
-        await asyncio.sleep(RED_BASE_CHECK_INTERVAL)
-        try:
-            for state in await red_base.check_all_projects(app.state.db):
-                if state.status == red_base.UNKNOWN:
-                    # Never silent: "could not look" is a state the operator
-                    # has to see, not an absence of news (#725).
-                    log.warning(
-                        "base CI state unknown for %s: %s", state.branch, state.reason
-                    )
-        except Exception:
-            log.exception("Red base watch error")
+    async with _own_connection(app) as db:
+        while True:
+            await asyncio.sleep(RED_BASE_CHECK_INTERVAL)
+            try:
+                for state in await red_base.check_all_projects(db):
+                    if state.status == red_base.UNKNOWN:
+                        # Never silent: "could not look" is a state the
+                        # operator has to see, not an absence of news (#725).
+                        log.warning(
+                            "base CI state unknown for %s: %s",
+                            state.branch,
+                            state.reason,
+                        )
+            except Exception:
+                log.exception("Red base watch error")
 
 
 def start_poller(app: FastAPI) -> asyncio.Task[None]:

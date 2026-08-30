@@ -10,7 +10,6 @@ translation) live in exactly one place.
 
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -32,7 +31,7 @@ from hub.models import (
     TaskRefineOutcome,
     TaskRisk,
 )
-from hub.db import deserialize_str_list, fetchall, serialize_str_list
+from hub.db import write_transaction, deserialize_str_list, fetchall, serialize_str_list
 from hub.services.readiness import parse_risks_from_row
 from hub.services.recommendations import calculate_readiness_with_recommendations
 from hub.services.project_policy import risk_map_for_task
@@ -173,59 +172,45 @@ class ProjectBindError(ValueError):
     """Raised when a project binding is invalid (#338)."""
 
 
-def get_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
-    """Return a per-connection write lock, created lazily on the running loop.
-
-    The Hub uses a single shared aiosqlite connection across requests. Two
-    concurrent mutations would otherwise interleave their SAVEPOINT/commit
-    pairs on that one connection, so one coroutine's ``commit()`` flushes
-    another's half-written rows — surfacing as sporadic HTTP 500s where the
-    write "sometimes still landed" (feedback #3). Serializing the critical
-    section makes list-append writes (e.g. parallel add_acceptance_criterion)
-    atomic and predictable. The lock is stored on the connection (not a module
-    global) so it always binds to the event loop that owns the connection,
-    which keeps per-test loops happy.
-
-    Serialization boundary (important): the lock is acquired by ``_atomic``
-    (refine / AC add / upsert / replace / bulk refine), ``create_subtasks_bulk``,
-    and the lifecycle completion paths (``add_update`` done-flow,
-    ``force_complete_task``) — i.e. the writers that contend over the same task
-    rows. Short single-statement lifecycle transitions and ``log_activity``
-    calls elsewhere are NOT lock-guarded; under high cross-path concurrency a
-    stray commit could still flush an open SAVEPOINT. Fully serializing every
-    commit on the shared connection (or moving to per-request connections /
-    ``BEGIN IMMEDIATE``) is tracked as separate hardening work.
-    """
-    lock: asyncio.Lock | None = getattr(db, "_oc_write_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        db._oc_write_lock = lock  # type: ignore[attr-defined]
-    return lock
-
-
 @asynccontextmanager
 async def _atomic(db: aiosqlite.Connection, name: str):
-    """SAVEPOINT-scoped atomic block, serialized by the per-connection lock.
+    """Атомарный блок на своей транзакции, взятой сразу на запись (#1065).
 
-    Without an explicit SAVEPOINT, a partial failure inside a multi-step
-    mutation (e.g. ``update_task_structured`` then
-    ``replace_acceptance_criteria``) leaves dirty rows in the implicit
-    transaction; the next handler's ``commit()`` then promotes them. The
-    SAVEPOINT gives per-operation atomicity; the write lock prevents
-    concurrent mutations from interleaving on the shared connection.
+    Что здесь было раньше и почему изменилось. Соединение было одно на
+    процесс, и блок держался на двух вещах: SAVEPOINT давал атомарность
+    операции, а per-connection asyncio.Lock не давал двум мутациям
+    переплести SAVEPOINT/commit на общем соединении. С соединением на запрос
+    вторая половина потеряла смысл — лок лежит НА соединении, а у каждого
+    запроса оно своё, так что сериализовать этому локу больше нечего.
+
+    Взамен транзакция открывается явно и СРАЗУ на запись. Это не украшение:
+    ``SAVEPOINT`` вне транзакции открывает её сам, но DEFERRED — драйвер не
+    считает эту команду изменяющей и своей неявной IMMEDIATE-транзакции не
+    начинает. Первый же INSERT внутри пытается поднять чтение до записи, а на
+    этом пути SQLite отдаёт SQLITE_BUSY немедленно и busy-handler не зовёт
+    вовсе. Измерено: двенадцать параллельных добавлений AC падали с
+    "database is locked" при busy_timeout=5000, пока BEGIN IMMEDIATE не встал
+    здесь. С ним писатели выстраиваются в очередь — то есть ровно то
+    поведение, ради которого раньше держали лок, но силами базы, а не памяти
+    исполнителя.
+
+    SAVEPOINT остаётся: он про атомарность многошаговой операции (например
+    ``update_task_structured`` плюс ``replace_acceptance_criteria``), и эта
+    задача у него та же, что была.
     """
     sp = name.replace("-", "_").replace(" ", "_")
-    async with get_write_lock(db):
-        await db.execute(f"SAVEPOINT {sp}")
-        try:
-            yield
-        except BaseException:
-            await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-            await db.execute(f"RELEASE SAVEPOINT {sp}")
-            raise
-        else:
-            await db.execute(f"RELEASE SAVEPOINT {sp}")
-            await db.commit()
+    if not db.in_transaction:
+        await db.execute("BEGIN IMMEDIATE")
+    await db.execute(f"SAVEPOINT {sp}")
+    try:
+        yield
+    except BaseException:
+        await db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+        await db.execute(f"RELEASE SAVEPOINT {sp}")
+        raise
+    else:
+        await db.execute(f"RELEASE SAVEPOINT {sp}")
+        await db.commit()
 
 
 def row_to_ac(row: aiosqlite.Row) -> AcceptanceCriterion:
@@ -488,7 +473,7 @@ async def refine_tasks_bulk(
 
     # Readiness is computed after commit so each report reflects the final row,
     # and persisted (#250) so lists/boards can rely on the stored values.
-    async with get_write_lock(db):
+    async with write_transaction(db):
         for outcome in outcomes:
             report = await calculate_readiness_with_recommendations(db, outcome.task_id)
             await _persist_readiness_fields(db, outcome.task_id, report)
@@ -744,7 +729,7 @@ async def get_readiness(
     # tasks refined before persistence existed.
     row = await repo.get_task(db, task_id)
     if row is not None and _persisted_readiness_stale(row, report):
-        async with get_write_lock(db):
+        async with write_transaction(db):
             await _persist_readiness_fields(db, task_id, report)
             await db.commit()
     return report

@@ -298,7 +298,13 @@ async def web_logout(request: Request):
 
 
 def _db(request: Request) -> aiosqlite.Connection:
-    return request.app.state.db
+    """Соединение ЭТОГО запроса — то же, что видят обработчики app.py (#1065).
+
+    Одна функция на весь дашборд, как и в app.py: переход на соединение на
+    запрос не потребовал править ни один роут.
+    """
+    conn = getattr(request.state, "db", None)
+    return conn if conn is not None else request.app.state.db
 
 
 def _is_htmx(request: Request) -> bool:

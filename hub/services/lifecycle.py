@@ -36,6 +36,7 @@ from hub.db import (
     fetchall,
     log_activity,
     structured_fields_from_row,
+    write_transaction,
 )
 from hub.integrations.registry import plugins
 from hub.services import verdict_text
@@ -109,7 +110,6 @@ from hub.services.refinement import (
     TaskNotFoundError,
     _guard_ac_locator,
     get_readiness,
-    get_write_lock,
     list_acceptance_criteria,
 )
 
@@ -932,7 +932,7 @@ async def create_subtasks_bulk(
             _guard_ac_locator(item.acceptance_criteria)
 
     created_ids: list[int] = []
-    async with get_write_lock(db):
+    async with write_transaction(db):
         await db.execute("SAVEPOINT bulk_child_tasks")
         try:
             for idx, item in enumerate(body.items):
@@ -2048,7 +2048,7 @@ async def submit_for_review(
                 "git_mode=remote — хаб не читает clone на своём хосте."
             )
 
-    async with get_write_lock(db):
+    async with write_transaction(db):
         if not await repo.transition_status_if(
             db,
             task_id,
@@ -2605,7 +2605,7 @@ async def record_review_verdict(
     if body.create_tasks_for_out_of_scope and body.findings:
         auto_created = await create_drafts_for_out_of_scope_findings(db, task, body)
 
-    async with get_write_lock(db):
+    async with write_transaction(db):
         findings_json = json.dumps(
             [f.model_dump(exclude_none=True) for f in body.findings],
             ensure_ascii=False,
@@ -3344,7 +3344,7 @@ async def add_update(
     # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
     # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
     # which is why it must run under the same lock.
-    async with get_write_lock(db):
+    async with write_transaction(db):
         # #364: the done row and the generation bump are written before the
         # git tail runs, and a git adapter that raises used to leave both
         # behind — reproduced: one done row and generation 1 after the
@@ -3739,7 +3739,7 @@ async def force_complete_task(
         update_fields["claimed_at"] = None
 
     # Serialize against refinement _atomic savepoints on the shared connection.
-    async with get_write_lock(db):
+    async with write_transaction(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()

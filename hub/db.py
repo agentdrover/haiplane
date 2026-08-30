@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,6 +11,13 @@ import aiosqlite
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
+
+# Сколько писатель ждёт занятую базу, прежде чем сдаться (#1065). По умолчанию
+# SQLite не ждёт вовсе: конкурентная запись сразу возвращает "database is
+# locked". Пока соединение было одно на процесс, конкурировать было некому —
+# очередь держал asyncio.Lock в коде. С соединением на запрос очередь держит
+# сама база, и ей нужно сказать, что ожидание законно.
+BUSY_TIMEOUT_MS = 5000
 
 
 async def fetchall(
@@ -1964,11 +1972,89 @@ async def _migrate_proposals(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-async def get_db() -> aiosqlite.Connection:
-    HUB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(HUB_DB_PATH))
+async def connect(dsn: str | None = None) -> aiosqlite.Connection:
+    """Открыть соединение с базой. Ни миграций, ни seed — только режимы.
+
+    Раньше это делал get_db одной операцией: открыть, мигрировать, засеять.
+    Пока соединение было одно на процесс, разницы не было. С соединением на
+    запрос она принципиальная: миграции и seed — работа подъёма приложения, и
+    гонять их на каждый запрос значит платить за них на каждом запросе и
+    сериализовать всё об один файл.
+
+    Режимы, а не умолчания (#1065):
+    * WAL — читатели не ждут писателя. Без него любые два соединения к одному
+      файлу выстраиваются в очередь на любой записи, и «соединение на запрос»
+      оказалось бы медленнее общего.
+    * busy_timeout — писатель ждёт занятую базу вместо мгновенного
+      "database is locked". Ноль по умолчанию означает, что конкуренция
+      превращается в ошибку, а не в задержку.
+    * foreign_keys — как было.
+
+    WAL к in-memory базе неприменим: она молча остаётся в режиме memory, и
+    PRAGMA это не ошибка, а тихий отказ. Поэтому режим здесь запрашивается, а
+    не утверждается — проверять его надо на файловой базе, что и делает
+    tests/test_db_transactions.py.
+    """
+    # isolation_level="IMMEDIATE" — это и есть BEGIN IMMEDIATE из постановки,
+    # и он снимает надобность править 165 мест с .commit(). Драйвер открывает
+    # неявную транзакцию перед первым INSERT/UPDATE/DELETE; по умолчанию она
+    # DEFERRED, то есть берёт write-лок в последний момент. Если к этому
+    # моменту соединение уже читало, SQLite отдаёт SQLITE_BUSY НЕМЕДЛЕННО и не
+    # зовёт busy-handler вовсе — так устроено избегание дедлока, и потому
+    # busy_timeout на этом пути не помогает.
+    #
+    # Измерено, а не выведено: с DEFERRED двенадцать параллельных записей в
+    # test_parallel_ac_writes_do_not_500 падали с "database is locked" при
+    # busy_timeout=5000. IMMEDIATE берёт write-лок сразу, busy-handler
+    # включается, и писатели выстраиваются в очередь вместо отказа.
+    #
+    # Чтения не затронуты: неявную транзакцию драйвер открывает только перед
+    # изменяющим запросом, SELECT её не начинает.
+    db = await aiosqlite.connect(
+        dsn or str(HUB_DB_PATH), uri=True, isolation_level="IMMEDIATE"
+    )
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA journal_mode = WAL")
+    await db.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    return db
+
+
+@asynccontextmanager
+async def write_transaction(db: aiosqlite.Connection):
+    """Блок «прочитать и записать» одной транзакцией, взятой сразу на запись.
+
+    Заменяет ручной ``get_write_lock`` (#1065). Лок лежал НА соединении и имел
+    смысл, пока соединение было одно на процесс: он не давал двум мутациям
+    переплести SAVEPOINT и commit. С соединением на запрос у каждого запроса
+    своё соединение, и сериализовать этому локу нечего — он молча перестал
+    работать, оставшись в коде.
+
+    Работу за него делает база. ``BEGIN IMMEDIATE`` берёт write-лок в начале,
+    а не при первой записи, и это важно ровно для схемы «проверил — вставил»:
+    без него два запроса проходят SELECT одновременно, и второй INSERT
+    прилетает IntegrityError вместо обещанного 409. Ждать очереди законно —
+    busy_timeout выставлен в connect(); на DEFERRED-пути SQLite не стал бы
+    ждать вовсе.
+
+    Вложенный вызов не открывает вторую транзакцию и не коммитит чужую:
+    владелец блока — тот, кто его начал.
+    """
+    if db.in_transaction:
+        yield
+        return
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        await db.rollback()
+        raise
+    else:
+        await db.commit()
+
+
+async def bootstrap(db: aiosqlite.Connection) -> None:
+    """Схема, миграции и seed — ровно один раз, на подъёме приложения."""
     await db.executescript(_SCHEMA)
     await _migrate(db)
     await _fix_orphaned_parents(db)
@@ -1983,6 +2069,17 @@ async def get_db() -> aiosqlite.Connection:
         await seed_default_project(db)
     if await _table_exists(db, "skills"):
         await seed_default_skills(db)
+
+
+async def get_db() -> aiosqlite.Connection:
+    """Соединение подъёма: открыть и привести базу в рабочее состояние.
+
+    Остаётся точкой входа для старта приложения и для тех, кому нужна
+    полностью готовая база одним вызовом.
+    """
+    HUB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = await connect()
+    await bootstrap(db)
     return db
 
 
