@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 from httpx import AsyncClient
@@ -155,7 +156,14 @@ def _load_hook(tmp_path: Path, monkeypatch):
     spec.loader.exec_module(module)
     module.CLAUDE_DIR = tmp_path
     module.SHARED_STATE_FILE = tmp_path / "hub-wait.json"
-    module.MAX_WAIT_SEC = 5
+    # Таймауты теста, а не прода. POLL_SEC приходится ужимать вместе с
+    # MAX_WAIT_SEC: без фида поллер спит POLL_SEC (15с по умолчанию) ПЕРЕД
+    # проверкой дедлайна, поэтому ожидание, которое не срабатывает, стоило
+    # ровно один боевой интервал сна — 15с, 7% всего прогона, измерено на
+    # test_an_empty_inbox_does_not_wake_anyone. Цикл остаётся настоящим:
+    # проходов внутри дедлайна теперь несколько, а не ноль.
+    module.MAX_WAIT_SEC = 0.5
+    module.POLL_SEC = 0.01
     for key in ("CLAUDE_SESSION_ID", "CLAUDE_SESSION", "CLAUDE_CODE_SESSION_ID"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(module, "hub_config", lambda: ("https://hub.example", "t"))
@@ -241,7 +249,14 @@ def test_an_empty_inbox_does_not_wake_anyone(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(module, "fetch_inbox", lambda *a, **k: [])
 
+    started = time.monotonic()
     assert _run(module, monkeypatch, {"session_id": "s-mine"}) == 0
+    elapsed = time.monotonic() - started
+    # Не срабатывающее ожидание доходит до дедлайна через sleep(POLL_SEC).
+    # На боевом POLL_SEC=15 этот путь стоил 15с — 7% всего прогона, при том
+    # что проверяется здесь тишина, а не длительность. Граница с запасом:
+    # ужатый харнесс укладывается в ~0.5с, боевой интервал в неё не влезет.
+    assert elapsed < 5, f"пустой inbox ждал {elapsed:.1f}с — POLL_SEC не ужат"
 
 
 # ---- AC-4: today's task waits behave exactly as before ----

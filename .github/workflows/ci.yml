@@ -76,9 +76,13 @@ jobs:
         id: types
         run: uv run mypy hub
 
+      # -n auto распараллеливает прогон по ядрам раннера. Не в addopts: тот же
+      # флаг достался бы шагу "Report AC tests" ниже, а его парсер ждёт nodeid
+      # первым токеном строки `-v` — xdist ставит там `[gw0]`, и каждый AC
+      # ушёл бы в not_found. Прогон AC остаётся последовательным.
       - name: Test
         id: tests
-        run: uv run pytest -q
+        run: uv run pytest -q -n auto
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
       # grew to its current size because nothing was watching. The check

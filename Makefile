@@ -30,8 +30,14 @@ hooks:
 doctor:
 	uv run hp-git-policy doctor $(REPO)
 
+# -n auto: прогон идёт в процессах по числу ядер. Замерено на 2710 тестах:
+# 3:38 последовательно против 0:50 на восьми воркерах, состав результата тот
+# же. Флаг стоит ЗДЕСЬ и в CI, а не в addopts, потому что addopts достался бы
+# и репортеру AC (scripts/ci_report_to_hub.py): он читает `-v` вывод построчно
+# и ждёт nodeid первым токеном, а xdist ставит перед ним `[gw0]` — каждый AC
+# молча стал бы not_found.
 test:
-	uv run pytest -q
+	uv run pytest -q -n auto
 
 lint:
 	uv run ruff check hub tests
