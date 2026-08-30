@@ -411,11 +411,17 @@ async def test_missing_cursor_key_is_named_in_the_alert(
 
     alerts = await _config_alerts(client, task_id)
     assert len(alerts) == 1, "one record per submission, as before"
-    text = alerts[0]
-    assert "CURSOR_API_KEY" in text
-    assert "CURSOR_REVIEWER_HUB_TOKEN" not in text, "the token is configured"
-    assert "repo проекта" not in text, "the project has its repo"
-    assert "reviewer-token" not in text, "no secret values in a card"
+    # Whole text, not substrings. "No values, no parts, no lengths" is an
+    # invariant about everything the message does NOT say, and a set of `in`
+    # checks can only ever ban the strings someone thought to ban: a len() or
+    # a prefix appended later would pass them all. Equality bans the rest by
+    # construction. The expected string is spelled out here rather than
+    # imported from the service — a test that builds its expectation from the
+    # code under test agrees with that code by definition.
+    assert alerts[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "CURSOR_API_KEY (ключ Cursor API). Вердикт остаётся человеку (#757)."
+    )
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["status"] == "review", "the submit must not suffer"
     assert not recorder.calls, "nothing to call the reviewer with"
@@ -435,10 +441,40 @@ async def test_alert_names_every_missing_setting(
 
     alerts = await _config_alerts(client, task_id)
     assert len(alerts) == 1
-    text = alerts[0]
-    assert "repo проекта" in text
-    assert "CURSOR_REVIEWER_HUB_TOKEN" in text
-    assert "CURSOR_API_KEY" not in text, "the key is configured"
+    assert alerts[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера). "
+        "Вердикт остаётся человеку (#757)."
+    )
+    assert not recorder.calls
+
+
+async def test_each_label_belongs_to_its_own_setting(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1083), the half a conjunction cannot hold: when two settings are
+    # missing TOGETHER, swapping their labels leaves both strings in the text
+    # and every assertion above stays green — while the operator is sent to
+    # fix the setting that was fine. Each label has to be pinned to its own
+    # condition, one missing setting at a time.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-p"}, "run": {"id": "run-p"}})
+    _wire(monkeypatch, recorder)
+
+    only_repo = await _submitted(client, db, "spike-only-repo", repo_name="")
+    assert (await _config_alerts(client, only_repo))[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "repo проекта (репозиторий на GitHub). "
+        "Вердикт остаётся человеку (#757)."
+    )
+
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+    only_token = await _submitted(client, db, "spike-only-token")
+    assert (await _config_alerts(client, only_token))[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера). "
+        "Вердикт остаётся человеку (#757)."
+    )
     assert not recorder.calls
 
 
