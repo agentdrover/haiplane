@@ -1648,6 +1648,36 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_finding_outcomes_task "
         "ON finding_outcomes(task_id, submission_generation)",
     ),
+    (
+        # Steward run orders (#1073). The hub places them; the steward never
+        # does — a judge that can order its own run is a judge nobody called.
+        # status: open → judged | timeout | superseded. #1075 already reads
+        # this table to decide whether the evidence packet may be handed out,
+        # so ordering a run is literally what opens that door.
+        "create_steward_runs",
+        "CREATE TABLE IF NOT EXISTS steward_runs ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,"
+        "  generation INTEGER NOT NULL,"
+        "  kind TEXT NOT NULL,"
+        "  status TEXT NOT NULL DEFAULT 'open',"
+        "  model TEXT NOT NULL DEFAULT '',"
+        "  project_id INTEGER,"
+        "  deadline_at TEXT NOT NULL,"
+        "  closed_reason TEXT NOT NULL DEFAULT '',"
+        "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  closed_at TEXT,"
+        # At-most-once lives HERE rather than in a read-before-write check:
+        # two poller ticks racing on the same generation is the ordinary case,
+        # not the exotic one, and a second order costs a second paid run.
+        "  UNIQUE(task_id, generation, kind)"
+        ")",
+    ),
+    (
+        "idx_steward_runs_open",
+        "CREATE INDEX IF NOT EXISTS idx_steward_runs_open "
+        "ON steward_runs(status, deadline_at)",
+    ),
 ]
 
 
