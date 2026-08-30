@@ -49,6 +49,11 @@
     "model_visible_chars": 73293,
     "max_tool_chars": 6955
   },
+  "working_freeze": {
+    "description_chars": 36383,
+    "max_tool_chars": 6404
+  },
+  "working_headroom_note": "ЧИТАЙ ЭТО ПЕРЕД ТЕМ, КАК ДОБАВЛЯТЬ ОПИСАНИЕ. Новое описание отвергает working_freeze, а не budgets: budgets — потолок с процентным запасом, он ловит долгий дрейф и сегодня вас НЕ остановит. Планируйте по остатку от ЖИВОГО каталога, а не по разности с measured: measured — состояние на момент последней заморозки, и разность с ним больше живого остатка. Живой остаток печатает scripts/mcp_catalog_budget.py первой же секцией. Заморозка двигается только вниз, это отдельное решение, и новое описание оплачивается подрезкой. Источник обоих чисел — hub/mcp_catalog.py; --update переписывает measured, budgets и baseline_tools целиком, это полная перезаморозка, а не правка одного ключа.",
   "baseline_tools": {
     "hub_add_acceptance_criterion": 1231,
     "hub_add_dependency": 906,
