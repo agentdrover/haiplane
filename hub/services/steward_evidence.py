@@ -712,4 +712,19 @@ def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
             for source, fact in packet.facts.items()
         },
         "absent_sources": packet.absent_sources(),
+        # Somebody else's words leave the hub marked as such (#1076/#1082).
+        # Inside the process the distinction was already there; without these
+        # two fields it stopped at the door, and the only reader of the packet
+        # is on the other side of it.
+        "quotes": [
+            {
+                "source": q.source,
+                "author": q.author,
+                "text": q.text,
+                "signals": list(q.signals),
+            }
+            for q in packet.quotes
+        ],
+        "injection_suspected": packet.injection_suspected,
+        "injection_signals": packet.injection_signals,
     }
