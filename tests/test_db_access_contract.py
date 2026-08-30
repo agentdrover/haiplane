@@ -14,6 +14,7 @@ aiosqlite объявляет ``execute_fetchall`` как ``Iterable[Row]``, хо
 
 from __future__ import annotations
 
+import ast
 import io
 import tokenize
 from pathlib import Path
@@ -74,3 +75,89 @@ def test_the_wrapper_module_itself_is_exempt():
         "или она переехала, и исключение стража надо пересмотреть вместе с ней"
     )
     assert WRAPPER not in _hub_modules()
+
+
+# Соединение на запрос (#1065): обработчик обязан брать базу через _db(request),
+# а не лезть в app.state.db. Общее соединение на процесс — это ровно та схема,
+# при которой commit одной корутины фиксировал незакоммиченное другой, и хаб
+# описал эту дыру сам в docstring get_write_lock, отложив её как hardening work.
+#
+# Разбор идёт токенами, а не подстрокой — по той же причине, что и выше: иначе
+# страж ловит собственное описание и объяснения в коде и оказывается удалён
+# первым же, кто на него наступит без вины.
+
+
+def _code_lines_with(path: Path, name: str) -> list[str]:
+    """Строки КОДА, где встречается имя ``name``: комментарии и строки не в счёт."""
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    hits: list[int] = []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.NAME and token.string == name:
+            hits.append(token.start[0])
+    return [
+        f"{path.relative_to(REPO_ROOT)}:{n}: {lines[n - 1].strip()}"
+        for n in sorted(set(hits))
+    ]
+
+
+def _function_spans(path: Path, names: dict[str, str]) -> list[tuple[int, int]]:
+    """Строчные границы функций, которым общее соединение положено по делу."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in names:
+                spans.append((node.lineno, node.end_lineno or node.lineno))
+    return spans
+
+
+def test_handlers_do_not_reach_for_the_shared_connection():
+    """Роут, взявший соединение приложения, работает не на своём.
+
+    Разрешённые случаи перечислены поимённо и объяснены: подъём (lifespan
+    открывает и закрывает соединение приложения), откат в ``_db()`` для прямых
+    вызовов из web.py в app.py, телеметрия и фоновые шаги — у них запроса нет
+    вовсе. Всё остальное — возврат к общей схеме.
+    """
+    # Границы берутся у ast, а не списком строк: список маркеров пришлось бы
+    # дописывать на каждую правку подъёма, и первый же дописавший превратил бы
+    # его в место, куда добавляют, чтобы страж замолчал.
+    exempt = {
+        "lifespan": "подъём и остановка приложения: соединение здесь и рождается",
+        "_db": "объявленный откат для прямых вызовов web.py → app.py",
+        "_provision_project_detached": "фон переживает запрос и открывает своё",
+    }
+    offenders: list[str] = []
+    for path in (HUB / "app.py", HUB / "web.py"):
+        spans = _function_spans(path, exempt)
+        for line in _code_lines_with(path, "state"):
+            if "app.state.db" not in line:
+                continue
+            number = int(line.split(":")[1])
+            if any(lo <= number <= hi for lo, hi in spans):
+                continue
+            offenders.append(line)
+
+    assert not offenders, (
+        "обработчик берёт общее соединение приложения вместо соединения "
+        "запроса — это возврат к схеме, при которой чужой commit фиксирует "
+        "вашу незавершённую работу. Берите _db(request):\n" + "\n".join(offenders)
+    )
+
+
+def test_the_manual_write_lock_is_gone():
+    """get_write_lock снят вместе с общим соединением, а не оставлен рядом.
+
+    Лок лежал НА соединении. С соединением на запрос у каждого запроса своё,
+    и сериализовать этому локу нечего: он молча перестал работать, продолжая
+    выглядеть защитой. Оставить его означало бы держать в коде правило,
+    которое ничего не делает, — худший вид гарантии.
+    """
+    survivors: list[str] = []
+    for path in HUB.rglob("*.py"):
+        survivors += _code_lines_with(path, "get_write_lock")
+    assert not survivors, (
+        "get_write_lock вернулся; на соединении запроса он не сериализует "
+        "ничего — нужна write_transaction() из hub/db.py:\n" + "\n".join(survivors)
+    )

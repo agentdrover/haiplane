@@ -102,9 +102,39 @@ def _setup_mock_plugins():
 
 
 @pytest.fixture
-async def db():
-    """In-memory SQLite database with Hub schema and migrations."""
-    conn = await aiosqlite.connect(":memory:")
+def db_dsn(tmp_path: Path) -> str:
+    """DSN тестовой базы — ФАЙЛ, а не ":memory:" (#1065).
+
+    Почему не ":memory:". In-memory база живёт внутри одного соединения:
+    второе соединение к ":memory:" получает другую, пустую (проверено:
+    CREATE TABLE на первом, SELECT на втором → no such table). С соединением
+    на запрос такая фикстура означала бы, что каждый запрос открывает свою
+    пустую базу, то есть тесты не проверяют ничего.
+
+    Почему не shared-cache in-memory. ``cache=shared`` базу разделяет, но
+    вводит блокировки НА УРОВНЕ ТАБЛИЦЫ: открытое чтение на соединении
+    фикстуры отдаёт писателю запроса SQLITE_LOCKED ("database table is
+    locked"), а busy_timeout лечит SQLITE_BUSY и на этот код не действует.
+    Измерено, а не предположено: с shared-cache падал
+    test_project_filter_returns_only_subtree.
+
+    Файл в tmp_path даёт ровно то, что на проде: WAL, при котором читатель не
+    блокирует писателя, и busy_timeout, который работает. Заодно это делает
+    проверяемым AC-4 — к in-memory базе journal_mode=WAL неприменим вовсе,
+    она молча остаётся в режиме memory.
+    """
+    return str(tmp_path / "hub-test.db")
+
+
+@pytest.fixture
+async def db(db_dsn):
+    """Соединение к тестовой базе со схемой и миграциями."""
+    # Держатель: пока это соединение открыто, shared-cache база жива. Закрытие
+    # ПОСЛЕДНЕГО соединения к in-memory базе стирает её, поэтому фикстура
+    # закрывается последней — соединения запросов приходят и уходят внутри.
+    conn = await aiosqlite.connect(db_dsn, uri=True)
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await conn.executescript(_SCHEMA)
@@ -118,15 +148,49 @@ async def db():
 
 
 @pytest.fixture
-async def client(db):
-    """httpx AsyncClient wired to the FastAPI app with in-memory DB."""
+async def client(db, db_dsn):
+    """httpx AsyncClient к приложению — с СОЕДИНЕНИЕМ НА ЗАПРОС (#1065).
+
+    ``app.state.dsn`` включает то же поведение, что на проде: middleware
+    открывает соединение на каждый запрос и закрывает его после. Фикстура
+    ``db`` остаётся рядом — через неё тест готовит состояние и проверяет
+    результат, — но обработчики работают уже НЕ через неё, а через свои
+    соединения к той же базе. Иначе тесты доказывали бы работу схемы, которой
+    на проде нет.
+    """
     with patch("hub.poller.start_poller", return_value=AsyncMock()):
         from hub.app import app
 
         app.state.db = db
+        app.state.dsn = db_dsn
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as c:
-            yield c
+
+        async def _flush_fixture_writes(_request):
+            """Довести до диска то, что тест подготовил через фикстуру (#1065).
+
+            Тест пишет через соединение фикстуры, а обработчик читает через
+            СВОЁ. Незакоммиченная подготовка невидима ему и вдобавок держит
+            write-лок — запрос получает "database is locked". Измерено: так
+            падали 39 тестов из 2701, и все они писали setup без коммита,
+            полагаясь на то, что соединение общее.
+
+            Коммит здесь, а не автокоммит на самой фикстуре: автокоммит отнял
+            бы предмет проверки у тестов транзакционности на голом соединении
+            (test_event_rolls_back_with_transaction делает rollback и ждёт,
+            что запись исчезла). Граница проходит там, где появляется второе
+            соединение, — то есть ровно здесь.
+            """
+            await db.commit()
+
+        try:
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                event_hooks={"request": [_flush_fixture_writes]},
+            ) as c:
+                yield c
+        finally:
+            app.state.dsn = None
 
 
 def _git_in(root: Path, *args: str) -> str:

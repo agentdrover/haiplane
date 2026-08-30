@@ -22,11 +22,12 @@ from fastapi import (
 )
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from hub import brand, config, models, services
 from hub import db as db_module
 from hub import repository as repo
-from hub.db import get_db, log_activity
+from hub.db import get_db, log_activity, write_transaction
 from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
@@ -148,7 +149,6 @@ from hub.services.refinement import (
     ProjectBindError,
     LimitExceededError,
     TaskNotFoundError,
-    get_write_lock,
 )
 from hub.services.diagnostics import (
     build_health,
@@ -227,6 +227,11 @@ _mcp_streamable_app = mcp_server.streamable_http_app()
 async def lifespan(app: FastAPI):
     config.validate_network_auth()
     _register_plugins()
+    # DSN, а не только соединение (#1065): по нему обработчик запроса открывает
+    # СВОЁ соединение. Общее соединение на процесс означало, что commit одной
+    # корутины фиксирует незакоммиченное другой — хаб описал эту дыру сам в
+    # docstring get_write_lock и отложил как hardening work.
+    app.state.dsn = str(config.HUB_DB_PATH)
     app.state.db = await get_db()
     log.info("Hub database ready at %s", config.HUB_DB_PATH)
     # MCP usage telemetry (#780) writes through this connection. It is handed
@@ -299,7 +304,63 @@ async def lifespan(app: FastAPI):
         await app.state.db.close()
 
 
+async def _provision_project_detached(app: FastAPI, pid: int, *, actor: str) -> None:
+    """Провизия проекта на СВОЁМ соединении (#1065).
+
+    Задача ставится в BackgroundTasks и выполняется после того, как ответ ушёл
+    и соединение запроса закрыто. Брать соединение запроса здесь нельзя — это
+    и есть разница между «работает на тестах с общим коннектом» и «работает».
+    """
+    dsn = getattr(app.state, "dsn", None)
+    if not dsn:
+        await services.provision_project(app.state.db, pid, actor=actor)
+        return
+    conn = await db_module.connect(dsn)
+    try:
+        await services.provision_project(conn, pid, actor=actor)
+    finally:
+        await conn.close()
+
+
+class RequestConnectionMiddleware(BaseHTTPMiddleware):
+    """Своё соединение с базой на каждый запрос (#1065).
+
+    Что это чинит. Общее соединение на процесс делили поллер, веб-роуты, REST
+    и MCP-телеметрия. Неявная транзакция на нём означает, что commit() одной
+    корутины фиксирует незакоммиченное другой — включая открытый SAVEPOINT.
+    Симптом наблюдался и записан в хабе: «sporadic HTTP 500s where the write
+    sometimes still landed». Пока соединение общее, это лечится только
+    дисциплиной: 165 вызовов .commit() против 13 взятий write-lock.
+
+    Соединение на запрос убирает саму возможность: чужого незакоммиченного на
+    этом соединении нет. Ручной лок после этого не нужен — очередь держит
+    сама база (WAL + busy_timeout), а не память исполнителя.
+
+    Транзакция не открывается здесь заранее: обработчики коммитят сами, и
+    каждый коммит теперь фиксирует ТОЛЬКО свою работу.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        dsn = getattr(request.app.state, "dsn", None)
+        if not dsn:
+            # Приложение подняли без DSN — соединения на запрос нет, и
+            # обработчики уедут на app.state.db через _db(). Так работают
+            # прямые вызовы из web.py и часть тестов.
+            return await call_next(request)
+        conn = await db_module.connect(dsn)
+        request.state.db = conn
+        try:
+            return await call_next(request)
+        finally:
+            request.state.db = None
+            await conn.close()
+
+
 app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lifespan)
+# Добавлен первым — значит выполняется последним, уже после аутентификации:
+# соединение открывается только для запроса, который дошёл до обработчика, а
+# не для каждого отбитого на пороге (#1065).
+app.add_middleware(RequestConnectionMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
@@ -324,7 +385,18 @@ def _row_or_404(row: aiosqlite.Row | None, missing: str) -> aiosqlite.Row:
 
 
 def _db(request: Request) -> aiosqlite.Connection:
-    return request.app.state.db
+    """Соединение ЭТОГО запроса (#1065).
+
+    Единственная точка, через которую обработчики берут базу — их 117, и
+    именно поэтому переход на соединение на запрос оказался правкой одной
+    функции, а не ста семнадцати.
+
+    Откат на app.state.db оставлен намеренно: hub/web.py вызывает часть
+    обработчиков app.py напрямую, а поллер и телеметрия работают вне
+    HTTP-запроса вовсе. Там своё соединение, и подсовывать им чужое нечем.
+    """
+    conn = getattr(request.state, "db", None)
+    return conn if conn is not None else request.app.state.db
 
 
 def _reject_agent_authored_source(request: Request, source: TaskSource) -> None:
@@ -667,7 +739,7 @@ async def api_create_project(
     # Write lock serializes check-then-insert: two concurrent creates with the
     # same slug would otherwise both pass the SELECT and the second INSERT
     # would surface as IntegrityError → 500 instead of the promised 409.
-    async with get_write_lock(db):
+    async with write_transaction(db):
         if await repo.get_project_by_slug(db, body.slug) is not None:
             raise HTTPException(409, f"project slug {body.slug!r} already exists")
         pid = await repo.create_project(
@@ -696,8 +768,16 @@ async def api_create_project(
         and body.repo.strip()
         and body.workspace_path.strip()
     ):
+        # Своё соединение, а не соединение запроса (#1065). BackgroundTasks
+        # выполняются ПОСЛЕ ответа, а соединение запроса к этому моменту уже
+        # закрыто — задача, пережившая запрос, не может занимать его ресурс.
+        # Поймано тестом test_create_active_project_auto_provisions: он падал
+        # с "Connection closed", и это был бы прод-баг, а не артефакт теста.
         background_tasks.add_task(
-            services.provision_project, db, pid, actor=identity.username
+            _provision_project_detached,
+            request.app,
+            pid,
+            actor=identity.username,
         )
     row = _row_or_404(await repo.get_project(db, pid), "project not found")
     return await _project_view(row)
