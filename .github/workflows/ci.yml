@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   test:
@@ -46,6 +47,56 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --dev
+
+      # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
+      # выполнился 5 раз подряд (PR → develop → релизный PR → main →
+      # обратный мерж), из них информацию несли только 2: остальные три
+      # гоняли pytest над байт-в-байт тем же деревом файлов под новым SHA —
+      # мерж- и squash-коммиты меняют SHA, но не содержимое. Маркер "дерево
+      # уже зелёное" — это сам успешный прогон над этим деревом, отдельной
+      # публикации хэша нет: ищем совпадение git tree-hash среди последних
+      # успешных прогонов ЭТОГО workflow. Равенство хэша дерева и есть
+      # равенство содержимого, так что источник-прогон доверен по
+      # построению — подделать чужой зелёный прогон с нашим деревом нельзя,
+      # не имея наш контент. git fetch по sha отдельным шагом нужен потому,
+      # что голова squash-нутого PR недостижима из develop локальным
+      # git rev-parse без явной подкачки. Только push: на pull_request этот
+      # шаг не выполняется вовсе — PR-прогоны несут AC-evidence для гейта
+      # доставки хаба (#546/#605), и их нельзя пропускать. continue-on-error:
+      # любой сбой здесь (сеть, gh api, отсутствие кандидатов) должен всегда
+      # означать полный прогон, а не покрасить джоб.
+      - name: Detect tree already tested (skip pytest on exact dedup)
+        id: treedup
+        if: ${{ github.event_name == 'push' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tree=$(git rev-parse HEAD^{tree})
+          echo "Current tree: $tree"
+
+          gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?status=success&per_page=50" \
+            --jq '.workflow_runs[] | "\(.head_sha) \(.html_url)"' | \
+          while read -r sha html_url; do
+            candidate_tree=$(git rev-parse "$sha^{tree}" 2>/dev/null) || true
+            if [ -z "$candidate_tree" ]; then
+              git fetch -q --no-tags origin "$sha" 2>/dev/null || true
+              candidate_tree=$(git rev-parse "$sha^{tree}" 2>/dev/null) || true
+            fi
+            if [ -z "$candidate_tree" ]; then
+              # Кандидат недостижим даже после fetch — пропускаем молча.
+              continue
+            fi
+            if [ "$candidate_tree" = "$tree" ]; then
+              echo "tree already green — pytest skipped: tree $tree, source run $html_url"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+          if [ "$(cat "$GITHUB_OUTPUT" 2>/dev/null | grep -c '^skip=true$')" = "0" ]; then
+            echo "tree not seen before — running pytest: $tree"
+          fi
 
       # #875: these steps get ids so their outcomes can be REPORTED to the
       # hub. The reviewer was paying model prices to rediscover defects ruff
@@ -82,6 +133,7 @@ jobs:
       # ушёл бы в not_found. Прогон AC остаётся последовательным.
       - name: Test
         id: tests
+        if: ${{ steps.treedup.outputs.skip != 'true' }}
         run: uv run pytest -q -n auto
 
       # #780: the tool catalog is a tax every agent pays on every turn, and it
