@@ -2663,3 +2663,97 @@ async def test_machine_owned_queue_is_not_reminded(db):
     await _sweep_human_queue(db)
 
     assert await _reminders(db, task_id) == []
+
+
+# --- A tick must not sleep inside an open transaction (retention lock leak) ---
+#
+# isolation_level="IMMEDIATE" (#1065) opens a transaction before ANY DML —
+# including a DELETE that matches nothing. The retention sweeps committed
+# conditionally ("if pruned:"), so a quiet tick left the transaction open and
+# the poller slept holding the write lock of the WHOLE database. Observed in
+# production on 30.08.2026: reads fine, every writer 500 "database is locked".
+
+
+async def _immediate_conn(db_dsn):
+    """A connection the way production opens it — BEGIN IMMEDIATE before DML."""
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_dsn, uri=True, isolation_level="IMMEDIATE")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA busy_timeout = 300")
+    return conn
+
+
+async def test_a_quiet_retention_sweep_leaves_no_open_transaction(db, db_dsn):
+    """Zero rows pruned must still commit: the DELETE already began a transaction."""
+    from hub.poller import (
+        _sweep_events_retention,
+        _sweep_messages_retention,
+        _sweep_mcp_retention,
+        _sweep_sessions_retention,
+    )
+
+    await db.commit()
+    conn = await _immediate_conn(db_dsn)
+    try:
+        for sweep in (
+            _sweep_events_retention,
+            _sweep_sessions_retention,
+            _sweep_messages_retention,
+            _sweep_mcp_retention,
+        ):
+            await sweep(conn)
+            assert not conn.in_transaction, (
+                f"{sweep.__name__} slept inside an open transaction"
+            )
+    finally:
+        await conn.close()
+
+
+async def test_a_quiet_tick_does_not_hold_the_write_lock(db, db_dsn):
+    """The whole tick, production-style connection: another writer stays able to write."""
+    import aiosqlite
+
+    from hub.poller import _poll_once
+
+    await db.commit()
+    conn = await _immediate_conn(db_dsn)
+    try:
+        await _poll_once(conn)
+        assert not conn.in_transaction
+
+        other = await aiosqlite.connect(db_dsn, uri=True, isolation_level="IMMEDIATE")
+        try:
+            await other.execute("PRAGMA busy_timeout = 300")
+            await other.execute("BEGIN IMMEDIATE")
+            await other.rollback()
+        finally:
+            await other.close()
+    finally:
+        await conn.close()
+
+
+async def test_the_tick_guard_rolls_back_a_forgotten_commit(db, db_dsn, caplog):
+    """A sweep that writes without committing is rolled back and named, not slept with."""
+    import hub.poller as poller
+
+    await db.commit()
+    conn = await _immediate_conn(db_dsn)
+
+    async def _leaky(_db) -> None:
+        await _db.execute(
+            "INSERT INTO events (kind, actor, payload) VALUES ('leak', 'test', '{}')"
+        )
+
+    try:
+        with caplog.at_level("WARNING", logger="hub"):
+            with patch("hub.poller._sweep_mcp_retention", _leaky):
+                await poller._poll_once(conn)
+
+        assert not conn.in_transaction
+        rows = await fetchall(conn, "SELECT * FROM events WHERE kind = 'leak'")
+        assert rows == [], "the uncommitted write survived the rollback"
+        warnings = [r for r in caplog.records if "open transaction" in r.getMessage()]
+        assert warnings, "the guard rolled back silently"
+    finally:
+        await conn.close()
