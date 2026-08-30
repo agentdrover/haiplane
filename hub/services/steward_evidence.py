@@ -488,9 +488,13 @@ async def open_run_exists(
     )
     if not rows:
         return False
+    # The table name is spelled out rather than interpolated from the constant
+    # above: a formatted SQL string is a finding to every scanner that reads
+    # this file, and "the value is a constant" is an argument each reader has
+    # to re-derive. The constant still names the table for the existence probe.
     open_runs = await fetchall(
         db,
-        f"SELECT 1 FROM {STEWARD_RUNS_TABLE} "  # noqa: S608 — name is a constant
+        "SELECT 1 FROM steward_runs "
         "WHERE task_id=? AND generation=? AND status=? LIMIT 1",
         (task_id, generation, RUN_OPEN),
     )
