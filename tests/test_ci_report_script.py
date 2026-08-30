@@ -438,3 +438,66 @@ def test_the_workflow_hands_the_reporter_what_it_ran():
             f"reporter is told it ran {command!r} — a drifted copy stops "
             "matching and the duplicate run comes back"
         )
+
+
+def test_plugin_flags_are_never_treated_as_non_selecting(script):
+    """``-p`` loads and DISABLES plugins, and one of them is the collector.
+
+    Measured against real pytest in this repository: ``--collect-only -q``
+    reports 2794 tests, and ``-p no:python`` reports none at all — the built-in
+    ``python`` plugin is what collects Python tests. Whitelisting ``-p`` as
+    "does not select" therefore declared a command that runs NOTHING proven by
+    the job's green suite. Every other whitelisted flag was checked the same
+    way, by collection count rather than by reading the docs.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in (
+        "uv run pytest -q -p no:python",
+        "uv run pytest -q -p no:cacheprovider",
+        "uv run pytest -q -p my_plugin",
+        # Attached form: the one that actually slipped through while -p was
+        # whitelisted, because "-p=..." carries its value and never becomes a
+        # positional. pytest itself rejects it (ImportError), so reusing the
+        # suite's pass reports a certain failure as green.
+        "uv run pytest -q -p=no:python",
+    ):
+        assert script.already_proven(command, ran) is None, command
+    # Pinned structurally as well, and not out of pedantry: the loop above
+    # passes even with -p whitelisted for every SPACED form, because a spaced
+    # value falls through to "positional" and differs anyway. Only the attached
+    # form and this assertion actually hold the line — a mutation restoring -p
+    # to the set has to fail something.
+    assert "-p" not in script._NON_SELECTING_FLAGS, (
+        "-p disables plugins, and `-p no:python` collects 0 of 2794 tests; "
+        "treating it as non-selecting declares a command that runs nothing "
+        "proven by the job's green suite"
+    )
+
+
+def test_a_dangling_flag_does_not_swallow_a_test_path(script):
+    """A path eaten as a flag's value turns a narrowed run into "whole suite".
+
+    ``uv run pytest -n tests/test_web.py`` is a card with a dangling ``-n``.
+    Real pytest exits 4 on it. Consuming the path as the value of ``-n`` left
+    the selection empty, keyed the command as the entire suite and declared it
+    proven — reporting a certain failure as a pass, which is the one direction
+    this mechanism must never be wrong in.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in (
+        "uv run pytest -n tests/test_web.py",
+        "uv run pytest --tb tests/test_web.py",
+        "uv run pytest --color tests/test_web.py",
+        "uv run pytest --dist tests/x.py::test_y",
+    ):
+        assert script.already_proven(command, ran) is None, command
+    # A real value is still consumed: worker count does not select anything.
+    assert script.already_proven("uv run pytest -n 4 -v", ran) is not None
+    assert script.already_proven("uv run pytest --tb=short -q", ran) is not None
+
+
+def test_a_different_launcher_is_a_different_command(script):
+    """The prefix up to ``pytest`` is part of the key, wrapper flags included."""
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in ("python -m pytest -q", "uv run --no-cache pytest -q", "pytest -q"):
+        assert script.already_proven(command, ran) is None, command

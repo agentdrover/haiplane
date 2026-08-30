@@ -233,6 +233,14 @@ def parse_checks(raw: str) -> dict[str, str]:
 # allowed before two pytest invocations count as the same assertion (#1081).
 # Closed on purpose: an unrecognised flag makes the commands non-equivalent and
 # the validation command is executed. Equivalence is proven, never assumed.
+#
+# Every entry was checked against real pytest by collection count, not by
+# reading the docs: `--collect-only -q` with the flag and without must report
+# the same number. `-p` failed that check and is deliberately ABSENT — it loads
+# and disables plugins, and pytest's own `python` plugin IS the collector for
+# Python tests: `-p no:python` collects 0 of 2794 and exits 5. A command that
+# runs nothing would otherwise have been declared proven by the job's green
+# suite, which is exactly the fiction this whole mechanism must not produce.
 _NON_SELECTING_FLAGS = {
     "-q",
     "--quiet",
@@ -244,11 +252,27 @@ _NON_SELECTING_FLAGS = {
     "--color",
     "--tb",
     "-r",
-    "-p",
     "-n",
     "--numprocesses",
     "--dist",
 }
+
+
+# Whitelisted flags whose value may live in the next token rather than after
+# an "=". Kept separate from the whitelist itself: membership here decides
+# whether a token is EATEN, and eating one too many is how a narrowed run gets
+# mistaken for the whole suite.
+_VALUE_TAKING_FLAGS = {"-n", "--numprocesses", "--dist", "--tb", "--color", "-r"}
+
+
+def _looks_like_a_test_path(token: str) -> bool:
+    """Could this token be a test path or nodeid rather than a flag's value?
+
+    Deliberately generous: a false "yes" only costs one extra run, while a
+    false "no" swallows a path and turns a narrowed selection into "the whole
+    suite, already proven".
+    """
+    return "/" in token or "::" in token or token.endswith(".py")
 
 
 def parse_ran_commands(raw: str) -> dict[str, str]:
@@ -298,19 +322,20 @@ def _selection_key(command: str) -> tuple | None:
         name = token.split("=", 1)[0]
         if name not in _NON_SELECTING_FLAGS:
             return None  # unknown flag: cannot prove it does not select
-        # A whitelisted flag may carry its value in the next token; skip it
-        # only when it is not itself an option.
-        if "=" not in token and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
-            if name in {
-                "-n",
-                "--numprocesses",
-                "--dist",
-                "-p",
-                "--tb",
-                "--color",
-                "-r",
-            }:
-                i += 1
+        # A whitelisted flag may carry its value in the next token. Consume it
+        # only when it cannot be a test path: `pytest -n tests/test_web.py` is
+        # a card with a dangling -n, and swallowing the path would key it as
+        # the WHOLE suite and declare it proven — while real pytest exits 4 on
+        # it. Refusing to consume leaves the path positional, the selection
+        # differs, and the command runs. Wrong in the cheap direction only.
+        if (
+            "=" not in token
+            and name in _VALUE_TAKING_FLAGS
+            and i + 1 < len(rest)
+            and not rest[i + 1].startswith("-")
+            and not _looks_like_a_test_path(rest[i + 1])
+        ):
+            i += 1
         i += 1
     return prefix, tuple(sorted(selecting))
 
