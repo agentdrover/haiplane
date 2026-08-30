@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2665,6 +2666,122 @@ async def test_machine_owned_queue_is_not_reminded(db):
     assert await _reminders(db, task_id) == []
 
 
+# --- The tick isolates one sweep's failure and declares its order (#1069) ---
+
+
+async def test_the_sweep_order_is_pinned(db):
+    """AC-3: the order is load-bearing, so it is declared, not implied by lines.
+
+    Review settlement runs before the release policy so a merge this pass
+    produced is released this pass; the retention sweeps trail the lifecycle
+    ones. A reordering that changes either is a decision, and it has to be
+    made against this list rather than by moving a call.
+    """
+    from hub.poller import SWEEPS
+
+    assert [sweep.name for sweep in SWEEPS] == [
+        "running_dispatch",
+        "review",
+        "pair_delivery",
+        "ci_check",
+        "stale_running",
+        "stale_statuses",
+        "unrefined_drafts",
+        "human_queue",
+        "autopilot_digests",
+        "delivery_discrepancies",
+        "review_dispatches",
+        "expired_claims",
+        "machine_deadlines",
+        "stale_arbiter",
+        "events_retention",
+        "stale_worktrees",
+        "sessions_retention",
+        "release_policy",
+        "messages_retention",
+        "mcp_retention",
+    ]
+
+
+async def test_a_failing_sweep_does_not_skip_the_rest_of_the_tick(db):
+    """AC-1: an exception in the middle of the order costs one sweep, not the tail.
+
+    The failure is planted where it used to hurt most — in the row query of a
+    sweep, outside ``_task_isolation``, which is how a timed-out call took the
+    eighteen sweeps after it down with it every tick.
+    """
+    import hub.poller as poller
+
+    ran: list[str] = []
+
+    def _recording(name: str):
+        async def _sweep(_db) -> None:
+            ran.append(name)
+
+        return _sweep
+
+    async def _explode(_db) -> None:
+        ran.append("review")
+        raise RuntimeError("row query timed out")
+
+    pinned = [
+        poller.Sweep(
+            sweep.name, _explode if sweep.name == "review" else _recording(sweep.name)
+        )
+        for sweep in poller.SWEEPS
+    ]
+
+    with patch.object(poller, "SWEEPS", tuple(pinned)):
+        await _run_poll_once(db)
+
+    assert ran == [sweep.name for sweep in poller.SWEEPS]
+
+
+async def test_a_failing_sweep_is_named_in_the_log(db, caplog):
+    """AC-2: isolation makes the error quieter only if it stops naming itself."""
+    import hub.poller as poller
+
+    async def _explode(_db) -> None:
+        raise RuntimeError("row query timed out")
+
+    pinned = (poller.Sweep("expired_claims", _explode),)
+
+    with caplog.at_level("ERROR", logger="hub"):
+        with patch.object(poller, "SWEEPS", pinned):
+            await _run_poll_once(db)
+
+    failures = [r for r in caplog.records if "expired_claims" in r.getMessage()]
+    assert failures, "the failing sweep is not named in the log"
+    assert "tick continues" in failures[0].getMessage()
+    assert failures[0].exc_info is not None, "the log carries no traceback"
+
+
+async def test_cancellation_still_stops_the_loop(db):
+    """AC-4: shutdown cancels the loop task, and neither wrapper may hold it.
+
+    ``CancelledError`` derives from ``BaseException`` for exactly this reason;
+    a bare ``except Exception`` in either wrapper keeps that true, and this
+    test is what notices if one is ever widened.
+    """
+    import hub.poller as poller
+
+    started = asyncio.Event()
+
+    async def _hang(_db) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    with patch.object(poller, "SWEEPS", (poller.Sweep("hangs", _hang),)):
+        with patch("hub.poller.asyncio.sleep", new_callable=AsyncMock):
+            loop_task = asyncio.create_task(_poll_running_tasks(_make_app(db)))
+            await started.wait()
+            loop_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop_task
+
+    assert loop_task.cancelled()
+
+
 # --- A tick must not sleep inside an open transaction (retention lock leak) ---
 #
 # isolation_level="IMMEDIATE" (#1065) opens a transaction before ANY DML —
@@ -2747,7 +2864,7 @@ async def test_the_tick_guard_rolls_back_a_forgotten_commit(db, db_dsn, caplog):
 
     try:
         with caplog.at_level("WARNING", logger="hub"):
-            with patch("hub.poller._sweep_mcp_retention", _leaky):
+            with patch.object(poller, "SWEEPS", (poller.Sweep("leaky", _leaky),)):
                 await poller._poll_once(conn)
 
         assert not conn.in_transaction
