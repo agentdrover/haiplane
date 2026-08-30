@@ -140,10 +140,14 @@ async def test_absent_report_is_absence_not_clean(
     assert empty_report.value["confirmed"] == []
     # Ни одно поле не позволяет спутать их: отсутствие не спеллится значением.
     assert no_report.state != empty_report.state
-    assert "machine_review_report" in (await build_evidence_packet(db, silent)).absent_sources()
-    assert "machine_review_report" not in (
-        await build_evidence_packet(db, clean)
-    ).absent_sources()
+    assert (
+        "machine_review_report"
+        in (await build_evidence_packet(db, silent)).absent_sources()
+    )
+    assert (
+        "machine_review_report"
+        not in (await build_evidence_packet(db, clean)).absent_sources()
+    )
 
 
 async def test_source_outside_closed_set_is_refused(db: aiosqlite.Connection):

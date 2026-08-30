@@ -253,15 +253,14 @@ def _surface_fact(
 
     source = "diff_vs_areas"
     if diff_paths is None:
-        return absent(
-            source, DIFF_UNREADABLE, diff_reason or "дифф ветки не прочитать"
-        )
+        return absent(source, DIFF_UNREADABLE, diff_reason or "дифф ветки не прочитать")
     verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
     if verdict == "unknown":
         return absent(source, SURFACE_UNKNOWN, detail or "сверка областей не выполнена")
     return present(
         source,
-        detail or f"дифф из {len(diff_paths)} путей, вне заявленного: {len(undeclared)}",
+        detail
+        or f"дифф из {len(diff_paths)} путей, вне заявленного: {len(undeclared)}",
         paths=list(diff_paths),
         undeclared=list(undeclared),
         within_declared=verdict == "ok",
@@ -346,9 +345,7 @@ def _locator_fact(brief: ReviewBrief | None) -> EvidenceFact:
     )
 
 
-async def _base_fact(
-    db: aiosqlite.Connection, project_row: Any | None
-) -> EvidenceFact:
+async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> EvidenceFact:
     """Is the base branch itself green (#921)?
 
     Read-only on purpose: ``check_project`` announces a fresh breakage as a
@@ -387,9 +384,7 @@ async def _base_fact(
     )
 
 
-async def _dependency_fact(
-    db: aiosqlite.Connection, task_id: int
-) -> EvidenceFact:
+async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
     """What this task waits for, judged by DELIVERY rather than status (#484/#485)."""
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
@@ -429,7 +424,9 @@ async def build_evidence_packet(
         return None
     task = dict(row)
     generation = (
-        generation if generation is not None else (task.get("submission_generation") or 0)
+        generation
+        if generation is not None
+        else (task.get("submission_generation") or 0)
     )
     pinned_sha = (task.get("submission_sha") or "").strip()
     project_row = await repo.resolve_project_for_task(db, task_id)
