@@ -1292,6 +1292,19 @@ async def _sweep_review_dispatches(db) -> None:
         log.exception("review dispatch sweep failed")
 
 
+async def _sweep_steward_runs(db) -> None:
+    # Steward run orders (#1073): close slots that are over — overdue or
+    # overtaken by a human verdict — and order runs for submissions that are
+    # waiting for one. The dispatcher is the ONLY thing that places orders;
+    # the steward principal cannot (#1021). Off by default: STEWARD_MODE.
+    try:
+        from hub.services.steward_dispatch import sweep_steward_runs
+
+        await sweep_steward_runs(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("steward run sweep failed")
+
+
 async def _sweep_expired_claims(db) -> None:
     # Claim lease expiry (#417): a claim held past the lease without a
     # pair start is auto-released back to open so the task returns to
@@ -1805,6 +1818,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("autopilot_digests", _sweep_autopilot_digests),
     Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
     Sweep("review_dispatches", _sweep_review_dispatches),
+    Sweep("steward_runs", _sweep_steward_runs),
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),

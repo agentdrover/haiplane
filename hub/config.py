@@ -127,6 +127,26 @@ EMPTY_REVIEW_MIN_USAGE = int(env_get("EMPTY_REVIEW_MIN_USAGE", "200000"))
 # is proven. An unknown value reads as the strictest band, not as "off" —
 # a typo in a drop-in must not silently disable a safeguard.
 PROVEN_EMPTY_MAX_CLASS = env_get("PROVEN_EMPTY_MAX_CLASS", "r1")
+# Steward mode (#1073, epic #994): the global kill-switch for the steward
+# contour. off — the dispatcher orders nothing and today's human route stands
+# everywhere; shadow — runs are ordered and judged, but nothing they say
+# changes a task (#997); act — the judgement may be applied (#998). An
+# unrecognised value reads as `off`, the same way AUTO_APPROVE_MAX_CLASS
+# treats a typo: a mistyped drop-in must not switch a contour ON.
+STEWARD_MODE = env_get("STEWARD_MODE", "off")
+# Runs per project per UTC day (#1073, owner's decision 28.08.2026). The cap
+# is about predictability rather than money: hitting it escalates with the
+# code `daily_cap` and the task goes down today's human route — it never
+# means "checked and clean".
+STEWARD_DAILY_CAP = int(env_get("STEWARD_DAILY_CAP", "20"))
+# Minutes a steward run may hold its slot (#1073). review:client is a
+# human-owned slot with no deadline of its own, so a hung cloud agent would
+# otherwise never escalate — it would just sit there looking ordered.
+STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
+# The model the steward runs on (#994 §4): a third family, distinct from the
+# implementer's and from the reviewer's. Declared on the order so the
+# diversity rule has something to check before the run starts.
+STEWARD_MODEL = env_get("STEWARD_MODEL", "gpt-5.3-codex")
 # Cursor Cloud Agents API (#756): the server-side executor for cross-model
 # reviews. Empty key = the integration is off and every client method
 # degrades to None without a network call. The key comes from the Cursor
