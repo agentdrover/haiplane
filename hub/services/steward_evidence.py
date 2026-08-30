@@ -36,6 +36,7 @@ cannot name is a ground no judgement can cite.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -135,6 +136,8 @@ class EvidencePacket:
     generation: int
     brief: ReviewBrief | None
     facts: dict[str, EvidenceFact]
+    # Somebody else's words, kept apart from the hub's own facts (#1076).
+    quotes: tuple["QuotedText", ...] = ()
 
     def fact(self, source: str) -> EvidenceFact:
         _check_source(source)
@@ -142,6 +145,24 @@ class EvidencePacket:
 
     def absent_sources(self) -> list[str]:
         return [s for s in STEWARD_GROUND_SOURCES if self.facts[s].is_absent]
+
+    @property
+    def injection_suspected(self) -> bool:
+        """Did any quoted text try to give the judge orders (#1076)?
+
+        A field on the packet rather than a line inside a quote: the reaction
+        to it belongs to F4, and a flag buried in the text it describes would
+        have to be parsed back out by whoever reacts.
+        """
+        return any(q.suspected for q in self.quotes)
+
+    @property
+    def injection_signals(self) -> list[str]:
+        """Which signals fired, so the flag can be argued with."""
+        out: list[str] = []
+        for q in self.quotes:
+            out.extend(sig for sig in q.signals if sig not in out)
+        return out
 
 
 def _finding_dicts(raw: str | None) -> list[dict]:
@@ -450,7 +471,180 @@ async def build_evidence_packet(
         ]
     }
     return EvidencePacket(
-        task_id=task_id, generation=generation, brief=brief, facts=facts
+        task_id=task_id,
+        generation=generation,
+        brief=brief,
+        facts=facts,
+        quotes=_quotes(task, brief, facts["machine_review_report"]),
+    )
+
+
+def _quotes(
+    task: dict[str, Any], brief: ReviewBrief | None, report: EvidenceFact
+) -> tuple[QuotedText, ...]:
+    """Every text in the packet that somebody else wrote.
+
+    Three of them, and the list is exhaustive by construction rather than by
+    diligence: the packet carries no other free text. The statement and the
+    submission summary come with the task; finding texts come with the report
+    of this generation, and only that one — a stale report's prose is as
+    irrelevant here as its verdict (#1074).
+    """
+    quotes: list[QuotedText] = []
+    statement = (task.get("description") or "").strip()
+    if statement:
+        quotes.append(
+            quote(
+                QUOTE_TASK_STATEMENT,
+                task.get("assigned_agent") or task.get("source") or "",
+                statement,
+            )
+        )
+    summary = (getattr(brief, "latest_submission_summary", "") or "").strip()
+    if summary:
+        quotes.append(
+            quote(
+                QUOTE_SUBMISSION_SUMMARY,
+                (task.get("submission_model") or task.get("assigned_agent") or ""),
+                summary,
+            )
+        )
+    if report.is_present:
+        author = f"review #{report.value.get('review_id')}"
+        for finding in (
+            list(report.value.get("confirmed") or [])
+            + list(report.value.get("unresolved") or [])
+            + list(report.value.get("rejected") or [])
+        ):
+            text = " ".join(
+                str(finding.get(k, "")) for k in ("title", "detail", "why", "reason")
+            ).strip()
+            if text:
+                quotes.append(quote(QUOTE_REVIEW_FINDING, author, text))
+    return tuple(quotes)
+
+
+# ---------------------------------------------------------------------------
+# Text inputs are DATA (#1076)
+# ---------------------------------------------------------------------------
+#
+# The facts above are the hub's own. These are not: the task statement, the
+# submission summary and the findings of somebody else's review are all
+# written by other agents, and after #1075 closed every other channel they are
+# the last thing a stranger can still put in front of the judge.
+#
+# So they travel quoted — each with the source it came from and the author who
+# wrote it — and never merged into a field that reads like a hub fact. And a
+# text shaped like an ORDER to the judge raises a flag on the packet.
+#
+# The flag is deliberately cheap to be wrong about. A false positive costs an
+# escalation, which is today's behaviour: the human keeps the verdict. A miss
+# costs a judgement steered by whoever wrote the text. Given that asymmetry the
+# detector is a short, readable list of signals rather than a classifier —
+# after an incident somebody has to be able to say WHY it fired, and "the model
+# thought so" is not an answer.
+
+QUOTE_TASK_STATEMENT = "task_statement"
+QUOTE_SUBMISSION_SUMMARY = "submission_summary"
+QUOTE_REVIEW_FINDING = "review_finding"
+
+# Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
+# judge — not about tone, not about imperatives in general. A statement telling
+# a developer what to build is full of imperatives and means nothing here.
+_ADDRESSED_TO_JUDGE = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bstewards?\b",
+        r"\bстюард\w*",
+        r"\bсуд(ья|ье|ью|ьи)\b",
+        r"\breviewers?\b",
+        r"\bревьюер\w*",
+        r"\bassistant\b",
+        r"\bagents?\b",
+        r"\bагент\w*",
+    )
+)
+# Word boundaries are not cosmetic here: without them "ai" matches "detail"
+# and "agent" matches a repository name, so every second statement would look
+# addressed. A signal that fires on ordinary prose stops being a signal.
+_ORDERS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"ignore (all )?previous",
+        r"\bdisregard\b",
+        r"approve (this|it)\b",
+        r"do not escalate",
+        r"\bno findings\b",
+        r"\bигнорируй\b",
+        r"\bне эскалируй\b",
+        # Imperative only: "одобри" is an order, "одобрит" is a description of
+        # what some gate will do, and half the autopilot backlog says the latter.
+        r"\bодобри\b",
+        r"\bапрувни\b",
+        r"\bсчитай чистым\b",
+    )
+)
+# Text pretending to be the frame around the model rather than content inside
+# it. These stand alone: nothing legitimate in a task statement opens a system
+# prompt.
+_FRAME_MARKERS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^\s*system\s*:",
+        r"\bsystem prompt\b",
+        r"</?system>",
+        r"ignore your instructions",
+        r"new instructions\s*:",
+        r"\bтвои инструкции\b",
+        r"\bсистемный промпт\b",
+    )
+)
+
+SIGNAL_ORDER_TO_JUDGE = "order_addressed_to_judge"
+SIGNAL_FRAME_IMPERSONATION = "frame_impersonation"
+
+
+@dataclass(frozen=True)
+class QuotedText:
+    """Somebody else's words, kept as words."""
+
+    source: str
+    author: str
+    text: str
+    signals: tuple[str, ...] = ()
+
+    @property
+    def suspected(self) -> bool:
+        return bool(self.signals)
+
+
+def injection_signals(text: str) -> tuple[str, ...]:
+    """Which signals this text raises, in order. Empty means none.
+
+    Returns the CODES rather than a boolean so a refusal can say what fired:
+    a flag nobody can explain is a flag nobody will trust, and the threshold
+    is meant to be recalibrated from the shadow phase against real examples.
+    """
+    body = text or ""
+    if not body.strip():
+        return ()
+    found: list[str] = []
+    if any(marker.search(body) for marker in _FRAME_MARKERS):
+        found.append(SIGNAL_FRAME_IMPERSONATION)
+    addressed = any(word.search(body) for word in _ADDRESSED_TO_JUDGE)
+    ordered = any(order.search(body) for order in _ORDERS)
+    if addressed and ordered:
+        found.append(SIGNAL_ORDER_TO_JUDGE)
+    return tuple(found)
+
+
+def quote(source: str, author: str, text: str) -> QuotedText:
+    """Wrap somebody else's text so it cannot be mistaken for a hub fact."""
+    return QuotedText(
+        source=source,
+        author=author or "unknown",
+        text=text or "",
+        signals=injection_signals(text or ""),
     )
 
 
