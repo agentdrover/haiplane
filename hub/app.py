@@ -115,6 +115,7 @@ from hub.actionable_errors import (
     chat_pair_run_forbidden_detail,
     chat_pair_task_not_open_detail,
     human_only_gate_detail,
+    steward_run_required_detail,
 )
 from hub.auth import (
     AuthMiddleware,
@@ -1972,13 +1973,41 @@ async def api_ci_run_report(
 @app.get("/api/tasks/{task_id}/steward-evidence")
 async def api_steward_evidence(
     task_id: int,
-    _identity=Depends(require_permission("steward.evidence.read")),
+    request: Request,
+    generation: int | None = None,
+    identity=Depends(require_permission("steward.evidence.read")),
 ):
-    """Read the evidence pack. Assembly is #996; this task only names the door."""
-    raise HTTPException(
-        status.HTTP_501_NOT_IMPLEMENTED,
-        f"steward evidence pack for task {task_id} is assembled in #996",
+    """Hand out the evidence packet — but only under an open run (#1074/#1075).
+
+    The packet is the steward's ONLY input, so this door is the whole width of
+    that input. Two things guard it: the route allowlist (#1021), which keeps
+    every other source unreachable, and the run check here, which keeps the
+    packet itself from being readable at an arbitrary moment. A judge that can
+    fetch evidence whenever it likes is a judge nobody ordered.
+
+    The refusal is a 403 rather than a 404: whether the task exists is not
+    something an unordered reader gets to learn.
+    """
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    asked = (
+        generation
+        if generation is not None
+        else (dict(row).get("submission_generation") or 0 if row else 0)
     )
+    if identity.is_steward and not await services.steward_open_run_exists(
+        db, task_id, asked
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=steward_run_required_detail(task_id, asked),
+        )
+    if row is None:
+        raise HTTPException(404, "task not found")
+    packet = await services.build_evidence_packet(db, task_id, asked)
+    if packet is None:
+        raise HTTPException(404, "task not found")
+    return services.steward_packet_payload(packet)
 
 
 @app.post(

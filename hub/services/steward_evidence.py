@@ -42,6 +42,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
 from hub.services.ci_report import (
     VALIDATION_FAIL,
@@ -451,3 +452,70 @@ async def build_evidence_packet(
     return EvidencePacket(
         task_id=task_id, generation=generation, brief=brief, facts=facts
     )
+
+
+# ---------------------------------------------------------------------------
+# The door (#1075)
+# ---------------------------------------------------------------------------
+#
+# Assembling the packet and being ALLOWED to read it are different questions,
+# and the second one is the security boundary: the packet is the steward's
+# only input, so anything that hands it out without a reason widens the input
+# by exactly that path.
+
+STEWARD_RUNS_TABLE = "steward_runs"
+RUN_OPEN = "open"
+
+
+async def open_run_exists(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> bool:
+    """Is there an OPEN steward run ordered for this generation (#1073)?
+
+    The dispatcher that places those orders is #1073 and does not exist yet,
+    so today this is always False and the door stays shut. That is the right
+    default rather than a gap to be filled later: a packet handed out with no
+    run behind it is an input nobody asked for, and "closed until something
+    opens it" is the only state that cannot be wrong in the meantime.
+
+    Written against the table the dispatcher will own rather than a constant,
+    so ordering a run is what opens the door — not an edit here.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (STEWARD_RUNS_TABLE,),
+    )
+    if not rows:
+        return False
+    # The table name is spelled out rather than interpolated from the constant
+    # above: a formatted SQL string is a finding to every scanner that reads
+    # this file, and "the value is a constant" is an argument each reader has
+    # to re-derive. The constant still names the table for the existence probe.
+    open_runs = await fetchall(
+        db,
+        "SELECT 1 FROM steward_runs "
+        "WHERE task_id=? AND generation=? AND status=? LIMIT 1",
+        (task_id, generation, RUN_OPEN),
+    )
+    return bool(open_runs)
+
+
+def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
+    """The packet as JSON for the door. Shape mirrors the dataclasses."""
+    return {
+        "task_id": packet.task_id,
+        "generation": packet.generation,
+        "brief": packet.brief.model_dump(mode="json") if packet.brief else None,
+        "facts": {
+            source: {
+                "source": fact.source,
+                "state": fact.state,
+                "detail": fact.detail,
+                "reason": fact.reason,
+                "value": fact.value,
+            }
+            for source, fact in packet.facts.items()
+        },
+        "absent_sources": packet.absent_sources(),
+    }
