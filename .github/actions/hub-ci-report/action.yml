@@ -43,6 +43,18 @@ inputs:
       Absent ⇒ the report names no checks, which grants nothing.
     required: false
     default: ""
+  ran-commands:
+    description: >-
+      Which commands this job ALREADY executed, one "<outcome> <command>" per
+      line; outcome is pass | fail | skipped (GitHub's own step outcomes are
+      accepted). A validation command these prove is not executed a second
+      time — the reporter runs in the same job that just ran the suite, and
+      re-running it cost as much as the tests themselves (#1081). Unlike
+      `checks`, which names outcomes by step name, this names the command
+      itself: "lint=success" cannot be matched against a task's
+      "uv run ruff check hub tests". Absent ⇒ nothing is reused.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -55,6 +67,7 @@ runs:
         HEAD_SHA: ${{ inputs.head-sha }}
         HAIPLANE_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
         HAIPLANE_HUB_CI_CHECKS: ${{ inputs.checks }}
+        HAIPLANE_HUB_CI_RAN: ${{ inputs.ran-commands }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter
