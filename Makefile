@@ -11,7 +11,7 @@
 
 REPO ?= .
 
-.PHONY: setup hooks doctor test lint format check
+.PHONY: setup hooks doctor test lint format types budget security check
 
 # The first command in a fresh clone. Idempotent: safe to re-run.
 setup:
@@ -41,10 +41,29 @@ doctor:
 test:
 	uv run pytest -q -n auto
 
+# Зелёный lint при красном шаге CI «Check formatting» стоил трёх пересдач за
+# сутки (#1080): форматирование не входило в эту цель, поэтому неотформатиро-
+# ванный файл проходил `make lint` и падал только в CI. `format` остаётся
+# отдельной целью для тех, кому нужна только она.
 lint:
 	uv run ruff check hub tests
+	uv run ruff format --check hub tests
 
 format:
 	uv run ruff format --check hub tests
 
-check: lint format test
+types:
+	uv run mypy hub
+
+budget:
+	uv run python scripts/complexity_budget.py
+	uv run python scripts/mcp_catalog_budget.py
+
+security:
+	uv run bandit -r hub -q
+	uv run python scripts/secret_scan.py
+
+# Состав обязан покрывать статические шаги CI-джоба test: сверку держит
+# tests/test_local_checks_match_ci.py — новый шаг в CI без цели здесь красит
+# тесты, а не проходит незамеченным (#1080).
+check: lint types budget security test

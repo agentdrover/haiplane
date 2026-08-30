@@ -217,22 +217,10 @@ jobs:
       - name: Static security scan
         run: uv run bandit -r hub -q
 
+      # #1080: тело проверки живёт в scripts/secret_scan.py, потому что его
+      # зовёт и `make security` — определение одно, разъехаться нечему.
       - name: Secret scan
-        run: |
-          uv run detect-secrets scan \
-            --exclude-files '(^uv\.lock$|^\.pytest_cache/|^\.ruff_cache/)' \
-            > /tmp/detect-secrets.json
-          uv run python - <<'PY'
-          import json
-          from pathlib import Path
-
-          report = json.loads(Path("/tmp/detect-secrets.json").read_text())
-          results = report.get("results", {})
-          if results:
-              print(json.dumps(results, indent=2))
-              raise SystemExit(1)
-          print("No secrets detected")
-          PY
+        run: uv run python scripts/secret_scan.py
 
   deploy:
     name: Deploy to server
