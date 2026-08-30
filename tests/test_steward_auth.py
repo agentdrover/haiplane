@@ -182,16 +182,34 @@ async def test_steward_principal_denied_everything_else(hub):
     assert len(seen) >= 20, "the walk must actually enumerate routes, not a handful"
 
 
+def _gate_refused(resp) -> bool:
+    """Отказал ли ИМЕННО allowlist маршрутов (#1021), а не гейт за дверью.
+
+    С #1075 за разрешённой дверью стоит второй, содержательный гейт: пакет
+    выдаётся только под открытый заказ прогона. Его 403 несёт другую причину,
+    и путать их нельзя — «маршрута нет в списке» и «читать сейчас нечего» это
+    разные утверждения, и только первое отменяло бы allowlist.
+    """
+    if resp.status_code != 403:
+        return False
+    try:
+        detail = resp.json().get("detail")
+    except ValueError:
+        return True
+    reason = detail.get("reason") if isinstance(detail, dict) else None
+    return reason == "steward_gate_forbidden"
+
+
 @pytest.mark.asyncio
 async def test_steward_may_reach_the_two_allowed_ops(hub):
-    """AC-1 complementary: the two named ops are not 403."""
+    """AC-1 complementary: the two named ops are not refused BY THE ALLOWLIST."""
     task_id = await _make_task(hub)
     get_path = f"/api/tasks/{task_id}/steward-evidence"
     post_path = f"/api/tasks/{task_id}/steward-judgement"
     got = await hub.client.get(get_path, headers=hub.steward_auth)
-    assert got.status_code != 403, got.text
+    assert not _gate_refused(got), got.text
     posted = await hub.client.post(post_path, json={}, headers=hub.steward_auth)
-    assert posted.status_code != 403, posted.text
+    assert not _gate_refused(posted), posted.text
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +356,92 @@ def test_system_role_seed_grants_only_the_two_ops():
     _slug, _name, _desc, perms = slugs["steward"]
     assert set(perms).isdisjoint(FORBIDDEN_PERMS)
     assert len(perms) == 2
+
+
+# ---------------------------------------------------------------------------
+# #1075 — пакет как единственный вход
+# ---------------------------------------------------------------------------
+
+
+_LEAK_MARKERS = ("submission_sha", "findings", "acceptance_criteria", "content")
+
+
+async def test_evidence_packet_is_only_input(hub):
+    """#1075 AC-1: каналы вне пакета не отдают стюарду данные.
+
+    Перебор всех маршрутов уже есть выше (#1021 AC-1); здесь названы именно те
+    источники, ради закрытия которых пакет и объявлен единственным входом:
+    карточка задачи, её лента, чат пары, инбокс и список сессий. Проверяется не
+    только код ответа, но и то, что тело отказа не несёт данных: 403 с
+    выдержкой из задачи внутри был бы той же утечкой, только вежливой.
+    """
+    task_id = await _make_task(hub)
+    channels = [
+        ("GET", f"/api/tasks/{task_id}"),
+        ("GET", f"/api/tasks/{task_id}/updates"),
+        ("GET", f"/api/tasks/{task_id}/review-brief"),
+        ("GET", "/api/inbox"),
+        ("GET", "/api/sessions"),
+        ("POST", "/api/auth/chat-pair/issue"),
+    ]
+
+    for method, path in channels:
+        kwargs: dict = {"headers": hub.steward_auth}
+        if method == "POST":
+            kwargs["json"] = {}
+        resp = await hub.client.request(method, path, **kwargs)
+        assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
+        body = resp.text
+        for marker in _LEAK_MARKERS:
+            assert marker not in body, f"{method} {path} протёк через {marker}"
+
+
+async def test_packet_requires_an_open_run(hub):
+    """#1075 AC-2: без открытого заказа прогона пакет не выдаётся.
+
+    Заказы размещает хаб (#1073), и пока их нет — читать нечего. Судья,
+    который берёт доказательства когда захочет, — судья, которого никто не
+    звал; поэтому дверь закрыта по умолчанию, а не открыта до появления
+    диспетчера.
+    """
+    task_id = await _make_task(hub)
+
+    resp = await hub.client.get(
+        f"/api/tasks/{task_id}/steward-evidence", headers=hub.steward_auth
+    )
+
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "steward_run_required"
+    # Отказ не рассказывает о задаче — включая то, существует ли она вообще.
+    missing = await hub.client.get(
+        "/api/tasks/999999/steward-evidence", headers=hub.steward_auth
+    )
+    assert missing.status_code == 403, missing.text
+    assert missing.json()["detail"]["reason"] == "steward_run_required"
+
+
+async def test_allowlist_is_closed(hub):
+    """#1075 AC-3: отказ называет операцию и попадает в аудит.
+
+    Молчаливый 403 защищает не хуже, но разобрать по нему нечего: у стюарда
+    ровно две двери, поэтому запрос в третью — это либо ошибка прогона, либо
+    проба границы, и различить их можно только по записи.
+    """
+    from hub.db import fetchall
+
+    resp = await hub.client.get(
+        f"/api/tasks/{await _make_task(hub)}", headers=hub.steward_auth
+    )
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "steward_gate_forbidden"
+    assert "/api/tasks/" in detail["message"] and "GET" in detail["message"]
+
+    events = await fetchall(
+        hub.db,
+        "SELECT kind, payload FROM events WHERE kind='steward_route_refused'",
+    )
+    assert events, "отказ стюарду не дошёл до аудита"
+    assert any("/api/tasks/" in (dict(e)["payload"] or "") for e in events)

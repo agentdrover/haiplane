@@ -482,6 +482,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if _chat_pair_refused(identity, request.method, path):
                     return _chat_pair_forbidden(request.method, path)
                 if _steward_refused(identity, request.method, path):
+                    await _record_steward_refusal(request, request.method, path)
                     return _steward_forbidden(request.method, path)
                 request.state.user = identity.username
                 request.state.identity = identity
@@ -511,6 +512,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if _chat_pair_refused(identity, request.method, path):
                 return _chat_pair_forbidden(request.method, path)
             if _steward_refused(identity, request.method, path):
+                await _record_steward_refusal(request, request.method, path)
                 return _steward_forbidden(request.method, path)
             request.state.user = identity.username
             request.state.identity = identity
@@ -576,6 +578,34 @@ def _chat_pair_forbidden(method: str, path: str) -> Response:
         ),
         media_type="application/json",
     )
+
+
+async def _record_steward_refusal(request: Request, method: str, path: str) -> None:
+    """A refused steward reaches the audit, not just the caller (#1075).
+
+    The refusal itself is the interesting event: the steward has exactly two
+    doors, so a request at a third one is either a bug in the run or someone
+    probing the boundary, and both are only visible if the attempt is written
+    down. Best effort by contract — a failure to record must never turn a 403
+    into a 500, because refusing is the part that protects anything.
+    """
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        from hub import repository as repo
+        from hub.services.gate_events import STEWARD_ROUTE_REFUSED
+
+        identity = getattr(request.state, "identity", None)
+        await repo.insert_event(
+            db,
+            kind=STEWARD_ROUTE_REFUSED,
+            actor=getattr(identity, "username", "") or "steward",
+            payload={"method": method, "path": path},
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — the refusal stands regardless
+        log.warning("steward refusal not recorded: %s %s", method, path)
 
 
 def _steward_forbidden(method: str, path: str) -> Response:

@@ -20,6 +20,11 @@ from hub.services.delivery_state import (
 from hub.services.outcomes import answer_outcome, outcome_debt
 from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
+from hub.services.steward_evidence import (
+    build_evidence_packet,
+    open_run_exists as steward_open_run_exists,
+    packet_payload as steward_packet_payload,
+)
 from hub.services.steward_judgement import record_steward_judgement
 from hub.services.finding_identity import (
     finding_uid,
@@ -195,6 +200,9 @@ __all__ = [
     "record_category_check",
     "project_id_for",
     "record_finding_dispositions",
+    "build_evidence_packet",
+    "steward_open_run_exists",
+    "steward_packet_payload",
     "record_steward_judgement",
     "finding_uid",
     "finding_uids",

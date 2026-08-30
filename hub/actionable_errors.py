@@ -888,3 +888,27 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
             "status_code": status_code,
         }
     )
+
+
+def steward_run_required_detail(task_id: int, generation: int) -> dict[str, Any]:
+    """A steward asked for the evidence packet with no run ordered (#1075).
+
+    Says nothing about the task itself — whether it exists, what state it is
+    in — because an unordered reader is not entitled to that either.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_run_required",
+            "actor_hint": "none",
+            "message": (
+                "the evidence packet is handed out only under an open steward "
+                f"run; task {task_id} generation {generation} has none"
+            ),
+            "hint": (
+                "Runs are ordered by the hub itself, never by the steward. "
+                "Without an order there is nothing to judge and nothing to read."
+            ),
+            "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )
