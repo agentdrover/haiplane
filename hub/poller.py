@@ -1430,8 +1430,14 @@ async def _sweep_events_retention(db) -> None:
     # Events feed retention (#349): the feed is a notification
     # channel, not an archive — activity_log keeps the history.
     pruned = await repo.prune_events(db, keep_days=14)
+    # Коммит БЕЗУСЛОВНЫЙ. isolation_level="IMMEDIATE" (#1065) открывает
+    # транзакцию перед любым DML — и перед DELETE, которому нечего удалять.
+    # Коммит за условием оставлял её открытой, и поллер засыпал, держа
+    # write-лок ВСЕЙ базы: каждый писатель процесса получал "database is
+    # locked" до следующего чужого коммита. Наблюдалось на проде 30.08.2026
+    # (окна 16:27–16:58 UTC): чтения работали, записи падали 500.
+    await db.commit()
     if pruned:
-        await db.commit()
         log.info("Poll: pruned %d events older than 14 days", pruned)
 
 
@@ -1493,8 +1499,10 @@ async def _sweep_sessions_retention(db) -> None:
     pruned_sessions = await repo.prune_agent_sessions(
         db, keep_days=config.SESSION_RETENTION_DAYS
     )
+    # Коммит безусловный — см. _sweep_events_retention: пустой DELETE тоже
+    # открыл транзакцию, и её нельзя унести в сон.
+    await db.commit()
     if pruned_sessions:
-        await db.commit()
         log.info(
             "Poll: pruned %d agent sessions with no sign of life for %d days",
             pruned_sessions,
@@ -1743,8 +1751,9 @@ async def _sweep_messages_retention(db) -> None:
     pruned_messages = await repo.prune_agent_messages(
         db, keep_days=config.MESSAGE_RETENTION_DAYS
     )
+    # Коммит безусловный — см. _sweep_events_retention.
+    await db.commit()
     if pruned_messages:
-        await db.commit()
         log.info(
             "Poll: pruned %d messages older than %d days",
             pruned_messages,
@@ -1760,8 +1769,9 @@ async def _sweep_mcp_retention(db) -> None:
     pruned_calls = await repo.prune_mcp_call_events(
         db, keep_days=config.MCP_TELEMETRY_RETENTION_DAYS
     )
+    # Коммит безусловный — см. _sweep_events_retention.
+    await db.commit()
     if pruned_calls:
-        await db.commit()
         log.info(
             "Poll: pruned %d MCP call records older than %d days",
             pruned_calls,
@@ -1843,6 +1853,18 @@ async def _poll_once(db) -> None:
             await sweep.run(db)
         except Exception:
             log.exception("Poll: sweep %s failed — tick continues", sweep.name)
+    # Тик не имеет права закончиться внутри транзакции: соединение поллера
+    # живёт весь процесс, и открытая транзакция здесь — это write-лок всей
+    # базы на всё время сна (#1065 сделал это наблюдаемым: своё соединение,
+    # BEGIN IMMEDIATE перед любым DML). Коммиты — дело проходов; то, что
+    # доехало сюда незакоммиченным, никем не решено, и фиксировать это молча
+    # было бы хуже отката. Громкий откат: лок снят, забытый коммит назван.
+    if db.in_transaction:
+        log.warning(
+            "Poll: tick ended inside an open transaction — rolling back; "
+            "some sweep wrote without committing"
+        )
+        await db.rollback()
 
 
 def _extract_agent_summary(full_log: str | None) -> str:
