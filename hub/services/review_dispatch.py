@@ -978,15 +978,37 @@ async def maybe_dispatch_review(
 
     gh_repo = (dict(project).get("repo") or "").strip()
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
-    if not cursor_cloud.is_configured() or not gh_repo or not reviewer_token:
+    # #1083: three independent preconditions, and the message used to list all
+    # three with "or" whichever one fired. Two of them live in the process
+    # environment on the host, so the card could not say which — telling "no
+    # API key" from "the project has no repo" took an ssh to the box. This
+    # alert is the ONLY trace a failed dispatch leaves (best-effort means
+    # nothing else breaks), so it names what is missing and only that.
+    #
+    # Names, never values: what goes into a card is the setting's name, which
+    # is already written in the open in hub/config.py. No value, no prefix, no
+    # length — a length is a guess narrowed.
+    missing = [
+        label
+        for ok, label in (
+            (cursor_cloud.is_configured(), "CURSOR_API_KEY (ключ Cursor API)"),
+            (bool(gh_repo), "repo проекта (репозиторий на GitHub)"),
+            (
+                bool(reviewer_token),
+                "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)",
+            ),
+        )
+        if not ok
+    ]
+    if missing:
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации "
-            "(ключ Cursor API, репозиторий проекта или ревьюер-токен). "
-            "Вердикт остаётся человеку (#757).",
+            "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+            + "; ".join(missing)
+            + ". Вердикт остаётся человеку (#757).",
         )
         await db.commit()
         return False

@@ -135,6 +135,7 @@ async def _submitted(
     *,
     verdict_auto: bool = True,
     policy: dict | None = None,
+    repo_name: str = "mrPDA/spike-repo",
     areas: list[str] | None = None,
     risks: list[dict] | None = None,
     clear_risk_class: bool = False,
@@ -146,7 +147,7 @@ async def _submitted(
         db,
         slug=slug,
         name=slug.title(),
-        repo_name="mrPDA/spike-repo",
+        repo_name=repo_name,
         workspace_path="/tmp/ws",
     )
     if policy is not None:
@@ -376,6 +377,83 @@ async def test_dispatch_failure_degrades_visibly(
     ]
     assert len(alerts) == 1
     assert not await repo.list_active_review_dispatches(db)
+
+
+# --- Which setting is missing (#1083) ----------------------------------------
+#
+# Three independent preconditions guard the call, and they used to collapse
+# into one message listing all three with "or". Two of them live in the
+# process environment on the host, so the card could not say which one fired:
+# telling "no API key" from "the project has no repo" took an ssh. The alert
+# is the ONLY trace a failed dispatch leaves — best-effort means nothing else
+# breaks — so it has to name what is actually missing, and nothing else.
+
+
+async def _config_alerts(client: AsyncClient, task_id: int) -> list[str]:
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    return [
+        u["content"]
+        for u in body["updates"] or []
+        if "не хватает конфигурации" in u["content"]
+    ]
+
+
+async def test_missing_cursor_key_is_named_in_the_alert(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1083): only the API key is missing → the alert names it, stays
+    # silent about the two settings that are in place, and prints no value.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-k"}, "run": {"id": "run-k"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+
+    task_id = await _submitted(client, db, "spike-nokey")
+
+    alerts = await _config_alerts(client, task_id)
+    assert len(alerts) == 1, "one record per submission, as before"
+    text = alerts[0]
+    assert "CURSOR_API_KEY" in text
+    assert "CURSOR_REVIEWER_HUB_TOKEN" not in text, "the token is configured"
+    assert "repo проекта" not in text, "the project has its repo"
+    assert "reviewer-token" not in text, "no secret values in a card"
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review", "the submit must not suffer"
+    assert not recorder.calls, "nothing to call the reviewer with"
+
+
+async def test_alert_names_every_missing_setting(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1083): two of three missing → both named in ONE alert, and the
+    # third — the one that is fine — is not. Naming only the first found
+    # would send the operator back for a second round trip.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-2m"}, "run": {"id": "run-2m"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+
+    task_id = await _submitted(client, db, "spike-norepo", repo_name="")
+
+    alerts = await _config_alerts(client, task_id)
+    assert len(alerts) == 1
+    text = alerts[0]
+    assert "repo проекта" in text
+    assert "CURSOR_REVIEWER_HUB_TOKEN" in text
+    assert "CURSOR_API_KEY" not in text, "the key is configured"
+    assert not recorder.calls
+
+
+async def test_no_config_alert_when_everything_is_configured(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1083): the healthy path stays silent. A diagnostic that also
+    # fires when nothing is wrong is worse than the disjunction it replaced.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "run-ok"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-configured")
+
+    assert await _config_alerts(client, task_id) == []
+    assert len(recorder.calls) == 1, "the reviewer is called as before"
 
 
 # --- Review profiles (#807) --------------------------------------------------
