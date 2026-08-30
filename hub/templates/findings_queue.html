@@ -43,15 +43,25 @@
         <input type="hidden" name="review_id" value="{{ g.review_id }}">
         <ul class="task-review-findings">
             {% for item in g.findings %}
-            <li>[{{ item.f.severity }}{% if item.f.category %}/{{ item.f.category }}{% endif %}]
-                {% if item.f.file %}{{ item.f.file }}{% if item.f.start_line %}:{{ item.f.start_line }}{% elif item.f.line %}:{{ item.f.line }}{% endif %} — {% endif %}
-                {{ item.f.title }}
-                {% if item.f.detail %}
-                <div class="inbox-item-desc">{{ item.f.detail }}</div>
-                {% endif %}
+            {# #1050: сначала место и суть, деталь по запросу. Форма разбора
+               работала на одной задаче; на двух десятках отчётов она стала
+               лентой текста, где место находки ищут глазами. Порядок здесь и
+               есть предмет: чем находку опознают — в первой строке, прозу
+               ревьюера — под свёрткой. <li> остаётся без класса: тесты #1042
+               режут страницу ровно по этому тегу. #}
+            <li>
+                <div class="finding-head">
+                    <span class="finding-severity">[{{ item.f.severity }}{% if item.f.category %}/{{ item.f.category }}{% endif %}]</span>
+                    {% if item.f.file %}<code class="finding-place">{{ item.f.file }}{% if item.f.start_line %}:{{ item.f.start_line }}{% elif item.f.line %}:{{ item.f.line }}{% endif %}</code>{% endif %}
+                    <span class="finding-title">{{ item.f.title }}</span>
+                </div>
                 {% set ev = item.evidence %}
                 {% if ev %}
-                <span class="muted">
+                {# Доказательство касания (#1042) стоит ДО свёртки. Это факт, за
+                   которым в очередь и приходят; уехав под клик, он вернул бы
+                   ручную сверку коммитов, а «ответа нет» под свёрткой читалось
+                   бы как «не тронуто» — пустота вместо чистоты (#762). #}
+                <div class="finding-evidence muted">
                     {% if ev.outcome == 'touched' %}
                     Место тронуто после отчёта:{% for c in ev.commits %}
                     {{ c.short }} {{ c.subject }}{% endfor %}
@@ -60,14 +70,24 @@
                     {% else %}
                     Ответа нет: {{ ev.reason_label }}
                     {% endif %}
-                </span>
+                </div>
                 {% endif %}
-                <label><input type="radio" name="disposition-{{ item.index }}"
-                    value="fixed"> исправлено</label>
-                <label><input type="radio" name="disposition-{{ item.index }}"
-                    value="false_positive"> ложняк</label>
-                <label><input type="radio" name="disposition-{{ item.index }}"
-                    value="wont_fix"> неважно</label>
+                {% if item.f.detail %}
+                <details class="finding-detail">
+                    <summary>Деталь ревьюера</summary>
+                    <div class="inbox-item-desc">{{ item.f.detail }}</div>
+                </details>
+                {% endif %}
+                {# Радиокнопки по-прежнему без checked: факт показывает хаб,
+                   судьбу называет человек (#876). #}
+                <div class="finding-dispositions">
+                    <label><input type="radio" name="disposition-{{ item.index }}"
+                        value="fixed"> исправлено</label>
+                    <label><input type="radio" name="disposition-{{ item.index }}"
+                        value="false_positive"> ложняк</label>
+                    <label><input type="radio" name="disposition-{{ item.index }}"
+                        value="wont_fix"> неважно</label>
+                </div>
             </li>
             {% endfor %}
         </ul>

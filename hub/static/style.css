@@ -3785,3 +3785,46 @@ body.htmx-request .htmx-progress {
 .task-diff-line--anchorable:hover {
     outline: 1px solid var(--border-focus);
 }
+
+/* #1050: карточка находки в очереди /findings. Порядок полей — предмет
+   задачи, а не украшение: severity, место и заголовок опознают находку без
+   клика, факт касания (#1042) стоит рядом с ними, и только проза ревьюера
+   уходит под свёртку. */
+.task-review-findings > li {
+    padding: var(--sp-3) 0;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.task-review-findings > li:last-child { border-bottom: none; }
+
+.finding-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--sp-2);
+    font-size: 13px;
+}
+.finding-severity { color: var(--text-muted); font-size: 11px; }
+.finding-place { color: var(--text-secondary); font-size: 11px; }
+.finding-title { font-weight: 600; }
+
+.finding-evidence { font-size: 11px; margin-top: var(--sp-1); }
+
+.finding-detail { margin-top: var(--sp-1); }
+.finding-detail > summary {
+    list-style: none;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.finding-detail > summary::-webkit-details-marker { display: none; }
+.finding-detail > summary::before { content: "\25B6 "; font-size: 9px; }
+.finding-detail[open] > summary::before { content: "\25BC "; }
+.finding-detail > summary:hover { color: var(--text); }
+
+.finding-dispositions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-3);
+    margin-top: var(--sp-2);
+    font-size: 12px;
+}
