@@ -473,7 +473,7 @@ async def _current_generation(
     await repo.update_task(db, task_id, submission_generation=generation)
 
 
-async def test_queue_shows_each_finding_its_own_touch_fact(
+async def test_the_queue_shows_touch_evidence(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
     """#1042 AC-1: the queue names a touch of the place, not a fix.
@@ -531,7 +531,7 @@ async def test_queue_treats_deleting_the_place_as_a_touch(
     assert "Место не тронуто после отчёта" not in block
 
 
-async def test_queue_git_runs_once_per_report_not_per_finding(
+async def test_evidence_costs_one_git_pass_per_report(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
     """#1042 AC-2: the git COUNTER, not a story about how git ought to work.
@@ -579,7 +579,7 @@ async def test_queue_git_runs_once_per_report_not_per_finding(
     )
 
 
-async def test_queue_evidence_follows_uid_not_position(
+async def test_evidence_follows_the_finding_not_its_slot(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
     """#1042 AC-3: reversing the report must not swap the facts (#1007).
@@ -622,7 +622,7 @@ async def test_queue_evidence_follows_uid_not_position(
     assert "Место не тронуто после отчёта" not in touched
 
 
-async def test_queue_unknown_is_never_untouched(
+async def test_the_queue_survives_a_missing_clone(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
     """#1042 AC-4: no clone / missing sha stay «ответа нет», never untouched (#762)."""
@@ -657,7 +657,7 @@ async def test_queue_unknown_is_never_untouched(
     assert "Место не тронуто после отчёта" not in body
 
 
-async def test_queue_evidence_never_prechecks_a_radio(
+async def test_evidence_never_preselects_a_disposition(
     client: AsyncClient, db: aiosqlite.Connection, tmp_path: Path
 ):
     """#1042 AC-5: even a touched place is not a disposition (#876)."""
