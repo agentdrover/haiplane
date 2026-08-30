@@ -2691,6 +2691,10 @@ async def test_the_sweep_order_is_pinned(db):
         "autopilot_digests",
         "delivery_discrepancies",
         "review_dispatches",
+        # #1073: заказ и закрытие слотов стюарда идут сразу за расчётом
+        # ревью-диспатчей — обе работы про жизненный цикл прогонов, и обе
+        # обязаны отработать до того, как истекут клеймы и вердикты.
+        "steward_runs",
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",

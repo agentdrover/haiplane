@@ -11,6 +11,7 @@ prose to a shell produces an exit code that looks like the work is broken.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -304,3 +305,199 @@ def test_ci_workflow_reports_through_the_action():
     assert "run: uv run python scripts/ci_report_to_hub.py" not in workflow, (
         "the old inline path would be a second reporter to keep in step"
     )
+
+
+# ---- #1081: what the job already ran is not run a second time ----------------
+
+
+def test_validation_reuses_the_jobs_own_test_outcome(script, monkeypatch):
+    """AC-1: the suite the job just ran is not run again by the reporter.
+
+    The card declares ``uv run pytest -q``; the job ran ``uv run pytest -q -n
+    auto``. Different strings, same assertion about the same tree — the worker
+    count does not change which tests run. Before this, the reporter executed
+    the suite a second time and the step cost as much as the Test step itself.
+    """
+    ran = {"uv run pytest -q -n auto": "pass", "uv run mypy hub": "pass"}
+
+    def explode(*a, **k):  # noqa: ARG001 - reuse must not reach the shell
+        raise AssertionError("re-ran a command the job had already run")
+
+    # monkeypatch, не присваивание: script.subprocess — ЭТОТ ЖЕ глобальный
+    # модуль subprocess, и голое присваивание протекает во все следующие
+    # тесты сессии (измерено: оно превращало `false` в соседнем тесте в
+    # no-op, и тот падал только при запуске файла целиком).
+    monkeypatch.setattr(script.subprocess, "run", explode)
+    status, log_tail, reason = script.run_validation(
+        ["uv run pytest -q", "uv run mypy hub"], ran
+    )
+
+    assert status == "pass", reason
+    assert "uv run pytest -q -n auto" in log_tail
+
+
+def test_a_command_the_job_did_not_run_is_still_executed(script):
+    """AC-2: the saving must never become a skipped check.
+
+    A narrower selection is NOT the same assertion: a positional argument picks
+    a subset, so a green whole-suite run proves nothing about it. It runs, and
+    when it fails the validation still fails.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+
+    status, _log, reason = script.run_validation(["false"], ran)
+    assert status == "fail", "a command the job never ran must still be executed"
+    assert "false" in reason
+
+    narrower = "uv run pytest -q tests/test_ci_report_script.py"
+    assert script.already_proven(narrower, ran) is None, (
+        "a positional argument narrows the run — the suite's outcome does not "
+        "prove it, and assuming otherwise is how validation becomes fiction"
+    )
+
+
+def test_reused_validation_says_so_in_the_log(script, capsys):
+    """AC-3: silent reuse is indistinguishable from a skipped check."""
+    ran = {"uv run ruff check hub tests": "pass"}
+    script.run_validation(["uv run ruff check hub tests"], ran)
+
+    printed = capsys.readouterr().out
+    assert "not re-run" in printed
+    assert "uv run ruff check hub tests" in printed
+
+
+def test_only_whitelisted_flags_may_differ(script):
+    """An unrecognised flag is not proven harmless, so it is not reused."""
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for narrower in (
+        "uv run pytest -q -k auth",  # -k selects
+        "uv run pytest -q -m slow",  # -m selects
+        "uv run pytest -q --ignore=tests/test_web.py",  # --ignore selects
+        "uv run pytest -q --deselect tests/x.py::t",
+        "uv run pytest -q --maxfail=1",
+        "uv run pytest -q --lf",
+    ):
+        assert script.already_proven(narrower, ran) is None, narrower
+    for same in ("uv run pytest -q", "uv run pytest -n 4 -v", "uv run pytest"):
+        assert script.already_proven(same, ran) is not None, same
+
+
+def test_a_failed_outcome_is_reused_as_a_failure(script):
+    """Reuse carries the outcome, not an assumption that it was green."""
+    ran = {"uv run mypy hub": "fail"}
+    status, _log, reason = script.run_validation(["uv run mypy hub"], ran)
+    assert status == "fail"
+    assert "uv run mypy hub" in reason
+
+
+def test_ran_commands_parsing_drops_what_it_cannot_read(script):
+    """Silence in, silence out — an outcome-less line grants nothing."""
+    parsed = script.parse_ran_commands(
+        "success uv run mypy hub\n"
+        "\n"  # blank
+        " uv run ruff check hub tests\n"  # step never ran: empty outcome
+        "banana uv run something\n"  # unrecognised outcome
+        "failure uv run pytest -q -n auto\n"
+    )
+    assert parsed == {"uv run mypy hub": "pass", "uv run pytest -q -n auto": "fail"}
+    assert script.parse_ran_commands("") == {}
+
+
+def test_the_workflow_hands_the_reporter_what_it_ran():
+    """The commands passed to the action must match the steps that ran them.
+
+    A drifted copy stops matching silently and the duplicate run returns, so
+    the pairing is asserted rather than trusted to review.
+    """
+    import yaml
+
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []]
+    by_id = {s.get("id"): s for s in steps if s.get("id")}
+    reporters = [s for s in steps if "hub-ci-report" in str(s.get("uses", ""))]
+    assert reporters, "no hub-ci-report step in ci.yml"
+
+    # В workflow выражения ещё НЕ вычислены, а внутри выражения есть свои
+    # пробелы — деление по первому прочло бы "${{" как исход. В рантайме
+    # репортер получает уже вычисленное значение ("success uv run ..."), и
+    # поэтому parse_ran_commands делить по первому пробелу может, а этот тест
+    # не может.
+    pairing = re.compile(r"^\$\{\{\s*steps\.(\w+)\.outcome\s*\}\}\s+(.+)$")
+    declared = {}
+    for line in (reporters[0]["with"].get("ran-commands") or "").splitlines():
+        match = pairing.match(line.strip())
+        if match:
+            declared[match.group(2).strip()] = match.group(1)
+    assert declared, "the reporter is told nothing about what this job ran"
+
+    for command, step_id in declared.items():
+        assert step_id in by_id, f"steps.{step_id} names no step in this workflow"
+        assert by_id[step_id]["run"].strip() == command, (
+            f"step {step_id!r} runs {by_id[step_id]['run'].strip()!r} but the "
+            f"reporter is told it ran {command!r} — a drifted copy stops "
+            "matching and the duplicate run comes back"
+        )
+
+
+def test_plugin_flags_are_never_treated_as_non_selecting(script):
+    """``-p`` loads and DISABLES plugins, and one of them is the collector.
+
+    Measured against real pytest in this repository: ``--collect-only -q``
+    reports 2794 tests, and ``-p no:python`` reports none at all — the built-in
+    ``python`` plugin is what collects Python tests. Whitelisting ``-p`` as
+    "does not select" therefore declared a command that runs NOTHING proven by
+    the job's green suite. Every other whitelisted flag was checked the same
+    way, by collection count rather than by reading the docs.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in (
+        "uv run pytest -q -p no:python",
+        "uv run pytest -q -p no:cacheprovider",
+        "uv run pytest -q -p my_plugin",
+        # Attached form: the one that actually slipped through while -p was
+        # whitelisted, because "-p=..." carries its value and never becomes a
+        # positional. pytest itself rejects it (ImportError), so reusing the
+        # suite's pass reports a certain failure as green.
+        "uv run pytest -q -p=no:python",
+    ):
+        assert script.already_proven(command, ran) is None, command
+    # Pinned structurally as well, and not out of pedantry: the loop above
+    # passes even with -p whitelisted for every SPACED form, because a spaced
+    # value falls through to "positional" and differs anyway. Only the attached
+    # form and this assertion actually hold the line — a mutation restoring -p
+    # to the set has to fail something.
+    assert "-p" not in script._NON_SELECTING_FLAGS, (
+        "-p disables plugins, and `-p no:python` collects 0 of 2794 tests; "
+        "treating it as non-selecting declares a command that runs nothing "
+        "proven by the job's green suite"
+    )
+
+
+def test_a_dangling_flag_does_not_swallow_a_test_path(script):
+    """A path eaten as a flag's value turns a narrowed run into "whole suite".
+
+    ``uv run pytest -n tests/test_web.py`` is a card with a dangling ``-n``.
+    Real pytest exits 4 on it. Consuming the path as the value of ``-n`` left
+    the selection empty, keyed the command as the entire suite and declared it
+    proven — reporting a certain failure as a pass, which is the one direction
+    this mechanism must never be wrong in.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in (
+        "uv run pytest -n tests/test_web.py",
+        "uv run pytest --tb tests/test_web.py",
+        "uv run pytest --color tests/test_web.py",
+        "uv run pytest --dist tests/x.py::test_y",
+    ):
+        assert script.already_proven(command, ran) is None, command
+    # A real value is still consumed: worker count does not select anything.
+    assert script.already_proven("uv run pytest -n 4 -v", ran) is not None
+    assert script.already_proven("uv run pytest --tb=short -q", ran) is not None
+
+
+def test_a_different_launcher_is_a_different_command(script):
+    """The prefix up to ``pytest`` is part of the key, wrapper flags included."""
+    ran = {"uv run pytest -q -n auto": "pass"}
+    for command in ("python -m pytest -q", "uv run --no-cache pytest -q", "pytest -q"):
+        assert script.already_proven(command, ran) is None, command
