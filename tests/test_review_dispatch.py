@@ -450,32 +450,75 @@ async def test_alert_names_every_missing_setting(
     assert not recorder.calls
 
 
-async def test_each_label_belongs_to_its_own_setting(
+_ALERT_HEAD = "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+_ALERT_TAIL = " Вердикт остаётся человеку (#757)."
+
+# Every combination of the three preconditions, with the WHOLE text the card
+# must carry. Written out, not assembled from the labels: an expectation built
+# by the same join the service uses would agree with any join the service
+# grows, including a wrong one.
+#
+# Exhaustive on purpose. Two review rounds in a row found the same shape of
+# hole — a combination nobody tested, where a short-circuit or a swap names
+# the wrong setting and every test stays green. Picking one more pair would
+# have invited a third round; seven rows leave no combination to find.
+_MISSING_COMBINATIONS: tuple[tuple[bool, bool, bool, str], ...] = (
+    # (key configured, repo set, token set) -> exact alert
+    (False, True, True, "CURSOR_API_KEY (ключ Cursor API)."),
+    (True, False, True, "repo проекта (репозиторий на GitHub)."),
+    (True, True, False, "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)."),
+    (
+        False,
+        False,
+        True,
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub).",
+    ),
+    (
+        False,
+        True,
+        False,
+        "CURSOR_API_KEY (ключ Cursor API); CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+    (
+        True,
+        False,
+        False,
+        "repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+    (
+        False,
+        False,
+        False,
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+)
+
+
+async def test_every_combination_names_exactly_what_is_missing(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-2 (#1083), the half a conjunction cannot hold: when two settings are
-    # missing TOGETHER, swapping their labels leaves both strings in the text
-    # and every assertion above stays green — while the operator is sent to
-    # fix the setting that was fine. Each label has to be pinned to its own
-    # condition, one missing setting at a time.
-    recorder = _DispatchRecorder({"agent": {"id": "bc-p"}, "run": {"id": "run-p"}})
-    _wire(monkeypatch, recorder)
-
-    only_repo = await _submitted(client, db, "spike-only-repo", repo_name="")
-    assert (await _config_alerts(client, only_repo))[0] == (
-        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
-        "repo проекта (репозиторий на GitHub). "
-        "Вердикт остаётся человеку (#757)."
-    )
-
-    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
-    only_token = await _submitted(client, db, "spike-only-token")
-    assert (await _config_alerts(client, only_token))[0] == (
-        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
-        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера). "
-        "Вердикт остаётся человеку (#757)."
-    )
-    assert not recorder.calls
+    # AC-1 и AC-2 (#1083) на всех семи сочетаниях сразу. Одно сочетание на
+    # раунд ревью — это способ никогда не закончить: пропущенная пара пускает
+    # и замыкание на первом условии, и перестановку ярлыков.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "run-x"}})
+    for index, (key_ok, repo_ok, token_ok, tail) in enumerate(_MISSING_COMBINATIONS):
+        _wire(monkeypatch, recorder)
+        if not key_ok:
+            monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+        if not token_ok:
+            monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+        task_id = await _submitted(
+            client,
+            db,
+            f"spike-combo-{index}",
+            repo_name="mrPDA/spike-repo" if repo_ok else "",
+        )
+        alerts = await _config_alerts(client, task_id)
+        assert len(alerts) == 1, f"one record per submission, combination {index}"
+        assert alerts[0] == _ALERT_HEAD + tail + _ALERT_TAIL, f"combination {index}"
+    assert not recorder.calls, "no combination here has everything it needs"
 
 
 async def test_no_config_alert_when_everything_is_configured(
