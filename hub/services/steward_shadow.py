@@ -51,10 +51,34 @@ REFUSED_SAME_FAMILY_REVIEWER = "same_family_as_reviewer"
 REFUSED_UNDECLARED_MODEL = "undeclared_model"
 REFUSED_RUN_FAILED = "run_failed"
 REFUSED_NOT_CONFIGURED = "not_configured"
+REFUSED_NO_IDENTITY_CHANNEL = "no_identity_channel"
 
 EVENT_RUN_STARTED = "steward_run_started"
+EVENT_RUN_REFUSED = "steward_run_refused"
 
 RUN_REFUSED = "refused"
+
+# The lock is taken BEFORE the provider is called and holds this marker until
+# the real agent id replaces it. Anything else would pay first and claim
+# second — the inversion of claim_arbiter_dispatch (#421).
+PENDING_PREFIX = "pending:"
+
+
+def identity_delivery(task_id: int, generation: int) -> str | None:
+    """How the run will authenticate to the hub, or None if it cannot.
+
+    Not a formality. Cursor drops ``mcpServers`` on the way into a cloud run
+    (#1084), so a token placed in those headers never arrives: the run starts,
+    reaches the door with no identity, reads nothing and dies at its deadline
+    — a paid nothing. For the REVIEWER that was solved by minting a one-time,
+    task-bound code and putting it in the prompt; the steward needs the same,
+    and ``chat_pair`` has no ``steward`` kind yet.
+
+    Until it does, this returns None and the run is refused as unconfigured —
+    which under the retry rule below leaves the order open rather than burning
+    it. Better an order waiting for a channel than an agent paid to be mute.
+    """
+    return None
 
 
 async def reviewer_model(
@@ -75,13 +99,20 @@ async def reviewer_model(
     )
     if rows:
         return (dict(rows[0]).get("model") or "").strip()
-    review = await repo.get_latest_machine_review(db, task_id)
-    if review is None:
+    # The report OF THIS GENERATION, not the newest one on the task. The
+    # latest-of-task read answered "" whenever a later generation had its own
+    # report — and "" is a refusal, so a resubmission silently killed the
+    # older order's only chance to run.
+    reports = await fetchall(
+        db,
+        "SELECT model FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, generation),
+    )
+    if not reports:
         return ""
-    row = dict(review)
-    if (row.get("submission_generation") or 0) != generation:
-        return ""
-    return (row.get("model") or "").strip()
+    return (dict(reports[0]).get("model") or "").strip()
 
 
 def family_refusal(
@@ -119,7 +150,7 @@ def family_refusal(
     return None
 
 
-def _prompt(task_id: int, generation: int, hub_base: str) -> str:
+def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
     """What the run is told. Short on purpose: the packet IS the input.
 
     No diff, no repository tour, no instructions to investigate — the steward
@@ -141,7 +172,7 @@ def _prompt(task_id: int, generation: int, hub_base: str) -> str:
         "grounds из закрытого множества источников, closures на каждую "
         "confirmed-находку при approve, escalate_reason при эскалации.\n\n"
         "Сомневаешься — эскалируй: эскалация возвращает решение человеку, то "
-        "есть к сегодняшнему поведению, и стоит дёшево."
+        "есть к сегодняшнему поведению, и стоит дёшево.\n\n" + delivery
     )
 
 
@@ -165,8 +196,49 @@ async def start_due_runs(db: aiosqlite.Connection) -> int:
     return started
 
 
+async def _refuse_transiently(
+    db: aiosqlite.Connection, order: dict, code: str, detail: str
+) -> None:
+    """Say no WITHOUT burning the order (finding of review #172).
+
+    UNIQUE(task_id, generation, kind) means an order closed for any reason can
+    never be placed again for that generation. So a network blip, a missing
+    key in this tick, or a provider 5xx used to end the judgement of that
+    submission permanently — one flicker of a beta API deciding the fate of a
+    review. Those are retryable: the slot stays open, the reason goes to the
+    feed, and the next tick tries again.
+
+    A same-family refusal is different and still closes the order: retrying it
+    would refuse identically every time.
+    """
+    await db.execute(
+        "UPDATE steward_runs SET agent_id='' WHERE id=? AND agent_id LIKE ?",
+        (order["id"], f"{PENDING_PREFIX}%"),
+    )
+    await repo.insert_event(
+        db,
+        kind=EVENT_RUN_REFUSED,
+        task_id=order["task_id"],
+        actor="hub",
+        payload={
+            "reason": code,
+            "detail": detail,
+            "run_id": order["id"],
+            "retryable": True,
+        },
+    )
+    await db.commit()
+    log.info("steward run not started (retryable): %s — %s", code, detail)
+
+
 async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
-    """Start one run, or refuse this order with a named reason."""
+    """Start one run for this order, or refuse it with a named reason.
+
+    Order of operations is the point. Everything that can refuse for free
+    happens first; then the slot is CLAIMED and committed; only then is the
+    provider called. Paying before claiming is how two ticks buy two agents
+    and abandon one of them — with a live token and an open door (#1075).
+    """
     task_id = order["task_id"]
     generation = order["generation"]
     task_row = await repo.get_task(db, task_id)
@@ -180,13 +252,21 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     reviewer = await reviewer_model(db, task_id, generation)
     refusal = family_refusal(steward, implementer, reviewer)
     if refusal is not None:
+        # NOT retryable: the same three declarations would refuse again on
+        # every tick, and an order that can never start should not keep a
+        # slot open pretending otherwise.
         code, detail = refusal
         await repo.insert_event(
             db,
-            kind="steward_run_refused",
+            kind=EVENT_RUN_REFUSED,
             task_id=task_id,
             actor="hub",
-            payload={"reason": code, "detail": detail, "run_id": order["id"]},
+            payload={
+                "reason": code,
+                "detail": detail,
+                "run_id": order["id"],
+                "retryable": False,
+            },
         )
         await close_run(db, order, RUN_REFUSED, f"{code}: {detail}")
         return False
@@ -204,15 +284,40 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         if not ok
     ]
     if missing:
-        # Names, never values (#1083): the setting's name is already public in
-        # hub/config.py, its value is not, and a length is a guess narrowed.
-        await close_run(
+        # Names, never values (#1083). Retryable: a key can be set on the host
+        # a minute from now, and this submission still deserves its judgement.
+        await _refuse_transiently(
             db,
             order,
-            RUN_REFUSED,
-            f"{REFUSED_NOT_CONFIGURED}: не хватает — " + "; ".join(missing),
+            REFUSED_NOT_CONFIGURED,
+            "не хватает — " + "; ".join(missing),
         )
         return False
+
+    delivery = identity_delivery(task_id, generation)
+    if delivery is None:
+        await _refuse_transiently(
+            db,
+            order,
+            REFUSED_NO_IDENTITY_CHANNEL,
+            "прогону нечем аутентифицироваться у хаба: Cursor отбрасывает "
+            "mcpServers (#1084), а одноразового кода для стюарда пока нет — "
+            "платить за немого агента незачем",
+        )
+        return False
+
+    # THE claim. Committed before a single rouble is spent, so a racing tick
+    # sees the slot taken and never reaches the provider at all.
+    claim = f"{PENDING_PREFIX}{order['id']}"
+    cursor = await db.execute(
+        "UPDATE steward_runs SET agent_id=? WHERE id=? AND agent_id='' AND status=?",
+        (claim, order["id"], RUN_OPEN),
+    )
+    if cursor.rowcount != 1:
+        await db.rollback()
+        log.info("steward run %s already claimed — not starting", order["id"])
+        return False
+    await db.commit()
 
     from hub.services.review_dispatch import instance_base_url
 
@@ -221,35 +326,29 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=(task.get("branch") or "").strip() or "HEAD",
         model_id=steward,
-        prompt_text=_prompt(task_id, generation, hub_base),
+        prompt_text=_prompt(task_id, generation, hub_base, delivery),
         hub_mcp_url=f"{hub_base}/mcp",
         reviewer_token=token,
     )
     agent_id = ((created or {}).get("agent") or {}).get("id") or ""
     if not agent_id:
-        await close_run(
+        # The provider did not take it. Release the claim rather than close
+        # the order: a beta API blinking must not cost this submission its
+        # only judgement.
+        await _refuse_transiently(
             db,
             order,
-            RUN_REFUSED,
-            f"{REFUSED_RUN_FAILED}: Cloud Agents API не принял запрос",
+            REFUSED_RUN_FAILED,
+            "Cloud Agents API не принял запрос — заказ остаётся открытым, "
+            "следующий тик попробует снова",
         )
         return False
     run_id = ((created or {}).get("run") or {}).get("id") or ""
 
-    # The lock is written under the same condition it guards: an order that
-    # already carries an agent_id is not overwritten, so two ticks racing here
-    # leave one run rather than two.
-    cursor = await db.execute(
-        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=? AND agent_id=''",
-        (agent_id, run_id, order["id"]),
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=? AND agent_id=?",
+        (agent_id, run_id, order["id"], claim),
     )
-    if cursor.rowcount != 1:
-        await db.commit()
-        log.warning(
-            "steward run %s already had an agent — second start ignored",
-            order["id"],
-        )
-        return False
     await repo.insert_event(
         db,
         kind=EVENT_RUN_STARTED,

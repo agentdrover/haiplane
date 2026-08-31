@@ -16,6 +16,7 @@ import pytest
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import steward_shadow as sh
 from hub.services.steward_dispatch import RUN_OPEN, order_run
 from hub.services.steward_shadow import (
     EVENT_RUN_STARTED,
@@ -29,6 +30,18 @@ from hub.services.steward_shadow import (
 )
 
 _CREATED = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
+
+# Канал доставки идентичности появится своей задачей (#1084 для ревьюера —
+# отдельная работа); здесь он подменяется, чтобы тесты проверяли СТАРТ, а не
+# отсутствие канала. Отсутствие канала проверяется своим тестом ниже.
+_DELIVERY = "код доступа: ABC-123"
+
+
+@pytest.fixture
+def with_identity(monkeypatch):
+    monkeypatch.setattr(
+        sh, "identity_delivery", lambda _task_id, _generation: _DELIVERY
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -106,7 +119,7 @@ async def _events(db: aiosqlite.Connection, kind: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def test_open_order_starts_one_run(db: aiosqlite.Connection):
+async def test_open_order_starts_one_run(db: aiosqlite.Connection, with_identity):
     """#1105 AC-1: открытый заказ превращается в прогон, и это видно в фиде.
 
     До этой задачи заказы доживали до дедлайна и закрывались run_timeout —
@@ -197,7 +210,9 @@ async def test_missing_declaration_is_not_diversity(db: aiosqlite.Connection):
     )
 
 
-async def test_run_starts_at_most_once_per_order(db: aiosqlite.Connection):
+async def test_run_starts_at_most_once_per_order(
+    db: aiosqlite.Connection, with_identity
+):
     """#1105 AC-4: повторный тик не плодит второй прогон.
 
     Поллер тикает каждые тридцать секунд, пока заказ стоит, так что «стартуй
@@ -230,8 +245,121 @@ async def test_run_starts_at_most_once_per_order(db: aiosqlite.Connection):
     ) as raced:
         assert await start_run(db, stale) is False
 
-    assert raced.await_count == 1, "провайдер вызван, но заказ уже занят"
+    # Находка ревью #172: раньше проигравший ОПЛАЧИВАЛ второго агента и
+    # бросал его — с живым токеном и открытой дверью. Замок берётся до
+    # обращения к провайдеру, поэтому проигравший до него не доходит.
+    assert raced.await_count == 0, "проигравший не должен платить провайдеру"
     after = await _runs(db, task_id)
     assert len(after) == 1
     assert after[0]["agent_id"] == "agent-1", "первый старт не перезаписан"
     assert len(await _events(db, EVENT_RUN_STARTED)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #1 (grok-4.6, отчёт 172)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_transient_failure_leaves_the_order_open(
+    db: aiosqlite.Connection, with_identity
+):
+    """Моргание провайдера не сжигает единственный шанс этой сдачи.
+
+    UNIQUE(task_id, generation, kind) значит, что закрытый заказ уже никогда
+    не будет размещён заново. Значит закрывать его на сетевой ошибке —
+    решать судьбу ревью подбрасыванием монетки от беты Cursor.
+    """
+    project_id = await _project(db, "shadow-transient")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_review_agent",
+        new=AsyncMock(return_value=None),
+    ):
+        assert await start_due_runs(db) == 0
+
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN, "заказ обязан остаться открытым"
+    assert run["agent_id"] == "", "замок снят — следующий тик попробует снова"
+    refusals = await _events(db, "steward_run_refused")
+    assert refusals and json.loads(refusals[-1]["payload"])["retryable"] is True
+
+    # И следующий тик действительно стартует, когда провайдер ожил.
+    with patch(
+        "hub.integrations.cursor_cloud.create_review_agent",
+        new=AsyncMock(return_value=_CREATED),
+    ):
+        assert await start_due_runs(db) == 1
+    assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
+
+
+async def test_missing_config_does_not_burn_the_slot(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Не настроено сейчас — не значит «не будет настроено никогда».
+
+    Ключ появляется на хосте drop-in'ом за минуту; заказ, сожжённый в эту
+    минуту, не вернуть.
+    """
+    monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", "")
+    project_id = await _project(db, "shadow-unconfigured")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_review_agent",
+        new=AsyncMock(return_value=_CREATED),
+    ) as started:
+        assert await start_due_runs(db) == 0
+
+    assert started.await_count == 0
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == ""
+
+
+async def test_no_identity_channel_means_no_paid_run(db: aiosqlite.Connection):
+    """Без канала доставки идентичности прогон не запускается вовсе.
+
+    Cursor отбрасывает mcpServers (#1084), поэтому агент, стартовавший без
+    одноразового кода, не прочитает пакет и не сдаст суждение — он просто
+    доживёт до дедлайна. Платить за немого агента незачем, и это отказ, а не
+    оптимизм.
+    """
+    project_id = await _project(db, "shadow-no-identity")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_review_agent",
+        new=AsyncMock(return_value=_CREATED),
+    ) as started:
+        assert await start_due_runs(db) == 0
+
+    assert started.await_count == 0, "провайдер не вызывается без канала"
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN, "заказ ждёт канала, а не сгорает"
+    refusals = await _events(db, "steward_run_refused")
+    assert json.loads(refusals[-1]["payload"])["reason"] == "no_identity_channel"
+
+
+async def test_reviewer_model_reads_this_generation(db: aiosqlite.Connection):
+    """Декларация ревьюера берётся по генерации заказа, а не по последней.
+
+    Пересдача создаёт более новый отчёт; заказ прошлой генерации остаётся
+    открытым. Чтение latest-of-task возвращало пустую строку — то есть
+    «модель не объявлена» — и навсегда закрывало заказ, у которого своя
+    декларация лежала в той же таблице.
+    """
+    project_id = await _project(db, "shadow-generation")
+    task_id = await _task(db, project_id, reviewer="")
+    await repo.insert_machine_review(
+        db, task_id=task_id, submission_generation=1, model="grok-4.6", incomplete=False
+    )
+    await repo.insert_machine_review(
+        db, task_id=task_id, submission_generation=2, model="", incomplete=False
+    )
+    await db.commit()
+
+    assert await sh.reviewer_model(db, task_id, 1) == "grok-4.6"
