@@ -1,0 +1,550 @@
+"""GitVerse как форж: REST-клиент к api.gitverse.ru (#1115, эпик #1112).
+
+CLI вроде ``gh`` у GitVerse нет — единственный вход это HTTP API. Форма
+путей повторяет GitHub (``/repos/{owner}/{repo}/pulls``), но три вещи
+отличаются, и каждая уже стоила бы часа отладки:
+
+1. Заголовок версии обязателен на КАЖДОМ запросе. Без него сервер отвечает
+   400 с пустым телом — ответ, неотличимый от проблемы с авторизацией.
+   Поэтому он ставится в одном месте и приделан к транспорту, а не к
+   вызывающим: забыть его в одном методе из семнадцати слишком легко.
+2. Токен нужен и для ПУБЛИЧНЫХ репозиториев: анонимного режима нет (401).
+3. Мержа в публичном API нет вовсе. Есть только ``GET .../merge`` со
+   смыслом «влит ли уже» (204 да / 404 нет). Сам мерж — задача #1116.
+
+Проверено живыми запросами 31.08.2026 против настоящего репозитория.
+Документация: https://gitverse.ru/docs/developers/public-api
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import httpx
+
+from hub import config
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    MergeabilityOutcome,
+)
+
+log = logging.getLogger(__name__)
+
+_TIMEOUT = 30.0
+#: Сколько раз повторить запрос, который сервер попросил повторить.
+_RETRIES = 2
+
+#: Причины, которые адаптер называет, пока соответствующая задача не сделана.
+#: Отказ по имени, а не молчаливый ``False``: преждевременно заведённый
+#: GitVerse-проект должен встать громко и с указанием, чего именно не хватает.
+_MERGE_PENDING = "мерж на GitVerse ещё не реализован — задача #1116"
+_CI_PENDING = "gitverse_ci_not_implemented"
+
+
+class GitVerseResponse:
+    """Ответ, у которого различимы «не смогли» и «сервер сказал нет».
+
+    ``ok`` False со ``status`` — сервер ответил и отказал; ``status`` None —
+    до сервера не дошли. Это разные диагнозы и разные руки, и клиент,
+    сливающий их в ``None``, лишает вызывающего возможности их различить —
+    ровно дефект #419 в новых декорациях.
+    """
+
+    __slots__ = ("status", "data", "text", "reason")
+
+    def __init__(
+        self,
+        status: int | None,
+        data: Any = None,
+        text: str = "",
+        reason: str = "",
+    ) -> None:
+        self.status = status
+        self.data = data
+        self.text = text
+        self.reason = reason
+
+    @property
+    def ok(self) -> bool:
+        return self.status is not None and 200 <= self.status < 300
+
+
+class GitVerseForge:
+    """Concrete forge plugin backed by the GitVerse REST API."""
+
+    name = "gitverse"
+
+    def __init__(
+        self,
+        token: str | None = None,
+        base_url: str | None = None,
+        version: str | None = None,
+    ) -> None:
+        self._token = (token if token is not None else config.GITVERSE_TOKEN).strip()
+        self._base = (base_url or config.GITVERSE_API_URL).rstrip("/")
+        self._version = (version or config.GITVERSE_API_VERSION).strip()
+
+    # -- транспорт ----------------------------------------------------------
+
+    def _is_configured(self) -> bool:
+        return bool(self._token)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Accept": f"application/vnd.gitverse.object+json;version={self._version}",
+            "Authorization": f"Bearer {self._token}",
+        }
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: float = _TIMEOUT,
+    ) -> GitVerseResponse:
+        """Один запрос с ретраями там, где они уместны, и только там.
+
+        Ретраится 429 (сервер сам просит подождать) и 5xx (его сторона). 4xx
+        не ретраится вовсе: повторять запрос, который отвергли по существу,
+        значит жечь квоту и оттягивать момент, когда причина будет названа.
+        """
+        if not self._is_configured():
+            return GitVerseResponse(None, reason="gitverse_token_not_configured")
+
+        url = f"{self._base}{path}"
+        delay = 1.0
+        last = GitVerseResponse(None, reason="gitverse_no_attempt")
+        for attempt in range(_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.request(
+                        method,
+                        url,
+                        json=json_body,
+                        params=params,
+                        headers=self._headers(),
+                    )
+            except Exception as exc:  # noqa: BLE001 - degradation is the contract
+                # Тип исключения, а не его текст: httpx кладёт в сообщение URL,
+                # а тот приходит из вызывающего кода.
+                last = GitVerseResponse(
+                    None, reason=f"gitverse_transport_error:{type(exc).__name__}"
+                )
+                log.warning(
+                    "gitverse %s %s failed: %s", method, path, type(exc).__name__
+                )
+                if attempt < _RETRIES:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                return last
+
+            self._note_rate_limit(resp)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last = GitVerseResponse(
+                    resp.status_code,
+                    text=resp.text[:300],
+                    reason=f"gitverse_http_{resp.status_code}",
+                )
+                if attempt < _RETRIES:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                return last
+
+            # 400 у этого API приходит с ПУСТЫМ телом, и это самый частый
+            # ответ на забытый или неверный заголовок версии. Проверка стоит
+            # ДО разбора тела, а не в обработчике ошибки разбора: пустое тело
+            # нечего разбирать, и подсказка, спрятанная в except, не сработала
+            # бы ровно в том случае, ради которого написана.
+            if resp.status_code == 400 and not resp.content:
+                return GitVerseResponse(
+                    400,
+                    text="",
+                    reason=(
+                        "gitverse_http_400_empty_body"
+                        " (проверьте заголовок Accept с версией)"
+                    ),
+                )
+
+            data: Any = None
+            if resp.content:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    return GitVerseResponse(
+                        resp.status_code,
+                        text=resp.text[:300],
+                        reason="gitverse_invalid_json",
+                    )
+            reason = (
+                ""
+                if 200 <= resp.status_code < 300
+                else (f"gitverse_http_{resp.status_code}")
+            )
+            return GitVerseResponse(
+                resp.status_code, data=data, text=resp.text[:300], reason=reason
+            )
+        return last
+
+    @staticmethod
+    def _note_rate_limit(resp: httpx.Response) -> None:
+        """Предупредить до того, как квота кончится посреди доставки.
+
+        Сервер сам сообщает остаток; читать его дешевле, чем разбираться
+        задним числом, почему цикл поллера вдруг весь стал ``unavailable``.
+        """
+        raw = resp.headers.get("gitverse-ratelimit-user-remaining")
+        if raw is None:
+            return
+        try:
+            left = int(raw)
+        except ValueError:
+            return
+        if left <= 100:
+            log.warning(
+                "gitverse rate limit is running out: %s requests left this hour", left
+            )
+
+    def _repo(self, gh_repo: str | None) -> str:
+        return (gh_repo or config.REPO_NAME or "").strip("/")
+
+    # -- pull requests ------------------------------------------------------
+
+    async def create_pr(
+        self,
+        title: str,
+        body: str,
+        branch: str,
+        base: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        slug = self._repo(gh_repo)
+        if not slug:
+            log.error("gitverse create_pr: репозиторий не назван")
+            return None
+        resp = await self._request(
+            "POST",
+            f"/repos/{slug}/pulls",
+            json_body={"title": title, "body": body, "head": branch, "base": base},
+        )
+        if resp.ok and isinstance(resp.data, dict):
+            number = resp.data.get("number")
+            if isinstance(number, int):
+                log.info("Created GitVerse PR #%d for branch %s", number, branch)
+                return number
+        # PR на эту ветку мог существовать до нас — это не ошибка, а тот же
+        # ответ, что у GitHub-адаптера на "already exists".
+        existing = await self.pr_for_branch(branch, repo=repo, gh_repo=gh_repo)
+        if existing is not None:
+            return existing
+        log.error(
+            "gitverse create_pr failed for %s: %s %s",
+            branch,
+            resp.reason or resp.status,
+            resp.text,
+        )
+        return None
+
+    async def pr_for_branch(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> int | None:
+        slug = self._repo(gh_repo)
+        if not slug:
+            return None
+        resp = await self._request(
+            "GET", f"/repos/{slug}/pulls", params={"state": "open"}
+        )
+        if not resp.ok or not isinstance(resp.data, list):
+            return None
+        for pr in resp.data:
+            if not isinstance(pr, dict):
+                continue
+            head = pr.get("head")
+            ref = head.get("ref") if isinstance(head, dict) else None
+            if str(ref or "") == branch and isinstance(pr.get("number"), int):
+                return int(pr["number"])
+        return None
+
+    async def open_or_update_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        """Найти и обновить, иначе создать — идемпотентно, как у GitHub (#812)."""
+        slug = self._repo(gh_repo)
+        if not slug:
+            return None
+        existing = await self.pr_for_branch(head, repo=repo, gh_repo=gh_repo)
+        if existing is not None:
+            await self._request(
+                "PATCH",
+                f"/repos/{slug}/pulls/{existing}",
+                json_body={"title": title, "body": body},
+            )
+            return existing
+        return await self.create_pr(title, body, head, base, repo=repo, gh_repo=gh_repo)
+
+    async def _pr(self, pr_number: int, gh_repo: str | None) -> GitVerseResponse:
+        slug = self._repo(gh_repo)
+        if not slug:
+            return GitVerseResponse(None, reason="gitverse_repo_not_named")
+        return await self._request("GET", f"/repos/{slug}/pulls/{pr_number}")
+
+    async def pr_state(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        """ "open" | "merged" | "closed" | "absent" | "" — как у GitHub-адаптера.
+
+        Пустая строка означает «спросить не удалось» и никогда не читается как
+        ответ: «не посмотрели» и «закрыт» ведут к противоположным решениям о
+        доставке (#802, правило #725). 404 — это ОТВЕТ: такого PR в этом
+        репозитории нет (#959).
+        """
+        resp = await self._pr(pr_number, gh_repo)
+        if resp.status == 404:
+            return "absent"
+        if not resp.ok or not isinstance(resp.data, dict):
+            return ""
+        # У GitVerse, как и у Gitea, влитый PR остаётся в состоянии "closed" и
+        # отличается флагом. Читать одно поле state было бы неверно: доставка
+        # прочла бы влитый PR как закрытый вручную.
+        if resp.data.get("merged") is True or resp.data.get("merged_at"):
+            return "merged"
+        return str(resp.data.get("state") or "").lower()
+
+    async def pr_is_draft(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        """Черновиков у GitVerse нет — и это НЕ то же, что «проверили и нет».
+
+        Ответ False здесь честный, потому что у форжа нет самого понятия
+        черновика; правило #498 («молчание — не обвинение») соблюдено без
+        запроса, который всё равно нечего было бы спросить.
+        """
+        return False
+
+    async def mark_pr_ready(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        """Нечего переводить в готовые: черновиков у форжа нет."""
+        return False
+
+    async def pr_head_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        resp = await self._pr(pr_number, gh_repo)
+        if not resp.ok or not isinstance(resp.data, dict):
+            return ""
+        head = resp.data.get("head")
+        if not isinstance(head, dict):
+            return ""
+        return str(head.get("sha") or "").strip()
+
+    async def pr_refs(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[str, str]:
+        resp = await self._pr(pr_number, gh_repo)
+        if not resp.ok or not isinstance(resp.data, dict):
+            return ("", "")
+        base = resp.data.get("base")
+        head = resp.data.get("head")
+        return (
+            str((base or {}).get("ref") or "").strip()
+            if isinstance(base, dict)
+            else "",
+            str((head or {}).get("ref") or "").strip()
+            if isinstance(head, dict)
+            else "",
+        )
+
+    async def _pr_merged(
+        self, pr_number: int, *, gh_repo: str | None = None
+    ) -> bool | None:
+        """Влит ли PR — по единственному endpoint'у, который об этом говорит.
+
+        Приватный намеренно: у операции пока нет потребителя, а ForgePlugin
+        описывает то, что хаб СПРАШИВАЕТ, а не всё, что адаптер умеет. #1116
+        поднимет её в протокол вместе с реализацией мержа — тогда и GitHub, и
+        noop обязаны будут на неё ответить, и это будет осмысленно.
+
+        ``GET /repos/{owner}/{repo}/pulls/{n}/merge``: 204 — влит, 404 — нет.
+        Третий ответ (None) означает «спросить не удалось», и он обязан
+        оставаться отличимым: доставка в #1116 признаёт мерж состоявшимся
+        только по 204, а не по коду возврата push.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return None
+        resp = await self._request("GET", f"/repos/{slug}/pulls/{pr_number}/merge")
+        if resp.status == 204:
+            return True
+        if resp.status == 404:
+            return False
+        return None
+
+    async def merge_commit_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        resp = await self._pr(pr_number, gh_repo)
+        if not resp.ok or not isinstance(resp.data, dict):
+            return ""
+        return str(resp.data.get("merge_commit_sha") or "").strip()
+
+    async def pr_mergeability(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[MergeabilityOutcome, str]:
+        """Сводится в #1116 — здесь отказ, который называет задачу.
+
+        Отвечать ``conflicting`` или ``mergeable`` без проверки нельзя: первое
+        подняло бы ложную тревогу, второе пустило бы доставку вслепую.
+        ``unavailable`` — единственный честный ответ, пока проверки нет.
+        """
+        return (MergeabilityOutcome.unavailable, _MERGE_PENDING)
+
+    async def merge_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        delete_branch: bool = True,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        """Сводится в #1116: в публичном API GitVerse мержа нет вовсе."""
+        log.error("gitverse merge_pr отказан: %s", _MERGE_PENDING)
+        return False
+
+    # -- CI -----------------------------------------------------------------
+    #
+    # Семантика исходов принадлежит #1117: у GitVerse нет ни commit statuses,
+    # ни check-runs, единственный источник — Actions runs, и его форма своя
+    # (поля commit_sha, status, ref, без conclusion). Пока её нет, все три
+    # читателя отвечают «спросить не удалось», а НЕ «проверок нет»: absent
+    # пустил бы доставку мимо CI, а pending заставил бы гейт ждать вечно.
+
+    async def check_pr_ci(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.unavailable, _CI_PENDING, details="#1117")
+
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_failure_logs(
+        self,
+        pr_number: int,
+        branch: str,
+        max_log_chars: int = 12000,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any]:
+        return {"failed_checks": [], "log_summary": "", "run_url": ""}
+
+    async def has_workflows(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool | None:
+        """Есть ли в репозитории workflow — спрашивается у API, не у каталога.
+
+        Раннер GitVerse обрабатывает и ``.gitverse/workflows/``, и
+        ``.github/workflows/``, так что вопрос «есть ли тут CI», заданный
+        одному каталогу, отвечается неверно.
+
+        ИЗМЕРЕНО 31.08.2026, и результат неприятный: живой
+        ``/actions/workflows`` отвечает 500 на репозиториях, которыми токен
+        владеет, и 404 там, где у токена нет прав администратора. То есть
+        полезного ответа он сейчас не даёт вовсе. Метод от этого не меняется:
+        ``None`` — «спросить не удалось» — и есть честный ответ, а выдумывать
+        вместо него False значило бы сказать «CI тут нет» про репозиторий, где
+        никто не смотрел. Рабочий источник для #1117 — ``/actions/runs``: он
+        отвечает 200 и, вопреки странице документации, отдаёт GitHub-подобную
+        форму ``{"total_count": N, "workflow_runs": [...]}``.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return None
+        resp = await self._request("GET", f"/repos/{slug}/actions/workflows")
+        if not resp.ok:
+            return None
+        payload = resp.data
+        if isinstance(payload, list):
+            return bool(payload)
+        if not isinstance(payload, dict):
+            return None
+        workflows = payload.get("workflows") or payload.get("items")
+        if isinstance(workflows, list):
+            return bool(workflows)
+        try:
+            return int(payload.get("total_count") or 0) > 0
+        except (TypeError, ValueError):
+            return None
+
+    # -- release ------------------------------------------------------------
+
+    async def compare_subjects(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]:
+        """Заголовки коммитов, которые ``head`` несёт сверх ``base``, новые первыми.
+
+        Заголовок режется здесь по первой строке — у GitVerse нет jq-параметра,
+        которым это делает GitHub-адаптер. Резать надо именно по КОММИТУ, а не
+        по строкам всего текста: многострочное сообщение иначе считается за
+        несколько коммитов, и релиз приписывает себе чужие задачи (#963).
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return []
+        resp = await self._request("GET", f"/repos/{slug}/compare/{base}...{head}")
+        if not resp.ok or not isinstance(resp.data, dict):
+            return []
+        commits = resp.data.get("commits")
+        if not isinstance(commits, list):
+            return []
+        subjects: list[str] = []
+        for item in commits:
+            if not isinstance(item, dict):
+                continue
+            commit = item.get("commit")
+            message = (commit or {}).get("message") if isinstance(commit, dict) else ""
+            subject = str(message or "").split("\n", 1)[0].strip()
+            if subject:
+                subjects.append(subject)
+        subjects.reverse()
+        return subjects
+
+    async def merge_branches(
+        self,
+        into_branch: str,
+        from_branch: str,
+        message: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        """Сводится в #1116: серверного мержа веток у GitVerse тоже нет."""
+        return ("unavailable", _MERGE_PENDING)

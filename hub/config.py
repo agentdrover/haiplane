@@ -35,6 +35,19 @@ N4L_BIN = env_get("N4L_BIN", str(HOME / ".local" / "bin" / "n4l"))
 N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
+
+# GitVerse как второй форж (#1115, эпик #1112). Токен обязателен даже для
+# ПУБЛИЧНЫХ репозиториев — анонимного режима у API нет, проверено живым
+# запросом: без заголовка авторизации он отвечает 401.
+GITVERSE_TOKEN = env_get("GITVERSE_TOKEN", "")
+# Базовый URL вынесен в настройку не ради красоты: у GitVerse есть
+# on-premise-поставка, и адрес там другой. Значение по умолчанию — облако.
+GITVERSE_API_URL = env_get("GITVERSE_API_URL", "https://api.gitverse.ru")
+# Версия API живёт в заголовке Accept, и это САМАЯ дорогая мелочь интеграции:
+# без него сервер отвечает 400 с ПУСТЫМ телом, неотличимым от проблемы с
+# авторизацией. Вынесено в настройку, потому что версии сосуществуют по шесть
+# месяцев — переезд на следующую не должен требовать правки кода.
+GITVERSE_API_VERSION = env_get("GITVERSE_API_VERSION", "1")
 VAST_JOB_BIN = env_get("VAST_JOB_BIN", str(HOME / ".local" / "bin" / "vast-haiplane"))
 # Vast.ai is opt-in. Disabled by default — set HAIPLANE_VAST_ENABLED=1 to turn on.
 VAST_ENABLED = env_get("VAST_ENABLED", "0") == "1"
