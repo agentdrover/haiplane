@@ -133,7 +133,7 @@ async def issue_code(
     same kind (and, for implementer, the same bound task).
     """
     kind = (kind or "intake").strip().lower() or "intake"
-    if kind == "implementer":
+    if kind in config.CHAT_PAIR_TASK_BOUND_KINDS:
         await db.execute(
             "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
             "AND bound_task_id = ? AND redeemed_at IS NULL",
@@ -154,7 +154,7 @@ async def issue_code(
         (
             principal_id,
             kind,
-            bound_task_id if kind == "implementer" else None,
+            bound_task_id if kind in config.CHAT_PAIR_TASK_BOUND_KINDS else None,
             hash_pair_code(code),
             f"+{int(ttl)} seconds",
         ),
@@ -211,6 +211,22 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             return None
         acting_id = int(acting["id"])
         acting_username = str(acting["username"])
+    elif kind == "reviewer":
+        # #1084: minted by the dispatch, not by a person, and spent by the
+        # cloud run it was minted for. It acts AS its issuer — the reviewer
+        # principal the dispatch resolved from CURSOR_REVIEWER_HUB_TOKEN — so
+        # the report lands under the identity the dispatch already pinned
+        # (#1025) and needs no second rule to be recognised as its own.
+        #
+        # The task must be IN REVIEW: a code outliving its submission would
+        # let a run file a report against work that has moved on.
+        if bound_task_id is None:
+            return None
+        task_rows = await fetchall(
+            db, "SELECT status FROM tasks WHERE id = ?", (int(bound_task_id),)
+        )
+        if not task_rows or dict(task_rows[0]).get("status") != "review":
+            return None
 
     cursor = await db.execute(
         "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "
@@ -232,7 +248,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             row["principal_id"],
             acting_id,
             kind,
-            bound_task_id if kind == "implementer" else None,
+            bound_task_id if kind in config.CHAT_PAIR_TASK_BOUND_KINDS else None,
             hash_pair_code(token),
             f"+{int(ttl)} seconds",
         ),
@@ -318,6 +334,18 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
             permissions=config.CHAT_PAIR_IMPLEMENTER_PERMS,
             auth_source="chat_pair",
             chat_pair_kind="implementer",
+            chat_pair_task_id=bound_id,
+        )
+    if kind == "reviewer":
+        # Walks as an agent under its issuer: no separate acting principal,
+        # because the issuer IS the reviewer principal (see redeem_code).
+        return TokenIdentity(
+            username=row["issuer_username"],
+            role="agent",
+            principal_id=row["principal_id"],
+            permissions=config.CHAT_PAIR_REVIEWER_PERMS,
+            auth_source="chat_pair",
+            chat_pair_kind="reviewer",
             chat_pair_task_id=bound_id,
         )
     return TokenIdentity(

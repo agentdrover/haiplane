@@ -1196,3 +1196,109 @@ async def test_expired_sibling_implementer_session_does_not_release_live_task(hu
     assert row["status"] == "running"
     who = await hub.client.get("/api/whoami", headers=live)
     assert who.status_code == 200, who.text
+
+
+# ---------------------------------------------------------------------------
+# kind=reviewer (#1084): облачный ревьюер, у которого нет MCP
+# ---------------------------------------------------------------------------
+#
+# Код этого вида чеканит ДИСПАТЧ, а не человек: маршрута выдачи для reviewer
+# нет и не должно быть — иначе появился бы способ выписать себе право сдать
+# отчёт от имени ревьюера. Поэтому тесты зовут issue_code напрямую, ровно как
+# это делает диспатч.
+
+
+async def _reviewer_session(hub, task_id: int) -> dict[str, str]:
+    code, _ttl = await cp.issue_code(
+        hub.db, hub.human_id, kind="reviewer", bound_task_id=task_id
+    )
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+async def _in_review(hub, title: str) -> int:
+    task_id = await _make_task(hub, title)
+    # Поколение сдачи обязательно: отчёт ревью привязывается к нему, и без
+    # сдачи приёмник отвечает 400 — это его правило, а не отказ доступа.
+    await hub.db.execute(
+        "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await hub.db.commit()
+    return task_id
+
+
+@pytest.mark.asyncio
+async def test_reviewer_session_reaches_two_routes_and_nothing_else(hub):
+    """AC-2 (#1084): два маршрута по своей задаче — и больше ничего.
+
+    Отказы проверяются ПОШТУЧНО и исполнением. «Их нет в списке» — не
+    проверка: список читает человек, а отказ выдаёт код.
+    """
+    bound = await _in_review(hub, "своя")
+    other = await _in_review(hub, "чужая")
+    session = await _reviewer_session(hub, bound)
+
+    brief = await hub.client.get(f"/api/tasks/{bound}/review-brief", headers=session)
+    assert brief.status_code == 200, brief.text
+
+    filed = await hub.client.post(
+        f"/api/tasks/{bound}/machine-review",
+        json={
+            "raw_count": 1,
+            "incomplete": False,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+        },
+        headers=session,
+    )
+    assert filed.status_code == 200, filed.text
+
+    # Всё остальное по СВОЕЙ задаче — отказ. Особенно submit-review: вердикт
+    # проверяемой стороне не принадлежит ни при каких обстоятельствах.
+    for method, path in (
+        ("POST", f"/api/tasks/{bound}/submit-review"),
+        ("POST", f"/api/tasks/{bound}/claim"),
+        ("POST", f"/api/tasks/{bound}/pair-start"),
+        ("POST", f"/api/tasks/{bound}/updates"),
+        ("GET", f"/api/tasks/{bound}"),
+        ("GET", "/api/whoami"),
+        ("POST", "/api/tasks"),
+    ):
+        resp = await hub.client.request(method, path, json={}, headers=session)
+        assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
+
+    # Чужая задача — отказ даже по разрешённому маршруту.
+    foreign = await hub.client.get(f"/api/tasks/{other}/review-brief", headers=session)
+    assert foreign.status_code == 403, foreign.text
+    foreign_report = await hub.client.post(
+        f"/api/tasks/{other}/machine-review",
+        json={"raw_count": 0, "incomplete": False},
+        headers=session,
+    )
+    assert foreign_report.status_code == 403, foreign_report.text
+
+
+@pytest.mark.asyncio
+async def test_reviewer_code_dies_with_its_submission(hub):
+    """AC-2 (#1084): код годен, только пока задача на ревью.
+
+    Собственный сторож, а не следствие: без него код, выписанный на сдачу,
+    пережил бы её и позволил бы сдать отчёт по работе, которая уже ушла
+    дальше — в running после доработки или в completed.
+    """
+    task_id = await _in_review(hub, "уехала дальше")
+    code, _ttl = await cp.issue_code(
+        hub.db, hub.human_id, kind="reviewer", bound_task_id=task_id
+    )
+    await hub.db.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+    await hub.db.commit()
+
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["detail"]["reason"] == "chat_pair_invalid"

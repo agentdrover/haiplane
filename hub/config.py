@@ -375,6 +375,24 @@ CHAT_PAIR_IMPLEMENTER_PERMS: frozenset[str] = frozenset(
     }
 )
 
+# Reviewer (#1084): the cloud reviewer gets no MCP from Cursor, so the header
+# carrying its token never reaches the run — it redeems a one-time code over
+# plain HTTPS instead. Two routes, so the narrowest set that opens them; the
+# real gate is the deny-by-default allowlist in hub/auth.py, exactly as the
+# module docstring of hub/services/chat_pair.py says.
+#
+# Deliberately NOT a trimmed CHAT_PAIR_IMPLEMENTER_PERMS: that set carries
+# tasks.update and tasks.agent_report, and the implementer allowlist opens
+# claim, pair-start and submit-review. A reviewer holding those would be the
+# checked party voting on itself — the defect #728 closed on the human path.
+CHAT_PAIR_REVIEWER_PERMS: frozenset[str] = frozenset({"tasks.read"})
+
+# Kinds whose session is bound to ONE task. Written once and read by both the
+# issuer and the route guard: when this was the literal "implementer" in five
+# places, adding a kind meant finding all five, and the one that got missed
+# would be an UNBOUND session — the failure that does not announce itself.
+CHAT_PAIR_TASK_BOUND_KINDS: frozenset[str] = frozenset({"implementer", "reviewer"})
+
 # Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
 # Those four include create/refine/update and would let the steward write the
 # statement it then judges. Deny-by-default lives in hub/auth.py; these strings
