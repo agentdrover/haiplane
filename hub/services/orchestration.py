@@ -2433,6 +2433,569 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
     return DeliveryPR(int(found))
 
 
+async def _deliver_completed_pair_task(
+    db: aiosqlite.Connection, task: dict[str, Any], delivery_pr: DeliveryPR
+) -> str | None:
+    """Доставка pair-задачи, у которой есть PR и нет job (#1067).
+
+    Третий вынос диспетчера: пятнадцать ветвлений из семнадцати у
+    _complete_without_review были здесь. Возвращает исход, если он решён,
+    и ``None``, если решать его дальше вызывающему.
+
+    ``delivery_pr`` приходит параметром, а не вычисляется здесь: он связан у
+    вызывающего ДО ветки — там об этом и написано, «a name that exists only on
+    one path is a trap for the next edit». Передать его явно дешевле, чем
+    повторить вычисление и разойтись с ним.
+    """
+    task_id = task["id"]
+    if delivery_pr.unusable:
+        # Nothing to merge: the recorded PR is closed and nothing
+        # replaces it. Refusing here is the decision the merge gate
+        # would reach anyway, taken before touching GitHub.
+        ok, detail = False, delivery_pr.reason
+    else:
+        ok, detail = await merge_before_completion(db, task)
+    if not ok:
+        # #951: a temporary state is not a decision. CI still running
+        # (or unreadable this minute) resolves itself — the poller in
+        # the same situation just retries next pass, and on 25.08.2026
+        # the done-flow's needs_decision here cost a human rework for
+        # a CI that went green four minutes later (#949). The task
+        # stays in running: the existing stale watches and the #418
+        # deadline backstop keep it from waiting forever. Terminal
+        # refusals — a red CI, a merge GitHub refused, a closed PR —
+        # still call a human below: those need an actual decision.
+        if detail.startswith(TRANSIENT_GATE_PREFIXES):
+            # #959: waiting is still right, but the reason has to be
+            # the true one. When the PR itself could not be read, "wait
+            # for a green CI" names a check that never ran and points
+            # at a PR the gate never established — the shape of hint
+            # #952 removed from the terminal branch, here in the
+            # patient one. A draft is a third cause (#1053): CI is
+            # already green, and resubmitting would stale the verdict.
+            if detail.startswith(PR_DRAFT_PREFIX):
+                cause = PR_DRAFT_WAIT_HINT
+            elif delivery_pr.established:
+                cause = (
+                    "Это временное состояние, решение человека не требуется: "
+                    "отчитайтесь о готовности снова, когда CI станет зелёным."
+                )
+            else:
+                cause = (
+                    "Состояние самого PR прочитать не удалось, поэтому "
+                    "про CI тут сказать нечего: отчитайтесь о готовности "
+                    "снова, когда PR станет доступен. Если он недоступен "
+                    "не временно — это вопрос к человеку."
+                )
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Доставка отложена: PR #{task['pr_number']} — {detail}. {cause}",
+            )
+            log.info(
+                "Task #%d stays running: merge gate waiting on CI (%s)",
+                task_id,
+                detail,
+            )
+            return "running"
+        budget_spent = False
+        if detail.startswith(RECOVERABLE_GATE_PREFIXES):
+            # #1030: the executor is right here — it just reported —
+            # so the refusal it can cure itself keeps the task on the
+            # conveyor instead of handing a human a door the agent
+            # cannot walk back through. The budget is what stops this
+            # from being an infinite loop: after MAX_CI_FIX_CYCLES
+            # attempts on a still-red CI the escalation below is the
+            # honest answer, and it names the spent budget as the
+            # cause rather than the CI outcome.
+            cycle = 0
+            if detail.startswith(CI_BUDGET_GATE_PREFIXES):
+                cycle, budget_spent = await charge_ci_fix_budget(db, task)
+            if not budget_spent:
+                attempt = (
+                    f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}." if cycle else ""
+                )
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "alert",
+                    f"Доставка не состоялась: PR #{task['pr_number']} — "
+                    f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
+                )
+                log.info(
+                    "Task #%d stays running: recoverable gate refusal (%s)",
+                    task_id,
+                    detail,
+                )
+                return "running"
+        await repo.update_task(db, task_id, status="needs_decision")
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            # #952: this line is written TOGETHER with the transition
+            # to needs_decision, and is read AFTER it — so it may only
+            # name actions that status accepts. "Report done again"
+            # is not one of them: the hub itself refuses it there
+            # (human_decision_required), which on 25.08.2026 sent an
+            # agent down a dead end the hint had pointed to (#949).
+            f"Done report NOT completed: PR #{task['pr_number']} is not "
+            f"delivered — {detail}."
+            + (
+                # #1030: after the budget the cause is no longer "the
+                # CI is red" but "the executor has had its tries" —
+                # naming the CI outcome alone would read as a first
+                # refusal and hide that the conveyor already gave way.
+                f" Бюджет починки исчерпан "
+                f"({task.get('ci_fix_cycle')}/"
+                f"{config.MAX_CI_FIX_CYCLES})."
+                if budget_spent
+                else ""
+            )
+            + " Решение за человеком "
+            "(hub_decide_task): rework вернёт задачу в running — "
+            "устраните причину и пересдайте done; accept завершит "
+            "задачу БЕЗ доставки PR.",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor=task.get("assigned_agent") or "agent",
+            payload={
+                "reason": ("ci_fix_cycle_limit" if budget_spent else "merge_gate"),
+                "detail": detail,
+            },
+        )
+        log.info(
+            "Task #%d → needs_decision: merge gate refused (%s)",
+            task_id,
+            detail,
+        )
+        return "needs_decision"
+    # #812: delivery succeeded, so the release range grew. Opening or
+    # refreshing the release PR is best-effort and never blocks the
+    # done report: the report answers about this task, and a release
+    # that could not be prepared is a reason in the log, not a failure
+    # of the work that is already in develop.
+    from hub.services.release import open_release_for_task
+
+    try:
+        await open_release_for_task(db, task_id)
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        log.warning("release PR not prepared for #%s: %s", task_id, exc)
+    return None
+
+
+async def _complete_without_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    has_done: bool,
+    exit_code: int | None,
+    result_text: str | None,
+) -> str:
+    """Done-отчёт по задаче, которой ревью не требуется (#1067).
+
+    Ветка диспетчера, вынесенная как есть. transition_after_agent_done — не
+    цепочка гейтов, а именно диспетчер исходов: четыре ветки, две из них по
+    250 строк. Список шагов сюда не ложится, а разрез по обработчикам —
+    ложится, и он же снимает цикломатику: 56 ветвлений в одной функции
+    против пяти в диспетчере после выноса.
+
+    Всегда возвращает исход: ни один путь внутри не проваливается наружу.
+    """
+    task_id = task["id"]
+    branch = task.get("branch")
+    pr_note = ""
+    # Bound before the branch: the refusal below reads it, and a name that
+    # exists only on one path is a trap for the next edit.
+    delivery_pr = DeliveryPR()
+    if not task.get("job_id"):
+        delivery_pr = await pr_for_delivery(db, task)
+        if delivery_pr.number:
+            task = {**task, "pr_number": delivery_pr.number}
+        pr_note = delivery_pr.reason
+        if not task.get("pr_number"):
+            # #967: the lookup finding nothing is no longer the end of the
+            # question. When git positively confirms commits on the branch,
+            # completing without a PR knowingly strands them — the state
+            # #961/#963/#965/#966 all reached in one week, each fixed by a
+            # human opening the PR after the fact. The hub opens it here
+            # and hands it to the same gate below. Without that knowledge
+            # (no branch, empty diff, git silent) today's path stands
+            # untouched — #498's rule that ignorance is not an accusation.
+            diff = await _confirmed_branch_diff(db, task, branch)
+            created, create_reason = await ensure_delivery_pr(
+                db, task, (branch or "").strip(), diff
+            )
+            if created:
+                task = {**task, "pr_number": created}
+                delivery_pr = DeliveryPR(created)
+                # The lookup's "PR not found" note would now read as "the
+                # delivery went unchecked" over a gate that IS checking it.
+                pr_note = ""
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "status",
+                    f"PR #{created} открыт хабом для доставки ветки "
+                    f"{branch}: на ней {len(diff or [])} изменённых "
+                    "файл(ов), а открытого PR не было (#967).",
+                )
+            elif create_reason:
+                await repo.update_task(db, task_id, status="needs_decision")
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "alert",
+                    # #952: names only actions needs_decision accepts.
+                    f"Done report NOT completed: ветка {branch} меняет "
+                    f"{len(diff or [])} файл(ов), а {create_reason}. "
+                    "Решение за человеком (hub_decide_task): rework "
+                    "вернёт задачу в running — откройте PR руками или "
+                    "почините доступ к GitHub и пересдайте done; accept "
+                    "завершит задачу БЕЗ доставки ветки.",
+                )
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task_id,
+                    actor=task.get("assigned_agent") or "agent",
+                    payload={
+                        "reason": "delivery_pr_missing",
+                        "detail": create_reason,
+                    },
+                )
+                log.info(
+                    "Task #%d → needs_decision: commits confirmed on %s "
+                    "and no PR could be opened (%s)",
+                    task_id,
+                    branch,
+                    create_reason,
+                )
+                return "needs_decision"
+    if pr_note:
+        # The gate could not look. Completion still follows today's rule,
+        # but the reader is told which check did not run — an absent line
+        # here would read as "there was nothing to deliver" (AC-4).
+        await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
+    if task.get("pr_number") and not task.get("job_id"):
+        delivered = await _deliver_completed_pair_task(db, task, delivery_pr)
+        if delivered is not None:
+            return delivered
+
+    # Review gate satisfied: either an explicit auto_review opt-out or
+    # the current submission already has an APPROVED verdict. Complete
+    # WITHOUT bumping the generation — no new work is being submitted,
+    # and a bump would invalidate the very approval that authorizes
+    # this completion (#306).
+    await repo.update_task(
+        db,
+        task_id,
+        status="completed",
+        exit_code=exit_code,
+        result_text=result_text,
+    )
+    await repo.insert_event(
+        db,
+        kind="task_completed",
+        task_id=task_id,
+        actor=task.get("assigned_agent") or "agent",
+        payload={"via": "report_done"},
+    )
+    log.info("Task #%d → completed after done report", task_id)
+    return "completed"
+
+
+async def _route_after_done(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    branch: str,
+    has_done: bool,
+    exit_code: int | None,
+    result_text: str | None,
+) -> str | None:
+    """Куда уходит задача, которой ревью требуется (#1067).
+
+    Вторая ветка диспетчера, вынесенная как есть. В отличие от первой может
+    провалиться наружу — тогда решает следующая ветка, — и потому отдаёт
+    ``None``. Это не «ничего не произошло»: это «исход здесь не решён».
+    """
+    task_id = task["id"]
+    ctx = await project_git_context(db, task_id)
+    workspace = ctx.get("repo")
+    # Worktree mode (#459): a PAIR task's branch is checked out in its own
+    # worktree while the main clone stays on base; targeting the main clone
+    # would silently fail checkout and let squash_branch reset the base
+    # branch. Only redirect for pair tasks (no job_id) whose worktree
+    # actually exists — headless dispatch tasks (job_id set) build their
+    # branch in the main clone and never create a worktree, so redirecting
+    # them at a nonexistent path would crash the poller's done-pipeline.
+    git_repo = workspace
+    if worktree_per_task_enabled() and not task.get("job_id"):
+        wt = plugins.git_ops.worktree_path(task_id, workspace)
+        if wt and os.path.isdir(wt):
+            git_repo = wt
+    # #361 I1: the result of this checkout was never inspected, and the
+    # comment above already names the consequence — squash_branch resetting
+    # the wrong branch. checkout() has always returned a bool; nobody read
+    # it. Every step below rewrites history or pushes, so a failed checkout
+    # must stop the tail rather than run it against whatever branch is
+    # current. Silence here is what docs/workspace-safety-policy.md
+    # invariant 4 forbids.
+    if not await plugins.git_ops.checkout(branch, repo=git_repo):
+        await repo.update_task(
+            db,
+            task_id,
+            status="needs_decision",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "blocker",
+            f"Не удалось перейти на ветку {branch!r} в {git_repo} — "
+            "git-хвост done-конвейера (commit, squash, push, PR) не "
+            "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
+            "рабочего каталога и решите через hub_decide_task.",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "done_checkout_failed", "branch": branch},
+        )
+        log.error(
+            "Task #%d → needs_decision: cannot check out %r in %s",
+            task_id,
+            branch,
+            git_repo,
+        )
+        return "needs_decision"
+    # Commit-scope gate (#361 AC-1). auto_commit stages the whole tree, and
+    # the tree was only proven clean at branch creation — a headless task
+    # then shares the main clone for its entire run, so an edit made by
+    # anyone else in that window is dirty here and looks exactly like the
+    # task's own work. affected_areas is the only attribution the hub has.
+    # It is a weak one (an agent may legitimately touch more than the task
+    # predicted), which is why 'require' escalates to a human rather than
+    # dropping files, and why the default is 'warn'.
+    scope_mode = (config.COMMIT_SCOPE_GATE or "warn").strip().lower()
+    if scope_mode != "off":
+        areas = deserialize_str_list(task.get("affected_areas"))
+        dirty = await plugins.git_ops.dirty_paths(repo=git_repo)
+        if not areas:
+            # No declared scope means the check could not run. Say so —
+            # silence here would read as "checked and clean" (#537).
+            if dirty:
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "status",
+                    "Проверка области коммита не выполнялась: у задачи не "
+                    f"объявлены affected_areas. В коммит уйдут {len(dirty)} "
+                    "файлов без сверки с областью задачи.",
+                )
+        else:
+            foreign = commit_scope.foreign_paths(dirty, areas)
+            if foreign and scope_mode == "require":
+                listed = ", ".join(foreign[:10])
+                error = (
+                    f"В рабочем каталоге {git_repo} есть изменения вне "
+                    f"объявленной области задачи #{task_id}: {listed}. "
+                    "git-хвост остановлен, чтобы чужая работа не ушла в PR "
+                    "задачи."
+                )
+                await repo.update_task(
+                    db,
+                    task_id,
+                    status="needs_decision",
+                    exit_code=exit_code,
+                    result_text=error,
+                )
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "blocker",
+                    f"{error} Объявленная область: {', '.join(areas)}. "
+                    "Решите через hub_decide_task: расширить область, "
+                    "убрать чужие правки или закоммитить как есть.",
+                )
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task_id,
+                    actor="hub",
+                    payload={
+                        "reason": "commit_scope_violation",
+                        "branch": branch,
+                        "foreign": foreign[:20],
+                    },
+                )
+                log.error(
+                    "Task #%d → needs_decision: %d file(s) outside scope",
+                    task_id,
+                    len(foreign),
+                )
+                return "needs_decision"
+            if foreign:
+                await repo.add_task_update(
+                    db,
+                    task_id,
+                    "hub",
+                    "status",
+                    f"В коммит задачи уходят {len(foreign)} файлов вне "
+                    f"объявленной области: {', '.join(foreign[:10])}. "
+                    "Режим проверки — warn, коммит выполнен. Включите "
+                    "HAIPLANE_COMMIT_SCOPE=require, чтобы останавливать.",
+                )
+    # expected_branch is defence in depth: the checkout above may report
+    # success while HEAD ends up elsewhere. Its refusal RAISES rather than
+    # returning False, because False also means "nothing to commit" and
+    # collapsing the two left the guard inert — squash and push ran anyway.
+    try:
+        await plugins.git_ops.auto_commit(
+            task_id,
+            title=task.get("title", ""),
+            repo=git_repo,
+            expected_branch=branch,
+        )
+    except WorkspaceBranchMismatchError as exc:
+        await repo.update_task(
+            db,
+            task_id,
+            status="needs_decision",
+            exit_code=exit_code,
+            result_text=str(exc),
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "blocker",
+            f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
+            f"переписать историю чужой ветки. Решите через hub_decide_task.",
+        )
+        await repo.insert_event(
+            db,
+            kind="needs_decision",
+            task_id=task_id,
+            actor="hub",
+            payload={"reason": "done_branch_mismatch", "branch": branch},
+        )
+        log.error("Task #%d → needs_decision: %s", task_id, exc)
+        return "needs_decision"
+    # #991: the CI gate asks for a PR where it means "is there anything to
+    # deliver". For a task whose work is not code — a policy turned on, a
+    # mechanism watched, a decision recorded — the branch exists (pair_start
+    # always makes one) and carries nothing the base does not have. There is
+    # no PR to open, so the poller retried and escalated: #927 sat in
+    # needs_decision with "Cannot create PR: no commits on branch or push
+    # failed" while its work was finished and evidenced by three live checks.
+    #
+    # The question is asked HERE and not earlier, and against git_repo and
+    # not the clone — both learned from the review of the first attempt:
+    #
+    #   * after auto_commit, because auto_commit is what turns a dirty tree
+    #     into commits. Asking before it called work-in-progress "nothing to
+    #     deliver" and skipped the very commit that delivers it.
+    #   * against git_repo, because for a pair task in worktree mode the
+    #     work lives in the worktree while the clone stays on base. Deciding
+    #     from the clone and acting on the worktree is how a decision comes
+    #     out right by accident.
+    #
+    # Three answers, and only one skips: content that does not differ means
+    # the CI gate has no subject. "Could not compare" keeps the old path —
+    # ignorance must not close a task quietly (#725). The REVIEW gate is
+    # untouched either way: skipping it would let anything uncommitted
+    # complete itself, a worse defect than the one being fixed.
+    # The base default belongs to git_ops (_resolve_base, #362 I4) — an
+    # empty base is passed through, never recomputed here.
+    try:
+        differs = await plugins.git_ops.content_differs(
+            (ctx.get("base_branch") or "").strip(),
+            branch,
+            repo=git_repo,
+            gh_repo=ctx.get("gh_repo"),
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        # A done report must not 500 because git blinked. An unanswered
+        # question keeps the old path, exactly like an explicit None.
+        log.warning("delivery check for #%s failed: %s", task_id, exc)
+        differs = None
+    # ONLY an explicit False skips. None means "could not compare", and it
+    # deliberately keeps the ordinary path — PR, CI and the gate — because
+    # the risk to guard against is silently closing a task, not opening a
+    # pull request that the CI gate will judge anyway (#725).
+    nothing_to_deliver = differs is False
+    if nothing_to_deliver:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Доставлять нечего: ветка {branch} после коммита не "
+            "отличается по содержимому от базовой ветки проекта, PR "
+            "открывать не из чего. Гейт CI пропущен как беспредметный — "
+            "ревью задача проходит обычным порядком (#991). Если работа "
+            "должна была быть в коде, значит она не закоммичена.",
+        )
+        log.info(
+            "Task #%d: nothing to deliver on %s — CI gate skipped",
+            task_id,
+            branch,
+        )
+
+    # Fall through to the review gate when there is nothing to deliver:
+    # squash, push and PR all have no subject, and the task still owes a
+    # verdict — it just owes no pull request (#991).
+    if not nothing_to_deliver:
+        squashed = await plugins.git_ops.squash_branch(
+            task_id,
+            task.get("title", ""),
+            branch,
+            repo=git_repo,
+            base_branch=ctx.get("base_branch"),
+        )
+        await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
+        if not task.get("pr_number"):
+            pr_num = await plugins.git_ops.create_pr(
+                task_id,
+                task["title"],
+                task.get("description", ""),
+                branch,
+                repo=git_repo,
+                gh_repo=ctx.get("gh_repo"),
+                base_branch=ctx.get("base_branch"),
+            )
+            if pr_num:
+                await repo.update_task(db, task_id, pr_number=pr_num)
+                task["pr_number"] = pr_num
+        await repo.update_task(
+            db,
+            task_id,
+            status="ci_check",
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        log.info("Task #%d → ci_check after done report", task_id)
+        return "ci_check"
+    return None
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -2457,249 +3020,13 @@ async def transition_after_agent_done(
         # the hub never learned its number" — and the second one completed
         # tasks over unmerged branches. The lookup runs here, at done time,
         # instead of only at submission.
-        pr_note = ""
-        # Bound before the branch: the refusal below reads it, and a name that
-        # exists only on one path is a trap for the next edit.
-        delivery_pr = DeliveryPR()
-        if not task.get("job_id"):
-            delivery_pr = await pr_for_delivery(db, task)
-            if delivery_pr.number:
-                task = {**task, "pr_number": delivery_pr.number}
-            pr_note = delivery_pr.reason
-            if not task.get("pr_number"):
-                # #967: the lookup finding nothing is no longer the end of the
-                # question. When git positively confirms commits on the branch,
-                # completing without a PR knowingly strands them — the state
-                # #961/#963/#965/#966 all reached in one week, each fixed by a
-                # human opening the PR after the fact. The hub opens it here
-                # and hands it to the same gate below. Without that knowledge
-                # (no branch, empty diff, git silent) today's path stands
-                # untouched — #498's rule that ignorance is not an accusation.
-                diff = await _confirmed_branch_diff(db, task, branch)
-                created, create_reason = await ensure_delivery_pr(
-                    db, task, (branch or "").strip(), diff
-                )
-                if created:
-                    task = {**task, "pr_number": created}
-                    delivery_pr = DeliveryPR(created)
-                    # The lookup's "PR not found" note would now read as "the
-                    # delivery went unchecked" over a gate that IS checking it.
-                    pr_note = ""
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "status",
-                        f"PR #{created} открыт хабом для доставки ветки "
-                        f"{branch}: на ней {len(diff or [])} изменённых "
-                        "файл(ов), а открытого PR не было (#967).",
-                    )
-                elif create_reason:
-                    await repo.update_task(db, task_id, status="needs_decision")
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "alert",
-                        # #952: names only actions needs_decision accepts.
-                        f"Done report NOT completed: ветка {branch} меняет "
-                        f"{len(diff or [])} файл(ов), а {create_reason}. "
-                        "Решение за человеком (hub_decide_task): rework "
-                        "вернёт задачу в running — откройте PR руками или "
-                        "почините доступ к GitHub и пересдайте done; accept "
-                        "завершит задачу БЕЗ доставки ветки.",
-                    )
-                    await repo.insert_event(
-                        db,
-                        kind="needs_decision",
-                        task_id=task_id,
-                        actor=task.get("assigned_agent") or "agent",
-                        payload={
-                            "reason": "delivery_pr_missing",
-                            "detail": create_reason,
-                        },
-                    )
-                    log.info(
-                        "Task #%d → needs_decision: commits confirmed on %s "
-                        "and no PR could be opened (%s)",
-                        task_id,
-                        branch,
-                        create_reason,
-                    )
-                    return "needs_decision"
-        if pr_note:
-            # The gate could not look. Completion still follows today's rule,
-            # but the reader is told which check did not run — an absent line
-            # here would read as "there was nothing to deliver" (AC-4).
-            await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
-        if task.get("pr_number") and not task.get("job_id"):
-            if delivery_pr.unusable:
-                # Nothing to merge: the recorded PR is closed and nothing
-                # replaces it. Refusing here is the decision the merge gate
-                # would reach anyway, taken before touching GitHub.
-                ok, detail = False, delivery_pr.reason
-            else:
-                ok, detail = await merge_before_completion(db, task)
-            if not ok:
-                # #951: a temporary state is not a decision. CI still running
-                # (or unreadable this minute) resolves itself — the poller in
-                # the same situation just retries next pass, and on 25.08.2026
-                # the done-flow's needs_decision here cost a human rework for
-                # a CI that went green four minutes later (#949). The task
-                # stays in running: the existing stale watches and the #418
-                # deadline backstop keep it from waiting forever. Terminal
-                # refusals — a red CI, a merge GitHub refused, a closed PR —
-                # still call a human below: those need an actual decision.
-                if detail.startswith(TRANSIENT_GATE_PREFIXES):
-                    # #959: waiting is still right, but the reason has to be
-                    # the true one. When the PR itself could not be read, "wait
-                    # for a green CI" names a check that never ran and points
-                    # at a PR the gate never established — the shape of hint
-                    # #952 removed from the terminal branch, here in the
-                    # patient one. A draft is a third cause (#1053): CI is
-                    # already green, and resubmitting would stale the verdict.
-                    if detail.startswith(PR_DRAFT_PREFIX):
-                        cause = PR_DRAFT_WAIT_HINT
-                    elif delivery_pr.established:
-                        cause = (
-                            "Это временное состояние, решение человека не требуется: "
-                            "отчитайтесь о готовности снова, когда CI станет зелёным."
-                        )
-                    else:
-                        cause = (
-                            "Состояние самого PR прочитать не удалось, поэтому "
-                            "про CI тут сказать нечего: отчитайтесь о готовности "
-                            "снова, когда PR станет доступен. Если он недоступен "
-                            "не временно — это вопрос к человеку."
-                        )
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "alert",
-                        f"Доставка отложена: PR #{task['pr_number']} — "
-                        f"{detail}. {cause}",
-                    )
-                    log.info(
-                        "Task #%d stays running: merge gate waiting on CI (%s)",
-                        task_id,
-                        detail,
-                    )
-                    return "running"
-                budget_spent = False
-                if detail.startswith(RECOVERABLE_GATE_PREFIXES):
-                    # #1030: the executor is right here — it just reported —
-                    # so the refusal it can cure itself keeps the task on the
-                    # conveyor instead of handing a human a door the agent
-                    # cannot walk back through. The budget is what stops this
-                    # from being an infinite loop: after MAX_CI_FIX_CYCLES
-                    # attempts on a still-red CI the escalation below is the
-                    # honest answer, and it names the spent budget as the
-                    # cause rather than the CI outcome.
-                    cycle = 0
-                    if detail.startswith(CI_BUDGET_GATE_PREFIXES):
-                        cycle, budget_spent = await charge_ci_fix_budget(db, task)
-                    if not budget_spent:
-                        attempt = (
-                            f" Попытка {cycle}/{config.MAX_CI_FIX_CYCLES}."
-                            if cycle
-                            else ""
-                        )
-                        await repo.add_task_update(
-                            db,
-                            task_id,
-                            "hub",
-                            "alert",
-                            f"Доставка не состоялась: PR #{task['pr_number']} — "
-                            f"{detail}. {RESUBMIT_AFTER_FIX_HINT}{attempt}",
-                        )
-                        log.info(
-                            "Task #%d stays running: recoverable gate refusal (%s)",
-                            task_id,
-                            detail,
-                        )
-                        return "running"
-                await repo.update_task(db, task_id, status="needs_decision")
-                await repo.add_task_update(
-                    db,
-                    task_id,
-                    "hub",
-                    "alert",
-                    # #952: this line is written TOGETHER with the transition
-                    # to needs_decision, and is read AFTER it — so it may only
-                    # name actions that status accepts. "Report done again"
-                    # is not one of them: the hub itself refuses it there
-                    # (human_decision_required), which on 25.08.2026 sent an
-                    # agent down a dead end the hint had pointed to (#949).
-                    f"Done report NOT completed: PR #{task['pr_number']} is not "
-                    f"delivered — {detail}."
-                    + (
-                        # #1030: after the budget the cause is no longer "the
-                        # CI is red" but "the executor has had its tries" —
-                        # naming the CI outcome alone would read as a first
-                        # refusal and hide that the conveyor already gave way.
-                        f" Бюджет починки исчерпан "
-                        f"({task.get('ci_fix_cycle')}/"
-                        f"{config.MAX_CI_FIX_CYCLES})."
-                        if budget_spent
-                        else ""
-                    )
-                    + " Решение за человеком "
-                    "(hub_decide_task): rework вернёт задачу в running — "
-                    "устраните причину и пересдайте done; accept завершит "
-                    "задачу БЕЗ доставки PR.",
-                )
-                await repo.insert_event(
-                    db,
-                    kind="needs_decision",
-                    task_id=task_id,
-                    actor=task.get("assigned_agent") or "agent",
-                    payload={
-                        "reason": (
-                            "ci_fix_cycle_limit" if budget_spent else "merge_gate"
-                        ),
-                        "detail": detail,
-                    },
-                )
-                log.info(
-                    "Task #%d → needs_decision: merge gate refused (%s)",
-                    task_id,
-                    detail,
-                )
-                return "needs_decision"
-            # #812: delivery succeeded, so the release range grew. Opening or
-            # refreshing the release PR is best-effort and never blocks the
-            # done report: the report answers about this task, and a release
-            # that could not be prepared is a reason in the log, not a failure
-            # of the work that is already in develop.
-            from hub.services.release import open_release_for_task
-
-            try:
-                await open_release_for_task(db, task_id)
-            except Exception as exc:  # noqa: BLE001 - a cause, not a failure
-                log.warning("release PR not prepared for #%s: %s", task_id, exc)
-
-        # Review gate satisfied: either an explicit auto_review opt-out or
-        # the current submission already has an APPROVED verdict. Complete
-        # WITHOUT bumping the generation — no new work is being submitted,
-        # and a bump would invalidate the very approval that authorizes
-        # this completion (#306).
-        await repo.update_task(
+        return await _complete_without_review(
             db,
-            task_id,
-            status="completed",
+            task,
+            has_done=has_done,
             exit_code=exit_code,
             result_text=result_text,
         )
-        await repo.insert_event(
-            db,
-            kind="task_completed",
-            task_id=task_id,
-            actor=task.get("assigned_agent") or "agent",
-            payload={"via": "report_done"},
-        )
-        log.info("Task #%d → completed after done report", task_id)
-        return "completed"
 
     if has_done:
         # Unreviewed done report = a work submission (#305): bumping the
@@ -2712,269 +3039,16 @@ async def transition_after_agent_done(
         and has_done
         and branch
     ):
-        ctx = await project_git_context(db, task_id)
-        workspace = ctx.get("repo")
-        # Worktree mode (#459): a PAIR task's branch is checked out in its own
-        # worktree while the main clone stays on base; targeting the main clone
-        # would silently fail checkout and let squash_branch reset the base
-        # branch. Only redirect for pair tasks (no job_id) whose worktree
-        # actually exists — headless dispatch tasks (job_id set) build their
-        # branch in the main clone and never create a worktree, so redirecting
-        # them at a nonexistent path would crash the poller's done-pipeline.
-        git_repo = workspace
-        if worktree_per_task_enabled() and not task.get("job_id"):
-            wt = plugins.git_ops.worktree_path(task_id, workspace)
-            if wt and os.path.isdir(wt):
-                git_repo = wt
-        # #361 I1: the result of this checkout was never inspected, and the
-        # comment above already names the consequence — squash_branch resetting
-        # the wrong branch. checkout() has always returned a bool; nobody read
-        # it. Every step below rewrites history or pushes, so a failed checkout
-        # must stop the tail rather than run it against whatever branch is
-        # current. Silence here is what docs/workspace-safety-policy.md
-        # invariant 4 forbids.
-        if not await plugins.git_ops.checkout(branch, repo=git_repo):
-            await repo.update_task(
-                db,
-                task_id,
-                status="needs_decision",
-                exit_code=exit_code,
-                result_text=result_text,
-            )
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "blocker",
-                f"Не удалось перейти на ветку {branch!r} в {git_repo} — "
-                "git-хвост done-конвейера (commit, squash, push, PR) не "
-                "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
-                "рабочего каталога и решите через hub_decide_task.",
-            )
-            await repo.insert_event(
-                db,
-                kind="needs_decision",
-                task_id=task_id,
-                actor="hub",
-                payload={"reason": "done_checkout_failed", "branch": branch},
-            )
-            log.error(
-                "Task #%d → needs_decision: cannot check out %r in %s",
-                task_id,
-                branch,
-                git_repo,
-            )
-            return "needs_decision"
-        # Commit-scope gate (#361 AC-1). auto_commit stages the whole tree, and
-        # the tree was only proven clean at branch creation — a headless task
-        # then shares the main clone for its entire run, so an edit made by
-        # anyone else in that window is dirty here and looks exactly like the
-        # task's own work. affected_areas is the only attribution the hub has.
-        # It is a weak one (an agent may legitimately touch more than the task
-        # predicted), which is why 'require' escalates to a human rather than
-        # dropping files, and why the default is 'warn'.
-        scope_mode = (config.COMMIT_SCOPE_GATE or "warn").strip().lower()
-        if scope_mode != "off":
-            areas = deserialize_str_list(task.get("affected_areas"))
-            dirty = await plugins.git_ops.dirty_paths(repo=git_repo)
-            if not areas:
-                # No declared scope means the check could not run. Say so —
-                # silence here would read as "checked and clean" (#537).
-                if dirty:
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "status",
-                        "Проверка области коммита не выполнялась: у задачи не "
-                        f"объявлены affected_areas. В коммит уйдут {len(dirty)} "
-                        "файлов без сверки с областью задачи.",
-                    )
-            else:
-                foreign = commit_scope.foreign_paths(dirty, areas)
-                if foreign and scope_mode == "require":
-                    listed = ", ".join(foreign[:10])
-                    error = (
-                        f"В рабочем каталоге {git_repo} есть изменения вне "
-                        f"объявленной области задачи #{task_id}: {listed}. "
-                        "git-хвост остановлен, чтобы чужая работа не ушла в PR "
-                        "задачи."
-                    )
-                    await repo.update_task(
-                        db,
-                        task_id,
-                        status="needs_decision",
-                        exit_code=exit_code,
-                        result_text=error,
-                    )
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "blocker",
-                        f"{error} Объявленная область: {', '.join(areas)}. "
-                        "Решите через hub_decide_task: расширить область, "
-                        "убрать чужие правки или закоммитить как есть.",
-                    )
-                    await repo.insert_event(
-                        db,
-                        kind="needs_decision",
-                        task_id=task_id,
-                        actor="hub",
-                        payload={
-                            "reason": "commit_scope_violation",
-                            "branch": branch,
-                            "foreign": foreign[:20],
-                        },
-                    )
-                    log.error(
-                        "Task #%d → needs_decision: %d file(s) outside scope",
-                        task_id,
-                        len(foreign),
-                    )
-                    return "needs_decision"
-                if foreign:
-                    await repo.add_task_update(
-                        db,
-                        task_id,
-                        "hub",
-                        "status",
-                        f"В коммит задачи уходят {len(foreign)} файлов вне "
-                        f"объявленной области: {', '.join(foreign[:10])}. "
-                        "Режим проверки — warn, коммит выполнен. Включите "
-                        "HAIPLANE_COMMIT_SCOPE=require, чтобы останавливать.",
-                    )
-        # expected_branch is defence in depth: the checkout above may report
-        # success while HEAD ends up elsewhere. Its refusal RAISES rather than
-        # returning False, because False also means "nothing to commit" and
-        # collapsing the two left the guard inert — squash and push ran anyway.
-        try:
-            await plugins.git_ops.auto_commit(
-                task_id,
-                title=task.get("title", ""),
-                repo=git_repo,
-                expected_branch=branch,
-            )
-        except WorkspaceBranchMismatchError as exc:
-            await repo.update_task(
-                db,
-                task_id,
-                status="needs_decision",
-                exit_code=exit_code,
-                result_text=str(exc),
-            )
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "blocker",
-                f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
-                f"переписать историю чужой ветки. Решите через hub_decide_task.",
-            )
-            await repo.insert_event(
-                db,
-                kind="needs_decision",
-                task_id=task_id,
-                actor="hub",
-                payload={"reason": "done_branch_mismatch", "branch": branch},
-            )
-            log.error("Task #%d → needs_decision: %s", task_id, exc)
-            return "needs_decision"
-        # #991: the CI gate asks for a PR where it means "is there anything to
-        # deliver". For a task whose work is not code — a policy turned on, a
-        # mechanism watched, a decision recorded — the branch exists (pair_start
-        # always makes one) and carries nothing the base does not have. There is
-        # no PR to open, so the poller retried and escalated: #927 sat in
-        # needs_decision with "Cannot create PR: no commits on branch or push
-        # failed" while its work was finished and evidenced by three live checks.
-        #
-        # The question is asked HERE and not earlier, and against git_repo and
-        # not the clone — both learned from the review of the first attempt:
-        #
-        #   * after auto_commit, because auto_commit is what turns a dirty tree
-        #     into commits. Asking before it called work-in-progress "nothing to
-        #     deliver" and skipped the very commit that delivers it.
-        #   * against git_repo, because for a pair task in worktree mode the
-        #     work lives in the worktree while the clone stays on base. Deciding
-        #     from the clone and acting on the worktree is how a decision comes
-        #     out right by accident.
-        #
-        # Three answers, and only one skips: content that does not differ means
-        # the CI gate has no subject. "Could not compare" keeps the old path —
-        # ignorance must not close a task quietly (#725). The REVIEW gate is
-        # untouched either way: skipping it would let anything uncommitted
-        # complete itself, a worse defect than the one being fixed.
-        # The base default belongs to git_ops (_resolve_base, #362 I4) — an
-        # empty base is passed through, never recomputed here.
-        try:
-            differs = await plugins.git_ops.content_differs(
-                (ctx.get("base_branch") or "").strip(),
-                branch,
-                repo=git_repo,
-                gh_repo=ctx.get("gh_repo"),
-            )
-        except Exception as exc:  # noqa: BLE001 - a cause, not a failure
-            # A done report must not 500 because git blinked. An unanswered
-            # question keeps the old path, exactly like an explicit None.
-            log.warning("delivery check for #%s failed: %s", task_id, exc)
-            differs = None
-        # ONLY an explicit False skips. None means "could not compare", and it
-        # deliberately keeps the ordinary path — PR, CI and the gate — because
-        # the risk to guard against is silently closing a task, not opening a
-        # pull request that the CI gate will judge anyway (#725).
-        nothing_to_deliver = differs is False
-        if nothing_to_deliver:
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "status",
-                f"Доставлять нечего: ветка {branch} после коммита не "
-                "отличается по содержимому от базовой ветки проекта, PR "
-                "открывать не из чего. Гейт CI пропущен как беспредметный — "
-                "ревью задача проходит обычным порядком (#991). Если работа "
-                "должна была быть в коде, значит она не закоммичена.",
-            )
-            log.info(
-                "Task #%d: nothing to deliver on %s — CI gate skipped",
-                task_id,
-                branch,
-            )
-
-        # Fall through to the review gate when there is nothing to deliver:
-        # squash, push and PR all have no subject, and the task still owes a
-        # verdict — it just owes no pull request (#991).
-        if not nothing_to_deliver:
-            squashed = await plugins.git_ops.squash_branch(
-                task_id,
-                task.get("title", ""),
-                branch,
-                repo=git_repo,
-                base_branch=ctx.get("base_branch"),
-            )
-            await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
-            if not task.get("pr_number"):
-                pr_num = await plugins.git_ops.create_pr(
-                    task_id,
-                    task["title"],
-                    task.get("description", ""),
-                    branch,
-                    repo=git_repo,
-                    gh_repo=ctx.get("gh_repo"),
-                    base_branch=ctx.get("base_branch"),
-                )
-                if pr_num:
-                    await repo.update_task(db, task_id, pr_number=pr_num)
-                    task["pr_number"] = pr_num
-            await repo.update_task(
-                db,
-                task_id,
-                status="ci_check",
-                exit_code=exit_code,
-                result_text=result_text,
-            )
-            log.info("Task #%d → ci_check after done report", task_id)
-            return "ci_check"
+        routed = await _route_after_done(
+            db,
+            task,
+            branch=branch,
+            has_done=has_done,
+            exit_code=exit_code,
+            result_text=result_text,
+        )
+        if routed is not None:
+            return routed
 
     if has_done and review_budget_exhausted(task.get("review_cycle", 0)):
         # Review cycle limit reached without approval: escalate to the human

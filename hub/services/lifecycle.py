@@ -1783,7 +1783,15 @@ class SubmitContext:
     outcome_note: str = ""
     outcome_writes: list[Any] = dc_field(default_factory=list)
     outcome_generation: int = 0
-    rules_mode: str = ""
+    # Читается из политики при создании контекста, а НЕ внутри шага (#1067,
+    # находка ревью PR #247). Присваивание жило в теле _step_submit_rules, и
+    # при SUBMIT_RULES=off шаг пропускался целиком — заголовок отчёта выходил
+    # «режим правил: » с пустым местом там, где раньше стояло off. Режим
+    # политики есть всегда, даже когда шаг по ней не выполняется; это разные
+    # вещи, и путать их не должно.
+    rules_mode: str = dc_field(
+        default_factory=lambda: (config.SUBMIT_RULES or "warn").strip().lower()
+    )
     rule_lines: list[str] = dc_field(default_factory=list)
     clean_lines: list[str] = dc_field(default_factory=list)
     unchecked_lines: list[str] = dc_field(default_factory=list)
@@ -1965,7 +1973,6 @@ async def _step_submit_rules(state: SubmitContext) -> None:
     # rejected, while the categories test-coverage, test-adequacy and
     # missing-test-hides-defect follow from the diff by rule, not by
     # reasoning. Refusals happen here, still before the transition.
-    state.rules_mode = (config.SUBMIT_RULES or "warn").strip().lower()
     state.rule_lines = []
     state.clean_lines = []
     state.unchecked_lines = []

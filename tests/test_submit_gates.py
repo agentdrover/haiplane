@@ -151,7 +151,7 @@ def test_the_network_walking_steps_come_last():
 
 # Гейты, которые проходит СДАЧА PAIR-ЗАДАЧИ и не проходит headless-путь.
 # Список зафиксирован здесь не как пожелание, а как факт, замеренный по коду:
-# transition_after_agent_done не вызывает ни _surface_check, ни
+# ни диспетчер transition_after_agent_done, ни его обработчики не вызывают ни _surface_check, ни
 # finding_outcome, ни resolve_branch_tip, ни machine_review_gap, ни
 # ac_tests_gap. Headless-задача уезжает в ревью без сверки объявленной
 # области с диффом, без спроса об исходах находок прошлой сдачи, без правил
@@ -183,7 +183,19 @@ def test_the_headless_path_runs_none_of_the_submit_gates():
 
     from hub.services import orchestration
 
-    source = inspect.getsource(orchestration.transition_after_agent_done)
+    # Читается диспетчер И его обработчики. После #1067 тела веток живут в
+    # отдельных функциях, и чтение одного transition_after_agent_done дало бы
+    # зелёный тест по причине переезда кода, а не отсутствия гейтов — то есть
+    # ровно та тихая поломка стража, которую этот файл и должен исключать.
+    source = "".join(
+        inspect.getsource(fn)
+        for fn in (
+            orchestration.transition_after_agent_done,
+            orchestration._complete_without_review,
+            orchestration._route_after_done,
+            orchestration._deliver_completed_pair_task,
+        )
+    )
     markers = {
         "surfaces": "_surface_check",
         "finding_outcomes": "finding_outcome",
@@ -254,3 +266,50 @@ async def test_a_task_without_a_branch_report_passes_the_branch_gate(db):
 
     view = await lifecycle.submit_for_review(db, task.id)
     assert view.status == "review"
+
+
+# --------------------------------------------------------------------------
+# Регрессия рефакторинга, найденная на ревью PR #247
+# --------------------------------------------------------------------------
+
+
+def test_the_rules_mode_survives_a_skipped_step():
+    """Заголовок отчёта называет режим даже когда шаг по нему пропущен.
+
+    Регрессия выноса: присваивание ``rules_mode`` жило В ТЕЛЕ
+    ``_step_submit_rules``, а при ``SUBMIT_RULES=off`` шаг не выполняется
+    вовсе — заголовок выходил «режим правил: » с пустым местом там, где
+    раньше стояло ``off``. Режим политики существует всегда, даже когда шаг
+    по ней не запускается; это разные вещи.
+
+    Проверяется на контексте, а не на прогоне: значение обязано быть верным
+    ДО того, как конвейер решит, выполнять ли шаг.
+    """
+    from unittest.mock import patch
+
+    for mode in ("off", "warn", "require"):
+        with patch.object(lifecycle.config, "SUBMIT_RULES", mode):
+            state = lifecycle.SubmitContext(
+                db=None,  # type: ignore[arg-type]
+                task_id=1,
+                task={},
+                body=models.TaskSubmitReview(),
+            )
+            assert state.rules_mode == mode, (
+                f"при SUBMIT_RULES={mode} заголовок отчёта назвал бы "
+                f"{state.rules_mode!r}"
+            )
+
+
+def test_the_rules_mode_defaults_to_warn_when_the_policy_is_unset():
+    """Незаданная политика — warn: действующее правило хаба, не пустая строка."""
+    from unittest.mock import patch
+
+    with patch.object(lifecycle.config, "SUBMIT_RULES", ""):
+        state = lifecycle.SubmitContext(
+            db=None,  # type: ignore[arg-type]
+            task_id=1,
+            task={},
+            body=models.TaskSubmitReview(),
+        )
+    assert state.rules_mode == "warn"
