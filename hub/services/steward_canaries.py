@@ -43,6 +43,12 @@ FIXTURE_DIR = (
 MUST_NOT_APPROVE = "must_not_approve"
 MUST_NOT_ESCALATE = "must_not_escalate"
 
+# The closed vocabulary of the judgement contract (#1022). A canary is passed
+# only by a verdict FROM this set: "not approve" used to be enough, and it let
+# a third word — or an empty answer — satisfy every expectation at once. A
+# judge that did not judge must not read as a judge that judged well.
+VALID_VERDICTS: frozenset[str] = frozenset({"approve", "changes_requested", "escalate"})
+
 ORIGIN_STORED = "stored"
 ORIGIN_GENERATED = "generated"
 
@@ -171,12 +177,21 @@ def stored_canaries() -> list[Canary]:
     """
     out: list[Canary] = []
     if not FIXTURE_DIR.is_dir():
-        return out
+        # Loud, not empty. A set that quietly shrinks to nothing reports the
+        # same green as a set that passed — which is the failure mode this
+        # whole module exists to prevent, applied to itself.
+        raise FileNotFoundError(
+            f"канареек нет: каталог {FIXTURE_DIR} отсутствует — "
+            "набор не может молча сузиться до пустого"
+        )
     for path in sorted(FIXTURE_DIR.glob("*.json")):
         try:
             raw = json.loads(path.read_text())
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError(
+                f"канарейка {path.name} не читается: {exc}. Проверка, которая "
+                "не загрузилась, обязана назвать причину, а не исчезнуть"
+            ) from exc
         out.append(
             Canary(
                 name=raw.get("name") or path.stem,
@@ -213,11 +228,26 @@ def evaluate(canary: Canary, judgement: dict[str, Any]) -> CanaryResult:
     """
     verdict = (judgement.get("verdict") or "").strip()
     confidence = (judgement.get("confidence") or "").strip()
+    if verdict not in VALID_VERDICTS:
+        # No verdict, or a word outside the contract. This is NOT a catch:
+        # "not approve" is true of silence and of "banana" alike, and treating
+        # either as a pass made the whole set green for a judge that never
+        # judged. The write path answers 422 to the same input (#1022) — the
+        # harness must not be more forgiving than the contract it tests.
+        return CanaryResult(
+            canary=canary,
+            verdict=verdict,
+            caught=False,
+            detail=(
+                f"суждения нет: вердикт {verdict!r} вне закрытого словаря "
+                f"{sorted(VALID_VERDICTS)} — не судил, а не рассудил"
+            ),
+        )
     # low confidence IS an escalation by contract (#1022), so a judge hedging
     # its way to approve does not get credit for the word.
     effective = "escalate" if confidence == "low" else verdict
     if canary.expectation == MUST_NOT_APPROVE:
-        caught = effective != "approve"
+        caught = effective in {"changes_requested", "escalate"}
         return CanaryResult(
             canary=canary,
             verdict=effective,
@@ -227,14 +257,18 @@ def evaluate(canary: Canary, judgement: dict[str, Any]) -> CanaryResult:
             else f"одобрено при заложенном дефекте: {canary.planted}",
         )
     if canary.expectation == MUST_NOT_ESCALATE:
-        caught = effective != "escalate"
+        # Only approve passes a clean packet. changes_requested here is a
+        # false alarm, not caution: the fixture has nothing to fix, and a
+        # judge that returns work on it is as useless as one that approves
+        # everything — the failure this expectation exists to catch.
+        caught = effective == "approve"
         return CanaryResult(
             canary=canary,
             verdict=effective,
             caught=caught,
             detail=""
             if caught
-            else "эскалация на чистом пакете: набор проверяет способность "
+            else f"{effective} на чистом пакете: набор проверяет способность "
             "находить, а не склонность жаловаться",
         )
     raise ValueError(f"unknown expectation {canary.expectation!r}")

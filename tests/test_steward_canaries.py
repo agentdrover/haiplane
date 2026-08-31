@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from hub.services import steward_canaries as sc
 from hub.services.steward_canaries import (
     MUST_NOT_APPROVE,
     MUST_NOT_ESCALATE,
@@ -128,3 +131,72 @@ def test_low_confidence_approve_is_not_an_approval():
     clean = next(c for c in all_canaries() if c.expectation == MUST_NOT_ESCALATE)
     result = evaluate(clean, {"verdict": "approve", "confidence": "low"})
     assert not result.caught
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #1 (grok-4.6, отчёт 171)
+# ---------------------------------------------------------------------------
+
+
+def test_a_third_verdict_does_not_pass_the_whole_set():
+    """Всегда-changes_requested проходил весь набор — теперь нет.
+
+    Словарь суждения закрыт тремя словами (#1022), а ожидания были написаны
+    через отрицание: «не approve» и «не escalate». Третье слово удовлетворяло
+    обоим сразу, то есть судья, возвращающий работу ВСЕГДА, был неотличим от
+    внимательного — при том, что AC-2 существует ровно против такого отказа.
+    """
+    complainer = run_canaries(_always("changes_requested", confidence="high"))
+
+    assert not complainer.passed, "ложное срабатывание на чистом пакете — тоже промах"
+    assert {r.canary.name for r in complainer.missed} == {"clean_submission"}
+    assert "changes_requested" in complainer.report()
+
+
+def test_silence_is_not_a_catch():
+    """Молчание и слово вне словаря — «не судил», а не «рассудил».
+
+    На записи контракт отвечает на такое 422; харнесс не имеет права быть
+    снисходительнее того, что он проверяет.
+    """
+    for judgement in ({}, {"verdict": ""}, {"verdict": "banana"}):
+        run = run_canaries(lambda _facts, j=judgement: j)
+        assert not run.passed, f"{judgement!r} не должно проходить набор"
+        assert len(run.missed) == len(all_canaries()), "не пройдена НИ одна"
+        assert "вне закрытого словаря" in run.report()
+
+
+def test_a_broken_fixture_is_loud(tmp_path, monkeypatch):
+    """Битая фикстура называет себя, а не тихо сужает набор.
+
+    Раньше json.loads падал в continue: файл на месте, канарейки в наборе
+    нет, CI зелёный. Так проверка на «не смог посмотреть ≠ посмотрел и
+    чисто» (#762) могла исчезнуть незамеченной — та самая ошибка, ради
+    которой эта фикстура и лежит.
+    """
+    broken = tmp_path / "canaries"
+    broken.mkdir()
+    (broken / "unreadable_diff.json").write_text("{ это не json")
+    monkeypatch.setattr(sc, "FIXTURE_DIR", broken)
+
+    with pytest.raises(ValueError) as err:
+        stored_canaries()
+
+    assert "unreadable_diff.json" in str(err.value)
+
+    monkeypatch.setattr(sc, "FIXTURE_DIR", tmp_path / "нет-такого")
+    with pytest.raises(FileNotFoundError):
+        stored_canaries()
+
+
+def test_every_stored_fixture_is_named_by_the_set():
+    """Каждая хранимая фикстура доезжает до набора под своим именем.
+
+    Проверка есть в файле, но не в наборе — это проверка, которой нет.
+    """
+    on_disk = {p.stem for p in sc.FIXTURE_DIR.glob("*.json")}
+    loaded = {c.name for c in stored_canaries()}
+
+    assert on_disk, "хранимая часть набора не должна быть пустой"
+    assert loaded == on_disk, "фикстура на диске обязана быть в наборе"
+    assert "unreadable_diff" in loaded
