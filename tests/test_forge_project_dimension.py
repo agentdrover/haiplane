@@ -11,26 +11,65 @@ from hub.models import DEFAULT_FORGE, FORGES, ProjectCreate, ProjectPatch, TaskC
 from hub.services import project_policy
 
 
-async def test_migration_defaults_existing_projects_to_github(db):
-    """AC-1. Миграция описывает то, что уже есть, и ничего не меняет.
+async def test_migration_defaults_existing_projects_to_github(monkeypatch):
+    """AC-1. Строка, написанная ДО колонки, переживает её появление.
 
-    Проекты, заведённые до #1114, все на GitHub, и колонка обязана сказать
-    это за них. Значение, которое кто-то должен проставить задним числом, —
-    это не миграция, а незаполненное поле, о котором узнают на первой
-    доставке.
+    Порядок здесь и есть предмет проверки, и в первой редакции он был неверен:
+    тест вставлял строку в базу, где колонка уже существовала, и проверял
+    работу её DEFAULT. Это проверка SQLite, а не миграции. Настоящий путь
+    обновления другой — строки уже лежат, колонки ещё нет, — и только он
+    отвечает на вопрос AC-1: что станет с проектами на проде.
+
+    Приём взят у соседа по той же проблеме:
+    test_gate_policy_migration_preserves_projects (#743) — снять миграцию из
+    списка, мигрировать, вписать строку, вернуть список, мигрировать снова.
     """
-    # Строка, вставленная БЕЗ упоминания forge — ровно как её вставили бы до
-    # появления колонки.
-    await db.execute(
-        "INSERT INTO projects (slug, name, repo, default_branch) "
-        "VALUES ('legacy', 'Legacy', 'agentdrover/haiplane', 'develop')"
+    import aiosqlite
+
+    import hub.db as db_module
+    from hub.db import _MIGRATIONS, _SCHEMA, _migrate
+
+    trimmed = [m for m in _MIGRATIONS if m[0] != "add_projects_forge"]
+    assert len(trimmed) == len(_MIGRATIONS) - 1, (
+        "миграция переименована — почините тест"
     )
-    await db.commit()
 
-    row = await repo.get_project_by_slug(db, "legacy")
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", trimmed)
+        await _migrate(conn)
 
-    assert row["forge"] == "github"
-    assert project_policy.forge_of(row) == "github"
+        cols = {
+            r["name"]
+            for r in await conn.execute_fetchall("PRAGMA table_info(projects)")
+        }
+        assert "forge" not in cols, "колонки ещё нет — это и есть состояние 'до'"
+
+        await conn.execute(
+            "INSERT INTO projects (slug, name, repo, workspace_path, "
+            "default_branch, default_branch_policy, status) "
+            "VALUES ('legacy', 'Legacy', 'agentdrover/haiplane', '', "
+            "'develop', '{}', 'active')"
+        )
+        await conn.commit()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+
+        rows = await conn.execute_fetchall(
+            "SELECT slug, name, default_branch, forge FROM projects WHERE slug='legacy'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["forge"] == "github", "проект дозаполнен, а не оставлен пустым"
+        # И ничего кроме: миграция добавляет колонку, а не переписывает строку.
+        assert rows[0]["name"] == "Legacy"
+        assert rows[0]["default_branch"] == "develop"
+        assert project_policy.forge_of(rows[0]) == "github"
+    finally:
+        await conn.close()
 
 
 async def test_creating_a_project_without_saying_forge_puts_it_on_github(db):

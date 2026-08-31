@@ -29,7 +29,7 @@ from hub.mcp_envelope import (
     format_echo_response,
     merge_mutation_response,
 )
-from hub.models import AWAITING_HUMAN_STATUSES, FINAL_STATUSES
+from hub.models import AWAITING_HUMAN_STATUSES, DEFAULT_FORGE, FINAL_STATUSES
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
@@ -2392,9 +2392,15 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
     # Форж назван в строке рядом с repo (#1114): owner/name выглядит одинаково
     # на любом хостинге, и без этого слова строка не отвечает на вопрос «куда
     # именно поедет доставка».
+    #
+    # Через forge_of, а не через `p.get("forge") or "github"`: второе — вторая
+    # копия правила, и она расходится с первой на мусоре и на регистре. Задача
+    # #1114 держится ровно на том, что читатель один; копия здесь отменяла бы
+    # её собственную посылку.
+    from hub.services.project_policy import forge_of
+
     lines = [
-        f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'}"
-        f"@{p.get('forge') or 'github'} "
+        f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'}@{forge_of(p)} "
         f"| base={p.get('default_branch') or config.PAIR_BASE_BRANCH}"
         + (" [archived]" if p.get("archived") else "")
         for p in projects
@@ -3238,6 +3244,7 @@ async def hub_create_project(
     repo: str = "",
     workspace_path: str = "",
     default_branch: str = config.PAIR_BASE_BRANCH,
+    forge: str = DEFAULT_FORGE,
 ) -> str:
     """Create a project (#338). HUMAN-ONLY: projects define git routing;
     agent tokens receive human_only_gate.
@@ -3248,6 +3255,7 @@ async def hub_create_project(
         repo: GitHub owner/repo for PRs
         workspace_path: Server workspace clone path
         default_branch: Integration branch (defaults to the configured base)
+        forge: github or gitverse
     """
     body = {
         "slug": slug,
@@ -3255,6 +3263,7 @@ async def hub_create_project(
         "repo": repo,
         "workspace_path": workspace_path,
         "default_branch": default_branch,
+        "forge": forge,
     }
     try:
         result = await _api_post("/api/projects", body)
@@ -3270,6 +3279,7 @@ async def hub_propose_project(
     repo: str = "",
     workspace_path: str = "",
     default_branch: str = config.PAIR_BASE_BRANCH,
+    forge: str = DEFAULT_FORGE,
 ) -> str:
     """Propose a project (#345): created as PENDING until a human
     activates it — pending projects stay out of git routing.
@@ -3280,6 +3290,7 @@ async def hub_propose_project(
         repo: GitHub owner/repo
         workspace_path: Server workspace clone path
         default_branch: Integration branch
+        forge: github or gitverse
     """
     body = {
         "slug": slug,
@@ -3287,6 +3298,7 @@ async def hub_propose_project(
         "repo": repo,
         "workspace_path": workspace_path,
         "default_branch": default_branch,
+        "forge": forge,
     }
     try:
         result = await _api_post("/api/projects", body)

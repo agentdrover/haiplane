@@ -2601,6 +2601,27 @@ async def test_hub_list_projects(mock_api_get: AsyncMock) -> None:
     mock_api_get.assert_awaited_once_with("/api/projects")
 
 
+async def test_hub_list_projects_names_the_forge(mock_api_get: AsyncMock) -> None:
+    """#1114: строка ответа называет форж каждого проекта.
+
+    Проверяется ТЕКСТ, а не только структурная часть: структуру задаёт REST,
+    а текст — эта функция, и суффикс @forge можно было убрать, не покраснев
+    ни одним тестом. Форж читается через forge_of, поэтому мусор в поле
+    деградирует в github, а не печатается как есть.
+    """
+    mock_api_get.return_value = [
+        {"slug": "gv", "name": "GV", "repo": "mrpda/hub", "forge": "gitverse"},
+        {"slug": "gh", "name": "GH", "repo": "own/rep", "forge": "github"},
+        {"slug": "junk", "name": "Junk", "repo": "own/rep", "forge": "gitlab"},
+    ]
+    text = (await hub_list_projects()).content[0].text
+
+    assert "repo=mrpda/hub@gitverse" in text
+    assert "repo=own/rep@github" in text
+    # Мусор в колонке не печатается как факт — читатель у форжа один.
+    assert "@gitlab" not in text
+
+
 async def test_deprecated_alias_marks_and_counts(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:

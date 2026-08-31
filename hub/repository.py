@@ -23,6 +23,7 @@ from hub.db import (
 )
 from hub.models import (
     AWAITING_HUMAN_STATUSES,
+    DEFAULT_FORGE,
     FINAL_STATUSES,
     IN_FLIGHT_STATUSES,
     QUEUED_STATUSES,
@@ -636,7 +637,7 @@ async def create_project(
     default_branch: str = config.PAIR_BASE_BRANCH,
     default_branch_policy: str = "{}",
     status: str = "active",
-    forge: str = "github",
+    forge: str = DEFAULT_FORGE,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO projects (slug, name, repo, workspace_path, "
