@@ -1690,6 +1690,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         ")",
     ),
     (
+        # #1105: which cloud run is carrying this order. Empty means nobody
+        # started it yet — that is what makes starting at-most-once possible
+        # without a second table.
+        "add_steward_runs_agent_id",
+        "ALTER TABLE steward_runs ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_steward_runs_run_id",
+        "ALTER TABLE steward_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
+    ),
+    (
         "idx_steward_runs_open",
         "CREATE INDEX IF NOT EXISTS idx_steward_runs_open "
         "ON steward_runs(status, deadline_at)",

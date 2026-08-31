@@ -147,6 +147,11 @@ STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
 # implementer's and from the reviewer's. Declared on the order so the
 # diversity rule has something to check before the run starts.
 STEWARD_MODEL = env_get("STEWARD_MODEL", "gpt-5.3-codex")
+# The hub token the steward run authenticates with (#1105). Same shape as
+# CURSOR_REVIEWER_HUB_TOKEN: the run reaches the hub's own MCP as the steward
+# principal, whose allowlist is two operations (#1021). Unset means no run —
+# a steward that cannot read the packet has nothing to judge.
+STEWARD_HUB_TOKEN = env_get("STEWARD_HUB_TOKEN", "")
 # Cursor Cloud Agents API (#756): the server-side executor for cross-model
 # reviews. Empty key = the integration is off and every client method
 # degrades to None without a network call. The key comes from the Cursor

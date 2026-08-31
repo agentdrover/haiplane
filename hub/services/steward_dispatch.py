@@ -327,6 +327,15 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
 
 
 async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
-    """One poller pass: close what is over, then order what is due."""
+    """One poller pass: close what is over, order what is due, start what waits.
+
+    Starting comes last on purpose. Closing first frees the daily budget of a
+    slot that is already over, and ordering before starting means an order
+    placed this tick is executed in the same pass rather than thirty seconds
+    later — the judge is cheap to call and expensive to keep waiting.
+    """
+    from hub.services.steward_shadow import start_due_runs
+
     await close_finished_runs(db)
     await order_due_runs(db)
+    await start_due_runs(db)
