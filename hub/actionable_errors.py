@@ -912,3 +912,30 @@ def steward_run_required_detail(task_id: int, generation: int) -> dict[str, Any]
             "suggested_tool": None,
         }
     )
+
+
+def steward_generation_pin_detail(
+    task_id: int, pinned: int, asked: int | None
+) -> dict[str, Any]:
+    """A steward session reached for a generation it was not minted for (#1120).
+
+    The pin is the whole reason the code is task-bound AND generation-bound:
+    a resubmission during a live run must leave that run judging the code it
+    was ordered to judge, not whatever landed since.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_generation_mismatch",
+            "actor_hint": "none",
+            "message": (
+                f"сессия стюарда выдана на генерацию {pinned} задачи {task_id}, "
+                f"а запрошена {asked}"
+            ),
+            "hint": (
+                "Код привязан к задаче И генерации. Пересдача не расширяет "
+                "права живого прогона — она делает его суждение неактуальным."
+            ),
+            "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )

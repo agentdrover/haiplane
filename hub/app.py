@@ -116,6 +116,7 @@ from hub.actionable_errors import (
     chat_pair_run_forbidden_detail,
     chat_pair_task_not_open_detail,
     human_only_gate_detail,
+    steward_generation_pin_detail,
     steward_run_required_detail,
 )
 from hub.auth import (
@@ -2030,11 +2031,30 @@ async def api_steward_evidence(
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
-    asked = (
-        generation
-        if generation is not None
-        else (dict(row).get("submission_generation") or 0 if row else 0)
+    # #1120 review: the session's pin is not decoration. A code minted for
+    # generation N must not read the packet of generation N+1 — otherwise a
+    # resubmission hands a live run evidence about code it was never ordered
+    # to judge, and the judgement it files describes the wrong submission.
+    # The session wins over the query parameter: a caller may ask, the pin
+    # decides.
+    pinned = (
+        identity.chat_pair_generation
+        if getattr(identity, "chat_pair_kind", None) == "steward"
+        else None
     )
+    if pinned is not None:
+        if generation is not None and int(generation) != int(pinned):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=steward_generation_pin_detail(task_id, pinned, generation),
+            )
+        asked = int(pinned)
+    else:
+        asked = (
+            generation
+            if generation is not None
+            else (dict(row).get("submission_generation") or 0 if row else 0)
+        )
     if identity.is_steward and not await services.steward_open_run_exists(
         db, task_id, asked
     ):
@@ -2067,7 +2087,15 @@ async def api_steward_judgement(
     the judgement is F4.
     """
     return await services.record_steward_judgement(
-        _db(request), task_id, body, identity
+        _db(request),
+        task_id,
+        body,
+        identity,
+        expected_generation=(
+            identity.chat_pair_generation
+            if getattr(identity, "chat_pair_kind", None) == "steward"
+            else None
+        ),
     )
 
 

@@ -135,11 +135,27 @@ async def issue_code(
     """
     kind = (kind or "intake").strip().lower() or "intake"
     if kind in config.CHAT_PAIR_TASK_BOUND_KINDS:
-        await db.execute(
-            "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
-            "AND bound_task_id = ? AND redeemed_at IS NULL",
-            (principal_id, kind, bound_task_id),
-        )
+        # #1120 review: burn is scoped to the GENERATION too, when there is
+        # one. Without it, minting a code for generation N+1 killed the
+        # unused code of a run already flying for generation N — a
+        # resubmission mid-run disarmed a paid agent, which then reached the
+        # door with a dead code and could only wait out its deadline.
+        #
+        # Same bucket, same generation: two live codes for one submission
+        # remain impossible, which is what burning is for.
+        if bound_generation is not None:
+            await db.execute(
+                "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+                "AND bound_task_id = ? AND bound_generation = ? "
+                "AND redeemed_at IS NULL",
+                (principal_id, kind, bound_task_id, bound_generation),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+                "AND bound_task_id = ? AND redeemed_at IS NULL",
+                (principal_id, kind, bound_task_id),
+            )
     else:
         await db.execute(
             "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "

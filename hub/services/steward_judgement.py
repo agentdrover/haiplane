@@ -10,6 +10,7 @@ from hub import repository as repo
 from hub.actionable_errors import (
     steward_closed_vocabulary_detail,
     steward_escalate_reason_required_detail,
+    steward_generation_pin_detail,
     steward_judgement_exists_detail,
     steward_unknown_finding_uid_detail,
     steward_verdict_required_detail,
@@ -46,11 +47,25 @@ async def record_steward_judgement(
     task_id: int,
     body: StewardJudgementSubmit,
     identity: TokenIdentity,
+    expected_generation: int | None = None,
 ) -> StewardJudgementView:
-    """Validate and store a judgement. The task status is not touched."""
+    """Validate and store a judgement. The task status is not touched.
+
+    ``expected_generation`` is the pin the caller's session carries (#1120).
+    When it is set, a judgement about any other generation is refused: a run
+    ordered for one submission does not get to rule on the next one just
+    because the author resubmitted while it was thinking.
+    """
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
+    if expected_generation is not None and body.generation != expected_generation:
+        raise HTTPException(
+            403,
+            detail=steward_generation_pin_detail(
+                task_id, expected_generation, body.generation
+            ),
+        )
 
     submitted_verdict = (body.verdict or "").strip()
     if not submitted_verdict:

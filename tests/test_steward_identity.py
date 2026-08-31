@@ -210,3 +210,131 @@ async def test_a_steward_session_is_not_a_human(db: aiosqlite.Connection, monkey
     with pytest.raises(HTTPException) as gate:
         require_human_or_admin(request)
     assert gate.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #1 (grok, отчёт 180)
+# ---------------------------------------------------------------------------
+
+
+async def _live_session(db, monkeypatch, task_id: int, generation: int) -> str:
+    """Настоящий путь: минт → обмен → токен. Ни одного вычеканенного вручную."""
+    block = await sh.identity_delivery(db, task_id, generation, "https://hub.example")
+    assert block, "канал обязан выдать код"
+    code = re.search(r'"code":"([^"]+)"', block).group(1)
+    session = await chat_pair.redeem_code(db, code)
+    assert session is not None
+    return session["token"]
+
+
+async def test_the_pin_is_read_not_just_written(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Сессия генерации 1 не судит генерацию 2 (находка high).
+
+    Привязка была построена и нигде не читалась: код помнил генерацию, а
+    двери её не спрашивали. Проверяется ИСПОЛНЕНИЕМ — живой минт, живой
+    обмен, живой HTTP, — потому что тот же класс дефекта на #1084 пережил
+    два круга ревью именно как «привязка есть, чтения нет».
+    """
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # Автор пересдал, пока прогон думал.
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    alien = await client.get(
+        f"/api/tasks/{task_id}/steward-evidence?generation=2", headers=auth
+    )
+    assert alien.status_code == 403, alien.text
+    assert alien.json()["detail"]["reason"] == "steward_generation_mismatch"
+
+    # И суждение о чужой генерации не принимается тем же кодом.
+    filed = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers=auth,
+        json={
+            "generation": 2,
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+        },
+    )
+    assert filed.status_code == 403, filed.text
+    assert filed.json()["detail"]["reason"] == "steward_generation_mismatch"
+
+
+async def test_a_new_mint_does_not_disarm_a_live_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Минт для генерации 2 не гасит неиспользованный код генерации 1.
+
+    Пересдача во время прогона обезоруживала оплаченного агента: его код
+    сгорал в чужом минте, и он доходил до двери с мёртвым ключом — умирал по
+    дедлайну, не сказав ничего.
+    """
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+
+    first = await sh.identity_delivery(db, task_id, 1, "https://hub.example")
+    code_one = re.search(r'"code":"([^"]+)"', first).group(1)
+
+    # Пересдача: хаб заказывает прогон на новую генерацию и минтит свой код.
+    second = await sh.identity_delivery(db, task_id, 2, "https://hub.example")
+    code_two = re.search(r'"code":"([^"]+)"', second).group(1)
+    assert code_two != code_one
+
+    still_alive = await chat_pair.redeem_code(db, code_one)
+    assert still_alive is not None, "код живого прогона обязан пережить чужой минт"
+    identity = await chat_pair.resolve_session(db, still_alive["token"])
+    assert identity.chat_pair_generation == 1
+
+
+async def test_two_codes_for_one_generation_still_impossible(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Сужение по генерации не отменяет саму цель гашения.
+
+    Два живых кода на ОДНУ сдачу — это две двери в один пакет; ровно от
+    этого гашение и защищает, и оно осталось на месте.
+    """
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+
+    first = await sh.identity_delivery(db, task_id, 1, "https://hub.example")
+    code_one = re.search(r'"code":"([^"]+)"', first).group(1)
+    again = await sh.identity_delivery(db, task_id, 1, "https://hub.example")
+    code_two = re.search(r'"code":"([^"]+)"', again).group(1)
+
+    assert code_two != code_one
+    assert await chat_pair.redeem_code(db, code_one) is None, "старый код сгорел"
+    assert await chat_pair.redeem_code(db, code_two) is not None
+
+
+async def test_the_pinned_session_reads_its_own_generation(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Своя генерация читается, и запроса даже не требуется.
+
+    Пин — не только запрет: он же и ответ на вопрос «какую сдачу судить».
+    Иначе прогон обязан был бы угадывать номер, а угадывание тут стоит
+    суждения о чужом коде.
+    """
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+
+    packet = await client.get(
+        f"/api/tasks/{task_id}/steward-evidence",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert packet.status_code == 200, packet.text
+    assert packet.json()["generation"] == 1
