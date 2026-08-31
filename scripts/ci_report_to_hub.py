@@ -375,18 +375,24 @@ def run_validation(
     """
     if not commands:
         return "skipped", "", "у задачи нет validation_commands"
-    prose = [c for c in commands if not is_command(c)]
-    if prose:
-        return (
-            "unknown",
-            "",
-            "не запускались: среди validation_commands есть записи, "
-            f"которые не являются командами ({len(prose)} из {len(commands)}), "
-            f"например {prose[0][:120]!r}",
-        )
     ran = ran or {}
     logs: list[str] = []
+    not_commands: list[str] = []
+    executed = 0
     for cmd in commands:
+        # #1103: judged ENTRY BY ENTRY. Prose still never reaches a shell —
+        # that requirement (#546) is why this check exists at all: handed to a
+        # shell, a sentence exits non-zero and the gate reads "validation
+        # failed" about work that is fine. What changed is the blast radius.
+        # The check used to sit BEFORE the loop and return for the whole list,
+        # so one note written for a human suppressed every real command beside
+        # it — measured on #1077, whose two entries begin with a real `gh` and
+        # continue in prose: the step took 2s and nothing ran at all.
+        if not is_command(cmd):
+            not_commands.append(cmd)
+            logs.append(f"$ {cmd}\n[не команда: не исполнялась]")
+            log(f"validation {cmd[:120]!r}: not a command — not executed")
+            continue
         proven = already_proven(cmd, ran)
         if proven is not None:
             outcome, by = proven
@@ -397,6 +403,9 @@ def run_validation(
             logs.append(
                 f"$ {cmd}\n[not re-run: this job already ran {by!r} → {outcome}]"
             )
+            # A reused outcome is EXECUTED evidence, not a skipped entry: the
+            # job ran it, this process merely declined to run it twice (#1081).
+            executed += 1
             if outcome == "fail":
                 return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
             continue
@@ -411,9 +420,25 @@ def run_validation(
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return "unknown", "\n".join(logs)[-_LOG_TAIL:], f"команда прервана: {exc}"
+        executed += 1
         logs.append(f"$ {cmd}\n{proc.stdout}{proc.stderr}")
         if proc.returncode != 0:
             return "fail", "\n".join(logs)[-_LOG_TAIL:], f"команда упала: {cmd}"
+    if not_commands:
+        # Partial execution is NOT a pass. The vocabulary the hub accepts is
+        # pass | fail | unknown | skipped, and `unknown` is the only honest
+        # member here: some entries were never checked, so the list as a whole
+        # proves nothing — even though everything runnable in it passed. The
+        # reason says both halves, because "unknown" alone would hide that the
+        # real commands did run and did pass.
+        shown = ", ".join(repr(c[:80]) for c in not_commands[:3])
+        more = f" и ещё {len(not_commands) - 3}" if len(not_commands) > 3 else ""
+        return (
+            "unknown",
+            "\n".join(logs)[-_LOG_TAIL:],
+            f"исполнено и прошло {executed} из {len(commands)}; "
+            f"не являются командами ({len(not_commands)}): {shown}{more}",
+        )
     return "pass", "\n".join(logs)[-_LOG_TAIL:], ""
 
 
