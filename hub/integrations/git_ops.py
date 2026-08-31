@@ -1,13 +1,15 @@
-"""Git + GitHub operations for Hub branching workflow.
+"""Git operations for the Hub branching workflow, plus the forge they pair with.
 
 Local git operations run against the workspace repo (config.WORKSPACE_REPO_LINK).
-GitHub operations use the ``gh`` CLI (config.GH_BIN).
+Everything that is asked of the REPOSITORY HOST rather than of git — pull
+requests, CI outcomes, merges — goes through ``protocols.ForgePlugin`` (#1113).
+Until then those nineteen methods called ``gh`` here directly, and "which
+forge" was spread across nineteen call sites with no place to plug a second
+one in.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import re
 import socket
@@ -19,23 +21,24 @@ from hub.actionable_errors import (
     pair_branch_dirty_detail,
     pair_worktree_dirty_detail,
 )
-from hub.config import GH_BIN, PAIR_BASE_BRANCH, REPO_NAME, WORKSPACE_REPO_LINK
+from hub.config import PAIR_BASE_BRANCH
+from hub.integrations import proc
+from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
-    CIProbeOutcome,
     CIProbeResult,
+    ForgePlugin,
     MergeabilityOutcome,
 )
 from hub.mcp_envelope import enrich_error_payload
 
 from hub import git_policy
 from hub.commit_scope import parse_porcelain_paths
-from hub.process_kill import kill_process_group
 
 log = logging.getLogger(__name__)
 
 # Exit code for a killed-on-timeout command: the shell convention, and distinct
 # from any rc git itself returns, so a caller can tell a timeout from a refusal.
-_TIMEOUT_RC = 124
+_TIMEOUT_RC = proc.TIMEOUT_RC
 
 
 class WorkspaceNotReadyError(Exception):
@@ -109,11 +112,23 @@ class PairBranchConflictError(Exception):
 # ---------------------------------------------------------------------------
 
 
+# Тонкие обёртки над общим слоем запуска процессов (#1113). Именно обёртки, а
+# не присваивание `_run = proc.run`: присваивание захватывает объект функции, и
+# тогда подмена `proc.run` этот модуль уже не затрагивает — сема ломается
+# ровно там, где её и проверяют. Обёртка ищет `proc.run` в момент вызова, так
+# что работают обе точки подмены.
+
+
 def _repo_root() -> str:
-    p = WORKSPACE_REPO_LINK
-    if p.is_symlink():
-        p = p.resolve()
-    return str(p)
+    return proc.repo_root()
+
+
+def _git_env() -> dict[str, str]:
+    return proc.git_env()
+
+
+async def _run(*cmd: str, **kw) -> tuple[int, str, str]:
+    return await proc.run(*cmd, **kw)
 
 
 def _hostname() -> str:
@@ -455,66 +470,9 @@ def _conv_commit_type(title: str) -> str:
     return "feat"
 
 
-def _git_env() -> dict[str, str]:
-    """Build env dict with SSH key for GitHub push."""
-    import os
-    from pathlib import Path
-
-    env = os.environ.copy()
-    ssh_key = Path.home() / ".ssh" / "id_ed25519"
-    if ssh_key.exists():
-        env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o StrictHostKeyChecking=accept-new"
-    # #377: anonymous https against a private repo must fail fast, not hang
-    # waiting for credentials on a headless server.
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
-
-async def _run(
-    *cmd: str,
-    cwd: str | None = None,
-    timeout: int = 60,
-    check: bool = True,
-) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        env=_git_env(),
-        # Required by kill_process_group: without its own session the child
-        # shares the hub's process group, and the group kill below would refuse
-        # to fire (killing our own group would take the hub down with it).
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (TimeoutError, asyncio.TimeoutError):
-        # #363 I5. This used to propagate. The poller wraps its entire tick in
-        # one try/except, so a single hung git call skipped every remaining
-        # stage of that tick — review, ci_check, stale sweeps, claim expiry —
-        # and did so again every tick until the cause went away. Worse, the
-        # child survived: asyncio cancels the read, not the process.
-        await kill_process_group(proc)
-        detail = f"timed out after {timeout}s: {' '.join(cmd[:4])}"
-        log.error("_run: %s", detail)
-        return _TIMEOUT_RC, "", detail
-    rc = proc.returncode or 0
-    out = stdout.decode(errors="replace").strip()
-    err = stderr.decode(errors="replace").strip()
-    if check and rc != 0:
-        log.warning("%s failed (rc=%d): %s", " ".join(cmd[:4]), rc, err)
-    return rc, out, err
-
-
 async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
     repo = repo or _repo_root()
     return await _run("git", "-C", repo, *args, cwd=repo, **kw)
-
-
-async def _gh(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
-    repo = repo or _repo_root()
-    return await _run(GH_BIN, *args, cwd=repo, **kw)
 
 
 async def _reject_broken_files(repo: str) -> list[str]:
@@ -624,11 +582,6 @@ async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     return None
 
 
-def _parse_pr_number(gh_output: str) -> int | None:
-    m = re.search(r"/pull/(\d+)", gh_output)
-    return int(m.group(1)) if m else None
-
-
 def _resolve_base(base_branch: str | None) -> str:
     """The base a task's work is cut from AND its PR targets (#362 I4).
 
@@ -643,40 +596,22 @@ def _resolve_base(base_branch: str | None) -> str:
     return base_branch or PAIR_BASE_BRANCH
 
 
-async def _find_pr_for_branch(
-    branch: str, repo: str | None = None, *, gh_repo: str | None = None
-) -> int | None:
-    rc, out, _ = await _gh(
-        "pr",
-        "list",
-        "--repo",
-        gh_repo or REPO_NAME,
-        "--head",
-        branch,
-        "--state",
-        "open",
-        "--json",
-        "number",
-        repo=repo,
-        check=False,
-    )
-    if rc == 0 and out:
-        try:
-            prs = json.loads(out)
-            if prs:
-                return prs[0]["number"]
-        except (json.JSONDecodeError, KeyError, IndexError):
-            pass
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
 
 
 class GitOpsIntegration:
-    """Concrete git_ops plugin backed by local git + gh CLI."""
+    """Concrete git_ops plugin: local git here, the repository host behind a forge.
+
+    ``forge`` is an attribute rather than a module-level singleton so a
+    project on another host can be given its own adapter without touching a
+    single call site (#1112). Today every project is on GitHub, so the
+    default is the GitHub adapter and nothing observable changes.
+    """
+
+    def __init__(self, forge: ForgePlugin | None = None) -> None:
+        self.forge: ForgePlugin = forge or GitHubForge()
 
     async def current_branch(self, repo: str | None = None) -> str:
         rc, out, _ = await _git("branch", "--show-current", repo=repo, check=False)
@@ -2047,34 +1982,14 @@ class GitOpsIntegration:
             f"{description or 'No description'}\n\n"
             "---\n*Created automatically by Haiplane Hub*"
         )
-
-        rc, out, err = await _gh(
-            "pr",
-            "create",
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--base",
-            _resolve_base(base_branch),
-            "--head",
-            branch,
-            "--title",
+        return await self.forge.create_pr(
             pr_title,
-            "--body",
             body,
+            branch,
+            _resolve_base(base_branch),
             repo=repo,
-            check=False,
-            timeout=30,
+            gh_repo=gh_repo,
         )
-        if rc != 0:
-            if "already exists" in err:
-                return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
-            log.error("Failed to create PR for %s: %s", branch, err)
-            return None
-
-        pr_number = _parse_pr_number(out)
-        if pr_number:
-            log.info("Created PR #%d for branch %s", pr_number, branch)
-        return pr_number
 
     async def get_ci_failure_logs(
         self,
@@ -2084,249 +1999,8 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"failed_checks": [], "log_summary": "", "run_url": ""}
-
-        rc, out, _ = await _gh(
-            "pr",
-            "checks",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "name,state",
-            repo=repo,
-            check=False,
-        )
-        if rc == 0 and out:
-            try:
-                checks = json.loads(out)
-                result["failed_checks"] = [
-                    c["name"]
-                    for c in checks
-                    if c.get("state", "").upper()
-                    in ("FAILURE", "ERROR", "ACTION_REQUIRED")
-                ]
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        rc, out, _ = await _gh(
-            "run",
-            "list",
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--branch",
-            branch,
-            "--limit",
-            "1",
-            "--json",
-            "databaseId,url,status",
-            repo=repo,
-            check=False,
-        )
-        run_id = None
-        if rc == 0 and out:
-            try:
-                runs = json.loads(out)
-                if runs:
-                    run_id = runs[0].get("databaseId")
-                    result["run_url"] = runs[0].get("url", "")
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass
-
-        if run_id:
-            rc, out, _ = await _gh(
-                "run",
-                "view",
-                str(run_id),
-                "--repo",
-                gh_repo or REPO_NAME,
-                "--log-failed",
-                repo=repo,
-                check=False,
-                timeout=90,
-            )
-            if rc == 0 and out:
-                if len(out) > max_log_chars:
-                    out = out[-max_log_chars:]
-                    out = "... (truncated) ...\n" + out
-                result["log_summary"] = out
-
-        return result
-
-    async def _repo_has_workflows(
-        self, *, repo: str | None, gh_repo: str | None
-    ) -> bool | None:
-        """Whether the repository defines any Actions workflow (#1041).
-
-        Called only on the branch that used to return ``absent``: empty
-        ``gh pr checks`` or empty ``actions/runs?head_sha=``. A working
-        probe never pays this extra GitHub call.
-        """
-        rc, out, _err = await _gh(
-            "api",
-            f"repos/{gh_repo or REPO_NAME}/actions/workflows",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            return None
-        try:
-            payload = json.loads(out)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        workflows = payload.get("workflows")
-        if isinstance(workflows, list) and workflows:
-            return True
-        try:
-            return int(payload.get("total_count") or 0) > 0
-        except (TypeError, ValueError):
-            return None
-
-    async def _pr_head_sha(
-        self, pr_number: int, *, repo: str | None, gh_repo: str | None
-    ) -> str:
-        rc, out, _err = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "headRefOid",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            return ""
-        try:
-            return str(json.loads(out).get("headRefOid") or "").strip()
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            return ""
-
-    async def _absent_or_missing_run(
-        self,
-        pr_number: int,
-        reason: str,
-        *,
-        repo: str | None,
-        gh_repo: str | None,
-        sha: str = "",
-    ) -> CIProbeResult:
-        """Split 'no CI in the repo' from 'this SHA has no run yet' (#1041)."""
-        has = await self._repo_has_workflows(repo=repo, gh_repo=gh_repo)
-        if has is None:
-            return CIProbeResult(CIProbeOutcome.unavailable, "workflows_unavailable")
-        if not has:
-            return CIProbeResult(CIProbeOutcome.absent, reason)
-        if not sha:
-            sha = await self._pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
-        return CIProbeResult(CIProbeOutcome.missing_run, reason, details=sha or None)
-
-    async def _workflow_runs_probe(
-        self, pr_number: int, repo: str | None, gh_repo: str | None
-    ) -> CIProbeResult:
-        """CI verdict from Actions workflow runs, by the PR's head SHA (#606).
-
-        The primary probe (``gh pr checks``) needs ``checks:read`` — a
-        permission GitHub removed from the fine-grained token picker while
-        the API still demands it (verified 2026-08-03: the picker's search
-        for "check" answers "No items available", the API answers 403). This
-        path uses only permissions a token can actually be granted: Pull
-        requests (headRefOid) and Actions (workflow runs).
-
-        The mapping is conservative — unknown is never ok: an unrecognised
-        conclusion reads as unavailable, not as passed. A workflow's
-        conclusion is GitHub's own aggregate over its jobs, so skipped jobs
-        (Deploy on a PR) are already accounted for.
-        """
-        rc, out, err = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "headRefOid",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            return CIProbeResult(
-                CIProbeOutcome.unavailable,
-                "workflow_runs_unavailable",
-                details=f"could not read headRefOid: {(err or '').strip()}",
-            )
-        try:
-            head_sha = str(json.loads(out).get("headRefOid") or "").strip()
-        except json.JSONDecodeError:
-            head_sha = ""
-        if not head_sha:
-            return CIProbeResult(
-                CIProbeOutcome.unavailable,
-                "workflow_runs_unavailable",
-                details="PR carries no readable headRefOid",
-            )
-
-        rc, out, err = await _gh(
-            "api",
-            f"repos/{gh_repo or REPO_NAME}/actions/runs?head_sha={head_sha}",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            return CIProbeResult(
-                CIProbeOutcome.unavailable,
-                "workflow_runs_unavailable",
-                details=(err or "").strip(),
-            )
-        try:
-            runs = json.loads(out).get("workflow_runs") or []
-        except (json.JSONDecodeError, AttributeError):
-            return CIProbeResult(
-                CIProbeOutcome.unavailable, "workflow_runs_invalid_json"
-            )
-
-        # No runs for this SHA used to mean "the repository has no CI"
-        # (#419). That collapsed two facts: no workflows at all, and
-        # workflows that have not yet produced a run for this commit.
-        if not runs:
-            return await self._absent_or_missing_run(
-                pr_number,
-                "no_workflow_runs",
-                repo=repo,
-                gh_repo=gh_repo,
-                sha=head_sha,
-            )
-
-        statuses = [str(r.get("status") or "").lower() for r in runs]
-        conclusions = [str(r.get("conclusion") or "").lower() for r in runs]
-        if any(
-            s in ("queued", "in_progress", "waiting", "requested", "pending")
-            for s in statuses
-        ):
-            return CIProbeResult(CIProbeOutcome.pending, "workflow_runs_running")
-        if any(
-            c
-            in (
-                "failure",
-                "cancelled",
-                "timed_out",
-                "startup_failure",
-                "action_required",
-            )
-            for c in conclusions
-        ):
-            return CIProbeResult(CIProbeOutcome.failed, "workflow_runs_failed")
-        if all(s == "completed" for s in statuses) and all(
-            c in ("success", "neutral", "skipped") for c in conclusions
-        ):
-            return CIProbeResult(CIProbeOutcome.passed, "workflow_runs_passed")
-        return CIProbeResult(
-            CIProbeOutcome.unavailable,
-            "workflow_runs_unknown_state",
-            details=",".join(sorted(set(conclusions) | set(statuses))),
+        return await self.forge.ci_failure_logs(
+            pr_number, branch, max_log_chars, repo=repo, gh_repo=gh_repo
         )
 
     async def branch_ci_runs(
@@ -2336,104 +2010,14 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
-        """Push runs on ``branch``, newest first — or None if unreadable (#929).
-
-        The PR probe above asks about one commit; this asks about the branch's
-        own history, which is what says whether the BASE is green right now
-        and, if not, which commits arrived since it last was.
-
-        None rather than an empty list when the question could not be asked:
-        "no runs" and "could not look" lead to opposite conclusions, and the
-        caller must not be able to confuse them by accident (#725).
-        """
-        rc, out, err = await _gh(
-            "api",
-            f"repos/{gh_repo or REPO_NAME}/actions/runs"
-            f"?branch={branch}&event=push&per_page={max(1, min(limit, 100))}",
-            repo=repo,
-            check=False,
+        return await self.forge.branch_ci_runs(
+            branch, limit, repo=repo, gh_repo=gh_repo
         )
-        if rc != 0 or not (out or "").strip():
-            log.warning(
-                "branch CI history for %s unavailable: %s", branch, (err or "").strip()
-            )
-            return None
-        try:
-            runs = json.loads(out).get("workflow_runs")
-        except (json.JSONDecodeError, AttributeError):
-            log.warning("branch CI history for %s: invalid json", branch)
-            return None
-        if runs is None:
-            return None
-        return [
-            {
-                "sha": str(r.get("head_sha") or ""),
-                "status": str(r.get("status") or "").lower(),
-                "conclusion": str(r.get("conclusion") or "").lower(),
-                "created_at": str(r.get("created_at") or ""),
-                "name": str(r.get("name") or ""),
-            }
-            for r in runs
-        ]
 
     async def check_pr_ci(
         self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult:
-        rc, out, err = await _gh(
-            "pr",
-            "checks",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "name,state",
-            repo=repo,
-            check=False,
-        )
-        # rc error / empty output — the probe itself could not run. Before
-        # answering "unavailable", try the workflow-runs fallback (#606): the
-        # primary path needs checks:read, which GitHub's token picker no
-        # longer offers while the API still demands it. A WORKING primary
-        # path never reaches this line, so its behaviour is untouched.
-        if rc != 0 or not out or not out.strip():
-            fallback = await self._workflow_runs_probe(pr_number, repo, gh_repo)
-            if fallback.outcome != CIProbeOutcome.unavailable:
-                return fallback
-            # Both paths failed: name the primary error — it is the one an
-            # operator can act on (#419: not pending, nothing known in flight).
-            return CIProbeResult(
-                CIProbeOutcome.unavailable,
-                "gh_error",
-                details=(err or "").strip() or fallback.details,
-            )
-        try:
-            checks = json.loads(out)
-        except json.JSONDecodeError:
-            return CIProbeResult(CIProbeOutcome.unavailable, "invalid_json")
-
-        # An empty check set used to skip the conveyor. It is still "no
-        # checks", but if the repo has workflows this SHA simply has no run
-        # yet — GitHub's registration lag, not "there is nothing to check".
-        if not checks:
-            return await self._absent_or_missing_run(
-                pr_number, "no_checks", repo=repo, gh_repo=gh_repo
-            )
-
-        states = [c.get("state", "").upper() for c in checks]
-        if any(
-            s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "")
-            for s in states
-        ):
-            return CIProbeResult(CIProbeOutcome.pending, "checks_running")
-        if any(s in ("FAILURE", "ERROR", "ACTION_REQUIRED") for s in states):
-            return CIProbeResult(CIProbeOutcome.failed, "checks_failed")
-        if all(s in ("SUCCESS", "NEUTRAL", "SKIPPED") for s in states):
-            return CIProbeResult(CIProbeOutcome.passed, "checks_passed")
-        # Reached only for states gh reports that we do not recognise — treat as
-        # unavailable (a stable reason) rather than silently waiting.
-        return CIProbeResult(
-            CIProbeOutcome.unavailable, "unknown_state", details=",".join(states)
-        )
+        return await self.forge.check_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def pr_for_branch(
         self,
@@ -2448,7 +2032,7 @@ class GitOpsIntegration:
         sets. Discovery at submission time closes that: the hub looks the PR
         up itself instead of asking anyone to remember a number.
         """
-        return await _find_pr_for_branch(branch, repo, gh_repo=gh_repo)
+        return await self.forge.pr_for_branch(branch, repo=repo, gh_repo=gh_repo)
 
     async def content_differs(
         self,
@@ -2518,61 +2102,22 @@ class GitOpsIntegration:
     ) -> tuple[MergeabilityOutcome, str]:
         """Can this PR be merged, and if not, why (#970).
 
-        The release asked GitHub one question before merging — is CI green —
-        and learned the rest by being refused. On 26.08.2026 PR #83 answered
-        both at once: «Ruff and pytest» pass 4m2s, and mergeable=CONFLICTING.
-        The poller called ``merge_pr`` every cycle, was refused every cycle,
-        and reported «GitHub отказал» — a sentence that names who said no.
-        A conflict, a revoked token and a deleted base branch all produce it,
-        and none of them is fixed the same way.
-
-        UNKNOWN is passed through as itself rather than folded into a
-        conflict. GitHub computes mergeability asynchronously and honestly
-        says UNKNOWN for the first seconds of a pull request's life — the
-        release PR the poller just opened is exactly that case, every time.
-        The next cycle asks again, the same way it already does for CI.
+        The forge answers the outcome; the FILES of a conflict come from the
+        clone, because only git can name them. The 409 a forge returns names
+        nothing, and a reason has to lead somewhere — #969 already reads them
+        out of the clone, so this is the same question with the same answer,
+        not a second one.
         """
-        rc, out, err = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "mergeable,mergeStateStatus",
-            repo=repo,
-            check=False,
+        outcome, detail = await self.forge.pr_mergeability(
+            pr_number, repo=repo, gh_repo=gh_repo
         )
-        if rc != 0 or not (out or "").strip():
-            detail = (err or "").strip() or "gh молчит"
-            return (MergeabilityOutcome.unavailable, detail[:200])
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return (MergeabilityOutcome.unavailable, "ответ gh не разобран")
-
-        mergeable = str(data.get("mergeable") or "").upper()
-        state = str(data.get("mergeStateStatus") or "").upper()
-        if mergeable == "MERGEABLE":
-            return (MergeabilityOutcome.mergeable, state.lower() or "mergeable")
-        if mergeable == "CONFLICTING":
-            # The 409 GitHub would answer names no files, and the reason has
-            # to lead somewhere. #969 already reads them out of the clone —
-            # the same question, so the same answer, not a second one.
-            files = await self._conflicting_files_of_pr(
-                pr_number, repo=repo, gh_repo=gh_repo
-            )
-            named = f": {', '.join(files)}" if files else ""
-            return (
-                MergeabilityOutcome.conflicting,
-                f"конфликт с базовой веткой{named}",
-            )
-        if mergeable == "UNKNOWN" or not mergeable:
-            return (
-                MergeabilityOutcome.unknown,
-                f"GitHub ещё не посчитал слияние ({state.lower() or 'без статуса'})",
-            )
-        return (MergeabilityOutcome.unavailable, f"нераспознанный ответ {mergeable}")
+        if outcome is not MergeabilityOutcome.conflicting:
+            return (outcome, detail)
+        files = await self._conflicting_files_of_pr(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
+        named = f": {', '.join(files)}" if files else ""
+        return (MergeabilityOutcome.conflicting, f"конфликт с базовой веткой{named}")
 
     async def _conflicting_files_of_pr(
         self,
@@ -2587,25 +2132,7 @@ class GitOpsIntegration:
         branch names come from the PR itself, so this works for a task PR as
         well as for the release one.
         """
-        rc, out, _ = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "baseRefName,headRefName",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            return []
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        base = str(data.get("baseRefName") or "").strip()
-        head = str(data.get("headRefName") or "").strip()
+        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
         if not base or not head:
             return []
         return await self._conflicting_files(head, base, repo=repo)
@@ -2636,49 +2163,22 @@ class GitOpsIntegration:
         worth of them collided in ``hub/db.py`` and release PR #83 stood
         conflicted with 13 tasks undelivered.
 
-        Asks GitHub to do the merge rather than driving the workspace clone.
-        The clone is shared, may sit on someone else's branch with a dirty
-        tree, and carries an armed pre-push hook — three ways for a
-        bookkeeping merge to damage work in progress (#949 was one of them).
-        The merges endpoint has no such surface: it answers 201 with the new
-        commit, 204 when there is nothing to merge, 409 on a conflict.
+        The merge itself is the forge's job — the clone is shared, may sit on
+        someone else's branch with a dirty tree, and carries an armed pre-push
+        hook (#949). Naming the conflicting files is git's job, and stays here.
         """
-        if not gh_repo and not REPO_NAME:
-            return ("unavailable", "не названо, в каком репозитории возвращать")
-        rc, out, err = await _gh(
-            "api",
-            "--method",
-            "POST",
-            f"repos/{gh_repo or REPO_NAME}/merges",
-            "-f",
-            f"base={head}",
-            "-f",
-            f"head={base}",
-            "-f",
-            f"commit_message=chore: return {base} into {head} after the release",
+        state, detail = await self.forge.merge_branches(
+            head,
+            base,
+            f"chore: return {base} into {head} after the release",
             repo=repo,
-            check=False,
+            gh_repo=gh_repo,
         )
-        if rc == 0:
-            # 204 — «уже содержит», и gh печатает пустоту. Это ответ, а не
-            # промах: возвращать нечего.
-            body = (out or "").strip()
-            if not body:
-                return ("nothing", f"{head} уже содержит {base}")
-            try:
-                sha = str(json.loads(body).get("sha") or "").strip()
-            except json.JSONDecodeError:
-                return ("unavailable", f"ответ GitHub не разобран: {body[:150]}")
-            if not sha:
-                return ("unavailable", "GitHub не назвал коммит возврата")
-            return ("returned", sha)
-
-        detail = (err or "").strip() or "gh молчит"
-        if "409" in detail or "conflict" in detail.lower():
-            files = await self._conflicting_files(base, head, repo=repo)
-            named = f": {', '.join(files)}" if files else ""
-            return ("conflict", f"{base} не сливается с {head} без конфликта{named}")
-        return ("unavailable", detail[:200])
+        if state != "conflict":
+            return (state, detail)
+        files = await self._conflicting_files(base, head, repo=repo)
+        named = f": {', '.join(files)}" if files else ""
+        return ("conflict", f"{base} не сливается с {head} без конфликта{named}")
 
     async def _conflicting_files(
         self, base: str, head: str, repo: str | None = None
@@ -2733,31 +2233,8 @@ class GitOpsIntegration:
         read back out. Empty means nothing to release — or that git could not
         answer, and the caller treats those the same way it treats an empty
         range: by doing nothing.
-
-        The subject is cut by JQ, not here (#963). Asking for the whole
-        message and splitting the reply by lines counts LINES, not commits:
-        jq prints a multi-line string as multiple output lines, so one commit
-        with a body arrived as as many "commits" as it had lines. Release PR
-        #40 listed 25 items — Co-authored-by among them — for a single commit,
-        and #44 claimed four tasks for three: a squash message repeats the
-        branch commit's subject, which also ends in «(#NNN)», so the number
-        was counted twice.
-
-        One output line = one commit is a contract, and it holds only while
-        the cut happens in the query: commit boundaries cannot be recovered
-        from concatenated text by anything but guessing.
         """
-        rc, out, _ = await _gh(
-            "api",
-            f"repos/{gh_repo or REPO_NAME}/compare/{base}...{head}",
-            "--jq",
-            '.commits[].commit.message | split("\n")[0]',
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not out:
-            return []
-        return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
+        return await self.forge.compare_subjects(base, head, repo=repo, gh_repo=gh_repo)
 
     async def undelivered_release_range(
         self,
@@ -2826,48 +2303,10 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> int | None:
-        """The open release PR for this range — found, updated, or created.
-
-        Idempotent on purpose (#812 AC-5): two sessions can deliver within
-        seconds of each other, and a second pull request over the same range
-        would split one release into two stories about the same commits.
-        """
-        existing = await _find_pr_for_branch(head, repo, gh_repo=gh_repo)
-        if existing:
-            await _gh(
-                "pr",
-                "edit",
-                str(existing),
-                "--repo",
-                gh_repo or REPO_NAME,
-                "--title",
-                title,
-                "--body",
-                body,
-                repo=repo,
-                check=False,
-            )
-            return existing
-        rc, out, err = await _gh(
-            "pr",
-            "create",
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--base",
-            base,
-            "--head",
-            head,
-            "--title",
-            title,
-            "--body",
-            body,
-            repo=repo,
-            check=False,
+        """The open release PR for this range — found, updated, or created."""
+        return await self.forge.open_or_update_pr(
+            base, head, title, body, repo=repo, gh_repo=gh_repo
         )
-        if rc != 0:
-            log.warning("release PR not created: %s", (err or out or "").strip()[:200])
-            return None
-        return _parse_pr_number(out)
 
     async def pr_state(
         self,
@@ -2877,41 +2316,12 @@ class GitOpsIntegration:
     ) -> str:
         """Where this PR stands: "open", "merged", "closed", "absent", or "".
 
-        Empty means the question could not be asked — no gh, no network, an
+        Empty means the question could not be asked — no forge, no network, an
         unreadable answer. The caller treats that as a cause to report, never
         as an answer: "could not look" and "closed" lead to opposite decisions
         about delivery (#802, the rule #725 wrote down).
-
-        "absent" is the fourth answer (#959), and it is an ANSWER: the number
-        is not in the project's repository. Until it had a name it arrived as
-        "" — the same value a blinking network produces — so the gate kept
-        waiting for CI on a PR that cannot exist. That is not hypothetical: a
-        project that moved between repositories carries numbers from the old
-        one, and on #880 the gate offered to wait for a green CI forever.
         """
-        # One field, and it is the whole answer: gh reports MERGED as a STATE,
-        # and there is no `merged` flag to ask for. Asking for one made the
-        # call fail outright ("Unknown JSON field"), so this method returned
-        # "could not look" every single time and the gate it feeds quietly
-        # fell back to the old behaviour (#803, found on the first live run).
-        rc, out, _ = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "state",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not out:
-            return await self._pr_absent_or_unknown(pr_number, repo, gh_repo)
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return ""
-        return str(data.get("state") or "").lower()
+        return await self.forge.pr_state(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def pr_is_draft(
         self,
@@ -2919,38 +2329,12 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool:
-        """Whether GitHub still treats this PR as a draft (#1053).
+        """Whether the forge still treats this PR as a draft (#1053).
 
-        A Cloud Agent opens PRs as drafts by default. Hub ``create_pr`` never
-        does. ``gh pr merge`` refuses a draft with the same boolean
-        ``merge_pr`` already returns for a conflict or a revoked token, and
-        that boolean used to send the task to ``needs_decision``. False here
-        means "not a draft or could not look" — same #498 rule as the other
-        readers: silence is not an accusation, and the merge call still runs.
+        False means "not a draft or could not look" — the #498 rule: silence
+        is not an accusation, and the merge call still runs.
         """
-        rc, out, err = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "isDraft",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            log.info(
-                "PR #%d draft probe unavailable: %s",
-                pr_number,
-                (err or "gh молчит").strip()[:200],
-            )
-            return False
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return False
-        return bool(data.get("isDraft"))
+        return await self.forge.pr_is_draft(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def mark_pr_ready(
         self,
@@ -2959,56 +2343,7 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
     ) -> bool:
         """Convert a draft PR to ready. Hub approval is the ready signal (#1053)."""
-        rc, _, err = await _gh(
-            "pr",
-            "ready",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            repo=repo,
-            check=False,
-        )
-        if rc == 0:
-            log.info("Marked PR #%d ready", pr_number)
-            return True
-        log.warning(
-            "Failed to mark PR #%d ready: %s",
-            pr_number,
-            (err or "").strip()[:200],
-        )
-        return False
-
-    async def _pr_absent_or_unknown(
-        self, pr_number: int, repo: str | None, gh_repo: str | None
-    ) -> str:
-        """Tell "no such PR here" from "could not ask", or "" (#959).
-
-        Asked ONLY after ``gh pr view`` has already failed, so the working path
-        pays nothing for it. Deliberately a second question rather than a
-        different first one: the comment above remembers #803, where changing
-        what pr_state asks broke the reading of MERGED for every PR. The cheap
-        answer keeps its transport; only the failure gets a follow-up.
-
-        The signal is the REST status in the response body, not a substring of
-        gh's prose — error text drifts between versions, a 404 does not. A
-        missing repository answers 404 too, and that is correct: "not reachable
-        as this project's PR" is the same decision either way.
-        """
-        rc, out, _ = await _gh(
-            "api",
-            f"repos/{gh_repo or REPO_NAME}/pulls/{pr_number}",
-            repo=repo,
-            check=False,
-        )
-        if rc == 0:
-            # The REST call answered where the GraphQL one did not. Nothing is
-            # claimed from that: the state is read by the caller's next pass.
-            return ""
-        try:
-            body = json.loads(out or "{}")
-        except json.JSONDecodeError:
-            return ""
-        return "absent" if str(body.get("status") or "") == "404" else ""
+        return await self.forge.mark_pr_ready(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def merge_commit_sha(
         self,
@@ -3023,30 +2358,7 @@ class GitOpsIntegration:
         write the intruder into the whitelist and mark the real merge as
         drift. The pull request knows its own merge commit, so ask it.
         """
-        rc, out, err = await _gh(
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--json",
-            "mergeCommit",
-            repo=repo,
-            check=False,
-        )
-        if rc != 0 or not (out or "").strip():
-            log.warning(
-                "could not read the merge commit of PR #%d: %s",
-                pr_number,
-                (err or "").strip(),
-            )
-            return ""
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            log.warning("PR #%d returned no readable merge commit", pr_number)
-            return ""
-        return str((data.get("mergeCommit") or {}).get("oid") or "").strip()
+        return await self.forge.merge_commit_sha(pr_number, repo=repo, gh_repo=gh_repo)
 
     async def merge_pr(
         self,
@@ -3062,38 +2374,20 @@ class GitOpsIntegration:
         Deleting the head is right for a task PR — short-lived branches, the
         repository's own rule. But this one call served the RELEASE PR too,
         whose head is the project's integration branch: every auto-release of
-        24–25.08 deleted develop, three times in two days, and the repo's
-        delete_branch_on_merge=false proves it was us, not GitHub. The default
-        stays True so the task path is untouched; the release path passes
-        False, because a release must not remove the branch work lands on.
+        24–25.08 deleted develop, three times in two days. The default stays
+        True so the task path is untouched; the release path passes False,
+        because a release must not remove the branch work lands on.
         """
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
         subject = f"{ctype}(task): {slug} (#{task_id})"
-
-        args = [
-            "pr",
-            "merge",
-            str(pr_number),
-            "--repo",
-            gh_repo or REPO_NAME,
-            "--squash",
-            "--admin",
-        ]
-        if delete_branch:
-            args.append("--delete-branch")
-        args += ["--subject", subject]
-        rc, _, err = await _gh(
-            *args,
+        return await self.forge.merge_pr(
+            pr_number,
+            subject,
+            delete_branch=delete_branch,
             repo=repo,
-            check=False,
-            timeout=30,
+            gh_repo=gh_repo,
         )
-        if rc == 0:
-            log.info("Merged PR #%d (squash, admin)", pr_number)
-            return True
-        log.error("Failed to merge PR #%d: %s", pr_number, err)
-        return False
 
     async def delete_branch(
         self,

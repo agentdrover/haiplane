@@ -29,7 +29,7 @@ def git_ops() -> GitOpsIntegration:
 
 async def test_create_pr_uses_pair_base_branch(git_ops: GitOpsIntegration) -> None:
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "https://github.com/org/repo/pull/99\n", ""),
     ) as mock_gh:
@@ -135,7 +135,7 @@ async def test_clone_repo_public_https_no_key(tmp_path):
         calls.append(" ".join(cmd))
         return (0, "", "")
 
-    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+    with patch("hub.integrations.proc.run", side_effect=fake_run):
         ok, detail = await GitOpsIntegration().clone_repo(
             "mrPDA/pub-repo", str(tmp_path / "ws"), "main"
         )
@@ -158,7 +158,7 @@ async def test_clone_repo_private_falls_back_to_ssh(tmp_path):
             return (128, "", "fatal: could not read Username")
         return (0, "", "")
 
-    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+    with patch("hub.integrations.proc.run", side_effect=fake_run):
         ok, detail = await GitOpsIntegration().clone_repo(
             "mrPDA/priv-repo", str(tmp_path / "ws"), "master"
         )
@@ -176,7 +176,7 @@ async def test_clone_repo_both_transports_fail_lists_reasons(tmp_path):
             return (128, "", "could not read Username")
         return (128, "", "Permission denied (publickey)")
 
-    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+    with patch("hub.integrations.proc.run", side_effect=fake_run):
         ok, detail = await GitOpsIntegration().clone_repo(
             "mrPDA/locked", str(tmp_path / "ws")
         )
@@ -195,7 +195,7 @@ async def test_clone_repo_explicit_url_untouched(tmp_path):
         calls.append(" ".join(cmd))
         return (0, "", "")
 
-    with patch("hub.integrations.git_ops._run", side_effect=fake_run):
+    with patch("hub.integrations.proc.run", side_effect=fake_run):
         ok, _ = await GitOpsIntegration().clone_repo(
             "git@gitlab.local:team/x.git", str(tmp_path / "ws")
         )
@@ -233,11 +233,11 @@ async def test_pair_prepare_branch_readable_error_without_workspace(
     # not a raw 'not a git repository' traceback.
     from pathlib import Path
 
-    import hub.integrations.git_ops as git_ops_module
+    import hub.integrations.proc as proc_module
     from hub.integrations.git_ops import GitOpsIntegration, PairBranchConflictError
 
     monkeypatch.setattr(
-        git_ops_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "empty-dir")
+        proc_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "empty-dir")
     )
     (tmp_path / "empty-dir").mkdir()
 
@@ -249,10 +249,10 @@ async def test_pair_prepare_branch_readable_error_without_workspace(
 async def test_create_branch_readable_error_without_workspace(monkeypatch, tmp_path):
     from pathlib import Path
 
-    import hub.integrations.git_ops as git_ops_module
+    import hub.integrations.proc as proc_module
     from hub.integrations.git_ops import GitOpsIntegration
 
-    monkeypatch.setattr(git_ops_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "nope"))
+    monkeypatch.setattr(proc_module, "WORKSPACE_REPO_LINK", Path(tmp_path / "nope"))
     branch = await GitOpsIntegration().create_branch(2, "Another task")
     assert branch == ""  # degraded, no exception
 
@@ -312,7 +312,7 @@ async def test_check_pr_ci_typed_outcomes(
         }
     else:
         gh_patch = {"new_callable": AsyncMock, "return_value": (rc, out, err)}
-    with patch("hub.integrations.git_ops._gh", **gh_patch):
+    with patch("hub.integrations.forge.github._gh", **gh_patch):
         result = await git_ops.check_pr_ci(42)
     assert result.outcome.value == expected_outcome
     assert result.reason == expected_reason
@@ -332,7 +332,7 @@ async def test_check_pr_ci_targets_project_repo(git_ops: GitOpsIntegration, gh_r
     from hub.config import REPO_NAME
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, '[{"name": "CI", "state": "SUCCESS"}]', ""),
     ) as mock_gh:
@@ -347,7 +347,7 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
     # AC-2/AC-3 (#420): merge targets the resolved project repo and workspace,
     # never the global default.
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "", ""),
     ) as mock_gh:
@@ -362,7 +362,7 @@ async def test_merge_pr_targets_project_repo(git_ops: GitOpsIntegration):
 
 async def test_pr_is_draft_reads_isDraft(git_ops: GitOpsIntegration) -> None:
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, '{"isDraft": true}', ""),
     ) as mock_gh:
@@ -375,7 +375,7 @@ async def test_pr_is_draft_treats_silence_as_not_a_draft(
     git_ops: GitOpsIntegration,
 ) -> None:
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(1, "", "gh: Not Found"),
     ):
@@ -384,7 +384,7 @@ async def test_pr_is_draft_treats_silence_as_not_a_draft(
 
 async def test_mark_pr_ready_calls_gh_pr_ready(git_ops: GitOpsIntegration) -> None:
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "", ""),
     ) as mock_gh:
@@ -417,7 +417,7 @@ async def test_merge_commit_sha_reads_the_pr_not_the_branch(
     and leaves the real merge to be reported as drift.
     """
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(rc, out, "boom"),
     ) as mock_gh:
@@ -434,7 +434,7 @@ async def test_merge_commit_sha_reads_the_pr_not_the_branch(
 async def test_get_ci_failure_logs_targets_project_repo(git_ops: GitOpsIntegration):
     # AC-2 (#420): failure-log lookup also uses the project repo.
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "[]", ""),
     ) as mock_gh:
@@ -1935,7 +1935,7 @@ async def test_ci_probe_falls_back_to_workflow_runs(git_ops: GitOpsIntegration):
     the workflow runs for the same head SHA are green. The probe must answer
     passed — and say which path answered."""
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(1, "", "GraphQL: Resource not accessible by personal access token"),
             view=(0, '{"headRefOid": "pr-head-oid-stand-in"}', ""),
@@ -1970,7 +1970,7 @@ async def test_workflow_fallback_maps_every_outcome(git_ops: GitOpsIntegration):
         if runs_payload == '{"workflow_runs": []}':
             extra["workflows"] = (0, _workflows_json(count=0), "")
         with patch(
-            "hub.integrations.git_ops._gh",
+            "hub.integrations.forge.github._gh",
             side_effect=_gh_router(
                 checks=(1, "", "denied"),
                 view=(0, '{"headRefOid": "abc"}', ""),
@@ -1987,7 +1987,7 @@ async def test_workflow_fallback_maps_every_outcome(git_ops: GitOpsIntegration):
 
 async def test_double_failure_stays_unavailable(git_ops: GitOpsIntegration):
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(1, "", "primary down"),
             view=(1, "", "fallback down too"),
@@ -2015,7 +2015,7 @@ async def test_fallback_is_not_consulted_when_checks_work(
         assert args[0] == "pr" and args[1] == "checks", f"fallback consulted: {args}"
         return (0, '[{"name": "CI", "state": "SUCCESS"}]', "")
 
-    with patch("hub.integrations.git_ops._gh", side_effect=only_checks):
+    with patch("hub.integrations.forge.github._gh", side_effect=only_checks):
         result = await git_ops.check_pr_ci(7)
 
     assert result.outcome == CIProbeOutcome.passed
@@ -2042,7 +2042,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
     sha = "pr-head-oid-stand-in"
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(0, "[]", ""),
             view=(0, json.dumps({"headRefOid": sha}), ""),
@@ -2059,7 +2059,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
     assert listed, "empty checks must list workflows to tell the two absents apart"
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(0, "[]", ""),
             view=(0, json.dumps({"headRefOid": sha}), ""),
@@ -2071,7 +2071,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
     assert waiting.details == sha
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(1, "", "denied"),
             view=(0, json.dumps({"headRefOid": sha}), ""),
@@ -2084,7 +2084,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
     assert via_runs.details == sha
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         side_effect=_gh_router(
             checks=(1, "", "denied"),
             view=(0, json.dumps({"headRefOid": sha}), ""),
@@ -2103,7 +2103,7 @@ async def test_probe_separates_no_workflows_from_no_run_for_sha(
             return (0, '[{"name": "CI", "state": "SUCCESS"}]', "")
         raise AssertionError(f"extra GitHub call on a working checks path: {args}")
 
-    with patch("hub.integrations.git_ops._gh", side_effect=only_checks):
+    with patch("hub.integrations.forge.github._gh", side_effect=only_checks):
         green = await git_ops.check_pr_ci(7)
     assert green.outcome == CIProbeOutcome.passed
     assert calls == [("pr", "checks")]
@@ -2119,7 +2119,7 @@ async def test_merge_subject_is_not_empty_for_cyrillic_titles(
     — a fully Cyrillic title slugged to the empty string exactly when commit
     subjects started being written by the hub rather than a human."""
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "", ""),
     ) as mock_gh:
@@ -2142,7 +2142,7 @@ async def test_ascii_slugs_are_unchanged(git_ops: GitOpsIntegration):
     assert _slugify("Weird  spacing -- and_punct!!") == "weird-spacing-and-punct"
 
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new_callable=AsyncMock,
         return_value=(0, "", ""),
     ) as mock_gh:
@@ -2240,7 +2240,7 @@ async def test_pr_state_asks_gh_only_for_fields_it_has(
         seen["args"] = args
         return 0, '{"state":"OPEN"}', ""
 
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=fake_gh)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=fake_gh)):
         await git_ops.pr_state(360, gh_repo="owner/repo")
 
     args = seen["args"]
@@ -2265,7 +2265,7 @@ async def test_pr_state_reads_the_three_states_gh_returns(
 ) -> None:
     """Real gh output, verified by hand on PRs #362 (open), #360, #358."""
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new=AsyncMock(return_value=(0, payload, "")),
     ):
         assert await git_ops.pr_state(1, gh_repo="owner/repo") == expected
@@ -2282,7 +2282,7 @@ async def test_pr_state_reads_the_three_states_gh_returns(
 async def test_pr_state_says_it_could_not_look(
     git_ops: GitOpsIntegration, answer: tuple
 ) -> None:
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(return_value=answer)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(return_value=answer)):
         assert await git_ops.pr_state(1, gh_repo="owner/repo") == "", (
             "an unanswerable question stays unanswered — 'could not look' and "
             "'closed' lead to opposite delivery decisions"
@@ -2326,7 +2326,7 @@ async def test_pr_state_reports_a_pr_absent_from_the_repository(
         view=(1, "", "GraphQL: Could not resolve to a PullRequest with the number"),
         api=(1, _NOT_FOUND_BODY, "gh: Not Found (HTTP 404)"),
     )
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=route)):
         assert await git_ops.pr_state(472, gh_repo="agentdrover/haiplane") == "absent"
 
 
@@ -2339,7 +2339,7 @@ async def test_pr_state_keeps_could_not_look_when_the_cause_is_not_a_404(
         view=(1, "", "dial tcp: connect: connection refused"),
         api=(1, "", "dial tcp: connect: connection refused"),
     )
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=route)):
         assert await git_ops.pr_state(472, gh_repo="agentdrover/haiplane") == ""
 
 
@@ -2347,7 +2347,7 @@ async def test_pr_state_does_not_pay_for_a_second_question_when_the_first_answer
     git_ops: GitOpsIntegration,
 ) -> None:
     route, seen = _pr_probe(view=(0, '{"state":"OPEN"}', ""))
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=route)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=route)):
         assert await git_ops.pr_state(360, gh_repo="owner/repo") == "open"
 
     assert seen["api"] == 0, "уточняющий вопрос задаётся только на пути отказа"
@@ -2408,7 +2408,7 @@ async def test_release_range_returns_one_subject_per_commit(
     # Два коммита в диапазоне — два элемента. До починки их было пять: строки
     # тела и Co-authored-by считались коммитами.
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new=AsyncMock(side_effect=_gh_compare_double()),
     ):
         subjects = await git_ops.release_range(
@@ -2428,7 +2428,7 @@ async def test_release_body_gets_one_task_id_per_commit(
     # стык. Номер, упомянутый в теле второй раз, приезжал вторым элементом
     # списка задач — так PR #44 насчитал четыре задачи при трёх реальных.
     with patch(
-        "hub.integrations.git_ops._gh",
+        "hub.integrations.forge.github._gh",
         new=AsyncMock(side_effect=_gh_compare_double()),
     ):
         subjects = await git_ops.release_range("main", "develop")
@@ -2450,13 +2450,13 @@ async def test_release_range_is_empty_on_refusal_or_empty_range(
     async def refused(*args, **kwargs):
         return 1, "", "gh: could not compare"
 
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=refused)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=refused)):
         assert await git_ops.release_range("main", "develop") == []
 
     async def empty(*args, **kwargs):
         return 0, "", ""
 
-    with patch("hub.integrations.git_ops._gh", new=AsyncMock(side_effect=empty)):
+    with patch("hub.integrations.forge.github._gh", new=AsyncMock(side_effect=empty)):
         assert await git_ops.release_range("main", "develop") == []
 
 
@@ -2631,3 +2631,105 @@ async def test_branch_diff_still_returns_none_when_the_branch_is_nowhere(
     diff = await git_ops.branch_diff(workspace, "develop", "task-1055/never-pushed")
 
     assert diff is None, "unknown ref stays unreadable, never an empty diff"
+
+
+# ---------------------------------------------------------------------------
+# Форж как отдельный плагин (#1113): делегирование без смены поведения
+# ---------------------------------------------------------------------------
+
+
+async def test_github_behaviour_unchanged() -> None:
+    """AC-1. git_ops больше не зовёт gh сам — и ничего этим не меняет.
+
+    Проверяется не «делегирует», а «делегирует ТО ЖЕ». Рефакторинг объявлен
+    наблюдаемо пустым, и дешевле всего его провалить, отдав форжу чуть другие
+    аргументы: базу по умолчанию вместо проектной, заголовок без номера
+    задачи, subject без слага. Всё это выглядит как работающий код.
+    """
+    forge = AsyncMock()
+    forge.create_pr.return_value = 42
+    forge.merge_pr.return_value = True
+    ops = GitOpsIntegration(forge=forge)
+
+    pr = await ops.create_pr(
+        1113,
+        "Форж списком",
+        "тело",
+        "task-1113/forge-plugin",
+        repo="/ws/proj",
+        gh_repo="owner/repo",
+        base_branch="develop",
+    )
+
+    assert pr == 42
+    title, body, branch, base = forge.create_pr.await_args.args
+    # Заголовок и тело собирает git_ops — это формат хаба, а не форжа.
+    assert title == "feat(task): Форж списком (#1113)"
+    assert "## Task #1113" in body and "тело" in body
+    assert branch == "task-1113/forge-plugin"
+    assert base == "develop", "база берётся из проекта, а не из умолчания форжа"
+    assert forge.create_pr.await_args.kwargs == {
+        "repo": "/ws/proj",
+        "gh_repo": "owner/repo",
+    }
+
+    await ops.merge_pr(7, 1113, "Форж списком", gh_repo="owner/repo")
+    number, subject = forge.merge_pr.await_args.args
+    assert number == 7
+    assert subject == "feat(task): forzh-spiskom (#1113)"
+    assert forge.merge_pr.await_args.kwargs["delete_branch"] is True
+
+
+async def test_git_ops_no_longer_calls_the_gh_cli() -> None:
+    """Ни одного вызова gh не осталось в git_ops — иначе форж обходится.
+
+    Не стилистика: пока хоть один вызов идёт мимо плагина, проект на другом
+    хостинге пойдёт по нему в GitHub и получит ответ про чужой репозиторий.
+    """
+    source = Path("hub/integrations/git_ops.py").read_text(encoding="utf-8")
+    assert "_gh(" not in source
+    assert "GH_BIN" not in source
+
+
+async def test_conflicting_files_are_named_by_git_not_by_the_forge() -> None:
+    """Форж отвечает «конфликт», имена файлов добавляет клон — и текст тот же.
+
+    Разрез проходит здесь потому, что 409 от форжа не называет ни одного
+    файла, а причина обязана вести куда-то (#970). Если бы имена собирал
+    форж, второй адаптер тащил бы свою копию работы с клоном.
+    """
+    from hub.integrations.protocols import MergeabilityOutcome
+
+    forge = AsyncMock()
+    forge.pr_mergeability.return_value = (
+        MergeabilityOutcome.conflicting,
+        "конфликт с базовой веткой",
+    )
+    forge.pr_refs.return_value = ("develop", "task-1113/forge-plugin")
+    ops = GitOpsIntegration(forge=forge)
+
+    with patch.object(
+        GitOpsIntegration, "_conflicting_files", AsyncMock(return_value=["hub/db.py"])
+    ):
+        outcome, detail = await ops.check_pr_mergeable(83, repo="/ws/proj")
+
+    assert outcome is MergeabilityOutcome.conflicting
+    assert detail == "конфликт с базовой веткой: hub/db.py"
+
+
+async def test_unknown_mergeability_still_is_not_a_conflict() -> None:
+    """#970 в новой форме: unknown проходит насквозь и файлов не ищет."""
+    from hub.integrations.protocols import MergeabilityOutcome
+
+    forge = AsyncMock()
+    forge.pr_mergeability.return_value = (
+        MergeabilityOutcome.unknown,
+        "GitHub ещё не посчитал слияние (unknown)",
+    )
+    ops = GitOpsIntegration(forge=forge)
+
+    outcome, detail = await ops.check_pr_mergeable(84, repo="/ws/proj")
+
+    assert outcome is MergeabilityOutcome.unknown
+    assert "не посчитал" in detail
+    forge.pr_refs.assert_not_awaited()

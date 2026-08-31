@@ -387,6 +387,135 @@ class GitOpsPlugin(Protocol):
 
 
 @runtime_checkable
+class ForgePlugin(Protocol):
+    """Всё, что хаб спрашивает не у git, а у хостинга репозитория (#1113).
+
+    До этого протокола форж не был объявлен нигде: девятнадцать методов
+    ``git_ops`` звали ``gh`` напрямую, и «какой хостинг» было размазано по
+    девятнадцати местам. Подключить второй (GitVerse, #1112) можно было
+    только вторым набором ветвлений внутри и без того трёхтысячестрочного
+    файла.
+
+    Граница проведена по вопросу, а не по транспорту: форж отвечает
+    ``CIProbeResult`` и ``MergeabilityOutcome``, а не сырым JSON. Это не
+    вкусовщина. У GitHub исход CI собирается из двух источников (``gh pr
+    checks`` и запуски Actions, #606), у GitVerse источник один и без поля
+    ``conclusion``. Отдавай форж сырьё — и разбор его формы всё равно
+    расползётся по вызывающим, вместе с семантикой #419, которую там будет
+    некому защитить.
+
+    Чистый git сюда не входит вовсе: ветки, коммиты, диффы, worktree —
+    это ``GitOpsPlugin``, и форжу они безразличны.
+
+    ``repo`` — локальный клон, из которого делается вызов (для gh это
+    рабочий каталог); ``gh_repo`` — сам репозиторий в форже, ``owner/name``.
+    """
+
+    #: Машинное имя форжа: попадает в диагностику, чтобы отказ называл, КТО
+    #: отказал, а не только что отказали.
+    name: str
+
+    async def create_pr(
+        self,
+        title: str,
+        body: str,
+        branch: str,
+        base: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None: ...
+    async def pr_for_branch(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> int | None: ...
+    async def open_or_update_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None: ...
+    async def pr_state(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str: ...
+    async def pr_is_draft(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool: ...
+    async def mark_pr_ready(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool: ...
+    async def pr_head_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str: ...
+    # Базовая и головная ветки PR — нужны, чтобы НАЗВАТЬ файлы конфликта.
+    # Сами файлы ищет git на стороне git_ops: форж их не знает, а ответ
+    # «конфликт» без имён файлов — это причина, которая никуда не ведёт.
+    async def pr_refs(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[str, str]: ...
+    async def pr_mergeability(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[MergeabilityOutcome, str]: ...
+    async def merge_commit_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str: ...
+    async def merge_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        delete_branch: bool = True,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool: ...
+    async def check_pr_ci(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult: ...
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None: ...
+    async def ci_failure_logs(
+        self,
+        pr_number: int,
+        branch: str,
+        max_log_chars: int = 12000,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any]: ...
+    async def has_workflows(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool | None: ...
+    async def compare_subjects(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]: ...
+    # Слить ``from_branch`` в ``into_branch`` силами форжа.
+    # ``(returned <sha> | nothing | conflict | unavailable, detail)``.
+    async def merge_branches(
+        self,
+        into_branch: str,
+        from_branch: str,
+        message: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]: ...
+
+
+@runtime_checkable
 class GitHubPlugin(Protocol):
     async def recent_commits(self, limit: int = 10) -> list[dict[str, Any]]: ...
     async def open_prs(self) -> list[dict[str, Any]]: ...
