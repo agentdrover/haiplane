@@ -368,6 +368,28 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
                 else None
             ),
         )
+    if kind == "steward":
+        # #1120: the steward run authenticates the same way the reviewer does
+        # since #1084 — Cursor drops mcpServers, so the header never arrives
+        # and a one-time code in the prompt is the only channel that does.
+        #
+        # Role and permissions come from the STEWARD side, not from chat-pair:
+        # the session is the steward principal reaching the hub by another
+        # road, not a new kind of actor with its own rights (#1021).
+        return TokenIdentity(
+            username=row["issuer_username"],
+            role="steward",
+            principal_id=row["principal_id"],
+            permissions=config.STEWARD_PERMS,
+            auth_source="chat_pair",
+            chat_pair_kind="steward",
+            chat_pair_task_id=bound_id,
+            chat_pair_generation=(
+                int(row["bound_generation"])
+                if row.get("bound_generation") is not None
+                else None
+            ),
+        )
     return TokenIdentity(
         username=row["issuer_username"],
         role="human",

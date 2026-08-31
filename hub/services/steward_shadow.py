@@ -64,21 +64,91 @@ RUN_REFUSED = "refused"
 PENDING_PREFIX = "pending:"
 
 
-def identity_delivery(task_id: int, generation: int) -> str | None:
-    """How the run will authenticate to the hub, or None if it cannot.
+async def steward_principal_id(db: aiosqlite.Connection) -> int | None:
+    """The principal behind STEWARD_HUB_TOKEN, or None (#1120).
 
-    Not a formality. Cursor drops ``mcpServers`` on the way into a cloud run
-    (#1084), so a token placed in those headers never arrives: the run starts,
-    reaches the door with no identity, reads nothing and dies at its deadline
-    — a paid nothing. For the REVIEWER that was solved by minting a one-time,
-    task-bound code and putting it in the prompt; the steward needs the same,
-    and ``chat_pair`` has no ``steward`` kind yet.
-
-    Until it does, this returns None and the run is refused as unconfigured —
-    which under the retry rule below leaves the order open rather than burning
-    it. Better an order waiting for a channel than an agent paid to be mute.
+    The same hash lookup auth performs, without its side effects — the shape
+    ``reviewer_principal_id`` already uses (#1025). None means no code can be
+    minted, and the run is refused rather than started blind.
     """
-    return None
+    token = (config.STEWARD_HUB_TOKEN or "").strip()
+    if not token:
+        return None
+    from hub import auth
+
+    if auth._is_open_mode():
+        # Open mode never reads the bearer header, so a session pinned to a
+        # principal would be unsatisfiable. Refusing here is honest; minting a
+        # code that cannot be spent is not.
+        return None
+    from hub.services.admin import hash_api_key
+
+    rows = await fetchall(
+        db,
+        "SELECT principal_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+        (hash_api_key(token),),
+    )
+    return int(dict(rows[0])["principal_id"]) if rows else None
+
+
+def delivery_block(task_id: int, code: str, base_url: str) -> str:
+    """How the run reaches the hub without MCP (#1084's lesson, #1120).
+
+    Empty when there is no code: an instruction naming a credential the run
+    does not have teaches it to invent one.
+    """
+    if not code or not base_url:
+        return ""
+    return (
+        "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ. Инструментов MCP у тебя нет, всё "
+        "идёт обычным HTTP. Код ниже живёт МИНУТЫ, а прогон дольше — обменяй "
+        "его сразу:\n"
+        f"  curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
+        "-H 'Content-Type: application/json' "
+        f'-d \'{{"code":"{code}"}}\'\n'
+        "В ответе поле token — сохрани в переменную, в вывод не печатай. "
+        "Пакет доказательств читается им же:\n"
+        f"  curl -sS {base_url}/api/tasks/{task_id}/steward-evidence "
+        '-H "Authorization: Bearer $TOKEN"\n'
+        "Суждение сдаётся туда же:\n"
+        f"  curl -sS -X POST {base_url}/api/tasks/{task_id}/steward-judgement "
+        "-H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' "
+        "-d '<суждение по контракту>'\n"
+        "Больше этим токеном не открыто НИЧЕГО: две операции, обе про эту "
+        "задачу. Это не ограничение прогона, а граница, на которой держится "
+        "допуск твоего суждения к действию."
+    )
+
+
+async def identity_delivery(
+    db: aiosqlite.Connection, task_id: int, generation: int, base_url: str
+) -> str | None:
+    """Mint the run's one-time code and the block telling it what to do.
+
+    Returns None when no code can be minted — no token, no principal, open
+    mode. The caller refuses the run rather than paying for an agent that
+    cannot read the packet it was ordered to judge.
+
+    The code is bound to the task AND the generation. Without the generation
+    pin every check downstream is dead code: issue_code stores NULL, redeem
+    skips the comparison, and a code minted for one submission would judge
+    the next one (#1084 learned this the expensive way).
+    """
+    principal_id = await steward_principal_id(db)
+    if principal_id is None:
+        return None
+    from hub.services import chat_pair
+
+    code, _ttl = await chat_pair.issue_code(
+        db,
+        principal_id,
+        kind="steward",
+        bound_task_id=task_id,
+        bound_generation=generation,
+    )
+    if not code:
+        return None
+    return delivery_block(task_id, code, base_url)
 
 
 async def reviewer_model(
@@ -294,15 +364,18 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         )
         return False
 
-    delivery = identity_delivery(task_id, generation)
+    from hub.services.review_dispatch import instance_base_url
+
+    hub_base = instance_base_url().rstrip("/")
+    delivery = await identity_delivery(db, task_id, generation, hub_base)
     if delivery is None:
         await _refuse_transiently(
             db,
             order,
             REFUSED_NO_IDENTITY_CHANNEL,
-            "прогону нечем аутентифицироваться у хаба: Cursor отбрасывает "
-            "mcpServers (#1084), а одноразового кода для стюарда пока нет — "
-            "платить за немого агента незачем",
+            "прогону нечем аутентифицироваться у хаба: нет принципала за "
+            "STEWARD_HUB_TOKEN (или открытый режим) — код обменять не на что, "
+            "а платить за немого агента незачем",
         )
         return False
 
@@ -319,9 +392,6 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         return False
     await db.commit()
 
-    from hub.services.review_dispatch import instance_base_url
-
-    hub_base = instance_base_url().rstrip("/")
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=(task.get("branch") or "").strip() or "HEAD",
