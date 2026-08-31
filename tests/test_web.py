@@ -5744,3 +5744,54 @@ async def test_board_shows_dispatch_note_when_a_configured_dispatcher_is_down(
     assert resp.status_code == 200
     assert "Open card on a dispatch host" in resp.text
     assert "Dispatch unavailable" in resp.text
+
+
+async def test_project_card_shows_forge(client: AsyncClient, db):
+    """#1114: на каком хостинге проект — видно в вебе, а не только в базе.
+
+    ``owner/name`` выглядит одинаково на любом форже, так что строка repo на
+    этот вопрос не отвечает. Проверяется и создание через форму: селект форжа
+    обязан доезжать до записи, иначе он украшение.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/projects/web-create",
+        data={
+            "slug": "gv-web",
+            "name": "GV Web",
+            "repo": "mrpda/hub",
+            "default_branch": "master",
+            "forge": "gitverse",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    from hub import repository as repo_module
+
+    row = await repo_module.get_project_by_slug(db, "gv-web")
+    assert row["forge"] == "gitverse", "селект формы обязан доезжать до записи"
+
+    page = await client.get("/projects")
+    assert "форж" in page.text
+    assert "gitverse" in page.text
+
+
+async def test_web_create_refuses_an_unknown_forge(client: AsyncClient, db):
+    """Опечатка в форже не создаёт проект молча на github."""
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "bad-forge", "name": "Bad", "forge": "gitlab"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "error" in resp.headers["location"]
+
+    from hub import repository as repo_module
+
+    assert await repo_module.get_project_by_slug(db, "bad-forge") is None

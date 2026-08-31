@@ -117,6 +117,9 @@
             <dl class="project-admin-facts">
                 <dt>slug</dt><dd>{{ c.project.slug }}</dd>
                 <dt>repo</dt><dd>{{ c.project.repo or '—' }}</dd>
+                {# #1114: репозиторий сам по себе не говорит, где он живёт —
+                   owner/name выглядит одинаково на любом хостинге. #}
+                <dt>форж</dt><dd>{{ c.project.forge }}</dd>
                 <dt>ветка</dt><dd>{{ c.project.default_branch }}</dd>
                 {# #887: что клон РЕАЛЬНО защищает, рядом с тем, что объявлено.
                    Состояния не сливаются: клон, который не смогли прочитать, —
@@ -178,6 +181,12 @@
                     <input name="repo" class="task-action-control" value="{{ c.project.repo }}">
                     <label class="task-action-label">Workspace path</label>
                     <input name="workspace_path" class="task-action-control" value="{{ c.project.workspace_path }}">
+                    <label class="task-action-label">Форж</label>
+                    <select name="forge" class="task-action-control">
+                        {% for f in forges %}
+                        <option value="{{ f }}" {% if c.project.forge == f %}selected{% endif %}>{{ f }}</option>
+                        {% endfor %}
+                    </select>
                     <label class="task-action-label">Default branch</label>
                     <input name="default_branch" class="task-action-control" value="{{ c.project.default_branch }}">
                     <label class="task-action-label">Branch policy (JSON; пусто = не менять)</label>
@@ -268,6 +277,12 @@
         <input id="np-repo" name="repo" class="task-action-control" placeholder="owner/repository">
         <label class="task-action-label" for="np-workspace">Workspace path</label>
         <input id="np-workspace" name="workspace_path" class="task-action-control" placeholder="/srv/workspaces/calc-kids">
+        <label class="task-action-label" for="np-forge">Форж</label>
+        <select id="np-forge" name="forge" class="task-action-control">
+            {% for f in forges %}
+            <option value="{{ f }}" {% if f == default_forge %}selected{% endif %}>{{ f }}</option>
+            {% endfor %}
+        </select>
         <label class="task-action-label" for="np-branch">Default branch</label>
         <input id="np-branch" name="default_branch" class="task-action-control" value="{{ default_base_branch }}">
         <label class="task-action-label" for="np-policy">Branch policy (JSON, optional)</label>

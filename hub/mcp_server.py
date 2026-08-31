@@ -2380,7 +2380,7 @@ async def hub_propose_task(
 
 @mcp.tool()
 async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
-    """List projects (#338): slug, repo, workspace, base branch.
+    """List projects (#338): slug, repo, forge, workspace, base branch.
 
     Args:
         include_archived: Include archived projects.
@@ -2389,8 +2389,12 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
     projects = await _api_get(f"/api/projects{query}")
     if not projects:
         return structured_echo_result("No projects.", projects=[])
+    # Форж назван в строке рядом с repo (#1114): owner/name выглядит одинаково
+    # на любом хостинге, и без этого слова строка не отвечает на вопрос «куда
+    # именно поедет доставка».
     lines = [
-        f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'} "
+        f"{p['slug']}: {p['name']} | repo={p.get('repo') or '-'}"
+        f"@{p.get('forge') or 'github'} "
         f"| base={p.get('default_branch') or config.PAIR_BASE_BRANCH}"
         + (" [archived]" if p.get("archived") else "")
         for p in projects
