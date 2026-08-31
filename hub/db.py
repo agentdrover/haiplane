@@ -852,6 +852,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE projects ADD COLUMN gate_policy TEXT NOT NULL DEFAULT '{}'",
     ),
     (
+        # Форж проекта (#1114, эпик #1112): на каком хостинге живёт репозиторий.
+        # DEFAULT 'github' — не вкусовщина, а условие безопасности миграции:
+        # все существующие проекты именно на нём, и колонка обязана описать
+        # то, что уже есть, а не потребовать от кого-то заполнить её задним
+        # числом. NOT NULL, потому что «форж неизвестен» — не состояние: у
+        # репозитория всегда есть хостинг, вопрос только в том, объявлен ли он.
+        "add_projects_forge",
+        "ALTER TABLE projects ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'",
+    ),
+    (
         # Autopilot daily digests (#739): one row per project per UTC day
         # that saw autopilot activity. The UNIQUE key is what makes the
         # poller's generation idempotent — the same rule the merge ledger

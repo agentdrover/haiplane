@@ -1170,6 +1170,7 @@ def test_cmd_projects_create() -> None:
         repo="mrPDA/calc-kids",
         workspace_path="/srv/calc",
         default_branch="develop",
+        forge="github",
     )
     with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
         rc = cli.cmd_projects_create(args)
@@ -1183,6 +1184,9 @@ def test_cmd_projects_create() -> None:
             "repo": "mrPDA/calc-kids",
             "workspace_path": "/srv/calc",
             "default_branch": "develop",
+            # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность,
+            # где форж задать нельзя, тихо заводит проект на github.
+            "forge": "github",
         },
     )
 

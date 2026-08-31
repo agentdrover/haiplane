@@ -781,6 +781,7 @@ async def api_create_project(
             default_branch=body.default_branch,
             default_branch_policy=_json.dumps(body.default_branch_policy),
             status=status_value,
+            forge=body.forge,
         )
         await db.commit()
     await db_module.log_activity(

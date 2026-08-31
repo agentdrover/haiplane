@@ -280,6 +280,23 @@ AUTO_APPROVE_CLASSES: tuple[str, ...] = ("r0", "r1")
 # therefore not covered by the default-project lock — dispatching a reviewer
 # removes no human from any gate.
 REVIEW_POLICY_VALUES: tuple[str, ...] = ("off", "dispatch")
+#: Хостинги репозиториев, которые хаб умеет вести (#1114, эпик #1112).
+#: Закрытый набор намеренно: незнакомое значение здесь означает не «экзотика»,
+#: а «проект указал форж, которого нет», и узнать об этом надо в момент
+#: записи — пока тот, кто ошибся, ещё здесь. Ровно то же правило, которым
+#: default_branch_policy ловит опечатку releaseBase (#886).
+FORGES: tuple[str, ...] = ("github", "gitverse")
+#: Форж по умолчанию: все проекты, заведённые до #1114, на нём.
+DEFAULT_FORGE = "github"
+
+
+def _validated_forge(value: str) -> str:
+    forge = (value or "").strip().lower()
+    if forge not in FORGES:
+        raise ValueError(f"unknown forge: {value!r}; allowed: {', '.join(FORGES)}")
+    return forge
+
+
 GATE_POLICY_KEYS: tuple[str, ...] = (
     "dor",
     "verdict",
@@ -1874,11 +1891,17 @@ class ProjectCreate(BaseModel):
     workspace_path: str = Field("", max_length=500)
     default_branch: str = Field(config.PAIR_BASE_BRANCH, max_length=100)
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+    forge: str = Field(DEFAULT_FORGE, max_length=30)
 
     @field_validator("default_branch_policy")
     @classmethod
     def _branch_policy_shape(cls, v: dict[str, Any]) -> dict[str, Any]:
         return _validated_branch_policy(v)
+
+    @field_validator("forge")
+    @classmethod
+    def _forge_known(cls, v: str) -> str:
+        return _validated_forge(v)
 
 
 class ProjectPatch(BaseModel):
@@ -1894,6 +1917,8 @@ class ProjectPatch(BaseModel):
     workspace_path: str | None = Field(default=None, max_length=500)
     default_branch: str | None = Field(default=None, max_length=100)
     default_branch_policy: dict[str, Any] | None = None
+    # Форж проекта (#1114). None — «не прислали», как и у соседей.
+    forge: str | None = Field(default=None, max_length=30)
     # Gate policy (#743): which gates this project delegates to the
     # autopilot, plus the two knobs that say how far it may reach (#760).
     # Anything else in the payload is a mistake worth refusing, not ignoring.
@@ -1905,6 +1930,11 @@ class ProjectPatch(BaseModel):
     @classmethod
     def _branch_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         return v if v is None else _validated_branch_policy(v)
+
+    @field_validator("forge")
+    @classmethod
+    def _forge_known(cls, v: str | None) -> str | None:
+        return v if v is None else _validated_forge(v)
 
     @field_validator("gate_policy")
     @classmethod
@@ -2532,6 +2562,9 @@ class ProjectView(BaseModel):
     workspace_path: str = ""
     default_branch: str = config.PAIR_BASE_BRANCH
     default_branch_policy: dict[str, Any] = Field(default_factory=dict)
+    # Форж проекта (#1114): виден в API и в вебе, чтобы понять, на каком
+    # хостинге проект, не заглядывая в базу.
+    forge: str = DEFAULT_FORGE
     # Gate policy (#743): {} means "no delegation" — every gate human.
     gate_policy: dict[str, Any] = Field(default_factory=dict)
     archived: bool = False

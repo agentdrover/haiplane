@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
+from hub.models import DEFAULT_FORGE, FORGES
 
 HUB_URL = config.env_get("HUB_URL", "http://127.0.0.1:8080") or "http://127.0.0.1:8080"
 HUB_TOKEN = config.env_get("HUB_TOKEN", "") or ""
@@ -396,6 +397,7 @@ def cmd_projects_create(args: argparse.Namespace) -> int:
         "repo": args.repo,
         "workspace_path": args.workspace_path,
         "default_branch": args.default_branch,
+        "forge": args.forge,
     }
     result = _api("POST", "/api/projects", body)
     _print_json(result)
@@ -1504,6 +1506,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="default_branch",
         default=config.PAIR_BASE_BRANCH,
     )
+    # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность, где
+    # форж задать нельзя, означает, что GitVerse-проект отсюда не завести —
+    # и молча, потому что умолчание примут за выбор.
+    pp_create.add_argument("--forge", choices=list(FORGES), default=DEFAULT_FORGE)
     pp_create.set_defaults(func=cmd_projects_create)
 
     p_approve_batch = sub.add_parser(

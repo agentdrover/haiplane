@@ -236,6 +236,7 @@ async def test_every_write_surface_rejects_unknown_key(client: AsyncClient, db) 
         repo="",
         workspace_path="",
         default_branch="develop",
+        forge="github",
     )
     with patch.object(cli, "_api", called), patch("sys.stdout", new=StringIO()):
         assert cli.cmd_projects_create(args) == 0
