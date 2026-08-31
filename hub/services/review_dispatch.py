@@ -1114,7 +1114,16 @@ async def maybe_dispatch_review(
         from hub.services import chat_pair
 
         reviewer_code, _code_ttl = await chat_pair.issue_code(
-            db, expected_principal, kind="reviewer", bound_task_id=task_id
+            db,
+            expected_principal,
+            kind="reviewer",
+            bound_task_id=task_id,
+            # THE pin. Without it every guard below is dead code: issue_code
+            # stores NULL, redeem_code skips the comparison, the session
+            # carries no generation and the intake check is falsy. The tests
+            # that "covered" this minted their codes by hand WITH a generation
+            # and so agreed with a path production never took.
+            bound_generation=generation,
         )
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",

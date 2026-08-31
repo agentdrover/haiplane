@@ -2233,3 +2233,37 @@ async def test_prompt_names_the_path_the_run_can_actually_take(
     without_code = recorder.calls[-1]["prompt_text"]
     assert not _CODE_IN_PROMPT.search(without_code)
     assert "сдай hub_submit_machine_review, это основной путь" in without_code
+
+
+async def test_dispatch_pins_the_generation_it_minted_for(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1084, находка ревью: пин проверялся ТОЛЬКО на кодах, вычеканенных
+    # руками с bound_generation. Диспатч его не передавал, поэтому в проде
+    # колонка была NULL, сравнение в обмене пропускалось, сессия несла None,
+    # и проверка на приёме была ложной — вся защита оказывалась мёртвой при
+    # зелёных тестах. Этот тест идёт ЧЕРЕЗ ДИСПАТЧ и потому её сторожит.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gen"}, "run": {"id": "run-gen"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    task_id = await _submitted(
+        client, db, "spike-gen-pin", policy={"review": "dispatch"}
+    )
+
+    code = _CODE_IN_PROMPT.search(recorder.calls[-1]["prompt_text"]).group(0)
+    rows = await db.execute_fetchall(
+        "SELECT bound_generation FROM chat_pair_codes WHERE kind='reviewer'"
+    )
+    assert [dict(r)["bound_generation"] for r in rows] == [1], "диспатч обязан пинить"
+
+    # Работа пересдана, пока прогон жив: статус остаётся review, меняется сдача.
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await db.commit()
+
+    refused = await client.post(
+        "/api/auth/chat-pair/redeem",
+        json={"code": code},
+        headers={"x-forwarded-for": "203.0.113.11"},
+    )
+    assert refused.status_code == 401, refused.text

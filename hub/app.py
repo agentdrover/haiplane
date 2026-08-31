@@ -1772,33 +1772,21 @@ async def api_submit_machine_review(
 
     # #1084: a reviewer session belongs to the submission it was minted for.
     # Redeem can happen before a resubmission and filing after it, and the
-    # intake below stamps whatever generation is CURRENT — so without this the
-    # run's report about the old diff would be recorded as a report about the
-    # new one. Checked here, next to the write, because the route allowlist
-    # sees paths and not the task's state.
-    if identity.chat_pair_kind == "reviewer" and identity.chat_pair_generation:
-        task_row = await repo.get_task(_db(request), task_id)
-        current = (dict(task_row).get("submission_generation") or 0) if task_row else 0
-        if int(identity.chat_pair_generation) != int(current):
-            raise HTTPException(
-                403,
-                detail={
-                    "reason": "chat_pair_generation_moved",
-                    "message": (
-                        "работа пересдана: этот код выписан на сдачу "
-                        f"#{identity.chat_pair_generation}, а текущая — "
-                        f"#{current}. Отчёт о прежнем диффе не принимается "
-                        "как отчёт о новом."
-                    ),
-                },
-            )
-
+    # intake stamps whatever generation is CURRENT. The pin travels INTO the
+    # intake rather than being checked here: a check here reads the task once
+    # and the write reads it again, and a resubmission between those two
+    # reads would be stamped as this report's own generation.
     return await record_machine_review(
         _db(request),
         task_id,
         body,
         principal_id=identity.principal_id,
         username=identity.username,
+        expected_generation=(
+            identity.chat_pair_generation
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
     )
 
 

@@ -43,6 +43,7 @@ async def record_machine_review(
     principal_id: int | None,
     username: str,
     origin: str = ORIGIN_MCP,
+    expected_generation: int | None = None,
 ) -> MachineReviewView:
     """Store one report and run everything that hangs off it (#381, #1036).
 
@@ -57,6 +58,22 @@ async def record_machine_review(
         raise HTTPException(404, "task not found")
     task = dict(row)
     generation = task.get("submission_generation") or 0
+    # #1084: the caller's pin is checked HERE, against the same read the row
+    # is stamped from. Checked at the route it was a check on one read and a
+    # write on another, with awaits in between — a resubmission landing in
+    # that window would still be stamped as the report's own generation.
+    if expected_generation is not None and int(expected_generation) != int(generation):
+        raise HTTPException(
+            403,
+            detail={
+                "reason": "chat_pair_generation_moved",
+                "message": (
+                    f"работа пересдана: отчёт выписан на сдачу #{expected_generation}, "
+                    f"текущая — #{generation}. Отчёт о прежнем диффе не "
+                    "принимается как отчёт о новом."
+                ),
+            },
+        )
     if generation == 0:
         raise HTTPException(
             400,
