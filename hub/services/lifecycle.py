@@ -2594,6 +2594,260 @@ async def _previous_verdict_update(db: Any, task_id: int) -> dict | None:
     return verdicts[-1] if verdicts else None
 
 
+@dataclass
+class VerdictContext:
+    """Что шаги вердикта читают и производят до его записи (#1067).
+
+    Шесть значений пересекают границу транзакции. Форма та же, что у
+    ``SubmitContext``, и намеренно: два конвейера, читаемые рядом, должны
+    выглядеть одинаково — иначе сравнивать их наборы шагов будет некому.
+    """
+
+    db: aiosqlite.Connection
+    task_id: int
+    task: dict[str, Any]
+    body: TaskReviewVerdict
+    # Флаги вызова, а не производное шагов: приходят из ручки и нужны записи.
+    self_approved: bool = False
+    principal_id: int | None = None
+
+    body_text: str = ""
+    pinned_sha: str = ""
+    diverged_tip: str = ""
+    sha_note: str = ""
+    undisposed_note: str = ""
+    inflight_note: str = ""
+    auto_created: list[int] = dc_field(default_factory=list)
+
+
+async def _vstep_has_a_submission(state: VerdictContext) -> None:
+    """Есть что рецензировать: сдача хотя бы одна была."""
+    if (state.task.get("submission_generation") or 0) == 0:
+        raise HTTPException(
+            400,
+            "no submission to review yet: the task has never been submitted for review",
+        )
+
+
+async def _vstep_changes_requested_has_content(state: VerdictContext) -> None:
+    """«Вернуть и переделать» обязано сказать, что переделать (#1010)."""
+    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
+    # came in with no findings and no comments: the task went back to running,
+    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
+    # the developer's only options were to guess or to ask the human the gate
+    # exists to spare. Every neighbouring gate already demands content — DoR
+    # refuses a task without acceptance criteria, submission refuses a branch
+    # it cannot name, delivery refuses a task without a live verdict — and
+    # this one asked for nothing. Either field satisfies it: one sentence is a
+    # reason, and demanding structured findings for "tests are red" would buy
+    # a formality. APPROVED stays free of the requirement (it is
+    # self-sufficient), which is why it is now filed under its author instead
+    # — see the principal_id passed from the web form.
+    if (
+        state.body.verdict.value == "changes_requested"
+        and not state.body.findings
+        and not state.body.comments.strip()
+    ):
+        raise HTTPException(422, detail=changes_requested_requires_content_detail())
+
+
+async def _vstep_verdict_matches_its_text(state: VerdictContext) -> None:
+    """Вердикт не противоречит собственному тексту (#1057)."""
+    # #1057: the same gate, two more things it can see. Both refusals happen
+    # here, before any write, so a rejected verdict leaves the task in review
+    # with its submission generation untouched — the property #1010 established
+    # and the reason these checks belong beside it rather than in the caller.
+    state.body_text = verdict_text.verdict_body(
+        state.body.comments, [f.message for f in state.body.findings]
+    )
+    declared = verdict_text.declared_outcome(state.body_text)
+    if declared and declared != state.body.verdict.value:
+        raise HTTPException(
+            422,
+            detail=verdict_contradicts_its_text_detail(
+                state.body.verdict.value, declared
+            ),
+        )
+
+
+async def _vstep_verdict_is_not_a_repeat(state: VerdictContext) -> None:
+    """Вердикт не повторяет дословно предыдущий (#1057)."""
+    if state.body_text.strip() and not state.body.acknowledge_repeat:
+        previous = await _previous_verdict_update(state.db, state.task_id)
+        if previous is not None:
+            said_before = verdict_text.fingerprint(
+                verdict_text.previous_verdict_body(previous["content"])
+            )
+            if said_before and said_before == verdict_text.fingerprint(state.body_text):
+                raise HTTPException(
+                    422,
+                    detail=verdict_repeats_previous_detail(str(previous["created_at"])),
+                )
+
+
+async def _vstep_changes_requested_has_in_scope_finding(state: VerdictContext) -> None:
+    """У возврата есть хотя бы одна находка в объёме."""
+    if state.body.verdict.value == "changes_requested" and state.body.findings:
+        if all(f.scope == FindingScope.out_of_scope for f in state.body.findings):
+            raise HTTPException(
+                422,
+                detail=enrich_error_payload(
+                    {
+                        "reason": "changes_requested_requires_in_scope_finding",
+                        "message": (
+                            "changes_requested requires at least one in_scope "
+                            "finding; all findings are out_of_scope"
+                        ),
+                        "hint": (
+                            "If nothing needs fixing in this task, submit "
+                            "verdict=approved and keep out-of-scope findings "
+                            "as recommendations (linked to follow-up tasks "
+                            "via linked_task_id)."
+                        ),
+                        "suggested_tool": "hub_submit_review",
+                    }
+                ),
+            )
+
+
+async def _vstep_machine_review_present(state: VerdictContext) -> None:
+    """Машинное ревью обязательно для аппрува (#382)."""
+    # Machine-review hard gate (#382): only in HAIPLANE_MACHINE_REVIEW=require,
+    # and only for APPROVED — the reviewer must always be able to reject work
+    # (changes_requested), harness or no harness. Default 'warn' keeps every
+    # verdict available; the panel shows the gap.
+    if (
+        config.MACHINE_REVIEW_MODE == "require"
+        and state.body.verdict.value == "approved"
+    ):
+        from hub.services.orchestration import machine_review_gap
+
+        gap = await machine_review_gap(state.db, state.task)
+        if gap:
+            raise HTTPException(
+                422,
+                f"machine-review обязателен для аппрува этой задачи: {gap}",
+            )
+
+
+async def _vstep_ac_tests_green(state: VerdictContext) -> None:
+    """Аппрув требует зелёных AC-тестов (#508)."""
+    # Verifiable SDD (#508): under 'require', an APPROVED verdict needs every
+    # current verifiable_by=test AC green. Only APPROVED is gated — a reviewer
+    # must always be able to reject red work (lesson from #382).
+    if config.SDD_AC_TESTS == "require" and state.body.verdict.value == "approved":
+        from hub.services.ac_tests import ac_tests_gap
+
+        ac_gap = await ac_tests_gap(state.db, state.task)
+        if ac_gap:
+            raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
+
+
+async def _vstep_branch_tip_matches(state: VerdictContext) -> None:
+    """Ветка стоит там же, где на сдаче (#572). Не отказывает — называет."""
+    # #572: does the branch still stand where it stood at submission? Only
+    # APPROVED is checked — it is the verdict that creates the false safety of
+    # review_approved_current, while changes_requested returns the task to
+    # work anyway. Three outcomes, never collapsed: diverged / match /
+    # could-not-check with the reason. Resolved before the write lock (it
+    # walks to the network), and a resolution failure degrades to a visible
+    # "unchecked" — a verdict must not be hostage to the remote.
+    state.pinned_sha = (state.task.get("submission_sha") or "").strip()
+    state.diverged_tip = ""
+    state.sha_note = ""
+    if state.body.verdict.value == "approved":
+        if not state.pinned_sha:
+            state.sha_note = (
+                "Сверка кода с моментом сдачи НЕ проводилась: вершина ветки "
+                "не была записана при сдаче. Вердикт относится к номеру "
+                "сдачи, не к коммиту."
+            )
+        else:
+            current_tip, tip_reason = await resolve_branch_tip(
+                state.db, state.task_id, state.task.get("branch") or ""
+            )
+            if not current_tip:
+                state.sha_note = (
+                    f"Сверка кода с моментом сдачи НЕ проводилась: {tip_reason}. "
+                    f"Сдавался коммит {state.pinned_sha[:12]}."
+                )
+            elif current_tip != state.pinned_sha:
+                state.diverged_tip = current_tip
+
+
+async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
+    """Что аппрув может молча перекрыть (#1012). Не отказывает — называет."""
+    # #1012: the other thing an approval can quietly override. The report is
+    # already bound to a submission and already knows whether the gate judged
+    # its findings; what was missing is anyone saying so at the moment the
+    # verdict is written. Read here, next to the sha check, for the same
+    # reason: both are questions about what the approver may not have seen,
+    # and neither may hold the write lock while it answers.
+    state.undisposed_note = ""
+    state.inflight_note = ""
+    if state.body.verdict.value == "approved":
+        from hub.services.review_evidence import (
+            attach_dispositions,
+            undisposed_confirmed,
+        )
+        from hub.services.review_evidence import undisposed_note as _undisposed_note
+        from hub.models import MachineReviewView
+
+        mr_row = await repo.get_latest_machine_review(state.db, state.task_id)
+        if mr_row is not None:
+            mr_view = MachineReviewView(**dict(mr_row))
+            mr_view.is_current = mr_view.submission_generation == (
+                state.task.get("submission_generation") or 0
+            )
+            await attach_dispositions(state.db, mr_view)
+            state.undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
+
+        has_current_report = False
+        if mr_row is not None:
+            has_current_report = int(mr_row["submission_generation"] or 0) == (
+                state.task.get("submission_generation") or 0
+            )
+        state.inflight_note = await inflight_verdict_note(
+            state.db, state.task, has_current_report=has_current_report
+        )
+
+
+async def _vstep_auto_draft_out_of_scope(state: VerdictContext) -> None:
+    """Драфты по внеобъёмным находкам — до записи вердикта."""
+    # Auto-draft follow-ups BEFORE persisting the verdict so the created
+    # ids land in the stored findings (create_task commits on its own, so
+    # it must run outside the verdict's write-lock critical section).
+    state.auto_created = []
+    if state.body.create_tasks_for_out_of_scope and state.body.findings:
+        state.auto_created = await create_drafts_for_out_of_scope_findings(
+            state.db, state.task, state.body
+        )
+
+
+# Порядок вердикта. Дешёвые проверки — до сетевых: сверка вершины ветки и
+# чтение отчёта машинного ревью ходят наружу, и гонять их ради отказа,
+# который уже случился, значит платить за него временем.
+VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
+    Step("has_a_submission", _vstep_has_a_submission),
+    Step("changes_requested_has_content", _vstep_changes_requested_has_content),
+    Step("verdict_matches_its_text", _vstep_verdict_matches_its_text),
+    Step("verdict_is_not_a_repeat", _vstep_verdict_is_not_a_repeat),
+    Step(
+        "changes_requested_has_in_scope_finding",
+        _vstep_changes_requested_has_in_scope_finding,
+    ),
+    Step(
+        "machine_review_present",
+        _vstep_machine_review_present,
+        mode=policy("MACHINE_REVIEW_MODE"),
+    ),
+    Step("ac_tests_green", _vstep_ac_tests_green, mode=policy("SDD_AC_TESTS")),
+    Step("branch_tip_matches", _vstep_branch_tip_matches, refuses=False),
+    Step("approval_blind_spots", _vstep_approval_blind_spots, refuses=False),
+    Step("auto_draft_out_of_scope", _vstep_auto_draft_out_of_scope, refuses=False),
+)
+
+
 async def record_review_verdict(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2639,171 +2893,117 @@ async def record_review_verdict(
         raise HTTPException(404, "task not found")
     task = dict(row)
 
-    if (task.get("submission_generation") or 0) == 0:
-        raise HTTPException(
-            400,
-            "no submission to review yet: the task has never been submitted for review",
-        )
-
-    # #1010: "take it back and redo it" must say what to redo. On 28.08 a verdict
-    # came in with no findings and no comments: the task went back to running,
-    # the feed said "Review verdict: CHANGES_REQUESTED" and nothing else, and
-    # the developer's only options were to guess or to ask the human the gate
-    # exists to spare. Every neighbouring gate already demands content — DoR
-    # refuses a task without acceptance criteria, submission refuses a branch
-    # it cannot name, delivery refuses a task without a live verdict — and
-    # this one asked for nothing. Either field satisfies it: one sentence is a
-    # reason, and demanding structured findings for "tests are red" would buy
-    # a formality. APPROVED stays free of the requirement (it is
-    # self-sufficient), which is why it is now filed under its author instead
-    # — see the principal_id passed from the web form.
-    if (
-        body.verdict.value == "changes_requested"
-        and not body.findings
-        and not body.comments.strip()
-    ):
-        raise HTTPException(422, detail=changes_requested_requires_content_detail())
-
-    # #1057: the same gate, two more things it can see. Both refusals happen
-    # here, before any write, so a rejected verdict leaves the task in review
-    # with its submission generation untouched — the property #1010 established
-    # and the reason these checks belong beside it rather than in the caller.
-    body_text = verdict_text.verdict_body(
-        body.comments, [f.message for f in body.findings]
+    state = VerdictContext(
+        db=db,
+        task_id=task_id,
+        task=task,
+        body=body,
+        self_approved=self_approved,
+        principal_id=principal_id,
     )
-    declared = verdict_text.declared_outcome(body_text)
-    if declared and declared != body.verdict.value:
-        raise HTTPException(
-            422,
-            detail=verdict_contradicts_its_text_detail(body.verdict.value, declared),
+    await run_steps(state, VERDICT_STEPS)
+
+    return await _apply_verdict(state)
+
+
+def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
+    """Текст записи о вердикте — сборка строки, а не запись (#1067).
+
+    Девятнадцать ветвлений из двадцати у ``_apply_verdict`` были здесь, и все
+    про то, ЧТО написать в ленту: разошлась ли ветка с моментом сдачи, есть
+    ли неразмеченные находки, идёт ли ещё харнесс, сам ли себя одобрил автор,
+    что за находки и комментарии. Ни одна ничего не пишет — запись делает
+    вызывающий строкой ниже, внутри той же транзакции.
+    """
+    agent = (state.body.agent or "").strip() or "reviewer"
+    content = f"Review verdict: {state.body.verdict.value.upper()}"
+    if state.diverged_tip:
+        content += (
+            f"\nКОД УШЁЛ ИЗ-ПОД ОДОБРЕНИЯ: сдавался {state.pinned_sha[:12]}, "
+            f"вершина ветки теперь {state.diverged_tip[:12]}. Вердикт записан "
+            f"для {state.pinned_sha[:12]} и НЕ распространяется на новые "
+            "коммиты; задача возвращена в running — пересдайте, чтобы "
+            "ревью увидело текущий код."
         )
-    if body_text.strip() and not body.acknowledge_repeat:
-        previous = await _previous_verdict_update(db, task_id)
-        if previous is not None:
-            said_before = verdict_text.fingerprint(
-                verdict_text.previous_verdict_body(previous["content"])
+    elif state.sha_note:
+        content += f"\n{state.sha_note}"
+    if state.undisposed_note:
+        content += f"\n{state.undisposed_note}"
+    if state.inflight_note:
+        content += f"\n{state.inflight_note}"
+    if state.self_approved:
+        content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
+        log.warning(
+            "Task #%s: review verdict %s accepted via "
+            "HAIPLANE_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
+            "implemented this task (no independent review)",
+            state.task_id,
+            state.body.verdict.value,
+            agent,
+        )
+    if state.body.findings:
+        # Human-readable echo only; the canonical structured findings
+        # live on the task row, so the update text can stay compact.
+        for f in state.body.findings[:20]:
+            place = (
+                f" ({f.file}:{f.line})"
+                if f.file and f.line
+                else (f" ({f.file})" if f.file else "")
             )
-            if said_before and said_before == verdict_text.fingerprint(body_text):
-                raise HTTPException(
-                    422,
-                    detail=verdict_repeats_previous_detail(str(previous["created_at"])),
+            scope_mark = ""
+            if f.scope == FindingScope.out_of_scope:
+                scope_mark = (
+                    f" [out-of-scope → #{f.linked_task_id}]"
+                    if f.linked_task_id
+                    else " [out-of-scope]"
                 )
-
-    if body.verdict.value == "changes_requested" and body.findings:
-        if all(f.scope == FindingScope.out_of_scope for f in body.findings):
-            raise HTTPException(
-                422,
-                detail=enrich_error_payload(
-                    {
-                        "reason": "changes_requested_requires_in_scope_finding",
-                        "message": (
-                            "changes_requested requires at least one in_scope "
-                            "finding; all findings are out_of_scope"
-                        ),
-                        "hint": (
-                            "If nothing needs fixing in this task, submit "
-                            "verdict=approved and keep out-of-scope findings "
-                            "as recommendations (linked to follow-up tasks "
-                            "via linked_task_id)."
-                        ),
-                        "suggested_tool": "hub_submit_review",
-                    }
-                ),
+            content += f"\n{f.id}. [{f.severity.value}]{place}{scope_mark} {f.message}"
+        if len(state.body.findings) > 20:
+            content += f"\n… and {len(state.body.findings) - 20} more findings"
+        unlinked = [
+            f.id
+            for f in state.body.findings
+            if f.scope == FindingScope.out_of_scope and not f.linked_task_id
+        ]
+        if unlinked:
+            ids = ", ".join(str(i) for i in unlinked)
+            content += (
+                f"\nWarning: out-of-scope finding(s) {ids} have no "
+                "linked_task_id — create follow-up task(s) and link them."
             )
-
-    # Machine-review hard gate (#382): only in HAIPLANE_MACHINE_REVIEW=require,
-    # and only for APPROVED — the reviewer must always be able to reject work
-    # (changes_requested), harness or no harness. Default 'warn' keeps every
-    # verdict available; the panel shows the gap.
-    if config.MACHINE_REVIEW_MODE == "require" and body.verdict.value == "approved":
-        from hub.services.orchestration import machine_review_gap
-
-        gap = await machine_review_gap(db, task)
-        if gap:
-            raise HTTPException(
-                422,
-                f"machine-review обязателен для аппрува этой задачи: {gap}",
+        if state.auto_created:
+            ids = ", ".join(f"#{i}" for i in state.auto_created)
+            content += (
+                f"\nAuto-created draft task(s) for out-of-scope "
+                f"findings: {ids} (awaiting human DoR approval)."
             )
+    if state.body.comments.strip():
+        content += f"\n{state.body.comments.strip()}"
+    return agent, content
 
-    # Verifiable SDD (#508): under 'require', an APPROVED verdict needs every
-    # current verifiable_by=test AC green. Only APPROVED is gated — a reviewer
-    # must always be able to reject red work (lesson from #382).
-    if config.SDD_AC_TESTS == "require" and body.verdict.value == "approved":
-        from hub.services.ac_tests import ac_tests_gap
 
-        ac_gap = await ac_tests_gap(db, task)
-        if ac_gap:
-            raise HTTPException(422, f"ac_tests_not_green: {ac_gap}")
+async def _apply_verdict(state: VerdictContext) -> TaskView:
+    """Запись вердикта и всё, что за ней (#1067).
 
-    # #572: does the branch still stand where it stood at submission? Only
-    # APPROVED is checked — it is the verdict that creates the false safety of
-    # review_approved_current, while changes_requested returns the task to
-    # work anyway. Three outcomes, never collapsed: diverged / match /
-    # could-not-check with the reason. Resolved before the write lock (it
-    # walks to the network), and a resolution failure degrades to a visible
-    # "unchecked" — a verdict must not be hostage to the remote.
-    pinned_sha = (task.get("submission_sha") or "").strip()
-    diverged_tip = ""
-    sha_note = ""
-    if body.verdict.value == "approved":
-        if not pinned_sha:
-            sha_note = (
-                "Сверка кода с моментом сдачи НЕ проводилась: вершина ветки "
-                "не была записана при сдаче. Вердикт относится к номеру "
-                "сдачи, не к коммиту."
-            )
-        else:
-            current_tip, tip_reason = await resolve_branch_tip(
-                db, task_id, task.get("branch") or ""
-            )
-            if not current_tip:
-                sha_note = (
-                    f"Сверка кода с моментом сдачи НЕ проводилась: {tip_reason}. "
-                    f"Сдавался коммит {pinned_sha[:12]}."
-                )
-            elif current_tip != pinned_sha:
-                diverged_tip = current_tip
+    Отделено от гейтов по тому же шву и по той же причине, что у сдачи: из
+    68 ветвлений record_review_verdict гейты несли 36, запись — 32. Вынос
+    одних гейтов оставлял функцию с цикломатикой 21 при пороге 15.
 
-    # #1012: the other thing an approval can quietly override. The report is
-    # already bound to a submission and already knows whether the gate judged
-    # its findings; what was missing is anyone saying so at the moment the
-    # verdict is written. Read here, next to the sha check, for the same
-    # reason: both are questions about what the approver may not have seen,
-    # and neither may hold the write lock while it answers.
-    undisposed_note = ""
-    inflight_note = ""
-    if body.verdict.value == "approved":
-        from hub.services.review_evidence import (
-            attach_dispositions,
-            undisposed_confirmed,
-        )
-        from hub.services.review_evidence import undisposed_note as _undisposed_note
-        from hub.models import MachineReviewView
+    Перенесено целиком, строка в строку: перемещение, не переработка.
+    """
+    db = state.db
+    task_id = state.task_id
+    task = state.task
+    body = state.body
+    self_approved = state.self_approved
+    principal_id = state.principal_id
 
-        mr_row = await repo.get_latest_machine_review(db, task_id)
-        if mr_row is not None:
-            mr_view = MachineReviewView(**dict(mr_row))
-            mr_view.is_current = mr_view.submission_generation == (
-                task.get("submission_generation") or 0
-            )
-            await attach_dispositions(db, mr_view)
-            undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
-
-        has_current_report = False
-        if mr_row is not None:
-            has_current_report = int(mr_row["submission_generation"] or 0) == (
-                task.get("submission_generation") or 0
-            )
-        inflight_note = await inflight_verdict_note(
-            db, task, has_current_report=has_current_report
-        )
-
-    # Auto-draft follow-ups BEFORE persisting the verdict so the created
-    # ids land in the stored findings (create_task commits on its own, so
-    # it must run outside the verdict's write-lock critical section).
-    auto_created: list[int] = []
-    if body.create_tasks_for_out_of_scope and body.findings:
-        auto_created = await create_drafts_for_out_of_scope_findings(db, task, body)
+    # Контракт между конвейером и записью вердикта.
+    pinned_sha = state.pinned_sha
+    diverged_tip = state.diverged_tip
+    sha_note = state.sha_note
+    undisposed_note = state.undisposed_note
+    inflight_note = state.inflight_note
 
     async with write_transaction(db):
         findings_json = json.dumps(
@@ -2817,72 +3017,7 @@ async def record_review_verdict(
             findings_json=findings_json,
             self_approved=self_approved,
         )
-        agent = (body.agent or "").strip() or "reviewer"
-        content = f"Review verdict: {body.verdict.value.upper()}"
-        if diverged_tip:
-            content += (
-                f"\nКОД УШЁЛ ИЗ-ПОД ОДОБРЕНИЯ: сдавался {pinned_sha[:12]}, "
-                f"вершина ветки теперь {diverged_tip[:12]}. Вердикт записан "
-                f"для {pinned_sha[:12]} и НЕ распространяется на новые "
-                "коммиты; задача возвращена в running — пересдайте, чтобы "
-                "ревью увидело текущий код."
-            )
-        elif sha_note:
-            content += f"\n{sha_note}"
-        if undisposed_note:
-            content += f"\n{undisposed_note}"
-        if inflight_note:
-            content += f"\n{inflight_note}"
-        if self_approved:
-            content += " [self-approved: solo mode, HAIPLANE_REVIEW_SELF_APPROVE=allow]"
-            log.warning(
-                "Task #%s: review verdict %s accepted via "
-                "HAIPLANE_REVIEW_SELF_APPROVE=allow — reviewer '%s' "
-                "implemented this task (no independent review)",
-                task_id,
-                body.verdict.value,
-                agent,
-            )
-        if body.findings:
-            # Human-readable echo only; the canonical structured findings
-            # live on the task row, so the update text can stay compact.
-            for f in body.findings[:20]:
-                place = (
-                    f" ({f.file}:{f.line})"
-                    if f.file and f.line
-                    else (f" ({f.file})" if f.file else "")
-                )
-                scope_mark = ""
-                if f.scope == FindingScope.out_of_scope:
-                    scope_mark = (
-                        f" [out-of-scope → #{f.linked_task_id}]"
-                        if f.linked_task_id
-                        else " [out-of-scope]"
-                    )
-                content += (
-                    f"\n{f.id}. [{f.severity.value}]{place}{scope_mark} {f.message}"
-                )
-            if len(body.findings) > 20:
-                content += f"\n… and {len(body.findings) - 20} more findings"
-            unlinked = [
-                f.id
-                for f in body.findings
-                if f.scope == FindingScope.out_of_scope and not f.linked_task_id
-            ]
-            if unlinked:
-                ids = ", ".join(str(i) for i in unlinked)
-                content += (
-                    f"\nWarning: out-of-scope finding(s) {ids} have no "
-                    "linked_task_id — create follow-up task(s) and link them."
-                )
-            if auto_created:
-                ids = ", ".join(f"#{i}" for i in auto_created)
-                content += (
-                    f"\nAuto-created draft task(s) for out-of-scope "
-                    f"findings: {ids} (awaiting human DoR approval)."
-                )
-        if body.comments.strip():
-            content += f"\n{body.comments.strip()}"
+        agent, content = _verdict_update_text(state)
         # The verdict is authored by a principal — the endpoint already
         # resolved one to check reviewer independence. Without this it would
         # be filed as "hub", which is exactly the confusion #559 removes.

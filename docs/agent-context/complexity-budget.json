@@ -21,7 +21,7 @@
     "  permanent  — исключение остаётся, и написано почему;",
     "  unclaimed  — долг, за которым не стоит задача.",
     "",
-    "unclaimed сейчас 27 из 34, и это записано, а не скрыто: эпик #1064 берёт",
+    "unclaimed сейчас 27 из 32, и это записано, а не скрыто: эпик #1064 берёт",
     "гейты (#1067) и поля MCP (#1068) — это 8 записей, плюс build_parser",
     "постоянным. Молчание о непокрытом читается как 'покрыто всё'."
   ],
@@ -210,22 +210,6 @@
       "measured": 65,
       "max": 75,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "record_review_verdict",
-      "rule": "C901",
-      "measured": 41,
-      "max": 48,
-      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "record_review_verdict",
-      "rule": "PLR0915",
-      "measured": 119,
-      "max": 137,
-      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
     },
     {
       "path": "hub/services/orchestration.py",
