@@ -7,7 +7,7 @@
     "",
     "Зачем ledger, а не отключение правила. Правило, которое нельзя удержать",
     "зелёным, отключают целиком, и проверки не остаётся вовсе (#847). Здесь",
-    "правило удерживается зелёным с первого дня: сегодняшние 36 нарушений",
+    "правило удерживается зелёным с первого дня: сегодняшние нарушения",
     "названы поимённо, а тридцать седьмое красит проверку.",
     "",
     "Почему адресация 'путь::функция', а не строкой файла: правка выше по файлу",
@@ -21,7 +21,7 @@
     "  permanent  — исключение остаётся, и написано почему;",
     "  unclaimed  — долг, за которым не стоит задача.",
     "",
-    "unclaimed сейчас 27 из 36, и это записано, а не скрыто: эпик #1064 берёт",
+    "unclaimed сейчас 27 из 30, и это записано, а не скрыто: эпик #1064 берёт",
     "гейты (#1067) и поля MCP (#1068) — это 8 записей, плюс build_parser",
     "постоянным. Молчание о непокрытом читается как 'покрыто всё'."
   ],
@@ -212,38 +212,6 @@
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
-      "path": "hub/services/lifecycle.py",
-      "function": "record_review_verdict",
-      "rule": "C901",
-      "measured": 41,
-      "max": 48,
-      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "record_review_verdict",
-      "rule": "PLR0915",
-      "measured": 119,
-      "max": 137,
-      "removed_by": "task:#1067 — цепочка гейтов вердикта становится объявленным списком"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "submit_for_review",
-      "rule": "C901",
-      "measured": 46,
-      "max": 53,
-      "removed_by": "task:#1067 — цепочка гейтов сдачи становится объявленным списком"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
-      "function": "submit_for_review",
-      "rule": "PLR0915",
-      "measured": 173,
-      "max": 199,
-      "removed_by": "task:#1067 — цепочка гейтов сдачи становится объявленным списком"
-    },
-    {
       "path": "hub/services/orchestration.py",
       "function": "_human_gate_metrics",
       "rule": "C901",
@@ -258,22 +226,6 @@
       "measured": 88,
       "max": 102,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/orchestration.py",
-      "function": "transition_after_agent_done",
-      "rule": "C901",
-      "measured": 36,
-      "max": 42,
-      "removed_by": "task:#1067 — headless-путь переходит на тот же механизм"
-    },
-    {
-      "path": "hub/services/orchestration.py",
-      "function": "transition_after_agent_done",
-      "rule": "PLR0915",
-      "measured": 134,
-      "max": 155,
-      "removed_by": "task:#1067 — headless-путь переходит на тот же механизм"
     },
     {
       "path": "hub/services/review_brief.py",
