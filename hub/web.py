@@ -46,6 +46,8 @@ from hub.services.finding_identity import finding_uids
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
+    DEFAULT_FORGE,
+    FORGES,
     FindingDisposition,
     FindingDispositionItem,
     MessageSend,
@@ -970,6 +972,8 @@ async def web_projects(request: Request, project_error: str = Query("")):
             # #475: the create form must prefill the branch the hub would
             # actually fall back to, not a literal that stops matching it.
             "default_base_branch": config.PAIR_BASE_BRANCH,
+            "forges": list(FORGES),
+            "default_forge": DEFAULT_FORGE,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -1026,6 +1030,7 @@ async def web_create_project(request: Request):
                 str(form.get("default_branch") or "").strip() or config.PAIR_BASE_BRANCH
             ),
             default_branch_policy=policy or {},
+            forge=str(form.get("forge") or "").strip() or DEFAULT_FORGE,
         )
     except ValidationError as exc:
         first = exc.errors()[0]
@@ -1059,10 +1064,10 @@ async def web_edit_project(project_id: int, request: Request):
     """Inline-edit form (#344): exactly the ProjectPatch fields."""
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("name", "repo", "workspace_path", "default_branch"):
+    for key in ("name", "repo", "workspace_path", "default_branch", "forge"):
         if key in form:
             value = str(form.get(key) or "").strip()
-            if not value and key in ("name", "default_branch"):
+            if not value and key in ("name", "default_branch", "forge"):
                 continue  # обязательные в модели — пустое значит «не менять»
             fields[key] = value
     policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))

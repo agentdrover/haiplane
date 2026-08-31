@@ -5744,3 +5744,119 @@ async def test_board_shows_dispatch_note_when_a_configured_dispatcher_is_down(
     assert resp.status_code == 200
     assert "Open card on a dispatch host" in resp.text
     assert "Dispatch unavailable" in resp.text
+
+
+async def test_project_card_shows_forge(client: AsyncClient, db):
+    """#1114: на каком хостинге проект — видно в вебе, а не только в базе.
+
+    ``owner/name`` выглядит одинаково на любом форже, так что строка repo на
+    этот вопрос не отвечает.
+
+    Проверяется ЗНАЧЕНИЕ на карточке, а не наличие слова на странице, и это
+    не придирка: строка «gitverse» есть на любой странице проектов всегда —
+    её печатает каждый селект формы, перебирающий FORGES. Проверка на
+    вхождение подстроки оставалась бы зелёной, даже если убрать значение из
+    карточки совсем или подставить туда константу. Поэтому здесь два проекта
+    на разных форжах и точная пара dt/dd для каждого: подмена значения
+    константой красит тест на одном из них при любом выборе константы.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    for slug, forge in (("gv-web", "gitverse"), ("gh-web", "github")):
+        resp = await client.post(
+            "/projects/web-create",
+            data={
+                "slug": slug,
+                "name": slug.upper(),
+                "repo": "owner/repo",
+                "default_branch": "master",
+                "forge": forge,
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+
+    from hub import repository as repo_module
+
+    row = await repo_module.get_project_by_slug(db, "gv-web")
+    assert row["forge"] == "gitverse", "селект формы обязан доезжать до записи"
+
+    page = await client.get("/projects")
+    rendered = " ".join(page.text.split())
+    assert "<dt>форж</dt><dd>gitverse</dd>" in rendered
+    assert "<dt>форж</dt><dd>github</dd>" in rendered
+
+
+async def test_web_edit_changes_the_forge(client: AsyncClient, db):
+    """Селект в форме ПРАВКИ тоже обязан доезжать до записи.
+
+    Создание было покрыто, правка — нет, а это разные обработчики: у правки
+    свой список полей, и forge в нём мог остаться неперечисленным. Тогда
+    селект рисуется, пользователь выбирает, форма отправляется — и ничего не
+    меняется.
+    """
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await client.post(
+        "/projects/web-create",
+        data={"slug": "switch-me", "name": "Switch", "default_branch": "main"},
+        follow_redirects=False,
+    )
+
+    from hub import repository as repo_module
+
+    row = await repo_module.get_project_by_slug(db, "switch-me")
+    assert row["forge"] == "github"
+
+    resp = await client.post(
+        f"/projects/{row['id']}/web-edit",
+        data={"name": "Switch", "default_branch": "main", "forge": "gitverse"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    row = await repo_module.get_project_by_slug(db, "switch-me")
+    assert row["forge"] == "gitverse", "селект правки обязан доезжать до записи"
+
+
+async def test_http_refuses_an_unknown_forge_and_names_the_allowed(
+    client: AsyncClient, db
+):
+    """AC-2 на HTTP: отказ не просто 422, а с перечислением допустимых.
+
+    Модельный тест проверяет `_validated_forge`; здесь проверяется, что
+    перечень доезжает до клиента через FastAPI, а не теряется по дороге —
+    ровно как это проверено для default_branch_policy.
+    """
+    created = await client.post(
+        "/api/projects", json={"slug": "bad", "name": "Bad", "forge": "gitlab"}
+    )
+    assert created.status_code == 422
+    assert "github" in created.text and "gitverse" in created.text
+
+    ok = await client.post("/api/projects", json={"slug": "good", "name": "Good"})
+    patched = await client.patch(
+        f"/api/projects/{ok.json()['id']}", json={"forge": "gitlab"}
+    )
+    assert patched.status_code == 422
+    assert "github" in patched.text and "gitverse" in patched.text
+
+
+async def test_web_create_refuses_an_unknown_forge(client: AsyncClient, db):
+    """Опечатка в форже не создаёт проект молча на github."""
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    resp = await client.post(
+        "/projects/web-create",
+        data={"slug": "bad-forge", "name": "Bad", "forge": "gitlab"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "error" in resp.headers["location"]
+
+    from hub import repository as repo_module
+
+    assert await repo_module.get_project_by_slug(db, "bad-forge") is None

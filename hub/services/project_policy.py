@@ -19,6 +19,7 @@ import aiosqlite
 
 from hub import config, git_policy
 from hub import repository as repo
+from hub.models import DEFAULT_FORGE, FORGES
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,45 @@ def base_branch_of(project) -> str:
         except (KeyError, IndexError, TypeError):
             declared = ""
     return declared or config.PAIR_BASE_BRANCH
+
+
+def forge_of(project) -> str:
+    """На каком форже живёт репозиторий уже загруженного проекта (#1114).
+
+    Один читатель рядом с ``base_branch_of`` и по тем же правилам: терпит
+    отсутствующий проект, отсутствующую колонку и мусор в ней, и во всех этих
+    случаях отвечает ``github``.
+
+    Почему падение читается как github, а не как «неизвестно». Неизвестного
+    форжа не бывает: у репозитория всегда есть хостинг. Вопрос лишь в том,
+    объявлен ли он, и до #1114 не был объявлен ни у кого — все проекты хаба
+    на GitHub. То есть github здесь описывает то, что есть, а не догадку.
+    Отвечать «неизвестно» было бы хуже вдвойне: вызывающему пришлось бы
+    выбирать адаптер самому, и он выбрал бы тот же github, только молча и в
+    каждом месте по-своему.
+
+    Незнакомое значение тоже сводится к github, и это НЕ дублирование
+    валидации на записи, а её дополнение. Запись отказывает и тем чинит
+    причину; чтение случается в гейте, где отказать некому — и подставить
+    туда несуществующий адаптер значит уронить доставку из-за строки в базе.
+    """
+    declared = ""
+    if project is not None:
+        try:
+            declared = str(project["forge"] or "").strip().lower()
+        except (KeyError, IndexError, TypeError):
+            declared = ""
+    return declared if declared in FORGES else DEFAULT_FORGE
+
+
+async def forge_for_task(db: aiosqlite.Connection, task_id: int) -> str:
+    """Форж проекта, которому принадлежит задача (#1114)."""
+    try:
+        project = await repo.resolve_project_for_task(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not resolve project for task #%s", task_id)
+        return DEFAULT_FORGE
+    return forge_of(project)
 
 
 async def base_branch_for_task(db: aiosqlite.Connection, task_id: int) -> str:
