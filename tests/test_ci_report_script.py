@@ -77,22 +77,32 @@ def test_ac_runner_reads_the_haiplane_prefix(script, monkeypatch):
 
 
 def test_prose_among_validation_commands_reports_unknown_not_failure(script):
-    # #546's own validation_commands end with a Russian sentence describing a
-    # manual check on a live PR. Executed in a shell that is a non-zero exit —
-    # and the gate would read "validation failed" about work that is fine.
+    """Prose never becomes a failure (#546) — the reason this filter exists.
+
+    #546's own validation_commands end with a Russian sentence describing a
+    manual check on a live PR. Handed to a shell that is a non-zero exit, and
+    the gate would read "validation failed" about work that is fine.
+
+    CHANGED BY #1103, deliberately: the status and the no-fail invariant are
+    exactly as before, but the assertion "nothing was run" is gone. It pinned
+    the blast radius, not the invariant — the filter used to suppress every
+    real command standing beside the prose. `ruff --version` is still chosen
+    for being instant, and now it is chosen for being SAFE to execute rather
+    than for never being executed.
+    """
     commands = [
-        # A real executable, chosen to return instantly: this list must never be
-        # worth executing. Put "uv run pytest -q" here and a regression that
-        # stops filtering prose would rerun the whole suite inside this test
-        # rather than failing it.
         "ruff --version",
         "Проверка на живом PR: бриф отдаёт непустой ac_test_results",
     ]
     status, log_tail, reason = script.run_validation(commands)
-    assert status == "unknown"
-    assert log_tail == "", "nothing was run, so there is nothing to quote"
+    assert status == "unknown", "an unchecked entry means the list proves nothing"
+    assert status != "fail", "prose is not a failure of the work"
     assert "не являются командами" in reason
     assert "Проверка на живом PR" in reason, "name the offending entry"
+    assert "ruff --version" in log_tail, (
+        "the real command beside the prose must have run — suppressing it was "
+        "the defect #1103 closed"
+    )
 
 
 def test_no_validation_commands_is_skipped_with_a_reason(script):
@@ -501,3 +511,96 @@ def test_a_different_launcher_is_a_different_command(script):
     ran = {"uv run pytest -q -n auto": "pass"}
     for command in ("python -m pytest -q", "uv run --no-cache pytest -q", "pytest -q"):
         assert script.already_proven(command, ran) is None, command
+
+
+# ---- #1103: each entry is judged on its own -------------------------------
+
+
+def test_prose_does_not_suppress_the_real_commands(script):
+    """AC-1: a note written for a human costs only itself.
+
+    Before this, the prose check sat before the execution loop and returned for
+    the WHOLE list, so a task with real commands and one note got zero executed
+    checks. Measured on #1077: its two entries begin with a real `gh` and
+    continue in prose after a dash; the reporter step took 2s and ran nothing,
+    and the task was approved and delivered on that.
+    """
+    commands = [
+        "ruff --version",
+        "После мержа: прогоны develop показывают пропуск pytest по маркеру",
+        "python3 --version",
+    ]
+    status, log_tail, reason = script.run_validation(commands)
+
+    assert "ruff --version" in log_tail
+    assert "python3 --version" in log_tail
+    assert status != "fail", "prose must never be reported as a failed check"
+    assert "исполнено и прошло 2 из 3" in reason
+
+
+def test_partial_validation_is_not_reported_as_pass(script):
+    """AC-2: everything runnable passing is still not a passing list.
+
+    The hub's vocabulary is pass | fail | unknown | skipped, and `unknown` is
+    the only honest member for a partly checked list: `pass` would claim
+    evidence for entries nobody looked at, which is worse than the blunt
+    "nothing ran" this task replaced.
+    """
+    status, _log, reason = script.run_validation(
+        ["ruff --version", "Проверить вручную на живом PR"]
+    )
+    assert status == "unknown"
+    assert "не являются командами" in reason
+
+    # All entries executable and green — only then is the list a pass.
+    status, _log, reason = script.run_validation(["ruff --version"])
+    assert status == "pass", reason
+
+
+def test_a_failing_command_beside_prose_is_still_a_failure(script):
+    """The substantive gain: a broken check no longer hides behind a note.
+
+    Before, a mixed list short-circuited to `unknown` and the failing command
+    was never executed, so a real breakage read as "not checked". Now it reads
+    as what it is.
+    """
+    status, log_tail, reason = script.run_validation(
+        ["false", "Ручная проверка: смотри бриф"]
+    )
+    assert status == "fail", "the command ran and failed — that is a fact"
+    assert "false" in reason
+    assert "false" in log_tail
+
+
+def test_each_entry_is_accounted_for_by_name(script):
+    """AC-3: partial coverage must be visible, not inferred from silence."""
+    commands = [
+        "ruff --version",
+        "Проверка вручную на живом PR",
+        "Ещё одна заметка для человека",
+    ]
+    _status, log_tail, reason = script.run_validation(commands)
+
+    for entry in commands:
+        assert entry in log_tail, f"entry not accounted for in the log: {entry}"
+    assert "не команда" in log_tail, "say WHY an entry was not executed"
+    assert "исполнено и прошло 1 из 3" in reason
+
+
+def test_a_reused_outcome_counts_as_executed(script):
+    """#1081 and #1103 compose: reuse is executed evidence, not a skipped entry.
+
+    The job ran the command; this process only declined to run it twice. If
+    reuse were counted as "not executed", a fully covered list would report
+    itself as partial and the saving would look like a gap.
+    """
+    ran = {"uv run pytest -q -n auto": "pass"}
+    status, log_tail, reason = script.run_validation(["uv run pytest -q"], ran)
+    assert status == "pass", reason
+    assert "not re-run" in log_tail
+
+    status, _log, reason = script.run_validation(
+        ["uv run pytest -q", "Заметка для человека"], ran
+    )
+    assert status == "unknown"
+    assert "исполнено и прошло 1 из 2" in reason
