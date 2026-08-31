@@ -363,3 +363,103 @@ async def test_reviewer_model_reads_this_generation(db: aiosqlite.Connection):
     await db.commit()
 
     assert await sh.reviewer_model(db, task_id, 1) == "grok-4.6"
+
+
+# ---------------------------------------------------------------------------
+# #1106 — рекомендация видна, слот закрывается
+# ---------------------------------------------------------------------------
+
+
+async def _judge(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    verdict: str = "approve",
+    generation: int = 1,
+    confidence: str = "high",
+) -> None:
+    """Суждение приходит контрактом #1022 — тем же путём, что у живого прогона."""
+    from hub.config import TokenIdentity
+    from hub.models import StewardJudgementSubmit
+    from hub.services.steward_judgement import record_steward_judgement
+
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=generation,
+            kind="verdict",
+            verdict=verdict,
+            confidence=confidence,
+            escalate_reason="precondition_failed" if verdict == "escalate" else None,
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+
+
+async def test_judgement_closes_the_slot(db: aiosqlite.Connection):
+    """#1106 AC-1: суждение закрывает заказ, ради которого его ждали.
+
+    Иначе слот доживает до дедлайна и закрывается как run_timeout: работа
+    сделана, а состояние говорит «ждём». Разница стоит дважды — суточный
+    потолок считает занятый слот, и дверь пакета (#1075) остаётся открытой
+    на заказе, который никто не исполняет.
+    """
+    from hub.services.steward_dispatch import RUN_JUDGED
+
+    project_id = await _project(db, "shadow-judged")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    await _judge(db, task_id)
+
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_JUDGED
+    assert run["closed_reason"], "закрытие обязано называть причину"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "review", "суждение не двигает задачу — это F4"
+
+
+async def test_card_shows_it_as_a_recommendation(db: aiosqlite.Connection, client):
+    """#1106 AC-2: человек видит рекомендацию там, где принимает решение.
+
+    И видит, что это РЕКОМЕНДАЦИЯ: блок, который читается как вердикт,
+    превращает теневую фазу в тихое делегирование.
+    """
+    project_id = await _project(db, "shadow-card")
+    task_id = await _task(db, project_id)
+    await _judge(db, task_id, verdict="changes_requested")
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert page.status_code == 200
+    body = page.text
+    assert "рекомендация стюарда" in body
+    assert "changes_requested" in body
+    assert "gpt-5.3-codex" in body
+    assert "Решение остаётся человеческим" in body
+
+
+async def test_shadow_never_transitions(db: aiosqlite.Connection):
+    """#1106 AC-3: ни один вердикт в тени не двигает задачу и не пишет вердикт.
+
+    Проверяется тестом, а не обещанием: approve — самый опасный случай, он и
+    стоит первым.
+    """
+    project_id = await _project(db, "shadow-no-transition")
+    for verdict in ("approve", "changes_requested", "escalate"):
+        task_id = await _task(db, project_id)
+        before = dict(await repo.get_task(db, task_id))
+
+        await _judge(
+            db,
+            task_id,
+            verdict=verdict,
+            confidence="high" if verdict != "escalate" else "medium",
+        )
+
+        after = dict(await repo.get_task(db, task_id))
+        assert after["status"] == before["status"] == "review", verdict
+        assert after["review_verdict"] is None, verdict
+        assert after["review_verdict_generation"] is None, verdict

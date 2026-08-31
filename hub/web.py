@@ -1670,6 +1670,17 @@ async def _web_task_detail_page(
     evidence = await gate_evidence(db, dict(row))
     review_in_flight = await inflight_view(db, dict(row))
 
+    # #1106: what the steward said about THIS submission. A recommendation,
+    # not a decision — it is shown next to the verdict buttons because that is
+    # where the human decides, and it is labelled so nobody reads it as the
+    # decision itself. Only the current generation: a judgement about code
+    # that has since been resubmitted describes other code (#1074).
+    steward_judgement = None
+    generation = int(dict(row).get("submission_generation") or 0)
+    if generation:
+        judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+        steward_judgement = dict(judged) if judged is not None else None
+
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
         finding_touch = await evidence_for_findings(
@@ -1800,6 +1811,7 @@ async def _web_task_detail_page(
             "review_in_flight": review_in_flight,
             "change_map": change_map,
             "machine_review": machine_review,
+            "steward_judgement": steward_judgement,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,

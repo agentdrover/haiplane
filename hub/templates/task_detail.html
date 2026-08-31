@@ -837,6 +837,35 @@
                     </details>
                 </div>
                 {% endif %}
+                {# #1106: что сказал бы стюард. РЕКОМЕНДАЦИЯ, а не решение:
+                   кликает по-прежнему человек, и в тени суждение не двигает
+                   задачу ни на шаг. Стоит здесь, у кнопок вердикта, потому
+                   что решение принимается здесь. #}
+                {% if steward_judgement %}
+                <div class="task-action-note">
+                    <span class="badge badge-self-approved">рекомендация стюарда</span>
+                    {{ steward_judgement.verdict }}
+                    {% if steward_judgement.confidence %}
+                    <span class="badge badge--xs">уверенность: {{ steward_judgement.confidence }}</span>
+                    {% endif %}
+                    {% if steward_judgement.model %}
+                    <span class="badge badge--xs">{{ steward_judgement.model }}</span>
+                    {% endif %}
+                    {% if steward_judgement.escalate_reason %}
+                    <span class="badge badge-failed">{{ steward_judgement.escalate_reason }}</span>
+                    {% endif %}
+                    <div class="muted">
+                        Решение остаётся человеческим: это то, что стюард
+                        сказал бы, а не то, что кто-то сделал.
+                    </div>
+                    {% if steward_judgement.grounds %}
+                    <details>
+                        <summary>основания</summary>
+                        <pre>{{ steward_judgement.grounds }}</pre>
+                    </details>
+                    {% endif %}
+                </div>
+                {% endif %}
                 {% if machine_review %}
                 <div class="task-action-note">
                     Machine review: {{ machine_review.raw_count }} raw &rarr;
