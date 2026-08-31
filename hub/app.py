@@ -193,10 +193,18 @@ def _register_plugins() -> None:
     # inside git_ops instead of silently disabling the whole plugin.
     import shutil
 
+    # Форж регистрируется ДО git_ops и передаётся в него (#1113): пока это
+    # один и тот же GitHub, но точка подключения второго хостинга теперь
+    # одна, а не девятнадцать вызовов gh внутри git_ops.
+    if config.GH_BIN:
+        from hub.integrations.forge import GitHubForge
+
+        plugins.forge = GitHubForge()
+
     if shutil.which("git"):
         from hub.integrations.git_ops import GitOpsIntegration
 
-        plugins.git_ops = GitOpsIntegration()
+        plugins.git_ops = GitOpsIntegration(forge=plugins.forge)
 
     if config.GH_BIN:
         from hub.integrations.github import GitHubIntegration

@@ -1,0 +1,15 @@
+{
+  "name": "clean_submission",
+  "expectation": "must_not_escalate",
+  "planted": "дефекта нет: чистая сдача обязана проходить, иначе набор поощряет шум",
+  "facts": {
+    "machine_review_report": {"state": "present", "value": {"confirmed": [], "unresolved": [], "raw_count": 9, "incomplete": false}},
+    "ci_pinned_sha": {"state": "present", "value": {"validation_status": "pass", "passed": true}},
+    "branch_tip": {"state": "present", "value": {"moved": false}},
+    "diff_vs_areas": {"state": "present", "value": {"within_declared": true, "undeclared": []}},
+    "risk_class": {"state": "present", "value": {"stored": "r1", "recomputed": "r1", "raised": false}},
+    "ac_locator": {"state": "present", "value": {"unresolved": 0}},
+    "red_base": {"state": "present", "value": {"status": "green"}},
+    "dependency_state": {"state": "present", "value": {"undelivered": 0}}
+  }
+}

@@ -545,7 +545,10 @@ async def test_a_dirty_checked_out_branch_is_refused_not_reset(
 @pytest.mark.asyncio
 async def test_the_release_merge_keeps_its_head_branch(monkeypatch) -> None:
     """AC-1: релизный вызов мержа не несёт --delete-branch, task-вызов несёт."""
-    from hub.integrations import git_ops as git_ops_mod
+    # Точка подмены переехала вместе с вызовом gh: с #1113 его делает адаптер
+    # форжа, а не git_ops. Проверяется ровно то же — какие аргументы уходят в
+    # gh для task-PR и для релизного.
+    from hub.integrations.forge import github as forge_mod
 
     calls: list[tuple[str, ...]] = []
 
@@ -553,7 +556,7 @@ async def test_the_release_merge_keeps_its_head_branch(monkeypatch) -> None:
         calls.append(args)
         return (0, "", "")
 
-    monkeypatch.setattr(git_ops_mod, "_gh", fake_gh)
+    monkeypatch.setattr(forge_mod, "_gh", fake_gh)
     ops = GitOpsIntegration()
 
     assert await ops.merge_pr(7, 7, "some task")

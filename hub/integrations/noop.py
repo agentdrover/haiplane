@@ -506,6 +506,147 @@ class NoopGitOps:
         return False, "git ops disabled (noop integration)"
 
 
+class NoopForge:
+    """Форж, которого нет: хаб обязан стартовать без настроенного хостинга.
+
+    Каждый ответ — «спросить не удалось», а не «ответ отрицательный». Разница
+    не стилистическая: ``pr_state`` возвращает "" (не «closed»),
+    ``branch_ci_runs`` — None (не пустой список), ``check_pr_ci`` —
+    ``unavailable`` (не ``absent``). Заглушка, отвечающая содержательно,
+    заставила бы гейт принять решение на основании молчания — ровно тот
+    дефект, который разбирали #419 и #725.
+    """
+
+    name = "noop"
+
+    async def create_pr(
+        self,
+        title: str,
+        body: str,
+        branch: str,
+        base: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        return None
+
+    async def pr_for_branch(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> int | None:
+        return None
+
+    async def open_or_update_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> int | None:
+        return None
+
+    async def pr_state(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        return ""
+
+    async def pr_is_draft(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        return False
+
+    async def mark_pr_ready(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        return False
+
+    async def pr_head_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        return ""
+
+    async def pr_refs(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[str, str]:
+        return ("", "")
+
+    async def pr_mergeability(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[MergeabilityOutcome, str]:
+        return (MergeabilityOutcome.unavailable, "форж не настроен")
+
+    async def merge_commit_sha(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> str:
+        return ""
+
+    async def merge_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        delete_branch: bool = True,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool:
+        return False
+
+    async def check_pr_ci(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIProbeResult:
+        return CIProbeResult(CIProbeOutcome.unavailable, "forge_not_configured")
+
+    async def branch_ci_runs(
+        self,
+        branch: str,
+        limit: int = 20,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        return None
+
+    async def ci_failure_logs(
+        self,
+        pr_number: int,
+        branch: str,
+        max_log_chars: int = 12000,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> dict[str, Any]:
+        return {"failed_checks": [], "log_summary": "", "run_url": ""}
+
+    async def has_workflows(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool | None:
+        return None
+
+    async def compare_subjects(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> list[str]:
+        return []
+
+    async def merge_branches(
+        self,
+        into_branch: str,
+        from_branch: str,
+        message: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[str, str]:
+        return ("unavailable", "форж не настроен")
+
+
 class NoopGitHub:
     async def recent_commits(self, limit: int = 10) -> list[dict[str, Any]]:
         return []
