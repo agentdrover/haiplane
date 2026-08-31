@@ -135,6 +135,7 @@ async def _submitted(
     *,
     verdict_auto: bool = True,
     policy: dict | None = None,
+    repo_name: str = "mrPDA/spike-repo",
     areas: list[str] | None = None,
     risks: list[dict] | None = None,
     clear_risk_class: bool = False,
@@ -146,7 +147,7 @@ async def _submitted(
         db,
         slug=slug,
         name=slug.title(),
-        repo_name="mrPDA/spike-repo",
+        repo_name=repo_name,
         workspace_path="/tmp/ws",
     )
     if policy is not None:
@@ -376,6 +377,162 @@ async def test_dispatch_failure_degrades_visibly(
     ]
     assert len(alerts) == 1
     assert not await repo.list_active_review_dispatches(db)
+
+
+# --- Which setting is missing (#1083) ----------------------------------------
+#
+# Three independent preconditions guard the call, and they used to collapse
+# into one message listing all three with "or". Two of them live in the
+# process environment on the host, so the card could not say which one fired:
+# telling "no API key" from "the project has no repo" took an ssh. The alert
+# is the ONLY trace a failed dispatch leaves — best-effort means nothing else
+# breaks — so it has to name what is actually missing, and nothing else.
+
+
+async def _config_alerts(client: AsyncClient, task_id: int) -> list[str]:
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    return [
+        u["content"]
+        for u in body["updates"] or []
+        if "не хватает конфигурации" in u["content"]
+    ]
+
+
+async def test_missing_cursor_key_is_named_in_the_alert(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1083): only the API key is missing → the alert names it, stays
+    # silent about the two settings that are in place, and prints no value.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-k"}, "run": {"id": "run-k"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+
+    task_id = await _submitted(client, db, "spike-nokey")
+
+    alerts = await _config_alerts(client, task_id)
+    assert len(alerts) == 1, "one record per submission, as before"
+    # Whole text, not substrings. "No values, no parts, no lengths" is an
+    # invariant about everything the message does NOT say, and a set of `in`
+    # checks can only ever ban the strings someone thought to ban: a len() or
+    # a prefix appended later would pass them all. Equality bans the rest by
+    # construction. The expected string is spelled out here rather than
+    # imported from the service — a test that builds its expectation from the
+    # code under test agrees with that code by definition.
+    assert alerts[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "CURSOR_API_KEY (ключ Cursor API). Вердикт остаётся человеку (#757)."
+    )
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review", "the submit must not suffer"
+    assert not recorder.calls, "nothing to call the reviewer with"
+
+
+async def test_alert_names_every_missing_setting(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1083): two of three missing → both named in ONE alert, and the
+    # third — the one that is fine — is not. Naming only the first found
+    # would send the operator back for a second round trip.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-2m"}, "run": {"id": "run-2m"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+
+    task_id = await _submitted(client, db, "spike-norepo", repo_name="")
+
+    alerts = await _config_alerts(client, task_id)
+    assert len(alerts) == 1
+    assert alerts[0] == (
+        "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+        "repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера). "
+        "Вердикт остаётся человеку (#757)."
+    )
+    assert not recorder.calls
+
+
+_ALERT_HEAD = "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+_ALERT_TAIL = " Вердикт остаётся человеку (#757)."
+
+# Every combination of the three preconditions, with the WHOLE text the card
+# must carry. Written out, not assembled from the labels: an expectation built
+# by the same join the service uses would agree with any join the service
+# grows, including a wrong one.
+#
+# Exhaustive on purpose. Two review rounds in a row found the same shape of
+# hole — a combination nobody tested, where a short-circuit or a swap names
+# the wrong setting and every test stays green. Picking one more pair would
+# have invited a third round; seven rows leave no combination to find.
+_MISSING_COMBINATIONS: tuple[tuple[bool, bool, bool, str], ...] = (
+    # (key configured, repo set, token set) -> exact alert
+    (False, True, True, "CURSOR_API_KEY (ключ Cursor API)."),
+    (True, False, True, "repo проекта (репозиторий на GitHub)."),
+    (True, True, False, "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)."),
+    (
+        False,
+        False,
+        True,
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub).",
+    ),
+    (
+        False,
+        True,
+        False,
+        "CURSOR_API_KEY (ключ Cursor API); CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+    (
+        True,
+        False,
+        False,
+        "repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+    (
+        False,
+        False,
+        False,
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub); "
+        "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
+    ),
+)
+
+
+async def test_every_combination_names_exactly_what_is_missing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 и AC-2 (#1083) на всех семи сочетаниях сразу. Одно сочетание на
+    # раунд ревью — это способ никогда не закончить: пропущенная пара пускает
+    # и замыкание на первом условии, и перестановку ярлыков.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "run-x"}})
+    for index, (key_ok, repo_ok, token_ok, tail) in enumerate(_MISSING_COMBINATIONS):
+        _wire(monkeypatch, recorder)
+        if not key_ok:
+            monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+        if not token_ok:
+            monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+        task_id = await _submitted(
+            client,
+            db,
+            f"spike-combo-{index}",
+            repo_name="mrPDA/spike-repo" if repo_ok else "",
+        )
+        alerts = await _config_alerts(client, task_id)
+        assert len(alerts) == 1, f"one record per submission, combination {index}"
+        assert alerts[0] == _ALERT_HEAD + tail + _ALERT_TAIL, f"combination {index}"
+    assert not recorder.calls, "no combination here has everything it needs"
+
+
+async def test_no_config_alert_when_everything_is_configured(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1083): the healthy path stays silent. A diagnostic that also
+    # fires when nothing is wrong is worse than the disjunction it replaced.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "run-ok"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-configured")
+
+    assert await _config_alerts(client, task_id) == []
+    assert len(recorder.calls) == 1, "the reviewer is called as before"
 
 
 # --- Review profiles (#807) --------------------------------------------------
