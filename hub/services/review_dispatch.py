@@ -713,10 +713,22 @@ async def collect_review_rules(
 # the answer wins — a model that quotes the format while explaining itself must
 # not be able to shadow its own report with the example.
 REPORT_FENCE = "haiplane-review"
-REPORT_BLOCK_INSTRUCTION = (
-    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+# #1084: what "the main path" is depends on what the run actually has. With a
+# code in the prompt it is HTTP, and saying otherwise costs the run its first
+# minutes on tools that are not there — while the code expires in five.
+_MAIN_PATH_MCP = (
     "1) Если инструменты хаба тебе доступны — сдай hub_submit_machine_review, "
     "это основной путь.\n"
+)
+_MAIN_PATH_HTTP = (
+    "1) Основной путь — HTTP из блока «ДОСТУП К ХАБУ» выше: тем же токеном "
+    "POST на /api/tasks/<id>/machine-review. Инструментов MCP у тебя нет, "
+    "не трать на них ходы.\n"
+)
+
+REPORT_BLOCK_INSTRUCTION = (
+    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+    "{main_path}"
     "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
     f"```{REPORT_FENCE}\n"
     '{"raw_count": <число находок до проверки>, "incomplete": true|false, '
@@ -736,6 +748,38 @@ REPORT_BLOCK_INSTRUCTION = (
 )
 
 
+def _delivery_block(task_id: int, code: str, base_url: str) -> str:
+    """How to file the report through the contract, with no MCP (#1084).
+
+    Empty when there is no code to spend: an instruction naming a credential
+    the run does not have would teach it to invent one. The text block below
+    stays either way — it is the fallback, and it is what the poller reads
+    when this path does not happen.
+    """
+    if not code or not base_url:
+        return ""
+    return (
+        "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ, ДО ЧТЕНИЯ КОДА. У тебя нет "
+        "инструментов MCP, поэтому отчёт сдаётся обычным HTTP. Код ниже "
+        "живёт МИНУТЫ, а твой прогон длится дольше — обменяй его сразу, "
+        "иначе он протухнет к моменту отчёта:\n"
+        f"  curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
+        "-H 'Content-Type: application/json' "
+        f'-d \'{{"code":"{code}"}}\'\n'
+        "В ответе поле token — сохрани его в переменную, в ответ не печатай. "
+        "Постановку, критерии и предыдущие находки читай тем же токеном:\n"
+        f"  curl -sS {base_url}/api/tasks/{task_id}/review-brief "
+        '-H "Authorization: Bearer $TOKEN"\n'
+        "Готовый отчёт сдай им же:\n"
+        f"  curl -sS -X POST {base_url}/api/tasks/{task_id}/machine-review "
+        '-H "Authorization: Bearer $TOKEN" '
+        "-H 'Content-Type: application/json' -d @report.json\n"
+        "Сессия видит ровно две ручки этой задачи — обзор ревью и приём "
+        "отчёта. Ни вердикт, ни клейм, ни правка задачи ей не доступны: "
+        "не пытайся, это не ограничение прошивки, а граница роли.\n\n"
+    )
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -744,6 +788,7 @@ def _review_prompt(
     rules_block: str,
     diff_block: str,
     prepass_block: str,
+    delivery_block: str = "",
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
@@ -763,7 +808,13 @@ def _review_prompt(
         # finishes, and its findings die in the final text nobody parses. So
         # the text becomes a second, weaker delivery: same fields, stated
         # once, at the very end, where a machine can find them.
-        f"{REPORT_BLOCK_INSTRUCTION}\n\n"
+        f"{delivery_block}"
+        # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
+        # скобках, и форматирование прочитало бы "raw_count" как поле.
+        + REPORT_BLOCK_INSTRUCTION.replace(
+            "{main_path}", _MAIN_PATH_HTTP if delivery_block else _MAIN_PATH_MCP
+        )
+        + "\n\n"
     )
     if profile == LITE:
         # No token ceiling is stated (#893). It used to say "бюджет 40000
@@ -1045,7 +1096,35 @@ async def maybe_dispatch_review(
 
     prepass = await review_evidence.prepass_state(db, task)
     prepass_block = review_evidence.prepass_block(prepass)
-    hub_mcp_url = f"{instance_base_url().rstrip('/')}/mcp"
+    hub_base = instance_base_url().rstrip("/")
+    hub_mcp_url = f"{hub_base}/mcp"
+    # #1084: the identity the run can actually carry. Cursor drops mcpServers
+    # on the way into a cloud run, so the header holding the reviewer token
+    # never arrives — but the network does: a run reported a 401 FROM this hub,
+    # which is a request that got there and came back. So the hub mints a
+    # one-time, task-bound code and puts THAT in the prompt.
+    #
+    # Under the pinned principal on purpose: the report then arrives as the
+    # identity #1025 already waits for, with no second rule about who owns it.
+    # No principal (unset or rotated token) means no code — the run falls back
+    # to leaving its report in the text, exactly as before this change.
+    expected_principal = await reviewer_principal_id(db)
+    reviewer_code = ""
+    if expected_principal is not None:
+        from hub.services import chat_pair
+
+        reviewer_code, _code_ttl = await chat_pair.issue_code(
+            db,
+            expected_principal,
+            kind="reviewer",
+            bound_task_id=task_id,
+            # THE pin. Without it every guard below is dead code: issue_code
+            # stores NULL, redeem_code skips the comparison, the session
+            # carries no generation and the intake check is falsy. The tests
+            # that "covered" this minted their codes by hand WITH a generation
+            # and so agreed with a path production never took.
+            bound_generation=generation,
+        )
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=branch,
@@ -1058,6 +1137,7 @@ async def maybe_dispatch_review(
             rules_block,
             diff_block,
             prepass_block,
+            _delivery_block(task_id, reviewer_code, hub_base),
         ),
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
@@ -1079,10 +1159,10 @@ async def maybe_dispatch_review(
         return False
 
     # #1025: pin whose report this dispatch waits for, resolved from the
-    # reviewer token at dispatch time. An unresolved token is logged and
-    # falls back to the old task+generation match rather than blocking the
-    # dispatch — degradation is this module's contract.
-    expected_principal = await reviewer_principal_id(db)
+    # reviewer token at dispatch time (above, where the code was minted under
+    # it). An unresolved token is logged and falls back to the old
+    # task+generation match rather than blocking the dispatch — degradation is
+    # this module's contract.
     if expected_principal is None:
         log.warning(
             "reviewer token resolves to no principal — dispatch for task #%s "

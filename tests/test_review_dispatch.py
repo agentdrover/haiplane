@@ -8,6 +8,7 @@ report whose tokens disagree with the provider's usage is flagged.
 from __future__ import annotations
 
 import json
+import re
 
 import aiosqlite
 from httpx import AsyncClient
@@ -2089,3 +2090,180 @@ def test_pick_review_model_stays_within_available_models(monkeypatch):
     grok_reviewer = pick_review_model("grok-4.6")
     assert grok_reviewer in available
     assert family(grok_reviewer) != family("grok-4.6"), "diversity still holds"
+
+
+# --- Отчёт по контракту без MCP (#1084) --------------------------------------
+#
+# У облачного агента Cursor нет инструментов MCP — заголовок с токеном до рана
+# не доезжает, и отчёт приходится вытаскивать из текста прогона. Сеть при этом
+# работает: ран получил от хаба 401, то есть дошёл и упёрся в отсутствие
+# личности. Значит личность надо доставить иначе — одноразовым кодом в промпте,
+# который ран меняет на короткую сессию с двумя маршрутами.
+
+
+_CODE_IN_PROMPT = re.compile(r"AH-[0-9A-HJKMNP-TV-Z]{8}")
+
+
+def _auth_on(monkeypatch) -> None:
+    """Обмен кода — публичный маршрут, но в open mode он отвечает 503: без
+    принципалов нет и личности, которую код мог бы нести. _pinned_setup
+    закрывает open mode только для middleware, а сам маршрут смотрит на
+    config.HUB_TOKENS."""
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"probe-token": TokenIdentity("probe", "agent")}
+    )
+
+
+async def test_dispatch_mints_a_reviewer_code_and_never_the_token(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1084): диспатч чеканит код, привязанный к ЭТОЙ задаче, и кладёт
+    # его в промпт. Долгоживущего токена там нет никогда, и кода нет в ленте.
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-code"}, "run": {"id": "run-code"}}
+    )
+    _wire(monkeypatch, recorder)
+    _, reviewer_token, _ = await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    task_id = await _submitted(client, db, "spike-code", policy={"review": "dispatch"})
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert reviewer_token not in prompt, "долгоживущий токен в промпт не попадает"
+
+    found = _CODE_IN_PROMPT.search(prompt)
+    assert found, "в промпте нет одноразового кода"
+    code = found.group(0)
+
+    # Код проверяется ОБМЕНОМ, а не совпадением строки: строка в промпте может
+    # быть похожа на код и не быть им.
+    redeemed = await client.post(
+        "/api/auth/chat-pair/redeem",
+        json={"code": code},
+        headers={"x-forwarded-for": "203.0.113.9"},
+    )
+    assert redeemed.status_code == 200, redeemed.text
+    body = redeemed.json()
+    assert body["kind"] == "reviewer"
+    assert body["bound_task_id"] == task_id
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert all(code not in (u["content"] or "") for u in updates), "код утёк в ленту"
+
+
+async def test_contract_report_wins_and_text_recovery_remains(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1084): отчёт, сданный сессией кода, записан как контрактный —
+    # происхождение mcp, не run_text, — привязан к текущему поколению и
+    # сходится с пином принципала своего диспатча. Восстановление из текста
+    # при этом остаётся: оно проверяется соседними тестами файла и не должно
+    # перезаписывать уже принятый контрактный отчёт.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ctr"}, "run": {"id": "run-ctr"}})
+    _wire(monkeypatch, recorder)
+    expected_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    task_id = await _submitted(
+        client, db, "spike-contract", policy={"review": "dispatch"}
+    )
+
+    code = _CODE_IN_PROMPT.search(recorder.calls[-1]["prompt_text"]).group(0)
+    session = (
+        await client.post(
+            "/api/auth/chat-pair/redeem",
+            json={"code": code},
+            headers={"x-forwarded-for": "203.0.113.10"},
+        )
+    ).json()
+    headers = {"Authorization": f"Bearer {session['token']}"}
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief", headers=headers)
+    assert brief.status_code == 200, brief.text
+
+    filed = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "raw_count": 2,
+            "incomplete": False,
+            "harness_skill": "multi-agent-review",
+            "findings_confirmed": [],
+            "findings_rejected": [],
+        },
+        headers=headers,
+    )
+    assert filed.status_code == 200, filed.text
+
+    row = dict(await repo.get_latest_machine_review(db, task_id))
+    # Происхождение живёт в orchestrator: восстановленный из текста отчёт
+    # несёт префикс "cursor-cloud-result:", сданный по контракту — нет.
+    assert not str(row["orchestrator"]).startswith("cursor-cloud-result"), (
+        "контрактный отчёт не должен помечаться как восстановленный из текста"
+    )
+    assert row["submission_generation"] == 1
+    assert not row["self_reviewed"], "ревьюер — не исполнитель задачи"
+    dispatch = await _any_dispatch_row(db, task_id)
+    assert dispatch["reviewer_principal_id"] == expected_pid == row["principal_id"]
+
+
+async def test_prompt_names_the_path_the_run_can_actually_take(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1084: промпт не должен звать в MCP, которого у рана нет. Пока код
+    # выписан, основной путь — HTTP, и обзор ревью тоже читается по HTTP:
+    # иначе за ним пойдут в несуществующий инструмент, а код живёт минуты.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-p1"}, "run": {"id": "run-p1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    await _submitted(client, db, "spike-prompt-http", policy={"review": "dispatch"})
+
+    with_code = recorder.calls[-1]["prompt_text"]
+    assert _CODE_IN_PROMPT.search(with_code), "код в промпте — предпосылка теста"
+    assert "/review-brief" in with_code, "обзор ревью тоже по HTTP"
+    assert "Основной путь — HTTP" in with_code
+    assert "сдай hub_submit_machine_review, это основной путь" not in with_code
+    assert "haiplane-review" in with_code, "запасной блок остаётся при любом пути"
+
+    # Без кода (нет ревьюер-принципала) формулировка прежняя: правка условная,
+    # а не вычёркивание MCP отовсюду — Cursor может починить доставку.
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "no-such-token")
+    await _submitted(client, db, "spike-prompt-mcp", policy={"review": "dispatch"})
+    without_code = recorder.calls[-1]["prompt_text"]
+    assert not _CODE_IN_PROMPT.search(without_code)
+    assert "сдай hub_submit_machine_review, это основной путь" in without_code
+
+
+async def test_dispatch_pins_the_generation_it_minted_for(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1084, находка ревью: пин проверялся ТОЛЬКО на кодах, вычеканенных
+    # руками с bound_generation. Диспатч его не передавал, поэтому в проде
+    # колонка была NULL, сравнение в обмене пропускалось, сессия несла None,
+    # и проверка на приёме была ложной — вся защита оказывалась мёртвой при
+    # зелёных тестах. Этот тест идёт ЧЕРЕЗ ДИСПАТЧ и потому её сторожит.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gen"}, "run": {"id": "run-gen"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    task_id = await _submitted(
+        client, db, "spike-gen-pin", policy={"review": "dispatch"}
+    )
+
+    code = _CODE_IN_PROMPT.search(recorder.calls[-1]["prompt_text"]).group(0)
+    rows = await db.execute_fetchall(
+        "SELECT bound_generation FROM chat_pair_codes WHERE kind='reviewer'"
+    )
+    assert [dict(r)["bound_generation"] for r in rows] == [1], "диспатч обязан пинить"
+
+    # Работа пересдана, пока прогон жив: статус остаётся review, меняется сдача.
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await db.commit()
+
+    refused = await client.post(
+        "/api/auth/chat-pair/redeem",
+        json={"code": code},
+        headers={"x-forwarded-for": "203.0.113.11"},
+    )
+    assert refused.status_code == 401, refused.text
