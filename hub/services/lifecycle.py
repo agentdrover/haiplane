@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +40,7 @@ from hub.db import (
     write_transaction,
 )
 from hub.integrations.registry import plugins
+from hub.services.gate_pipeline import Step, policy, run_steps
 from hub.services import verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
@@ -1753,6 +1755,358 @@ def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@dataclass
+class SubmitContext:
+    """Что шаги сдачи читают и производят до перехода (#1067).
+
+    Двадцать значений пересекают границу транзакции — они и собраны здесь.
+    Дата-класс, а не двадцать параметров: шаг, которому понадобилось новое
+    поле, дописывает его сюда, а не в сигнатуру каждого соседа.
+    """
+
+    db: aiosqlite.Connection
+    task_id: int
+    task: dict[str, Any]
+    body: TaskSubmitReview
+
+    resubmitted_from_review: bool = False
+    replaced_sha: str = ""
+    canonical: str = ""
+    reported: str = ""
+    diff_paths: list[str] | None = None
+    diff_reason: str = ""
+    risk_fields: dict[str, Any] = dc_field(default_factory=dict)
+    risk_alert: str = ""
+    risk_note: str = ""
+    surface_note: str = ""
+    accepted_paths: list[str] = dc_field(default_factory=list)
+    outcome_note: str = ""
+    outcome_writes: list[Any] = dc_field(default_factory=list)
+    outcome_generation: int = 0
+    rules_mode: str = ""
+    rule_lines: list[str] = dc_field(default_factory=list)
+    clean_lines: list[str] = dc_field(default_factory=list)
+    unchecked_lines: list[str] = dc_field(default_factory=list)
+    submission_sha: str = ""
+    sha_reason: str = ""
+    discovered_pr: int | None = None
+    pr_opened_by_hub: bool = False
+    pr_ensure_note: str = ""
+
+
+async def _step_task_is_submittable(state: SubmitContext) -> None:
+    """Задача pair и в статусе, из которого сдают (#305, #1054)."""
+    if state.task.get("job_id"):
+        raise HTTPException(
+            400,
+            "headless tasks are submitted for review by their done report; "
+            "submit-for-review is only for pair tasks without a dispatch job",
+        )
+    if state.task["status"] not in ("running", "review"):
+        raise HTTPException(
+            400,
+            f"can only submit running or under-review pair tasks for review, "
+            f"current status: {state.task['status']}",
+        )
+    # #1054: what this submission replaces, read before anything is written.
+    state.resubmitted_from_review = state.task["status"] == "review"
+    state.replaced_sha = (state.task.get("submission_sha") or "").strip()
+
+
+async def _step_branch_matches(state: SubmitContext) -> None:
+    """Клиент работал в ветке, которой владеет задача (#533)."""
+    # #533: the task records a canonical branch; the client reports the one it
+    # worked in. A mismatch means the hub, CI and the reviewer are looking at
+    # a branch nobody wrote in.
+    #
+    # This compares a REPORT, not an observation. The hub has no working copy
+    # of the project to inspect — on production the workspace holds a single
+    # .placeholder file — so a client that names the right branch while
+    # sitting in another passes. It catches forgetting to switch, which is
+    # the failure that actually happens; it is not a guarantee, and the
+    # policy document says so in the same words.
+    #
+    # Pair path only: a headless task's branch belongs to the dispatch job,
+    # and the client never reports one.
+    state.reported = (state.body.branch or "").strip()
+    state.canonical = (state.task.get("branch") or "").strip()
+    if state.reported and state.canonical and state.reported != state.canonical:
+        raise HTTPException(
+            409,
+            {
+                "error": "branch_mismatch",
+                "task_id": state.task_id,
+                "expected": state.canonical,
+                "reported": state.reported,
+                "hint": (
+                    f"work in the branch this task owns: git switch {state.canonical} "
+                    f"(create it from the base branch if it does not exist), or "
+                    f"move the commits over. If {state.reported!r} is genuinely the "
+                    "right branch, update the task's branch field first so the "
+                    "hub, CI and the reviewer all point at the same place."
+                ),
+            },
+        )
+
+
+async def _step_resolve_diff(state: SubmitContext) -> None:
+    """Дифф ветки и пересчёт риск-класса — контекст двух следующих шагов (#583)."""
+    # #583: one diff resolution feeds the surface check and the risk-class
+    # recompute. Resolved BEFORE the write lock — this walks to the network.
+    state.diff_paths, state.diff_reason = await _resolve_branch_diff(
+        state.db, state.task
+    )
+    state.risk_fields, state.risk_alert, state.risk_note = _risk_recompute_on_submit(
+        state.task,
+        state.diff_paths,
+        state.diff_reason,
+        await risk_map_for_task(state.db, state.task_id),
+    )
+
+
+async def _step_surfaces(state: SubmitContext) -> None:
+    """Объявленная область против фактического диффа (#550, #890)."""
+    # #550: before the transition, not after — a refusal has to happen while
+    # there is still something to refuse.
+    surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
+    state.surface_note = ""
+    # #890: paths the submitter accepts as the real scope. Empty unless the
+    # submission asked for it — the hub never widens affected_areas on its own.
+    state.accepted_paths = []
+    if surfaces_mode != "off":
+        verdict, undeclared, detail = _surface_check(
+            state.task, state.diff_paths, state.diff_reason
+        )
+        if verdict == "undeclared":
+            listed = ", ".join(undeclared[:10])
+            if state.body.accept_areas:
+                # #890: affected_areas is written at DoR as a PREDICTION, and
+                # work discovers its own scope — #854 measured 46 of 104
+                # submissions changing files outside the declared set, and
+                # showed the residue is real surfaces, not routine noise.
+                # Refusing that punishes imprecise foresight; what review,
+                # commit-scope and the risk recompute actually need is that
+                # declared and actual agree AT SUBMISSION. So the submitter
+                # may accept the truth in one step — explicitly, and on the
+                # record below.
+                state.accepted_paths = list(undeclared)
+                # Deliberately NOT the "Вне объявленной области" wording: an
+                # accepted scope is a recorded fact, not an open divergence.
+                state.surface_note = (
+                    f"Область: объём признан на сдаче — +{len(undeclared)} "
+                    "путь(ей) дописан(ы) в affected_areas."
+                )
+            elif surfaces_mode == "require":
+                raise HTTPException(
+                    422,
+                    f"ветка меняет файлы вне объявленной области: {listed}. "
+                    "Допишите их в affected_areas, признайте фактические "
+                    "области на сдаче (accept_areas) или объясните в сдаче, "
+                    "почему они здесь. Проверка сравнивает с фактическим "
+                    "диффом, а не с предсказанием.",
+                )
+            else:
+                state.surface_note = (
+                    f"Вне объявленной области изменены: {listed}. Режим "
+                    "проверки — warn, сдача принята. Область стоит дописать "
+                    "(или признать на сдаче через accept_areas): по ней "
+                    "сверяется и commit-scope."
+                )
+        elif verdict == "unknown":
+            # Nothing to accept: a check that did not run is not a divergence,
+            # and accept_areas must never turn silence into agreement.
+            state.surface_note = (
+                f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
+                "Это не значит, что расхождений нет."
+            )
+
+
+async def _step_finding_outcomes(state: SubmitContext) -> None:
+    """Исходы находок предыдущей сдачи (#911)."""
+    # #911: what became of the findings the PREVIOUS submission was sent back
+    # over. Placed with the other pre-transition gates for the same reason they
+    # are here — a refusal has to happen while there is still something to
+    # refuse — and before the paid layers, because it costs one indexed read.
+    #
+    # The generation asked about is the CURRENT one, before the bump below: the
+    # report for the submission being made does not exist yet. On a first
+    # submission there are no reports and the gate is silent, which is the
+    # point — it asks only where an answer is owed.
+    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
+    state.outcome_note = ""
+    state.outcome_writes = []
+    state.outcome_generation = int(state.task.get("submission_generation") or 0)
+    if outcome_mode != "off":
+        open_items = await finding_outcome.open_findings(
+            state.db, state.task_id, state.outcome_generation
+        )
+        try:
+            state.outcome_writes, still_open = finding_outcome.plan_outcomes(
+                open_items, state.body.finding_outcomes
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if still_open:
+            if outcome_mode == "require":
+                raise HTTPException(422, finding_outcome.refusal_text(still_open))
+            state.outcome_note = (
+                f"Исходы находок: НЕ названы для {len(still_open)} "
+                "подтверждённых находок предыдущей сдачи. Режим проверки — "
+                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
+            )
+
+
+async def _step_submit_rules(state: SubmitContext) -> None:
+    """Дешёвый детерминированный слой по диффу (#855)."""
+    # #855: the cheap deterministic layer, on the diff this submission already
+    # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
+    # paid reviewer for a measured reason: over 30 days the harness confirmed
+    # findings at 124k tokens apiece and 61% of its raw findings were
+    # rejected, while the categories test-coverage, test-adequacy and
+    # missing-test-hides-defect follow from the diff by rule, not by
+    # reasoning. Refusals happen here, still before the transition.
+    state.rules_mode = (config.SUBMIT_RULES or "warn").strip().lower()
+    state.rule_lines = []
+    state.clean_lines = []
+    state.unchecked_lines = []
+    if state.rules_mode != "off":
+        if state.diff_paths is None:
+            # The honesty contract of #550/#725: a check that could not run
+            # says so. Silence here would read as "no rule fired".
+            state.unchecked_lines.append(
+                f"Правила по диффу НЕ проверялись: {state.diff_reason or 'дифф не разрешён'}. "
+                "Это не значит, что нарушений нет."
+            )
+        else:
+            code_no_tests = commit_scope.code_without_tests(state.diff_paths)
+            if code_no_tests:
+                listed = ", ".join(code_no_tests[:10])
+                more = (
+                    f" и ещё {len(code_no_tests) - 10}"
+                    if len(code_no_tests) > 10
+                    else ""
+                )
+                if state.rules_mode == "require":
+                    raise HTTPException(
+                        422,
+                        f"дифф меняет код и не трогает ни одного теста: "
+                        f"{listed}{more}. Принесите тест либо назовите в сдаче "
+                        "причину, по которой его здесь быть не должно. "
+                        "Правило смотрит на пути в диффе, не на содержимое.",
+                    )
+                state.rule_lines.append(
+                    f"Тесты рядом с кодом: СРАБОТАЛО — дифф меняет код и не "
+                    f"трогает ни одного теста: {listed}{more}. Принесите тест "
+                    "или назовите причину в сдаче."
+                )
+            else:
+                # Silence on a clean run is deliberate. A line on every
+                # submission would be the noise this layer is supposed to
+                # replace — and #593 already names the failure mode: a gate
+                # that speaks constantly stops being read. What ran cleanly
+                # is listed below only when the report exists for some other
+                # reason.
+                state.clean_lines.append("Тесты рядом с кодом: проверено, чисто.")
+            if (state.task.get("work_type") or "") == "bug" and commit_scope.tests_only(
+                state.diff_paths
+            ):
+                # Named, never refused: a missing test genuinely is the whole
+                # fix often enough, and a rule that cannot tell the two apart
+                # must not be the one deciding.
+                state.rule_lines.append(
+                    "Баг правит только тесты: отмечено. Тест, написанный под "
+                    "уже изменённое поведение, ничего не доказывает о "
+                    "починке — но это признак, а не запрет."
+                )
+
+
+async def _step_pin_submission_sha(state: SubmitContext) -> None:
+    """Код, который будет судить ревьюер (#572)."""
+    # #572: pin the code the reviewer will actually be judging. Resolved by
+    # the hub BEFORE the write lock — this walks to the network. An empty
+    # result is recorded as empty and the submission proceeds: the pin is
+    # protection for the verdict, not a new gate on submitting.
+    state.submission_sha, state.sha_reason = await resolve_branch_tip(
+        state.db, state.task_id, state.task.get("branch") or ""
+    )
+
+
+async def _step_delivery_pr(state: SubmitContext) -> None:
+    """PR, который повезёт работу (#605, #967, #975)."""
+    # #605: record which PR carries this work. The pair flow never sets
+    # pr_number — only headless create_pr does — so the delivery gate would
+    # have keyed on a field nobody fills. The hub looks it up itself; a
+    # discovery failure records nothing and the submission proceeds, because
+    # a task that genuinely has no PR (config work) must submit exactly as
+    # before — the gate then completes it untouched.
+    state.discovered_pr = None
+    state.pr_opened_by_hub = False
+    state.pr_ensure_note = ""
+    if not state.task.get("pr_number") and state.canonical:
+        from hub.services.orchestration import ensure_delivery_pr, project_git_context
+
+        try:
+            ctx = await project_git_context(state.db, state.task_id)
+            state.discovered_pr = await plugins.git_ops.pr_for_branch(
+                state.canonical, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            )
+        except Exception as exc:  # noqa: BLE001 - best effort by contract
+            log.warning(
+                "PR discovery failed for #%s (%s): %s",
+                state.task_id,
+                state.canonical,
+                exc,
+            )
+        # #967: discovery finding nothing used to end the question — and four
+        # tasks in one week ended completed with commits stranded on a branch.
+        # When THIS submission's diff (#583, resolved once above) positively
+        # shows changes, the hub opens the PR itself: CI then runs in parallel
+        # with the review instead of starting after done. A refusal is a
+        # warning, never a failed submission — the review in the hub is valid
+        # without a PR; the done gate is where the missing PR becomes a block.
+        if not state.discovered_pr and state.diff_paths:
+            state.discovered_pr, state.pr_ensure_note = await ensure_delivery_pr(
+                state.db, state.task, state.canonical, state.diff_paths
+            )
+            state.pr_opened_by_hub = bool(state.discovered_pr)
+
+    # #975 AC-6: remote pair-start never has a hub-host diff, so None/[] is
+    # the normal observation — not the #498 "could not look, stay silent"
+    # case. A placeholder project (no gh_repo) cannot open a PR either.
+    # Name that on the submit response; do not look like empty success.
+    if (
+        _git_mode_is_remote(state.task)
+        and not state.task.get("pr_number")
+        and not state.discovered_pr
+        and not state.pr_ensure_note
+        and state.canonical
+    ):
+        from hub.services.orchestration import project_git_context as _git_ctx
+
+        remote_ctx = await _git_ctx(state.db, state.task_id)
+        if not (remote_ctx.get("gh_repo") or "").strip():
+            state.pr_ensure_note = (
+                f"diff/PR для ветки {state.canonical} открыть не удалось: "
+                "у проекта нет origin/repo (placeholder workspace). "
+                "git_mode=remote — хаб не читает clone на своём хосте."
+            )
+
+
+# Порядок сдачи. Он и был несущим — сетевые резолвы до транзакции, отказ до
+# записи, — но держался тем, что никто не переставил блоки. Теперь его можно
+# сверить тестом и сравнить с набором headless-пути.
+SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
+    Step("task_is_submittable", _step_task_is_submittable),
+    Step("branch_matches", _step_branch_matches),
+    Step("resolve_diff", _step_resolve_diff, refuses=False),
+    Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
+    Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
+    Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
+    Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step("delivery_pr", _step_delivery_pr, refuses=False),
+)
+
+
 async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1786,267 +2140,192 @@ async def submit_for_review(
     task = dict(row)
     body = body or TaskSubmitReview()
 
-    if task.get("job_id"):
-        raise HTTPException(
-            400,
-            "headless tasks are submitted for review by their done report; "
-            "submit-for-review is only for pair tasks without a dispatch job",
+    state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
+    await run_steps(state, SUBMIT_STEPS)
+
+    return await _apply_submission(state)
+
+
+def _submission_update_text(
+    state: SubmitContext,
+    *,
+    generation: int,
+    adopted: dict[str, Any] | None,
+    declared_model: str,
+) -> tuple[str, str]:
+    """Текст записи о сдаче — сборка строки, а не запись (#1067).
+
+    Пятнадцать ветвлений из двадцати трёх у ``_apply_submission`` были здесь,
+    и все они про то, ЧТО написать в ленту: открыт ли PR хабом, закреплён ли
+    SHA, пересдача ли это, принят ли найденный PR, сменился ли риск-класс.
+    Ни одна из них ничего не пишет — запись делает вызывающий одной строкой
+    ниже, внутри той же транзакции.
+
+    Три аргумента идут отдельно от контекста намеренно: ``generation``,
+    ``adopted`` и ``declared_model`` вычисляются ВНУТРИ транзакции и до неё
+    не существуют. Класть их в SubmitContext значило бы завести полям место,
+    где они половину жизни пустые.
+    """
+    agent = (state.body.agent or "").strip() or state.task.get("assigned_agent", "")
+    summary = (state.body.summary or "").strip()
+    content = f"{repo.SUBMISSION_UPDATE_PREFIX}{generation})."
+    if state.pr_opened_by_hub:
+        content += f" PR #{state.discovered_pr} открыт хабом для доставки (#967)."
+    elif state.discovered_pr:
+        content += f" PR #{state.discovered_pr} recorded for delivery."
+    if state.submission_sha:
+        content += f" Branch tip at submission: {state.submission_sha[:12]}."
+    else:
+        # Unchecked is a state the reviewer must see, not an absence of
+        # news — the same rule the drift guard follows (#534, #572).
+        # #767: this line used to hang off ``if adopted`` — the CI-report
+        # branch — while speaking about pinning. A submission with a
+        # pinned sha and no CI report to adopt therefore printed both
+        # "Branch tip at submission: 97e4707248ee" and "Branch tip NOT
+        # pinned: " with an empty reason, contradicting itself in one
+        # sentence (seen on #725 and #763). It belongs to the sha, so it
+        # is bound to the sha.
+        content += f" Branch tip NOT pinned: {state.sha_reason}."
+    if state.resubmitted_from_review:
+        # #1054: someone may be reading the previous submission right now.
+        # Both commits are named, so what he is looking at and what
+        # replaced it are in the feed rather than in his assumptions.
+        replaced = state.replaced_sha[:12] if state.replaced_sha else "—"
+        content += (
+            f" Пересдача из review: сдача {replaced} заменена на "
+            f"{state.submission_sha[:12] if state.submission_sha else '—'}; вердикт "
+            "по заменённой сдаче больше не текущий."
         )
-    if task["status"] not in ("running", "review"):
-        raise HTTPException(
-            400,
-            f"can only submit running or under-review pair tasks for review, "
-            f"current status: {task['status']}",
+    if adopted:
+        # #1056: the count used to stand here, so five not_found results
+        # printed exactly like five passing ones. The reader of the feed —
+        # the human at the gate — got "5 AC result(s)" as if it were
+        # evidence. What is printed now is the outcome.
+        from hub.services.ac_tests import describe_recorded_results
+
+        ac_phrase = describe_recorded_results(adopted.get("ac_recorded"))
+        v_status = adopted.get("validation_status") or "—"
+        content += (
+            f" CI run report adopted for this commit: {ac_phrase}, "
+            f"validation {v_status}."
         )
-    # #1054: what this submission replaces, read before anything is written.
-    resubmitted_from_review = task["status"] == "review"
-    replaced_sha = (task.get("submission_sha") or "").strip()
+    if state.risk_note:
+        content += state.risk_note
+    if declared_model:
+        content += f" Модель исполнителя (декларация): {declared_model}."
+    if summary:
+        content += f" {summary}"
+    return agent, content
 
-    # #533: the task records a canonical branch; the client reports the one it
-    # worked in. A mismatch means the hub, CI and the reviewer are looking at
-    # a branch nobody wrote in.
-    #
-    # This compares a REPORT, not an observation. The hub has no working copy
-    # of the project to inspect — on production the workspace holds a single
-    # .placeholder file — so a client that names the right branch while
-    # sitting in another passes. It catches forgetting to switch, which is
-    # the failure that actually happens; it is not a guarantee, and the
-    # policy document says so in the same words.
-    #
-    # Pair path only: a headless task's branch belongs to the dispatch job,
-    # and the client never reports one.
-    reported = (body.branch or "").strip()
-    canonical = (task.get("branch") or "").strip()
-    if reported and canonical and reported != canonical:
-        raise HTTPException(
-            409,
-            {
-                "error": "branch_mismatch",
-                "task_id": task_id,
-                "expected": canonical,
-                "reported": reported,
-                "hint": (
-                    f"work in the branch this task owns: git switch {canonical} "
-                    f"(create it from the base branch if it does not exist), or "
-                    f"move the commits over. If {reported!r} is genuinely the "
-                    "right branch, update the task's branch field first so the "
-                    "hub, CI and the reviewer all point at the same place."
-                ),
-            },
+
+async def _write_submission_notices(state: SubmitContext) -> None:
+    """Заметки о сдаче в ленту: что проверено, чего не хватает (#1067).
+
+    Вынесено вместе с записями, а не только со сборкой текста: блок целиком
+    про уведомление читателя и ничего не решает о переходе. Все входы —
+    из контекста, поэтому это перемещение, а не переработка.
+
+    Вызывается ВНУТРИ транзакции: заметка о сдаче и сама сдача обязаны
+    попасть в базу вместе, иначе лента расскажет о переходе, которого не
+    было, или умолчит о состоявшемся.
+    """
+    report_lines = [
+        ln for ln in ([state.surface_note, state.outcome_note] + state.rule_lines) if ln
+    ]
+    report_lines += state.unchecked_lines
+    if report_lines:
+        # Only now is "what ran and found nothing" worth printing: inside
+        # a report the reader is already looking at.
+        report_lines += state.clean_lines
+        header = f"Отчёт проверок на сдаче (режим правил: {state.rules_mode})."
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            "alert",
+            header + "\n— " + "\n— ".join(report_lines),
+        )
+    if state.pr_ensure_note:
+        # #967: the refusal half of AC-1 — the reader learns the PR is
+        # missing NOW, at submission, not from the done gate later.
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            "alert",
+            f"{state.pr_ensure_note}. Сдача принята — ревью валидно и без PR, "
+            "но done без него не завершится: гейт откроет PR сам или "
+            "спросит человека (#967).",
+        )
+    if state.risk_alert:
+        await repo.add_task_update(
+            state.db, state.task_id, "hub", "alert", state.risk_alert
         )
 
-    # #583: one diff resolution feeds the surface check and the risk-class
-    # recompute. Resolved BEFORE the write lock — this walks to the network.
-    diff_paths, diff_reason = await _resolve_branch_diff(db, task)
-    risk_fields, risk_alert, risk_note = _risk_recompute_on_submit(
-        task, diff_paths, diff_reason, await risk_map_for_task(db, task_id)
-    )
 
-    # #550: before the transition, not after — a refusal has to happen while
-    # there is still something to refuse.
-    surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
-    surface_note = ""
-    # #890: paths the submitter accepts as the real scope. Empty unless the
-    # submission asked for it — the hub never widens affected_areas on its own.
-    accepted_paths: list[str] = []
-    if surfaces_mode != "off":
-        verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
-        if verdict == "undeclared":
-            listed = ", ".join(undeclared[:10])
-            if body.accept_areas:
-                # #890: affected_areas is written at DoR as a PREDICTION, and
-                # work discovers its own scope — #854 measured 46 of 104
-                # submissions changing files outside the declared set, and
-                # showed the residue is real surfaces, not routine noise.
-                # Refusing that punishes imprecise foresight; what review,
-                # commit-scope and the risk recompute actually need is that
-                # declared and actual agree AT SUBMISSION. So the submitter
-                # may accept the truth in one step — explicitly, and on the
-                # record below.
-                accepted_paths = list(undeclared)
-                # Deliberately NOT the "Вне объявленной области" wording: an
-                # accepted scope is a recorded fact, not an open divergence.
-                surface_note = (
-                    f"Область: объём признан на сдаче — +{len(undeclared)} "
-                    "путь(ей) дописан(ы) в affected_areas."
-                )
-            elif surfaces_mode == "require":
-                raise HTTPException(
-                    422,
-                    f"ветка меняет файлы вне объявленной области: {listed}. "
-                    "Допишите их в affected_areas, признайте фактические "
-                    "области на сдаче (accept_areas) или объясните в сдаче, "
-                    "почему они здесь. Проверка сравнивает с фактическим "
-                    "диффом, а не с предсказанием.",
-                )
-            else:
-                surface_note = (
-                    f"Вне объявленной области изменены: {listed}. Режим "
-                    "проверки — warn, сдача принята. Область стоит дописать "
-                    "(или признать на сдаче через accept_areas): по ней "
-                    "сверяется и commit-scope."
-                )
-        elif verdict == "unknown":
-            # Nothing to accept: a check that did not run is not a divergence,
-            # and accept_areas must never turn silence into agreement.
-            surface_note = (
-                f"Сверка объявленной области с диффом НЕ выполнялась: {detail}. "
-                "Это не значит, что расхождений нет."
-            )
+async def _dispatch_cross_model_review(db: aiosqlite.Connection, task_id: int) -> None:
+    """Кросс-модельного ревьюера зовёт хаб, а не исполнитель (#757).
 
-    # #911: what became of the findings the PREVIOUS submission was sent back
-    # over. Placed with the other pre-transition gates for the same reason they
-    # are here — a refusal has to happen while there is still something to
-    # refuse — and before the paid layers, because it costs one indexed read.
-    #
-    # The generation asked about is the CURRENT one, before the bump below: the
-    # report for the submission being made does not exist yet. On a first
-    # submission there are no reports and the gate is silent, which is the
-    # point — it asks only where an answer is owed.
-    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
-    outcome_note = ""
-    outcome_writes: list[Any] = []
-    outcome_generation = int(task.get("submission_generation") or 0)
-    if outcome_mode != "off":
-        open_items = await finding_outcome.open_findings(
-            db, task_id, outcome_generation
-        )
-        try:
-            outcome_writes, still_open = finding_outcome.plan_outcomes(
-                open_items, body.finding_outcomes
-            )
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        if still_open:
-            if outcome_mode == "require":
-                raise HTTPException(422, finding_outcome.refusal_text(still_open))
-            outcome_note = (
-                f"Исходы находок: НЕ названы для {len(still_open)} "
-                "подтверждённых находок предыдущей сдачи. Режим проверки — "
-                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
-            )
+    Best-effort по контракту: неудача диспетча пишет в лог и НЕ ломает сдачу.
+    Отдельной функцией — чтобы это обещание было видно в имени и подписи, а не
+    только в комментарии посреди перехода.
+    """
+    try:
+        from hub.services.review_dispatch import maybe_dispatch_review
 
-    # #855: the cheap deterministic layer, on the diff this submission already
-    # resolved (#583) — no extra git call and no tokens. It runs BEFORE the
-    # paid reviewer for a measured reason: over 30 days the harness confirmed
-    # findings at 124k tokens apiece and 61% of its raw findings were
-    # rejected, while the categories test-coverage, test-adequacy and
-    # missing-test-hides-defect follow from the diff by rule, not by
-    # reasoning. Refusals happen here, still before the transition.
-    rules_mode = (config.SUBMIT_RULES or "warn").strip().lower()
-    rule_lines: list[str] = []
-    clean_lines: list[str] = []
-    unchecked_lines: list[str] = []
-    if rules_mode != "off":
-        if diff_paths is None:
-            # The honesty contract of #550/#725: a check that could not run
-            # says so. Silence here would read as "no rule fired".
-            unchecked_lines.append(
-                f"Правила по диффу НЕ проверялись: {diff_reason or 'дифф не разрешён'}. "
-                "Это не значит, что нарушений нет."
-            )
-        else:
-            code_no_tests = commit_scope.code_without_tests(diff_paths)
-            if code_no_tests:
-                listed = ", ".join(code_no_tests[:10])
-                more = (
-                    f" и ещё {len(code_no_tests) - 10}"
-                    if len(code_no_tests) > 10
-                    else ""
-                )
-                if rules_mode == "require":
-                    raise HTTPException(
-                        422,
-                        f"дифф меняет код и не трогает ни одного теста: "
-                        f"{listed}{more}. Принесите тест либо назовите в сдаче "
-                        "причину, по которой его здесь быть не должно. "
-                        "Правило смотрит на пути в диффе, не на содержимое.",
-                    )
-                rule_lines.append(
-                    f"Тесты рядом с кодом: СРАБОТАЛО — дифф меняет код и не "
-                    f"трогает ни одного теста: {listed}{more}. Принесите тест "
-                    "или назовите причину в сдаче."
-                )
-            else:
-                # Silence on a clean run is deliberate. A line on every
-                # submission would be the noise this layer is supposed to
-                # replace — and #593 already names the failure mode: a gate
-                # that speaks constantly stops being read. What ran cleanly
-                # is listed below only when the report exists for some other
-                # reason.
-                clean_lines.append("Тесты рядом с кодом: проверено, чисто.")
-            if (task.get("work_type") or "") == "bug" and commit_scope.tests_only(
-                diff_paths
-            ):
-                # Named, never refused: a missing test genuinely is the whole
-                # fix often enough, and a rule that cannot tell the two apart
-                # must not be the one deciding.
-                rule_lines.append(
-                    "Баг правит только тесты: отмечено. Тест, написанный под "
-                    "уже изменённое поведение, ничего не доказывает о "
-                    "починке — но это признак, а не запрет."
-                )
+        await maybe_dispatch_review(db, task_id)
+    except Exception:  # noqa: BLE001 - dispatch must never break a submit
+        log.exception("cross-model review dispatch failed for task #%s", task_id)
 
-    # #572: pin the code the reviewer will actually be judging. Resolved by
-    # the hub BEFORE the write lock — this walks to the network. An empty
-    # result is recorded as empty and the submission proceeds: the pin is
-    # protection for the verdict, not a new gate on submitting.
-    submission_sha, sha_reason = await resolve_branch_tip(
-        db, task_id, task.get("branch") or ""
-    )
 
-    # #605: record which PR carries this work. The pair flow never sets
-    # pr_number — only headless create_pr does — so the delivery gate would
-    # have keyed on a field nobody fills. The hub looks it up itself; a
-    # discovery failure records nothing and the submission proceeds, because
-    # a task that genuinely has no PR (config work) must submit exactly as
-    # before — the gate then completes it untouched.
-    discovered_pr: int | None = None
-    pr_opened_by_hub = False
-    pr_ensure_note = ""
-    if not task.get("pr_number") and canonical:
-        from hub.services.orchestration import ensure_delivery_pr, project_git_context
+async def _warn_on_branch_stacking(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> dict[str, Any] | None:
+    """Ветка везёт коммиты другой несмерженной задачи — предупредить (#438).
 
-        try:
-            ctx = await project_git_context(db, task_id)
-            discovered_pr = await plugins.git_ops.pr_for_branch(
-                canonical, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
-            )
-        except Exception as exc:  # noqa: BLE001 - best effort by contract
-            log.warning("PR discovery failed for #%s (%s): %s", task_id, canonical, exc)
-        # #967: discovery finding nothing used to end the question — and four
-        # tasks in one week ended completed with commits stranded on a branch.
-        # When THIS submission's diff (#583, resolved once above) positively
-        # shows changes, the hub opens the PR itself: CI then runs in parallel
-        # with the review instead of starting after done. A refusal is a
-        # warning, never a failed submission — the review in the hub is valid
-        # without a PR; the done gate is where the missing PR becomes a block.
-        if not discovered_pr and diff_paths:
-            discovered_pr, pr_ensure_note = await ensure_delivery_pr(
-                db, task, canonical, diff_paths
-            )
-            pr_opened_by_hub = bool(discovered_pr)
+    Предупреждение, никогда не запрет: стек может быть осознанным решением,
+    поэтому находка — это алерт в ленту и подсказка в ответе, а не отказ в
+    сдаче. Возвращает находку, чтобы вызывающий дописал подсказку в ответ.
+    """
+    stacking = await detect_branch_stacking(db, task_id, branch)
+    if stacking:
+        await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
+        await db.commit()
+    return stacking
 
-    # #975 AC-6: remote pair-start never has a hub-host diff, so None/[] is
-    # the normal observation — not the #498 "could not look, stay silent"
-    # case. A placeholder project (no gh_repo) cannot open a PR either.
-    # Name that on the submit response; do not look like empty success.
-    if (
-        _git_mode_is_remote(task)
-        and not task.get("pr_number")
-        and not discovered_pr
-        and not pr_ensure_note
-        and canonical
-    ):
-        from hub.services.orchestration import project_git_context as _git_ctx
 
-        remote_ctx = await _git_ctx(db, task_id)
-        if not (remote_ctx.get("gh_repo") or "").strip():
-            pr_ensure_note = (
-                f"diff/PR для ветки {canonical} открыть не удалось: "
-                "у проекта нет origin/repo (placeholder workspace). "
-                "git_mode=remote — хаб не читает clone на своём хосте."
-            )
+async def _apply_submission(state: SubmitContext) -> TaskView:
+    """Сам переход: запись статуса, пиннинг сдачи и всё, что за ними (#1067).
+
+    Отделено от гейтов не ради красоты, а по замеру: из 82 ветвлений
+    submit_for_review 37 несло именно тело перехода — больше, чем все гейты
+    вместе. Вынос одних гейтов оставлял функцию с цикломатикой 24 при цели
+    15, и порог из #1066 её бы не пропустил.
+
+    Перенесено ЦЕЛИКОМ, строка в строку: это перемещение, а не переработка.
+    Единственный отказ внутри транзакции — compare-and-swap
+    ``transition_status_if`` — остаётся здесь и гейтом не является: это
+    оптимистическая блокировка самого перехода, и вынести её наружу значило
+    бы её сломать.
+    """
+    db = state.db
+    task_id = state.task_id
+    task = state.task
+    body = state.body
+
+    # Контракт между конвейером и переходом, выписанный целиком: шесть
+    # значений — ровно те, что шаги производят, а транзакция ниже читает.
+    # Список здесь, а не по месту, чтобы шаг, забывший что-то заполнить, был
+    # виден одним взглядом; ruff же ловит обратное — значение, которое больше
+    # никому не нужно (так отсюда ушли четыре: их «использование» ниже
+    # оказалось упоминанием в комментарии, а не чтением).
+    # Тело перехода при этом не изменилось ни на строку.
+    risk_fields = state.risk_fields
+    accepted_paths = state.accepted_paths
+    outcome_writes = state.outcome_writes
+    outcome_generation = state.outcome_generation
+    submission_sha = state.submission_sha
+    discovered_pr = state.discovered_pr
 
     async with write_transaction(db):
         if not await repo.transition_status_if(
@@ -2076,8 +2355,10 @@ async def submit_for_review(
                 reported_by=(body.agent or task.get("assigned_agent") or ""),
             )
         if outcome_drafts:
-            outcome_note = (
-                (outcome_note + " " if outcome_note else "")
+            # Пишем В КОНТЕКСТ: заметку ниже печатает
+            # _write_submission_notices, и она читает его, а не локальную.
+            state.outcome_note = (
+                (state.outcome_note + " " if state.outcome_note else "")
                 + f"Исходы находок: заведено дефект-драфтов {len(outcome_drafts)} — "
                 + ", ".join(f"#{i}" for i in outcome_drafts)
                 + ". Находка, которую не чинят, остаётся работой, а не исчезает."
@@ -2123,55 +2404,12 @@ async def submit_for_review(
         # submission must leave the task exactly where it was, class included.
         if risk_fields:
             await repo.update_task(db, task_id, **risk_fields)
-        agent = (body.agent or "").strip() or task.get("assigned_agent", "")
-        summary = (body.summary or "").strip()
-        content = f"{repo.SUBMISSION_UPDATE_PREFIX}{generation})."
-        if pr_opened_by_hub:
-            content += f" PR #{discovered_pr} открыт хабом для доставки (#967)."
-        elif discovered_pr:
-            content += f" PR #{discovered_pr} recorded for delivery."
-        if submission_sha:
-            content += f" Branch tip at submission: {submission_sha[:12]}."
-        else:
-            # Unchecked is a state the reviewer must see, not an absence of
-            # news — the same rule the drift guard follows (#534, #572).
-            # #767: this line used to hang off ``if adopted`` — the CI-report
-            # branch — while speaking about pinning. A submission with a
-            # pinned sha and no CI report to adopt therefore printed both
-            # "Branch tip at submission: 97e4707248ee" and "Branch tip NOT
-            # pinned: " with an empty reason, contradicting itself in one
-            # sentence (seen on #725 and #763). It belongs to the sha, so it
-            # is bound to the sha.
-            content += f" Branch tip NOT pinned: {sha_reason}."
-        if resubmitted_from_review:
-            # #1054: someone may be reading the previous submission right now.
-            # Both commits are named, so what he is looking at and what
-            # replaced it are in the feed rather than in his assumptions.
-            replaced = replaced_sha[:12] if replaced_sha else "—"
-            content += (
-                f" Пересдача из review: сдача {replaced} заменена на "
-                f"{submission_sha[:12] if submission_sha else '—'}; вердикт "
-                "по заменённой сдаче больше не текущий."
-            )
-        if adopted:
-            # #1056: the count used to stand here, so five not_found results
-            # printed exactly like five passing ones. The reader of the feed —
-            # the human at the gate — got "5 AC result(s)" as if it were
-            # evidence. What is printed now is the outcome.
-            from hub.services.ac_tests import describe_recorded_results
-
-            ac_phrase = describe_recorded_results(adopted.get("ac_recorded"))
-            v_status = adopted.get("validation_status") or "—"
-            content += (
-                f" CI run report adopted for this commit: {ac_phrase}, "
-                f"validation {v_status}."
-            )
-        if risk_note:
-            content += risk_note
-        if declared_model:
-            content += f" Модель исполнителя (декларация): {declared_model}."
-        if summary:
-            content += f" {summary}"
+        agent, content = _submission_update_text(
+            state,
+            generation=generation,
+            adopted=adopted,
+            declared_model=declared_model,
+        )
         await repo.add_task_update(db, task_id, agent, "status", content)
         # #890: the accepted scope is written INSIDE the same transaction as
         # the transition, so a task can never end up in review with the field
@@ -2206,30 +2444,7 @@ async def submit_for_review(
         # leave the reader with a single list of what was checked. The wording
         # of each line is preserved verbatim, so anything that read the old
         # alerts still finds its phrase.
-        report_lines = [ln for ln in ([surface_note, outcome_note] + rule_lines) if ln]
-        report_lines += unchecked_lines
-        if report_lines:
-            # Only now is "what ran and found nothing" worth printing: inside
-            # a report the reader is already looking at.
-            report_lines += clean_lines
-            header = f"Отчёт проверок на сдаче (режим правил: {rules_mode})."
-            await repo.add_task_update(
-                db, task_id, "hub", "alert", header + "\n— " + "\n— ".join(report_lines)
-            )
-        if pr_ensure_note:
-            # #967: the refusal half of AC-1 — the reader learns the PR is
-            # missing NOW, at submission, not from the done gate later.
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                f"{pr_ensure_note}. Сдача принята — ревью валидно и без PR, "
-                "но done без него не завершится: гейт откроет PR сам или "
-                "спросит человека (#967).",
-            )
-        if risk_alert:
-            await repo.add_task_update(db, task_id, "hub", "alert", risk_alert)
+        await _write_submission_notices(state)
         await db.commit()
         await log_activity(
             db,
@@ -2238,24 +2453,9 @@ async def submit_for_review(
             detail=mutation_activity_detail(),
         )
 
-    # Advisory branch-stacking detection (#438): warn — never block — when
-    # this branch carries commits of another unmerged task branch. A stack
-    # can be a deliberate decision, so the finding is an alert update plus
-    # a response hint, not a failed submission.
-    stacking = await detect_branch_stacking(db, task_id, task.get("branch") or "")
-    if stacking:
-        await repo.add_task_update(db, task_id, "hub", "alert", stacking["message"])
-        await db.commit()
+    stacking = await _warn_on_branch_stacking(db, task_id, task.get("branch") or "")
 
-    # #757: the hub — not the implementer — calls the cross-model reviewer.
-    # Best-effort by contract: a failed dispatch alerts inside and must
-    # never break the submission itself.
-    try:
-        from hub.services.review_dispatch import maybe_dispatch_review
-
-        await maybe_dispatch_review(db, task_id)
-    except Exception:  # noqa: BLE001 - dispatch must never break a submit
-        log.exception("cross-model review dispatch failed for task #%s", task_id)
+    await _dispatch_cross_model_review(db, task_id)
 
     row = _existing_task(await repo.get_task(db, task_id), task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -2277,13 +2477,13 @@ async def submit_for_review(
             if view.lifecycle_hint
             else stacking["message"]
         )
-    if pr_ensure_note:
+    if state.pr_ensure_note:
         # Agent-facing copy of the feed alert: MCP/REST must not look like
         # a silent success when the PR could not be made (#975 AC-6, #967).
         view.lifecycle_hint = (
-            f"{view.lifecycle_hint}\n{pr_ensure_note}"
+            f"{view.lifecycle_hint}\n{state.pr_ensure_note}"
             if view.lifecycle_hint
-            else pr_ensure_note
+            else state.pr_ensure_note
         )
     # #836: hand back the baseline for waiting on THIS submission's verdict.
     # A snapshot of the current values, never of the desired ones: a baseline
