@@ -1495,6 +1495,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "REFERENCES tasks(id)",
     ),
     (
+        # #1084: a reviewer code belongs to ONE SUBMISSION, not merely to a
+        # task that happens to still be in review. A resubmission while the
+        # run is alive leaves the status untouched, so a code guarded only by
+        # status would outlive the work it was minted for and file a report
+        # about the old diff against the new generation.
+        "add_chat_pair_codes_bound_generation",
+        "ALTER TABLE chat_pair_codes ADD COLUMN bound_generation INTEGER",
+    ),
+    (
+        # The session inherits it: redeem can happen before the resubmission
+        # and filing after it, and that window is the same defect one step
+        # later.
+        "add_chat_pair_sessions_bound_generation",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN bound_generation INTEGER",
+    ),
+    (
         "add_chat_pair_sessions_acting_principal_id",
         "ALTER TABLE chat_pair_sessions ADD COLUMN acting_principal_id INTEGER "
         "REFERENCES principals(id)",

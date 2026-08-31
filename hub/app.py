@@ -10,6 +10,7 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
+from pydantic import ValidationError
 from fastapi import (
     BackgroundTasks,
     Depends,
@@ -488,7 +489,27 @@ async def _chat_pair_start_payload(request: Request) -> ChatPairStartRequest:
         return ChatPairStartRequest()
     if not data:
         return ChatPairStartRequest()
-    return ChatPairStartRequest.model_validate(data)
+    try:
+        return ChatPairStartRequest.model_validate(data)
+    except ValidationError as exc:
+        # #1084: the validator is what keeps a THIRD kind — reviewer — out of
+        # human hands: its code may only be minted by the dispatch. Raised
+        # here rather than declared as a body parameter, so pydantic's error
+        # escaped the handler as a 500 instead of refusing. A refusal that
+        # arrives as a crash is one error handler away from not being a
+        # refusal at all.
+        # Only the messages: pydantic packs the original exception into ctx,
+        # and a detail that cannot be serialised turns a refusal into a 500 —
+        # which is the very thing this branch exists to stop.
+        raise HTTPException(
+            422,
+            detail={
+                "reason": "chat_pair_start_invalid",
+                "message": "; ".join(
+                    str(err.get("msg", "")) for err in exc.errors(include_url=False)
+                ),
+            },
+        ) from exc
 
 
 @app.post("/api/auth/chat-pair/start", response_model=ChatPairStartView)
@@ -1749,12 +1770,23 @@ async def api_submit_machine_review(
     """
     from hub.services.machine_review_intake import record_machine_review
 
+    # #1084: a reviewer session belongs to the submission it was minted for.
+    # Redeem can happen before a resubmission and filing after it, and the
+    # intake stamps whatever generation is CURRENT. The pin travels INTO the
+    # intake rather than being checked here: a check here reads the task once
+    # and the write reads it again, and a resubmission between those two
+    # reads would be stamped as this report's own generation.
     return await record_machine_review(
         _db(request),
         task_id,
         body,
         principal_id=identity.principal_id,
         username=identity.username,
+        expected_generation=(
+            identity.chat_pair_generation
+            if identity.chat_pair_kind == "reviewer"
+            else None
+        ),
     )
 
 

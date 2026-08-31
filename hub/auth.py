@@ -194,6 +194,18 @@ CHAT_PAIR_IMPLEMENTER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/auth/chat-pair/revoke"),
 )
 
+# #1084: the cloud reviewer. TWO routes — read the brief, file the report —
+# and nothing else, by the same reasoning as STEWARD_ALLOWLIST below: a list
+# built by subtracting from the implementer's would still carry claim,
+# pair-start and submit-review, and the reviewer must never be able to take
+# the task or sign a verdict on it. /api/whoami is left out too: the redeem
+# response already tells the run who it is, so the route would buy nothing
+# and widen the surface.
+CHAT_PAIR_REVIEWER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/tasks/{task_id}/review-brief"),
+    ("POST", "/api/tasks/{task_id}/machine-review"),
+)
+
 
 # ---------------------------------------------------------------------------
 # Steward route allowlist (#1021)
@@ -243,6 +255,14 @@ _CHAT_PAIR_IMPLEMENTER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
     (method, _template_to_regex(template))
     for method, template in CHAT_PAIR_IMPLEMENTER_ALLOWLIST
 )
+_CHAT_PAIR_REVIEWER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template))
+    for method, template in CHAT_PAIR_REVIEWER_ALLOWLIST
+)
+_ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
+    "implementer": _CHAT_PAIR_IMPLEMENTER_ALLOWED,
+    "reviewer": _CHAT_PAIR_REVIEWER_ALLOWED,
+}
 _STEWARD_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
     (method, _template_to_regex(template)) for method, template in STEWARD_ALLOWLIST
 )
@@ -262,9 +282,7 @@ def chat_pair_route_allowed(
         if identity
         else "intake"
     )
-    allow = (
-        _CHAT_PAIR_IMPLEMENTER_ALLOWED if kind == "implementer" else _CHAT_PAIR_ALLOWED
-    )
+    allow = _ALLOW_BY_KIND.get(kind, _CHAT_PAIR_ALLOWED)
     bound = getattr(identity, "chat_pair_task_id", None) if identity else None
     probe = "GET" if method == "HEAD" else method
     for allowed_method, pattern in allow:
@@ -274,7 +292,7 @@ def chat_pair_route_allowed(
         if not matched:
             continue
         captured = matched.groupdict().get("task_id")
-        if kind == "implementer" and captured is not None:
+        if kind in config.CHAT_PAIR_TASK_BOUND_KINDS and captured is not None:
             try:
                 got = int(captured)
             except ValueError:
@@ -326,6 +344,7 @@ def _with_auth_source(
         api_key_id=api_key_id,
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
+        chat_pair_generation=identity.chat_pair_generation,
     )
 
 
