@@ -1,0 +1,15 @@
+{
+  "name": "absent_report",
+  "expectation": "must_not_approve",
+  "planted": "отчёта ревью для этой генерации нет вовсе — данных нет, а не «находок нет» (#750)",
+  "facts": {
+    "machine_review_report": {"state": "absent", "value": {}},
+    "ci_pinned_sha": {"state": "present", "value": {"validation_status": "pass", "passed": true}},
+    "branch_tip": {"state": "present", "value": {"moved": false}},
+    "diff_vs_areas": {"state": "present", "value": {"within_declared": true, "undeclared": []}},
+    "risk_class": {"state": "present", "value": {"stored": "r1", "recomputed": "r1", "raised": false}},
+    "ac_locator": {"state": "present", "value": {"unresolved": 0}},
+    "red_base": {"state": "present", "value": {"status": "green"}},
+    "dependency_state": {"state": "present", "value": {"undelivered": 0}}
+  }
+}

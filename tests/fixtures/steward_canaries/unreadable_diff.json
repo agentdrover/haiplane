@@ -1,0 +1,15 @@
+{
+  "name": "unreadable_diff",
+  "expectation": "must_not_approve",
+  "planted": "дифф прочитать не удалось: «не смог посмотреть» не равно «посмотрел и чисто» (#762)",
+  "facts": {
+    "machine_review_report": {"state": "present", "value": {"confirmed": [], "unresolved": [], "raw_count": 5, "incomplete": false}},
+    "ci_pinned_sha": {"state": "present", "value": {"validation_status": "pass", "passed": true}},
+    "branch_tip": {"state": "present", "value": {"moved": false}},
+    "diff_vs_areas": {"state": "absent", "value": {}},
+    "risk_class": {"state": "absent", "value": {}},
+    "ac_locator": {"state": "present", "value": {"unresolved": 0}},
+    "red_base": {"state": "present", "value": {"status": "green"}},
+    "dependency_state": {"state": "present", "value": {"undelivered": 0}}
+  }
+}
