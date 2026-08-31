@@ -463,3 +463,81 @@ async def test_shadow_never_transitions(db: aiosqlite.Connection):
         assert after["status"] == before["status"] == "review", verdict
         assert after["review_verdict"] is None, verdict
         assert after["review_verdict_generation"] is None, verdict
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #1 (grok-4.6, отчёт 179)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_deadline_never_overwrites_a_judgement(db: aiosqlite.Connection):
+    """Дедлайн закрывает только НЕЗАВЕРШЁННОЕ (находка high).
+
+    Поллер читает открытые слоты, потом обходит их по одному — и суждение
+    успевает лечь в этот зазор. Запись по одному id позволяла дедлайну
+    затереть уже вынесенный вердикт: ответ лежал в строке, а состояние
+    говорило «прогон не ответил».
+    """
+    from hub.services.steward_dispatch import RUN_JUDGED, RUN_TIMEOUT, close_run
+
+    project_id = await _project(db, "shadow-deadline-race")
+    task_id = await _task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+
+    # Суждение пришло...
+    await _judge(db, task_id)
+    # ...а поллер держит снимок, снятый ДО него, и дошёл до дедлайна.
+    stale = dict(run)
+    applied = await close_run(
+        db, stale, RUN_TIMEOUT, "прогон не вернул суждение до дедлайна слота"
+    )
+
+    assert applied is False, "закрытие закрытого слота не применяется"
+    after = (await _runs(db, task_id))[0]
+    assert after["status"] == RUN_JUDGED, "суждение обязано пережить дедлайн"
+    assert "суждение записано" in after["closed_reason"]
+
+
+async def test_a_stale_deadline_sweep_leaves_the_verdict_alone(
+    db: aiosqlite.Connection,
+):
+    """То же самое через настоящий свип, а не через прямой вызов.
+
+    Свип — это путь, которым дедлайн срабатывает в проде; проверять только
+    close_run значило бы проверить деталь и не проверить дорогу.
+    """
+    from hub.services.steward_dispatch import RUN_JUDGED, close_finished_runs
+
+    project_id = await _project(db, "shadow-sweep-race")
+    task_id = await _task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at = datetime('now', '-1 minute') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+    await _judge(db, task_id)
+
+    closed = await close_finished_runs(db)
+
+    assert closed == 0, "закрывать было нечего: слот уже судим"
+    assert (await _runs(db, task_id))[0]["status"] == RUN_JUDGED
+
+
+async def test_empty_grounds_are_not_shown_as_a_list(db: aiosqlite.Connection, client):
+    """Пустые основания читаются как отсутствие, а не как «[]» (находка low).
+
+    Раскрывашка с пустым JSON-массивом внутри выглядит как содержимое,
+    которого нет, — и человек на гейте видит «основания» там, где их не
+    приложили.
+    """
+    project_id = await _project(db, "shadow-empty-grounds")
+    task_id = await _task(db, project_id)
+    await _judge(db, task_id)
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert page.status_code == 200
+    assert "оснований не приложено" in page.text
+    assert "[]" not in page.text

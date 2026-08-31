@@ -860,9 +860,15 @@
                     </div>
                     {% if steward_judgement.grounds %}
                     <details>
-                        <summary>основания</summary>
-                        <pre>{{ steward_judgement.grounds }}</pre>
+                        <summary>основания ({{ steward_judgement.grounds|length }})</summary>
+                        <ul>
+                            {% for ground in steward_judgement.grounds %}
+                            <li>{{ ground.source }}{% if ground.detail %} — {{ ground.detail }}{% endif %}</li>
+                            {% endfor %}
+                        </ul>
                     </details>
+                    {% else %}
+                    <span class="muted">оснований не приложено</span>
                     {% endif %}
                 </div>
                 {% endif %}
