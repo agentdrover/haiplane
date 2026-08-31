@@ -713,10 +713,22 @@ async def collect_review_rules(
 # the answer wins — a model that quotes the format while explaining itself must
 # not be able to shadow its own report with the example.
 REPORT_FENCE = "haiplane-review"
-REPORT_BLOCK_INSTRUCTION = (
-    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+# #1084: what "the main path" is depends on what the run actually has. With a
+# code in the prompt it is HTTP, and saying otherwise costs the run its first
+# minutes on tools that are not there — while the code expires in five.
+_MAIN_PATH_MCP = (
     "1) Если инструменты хаба тебе доступны — сдай hub_submit_machine_review, "
     "это основной путь.\n"
+)
+_MAIN_PATH_HTTP = (
+    "1) Основной путь — HTTP из блока «ДОСТУП К ХАБУ» выше: тем же токеном "
+    "POST на /api/tasks/<id>/machine-review. Инструментов MCP у тебя нет, "
+    "не трать на них ходы.\n"
+)
+
+REPORT_BLOCK_INSTRUCTION = (
+    "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+    "{main_path}"
     "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
     f"```{REPORT_FENCE}\n"
     '{"raw_count": <число находок до проверки>, "incomplete": true|false, '
@@ -755,7 +767,10 @@ def _delivery_block(task_id: int, code: str, base_url: str) -> str:
         "-H 'Content-Type: application/json' "
         f'-d \'{{"code":"{code}"}}\'\n'
         "В ответе поле token — сохрани его в переменную, в ответ не печатай. "
-        "Готовый отчёт сдай тем же токеном:\n"
+        "Постановку, критерии и предыдущие находки читай тем же токеном:\n"
+        f"  curl -sS {base_url}/api/tasks/{task_id}/review-brief "
+        '-H "Authorization: Bearer $TOKEN"\n'
+        "Готовый отчёт сдай им же:\n"
         f"  curl -sS -X POST {base_url}/api/tasks/{task_id}/machine-review "
         '-H "Authorization: Bearer $TOKEN" '
         "-H 'Content-Type: application/json' -d @report.json\n"
@@ -794,7 +809,12 @@ def _review_prompt(
         # the text becomes a second, weaker delivery: same fields, stated
         # once, at the very end, where a machine can find them.
         f"{delivery_block}"
-        f"{REPORT_BLOCK_INSTRUCTION}\n\n"
+        # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
+        # скобках, и форматирование прочитало бы "raw_count" как поле.
+        + REPORT_BLOCK_INSTRUCTION.replace(
+            "{main_path}", _MAIN_PATH_HTTP if delivery_block else _MAIN_PATH_MCP
+        )
+        + "\n\n"
     )
     if profile == LITE:
         # No token ceiling is stated (#893). It used to say "бюджет 40000

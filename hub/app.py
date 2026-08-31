@@ -10,6 +10,7 @@ from typing import Any
 
 import aiosqlite
 import uvicorn
+from pydantic import ValidationError
 from fastapi import (
     BackgroundTasks,
     Depends,
@@ -488,7 +489,27 @@ async def _chat_pair_start_payload(request: Request) -> ChatPairStartRequest:
         return ChatPairStartRequest()
     if not data:
         return ChatPairStartRequest()
-    return ChatPairStartRequest.model_validate(data)
+    try:
+        return ChatPairStartRequest.model_validate(data)
+    except ValidationError as exc:
+        # #1084: the validator is what keeps a THIRD kind — reviewer — out of
+        # human hands: its code may only be minted by the dispatch. Raised
+        # here rather than declared as a body parameter, so pydantic's error
+        # escaped the handler as a 500 instead of refusing. A refusal that
+        # arrives as a crash is one error handler away from not being a
+        # refusal at all.
+        # Only the messages: pydantic packs the original exception into ctx,
+        # and a detail that cannot be serialised turns a refusal into a 500 —
+        # which is the very thing this branch exists to stop.
+        raise HTTPException(
+            422,
+            detail={
+                "reason": "chat_pair_start_invalid",
+                "message": "; ".join(
+                    str(err.get("msg", "")) for err in exc.errors(include_url=False)
+                ),
+            },
+        ) from exc
 
 
 @app.post("/api/auth/chat-pair/start", response_model=ChatPairStartView)
@@ -1748,6 +1769,29 @@ async def api_submit_machine_review(
     calling this route, and two write paths for one fact drift apart.
     """
     from hub.services.machine_review_intake import record_machine_review
+
+    # #1084: a reviewer session belongs to the submission it was minted for.
+    # Redeem can happen before a resubmission and filing after it, and the
+    # intake below stamps whatever generation is CURRENT — so without this the
+    # run's report about the old diff would be recorded as a report about the
+    # new one. Checked here, next to the write, because the route allowlist
+    # sees paths and not the task's state.
+    if identity.chat_pair_kind == "reviewer" and identity.chat_pair_generation:
+        task_row = await repo.get_task(_db(request), task_id)
+        current = (dict(task_row).get("submission_generation") or 0) if task_row else 0
+        if int(identity.chat_pair_generation) != int(current):
+            raise HTTPException(
+                403,
+                detail={
+                    "reason": "chat_pair_generation_moved",
+                    "message": (
+                        "работа пересдана: этот код выписан на сдачу "
+                        f"#{identity.chat_pair_generation}, а текущая — "
+                        f"#{current}. Отчёт о прежнем диффе не принимается "
+                        "как отчёт о новом."
+                    ),
+                },
+            )
 
     return await record_machine_review(
         _db(request),

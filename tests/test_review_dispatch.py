@@ -2205,3 +2205,31 @@ async def test_contract_report_wins_and_text_recovery_remains(
     assert not row["self_reviewed"], "ревьюер — не исполнитель задачи"
     dispatch = await _any_dispatch_row(db, task_id)
     assert dispatch["reviewer_principal_id"] == expected_pid == row["principal_id"]
+
+
+async def test_prompt_names_the_path_the_run_can_actually_take(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1084: промпт не должен звать в MCP, которого у рана нет. Пока код
+    # выписан, основной путь — HTTP, и обзор ревью тоже читается по HTTP:
+    # иначе за ним пойдут в несуществующий инструмент, а код живёт минуты.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-p1"}, "run": {"id": "run-p1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    _auth_on(monkeypatch)
+    await _submitted(client, db, "spike-prompt-http", policy={"review": "dispatch"})
+
+    with_code = recorder.calls[-1]["prompt_text"]
+    assert _CODE_IN_PROMPT.search(with_code), "код в промпте — предпосылка теста"
+    assert "/review-brief" in with_code, "обзор ревью тоже по HTTP"
+    assert "Основной путь — HTTP" in with_code
+    assert "сдай hub_submit_machine_review, это основной путь" not in with_code
+    assert "haiplane-review" in with_code, "запасной блок остаётся при любом пути"
+
+    # Без кода (нет ревьюер-принципала) формулировка прежняя: правка условная,
+    # а не вычёркивание MCP отовсюду — Cursor может починить доставку.
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "no-such-token")
+    await _submitted(client, db, "spike-prompt-mcp", policy={"review": "dispatch"})
+    without_code = recorder.calls[-1]["prompt_text"]
+    assert not _CODE_IN_PROMPT.search(without_code)
+    assert "сдай hub_submit_machine_review, это основной путь" in without_code

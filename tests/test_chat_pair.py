@@ -1210,7 +1210,11 @@ async def test_expired_sibling_implementer_session_does_not_release_live_task(hu
 
 async def _reviewer_session(hub, task_id: int) -> dict[str, str]:
     code, _ttl = await cp.issue_code(
-        hub.db, hub.human_id, kind="reviewer", bound_task_id=task_id
+        hub.db,
+        hub.human_id,
+        kind="reviewer",
+        bound_task_id=task_id,
+        bound_generation=1,
     )
     resp = await hub.client.post(
         "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
@@ -1302,3 +1306,72 @@ async def test_reviewer_code_dies_with_its_submission(hub):
     )
     assert resp.status_code == 401, resp.text
     assert resp.json()["detail"]["reason"] == "chat_pair_invalid"
+
+
+@pytest.mark.asyncio
+async def test_start_route_refuses_to_mint_a_reviewer_code(hub):
+    """#1084: reviewer-код чеканит только диспатч, человеку он недоступен.
+
+    Замок, а не наблюдение. Сегодня валидатор режет всё кроме intake и
+    implementer — но это утверждение ничем не держится: допишет кто-нибудь
+    третий вид в множество, и «человек такой код выписать не может»
+    перестанет быть правдой молча, при зелёных AC.
+    """
+    task_id = await _in_review(hub, "чужими руками")
+    before = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "reviewer", "task_id": task_id},
+        headers={**hub.human_auth, **_ip()},
+    )
+    assert resp.status_code == 422, resp.text
+
+    after = await _rows(hub.db, "SELECT id FROM chat_pair_codes")
+    assert after == before, "отказ обязан быть до чеканки, а не после"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_code_dies_when_work_is_resubmitted(hub):
+    """#1084: код привязан к СДАЧЕ, а не к тому, что задача всё ещё на ревью.
+
+    Пересдача во время живого прогона оставляет задачу в review, поэтому
+    проверки статуса мало: код поколения N доработал бы до поколения N+1, и
+    отчёт о старом диффе лёг бы как отчёт о новом.
+    """
+    task_id = await _in_review(hub, "пересдана на ходу")
+    code, _ttl = await cp.issue_code(
+        hub.db, hub.human_id, kind="reviewer", bound_task_id=task_id, bound_generation=1
+    )
+    await hub.db.execute(
+        "UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,)
+    )
+    await hub.db.commit()
+
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_reviewer_session_cannot_file_against_a_newer_submission(hub):
+    """#1084: и уже выданная сессия тоже принадлежит своей сдаче.
+
+    Обмен мог пройти до пересдачи — тогда сессия жива, а работа под ней
+    сменилась. Отчёт в этот момент лёг бы на чужое поколение.
+    """
+    task_id = await _in_review(hub, "сменилась под сессией")
+    session = await _reviewer_session(hub, task_id)
+
+    await hub.db.execute(
+        "UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,)
+    )
+    await hub.db.commit()
+
+    filed = await hub.client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={"raw_count": 0, "incomplete": False},
+        headers=session,
+    )
+    assert filed.status_code == 403, filed.text

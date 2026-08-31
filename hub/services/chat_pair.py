@@ -126,6 +126,7 @@ async def issue_code(
     *,
     kind: str = "intake",
     bound_task_id: int | None = None,
+    bound_generation: int | None = None,
 ) -> tuple[str, int]:
     """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
 
@@ -149,12 +150,14 @@ async def issue_code(
     code = generate_pair_code()
     await db.execute(
         "INSERT INTO chat_pair_codes "
-        "(principal_id, kind, bound_task_id, code_hash, expires_at) "
-        "VALUES (?, ?, ?, ?, datetime('now', ?))",
+        "(principal_id, kind, bound_task_id, bound_generation, code_hash, "
+        " expires_at) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
         (
             principal_id,
             kind,
             bound_task_id if kind in config.CHAT_PAIR_TASK_BOUND_KINDS else None,
+            bound_generation,
             hash_pair_code(code),
             f"+{int(ttl)} seconds",
         ),
@@ -182,7 +185,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "p.username, p.status "
+        "c.bound_generation, p.username, p.status "
         "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
         "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
         "AND c.expires_at > datetime('now')",
@@ -223,10 +226,21 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
         if bound_task_id is None:
             return None
         task_rows = await fetchall(
-            db, "SELECT status FROM tasks WHERE id = ?", (int(bound_task_id),)
+            db,
+            "SELECT status, submission_generation FROM tasks WHERE id = ?",
+            (int(bound_task_id),),
         )
         if not task_rows or dict(task_rows[0]).get("status") != "review":
             return None
+        # The submission, not just the status. A resubmission during a live
+        # run keeps the task in review, so status alone would let a code
+        # minted for generation N be spent against N+1 — a report about the
+        # old diff, recorded as a report about the new one.
+        pinned = row.get("bound_generation")
+        if pinned is not None:
+            current = dict(task_rows[0]).get("submission_generation") or 0
+            if int(pinned) != int(current):
+                return None
 
     cursor = await db.execute(
         "UPDATE chat_pair_codes SET redeemed_at = datetime('now') "
@@ -242,13 +256,14 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
-        " token_hash, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        " bound_generation, token_hash, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?))",
         (
             row["principal_id"],
             acting_id,
             kind,
             bound_task_id if kind in config.CHAT_PAIR_TASK_BOUND_KINDS else None,
+            row.get("bound_generation"),
             hash_pair_code(token),
             f"+{int(ttl)} seconds",
         ),
@@ -299,7 +314,7 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
     rows = await fetchall(
         db,
         "SELECT s.principal_id, s.acting_principal_id, s.kind, s.bound_task_id, "
-        "p.username AS issuer_username, p.status AS issuer_status "
+        "s.bound_generation, p.username AS issuer_username, p.status AS issuer_status "
         "FROM chat_pair_sessions s JOIN principals p ON p.id = s.principal_id "
         "WHERE s.token_hash = ? AND s.revoked_at IS NULL "
         "AND s.expires_at > datetime('now')",
@@ -347,6 +362,11 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
             auth_source="chat_pair",
             chat_pair_kind="reviewer",
             chat_pair_task_id=bound_id,
+            chat_pair_generation=(
+                int(row["bound_generation"])
+                if row.get("bound_generation") is not None
+                else None
+            ),
         )
     return TokenIdentity(
         username=row["issuer_username"],
