@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import HTTPException
 
@@ -31,6 +32,9 @@ from hub.services.gate_events import (
     STEWARD_ESCALATED,
     STEWARD_JUDGEMENT,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
@@ -152,6 +156,7 @@ async def record_steward_judgement(
         actor="steward",
         payload=payload,
     )
+    await _close_the_order(db, task_id, body.generation, body.kind)
     await db.commit()
     saved = await repo.get_steward_judgement_by_id(db, inserted)
     if saved is None:
@@ -184,3 +189,36 @@ async def _refuse_unknown_closure_uids(
                 422,
                 detail=steward_unknown_finding_uid_detail(closure.finding_uid),
             )
+
+
+async def _close_the_order(db, task_id: int, generation: int, kind: str) -> None:
+    """The judgement arrived — the slot it was ordered for is done (#1106).
+
+    Without this the order sits open until its deadline and closes as
+    ``run_timeout``: the work is finished and the state says "still waiting".
+    That difference matters twice — the daily cap counts an occupied slot,
+    and the evidence door (#1075) stays open on an order nobody is filling.
+
+    Best effort by contract: the judgement is already stored, and a slot that
+    fails to close is a wrong state, not a lost answer. It closes on the next
+    poller tick by deadline anyway.
+    """
+    try:
+        from hub.services.steward_dispatch import RUN_JUDGED, close_run, open_run
+
+        order = await open_run(db, task_id, generation, kind)
+        if order is not None:
+            await close_run(db, order, RUN_JUDGED, f"суждение записано: {kind}")
+    except Exception as exc:  # noqa: BLE001 — the judgement stands regardless
+        # WITH the reason (#1106 review). A swallowed failure that names
+        # nothing is indistinguishable from "there was no order to close",
+        # and the two need different answers: one is normal, the other is a
+        # slot that will now expire by deadline as if nobody judged.
+        log.warning(
+            "steward order not closed after judgement: task #%s gen %s kind %s: %s",
+            task_id,
+            generation,
+            kind,
+            exc,
+            exc_info=True,
+        )

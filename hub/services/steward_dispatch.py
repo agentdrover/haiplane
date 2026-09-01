@@ -210,13 +210,27 @@ async def order_run(
 
 async def close_run(
     db: aiosqlite.Connection, run: dict[str, Any], status: str, reason: str
-) -> None:
-    """Close a slot and say why, in the feed as well as in the row."""
-    await db.execute(
+) -> bool:
+    """Close an OPEN slot and say why, in the feed as well as in the row.
+
+    Only open (#1106 review): the poller reads the open slots, then walks
+    them one by one, and a judgement can land in that gap. Writing by id
+    alone let the deadline overwrite a slot that had already been judged —
+    the answer was in the row and the state said the run timed out. A
+    deadline may only close what is still unfinished.
+
+    Returns False when the slot was already closed by someone else. That is
+    not an error: it means the race resolved the other way, and the caller
+    has nothing left to do.
+    """
+    cursor = await db.execute(
         "UPDATE steward_runs SET status=?, closed_reason=?, "
-        "closed_at=datetime('now') WHERE id=?",
-        (status, reason, run["id"]),
+        "closed_at=datetime('now') WHERE id=? AND status=?",
+        (status, reason, run["id"], RUN_OPEN),
     )
+    if cursor.rowcount != 1:
+        log.info("steward run %s already closed — %s not applied", run["id"], status)
+        return False
     await repo.insert_event(
         db,
         kind=EVENT_CLOSED,
@@ -230,6 +244,7 @@ async def close_run(
         },
     )
     await db.commit()
+    return True
 
 
 def _policy_wants_steward(project_row: Any | None) -> bool:
@@ -302,13 +317,13 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         # a late judgement a 409, and this closes the slot behind it).
         verdict_generation = task.get("review_verdict_generation")
         if task and verdict_generation == run["generation"]:
-            await close_run(
+            if await close_run(
                 db,
                 run,
                 RUN_SUPERSEDED,
                 "человеческий вердикт на эту генерацию — судить больше нечего",
-            )
-            closed += 1
+            ):
+                closed += 1
             continue
         overdue = await fetchall(
             db,
@@ -316,13 +331,13 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             (run["id"],),
         )
         if overdue:
-            await close_run(
+            if await close_run(
                 db,
                 run,
                 RUN_TIMEOUT,
                 "прогон не вернул суждение до дедлайна слота",
-            )
-            closed += 1
+            ):
+                closed += 1
     return closed
 
 
