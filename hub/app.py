@@ -823,6 +823,55 @@ async def api_list_projects(
     return [await _project_view(r) for r in rows]
 
 
+def _refuse_unrunnable_cloud_review(before, fields: dict) -> None:
+    """Не хранить как исполнимую политику, исполнить которую нельзя (#1119).
+
+    Облачный ревьюер работает только с GitHub (измерено 31.08.2026), поэтому
+    ``review=dispatch`` на проекте другого форжа — не «попробуем», а
+    гарантированный отказ на КАЖДОЙ сдаче. Отказать на записи дешевле: тут
+    есть кому прочитать причину.
+
+    Инвариант, а не проверка поля, — и в этом была ошибка первой редакции
+    (найдено ревью, отчёт #201). Она стояла внутри ветки ``gate_policy`` и
+    поэтому смотрела только на патч политики. PATCH, который менял ОДИН
+    ``forge``, проходил мимо: проект с ``review=dispatch`` на GitHub
+    переключался на GitVerse и сохранял политику, которую больше нельзя
+    исполнить. Запрещённое состояние достижимо двумя дорогами, и закрывать
+    надо обе — поэтому оба значения берутся ПОСЛЕ патча, каждое из патча,
+    если оно там есть, иначе из строки.
+    """
+    import json as _json
+
+    from hub.services.review_dispatch import CLOUD_REVIEW_FORGES
+
+    if "forge" not in fields and "gate_policy" not in fields:
+        return
+    if "gate_policy" in fields and fields["gate_policy"] is not None:
+        review_after = str(
+            _json.loads(fields["gate_policy"]).get("review") or ""
+        ).strip()
+    else:
+        review_after = str(
+            project_policy.gate_policy_of(before).get("review") or ""
+        ).strip()
+    forge_after = str(fields.get("forge") or project_policy.forge_of(before)).strip()
+    if review_after != "dispatch" or forge_after in CLOUD_REVIEW_FORGES:
+        return
+    raise HTTPException(
+        422,
+        {
+            "error": "cloud_review_forge_unsupported",
+            "hint": (
+                f"облачный ревьюер не работает с форжем «{forge_after}»: "
+                f"он принимает только {', '.join(CLOUD_REVIEW_FORGES)} "
+                "(проверено 31.08.2026). Уберите review=dispatch — "
+                "ключ принимает off или dispatch, и вердикт всё равно за "
+                "человеком"
+            ),
+        },
+    )
+
+
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
 async def api_patch_project(
     project_id: int,
@@ -865,35 +914,8 @@ async def api_patch_project(
                     ),
                 },
             )
-        # #1119: политика, которую нельзя исполнить, не должна храниться как
-        # исполнимая. Облачный ревьюер работает только с GitHub (измерено
-        # 31.08.2026), поэтому review=dispatch на проекте другого форжа —
-        # это не «попробуем», а гарантированный отказ на КАЖДОЙ сдаче.
-        # Отказать на записи дешевле: тут есть кому прочитать причину.
-        # Форж берётся из ПАТЧА, если он там есть, иначе из строки: иначе
-        # можно было бы переключить форж и политику одним вызовом и проскочить.
-        from hub.services.review_dispatch import CLOUD_REVIEW_FORGES
-
-        forge_after = str(
-            fields.get("forge") or project_policy.forge_of(before)
-        ).strip()
-        if (
-            fields["gate_policy"].get("review") == "dispatch"
-            and forge_after not in CLOUD_REVIEW_FORGES
-        ):
-            raise HTTPException(
-                422,
-                {
-                    "error": "cloud_review_forge_unsupported",
-                    "hint": (
-                        f"облачный ревьюер не работает с форжем «{forge_after}»: "
-                        f"он принимает только {', '.join(CLOUD_REVIEW_FORGES)} "
-                        "(проверено 31.08.2026). Оставьте review=human — "
-                        "вердикт всё равно за человеком"
-                    ),
-                },
-            )
         fields["gate_policy"] = _json.dumps(fields["gate_policy"])
+    _refuse_unrunnable_cloud_review(before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
     if fields:

@@ -112,3 +112,77 @@ def test_cloud_review_is_declared_github_only(forge):
     """
     assert CLOUD_REVIEW_FORGES == ("github",)
     assert forge not in CLOUD_REVIEW_FORGES
+
+
+async def test_dispatch_policy_refused_for_unreachable_forge(client):
+    """AC-3. Запрещённое состояние недостижимо ОБЕИМИ дорогами.
+
+    Первая редакция закрывала одну: проверка стояла внутри ветки
+    ``gate_policy`` и смотрела только на патч политики. PATCH, менявший ОДИН
+    ``forge``, проходил мимо — проект с ``review=dispatch`` переключался на
+    GitVerse и сохранял политику, исполнить которую больше нельзя (найдено
+    ревью, отчёт #201).
+
+    Это и есть разница между проверкой поля и инвариантом: поле проверяют там,
+    где его пишут, а инвариант — везде, откуда в запрещённое состояние можно
+    попасть.
+    """
+    human = {"Authorization": "Bearer human-token"}
+
+    created = await client.post(
+        "/api/projects",
+        json={"slug": "forge-invariant", "name": "FI", "repo": "mrpda/snip-portal"},
+        headers=human,
+    )
+    assert created.status_code == 200, created.text
+    pid = created.json()["id"]
+
+    # Дорога 1: политика на проекте, который УЖЕ на GitVerse.
+    assert (
+        await client.patch(
+            f"/api/projects/{pid}", json={"forge": "gitverse"}, headers=human
+        )
+    ).status_code == 200
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"review": "dispatch"}},
+        headers=human,
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "cloud_review_forge_unsupported"
+
+    # Дорога 2 — та, что была открыта: политика стоит, переключают форж.
+    assert (
+        await client.patch(
+            f"/api/projects/{pid}", json={"forge": "github"}, headers=human
+        )
+    ).status_code == 200
+    assert (
+        await client.patch(
+            f"/api/projects/{pid}",
+            json={"gate_policy": {"review": "dispatch"}},
+            headers=human,
+        )
+    ).status_code == 200
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"forge": "gitverse"}, headers=human
+    )
+    assert resp.status_code == 422, (
+        "переключение форжа обязано отказать, пока политика просит облачного "
+        "ревьюера: иначе в базе останется политика, которую нельзя исполнить"
+    )
+    assert resp.json()["detail"]["error"] == "cloud_review_forge_unsupported"
+
+    # Дорога 3: оба поля одним вызовом — проскочить между проверками нечем.
+    relax = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"review": "off"}},
+        headers=human,
+    )
+    assert relax.status_code == 200, relax.text
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"forge": "gitverse", "gate_policy": {"review": "dispatch"}},
+        headers=human,
+    )
+    assert resp.status_code == 422, resp.text

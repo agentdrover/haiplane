@@ -492,6 +492,33 @@ class NoopGitOps:
     ) -> bool:
         return False
 
+    async def merge_pr_with_detail(
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        delete_branch: bool = True,
+    ) -> tuple[bool, str]:
+        """Согласован с ``merge_pr``, а не отвечает отдельно (#1116).
+
+        Делегирование здесь — не экономия строк. Заглушка служит основой для
+        тестовых дублёров, которые подменяют ОДИН метод; отвечай второй сам
+        по себе, и дублёр, настроивший merge_pr, получил бы от соседнего
+        метода противоположный ответ. Такое расхождение читается как поломка
+        доставки, а не как незаконченный дублёр.
+        """
+        ok = await self.merge_pr(
+            pr_number,
+            task_id,
+            title,
+            repo=repo,
+            gh_repo=gh_repo,
+            delete_branch=delete_branch,
+        )
+        return (ok, "" if ok else "git_ops не настроен")
+
     async def delete_branch(
         self,
         branch: str,
@@ -519,6 +546,7 @@ class NoopForge:
     """
 
     name = "noop"
+    can_merge_via_api = False
 
     def repo_url(self, gh_repo: str | None = None) -> str:
         return ""
@@ -600,6 +628,21 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> bool:
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        return None
 
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None

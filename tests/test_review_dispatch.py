@@ -142,6 +142,7 @@ async def _submitted(
     clear_risk_class: bool = False,
     diff: str | None = None,
     rules: dict[str, str] | None = None,
+    forge: str = "github",
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -151,6 +152,11 @@ async def _submitted(
         repo_name=repo_name,
         workspace_path="/tmp/ws",
     )
+    if forge != "github":
+        # Форж выставляется ДО сдачи намеренно: диспатч случается внутри
+        # submit_for_review, и проект, переключённый после, проверял бы не тот
+        # момент (#1119).
+        await repo.update_project(db, pid, forge=forge)
     if policy is not None:
         await repo.update_project(db, pid, gate_policy=json.dumps(policy))
     elif verdict_auto:
@@ -2267,3 +2273,73 @@ async def test_dispatch_pins_the_generation_it_minted_for(
         headers={"x-forwarded-for": "203.0.113.11"},
     )
     assert refused.status_code == 401, refused.text
+
+
+async def test_cloud_review_never_calls_cursor_for_a_gitverse_project(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1119): отказ проверяется ПОВЕДЕНИЕМ, а не формой константы.
+
+    Первая редакция этого критерия сверяла ``CLOUD_REVIEW_FORGES == ("github",)``
+    — то есть читала объявление вслух. Такой тест переживает удаление самой
+    проверки из ``maybe_dispatch_review`` и остаётся зелёным, а платит за это
+    оплаченный прогон облачного агента в пустоту (найдено ревью, отчёт #201).
+
+    Здесь Cursor замокан и СЧИТАЕТ вызовы: единственное доказательство, что до
+    него не дошли, — пустой список.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gv"}, "run": {"id": "r-gv"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-gitverse",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+
+    assert recorder.calls == [], (
+        "облачный ревьюер не должен быть вызван для GitVerse-проекта: "
+        "измерено 31.08.2026, что тот же запрос с адресом GitVerse даёт 400 и "
+        "500, и ни один ответ не называет причину"
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "отказ ревьюера не должен ломать сдачу"
+
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("gitverse" in a for a in alerts), (
+        "карточка обязана назвать ФОРЖ как причину: молчаливый пропуск "
+        "неотличим от «ревьюер не настроен» (#498)"
+    )
+
+
+async def test_the_same_submission_on_github_does_reach_cursor(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Контроль к предыдущему: тест обязан уметь падать.
+
+    Без этой пары «вызовов ноль» доказывало бы что угодно — например, что
+    диспатч не сработал по совсем другой причине и форж тут ни при чём.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gh"}, "run": {"id": "r-gh"}})
+    _wire(monkeypatch, recorder)
+
+    await _submitted(
+        client,
+        db,
+        "spike-github-control",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="github",
+    )
+
+    assert len(recorder.calls) == 1, (
+        "при том же наборе условий и форже github вызов обязан состояться — "
+        "иначе предыдущий тест зелен по посторонней причине"
+    )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.git_ops import (
+    MERGE_UNCONFIRMED,
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
@@ -2035,6 +2037,11 @@ TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.unavailable.value}",
     f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
+    # #1116 (по ревью): мерж СОСТОЯЛСЯ, а подтвердить его не вышло. Раньше
+    # это давало обычный merge_failed и уводило к человеку задачу, код
+    # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
+    # нечего. Лечится следующим циклом, а не решением.
+    MERGE_UNCONFIRMED,
 )
 PR_DRAFT_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб пометит "
@@ -2107,6 +2114,36 @@ async def charge_ci_fix_budget(
     task["ci_fix_cycle"] = cycle
     task["ci_fix_charged_generation"] = generation
     return cycle, cycle > config.MAX_CI_FIX_CYCLES
+
+
+def _merge_failure_detail(detail: str) -> str:
+    """Причина неудачного мержа в виде, пригодном для КЛАССИФИКАЦИИ (#1116).
+
+    Три случая, и они ведут к разному. Пустая деталь — форж отказал молча
+    (путь GitHub, где причины и не было): строка остаётся прежней до символа.
+    Деталь с меткой неподтверждённости — временное состояние, которое лечится
+    следующим циклом, а не человеком. Всё остальное — названная причина, и
+    она уходит наружу вместо слова «GitHub», которое на другом форже просто
+    неверно.
+    """
+    if not detail:
+        return "merge_failed: GitHub refused the merge"
+    if detail.startswith(MERGE_UNCONFIRMED):
+        return detail
+    return f"merge_failed: {detail}"
+
+
+def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
+    """SHA мержа: у форжа, а если он не знает — из детали успеха (#1116).
+
+    Форж без API-мержа о мерже пушем не знает и merge_commit_sha не
+    заполняет. Коммит при этом назвал сам мерж. Без этой подстановки строка
+    реестра писалась с пустым sha — то есть реестр переставал отличать наш
+    мерж от чужого, ради чего он и заведён (#534).
+    """
+    if merge_sha:
+        return merge_sha
+    return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
 
 
 async def merge_before_completion(
@@ -2187,7 +2224,7 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        merged = await plugins.git_ops.merge_pr(
+        merged, merge_detail = await plugins.git_ops.merge_pr_with_detail(
             pr_num,
             task_id,
             task.get("title") or "",
@@ -2195,7 +2232,7 @@ async def merge_before_completion(
             gh_repo=gh_repo,
         )
         if not merged:
-            return False, "merge_failed: GitHub refused the merge"
+            return False, _merge_failure_detail(merge_detail)
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
@@ -2204,6 +2241,7 @@ async def merge_before_completion(
             merge_sha = await plugins.git_ops.merge_commit_sha(
                 pr_num, repo=workspace, gh_repo=gh_repo
             )
+            merge_sha = _merge_sha_or_detail(merge_sha, merge_detail)
         except Exception:  # noqa: BLE001 - the drift guard flags it once
             log.exception(
                 "could not read the merge commit for task #%s; "

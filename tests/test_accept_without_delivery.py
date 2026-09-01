@@ -530,6 +530,15 @@ class _MergeSpy:
         self.merged.append(int(pr_number))
         return True
 
+    async def merge_pr_with_detail(
+        self, pr_number, task_id, title, repo=None, gh_repo=None, delete_branch=True
+    ):
+        # #1116: гейт спрашивает причину отказа, а не только факт. Дублёр
+        # отвечает согласованно со своим merge_pr — иначе он рассказывал бы
+        # о доставке две разные истории.
+        ok = await self.merge_pr(pr_number, task_id, title, repo=repo, gh_repo=gh_repo)
+        return (ok, "" if ok else "")
+
     async def merge_commit_sha(self, pr_number, repo=None, gh_repo=None):
         return f"{int(pr_number):040d}"
 
@@ -571,6 +580,9 @@ def _install(monkeypatch, spy: _MergeSpy) -> None:
     for name in (
         "check_pr_ci",
         "merge_pr",
+        # #1116: гейт зовёт детальный вариант — без него подменялся бы один
+        # метод, а работал бы другой, и дублёр молча переставал бы дублировать.
+        "merge_pr_with_detail",
         "merge_commit_sha",
         "head_sha",
         "pull_main",
