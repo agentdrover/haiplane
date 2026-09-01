@@ -45,6 +45,14 @@ class GitHubForge:
     #: gh pr merge — один вызов, форж сливает сам (#1116).
     can_merge_via_api = True
 
+    # -- адреса --------------------------------------------------------------
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return f"https://github.com/{gh_repo or REPO_NAME}"
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        return f"{self.repo_url(gh_repo)}/pull/{pr_number}"
+
     # -- pull requests ------------------------------------------------------
 
     async def create_pr(

@@ -55,6 +55,7 @@ class NoopDispatch:
         branch: str = "",
         pr_number: int | None = None,
         breadcrumb: str = "",
+        pr_url: str = "",
     ) -> str:
         return f"[noop] review #{task_id}: {title}"
 
@@ -564,6 +565,12 @@ class NoopForge:
 
     name = "noop"
     can_merge_via_api = False
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return ""
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        return ""
 
     async def create_pr(
         self,
