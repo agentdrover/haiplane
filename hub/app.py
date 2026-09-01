@@ -2031,10 +2031,12 @@ async def api_steward_evidence(
     """
     db = _db(request)
     row = await repo.get_task(db, task_id)
-    asked = (
-        generation
-        if generation is not None
-        else (dict(row).get("submission_generation") or 0 if row else 0)
+    # #1120, third round: ONE guard for every pinned entrance, listed in
+    # hub/services/steward_evidence.py. Checking the pin per door is how this
+    # mechanism was wrong three times — passed but not read, read on one door
+    # and not the other.
+    asked = services.steward_pinned_generation(
+        identity, dict(row) if row is not None else {"id": task_id}, generation
     )
     if identity.is_steward and not await services.steward_open_run_exists(
         db, task_id, asked
@@ -2068,7 +2070,15 @@ async def api_steward_judgement(
     the judgement is F4.
     """
     return await services.record_steward_judgement(
-        _db(request), task_id, body, identity
+        _db(request),
+        task_id,
+        body,
+        identity,
+        expected_generation=(
+            identity.chat_pair_generation
+            if getattr(identity, "chat_pair_kind", None) == "steward"
+            else None
+        ),
     )
 
 

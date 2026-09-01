@@ -50,11 +50,26 @@ async def record_steward_judgement(
     task_id: int,
     body: StewardJudgementSubmit,
     identity: TokenIdentity,
+    expected_generation: int | None = None,
 ) -> StewardJudgementView:
-    """Validate and store a judgement. The task status is not touched."""
+    """Validate and store a judgement. The task status is not touched.
+
+    ``expected_generation`` is the pin the caller's session carries (#1120).
+    When it is set, a judgement about any other generation is refused: a run
+    ordered for one submission does not get to rule on the next one just
+    because the author resubmitted while it was thinking.
+    """
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
+    if expected_generation is not None:
+        # The SAME guard the evidence door uses (#1120): one rule, two
+        # entrances. A judgement filed for another generation — or for one
+        # that stopped being current while the run was thinking — is refused
+        # here, not silently stored beside the live submission.
+        from hub.services.steward_evidence import pinned_generation
+
+        pinned_generation(identity, dict(row), body.generation)
 
     submitted_verdict = (body.verdict or "").strip()
     if not submitted_verdict:

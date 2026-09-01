@@ -396,7 +396,13 @@ CHAT_PAIR_REVIEWER_PERMS: frozenset[str] = frozenset({"tasks.read"})
 # issuer and the route guard: when this was the literal "implementer" in five
 # places, adding a kind meant finding all five, and the one that got missed
 # would be an UNBOUND session — the failure that does not announce itself.
-CHAT_PAIR_TASK_BOUND_KINDS: frozenset[str] = frozenset({"implementer", "reviewer"})
+# #1120: steward joins the task-bound kinds. Its code is minted for ONE task
+# and ONE generation, and the route check below refuses a path whose {task_id}
+# is not the bound one — a judge let loose on a neighbouring task would be
+# judging evidence nobody ordered for it.
+CHAT_PAIR_TASK_BOUND_KINDS: frozenset[str] = frozenset(
+    {"implementer", "reviewer", "steward"}
+)
 
 # Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
 # Those four include create/refine/update and would let the steward write the

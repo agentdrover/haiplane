@@ -259,13 +259,18 @@ _CHAT_PAIR_REVIEWER_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tu
     (method, _template_to_regex(template))
     for method, template in CHAT_PAIR_REVIEWER_ALLOWLIST
 )
-_ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
-    "implementer": _CHAT_PAIR_IMPLEMENTER_ALLOWED,
-    "reviewer": _CHAT_PAIR_REVIEWER_ALLOWED,
-}
 _STEWARD_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
     (method, _template_to_regex(template)) for method, template in STEWARD_ALLOWLIST
 )
+_ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
+    "implementer": _CHAT_PAIR_IMPLEMENTER_ALLOWED,
+    "reviewer": _CHAT_PAIR_REVIEWER_ALLOWED,
+    # #1120: a steward session walks the SAME two operations its token does
+    # (#1021). Sharing the list rather than copying it is the point: two
+    # descriptions of one boundary drift, and the one that drifts wider wins
+    # silently.
+    "steward": _STEWARD_ALLOWED,
+}
 
 
 def chat_pair_route_allowed(

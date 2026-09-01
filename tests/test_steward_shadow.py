@@ -39,9 +39,17 @@ _DELIVERY = "код доступа: ABC-123"
 
 @pytest.fixture
 def with_identity(monkeypatch):
-    monkeypatch.setattr(
-        sh, "identity_delivery", lambda _task_id, _generation: _DELIVERY
-    )
+    """Канал доставки идентичности стал настоящим в #1120.
+
+    Здесь он подменяется, потому что эти тесты про СТАРТ: минтить живой код
+    им незачем. Его ОТСУТСТВИЕ проверяется своим тестом ниже, а сам канал —
+    в tests/test_steward_identity.py.
+    """
+
+    async def _delivery(_db, _task_id, _generation, _base_url):
+        return _DELIVERY
+
+    monkeypatch.setattr(sh, "identity_delivery", _delivery)
 
 
 @pytest.fixture(autouse=True)
