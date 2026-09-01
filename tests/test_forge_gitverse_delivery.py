@@ -390,3 +390,43 @@ async def test_trial_merge_failure_is_not_a_conflict(repo_pair, monkeypatch):
     assert outcome is MergeabilityOutcome.unavailable
     assert outcome is not MergeabilityOutcome.conflicting
     assert "rc=128" in detail
+
+
+async def test_the_delivery_oracle_is_the_base_branch_and_the_ledger(repo_pair):
+    """AC-5, положительная половина: чем доставка ДОКАЗЫВАЕТСЯ.
+
+    Прежний тест закреплял отрицание — что состояние PR не спрашивают. Этого
+    мало: отрицание не мешает вернуть проверку через PR другим путём. Здесь
+    закреплено само правило — доставка доказывается тем, что полученный
+    коммит достижим в базовой ветке, и этот же коммит уходит в реестр мержей
+    хаба.
+
+    Почему это и есть предмет задачи: замером 01.09.2026 показано, что на
+    GitVerse доставленный хабом и брошенный человеком PR через API
+    НЕРАЗЛИЧИМЫ — оба closed, merged=False. Значит любой оракул, читающий
+    состояние PR, отвечает на другой вопрос.
+    """
+    bare, work = repo_pair
+    forge = _forge()
+    ops = GitOpsIntegration(forge=forge)
+
+    ok, merged_sha = await ops.merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok
+    # 1. Спрошена ИМЕННО базовая ветка, и спрошена про ЭТОТ коммит.
+    branch, sha = forge.branch_contains.await_args.args[:2]
+    assert branch == "main"
+    assert sha == merged_sha
+
+    # 2. Названный коммит существует и реально лежит в базе на remote —
+    #    проверяем это git'ом, а не ответом мока.
+    _git(work, "fetch", "-q", "origin")
+    assert _git(work, "cat-file", "-t", merged_sha) == "commit"
+    reachable = _git(work, "log", "--format=%H", "origin/main")
+    assert merged_sha in reachable.split()
+
+    # 3. Тот же коммит — то, что уйдёт в реестр мержей: деталь успеха и есть
+    #    SHA, а не текст. Пустой реестр не отличил бы наш мерж от чужого.
+    assert merged_sha and merged_sha == sha
