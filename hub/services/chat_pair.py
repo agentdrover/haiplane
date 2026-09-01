@@ -135,11 +135,27 @@ async def issue_code(
     """
     kind = (kind or "intake").strip().lower() or "intake"
     if kind in config.CHAT_PAIR_TASK_BOUND_KINDS:
-        await db.execute(
-            "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
-            "AND bound_task_id = ? AND redeemed_at IS NULL",
-            (principal_id, kind, bound_task_id),
-        )
+        # #1120 review: burn is scoped to the GENERATION too, when there is
+        # one. Without it, minting a code for generation N+1 killed the
+        # unused code of a run already flying for generation N — a
+        # resubmission mid-run disarmed a paid agent, which then reached the
+        # door with a dead code and could only wait out its deadline.
+        #
+        # Same bucket, same generation: two live codes for one submission
+        # remain impossible, which is what burning is for.
+        if bound_generation is not None:
+            await db.execute(
+                "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+                "AND bound_task_id = ? AND bound_generation = ? "
+                "AND redeemed_at IS NULL",
+                (principal_id, kind, bound_task_id, bound_generation),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
+                "AND bound_task_id = ? AND redeemed_at IS NULL",
+                (principal_id, kind, bound_task_id),
+            )
     else:
         await db.execute(
             "DELETE FROM chat_pair_codes WHERE principal_id = ? AND kind = ? "
@@ -361,6 +377,28 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
             permissions=config.CHAT_PAIR_REVIEWER_PERMS,
             auth_source="chat_pair",
             chat_pair_kind="reviewer",
+            chat_pair_task_id=bound_id,
+            chat_pair_generation=(
+                int(row["bound_generation"])
+                if row.get("bound_generation") is not None
+                else None
+            ),
+        )
+    if kind == "steward":
+        # #1120: the steward run authenticates the same way the reviewer does
+        # since #1084 — Cursor drops mcpServers, so the header never arrives
+        # and a one-time code in the prompt is the only channel that does.
+        #
+        # Role and permissions come from the STEWARD side, not from chat-pair:
+        # the session is the steward principal reaching the hub by another
+        # road, not a new kind of actor with its own rights (#1021).
+        return TokenIdentity(
+            username=row["issuer_username"],
+            role="steward",
+            principal_id=row["principal_id"],
+            permissions=config.STEWARD_PERMS,
+            auth_source="chat_pair",
+            chat_pair_kind="steward",
             chat_pair_task_id=bound_id,
             chat_pair_generation=(
                 int(row["bound_generation"])

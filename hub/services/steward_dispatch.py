@@ -70,14 +70,37 @@ EVENT_CLOSED = "steward_run_closed"
 _MODES = {"off", "shadow", "act"}
 
 
-def steward_mode() -> str:
-    """The global switch, read strictly (#835's rule for typos).
+def configured_mode() -> str:
+    """The raw value the environment carries, validated but not capped.
 
-    An unknown value is ``off``: a mistyped drop-in must never be the thing
-    that switches a contour on.
+    ONE caller by design: steward_shadow.effective_mode, which is where act
+    is granted or refused. Everyone else reads requested_mode and therefore
+    cannot act on autonomy nobody measured.
     """
     mode = (config.STEWARD_MODE or "off").strip().lower()
     return mode if mode in _MODES else "off"
+
+
+def requested_mode() -> str:
+    """What the environment ASKS for, capped at shadow (#1107 review).
+
+    An unknown value is ``off``: a mistyped drop-in must never be the thing
+    that switches a contour on (#835).
+
+    And ``act`` is never returned here. Autonomy is not a configuration
+    value — it is a permission the measurement grants, and granting it needs
+    the database (steward_shadow.effective_mode). Capping the synchronous
+    reader is what makes forgetting that function harmless: a consumer that
+    asks here gets shadow, which is today's behaviour, rather than autonomy
+    nobody checked.
+    """
+    mode = configured_mode()
+    return "shadow" if mode == "act" else mode
+
+
+def steward_mode() -> str:
+    """Backwards-compatible alias of :func:`requested_mode`."""
+    return requested_mode()
 
 
 def dispatcher_enabled() -> bool:
@@ -315,6 +338,20 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         # A human verdict on this very generation ends the run: the judgement
         # it was ordered for is no longer anybody's to make (#1022 gives such
         # a late judgement a 409, and this closes the slot behind it).
+        # #1120 review: a resubmission ends the run too. Its subject stopped
+        # being the thing under review, and a slot left open would hold the
+        # daily cap and the evidence door for code nobody is judging any more.
+        current_generation = int(task.get("submission_generation") or 0)
+        if task and current_generation > int(run["generation"]):
+            await close_run(
+                db,
+                run,
+                RUN_SUPERSEDED,
+                f"работа пересдана: генерация {current_generation} вместо "
+                f"{run['generation']} — этот прогон судил другой код",
+            )
+            closed += 1
+            continue
         verdict_generation = task.get("review_verdict_generation")
         if task and verdict_generation == run["generation"]:
             if await close_run(

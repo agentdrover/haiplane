@@ -22,6 +22,7 @@ from hub.services.orchestration import record_category_check
 from hub.services.finding_disposition import record_finding_dispositions
 from hub.services.steward_evidence import (
     build_evidence_packet,
+    pinned_generation as steward_pinned_generation,
     open_run_exists as steward_open_run_exists,
     packet_payload as steward_packet_payload,
 )
@@ -201,6 +202,7 @@ __all__ = [
     "project_id_for",
     "record_finding_dispositions",
     "build_evidence_packet",
+    "steward_pinned_generation",
     "steward_open_run_exists",
     "steward_packet_payload",
     "record_steward_judgement",

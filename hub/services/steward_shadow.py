@@ -27,7 +27,9 @@ is. A token that outlives its order buys nothing.
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 
 import aiosqlite
 
@@ -39,6 +41,7 @@ from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     RUN_OPEN,
     close_run,
+    configured_mode,
     steward_mode,
 )
 
@@ -55,6 +58,7 @@ REFUSED_NO_IDENTITY_CHANNEL = "no_identity_channel"
 
 EVENT_RUN_STARTED = "steward_run_started"
 EVENT_RUN_REFUSED = "steward_run_refused"
+EVENT_ACT_REFUSED = "steward_act_refused"
 
 RUN_REFUSED = "refused"
 
@@ -64,21 +68,91 @@ RUN_REFUSED = "refused"
 PENDING_PREFIX = "pending:"
 
 
-def identity_delivery(task_id: int, generation: int) -> str | None:
-    """How the run will authenticate to the hub, or None if it cannot.
+async def steward_principal_id(db: aiosqlite.Connection) -> int | None:
+    """The principal behind STEWARD_HUB_TOKEN, or None (#1120).
 
-    Not a formality. Cursor drops ``mcpServers`` on the way into a cloud run
-    (#1084), so a token placed in those headers never arrives: the run starts,
-    reaches the door with no identity, reads nothing and dies at its deadline
-    — a paid nothing. For the REVIEWER that was solved by minting a one-time,
-    task-bound code and putting it in the prompt; the steward needs the same,
-    and ``chat_pair`` has no ``steward`` kind yet.
-
-    Until it does, this returns None and the run is refused as unconfigured —
-    which under the retry rule below leaves the order open rather than burning
-    it. Better an order waiting for a channel than an agent paid to be mute.
+    The same hash lookup auth performs, without its side effects — the shape
+    ``reviewer_principal_id`` already uses (#1025). None means no code can be
+    minted, and the run is refused rather than started blind.
     """
-    return None
+    token = (config.STEWARD_HUB_TOKEN or "").strip()
+    if not token:
+        return None
+    from hub import auth
+
+    if auth._is_open_mode():
+        # Open mode never reads the bearer header, so a session pinned to a
+        # principal would be unsatisfiable. Refusing here is honest; minting a
+        # code that cannot be spent is not.
+        return None
+    from hub.services.admin import hash_api_key
+
+    rows = await fetchall(
+        db,
+        "SELECT principal_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+        (hash_api_key(token),),
+    )
+    return int(dict(rows[0])["principal_id"]) if rows else None
+
+
+def delivery_block(task_id: int, code: str, base_url: str) -> str:
+    """How the run reaches the hub without MCP (#1084's lesson, #1120).
+
+    Empty when there is no code: an instruction naming a credential the run
+    does not have teaches it to invent one.
+    """
+    if not code or not base_url:
+        return ""
+    return (
+        "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ. Инструментов MCP у тебя нет, всё "
+        "идёт обычным HTTP. Код ниже живёт МИНУТЫ, а прогон дольше — обменяй "
+        "его сразу:\n"
+        f"  curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
+        "-H 'Content-Type: application/json' "
+        f'-d \'{{"code":"{code}"}}\'\n'
+        "В ответе поле token — сохрани в переменную, в вывод не печатай. "
+        "Пакет доказательств читается им же:\n"
+        f"  curl -sS {base_url}/api/tasks/{task_id}/steward-evidence "
+        '-H "Authorization: Bearer $TOKEN"\n'
+        "Суждение сдаётся туда же:\n"
+        f"  curl -sS -X POST {base_url}/api/tasks/{task_id}/steward-judgement "
+        "-H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' "
+        "-d '<суждение по контракту>'\n"
+        "Больше этим токеном не открыто НИЧЕГО: две операции, обе про эту "
+        "задачу. Это не ограничение прогона, а граница, на которой держится "
+        "допуск твоего суждения к действию."
+    )
+
+
+async def identity_delivery(
+    db: aiosqlite.Connection, task_id: int, generation: int, base_url: str
+) -> str | None:
+    """Mint the run's one-time code and the block telling it what to do.
+
+    Returns None when no code can be minted — no token, no principal, open
+    mode. The caller refuses the run rather than paying for an agent that
+    cannot read the packet it was ordered to judge.
+
+    The code is bound to the task AND the generation. Without the generation
+    pin every check downstream is dead code: issue_code stores NULL, redeem
+    skips the comparison, and a code minted for one submission would judge
+    the next one (#1084 learned this the expensive way).
+    """
+    principal_id = await steward_principal_id(db)
+    if principal_id is None:
+        return None
+    from hub.services import chat_pair
+
+    code, _ttl = await chat_pair.issue_code(
+        db,
+        principal_id,
+        kind="steward",
+        bound_task_id=task_id,
+        bound_generation=generation,
+    )
+    if not code:
+        return None
+    return delivery_block(task_id, code, base_url)
 
 
 async def reviewer_model(
@@ -294,15 +368,18 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         )
         return False
 
-    delivery = identity_delivery(task_id, generation)
+    from hub.services.review_dispatch import instance_base_url
+
+    hub_base = instance_base_url().rstrip("/")
+    delivery = await identity_delivery(db, task_id, generation, hub_base)
     if delivery is None:
         await _refuse_transiently(
             db,
             order,
             REFUSED_NO_IDENTITY_CHANNEL,
-            "прогону нечем аутентифицироваться у хаба: Cursor отбрасывает "
-            "mcpServers (#1084), а одноразового кода для стюарда пока нет — "
-            "платить за немого агента незачем",
+            "прогону нечем аутентифицироваться у хаба: нет принципала за "
+            "STEWARD_HUB_TOKEN (или открытый режим) — код обменять не на что, "
+            "а платить за немого агента незачем",
         )
         return False
 
@@ -319,9 +396,6 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         return False
     await db.commit()
 
-    from hub.services.review_dispatch import instance_base_url
-
-    hub_base = instance_base_url().rstrip("/")
     created = await cursor_cloud.create_review_agent(
         repo_url=f"https://github.com/{gh_repo}",
         starting_ref=(task.get("branch") or "").strip() or "HEAD",
@@ -366,3 +440,268 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     await db.commit()
     log.info("steward run started: task #%s gen %s", task_id, generation)
     return True
+
+
+# ---------------------------------------------------------------------------
+# The 2x2 table and the thresholds (#1107)
+# ---------------------------------------------------------------------------
+#
+# Agreement is not the measure. The base rate of approval is 0.98, so an agent
+# that approves everything agrees with the human 98% of the time and looks
+# excellent. What matters is behaviour on the submissions where the human
+# RETURNED the work — and one cell of the table, counted apart from the rest:
+# a steward approve where the human asked for changes.
+#
+# That cell is the only unacceptable error. Everything else is a disagreement
+# to be discussed; this one is a submission that would have shipped.
+
+ACT_MIN_HUMAN_CHANGES = 10
+ACT_ESCALATION_FLOOR = 0.05
+ACT_ESCALATION_CEILING = 0.50
+
+REASON_SAMPLE_TOO_SMALL = "sample_too_small"
+REASON_FALSE_APPROVE = "false_approve"
+REASON_STAMPING = "escalations_below_floor"
+REASON_OVER_ESCALATING = "escalations_above_ceiling"
+REASON_NO_SAMPLE = "no_sample"
+
+
+@dataclass(frozen=True)
+class ShadowTable:
+    """What the steward would have said against what the human did."""
+
+    both_approve: int = 0
+    steward_approve_human_changes: int = 0  # THE cell
+    steward_changes_human_approve: int = 0
+    both_changes: int = 0
+    escalated: int = 0
+    unpaired: int = 0
+
+    @property
+    def false_approve(self) -> int:
+        """The only unacceptable error, counted on its own."""
+        return self.steward_approve_human_changes
+
+    @property
+    def human_changes(self) -> int:
+        """Submissions the human returned — the denominator that matters.
+
+        Not "any submission": at first-pass 0.98 a hundred of those yield two
+        to four returns, and "zero false-approve" over such a sample measures
+        nothing at all.
+        """
+        return self.steward_approve_human_changes + self.both_changes
+
+    @property
+    def paired(self) -> int:
+        return (
+            self.both_approve
+            + self.steward_approve_human_changes
+            + self.steward_changes_human_approve
+            + self.both_changes
+        )
+
+    @property
+    def judged(self) -> int:
+        return self.paired + self.escalated
+
+    @property
+    def escalation_share(self) -> float | None:
+        """The share, or None when nothing has been judged yet.
+
+        Not 0.0 (#1107 review). Zero is a measurement — "this judge never
+        escalates" — and an empty sample is the absence of one. Returning the
+        first for the second is #762 applied to a ratio: emptiness read as
+        cleanliness, here as "suspiciously agreeable".
+        """
+        return (self.escalated / self.judged) if self.judged else None
+
+
+async def _human_verdicts(db: aiosqlite.Connection) -> dict[tuple[int, int], str]:
+    """Human verdict per (task, generation), from the feed's own record.
+
+    The task row carries only the LATEST verdict, so a resubmission would
+    erase the history this table is made of. The events do not: every verdict
+    was written with the generation it judged (#1022 era), and that is the
+    only place the pairing can come from without inventing it.
+    """
+    # actor matters (#1107 review): auto_verdict writes the same event under
+    # actor='policy' (#745), and a policy signature counted as a human one
+    # would make the table measure agreement with AUTOMATION — the very
+    # thing it exists to check. Same for a future steward-applied verdict:
+    # the denominator is human decisions or it is nothing.
+    rows = await fetchall(
+        db,
+        "SELECT task_id, actor, payload FROM events "
+        "WHERE kind='review_verdict_recorded' "
+        "AND actor NOT IN ('policy', 'steward', 'hub') "
+        "ORDER BY id ASC",
+        (),
+    )
+    out: dict[tuple[int, int], str] = {}
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload") or "{}")
+        except ValueError:
+            continue
+        generation = int(payload.get("submission_generation") or 0)
+        verdict = (payload.get("verdict") or "").strip()
+        if not generation or verdict not in {"approved", "changes_requested"}:
+            continue
+        # Later verdict on the same generation wins: a human may change their
+        # mind, and the table records what they DID, not their first draft.
+        out[(int(item["task_id"]), generation)] = verdict
+    return out
+
+
+async def shadow_table(db: aiosqlite.Connection) -> ShadowTable:
+    """Build the table from recorded judgements and recorded verdicts."""
+    judgements = await fetchall(
+        db,
+        "SELECT task_id, generation, verdict FROM steward_judgements "
+        "WHERE kind='verdict' ORDER BY id ASC",
+        (),
+    )
+    humans = await _human_verdicts(db)
+    cells = {
+        "both_approve": 0,
+        "steward_approve_human_changes": 0,
+        "steward_changes_human_approve": 0,
+        "both_changes": 0,
+    }
+    escalated = 0
+    unpaired = 0
+    for row in judgements:
+        item = dict(row)
+        verdict = (item.get("verdict") or "").strip()
+        if verdict == "escalate":
+            escalated += 1
+            continue
+        human = humans.get((int(item["task_id"]), int(item["generation"])))
+        if human is None:
+            # No human verdict for this generation yet. Not agreement, not
+            # disagreement — no data, and counted as such (#762).
+            unpaired += 1
+            continue
+        if verdict == "approve":
+            key = (
+                "both_approve"
+                if human == "approved"
+                else "steward_approve_human_changes"
+            )
+        else:
+            key = (
+                "steward_changes_human_approve"
+                if human == "approved"
+                else "both_changes"
+            )
+        cells[key] += 1
+    return ShadowTable(escalated=escalated, unpaired=unpaired, **cells)
+
+
+async def act_refusals(db: aiosqlite.Connection) -> list[tuple[str, str]]:
+    """Which exit criteria are not met yet, by name. Empty means all are.
+
+    Checked in CODE at the moment act is switched on, never by eye: this is
+    exactly the mistake #585 refuses to allow on R2 — widening a band on an
+    impression rather than on a measurement.
+    """
+    table = await shadow_table(db)
+    out: list[tuple[str, str]] = []
+    if table.human_changes < ACT_MIN_HUMAN_CHANGES:
+        out.append(
+            (
+                REASON_SAMPLE_TOO_SMALL,
+                f"человеческих changes_requested в выборке {table.human_changes}, "
+                f"нужно {ACT_MIN_HUMAN_CHANGES}: «сто любых сдач» критерием не "
+                "являются — при first-pass 0.98 они дают 2-4 возврата",
+            )
+        )
+    if table.false_approve:
+        out.append(
+            (
+                REASON_FALSE_APPROVE,
+                f"false-approve: {table.false_approve} — стюард одобрил бы то, "
+                "что человек вернул; единственная неприемлемая ошибка",
+            )
+        )
+    share = table.escalation_share
+    if share is None:
+        out.append(
+            (
+                REASON_NO_SAMPLE,
+                "суждений нет вовсе: доля эскалаций не измерена, а не равна нулю",
+            )
+        )
+        return out
+    if share < ACT_ESCALATION_FLOOR:
+        out.append(
+            (
+                REASON_STAMPING,
+                f"доля эскалаций {share:.0%} ниже {ACT_ESCALATION_FLOOR:.0%}: "
+                "судья соглашается со всем подряд, то есть штампует",
+            )
+        )
+    if share > ACT_ESCALATION_CEILING:
+        out.append(
+            (
+                REASON_OVER_ESCALATING,
+                f"доля эскалаций {share:.0%} выше {ACT_ESCALATION_CEILING:.0%}: "
+                "судья возвращает человеку почти всё, и смысла в нём нет",
+            )
+        )
+    return out
+
+
+async def effective_mode(db: aiosqlite.Connection) -> str:
+    """The mode the contour may ACTUALLY run in. THE reader of `act`.
+
+    `act` is asked for in the environment and GRANTED here — only when the
+    shadow phase produced the numbers that allow it. And this is the only
+    place where the word can be returned at all: ``requested_mode`` caps its
+    answer at ``shadow``, so a consumer that forgets this function does not
+    silently get autonomy, it gets today's behaviour (#1107 review).
+
+    The refusal reaches the feed ONCE per changed set of reasons. Written on
+    every call it would bury the feed under a line per poller tick — and a
+    record nobody can read is the same as no record.
+    """
+    asked = configured_mode()
+    if asked != "act":
+        return asked
+    refusals = await act_refusals(db)
+    if not refusals:
+        return "act"
+    codes = [code for code, _ in refusals]
+    await _announce_refusal_once(db, codes, refusals)
+    return "shadow"
+
+
+async def _announce_refusal_once(
+    db: aiosqlite.Connection, codes: list[str], refusals: list[tuple[str, str]]
+) -> None:
+    """Write the refusal only when its REASONS changed since last time."""
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        (EVENT_ACT_REFUSED,),
+    )
+    if rows:
+        try:
+            previous = json.loads(dict(rows[0]).get("payload") or "{}")
+        except ValueError:
+            previous = {}
+        if list(previous.get("reasons") or []) == codes:
+            return
+    await repo.insert_event(
+        db,
+        kind=EVENT_ACT_REFUSED,
+        actor="hub",
+        payload={"reasons": codes},
+    )
+    await db.commit()
+    log.warning(
+        "STEWARD_MODE=act not granted: %s",
+        "; ".join(f"{code}: {detail}" for code, detail in refusals),
+    )
