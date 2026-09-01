@@ -11,6 +11,7 @@ one in.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import socket
 from collections.abc import Awaitable, Callable
@@ -2111,6 +2112,13 @@ class GitOpsIntegration:
         outcome, detail = await self.forge.pr_mergeability(
             pr_number, repo=repo, gh_repo=gh_repo
         )
+        # Форж, который не умеет мержить, обычно не умеет и предсказывать мерж
+        # (#1116). Тогда вопрос задаётся git: пробное слияние в одноразовом
+        # рабочем дереве — единственный способ узнать ответ, не тронув ничего.
+        if outcome is MergeabilityOutcome.unavailable and not (
+            self.forge.can_merge_via_api
+        ):
+            return await self._mergeable_by_trial(pr_number, repo=repo, gh_repo=gh_repo)
         if outcome is not MergeabilityOutcome.conflicting:
             return (outcome, detail)
         files = await self._conflicting_files_of_pr(
@@ -2118,6 +2126,85 @@ class GitOpsIntegration:
         )
         named = f": {', '.join(files)}" if files else ""
         return (MergeabilityOutcome.conflicting, f"конфликт с базовой веткой{named}")
+
+    async def _mergeable_by_trial(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[MergeabilityOutcome, str]:
+        """Сольётся ли PR — по пробному мержу, который ничего не меняет (#1116).
+
+        Исходы те же четыре, что и у форжа, и различие между ними сохраняется
+        целиком (#970). ``unknown`` здесь не бывает: git отвечает определённо,
+        и притворяться, что «ещё не посчитал», было бы враньём. А вот
+        ``unavailable`` бывает часто — нет клона, не дотянулись до origin, не
+        разрешились ветки, — и это НЕ конфликт: одно чинится сетью, другое
+        руками человека.
+        """
+        workspace = repo or _repo_root()
+        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        if not base or not head:
+            return (
+                MergeabilityOutcome.unavailable,
+                f"PR #{pr_number}: форж не назвал базовую и головную ветки",
+            )
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=workspace,
+            check=False,
+        )
+        if rc != 0:
+            return (
+                MergeabilityOutcome.unavailable,
+                f"не удалось получить ветки из origin: {err[:150]}",
+            )
+        path = os.path.join(
+            os.path.dirname(workspace.rstrip("/")) or "/",
+            f".hub-trial-{pr_number}",
+        )
+        await _git("worktree", "remove", "--force", path, repo=workspace, check=False)
+        rc, _, err = await _git(
+            "worktree",
+            "add",
+            "--force",
+            "--detach",
+            path,
+            f"origin/{base}",
+            repo=workspace,
+            check=False,
+        )
+        if rc != 0:
+            return (
+                MergeabilityOutcome.unavailable,
+                f"не удалось подготовить дерево для пробы: {err[:150]}",
+            )
+        try:
+            rc, _, _ = await _git(
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                f"origin/{head}",
+                repo=path,
+                check=False,
+            )
+            await _git("merge", "--abort", repo=path, check=False)
+        finally:
+            await _git(
+                "worktree", "remove", "--force", path, repo=workspace, check=False
+            )
+        if rc == 0:
+            return (MergeabilityOutcome.mergeable, "пробное слияние прошло")
+        files = await self._conflicting_files(head, base, repo=workspace)
+        named = f": {', '.join(files)}" if files else ""
+        return (
+            MergeabilityOutcome.conflicting,
+            f"конфликт с базовой веткой{named}",
+        )
 
     async def _conflicting_files_of_pr(
         self,
@@ -2371,6 +2458,10 @@ class GitOpsIntegration:
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
 
+        Ветвится по ОБЪЯВЛЕННОЙ способности форжа, а не по попытке (#1116).
+        GitHub сливает сам одним вызовом. У GitVerse такого вызова нет вовсе,
+        и слить можно только локальным git — а git живёт здесь, не в адаптере.
+
         Deleting the head is right for a task PR — short-lived branches, the
         repository's own rule. But this one call served the RELEASE PR too,
         whose head is the project's integration branch: every auto-release of
@@ -2381,13 +2472,154 @@ class GitOpsIntegration:
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
         subject = f"{ctype}(task): {slug} (#{task_id})"
-        return await self.forge.merge_pr(
-            pr_number,
-            subject,
-            delete_branch=delete_branch,
-            repo=repo,
-            gh_repo=gh_repo,
+        if self.forge.can_merge_via_api:
+            return await self.forge.merge_pr(
+                pr_number,
+                subject,
+                delete_branch=delete_branch,
+                repo=repo,
+                gh_repo=gh_repo,
+            )
+        ok, detail = await self.merge_pr_by_push(
+            pr_number, subject, repo=repo, gh_repo=gh_repo
         )
+        if not ok:
+            log.error("merge by push failed for PR #%d: %s", pr_number, detail)
+        return ok
+
+    async def merge_pr_by_push(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[bool, str]:
+        """Слить PR локальным git и ДОКАЗАТЬ доставку базовой веткой (#1116).
+
+        Для форжей, которые не умеют мержить сами. Возвращает ``(ok, detail)``
+        — деталь называет ПРИЧИНУ, а не актора: защита базовой ветки, конфликт,
+        отсутствие клона и недоступная сеть чинятся разными руками, и «форж
+        отказал» не ведёт никуда (#970).
+
+        Порядок шагов не произволен, каждый закрывает свой способ соврать:
+
+        1. Ветки берутся у PR, а не у вызывающего: имя ветки задачи могло
+           разойтись с тем, что в PR на самом деле.
+        2. Мерж делается в ОДНОРАЗОВОМ worktree, а не в рабочем клоне. Клон
+           общий, может стоять на чужой ветке с грязным деревом и несёт
+           взведённый pre-push хук — три способа повредить чужую работу
+           бухгалтерским мержем (#949 был одним из них).
+        3. Доставка подтверждается достижимостью полученного SHA в базовой
+           ветке НА REMOTE, а не кодом возврата push. Измерено 01.09.2026:
+           GitVerse после такого мержа оставляет PR в состоянии open,
+           merged=False, а GET /pulls/{n}/merge отвечает 404 и до, и после —
+           то есть форж об успехе не сообщает вовсе.
+        4. Только после подтверждения PR закрывается явно. Незакрытый висел бы
+           открытым вечно, и pr_for_branch находил бы его на уже доставленной
+           ветке.
+        """
+        workspace = repo or _repo_root()
+        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        if not base or not head:
+            return (False, f"PR #{pr_number}: форж не назвал базовую и головную ветки")
+
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{head}:refs/remotes/origin/{head}",
+            repo=workspace,
+            check=False,
+        )
+        if rc != 0:
+            return (False, f"не удалось получить ветки из origin: {err[:150]}")
+
+        path = os.path.join(
+            os.path.dirname(workspace.rstrip("/")) or "/",
+            f".hub-merge-{pr_number}",
+        )
+        await _git("worktree", "remove", "--force", path, repo=workspace, check=False)
+        rc, _, err = await _git(
+            "worktree",
+            "add",
+            "--force",
+            "-B",
+            f"hub-merge/{pr_number}",
+            path,
+            f"origin/{base}",
+            repo=workspace,
+            check=False,
+        )
+        if rc != 0:
+            return (
+                False,
+                f"не удалось подготовить рабочее дерево для мержа: {err[:150]}",
+            )
+
+        try:
+            rc, _, err = await _git(
+                "merge",
+                "--no-ff",
+                "-m",
+                subject,
+                f"origin/{head}",
+                repo=path,
+                check=False,
+            )
+            if rc != 0:
+                files = await self._conflicting_files(head, base, repo=workspace)
+                named = f": {', '.join(files)}" if files else ""
+                return (False, f"{head} не сливается с {base} без конфликта{named}")
+
+            rc, merged_sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            merged_sha = (merged_sha or "").strip()
+            if rc != 0 or not merged_sha:
+                return (False, "git не назвал коммит мержа")
+
+            rc, _, err = await _git(
+                "push", "origin", f"HEAD:refs/heads/{base}", repo=path, check=False
+            )
+            if rc != 0:
+                detail = (err or "").strip()
+                low = detail.lower()
+                if "protected" in low or "denied" in low or "pre-receive" in low:
+                    return (
+                        False,
+                        f"базовая ветка {base} закрыта от прямого push — "
+                        f"на этом форже доставка иначе невозможна: {detail[:150]}",
+                    )
+                return (False, f"push в {base} не прошёл: {detail[:150]}")
+        finally:
+            await _git(
+                "worktree", "remove", "--force", path, repo=workspace, check=False
+            )
+
+        landed = await self.forge.branch_contains(
+            base, merged_sha, repo=repo, gh_repo=gh_repo
+        )
+        if landed is None:
+            return (
+                False,
+                f"push прошёл, но подтвердить попадание {merged_sha[:12]} в {base} "
+                "не удалось — спросите снова, это не отказ",
+            )
+        if not landed:
+            return (
+                False,
+                f"push прошёл, а {merged_sha[:12]} в {base} не появился — "
+                "доставку засчитывать нельзя",
+            )
+
+        # Закрытие — уже ПОСЛЕ доказательства: незакрытый PR неприятен, но
+        # закрытый без мержа врёт сильнее.
+        if not await self.forge.close_pr(pr_number, repo=repo, gh_repo=gh_repo):
+            log.warning(
+                "PR #%d влит, но не закрыт — он останется открытым на форже",
+                pr_number,
+            )
+        log.info("Merged PR #%d by push (%s)", pr_number, merged_sha[:12])
+        return (True, merged_sha)
 
     async def delete_branch(
         self,

@@ -99,6 +99,17 @@ async def test_hub_starts_with_noop_forge():
     assert (await forge.merge_branches("develop", "main", "msg"))[0] == "unavailable"
 
 
+def test_every_forge_declares_whether_it_can_merge():
+    """#1116: способность мержить объявлена, а не выясняется попыткой.
+
+    Флаг обязан быть у КАЖДОЙ реализации: вызывающий читает его до вызова, и
+    отсутствие атрибута уронило бы доставку в момент, когда она уже началась.
+    """
+    assert GitHubForge().can_merge_via_api is True
+    assert GitVerseForge().can_merge_via_api is False
+    assert NoopForge().can_merge_via_api is False
+
+
 def test_every_forge_names_itself():
     """Отказ должен называть, КТО отказал, а не только что отказали."""
     assert GitHubForge().name == "github"

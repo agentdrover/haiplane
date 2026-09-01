@@ -518,6 +518,7 @@ class NoopForge:
     """
 
     name = "noop"
+    can_merge_via_api = False
 
     async def create_pr(
         self,
@@ -593,6 +594,21 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> bool:
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        return None
 
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
