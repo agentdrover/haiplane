@@ -141,6 +141,7 @@ class NoopGitOps:
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return None
 
@@ -149,6 +150,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         """No git here — "could not look" (#802).
 
@@ -162,6 +164,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         """No GitHub — "not a draft". Ignorance is not an accusation (#498)."""
         return False
@@ -171,6 +174,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         return False
 
@@ -180,6 +184,7 @@ class NoopGitOps:
         head: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]:
         """No git here — an empty range means the release has nothing to say."""
         return []
@@ -202,6 +207,7 @@ class NoopGitOps:
         body: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return None
 
@@ -210,6 +216,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         return ""
 
@@ -267,6 +274,7 @@ class NoopGitOps:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]:
         """No GitHub here — "could not ask", never "mergeable" (#970).
 
@@ -283,6 +291,7 @@ class NoopGitOps:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[str, str]:
         """No git here — "could not ask", never "nothing to return" (#969).
 
@@ -450,6 +459,7 @@ class NoopGitOps:
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         base_branch: str | None = None,
     ) -> int | None:
         return None
@@ -461,11 +471,16 @@ class NoopGitOps:
         max_log_chars: int = 4000,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> dict[str, Any]:
         return {}
 
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
@@ -475,6 +490,7 @@ class NoopGitOps:
         limit: int = 20,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[dict] | None:
         # None, not []: this plugin cannot look, and "looked and found no
         # runs" is a different answer that would read as a green base (#929).
@@ -487,6 +503,7 @@ class NoopGitOps:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> bool:
         return False
@@ -498,6 +515,7 @@ class NoopGitOps:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> tuple[bool, str]:
         """Согласован с ``merge_pr``, а не отвечает отдельно (#1116).

@@ -23,6 +23,7 @@ from hub.actionable_errors import (
     pair_worktree_dirty_detail,
 )
 from hub.config import PAIR_BASE_BRANCH
+from hub.integrations import forge as forge_registry
 from hub.integrations import proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
@@ -39,6 +40,10 @@ log = logging.getLogger(__name__)
 
 # Exit code for a killed-on-timeout command: the shell convention, and distinct
 # from any rc git itself returns, so a caller can tell a timeout from a refusal.
+#: Имя заглушки-форжа. Хаб с ней стартует без настроенных интеграций, и
+#: резолв по имени её не заменяет (см. GitOpsIntegration._forge_for).
+NOOP_FORGE = "noop"
+
 _TIMEOUT_RC = proc.TIMEOUT_RC
 
 
@@ -625,6 +630,32 @@ class GitOpsIntegration:
 
     def __init__(self, forge: ForgePlugin | None = None) -> None:
         self.forge: ForgePlugin = forge or GitHubForge()
+
+    def _forge_for(self, forge: str = "") -> ForgePlugin:
+        """Адаптер ДЛЯ ЭТОГО ВЫЗОВА (#1146).
+
+        До задачи форж был свойством инстанса: ``plugins.forge`` выбирался один
+        раз при старте и обслуживал все проекты, а колонка ``projects.forge``
+        (#1114) не читалась никем — смена форжа меняла только текст в карточке.
+
+        Правило одно, и оба его случая нужны:
+
+        * Имя не названо ИЛИ настроенный адаптер обслуживает именно этот форж —
+          отвечает настроенный. Это сохраняет поведение всех существующих
+          github-проектов до последнего кода возврата и, что важнее, сохраняет
+          ПОДМЕНУ: тест, вложивший свой адаптер, продолжает получать вызовы, а
+          не свежий настоящий GitHubForge.
+        * Проект объявил другой форж — вызов уходит к адаптеру этого форжа.
+
+        Отдельно ненастроенный хаб. ``NoopForge`` означает «хостинга нет вовсе»,
+        и резолвить поверх него нельзя: это включило бы интеграцию, которую
+        никто не настраивал, и заменило бы честное «спросить не удалось» на
+        содержательный ответ — ровно тот дефект, который разбирали #419 и #725.
+        """
+        configured = self.forge
+        if not forge or forge == configured.name or configured.name == NOOP_FORGE:
+            return configured
+        return forge_registry.client_for(forge)
 
     async def current_branch(self, repo: str | None = None) -> str:
         rc, out, _ = await _git("branch", "--show-current", repo=repo, check=False)
@@ -1986,6 +2017,7 @@ class GitOpsIntegration:
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         base_branch: str | None = None,
     ) -> int | None:
         ctype = _conv_commit_type(title)
@@ -1995,7 +2027,7 @@ class GitOpsIntegration:
             f"{description or 'No description'}\n\n"
             "---\n*Created automatically by Haiplane Hub*"
         )
-        return await self.forge.create_pr(
+        return await self._forge_for(forge).create_pr(
             pr_title,
             body,
             branch,
@@ -2011,8 +2043,9 @@ class GitOpsIntegration:
         max_log_chars: int = 12000,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> dict[str, Any]:
-        return await self.forge.ci_failure_logs(
+        return await self._forge_for(forge).ci_failure_logs(
             pr_number, branch, max_log_chars, repo=repo, gh_repo=gh_repo
         )
 
@@ -2022,21 +2055,29 @@ class GitOpsIntegration:
         limit: int = 20,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[dict[str, Any]] | None:
-        return await self.forge.branch_ci_runs(
+        return await self._forge_for(forge).branch_ci_runs(
             branch, limit, repo=repo, gh_repo=gh_repo
         )
 
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> CIProbeResult:
-        return await self.forge.check_pr_ci(pr_number, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).check_pr_ci(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
 
     async def pr_for_branch(
         self,
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         """The open PR whose head is ``branch``, or None (#605).
 
@@ -2045,7 +2086,9 @@ class GitOpsIntegration:
         sets. Discovery at submission time closes that: the hub looks the PR
         up itself instead of asking anyone to remember a number.
         """
-        return await self.forge.pr_for_branch(branch, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).pr_for_branch(
+            branch, repo=repo, gh_repo=gh_repo
+        )
 
     async def content_differs(
         self,
@@ -2112,6 +2155,7 @@ class GitOpsIntegration:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]:
         """Can this PR be merged, and if not, why (#970).
 
@@ -2121,20 +2165,22 @@ class GitOpsIntegration:
         out of the clone, so this is the same question with the same answer,
         not a second one.
         """
-        outcome, detail = await self.forge.pr_mergeability(
+        outcome, detail = await self._forge_for(forge).pr_mergeability(
             pr_number, repo=repo, gh_repo=gh_repo
         )
         # Форж, который не умеет мержить, обычно не умеет и предсказывать мерж
         # (#1116). Тогда вопрос задаётся git: пробное слияние в одноразовом
         # рабочем дереве — единственный способ узнать ответ, не тронув ничего.
         if outcome is MergeabilityOutcome.unavailable and not (
-            self.forge.can_merge_via_api
+            self._forge_for(forge).can_merge_via_api
         ):
-            return await self._mergeable_by_trial(pr_number, repo=repo, gh_repo=gh_repo)
+            return await self._mergeable_by_trial(
+                pr_number, repo=repo, gh_repo=gh_repo, forge=forge
+            )
         if outcome is not MergeabilityOutcome.conflicting:
             return (outcome, detail)
         files = await self._conflicting_files_of_pr(
-            pr_number, repo=repo, gh_repo=gh_repo
+            pr_number, repo=repo, gh_repo=gh_repo, forge=forge
         )
         named = f": {', '.join(files)}" if files else ""
         return (MergeabilityOutcome.conflicting, f"конфликт с базовой веткой{named}")
@@ -2145,6 +2191,7 @@ class GitOpsIntegration:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]:
         """Сольётся ли PR — по пробному мержу, который ничего не меняет (#1116).
 
@@ -2156,7 +2203,9 @@ class GitOpsIntegration:
         руками человека.
         """
         workspace = repo or _repo_root()
-        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        base, head = await self._forge_for(forge).pr_refs(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
         if not base or not head:
             return (
                 MergeabilityOutcome.unavailable,
@@ -2229,6 +2278,7 @@ class GitOpsIntegration:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]:
         """Files this PR collides with its base on, when git can name them.
 
@@ -2237,7 +2287,9 @@ class GitOpsIntegration:
         branch names come from the PR itself, so this works for a task PR as
         well as for the release one.
         """
-        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        base, head = await self._forge_for(forge).pr_refs(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
         if not base or not head:
             return []
         return await self._conflicting_files(head, base, repo=repo)
@@ -2249,6 +2301,7 @@ class GitOpsIntegration:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[str, str]:
         """Merge the release branch back into the integration branch (#969).
 
@@ -2272,7 +2325,7 @@ class GitOpsIntegration:
         someone else's branch with a dirty tree, and carries an armed pre-push
         hook (#949). Naming the conflicting files is git's job, and stays here.
         """
-        state, detail = await self.forge.merge_branches(
+        state, detail = await self._forge_for(forge).merge_branches(
             head,
             base,
             f"chore: return {base} into {head} after the release",
@@ -2330,6 +2383,7 @@ class GitOpsIntegration:
         head: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]:
         """Commit subjects that ``head`` carries over ``base``, newest first.
 
@@ -2339,7 +2393,9 @@ class GitOpsIntegration:
         answer, and the caller treats those the same way it treats an empty
         range: by doing nothing.
         """
-        return await self.forge.compare_subjects(base, head, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).compare_subjects(
+            base, head, repo=repo, gh_repo=gh_repo
+        )
 
     async def undelivered_release_range(
         self,
@@ -2407,9 +2463,10 @@ class GitOpsIntegration:
         body: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         """The open release PR for this range — found, updated, or created."""
-        return await self.forge.open_or_update_pr(
+        return await self._forge_for(forge).open_or_update_pr(
             base, head, title, body, repo=repo, gh_repo=gh_repo
         )
 
@@ -2418,6 +2475,7 @@ class GitOpsIntegration:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         """Where this PR stands: "open", "merged", "closed", "absent", or "".
 
@@ -2426,35 +2484,44 @@ class GitOpsIntegration:
         as an answer: "could not look" and "closed" lead to opposite decisions
         about delivery (#802, the rule #725 wrote down).
         """
-        return await self.forge.pr_state(pr_number, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).pr_state(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
 
     async def pr_is_draft(
         self,
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         """Whether the forge still treats this PR as a draft (#1053).
 
         False means "not a draft or could not look" — the #498 rule: silence
         is not an accusation, and the merge call still runs.
         """
-        return await self.forge.pr_is_draft(pr_number, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).pr_is_draft(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
 
     async def mark_pr_ready(
         self,
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         """Convert a draft PR to ready. Hub approval is the ready signal (#1053)."""
-        return await self.forge.mark_pr_ready(pr_number, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).mark_pr_ready(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
 
     async def merge_commit_sha(
         self,
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         """The SHA of the commit THIS pull request produced, or "" (#534).
 
@@ -2463,7 +2530,9 @@ class GitOpsIntegration:
         write the intruder into the whitelist and mark the real merge as
         drift. The pull request knows its own merge commit, so ask it.
         """
-        return await self.forge.merge_commit_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        return await self._forge_for(forge).merge_commit_sha(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
 
     async def merge_pr(
         self,
@@ -2472,6 +2541,7 @@ class GitOpsIntegration:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
@@ -2493,6 +2563,7 @@ class GitOpsIntegration:
             title,
             repo=repo,
             gh_repo=gh_repo,
+            forge=forge,
             delete_branch=delete_branch,
         )
         return ok
@@ -2504,6 +2575,7 @@ class GitOpsIntegration:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> tuple[bool, str]:
         """Слить PR и НАЗВАТЬ причину, если не вышло (#1116, по ревью).
@@ -2516,8 +2588,8 @@ class GitOpsIntegration:
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
         subject = f"{ctype}(task): {slug} (#{task_id})"
-        if self.forge.can_merge_via_api:
-            ok = await self.forge.merge_pr(
+        if self._forge_for(forge).can_merge_via_api:
+            ok = await self._forge_for(forge).merge_pr(
                 pr_number,
                 subject,
                 delete_branch=delete_branch,
@@ -2526,7 +2598,7 @@ class GitOpsIntegration:
             )
             return (ok, "")
         ok, detail = await self.merge_pr_by_push(
-            pr_number, subject, repo=repo, gh_repo=gh_repo
+            pr_number, subject, repo=repo, gh_repo=gh_repo, forge=forge
         )
         if not ok:
             log.error("merge by push failed for PR #%d: %s", pr_number, detail)
@@ -2539,6 +2611,7 @@ class GitOpsIntegration:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[bool, str]:
         """Слить PR локальным git и ДОКАЗАТЬ доставку базовой веткой (#1116).
 
@@ -2565,7 +2638,9 @@ class GitOpsIntegration:
            ветке.
         """
         workspace = repo or _repo_root()
-        base, head = await self.forge.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        base, head = await self._forge_for(forge).pr_refs(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
         if not base or not head:
             return (False, f"PR #{pr_number}: форж не назвал базовую и головную ветки")
 
@@ -2650,7 +2725,7 @@ class GitOpsIntegration:
                 "worktree", "remove", "--force", path, repo=workspace, check=False
             )
 
-        landed = await self.forge.branch_contains(
+        landed = await self._forge_for(forge).branch_contains(
             base, merged_sha, repo=repo, gh_repo=gh_repo
         )
         if landed is None:
@@ -2671,7 +2746,9 @@ class GitOpsIntegration:
 
         # Закрытие — уже ПОСЛЕ доказательства: незакрытый PR неприятен, но
         # закрытый без мержа врёт сильнее.
-        if not await self.forge.close_pr(pr_number, repo=repo, gh_repo=gh_repo):
+        if not await self._forge_for(forge).close_pr(
+            pr_number, repo=repo, gh_repo=gh_repo
+        ):
             log.warning(
                 "PR #%d влит, но не закрыт — он останется открытым на форже",
                 pr_number,

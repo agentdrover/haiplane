@@ -36,6 +36,7 @@ from hub.services.gate_events import (
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
+    forge_of,
     rearm_clone,
     release_base_of,
 )
@@ -63,6 +64,16 @@ async def project_git_context(
         ctx["gh_repo"] = d["repo"].strip()
     if (d.get("default_branch") or "").strip():
         ctx["base_branch"] = d["default_branch"].strip()
+    # #1146: форж едет тем же путём, что repo и base_branch, и по той же
+    # причине — это пер-проектная величина того же времени жизни.
+    #
+    # И по тому же ПРАВИЛУ: ключ появляется только там, где проект что-то
+    # объявил. Безусловный ключ ломал бы инвариант #604 — ненастроенный проект
+    # не отдаёт НИ ОДНОГО ключа, и git_ops падает на окружение. Форж без
+    # репозитория и означать нечего: пустое имя читается как «спроси у
+    # настроенного адаптера», то есть ровно как прежнее поведение.
+    if "gh_repo" in ctx:
+        ctx["forge"] = forge_of(row)
     # No special case for the default project (#604). One existed here —
     # an unconditional empty context, written when default had no real
     # fields and "behave like the pre-project hub" was the only correct
@@ -2201,7 +2212,9 @@ async def merge_before_completion(
         workspace = ctx.get("repo")
         gh_repo = ctx.get("gh_repo")
 
-        ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
+        ci = await plugins.git_ops.check_pr_ci(
+            pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
+        )
         if ci.outcome == CIProbeOutcome.missing_run:
             elapsed = _seconds_since_ci_start(task.get("ci_check_started_at"))
             if elapsed is None:
@@ -2214,9 +2227,14 @@ async def merge_before_completion(
         # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
         # here is the ready signal. Asking merge_pr first collapses a draft
         # into merge_failed — a one-way door to needs_decision.
-        if await plugins.git_ops.pr_is_draft(pr_num, repo=workspace, gh_repo=gh_repo):
+        if await plugins.git_ops.pr_is_draft(
+            pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
+        ):
             marked = await plugins.git_ops.mark_pr_ready(
-                pr_num, repo=workspace, gh_repo=gh_repo
+                pr_num,
+                repo=workspace,
+                gh_repo=gh_repo,
+                forge=ctx.get("forge", ""),
             )
             if not marked:
                 return False, (
@@ -2230,6 +2248,7 @@ async def merge_before_completion(
             task.get("title") or "",
             repo=workspace,
             gh_repo=gh_repo,
+            forge=ctx.get("forge", ""),
         )
         if not merged:
             return False, _merge_failure_detail(merge_detail)
@@ -2239,7 +2258,10 @@ async def merge_before_completion(
         merge_sha = ""
         try:
             merge_sha = await plugins.git_ops.merge_commit_sha(
-                pr_num, repo=workspace, gh_repo=gh_repo
+                pr_num,
+                repo=workspace,
+                gh_repo=gh_repo,
+                forge=ctx.get("forge", ""),
             )
             merge_sha = _merge_sha_or_detail(merge_sha, merge_detail)
         except Exception:  # noqa: BLE001 - the drift guard flags it once
@@ -2308,7 +2330,10 @@ async def _recorded_pr_state(
     try:
         ctx = await project_git_context(db, task["id"])
         state = await plugins.git_ops.pr_state(
-            pr_number, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            pr_number,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning(
@@ -2330,7 +2355,10 @@ async def _live_pr_for_branch(
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
-            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            branch,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning("PR search failed for #%s (%s): %s", task["id"], branch, exc)
@@ -2415,6 +2443,7 @@ async def ensure_delivery_pr(
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
             base_branch=ctx.get("base_branch"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         log.warning("ensure_delivery_pr failed for #%s (%s): %s", task_id, branch, exc)
@@ -2493,7 +2522,10 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
-            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            branch,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning(
@@ -3055,6 +3087,7 @@ async def _route_after_done(
                 repo=git_repo,
                 gh_repo=ctx.get("gh_repo"),
                 base_branch=ctx.get("base_branch"),
+                forge=ctx.get("forge", ""),
             )
             if pr_num:
                 await repo.update_task(db, task_id, pr_number=pr_num)

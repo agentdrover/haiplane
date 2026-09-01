@@ -375,7 +375,7 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
     describes.
     """
     from hub.integrations.registry import plugins
-    from hub.services.project_policy import base_branch_of
+    from hub.services.project_policy import base_branch_of, forge_of
     from hub.services.red_base import UNKNOWN, read_state
 
     source = "red_base"
@@ -388,6 +388,7 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
             branch,
             repo=(project.get("workspace_path") or "").strip() or None,
             gh_repo=(project.get("repo") or "").strip() or None,
+            forge=forge_of(project),
         )
     except Exception:  # noqa: BLE001 — the packet assembles regardless
         runs = None

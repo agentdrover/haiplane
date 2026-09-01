@@ -231,6 +231,7 @@ class GitOpsPlugin(Protocol):
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[str, str]: ...
     async def check_pr_mergeable(
         self,
@@ -238,6 +239,7 @@ class GitOpsPlugin(Protocol):
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
@@ -275,6 +277,7 @@ class GitOpsPlugin(Protocol):
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         base_branch: str | None = None,
     ) -> int | None: ...
     async def get_ci_failure_logs(
@@ -284,9 +287,14 @@ class GitOpsPlugin(Protocol):
         max_log_chars: int = 4000,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> dict[str, Any]: ...
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> CIProbeResult: ...
     async def branch_ci_runs(
         self,
@@ -294,6 +302,7 @@ class GitOpsPlugin(Protocol):
         limit: int = 20,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[dict[str, Any]] | None: ...
     # Читатели git и GitHub, которые вызываются из services/, но в протоколе
     # отсутствовали: реализации (git_ops, noop) их имеют, контракт — нет. То
@@ -327,21 +336,35 @@ class GitOpsPlugin(Protocol):
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None: ...
     async def merge_commit_sha(
         self,
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str: ...
     async def pr_state(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> str: ...
     async def pr_is_draft(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool: ...
     async def mark_pr_ready(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool: ...
     async def release_range(
         self,
@@ -349,6 +372,7 @@ class GitOpsPlugin(Protocol):
         head: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]: ...
     async def undelivered_release_range(
         self,
@@ -365,6 +389,7 @@ class GitOpsPlugin(Protocol):
         body: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None: ...
     async def merge_pr(
         self,
@@ -373,6 +398,7 @@ class GitOpsPlugin(Protocol):
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> bool: ...
     # То же, но с ПРИЧИНОЙ отказа (#1116, по ревью). Булевого ответа не
@@ -387,6 +413,7 @@ class GitOpsPlugin(Protocol):
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> tuple[bool, str]: ...
     async def delete_branch(

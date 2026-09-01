@@ -63,6 +63,7 @@ class _DiffGitOps(NoopGitOps):
         repo=None,
         gh_repo=None,
         base_branch=None,
+        forge: str = "",
     ):
         return 41
 

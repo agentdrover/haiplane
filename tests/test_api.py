@@ -3994,6 +3994,7 @@ class _RulesDiff(NoopGitOps):
         repo=None,
         gh_repo=None,
         base_branch=None,
+        forge: str = "",
     ):
         return 41
 
