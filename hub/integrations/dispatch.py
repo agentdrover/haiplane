@@ -131,16 +131,15 @@ class DispatchIntegration:
         branch: str = "",
         pr_number: int | None = None,
         breadcrumb: str = "",
+        pr_url: str = "",
     ) -> str:
-        from hub.config import REPO_NAME
-
+        # Готовый адрес приходит снаружи (#1119). Раньше он собирался здесь из
+        # литерала github.com и глобального REPO_NAME — то есть сборщик текста
+        # знал и хостинг, и репозиторий, и оба знал неверно для любого проекта
+        # кроме одного. Знает их вызывающий: у него есть задача и проект.
         diff_cmd = f"git diff main..{branch}" if branch else "git diff HEAD~1"
         branch_note = f"\nВетка разработчика: `{branch}`\n" if branch else ""
-        pr_note = (
-            f"PR: https://github.com/{REPO_NAME}/pull/{pr_number}\n"
-            if pr_number
-            else ""
-        )
+        pr_note = f"PR: {pr_url}\n" if pr_url else ""
         breadcrumb_note = f"Иерархия: {breadcrumb}\n" if breadcrumb else ""
         return (
             f"ЗАДАНИЕ: Code review задачи #{task_id}: {title}\n\n"
