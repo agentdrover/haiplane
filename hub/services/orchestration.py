@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-from hub import commit_scope, config
+from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
@@ -33,14 +33,61 @@ from hub.services.gate_events import (
     STEWARD_OVERRIDE_WINDOW_DAYS,
     sql_in,
 )
+from hub.integrations import forge as forge_urls
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
+    forge_of,
     rearm_clone,
     release_base_of,
 )
 
 log = logging.getLogger("hub")
+
+
+#: форж → (атрибут config, суффикс переменной окружения)
+_FORGE_CREDENTIALS: dict[str, tuple[str, str]] = {
+    "gitverse": ("GITVERSE_TOKEN", "GITVERSE_TOKEN"),
+}
+
+
+async def _forge_credential_refusal(forge: str, gh_repo: str) -> str:
+    """Причина, по которой форж не обслужит этот проект, или "" если обслужит.
+
+    Проверяются ОБА credential'а, и в порядке возрастания цены: сперва задан ли
+    токен вообще (чтение конфига), затем видит ли им API сам репозиторий (один
+    запрос). Deploy key проверяет уже клонирование — там отказ называет себя
+    отдельно (``no_deploy_key``, ``host_key_unpinned``).
+
+    Зачем API-проверка вообще, если репозиторий и так клонируется: git токен
+    НЕ ИСПОЛЬЗУЕТ. Репозиторий прекрасно клонируется по ключу и без токена,
+    провижининг отчитывается ok — а гейт потом не откроет PR и не прочтёт CI,
+    и выяснится это на первой же задаче, когда работа уже сделана.
+
+    Спрашивается адаптер ОБЪЯВЛЕННОГО форжа, а не сконфигурированный
+    ``plugins.forge``: последний сегодня всегда GitHub, и провижининг
+    GitVerse-проекта проверил бы доступ не туда — дефект #1118, зашедший с
+    другой стороны.
+
+    Спрашиваются ТОЛЬКО форжи из ``_FORGE_CREDENTIALS``, то есть сегодня один
+    GitVerse. Это не забывчивость: авторизация ``gh`` — предположение уровня
+    хоста, которое хаб делает в каждом гейтовом вызове, и сделать провижининг
+    единственным местом, которое её стережёт, значило бы поменять поведение
+    всех существующих проектов ради задачи, которая обязана его сохранить.
+    Появится у GitHub объявленный credential — строка в словаре включит и его.
+    """
+    setting = _FORGE_CREDENTIALS.get(forge)
+    if setting is None:
+        return ""
+    attribute, env_suffix = setting
+    if not str(getattr(config, attribute, "") or "").strip():
+        return (
+            f"{forge}_token_missing: {brand.ENV_PREFIX}{env_suffix} не задан — "
+            f"репозиторий можно склонировать по ключу, но гейт не откроет PR "
+            f"и не прочтёт CI"
+        )
+    ok, cause = await forge_urls.client_for(forge).repo_access(gh_repo=gh_repo)
+    return "" if ok else cause
 
 
 async def project_git_context(
@@ -1480,10 +1527,13 @@ async def provision_project(
     if row is None:
         return {"provision_status": "error", "provision_detail": "project not found"}
     project = dict(row)
+    forge = forge_of(project)
     if not (project.get("repo") or "").strip():
         ok, detail = False, "project has no repo configured"
     elif not (project.get("workspace_path") or "").strip():
         ok, detail = False, "project has no workspace_path configured"
+    elif refusal := await _forge_credential_refusal(forge, project["repo"].strip()):
+        ok, detail = False, refusal
     else:
         ok, detail = await plugins.git_ops.clone_repo(
             project["repo"].strip(),
@@ -1492,6 +1542,10 @@ async def provision_project(
             # stood here cloned calc-kids' master workspace with --branch
             # develop the moment the column was blank.
             base_branch_of(project),
+            # #1118: и тот же единственный читатель для площадки (#1114). Без
+            # него провижининг склеивал github-адрес из owner/name и молча
+            # клонировал GitVerse-проект с чужого хостинга.
+            forge=forge,
         )
         if ok:
             seed = workflow_seed.seed_project_workflows(
@@ -1502,6 +1556,7 @@ async def provision_project(
                 base_branch=base_branch_of(project),
                 release_branch=release_base_of(project),
                 ac_runner=ci_runner_of(project),
+                forge=forge,
             )
             detail = f"{detail}; workflows: {seed.detail}"
             # #887: clone_repo records only the base branch, and only for the

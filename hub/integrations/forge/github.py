@@ -529,6 +529,34 @@ class GitHubForge:
 
     # -- CI -----------------------------------------------------------------
 
+    async def repo_access(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[bool, str]:
+        """Видит ли ``gh`` этот репозиторий текущей авторизацией (#1118, AC-3).
+
+        Для GitHub credential один — авторизация ``gh``, — но вопрос тот же,
+        что у второго форжа: провижининг не должен отчитываться «ok» о
+        проекте, репозиторий которого хаб потом не сможет спросить ни о PR,
+        ни о прогонах.
+        """
+        rc, _out, err = await _gh(
+            "repo",
+            "view",
+            gh_repo or REPO_NAME,
+            "--json",
+            "name",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            return True, ""
+        low = (err or "").lower()
+        if "could not resolve to a repository" in low or "not found" in low:
+            return False, "github_repo_not_found_or_no_access"
+        if "authentication" in low or "gh auth login" in low or "401" in low:
+            return False, "github_not_authenticated"
+        return False, f"github_repo_unreadable: {(err or '').strip()[:120]}"
+
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None
     ) -> bool | None:

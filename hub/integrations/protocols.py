@@ -396,7 +396,11 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
     ) -> bool: ...
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str | None = None
+        self,
+        repo_url: str,
+        workspace_path: str,
+        base_branch: str | None = None,
+        forge: str = "github",
     ) -> tuple[bool, str]: ...
 
 
@@ -534,6 +538,9 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> dict[str, Any]: ...
+    async def repo_access(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[bool, str]: ...
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None
     ) -> bool | None: ...

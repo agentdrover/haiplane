@@ -3871,7 +3871,12 @@ async def test_provision_project_success_and_repeat(db: aiosqlite.Connection):
 
     result = await services.provision_project(db, pid, actor="denis")
     assert result["provision_status"] == "ok"
-    clone.assert_awaited_with("mrPDA/prov", "/srv/prov", "trunk")
+    # #1118: форж теперь ЕДЕТ ВНИЗ вместе с базовой веткой, и ожидание правлено
+    # именно потому, что поменялся вызов, а не поведение: для github-проекта
+    # адрес клона остаётся тем же до буквы. Именованный аргумент здесь и есть
+    # предмет проверки — без него провижининг снова склеивал бы github-адрес
+    # для любого форжа.
+    clone.assert_awaited_with("mrPDA/prov", "/srv/prov", "trunk", forge="github")
     row = await repo.get_project(db, pid)
     assert row["provision_status"] == "ok"
     # #476: the detail now carries the workflow-seeding sentence too. This

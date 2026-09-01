@@ -52,6 +52,38 @@ TEMPLATE_PACKAGE = "hub.workflow_templates"
 #: Where GitHub looks. Not configurable — it is GitHub's constant, not ours.
 WORKFLOWS_DIR = os.path.join(".github", "workflows")
 
+#: Каталог, в который хаб ПИШЕТ, по имени форжа (#1118).
+#:
+#: Измерено на mrpda/snip-portal 01–02.09.2026 по истории прогонов, без единого
+#: пуша. GitVerse берёт ``.gitverse/workflows/``, а ``.github/workflows/``
+#: читает ТОЛЬКО когда своего каталога нет — это ПОДМЕНА, а не объединение:
+#:
+#:   коммит d02d83c8: .gitverse/workflows НЕТ  → haiplane-ci.yml прогнался, зелёный
+#:   коммит af8aaac6: .gitverse/workflows есть → только ci.yaml, и так же далее
+#:
+#: Отсюда правило: сеять в РОДНОЙ каталог форжа. Запасной путь выключается
+#: чужим коммитом, который всего лишь добавил репозиторию собственный CI, — и
+#: выключается молча. Файл хаба не должен зависеть от того, чего в
+#: репозитории пока нет: это ровно тот же отказ «зелёное состояние при
+#: неработающем механизме», ради которого заведена #1118.
+#:
+#: Шаблон при этом ОДИН на оба форжа: синтаксис Actions раннер GitVerse
+#: понимает, и это тоже измерено, а не выведено (прогон 1442906, success).
+FORGE_WORKFLOWS_DIR: dict[str, str] = {
+    "github": WORKFLOWS_DIR,
+    "gitverse": os.path.join(".gitverse", "workflows"),
+}
+
+#: Каталоги, которые СКАНИРУЮТСЯ на чужой CI — все известные, независимо от
+#: форжа проекта. Вопрос «работает ли здесь уже что-нибудь» не про то, где
+#: пишем мы: у snip-portal свой CI лежал в ``.gitverse/workflows``, хаб туда не
+#: смотрел, увидел пустоту и посеял в репозиторий, у которого CI БЫЛ. Правило
+#: «писать только туда, где своего нет» проверялось не о том, что заявляло.
+SCANNED_WORKFLOW_DIRS: tuple[str, ...] = (
+    WORKFLOWS_DIR,
+    os.path.join(".gitverse", "workflows"),
+)
+
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 
 #: template file -> the name the hub owns in the target repository. The names
@@ -197,18 +229,28 @@ def render_all(
 
 
 def existing_workflows(workspace: str) -> list[str]:
-    """Workflow file names already present in the repository, sorted.
+    """Workflow paths already present in the repository, sorted.
 
     The question is "does anything run here", not "does OUR file exist": a
     repository with its own pipeline needs nothing from the hub, and the gate
     reads its outcome just as well.
+
+    #1118: сканируются ВСЕ известные каталоги, а не только гитхабовский, и
+    возвращается путь, а не имя. Имени было мало ровно для того случая, ради
+    которого функция и написана: ``ci.yaml`` в ``.gitverse/workflows`` и
+    ``ci.yml`` в ``.github/workflows`` — разные ответы на вопрос «чей это CI»,
+    а по одному имени они неразличимы.
     """
-    directory = os.path.join(workspace, WORKFLOWS_DIR)
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return []
-    return sorted(n for n in names if n.endswith(WORKFLOW_SUFFIXES))
+    found: list[str] = []
+    for relative in SCANNED_WORKFLOW_DIRS:
+        try:
+            names = os.listdir(os.path.join(workspace, relative))
+        except OSError:
+            continue
+        found.extend(
+            os.path.join(relative, n) for n in names if n.endswith(WORKFLOW_SUFFIXES)
+        )
+    return sorted(found)
 
 
 def _git(workspace: str, *args: str) -> tuple[int, str]:
@@ -247,6 +289,7 @@ def seed_project_workflows(
     release_branch: str,
     ac_runner: str = "",
     push: bool = True,
+    forge: str = "github",
 ) -> SeedResult:
     """Write, commit and push the hub's workflows into a project's clone.
 
@@ -269,6 +312,7 @@ def seed_project_workflows(
             release_branch=release_branch,
             ac_runner=ac_runner,
             push=push,
+            forge=forge,
         )
     except Exception as exc:  # noqa: BLE001 - provisioning must always answer
         log.warning("could not seed workflows into %s: %s", workspace, exc)
@@ -282,6 +326,7 @@ def _seed(
     release_branch: str,
     ac_runner: str,
     push: bool,
+    forge: str = "github",
 ) -> SeedResult:
     if not workspace or not os.path.isdir(os.path.join(workspace, ".git")):
         return SeedResult(UNAVAILABLE, "no git workspace to seed workflows into")
@@ -292,6 +337,7 @@ def _seed(
             PRESENT,
             "repository already carries workflows, none added: " + ", ".join(present),
         )
+    target_dir = FORGE_WORKFLOWS_DIR.get(forge, WORKFLOWS_DIR)
 
     base = (base_branch or "").strip()
     if not base:
@@ -320,7 +366,7 @@ def _seed(
             "workflows not seeded",
         )
 
-    directory = os.path.join(workspace, WORKFLOWS_DIR)
+    directory = os.path.join(workspace, target_dir)
     os.makedirs(directory, exist_ok=True)
     written: list[str] = []
     for name, content in sorted(files.items()):
@@ -328,7 +374,7 @@ def _seed(
             handle.write(content)
         written.append(name)
 
-    paths = [os.path.join(WORKFLOWS_DIR, name) for name in written]
+    paths = [os.path.join(target_dir, name) for name in written]
     rc, out = _git(workspace, "add", "--", *paths)
     if rc != 0:
         _discard(workspace, paths)
@@ -353,7 +399,7 @@ def _seed(
     if not push:
         return SeedResult(
             SEEDED,
-            f"committed locally on {base}: " + ", ".join(written),
+            f"committed locally on {base} in {target_dir}: " + ", ".join(written),
             tuple(written),
         )
 
@@ -373,7 +419,13 @@ def _seed(
         )
 
     log.info("seeded workflows into %s on %s: %s", workspace, base, ", ".join(written))
-    return SeedResult(SEEDED, f"added on {base}: " + ", ".join(written), tuple(written))
+    return SeedResult(
+        SEEDED,
+        # Каталог назван в детали намеренно: на GitVerse от него зависит,
+        # прогонится файл или тихо пролежит мёртвым (#1118).
+        f"added on {base} in {target_dir}: " + ", ".join(written),
+        tuple(written),
+    )
 
 
 def _discard(workspace: str, paths: list[str]) -> None:
