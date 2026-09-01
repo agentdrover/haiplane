@@ -57,32 +57,122 @@ _AUTOPILOT_EVENT_KINDS = (
 _DELEGATED_TO_MACHINE: frozenset[str] = frozenset({"auto", "steward"})
 
 
-def deterministic_sample(task_ids: list[int], digest_date: str) -> list[int]:
+# Порог совпадения по модулю 10 для обычной (базовой) выборки — ~10%. Число
+# само по себе ничего не значит, важно только его отношение к _OVERSAMPLE_
+# _THRESHOLD ниже: оба порога читают ОДИН и тот же остаток от ОДНОГО и того
+# же sha256(tid:date), только сравнивают его с разными границами. Это и
+# делает oversample «тем же хешем с другим порогом», а не вторым проходом.
+_BASE_THRESHOLD = 1
+
+# Порог для «применённого approve» — решения, которое уже изменило исход и
+# которого человек не видел (#1144). Втрое шире базового: такое решение
+# обязано попадать в спот-чек чаще среднего, но 3 из 10 — это всё ещё
+# выборка, а не «взять всё» (тот было бы 10 из 10, то есть 100%). Если это
+# число когда-нибудь дорастёт до _BASE_THRESHOLD * 10, oversample перестанет
+# быть надзором и станет отменой делегирования — граница нарочно далека от
+# этого края.
+_OVERSAMPLE_THRESHOLD = 3
+
+
+def deterministic_sample(
+    task_ids: list[int],
+    digest_date: str,
+    *,
+    oversample_ids: frozenset[int] | set[int] = frozenset(),
+) -> list[int]:
     """~10% of ``task_ids``, at least one, stable for (ids, date).
 
     Hash-based rather than random on purpose: the same day recomputed must
     name the same tasks, or the audit trail cannot be reasoned about.
+
+    ``oversample_ids`` names the subset that gets a wider window on the SAME
+    hash (#1144): an applied approve — a machine decision that already took
+    effect and that a person never saw — is the most expensive kind of
+    mistake to miss, so it is checked against ``_OVERSAMPLE_THRESHOLD``
+    (~30%) instead of ``_BASE_THRESHOLD`` (~10%). A task outside
+    ``oversample_ids`` (an escalation, a changes-requested verdict, ...)
+    still gets its 10% chance — the old bug was not "escalations should be
+    rare in the sample", it was "escalations never entered the sample at
+    all". Two categories, one pass, one hash: a second pass computing its
+    own picks would give the escalations a DIFFERENT 10% than the approvals
+    see, and the two sets would disagree about which day was audited.
     """
     if not task_ids:
         return []
+    universe = sorted(set(task_ids))
     picked = [
         tid
-        for tid in sorted(set(task_ids))
+        for tid in universe
         if int(hashlib.sha256(f"{tid}:{digest_date}".encode()).hexdigest(), 16) % 10
-        == 0
+        < (_OVERSAMPLE_THRESHOLD if tid in oversample_ids else _BASE_THRESHOLD)
     ]
     if not picked:
         # Minimum one: an audit sample of zero is no audit at all. The
         # choice stays deterministic — lowest hash wins.
         picked = [
             min(
-                set(task_ids),
+                universe,
                 key=lambda tid: hashlib.sha256(
                     f"{tid}:{digest_date}".encode()
                 ).hexdigest(),
             )
         ]
     return picked
+
+
+# Значение вердикта автопилота, при котором решение уже применилось и
+# пропустило задачу дальше — сравнивается со строкой из ReviewVerdict.value
+# (hub/models.py), не с вокабуляром стюарда: у автопилота "approved" (с "d"),
+# у стюарда "approve" — они пишутся в РАЗНЫЕ поля разными системами, и
+# смешение написаний ничего не сломало бы явно, а просто тихо перестало бы
+# ловить половину применённых approve.
+_POLICY_VERDICT_APPROVED = "approved"
+
+# Вердикт стюарда, который значит то же самое: решение применилось, а не
+# ушло эскалацией. STEWARD_VERDICTS (hub/models.py) — "approve" без "d".
+_STEWARD_VERDICT_APPROVE = "approve"
+
+
+def _audit_pool_and_oversample(
+    approvals: list[dict],
+    verdicts: list[dict],
+    escalations: list[dict],
+    steward: list[dict],
+) -> tuple[list[int], set[int]]:
+    """Кого спот-чек вообще может выбрать, и кого — выбрать охотнее (#1144).
+
+    Пул — это ВСЕ решения дня без разбора: одобрения DoR, вердикты ревью
+    (любые, не только approved), эскалации автопилота и ЛЮБОЕ суждение
+    стюарда, включая его собственные эскалации. До этой правки эскалации
+    (обеих систем) и суждения стюарда в пул не попадали вовсе — эскалация
+    трактовалась как «и так уйдёт человеку», а для стюарда эскалация — это
+    его ОТКАЗ судить, который сам нуждается в проверке не меньше approve.
+
+    Oversample — подмножество пула, у которого решение уже ПРИМЕНИЛОСЬ и
+    пропустило задачу дальше без участия человека: одобрения DoR (они по
+    определению применяются сразу), approved-вердикты автопилота и
+    approve-суждения стюарда. Именно эта категория — самая дорогая ошибка:
+    решение уже изменило исход. changes_requested и escalate туда не
+    входят — это как раз решения «на всякий случай / отказ судить», ошибка
+    в которых стоит дешевле (лишний цикл ревью или лишний взгляд человека),
+    а не дороже.
+    """
+    approval_ids = [a["task_id"] for a in approvals]
+    verdict_ids = [v["task_id"] for v in verdicts]
+    escalation_ids = [e["task_id"] for e in escalations]
+    steward_ids = [s["task_id"] for s in steward]
+    pool = approval_ids + verdict_ids + escalation_ids + steward_ids
+
+    oversample = set(approval_ids)
+    oversample.update(
+        v["task_id"]
+        for v in verdicts
+        if str(v["payload"].get("verdict") or "").lower() == _POLICY_VERDICT_APPROVED
+    )
+    oversample.update(
+        s["task_id"] for s in steward if s.get("verdict") == _STEWARD_VERDICT_APPROVE
+    )
+    return pool, oversample
 
 
 def _policy_delegates(gate_policy_raw: str | None) -> bool:
@@ -277,10 +367,10 @@ async def generate_due_digests(
             "WHERE project_id=? AND merged_at >= ? AND merged_at < ?",
             (project["id"], day_start, day_end),
         )
-        sample = deterministic_sample(
-            [a["task_id"] for a in approvals] + [v["task_id"] for v in verdicts],
-            day,
+        pool, oversample = _audit_pool_and_oversample(
+            approvals, verdicts, escalations, steward
         )
+        sample = deterministic_sample(pool, day, oversample_ids=oversample)
         # #878: the debt rides along with a digest that is being created for
         # other reasons. It does NOT cause one: this digest is per-project and
         # only exists on days with autopilot activity, while the debt is a
