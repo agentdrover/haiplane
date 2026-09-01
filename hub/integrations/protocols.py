@@ -92,6 +92,7 @@ class DispatchPlugin(Protocol):
         branch: str = "",
         pr_number: int | None = None,
         breadcrumb: str = "",
+        pr_url: str = "",
     ) -> str: ...
 
     def build_fix_message(
@@ -440,6 +441,13 @@ class ForgePlugin(Protocol):
     #: То есть форж не сообщает об успехе даже задним числом — вызывающий
     #: обязан знать заранее, что доказательство придётся искать в другом месте.
     can_merge_via_api: bool
+
+    # Адрес репозитория и адрес PR в вебе (#1119). Строит форж, потому что
+    # только он знает свой хост И свою форму пути. Форма — не мелочь:
+    # у GitHub это /pull/<n>, у GitVerse /pulls/<n>, во множественном числе
+    # (снято с живого html_url, а не угадано).
+    def repo_url(self, gh_repo: str | None = None) -> str: ...
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str: ...
 
     async def create_pr(
         self,
