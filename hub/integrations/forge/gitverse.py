@@ -708,7 +708,17 @@ class GitVerseForge:
             for r in mine
             if str(r.get("status") or "").strip().lower() in self._RUN_FAILURE
         ]
-        run = (failed_runs or mine)[0]
+
+        # ПОСЛЕДНИЙ по времени запуска, а не первый в списке. Один коммит даёт
+        # несколько прогонов сплошь и рядом — перезапуск, правка workflow,
+        # флейк, — и чинить надо по свежему логу: старый может относиться к
+        # уже исправленному шагу. Живой API отдаёт новые первыми, но опираться
+        # на это нельзя: порядок нигде не обещан, а цена ошибки — человек,
+        # который час чинит то, что уже починено.
+        def _started(entry: dict[str, Any]) -> str:
+            return str(entry.get("started") or "")
+
+        run = max(failed_runs or mine, key=_started)
         run_id = run.get("id")
         if run_id is None:
             return result

@@ -430,3 +430,85 @@ async def test_no_run_for_this_head_shows_nothing_rather_than_someone_elses(
     result = await _forge().ci_failure_logs(7, "task-1/x", gh_repo="own/rep")
 
     assert result == {"failed_checks": [], "log_summary": "", "run_url": ""}
+
+
+# ---------------------------------------------------------------------------
+# Один коммит — несколько прогонов: перезапуск, правка workflow, флейк
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param("newest_first", id="новее-первым-как-отдаёт-живой-API"),
+        pytest.param("oldest_first", id="старее-первым-если-порядок-изменится"),
+    ],
+)
+async def test_green_then_red_on_one_sha_is_red(patched_httpx, order):
+    """AC-1. Зелёный, а следом красный на ТОМ ЖЕ коммите — это красный.
+
+    Так бывает от перезапуска, правки workflow и флейка. Промах здесь самый
+    дорогой из возможных для CI-пробы: гейт откроет доставку по устаревшему
+    зелёному, и непроверенное уедет в базовую ветку.
+
+    Проверяется при ОБОИХ порядках списка. Живой API отдаёт новые первыми, но
+    ответ не имеет права зависеть от порядка: он про множество прогонов
+    коммита, а не про то, какой из них попался первым.
+    """
+    seen, responses = patched_httpx
+    green = {**_run(HEAD, "success"), "id": 1}
+    red = {**_run(HEAD, "failure"), "id": 2}
+    pair = [red, green] if order == "newest_first" else [green, red]
+    responses.extend([_pr(), _pr(), _runs(*pair)])
+
+    probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
+
+    assert probe.outcome is CIProbeOutcome.failed, (
+        "последующее падение на том же коммите отменяет прежний зелёный"
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param("newest_first", id="новее-первым"),
+        pytest.param("oldest_first", id="старее-первым"),
+    ],
+)
+async def test_failure_logs_take_the_latest_failed_run(patched_httpx, order):
+    """Логи — у ПОСЛЕДНЕГО падения коммита, а не у первого попавшегося.
+
+    Если коммит падал дважды, чинить надо по свежему логу: старый может
+    относиться к уже исправленному шагу. Порядок в ответе тоже не должен
+    решать — прогоны сравниваются по времени запуска.
+    """
+    seen, responses = patched_httpx
+    old_fail = {
+        **_run(HEAD, "failure"),
+        "id": 1,
+        "started": "2026-08-31T10:00:00Z",
+    }
+    new_fail = {
+        **_run(HEAD, "failure"),
+        "id": 2,
+        "started": "2026-08-31T12:00:00Z",
+    }
+    pair = [new_fail, old_fail] if order == "newest_first" else [old_fail, new_fail]
+    responses.extend(
+        [
+            _runs(*pair),
+            _pr(),
+            httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "jobs": [{"id": 9, "name": "Backend", "status": "failure"}],
+                },
+            ),
+            httpx.Response(200, text="след свежего падения"),
+        ]
+    )
+
+    result = await _forge().ci_failure_logs(7, "task-1/x", gh_repo="own/rep")
+
+    assert "actions/runs/2" in result["run_url"], "взят самый свежий упавший прогон"
