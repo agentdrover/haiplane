@@ -284,11 +284,7 @@ async def test_compare_cuts_subjects_by_commit_not_by_line(patched_httpx):
 
 
 async def test_absent_capabilities_answer_honestly():
-    """AC-4. Чего у форжа НЕТ и чего ЕЩЁ НЕТ — это разные ответы.
-
-    Черновиков у GitVerse нет вовсе, поэтому False здесь — факт о форже, а
-    не результат непроверенной догадки; запроса не делается, потому что
-    спрашивать нечего.
+    """AC-4. Чего ЕЩЁ НЕТ у нас — отвечается «спросить не удалось».
 
     Мерж и CI существуют, но их семантика принадлежит #1116 и #1117. До тех
     пор ответ — «спросить не удалось», и это важнее, чем кажется: ``absent``
@@ -296,9 +292,6 @@ async def test_absent_capabilities_answer_honestly():
     ``mergeable`` пустил бы её вслепую.
     """
     forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
-
-    assert await forge.pr_is_draft(1) is False
-    assert await forge.mark_pr_ready(1) is False
 
     outcome, detail = await forge.pr_mergeability(1)
     assert outcome is MergeabilityOutcome.unavailable
@@ -357,3 +350,107 @@ async def test_live_contract_against_real_repo():
     )
 
     assert await forge.has_workflows(gh_repo=_LIVE_REPO) in (True, False, None)
+
+
+# ---------------------------------------------------------------------------
+# Черновики: у GitVerse они ЕСТЬ, и снимаются только через заголовок
+# ---------------------------------------------------------------------------
+
+
+async def test_draft_is_read_from_the_pull_request(patched_httpx, monkeypatch):
+    """Черновик читается полем is_draft, а не объявляется отсутствующим.
+
+    Первая редакция этого адаптера отвечала жёстким False с обоснованием
+    «черновиков у форжа нет». Документация говорит обратное: есть чекбокс
+    «Черновик», префикс Draft: в заголовке и поле is_draft в ответе — а
+    ВЛИТЬ черновик нельзя. То есть жёсткий False воспроизводил бы #1053:
+    гейт пошёл бы мержить черновик и получил бы отказ без диагноза.
+    """
+    seen, responses = patched_httpx
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+
+    responses.append(httpx.Response(200, json={"is_draft": True}))
+    assert await forge.pr_is_draft(1, gh_repo="own/rep") is True
+
+    responses.append(httpx.Response(200, json={"is_draft": False}))
+    assert await forge.pr_is_draft(1, gh_repo="own/rep") is False
+
+    # Не посмотрели — не обвиняем (#498): мерж всё равно попробуют.
+    responses.extend([httpx.Response(500)] * 3)
+    assert await forge.pr_is_draft(1, gh_repo="own/rep") is False
+
+
+async def test_ready_strips_the_draft_prefix_and_verifies(patched_httpx):
+    """Готовность подтверждается повторным чтением, а не кодом PATCH.
+
+    Снятие отметки — побочный эффект правки заголовка, и утверждать, что он
+    случился, можно только увидев его.
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend(
+        [
+            httpx.Response(200, json={"is_draft": True, "title": "Draft: форж"}),
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"is_draft": False, "title": "форж"}),
+        ]
+    )
+
+    assert await forge.mark_pr_ready(1, gh_repo="own/rep") is True
+    patched = [r for r in seen if r.method == "PATCH"]
+    assert len(patched) == 1
+    assert b'"title":"\xd1\x84\xd0\xbe\xd1\x80\xd0\xb6"' in patched[0].content.replace(
+        b" ", b""
+    )
+
+
+async def test_checkbox_draft_is_refused_not_faked(patched_httpx):
+    """Черновик без префикса в заголовке API снять НЕ может — и говорит это.
+
+    Ложное True здесь дороже отказа: гейт пошёл бы мержить черновик и
+    получил бы отказ без диагноза — ровно то, что чинил #1053.
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.append(
+        httpx.Response(200, json={"is_draft": True, "title": "Форж без префикса"})
+    )
+
+    assert await forge.mark_pr_ready(1, gh_repo="own/rep") is False
+    assert not [r for r in seen if r.method == "PATCH"], (
+        "нечего править — и запрос не отправляется"
+    )
+
+
+async def test_ready_pr_needs_no_conversion(patched_httpx):
+    """Не черновик — переводить нечего, и лишних запросов не делается."""
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.append(httpx.Response(200, json={"is_draft": False, "title": "форж"}))
+
+    assert await forge.mark_pr_ready(1, gh_repo="own/rep") is True
+    assert len(seen) == 1
+
+
+async def test_ready_is_not_claimed_when_the_flag_survives(patched_httpx):
+    """PATCH прошёл, а отметка осталась — это НЕ готовность.
+
+    Тест написан после мутационной проверки: счастливый путь один не
+    отличает «проверили результат» от «предположили его», потому что там
+    повторное чтение всё равно вернуло бы то, что нужно. Здесь форж
+    принимает правку заголовка, но черновиком быть не перестаёт — и метод
+    обязан ответить False. Иначе гейт пойдёт мержить черновик, а отказ
+    придёт тем же булевым, что конфликт и отозванный токен (#1053).
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend(
+        [
+            httpx.Response(200, json={"is_draft": True, "title": "Draft: форж"}),
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"is_draft": True, "title": "форж"}),
+        ]
+    )
+
+    assert await forge.mark_pr_ready(1, gh_repo="own/rep") is False

@@ -11,6 +11,9 @@ CLI вроде ``gh`` у GitVerse нет — единственный вход �
 2. Токен нужен и для ПУБЛИЧНЫХ репозиториев: анонимного режима нет (401).
 3. Мержа в публичном API нет вовсе. Есть только ``GET .../merge`` со
    смыслом «влит ли уже» (204 да / 404 нет). Сам мерж — задача #1116.
+4. Черновики У ФОРЖА ЕСТЬ, и снять черновик через API можно только косвенно
+   — сняв префикс ``Draft:`` с заголовка. Поле ``is_draft`` на запись
+   недоступно. Подробности у ``mark_pr_ready``.
 
 Проверено живыми запросами 31.08.2026 против настоящего репозитория.
 Документация: https://gitverse.ru/docs/developers/public-api
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -328,19 +332,81 @@ class GitVerseForge:
     async def pr_is_draft(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> bool:
-        """Черновиков у GitVerse нет — и это НЕ то же, что «проверили и нет».
+        """Считает ли GitVerse этот PR черновиком (поле ``is_draft``).
 
-        Ответ False здесь честный, потому что у форжа нет самого понятия
-        черновика; правило #498 («молчание — не обвинение») соблюдено без
-        запроса, который всё равно нечего было бы спросить.
+        Черновики у GitVerse ЕСТЬ, и это важно ровно по той причине, по
+        которой важно было на GitHub (#1053): влить черновик нельзя, а отказ
+        мержа приходит тем же самым булевым, что и конфликт или отозванный
+        токен — и отправляет задачу в needs_decision с неверным диагнозом.
+
+        False при неудачном запросе — правило #498: молчание не обвинение, и
+        попытка мержа всё равно состоится. Отличать «не черновик» от «не
+        посмотрели» здесь незачем: оба ведут к одному действию.
         """
-        return False
+        resp = await self._pr(pr_number, gh_repo)
+        if not resp.ok or not isinstance(resp.data, dict):
+            log.info(
+                "PR #%d draft probe unavailable: %s",
+                pr_number,
+                resp.reason or resp.status,
+            )
+            return False
+        return bool(resp.data.get("is_draft"))
 
     async def mark_pr_ready(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> bool:
-        """Нечего переводить в готовые: черновиков у форжа нет."""
-        return False
+        """Снять с PR статус черновика. Одобрение хабом и есть сигнал (#1053).
+
+        Прямого способа нет: ``is_draft`` на запись недоступен, PATCH
+        принимает только title, body, state, base и maintainer_can_modify.
+        Документированный обходной путь один — снять префикс ``Draft:`` с
+        заголовка, после чего форж снимает отметку сам.
+
+        Отсюда случай, в котором API бессилен: черновик, выставленный
+        ЧЕКБОКСОМ, а не префиксом. Тогда заголовок править нечего, и метод
+        отвечает False с названной причиной — а не True, потому что «мы
+        что-то отправили». Ложное True здесь дороже отказа: гейт пошёл бы
+        мержить черновик и получил бы отказ без диагноза.
+
+        Результат сверяется повторным чтением, а не выводится из кода PATCH:
+        снятие отметки — побочный эффект правки заголовка, и утверждать, что
+        он случился, можно только увидев его.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return False
+        resp = await self._pr(pr_number, gh_repo)
+        if not resp.ok or not isinstance(resp.data, dict):
+            return False
+        if not resp.data.get("is_draft"):
+            return True  # уже готов — переводить нечего
+
+        title = str(resp.data.get("title") or "")
+        stripped = re.sub(r"^\s*draft:\s*", "", title, count=1, flags=re.IGNORECASE)
+        if stripped == title or not stripped:
+            log.warning(
+                "PR #%d: черновик выставлен не префиксом заголовка — "
+                "снять его через API нельзя, нужен человек в вебе",
+                pr_number,
+            )
+            return False
+
+        patch = await self._request(
+            "PATCH", f"/repos/{slug}/pulls/{pr_number}", json_body={"title": stripped}
+        )
+        if not patch.ok:
+            log.warning(
+                "PR #%d: заголовок не удалось поправить: %s",
+                pr_number,
+                patch.reason or patch.status,
+            )
+            return False
+
+        again = await self._pr(pr_number, gh_repo)
+        if not again.ok or not isinstance(again.data, dict):
+            return False
+        return not again.data.get("is_draft")
 
     async def pr_head_sha(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
