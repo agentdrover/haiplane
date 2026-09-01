@@ -422,6 +422,18 @@ def _slugify(title: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
+#: Префикс детали, по которому вызывающий узнаёт: слить УДАЛОСЬ, а
+#: подтвердить — нет. Это состояние лечится повтором, а не человеком.
+MERGE_UNCONFIRMED = "merge_unconfirmed"
+
+
+def _scratch_worktree(workspace: str, kind: str, pr_number: int) -> str:
+    """Путь одноразового рабочего дерева, уникальный по КЛОНУ и номеру PR."""
+    parent = os.path.dirname(workspace.rstrip("/")) or "/"
+    clone = os.path.basename(workspace.rstrip("/")) or "repo"
+    return os.path.join(parent, f".hub-{kind}-{clone}-{pr_number}")
+
+
 def canonical_task_branch(task_id: int, branch_slug: str, title: str = "") -> str:
     """The one place a task's branch name is assembled (#884).
 
@@ -2163,10 +2175,7 @@ class GitOpsIntegration:
                 MergeabilityOutcome.unavailable,
                 f"не удалось получить ветки из origin: {err[:150]}",
             )
-        path = os.path.join(
-            os.path.dirname(workspace.rstrip("/")) or "/",
-            f".hub-trial-{pr_number}",
-        )
+        path = _scratch_worktree(workspace, "trial", pr_number)
         await _git("worktree", "remove", "--force", path, repo=workspace, check=False)
         rc, _, err = await _git(
             "worktree",
@@ -2199,6 +2208,15 @@ class GitOpsIntegration:
             )
         if rc == 0:
             return (MergeabilityOutcome.mergeable, "пробное слияние прошло")
+        if rc == _TIMEOUT_RC or rc >= 128:
+            # Таймаут и падение самого git — это «спросить не удалось», а не
+            # конфликт: первое лечится повтором, второе руками человека.
+            # Схлопывать их в conflicting значит поднимать ложную тревогу
+            # ровно того рода, который разбирал #970.
+            return (
+                MergeabilityOutcome.unavailable,
+                f"пробное слияние не состоялось (git rc={rc})",
+            )
         files = await self._conflicting_files(head, base, repo=workspace)
         named = f": {', '.join(files)}" if files else ""
         return (
@@ -2469,23 +2487,50 @@ class GitOpsIntegration:
         True so the task path is untouched; the release path passes False,
         because a release must not remove the branch work lands on.
         """
+        ok, _detail = await self.merge_pr_with_detail(
+            pr_number,
+            task_id,
+            title,
+            repo=repo,
+            gh_repo=gh_repo,
+            delete_branch=delete_branch,
+        )
+        return ok
+
+    async def merge_pr_with_detail(
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        delete_branch: bool = True,
+    ) -> tuple[bool, str]:
+        """Слить PR и НАЗВАТЬ причину, если не вышло (#1116, по ревью).
+
+        Пустая деталь при неудаче означает «форж отказал и причины не дал» —
+        путь GitHub, где её и раньше не было. Непустая приходит с пути
+        мержа пушем, и вызывающий обязан её различать: «не смогли слить» и
+        «слили, но не подтвердили» ведут к противоположным действиям.
+        """
         ctype = _conv_commit_type(title)
         slug = _slugify(title, max_len=60)
         subject = f"{ctype}(task): {slug} (#{task_id})"
         if self.forge.can_merge_via_api:
-            return await self.forge.merge_pr(
+            ok = await self.forge.merge_pr(
                 pr_number,
                 subject,
                 delete_branch=delete_branch,
                 repo=repo,
                 gh_repo=gh_repo,
             )
+            return (ok, "")
         ok, detail = await self.merge_pr_by_push(
             pr_number, subject, repo=repo, gh_repo=gh_repo
         )
         if not ok:
             log.error("merge by push failed for PR #%d: %s", pr_number, detail)
-        return ok
+        return (ok, detail)
 
     async def merge_pr_by_push(
         self,
@@ -2535,10 +2580,10 @@ class GitOpsIntegration:
         if rc != 0:
             return (False, f"не удалось получить ветки из origin: {err[:150]}")
 
-        path = os.path.join(
-            os.path.dirname(workspace.rstrip("/")) or "/",
-            f".hub-merge-{pr_number}",
-        )
+        # Имя включает клон, а не только номер PR: два проекта на одном
+        # форже легко имеют PR №1 каждый, и общий путь свёл бы их мержи в
+        # одно дерево.
+        path = _scratch_worktree(workspace, "merge", pr_number)
         await _git("worktree", "remove", "--force", path, repo=workspace, check=False)
         rc, _, err = await _git(
             "worktree",
@@ -2583,7 +2628,17 @@ class GitOpsIntegration:
             if rc != 0:
                 detail = (err or "").strip()
                 low = detail.lower()
-                if "protected" in low or "denied" in low or "pre-receive" in low:
+                # Отказ ДОСТУПА проверяется первым и отдельно: «Permission
+                # denied (publickey)» содержит слово denied и попадал в ветку
+                # про защиту базы — то есть отказ называл причину, которой
+                # нет, и человек шёл снимать защиту вместо починки ключа.
+                if "publickey" in low or "authentication failed" in low:
+                    return (
+                        False,
+                        f"push в {base} отвергнут по доступу — ключ или токен: "
+                        f"{detail[:150]}",
+                    )
+                if "protected" in low or "pre-receive" in low or "denied" in low:
                     return (
                         False,
                         f"базовая ветка {base} закрыта от прямого push — "
@@ -2599,10 +2654,13 @@ class GitOpsIntegration:
             base, merged_sha, repo=repo, gh_repo=gh_repo
         )
         if landed is None:
+            # Машинная метка, а не только слова: вызывающий классифицирует по
+            # префиксу, и без него «спросите снова» читалось человеком, но не
+            # гейтом — и работа уходила в needs_decision уже лёжа в базе.
             return (
                 False,
-                f"push прошёл, но подтвердить попадание {merged_sha[:12]} в {base} "
-                "не удалось — спросите снова, это не отказ",
+                f"{MERGE_UNCONFIRMED}: push прошёл, но подтвердить попадание "
+                f"{merged_sha[:12]} в {base} не удалось — спросите снова",
             )
         if not landed:
             return (

@@ -161,7 +161,17 @@ async def test_unconfirmed_is_not_the_same_as_not_delivered(repo_pair):
     )
 
     assert ok is False
-    assert "это не отказ" in detail
+    # Метка МАШИННАЯ, а не только словесная: по ней гейт классифицирует
+    # состояние как временное. Без префикса «спросите снова» читал человек,
+    # а гейт читал обычный отказ и уводил в needs_decision работу, которая
+    # уже лежит в базовой ветке.
+    from hub.integrations.git_ops import MERGE_UNCONFIRMED
+    from hub.services.orchestration import TRANSIENT_GATE_PREFIXES
+
+    assert detail.startswith(MERGE_UNCONFIRMED)
+    assert detail.startswith(TRANSIENT_GATE_PREFIXES), (
+        "неподтверждённый мерж обязан читаться гейтом как временное состояние"
+    )
 
 
 async def test_protected_base_names_the_cause(repo_pair):
@@ -300,3 +310,83 @@ async def test_closed_pr_is_never_read_as_delivered(repo_pair):
     assert ok
     forge.pr_state.assert_not_awaited()
     forge._pr_merged.assert_not_awaited()
+
+
+async def test_close_failure_does_not_undo_a_landed_delivery(repo_pair):
+    """Работа в базе, а PR не закрылся — доставка ВСЁ РАВНО состоялась.
+
+    Порядок ценностей здесь такой: незакрытый PR — грязь, которую видно и
+    можно убрать руками; объявленная недоставленной работа, уже лежащая в
+    базовой ветке, — потерянная задача и лишнее решение человека. Поэтому
+    неудача закрытия логируется, но исхода не меняет.
+    """
+    bare, work = repo_pair
+    forge = _forge(closed=False)
+
+    ok, detail = await GitOpsIntegration(forge=forge).merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok is True, detail
+    forge.close_pr.assert_awaited_once()
+
+
+async def test_scratch_worktrees_do_not_collide_between_clones(tmp_path):
+    """Два клона с PR №1 у каждого не делят одно временное дерево.
+
+    Путь строился из каталога-родителя и номера PR — а номера у разных
+    проектов совпадают сплошь и рядом.
+    """
+    from hub.integrations.git_ops import _scratch_worktree
+
+    first = _scratch_worktree("/srv/ws/alpha", "merge", 1)
+    second = _scratch_worktree("/srv/ws/beta", "merge", 1)
+
+    assert first != second
+    assert "alpha" in first and "beta" in second
+
+
+async def test_access_denial_is_not_reported_as_a_protected_branch(repo_pair):
+    """«Permission denied (publickey)» — это ключ, а не защита ветки.
+
+    Слово denied есть в обоих сообщениях, и классификация по нему отправляла
+    человека снимать защиту там, где надо чинить доступ. AC-4 требует НАЗВАТЬ
+    причину — назвать неверную хуже, чем не назвать никакой.
+    """
+    bare, work = repo_pair
+    hook = bare / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'Permission denied (publickey)' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    ok, detail = await GitOpsIntegration(forge=_forge()).merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok is False
+    assert "по доступу" in detail
+    assert "закрыта от прямого push" not in detail
+
+
+async def test_trial_merge_failure_is_not_a_conflict(repo_pair, monkeypatch):
+    """Упавший git при пробе — unavailable, а не conflicting (#970).
+
+    Таймаут и падение самого git лечатся повтором, конфликт — руками
+    человека. Схлопнуть их значит поднять ложную тревогу.
+    """
+    from hub.integrations import git_ops as git_ops_mod
+
+    bare, work = repo_pair
+    ops = GitOpsIntegration(forge=_forge())
+    real_git = git_ops_mod._git
+
+    async def flaky(*args, **kw):
+        if args and args[0] == "merge":
+            return (128, "", "fatal: git упал")
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", flaky)
+    outcome, detail = await ops.check_pr_mergeable(7, repo=str(work))
+
+    assert outcome is MergeabilityOutcome.unavailable
+    assert outcome is not MergeabilityOutcome.conflicting
+    assert "rc=128" in detail

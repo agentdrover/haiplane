@@ -375,6 +375,20 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         delete_branch: bool = True,
     ) -> bool: ...
+    # То же, но с ПРИЧИНОЙ отказа (#1116, по ревью). Булевого ответа не
+    # хватает: «слить не смогли» и «слили, но подтвердить не удалось» ведут к
+    # противоположным действиям — первое к человеку, второе к повтору через
+    # цикл. Схлопнутые в один False, они уводили доставленную работу в
+    # needs_decision, оставляя PR открытым и реестр пустым.
+    async def merge_pr_with_detail(
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        delete_branch: bool = True,
+    ) -> tuple[bool, str]: ...
     async def delete_branch(
         self,
         branch: str,

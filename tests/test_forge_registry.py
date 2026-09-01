@@ -95,6 +95,9 @@ async def test_hub_starts_with_noop_forge():
         "run_url": "",
     }
     assert await forge.has_workflows() is None
+    # #1116: новые операции обязаны отвечать так же честно.
+    assert await forge.close_pr(1) is False
+    assert await forge.branch_contains("develop", "abc") is None
     assert await forge.compare_subjects("develop", "main") == []
     assert (await forge.merge_branches("develop", "main", "msg"))[0] == "unavailable"
 
