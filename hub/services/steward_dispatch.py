@@ -70,14 +70,37 @@ EVENT_CLOSED = "steward_run_closed"
 _MODES = {"off", "shadow", "act"}
 
 
-def steward_mode() -> str:
-    """The global switch, read strictly (#835's rule for typos).
+def configured_mode() -> str:
+    """The raw value the environment carries, validated but not capped.
 
-    An unknown value is ``off``: a mistyped drop-in must never be the thing
-    that switches a contour on.
+    ONE caller by design: steward_shadow.effective_mode, which is where act
+    is granted or refused. Everyone else reads requested_mode and therefore
+    cannot act on autonomy nobody measured.
     """
     mode = (config.STEWARD_MODE or "off").strip().lower()
     return mode if mode in _MODES else "off"
+
+
+def requested_mode() -> str:
+    """What the environment ASKS for, capped at shadow (#1107 review).
+
+    An unknown value is ``off``: a mistyped drop-in must never be the thing
+    that switches a contour on (#835).
+
+    And ``act`` is never returned here. Autonomy is not a configuration
+    value — it is a permission the measurement grants, and granting it needs
+    the database (steward_shadow.effective_mode). Capping the synchronous
+    reader is what makes forgetting that function harmless: a consumer that
+    asks here gets shadow, which is today's behaviour, rather than autonomy
+    nobody checked.
+    """
+    mode = configured_mode()
+    return "shadow" if mode == "act" else mode
+
+
+def steward_mode() -> str:
+    """Backwards-compatible alias of :func:`requested_mode`."""
+    return requested_mode()
 
 
 def dispatcher_enabled() -> bool:

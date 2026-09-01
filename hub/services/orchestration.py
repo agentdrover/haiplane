@@ -504,6 +504,36 @@ async def record_category_check(
     return {"category": category, "check_ref": check_ref, "covered": True}
 
 
+async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
+    """The 2x2 table and the act thresholds, for the practice metrics (#1107).
+
+    Read-only and total rather than windowed: the exit criteria are about the
+    whole shadow phase, and a 90-day window would quietly reset the sample
+    the decision rests on.
+    """
+    from hub.services.steward_shadow import act_refusals, shadow_table
+
+    table = await shadow_table(db)
+    refusals = await act_refusals(db)
+    return {
+        "both_approve": table.both_approve,
+        "steward_approve_human_changes": table.steward_approve_human_changes,
+        "steward_changes_human_approve": table.steward_changes_human_approve,
+        "both_changes": table.both_changes,
+        "escalated": table.escalated,
+        "unpaired": table.unpaired,
+        "false_approve": table.false_approve,
+        "human_changes": table.human_changes,
+        # None means "not measured", never 0.0 — the same distinction the
+        # packet draws between absent and negative (#762).
+        "escalation_share": table.escalation_share,
+        "act_refusals": [
+            {"reason": code, "detail": detail} for code, detail in refusals
+        ],
+        "act_ready": not refusals,
+    }
+
+
 async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = 90
 ) -> dict[str, Any]:
@@ -792,6 +822,7 @@ async def practice_metrics(
 
     model_declarations = await _model_declaration_metrics(db, since)
     human_gates = await _human_gate_metrics(db, since)
+    steward_shadow_metrics = await _steward_shadow_metrics(db)
     human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
@@ -809,6 +840,12 @@ async def practice_metrics(
         "escaped_defects": escaped,
         "model_declarations": model_declarations,
         "human_gates": human_gates,
+        # #1107: the shadow table lives BESIDE the other practice numbers,
+        # not in a corner of its own. The question it answers — would the
+        # steward have agreed, and where would it have been wrong — belongs
+        # next to override-rate and review outcomes, because that is where
+        # the owner already looks when deciding what to automate.
+        "steward_shadow": steward_shadow_metrics,
         "human_touches": human_touches,
         "review_outcomes": review_outcomes,
     }
