@@ -1628,6 +1628,38 @@ async def web_tasks(
     )
 
 
+async def _steward_recommendation(
+    db, task_id: int, task: dict[str, Any]
+) -> dict[str, Any] | None:
+    """What the steward said about THIS submission, for the card (#1106).
+
+    A recommendation, not a decision — shown next to the verdict buttons
+    because that is where the human decides. Only the current generation: a
+    judgement about code that has since been resubmitted describes other
+    code (#1074).
+
+    Lives outside the page builder on purpose: that function is at its
+    complexity ceiling, and a card block is a thing with its own rule, not
+    four more lines of one long assembly.
+    """
+    generation = int(task.get("submission_generation") or 0)
+    if not generation:
+        return None
+    judged = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+    if judged is None:
+        return None
+    out = dict(judged)
+    # Grounds are stored as a JSON string, and an empty list is "[]" — which
+    # a template reads as truthy. Parsed here so "no grounds" and "grounds,
+    # here they are" look different to the human at the gate.
+    try:
+        parsed = json.loads(out.get("grounds") or "[]")
+    except (TypeError, ValueError):
+        parsed = []
+    out["grounds"] = parsed if isinstance(parsed, list) else []
+    return out
+
+
 async def _web_task_detail_page(
     request: Request,
     task_id: int,
@@ -1674,6 +1706,8 @@ async def _web_task_detail_page(
 
     evidence = await gate_evidence(db, dict(row))
     review_in_flight = await inflight_view(db, dict(row))
+
+    steward_judgement = await _steward_recommendation(db, task_id, dict(row))
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -1805,6 +1839,7 @@ async def _web_task_detail_page(
             "review_in_flight": review_in_flight,
             "change_map": change_map,
             "machine_review": machine_review,
+            "steward_judgement": steward_judgement,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,
