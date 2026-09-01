@@ -18,7 +18,10 @@ from hub.integrations.forge.gitverse import GitVerseForge
 from hub.integrations.protocols import CIProbeOutcome
 
 TOKEN = "test-token-not-a-real-secret"
-HEAD = "af8aaac66ee246c5c2f4de9832a5911f056bda84"
+# НЕ настоящий sha и намеренно не hex: сорок шестнадцатеричных знаков
+# сканер секретов читает как «строку с высокой энтропией» и красит CI.
+# Тестам форма коммита безразлична — они сравнивают строки на равенство.
+HEAD = "head-commit-of-the-pull-request"
 
 
 @pytest.fixture
@@ -299,6 +302,7 @@ async def test_failure_logs_are_not_truncated_by_the_transport(patched_httpx):
     responses.extend(
         [
             _runs(_run(HEAD, "failure")),
+            _pr(),  # голова PR: логи берутся у ЕЁ прогона, а не у первого
             httpx.Response(
                 200,
                 json={
@@ -352,3 +356,77 @@ def test_full_ref_is_shortened():
     assert GitVerseForge._short_ref("refs/heads/main") == "main"
     assert GitVerseForge._short_ref("refs/heads/task-1/x") == "task-1/x"
     assert GitVerseForge._short_ref("main") == "main"
+
+
+async def test_workflow_presence_asks_the_api_not_a_directory(patched_httpx):
+    """AC-4. «Есть ли тут CI» спрашивается у API, а не у каталога.
+
+    Соблазн посмотреть содержимое .github/workflows велик и отвечает неверно:
+    раннер GitVerse обрабатывает ОБА каталога — и .gitverse/workflows/, и
+    .github/workflows/, — так что репозиторий со своим CI в первом из них был
+    бы объявлен «без CI», а доставка поехала бы мимо проверок.
+
+    Проверяется по тому, КУДА ушёл запрос, а не по совпадению ответа.
+    """
+    seen, responses = patched_httpx
+    responses.append(
+        httpx.Response(
+            200,
+            json={
+                "total_count": 1,
+                "workflows": [{"name": "CI", "path": ".gitverse/workflows/ci.yaml"}],
+            },
+        )
+    )
+
+    assert await _forge().has_workflows(gh_repo="own/rep") is True
+
+    assert len(seen) == 1
+    assert seen[0].url.path == "/repos/own/rep/actions/workflows"
+    assert "contents" not in str(seen[0].url), "содержимое каталога не спрашивается"
+
+
+async def test_failure_logs_belong_to_the_head_of_this_pr(patched_httpx):
+    """Логи берутся у прогона ГОЛОВЫ PR, а не у первого в ветке.
+
+    На ветке с историей первым лежит самый свежий прогон — возможно, чужого
+    коммита. Показать его логи значит отправить человека чинить чужое
+    падение, и он это заметит не сразу.
+    """
+    seen, responses = patched_httpx
+    other, mine = "commit-of-somebody-else", HEAD
+    responses.extend(
+        [
+            _runs(
+                {**_run(other, "failure"), "id": 111},
+                {**_run(mine, "failure"), "id": 222},
+            ),
+            _pr(),  # pr_head_sha
+            httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "jobs": [{"id": 9, "name": "Backend", "status": "failure"}],
+                },
+            ),
+            httpx.Response(200, text="след падения нашего коммита"),
+        ]
+    )
+
+    result = await _forge().ci_failure_logs(7, "task-1/x", gh_repo="own/rep")
+
+    assert "actions/runs/222" in result["run_url"], "взят прогон нашей головы"
+    assert "111" not in result["run_url"]
+    assert "след падения нашего коммита" in result["log_summary"]
+
+
+async def test_no_run_for_this_head_shows_nothing_rather_than_someone_elses(
+    patched_httpx,
+):
+    """Прогона на нашу голову нет — показываем пустоту, а не чужой лог."""
+    seen, responses = patched_httpx
+    responses.extend([_runs(_run("commit-of-somebody-else", "failure")), _pr()])
+
+    result = await _forge().ci_failure_logs(7, "task-1/x", gh_repo="own/rep")
+
+    assert result == {"failed_checks": [], "log_summary": "", "run_url": ""}

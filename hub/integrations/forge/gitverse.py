@@ -688,10 +688,27 @@ class GitVerseForge:
         slug = self._repo(gh_repo)
         if not slug:
             return result
-        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=5)
+        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=20)
         if not runs:
             return result
-        run = runs[0]
+
+        # Прогон ГОЛОВЫ этого PR, а не первый в списке ветки. На ветке с
+        # историей первым лежит самый свежий прогон — возможно, чужого
+        # коммита, — и человек чинил бы по логам чужого падения. Порядок в
+        # списке отвечает на «когда запустили», а вопрос здесь — «что упало
+        # у ЭТОГО коммита».
+        head_sha = await self.pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        mine = [r for r in runs if str(r.get("commit_sha") or "") == head_sha]
+        if not mine:
+            # Головы не знаем или прогонов на неё нет: показать чужой лог
+            # хуже, чем не показать никакого — он уведёт чинить не то.
+            return result
+        failed_runs = [
+            r
+            for r in mine
+            if str(r.get("status") or "").strip().lower() in self._RUN_FAILURE
+        ]
+        run = (failed_runs or mine)[0]
         run_id = run.get("id")
         if run_id is None:
             return result
