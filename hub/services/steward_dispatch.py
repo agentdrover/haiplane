@@ -12,7 +12,7 @@ judge that can start itself decides WHEN it judges, and the packet it reads
 is a hub-only verb: the steward principal has two operations (#1021), and
 neither of them is this one.
 
-Four guards stand between a submission and an order, and each of them fails
+Five guards stand between a submission and an order, and each of them fails
 toward today's human route rather than toward a run:
 
 ``STEWARD_MODE``
@@ -26,7 +26,13 @@ daily cap
     feed and the human route, never "checked and clean";
 deadline
     ``review:client`` is a human-owned slot with no deadline of its own, so a
-    hung run would sit there looking ordered forever. The slot has one.
+    hung run would sit there looking ordered forever. The slot has one;
+nothing new (#1150)
+    a resubmission that did not touch the places the previous generation's
+    findings named buys no run at all. No new information, no new opinion —
+    and unlike the other four, this one is about MONEY as much as order: the
+    refusal costs nothing where the run costs 1.5-2.7M provider tokens for
+    an answer already known.
 
 What this module does NOT do is start the cloud agent. Ordering a run and
 executing it are different jobs with different failure modes, and the second
@@ -62,6 +68,7 @@ REFUSED_MODE_OFF = "steward_off"
 REFUSED_DAILY_CAP = "daily_cap"
 REFUSED_ALREADY_ORDERED = "already_ordered"
 REFUSED_NO_GENERATION = "no_generation"
+REFUSED_NO_NEW_INFORMATION = "no_new_information"
 
 EVENT_ORDERED = "steward_run_ordered"
 EVENT_REFUSED = "steward_run_refused"
@@ -285,6 +292,77 @@ def _policy_wants_steward(project_row: Any | None) -> bool:
     return isinstance(policy, dict) and policy.get("verdict") == "steward"
 
 
+async def _nothing_new_since(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Почему пересдача не несёт новой информации, или "" если несёт.
+
+    Правило: нет новой информации — нет нового мнения. Агент, запущенный
+    на пересдаче, где места находок не тронуты, прочитает тот же пакет,
+    придёт к тому же выводу и вернёт то же суждение — полтора-два миллиона
+    токенов провайдера за воспроизведение известного ответа. Хуже: два
+    одинаковых суждения подряд читаются как подтверждение, хотя это одно
+    суждение, посчитанное дважды.
+
+    Отвечает ХАБ и отвечает диффом. Спросить об этом модель значило бы
+    поменять проверяемый факт на мнение — и заплатить за мнение.
+
+    Три случая пропускают дальше, и каждый по своей причине:
+
+    * первая сдача — сравнивать не с чем;
+    * у прошлой генерации не было подтверждённых находок — отказывать не за
+      что: возвращали не по ним;
+    * хотя бы про одну находку хаб НЕ СМОГ узнать, тронута ли она. «Не
+      удалось посмотреть» — не «ничего не изменилось» (#762): здесь
+      неизвестность стоит прогона, а не отказа, потому что цена ошибки
+      несимметрична — лишний прогон стоит денег, пропущенная правка стоит
+      суждения о коде, которого никто не судил.
+    """
+    from hub.services.finding_evidence import OUTCOME_UNTOUCHED, evidence_for_report
+
+    previous = generation - 1
+    if previous < 1:
+        # Первой сдаче сравнивать не с чем. Строго говоря, эту строку можно
+        # снять без изменения поведения: поколения начинаются с единицы
+        # (order_due_runs отбирает submission_generation > 0), и запрос
+        # отчётов нулевого поколения всегда пуст. Оставлена намеренно —
+        # она отвечает на вопрос «почему первая сдача проходит» там, где
+        # его задают, а не заставляет читателя выводить ответ из фильтра
+        # в другой функции.
+        return ""
+    reports = await repo.machine_reviews_of_generation(db, task_id, previous)
+    confirmed: list[dict[str, Any]] = []
+    for report in reports:
+        raw = dict(report).get("findings_confirmed")
+        if isinstance(raw, str):
+            try:
+                entries = json.loads(raw or "[]")
+            except ValueError:
+                entries = []
+        else:
+            entries = raw or []
+        confirmed.extend(e for e in entries if isinstance(e, dict))
+
+    # Один страж на один случай. Здесь их было два: отдельная проверка
+    # «подтверждённых находок нет» и проверка пустого результата ниже. Они
+    # закрывали ровно одно и то же — evidence_for_report на пустом списке
+    # возвращает пустой словарь, — и мутация, снимавшая первую, не меняла
+    # поведения. Проверка, которую нельзя сломать по отдельности, не
+    # проверяется по отдельности, и держать её значит держать код, про
+    # который нельзя сказать, работает ли он.
+    evidence = await evidence_for_report(db, task_id, confirmed, generation=previous)
+    if not evidence:
+        return ""
+    outcomes = [str(blob.get("outcome") or "") for blob in evidence.values()]
+    if any(outcome != OUTCOME_UNTOUCHED for outcome in outcomes):
+        return ""
+    return (
+        f"пересдача не тронула места находок прошлой сдачи "
+        f"(подтверждённых находок: {len(confirmed)}) — прогон вернул бы то же "
+        "суждение, посчитанное второй раз"
+    )
+
+
 async def order_due_runs(db: aiosqlite.Connection) -> int:
     """Order a run for every submission that is waiting for one."""
     if not dispatcher_enabled():
@@ -305,6 +383,12 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         if await open_run(db, task_id, generation) is not None:
             continue
         if await _judged(db, task_id, generation):
+            continue
+        # Пятый страж, и единственный, который экономит деньги: отказ ДО
+        # заказа стоит ноль, отказ после — полный прогон (#1150).
+        stale = await _nothing_new_since(db, task_id, generation)
+        if stale:
+            await _refuse(db, task_id, REFUSED_NO_NEW_INFORMATION, stale)
             continue
         if await order_run(db, task_id, generation) is not None:
             ordered += 1

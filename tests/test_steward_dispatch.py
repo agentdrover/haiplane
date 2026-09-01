@@ -243,3 +243,153 @@ async def test_project_without_the_policy_is_left_alone(db: aiosqlite.Connection
 
     assert await order_due_runs(db) == 0
     assert await open_run(db, task_id, 1) is None
+
+
+# ---------------------------------------------------------------------------
+# #1150 — пересдача без изменений не оплачивается
+# ---------------------------------------------------------------------------
+
+
+async def _reported(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    confirmed: list[dict],
+) -> None:
+    """Отчёт машинного ревью с подтверждёнными находками на эту генерацию."""
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="multi-agent-review",
+        harness_version=1,
+        agent_count=11,
+        tokens_spent=None,
+        duration_ms=1000,
+        orchestrator="cursor",
+        model="grok-4.6",
+        raw_count=7,
+        findings_confirmed=json.dumps(confirmed),
+        findings_rejected=json.dumps([]),
+        unresolved=json.dumps([]),
+        lost_dimensions=json.dumps([]),
+        incomplete=False,
+        submitted_by="cursor-cloud-reviewer",
+        self_reviewed=False,
+    )
+    await db.commit()
+
+
+def _touch(monkeypatch, outcome: str) -> None:
+    """Что хаб узнал про места находок — подменяется на уровне вычисления.
+
+    Настоящий ответ считает git по клону, которого в тестах нет: без
+    подмены все три случая слились бы в один — «неизвестно». Подменяется
+    ИМЕННО вычисление, а не решение диспетчера: правило остаётся под
+    проверкой, подделан только факт, на котором оно работает.
+    """
+
+    async def _fake(db, task_id, findings, *, generation):
+        from hub.services.finding_identity import finding_uids
+
+        return {uid: {"outcome": outcome} for uid in finding_uids(findings)}
+
+    monkeypatch.setattr(
+        "hub.services.finding_evidence.evidence_for_report", _fake, raising=True
+    )
+
+
+_FINDING = {
+    "title": "страж не читает пин",
+    "severity": "high",
+    "file": "hub/services/steward_apply.py",
+    "locator": "lines",
+    "start_line": 10,
+    "end_line": 20,
+}
+
+
+async def test_resubmit_without_changes_refused_before_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1150): прогона нет ВООБЩЕ, а не «есть, но бесполезный».
+
+    Отказ до старта стоит ноль, отказ после — полтора-два миллиона токенов
+    провайдера за воспроизведение известного ответа. Поэтому проверяется
+    отсутствие СТРОКИ в steward_runs, а не отсутствие суждения: заказ,
+    который потом закроют, уже оплачен.
+    """
+    project_id = await _project(db, "steward-stale", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, task_id, 1, [_FINDING])
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+
+    ordered = await order_due_runs(db)
+
+    assert ordered == 0
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE task_id=?", (task_id,))
+    assert rows == [], "заказа не должно появиться вовсе — он и есть оплата"
+    refusals = await _events(db, EVENT_REFUSED)
+    assert refusals, "молчаливый отказ неотличим от бага"
+    payload = json.loads(refusals[-1]["payload"])
+    assert payload["reason"] == "no_new_information"
+    assert "не тронула места находок" in payload["detail"]
+
+
+async def test_real_change_still_gets_its_run(db: aiosqlite.Connection, monkeypatch):
+    """AC-2 (#1150): отказ, умеющий только отказывать, — это выключатель.
+
+    Три случая обязаны пропускать, и каждый по своей причине: правка мест
+    находок, отсутствие подтверждённых находок у прошлой сдачи, и —
+    отдельно — неизвестность. «Хаб не смог посмотреть» не равно «ничего не
+    изменилось» (#762), и цена ошибки здесь несимметрична: лишний прогон
+    стоит денег, пропущенная правка — суждения о коде, которого никто не
+    судил.
+    """
+    project_id = await _project(db, "steward-fresh", steward=True)
+
+    touched = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, touched, 1, [_FINDING])
+    await repo.update_task(db, touched, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "touched")
+    assert await order_due_runs(db) == 1, "правка мест находок обязана купить прогон"
+
+    # Прошлая сдача без подтверждённых находок: отказывать не за что —
+    # возвращали работу не по ним.
+    clean = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, clean, 1, [])
+    await repo.update_task(db, clean, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+    assert await order_due_runs(db) == 1, "без находок прошлой сдачи отказ беспредметен"
+
+    # Неизвестность покупает прогон, а не отказ.
+    unknown = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, unknown, 1, [_FINDING])
+    await repo.update_task(db, unknown, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "unknown")
+    assert await order_due_runs(db) == 1, (
+        "«не удалось посмотреть» — не «ничего не изменилось»: неизвестность "
+        "стоит прогона, а не отказа"
+    )
+
+
+async def test_the_first_submission_is_never_stale(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Первой сдаче сравнивать не с чем, и она проходит без вопросов.
+
+    Отдельным тестом, потому что арифметика поколений — обычное место
+    ошибки на единицу: generation-1 у первой сдачи равен нулю, и «нет
+    отчёта нулевой генерации» не должно читаться как «ничего не менялось».
+    """
+    project_id = await _project(db, "steward-first", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    _touch(monkeypatch, "untouched")
+
+    assert await order_due_runs(db) == 1
+    assert await open_run(db, task_id, 1) is not None
