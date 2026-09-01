@@ -41,6 +41,7 @@ from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     RUN_OPEN,
     close_run,
+    configured_mode,
     steward_mode,
 )
 
@@ -57,6 +58,7 @@ REFUSED_NO_IDENTITY_CHANNEL = "no_identity_channel"
 
 EVENT_RUN_STARTED = "steward_run_started"
 EVENT_RUN_REFUSED = "steward_run_refused"
+EVENT_ACT_REFUSED = "steward_act_refused"
 
 RUN_REFUSED = "refused"
 
@@ -391,6 +393,7 @@ REASON_SAMPLE_TOO_SMALL = "sample_too_small"
 REASON_FALSE_APPROVE = "false_approve"
 REASON_STAMPING = "escalations_below_floor"
 REASON_OVER_ESCALATING = "escalations_above_ceiling"
+REASON_NO_SAMPLE = "no_sample"
 
 
 @dataclass(frozen=True)
@@ -433,8 +436,15 @@ class ShadowTable:
         return self.paired + self.escalated
 
     @property
-    def escalation_share(self) -> float:
-        return (self.escalated / self.judged) if self.judged else 0.0
+    def escalation_share(self) -> float | None:
+        """The share, or None when nothing has been judged yet.
+
+        Not 0.0 (#1107 review). Zero is a measurement — "this judge never
+        escalates" — and an empty sample is the absence of one. Returning the
+        first for the second is #762 applied to a ratio: emptiness read as
+        cleanliness, here as "suspiciously agreeable".
+        """
+        return (self.escalated / self.judged) if self.judged else None
 
 
 async def _human_verdicts(db: aiosqlite.Connection) -> dict[tuple[int, int], str]:
@@ -445,9 +455,16 @@ async def _human_verdicts(db: aiosqlite.Connection) -> dict[tuple[int, int], str
     was written with the generation it judged (#1022 era), and that is the
     only place the pairing can come from without inventing it.
     """
+    # actor matters (#1107 review): auto_verdict writes the same event under
+    # actor='policy' (#745), and a policy signature counted as a human one
+    # would make the table measure agreement with AUTOMATION — the very
+    # thing it exists to check. Same for a future steward-applied verdict:
+    # the denominator is human decisions or it is nothing.
     rows = await fetchall(
         db,
-        "SELECT task_id, payload FROM events WHERE kind='review_verdict_recorded' "
+        "SELECT task_id, actor, payload FROM events "
+        "WHERE kind='review_verdict_recorded' "
+        "AND actor NOT IN ('policy', 'steward', 'hub') "
         "ORDER BY id ASC",
         (),
     )
@@ -540,7 +557,15 @@ async def act_refusals(db: aiosqlite.Connection) -> list[tuple[str, str]]:
             )
         )
     share = table.escalation_share
-    if table.judged and share < ACT_ESCALATION_FLOOR:
+    if share is None:
+        out.append(
+            (
+                REASON_NO_SAMPLE,
+                "суждений нет вовсе: доля эскалаций не измерена, а не равна нулю",
+            )
+        )
+        return out
+    if share < ACT_ESCALATION_FLOOR:
         out.append(
             (
                 REASON_STAMPING,
@@ -560,28 +585,53 @@ async def act_refusals(db: aiosqlite.Connection) -> list[tuple[str, str]]:
 
 
 async def effective_mode(db: aiosqlite.Connection) -> str:
-    """The mode the contour may ACTUALLY run in right now.
+    """The mode the contour may ACTUALLY run in. THE reader of `act`.
 
-    ``act`` is asked for in the environment and GRANTED here — only when the
-    shadow phase has produced the numbers that allow it. A configuration that
-    asks for more than the measurement supports degrades to shadow and says
-    why in the feed; it never silently becomes act.
+    `act` is asked for in the environment and GRANTED here — only when the
+    shadow phase produced the numbers that allow it. And this is the only
+    place where the word can be returned at all: ``requested_mode`` caps its
+    answer at ``shadow``, so a consumer that forgets this function does not
+    silently get autonomy, it gets today's behaviour (#1107 review).
+
+    The refusal reaches the feed ONCE per changed set of reasons. Written on
+    every call it would bury the feed under a line per poller tick — and a
+    record nobody can read is the same as no record.
     """
-    asked = steward_mode()
+    asked = configured_mode()
     if asked != "act":
         return asked
     refusals = await act_refusals(db)
     if not refusals:
         return "act"
+    codes = [code for code, _ in refusals]
+    await _announce_refusal_once(db, codes, refusals)
+    return "shadow"
+
+
+async def _announce_refusal_once(
+    db: aiosqlite.Connection, codes: list[str], refusals: list[tuple[str, str]]
+) -> None:
+    """Write the refusal only when its REASONS changed since last time."""
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        (EVENT_ACT_REFUSED,),
+    )
+    if rows:
+        try:
+            previous = json.loads(dict(rows[0]).get("payload") or "{}")
+        except ValueError:
+            previous = {}
+        if list(previous.get("reasons") or []) == codes:
+            return
     await repo.insert_event(
         db,
-        kind="steward_act_refused",
+        kind=EVENT_ACT_REFUSED,
         actor="hub",
-        payload={"reasons": [code for code, _ in refusals]},
+        payload={"reasons": codes},
     )
     await db.commit()
     log.warning(
         "STEWARD_MODE=act not granted: %s",
         "; ".join(f"{code}: {detail}" for code, detail in refusals),
     )
-    return "shadow"

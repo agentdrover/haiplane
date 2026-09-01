@@ -695,3 +695,145 @@ async def test_act_is_granted_when_the_numbers_allow(
 
     assert await act_refusals(db) == []
     assert await effective_mode(db) == "act"
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #1 (grok, отчёт 187)
+# ---------------------------------------------------------------------------
+
+
+def test_act_cannot_be_reached_without_the_measurement():
+    """Синхронный читатель режима НИКОГДА не отдаёт act (находка high).
+
+    Пороги, стоящие в стороне от выключателя, — это не пороги, а справка:
+    поставил STEWARD_MODE=act, и контур пошёл бы работать, ни разу их не
+    спросив. Теперь autonomy выдаёт только effective_mode, которому нужна
+    база; забывший про него потребитель получает сегодняшнее поведение.
+    """
+    import hub.services.steward_dispatch as sd
+
+    for asked in ("act", "ACT", " act "):
+        sd.config.STEWARD_MODE = asked
+        assert sd.configured_mode() == "act", "сырое значение читается как есть"
+        assert sd.requested_mode() == "shadow", "но синхронно act не выдаётся"
+        assert sd.steward_mode() == "shadow", "включая старое имя функции"
+    sd.config.STEWARD_MODE = "off"
+
+
+async def test_no_reader_compares_the_mode_to_act_directly(db: aiosqlite.Connection):
+    """Ни один потребитель не сравнивает режим с act мимо стража.
+
+    Перечислением, а не примером: это тот же приём, которым закрыт пин
+    (#1120) — границу, которую нельзя пересчитать, нельзя и удержать.
+    """
+    from pathlib import Path
+
+    hub_dir = Path(__file__).resolve().parents[1] / "hub"
+    offenders = []
+    for path in hub_dir.rglob("*.py"):
+        if path.name == "steward_shadow.py":
+            continue  # тут и живёт единственный законный читатель
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#") or '"""' in stripped:
+                continue
+            if '== "act"' not in stripped and "== 'act'" not in stripped:
+                continue
+            # Понижение — не чтение: строка, которая сравнивает с act, чтобы
+            # ВЕРНУТЬ shadow, и есть тот самый колпак. Всё остальное —
+            # действие по автономии, которую никто не измерял.
+            if '"shadow"' in stripped:
+                continue
+            offenders.append(f"{path.name}:{number}")
+    assert not offenders, f"act читается мимо effective_mode: {offenders}"
+
+
+async def test_a_policy_verdict_is_not_a_human_one(db: aiosqlite.Connection):
+    """Автовердикт политики не попадает в числитель таблицы (находка medium).
+
+    auto_verdict (#745) пишет то же событие под actor='policy'. Засчитанный
+    как человеческий, он превращает таблицу в измерение согласия с
+    автоматикой — ровно то, что она должна проверять.
+    """
+    from hub.services.steward_shadow import shadow_table
+
+    project_id = await _project(db, "shadow-policy")
+    task_id = await _pair(db, project_id, steward="approve", human=None)
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "changes_requested", "submission_generation": 1},
+    )
+    await db.commit()
+
+    table = await shadow_table(db)
+
+    assert table.false_approve == 0, "подпись политики не человеческая"
+    assert table.unpaired == 1, "и это отсутствие пары, а не согласие"
+
+
+async def test_an_empty_sample_has_no_escalation_share(db: aiosqlite.Connection):
+    """Пустая выборка — «не измерено», а не ноль (находка medium).
+
+    Ноль это результат («судья не эскалирует никогда»), и подставленный
+    вместо отсутствия он читается как обвинение в штамповке там, где
+    измерять было нечего.
+    """
+    from hub.services.steward_shadow import REASON_NO_SAMPLE, act_refusals, shadow_table
+
+    table = await shadow_table(db)
+
+    assert table.judged == 0
+    assert table.escalation_share is None
+    codes = {code for code, _ in await act_refusals(db)}
+    assert REASON_NO_SAMPLE in codes
+
+
+async def test_the_refusal_is_written_once_per_reason_set(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ пишется при СМЕНЕ причин, а не на каждый вызов (находка medium).
+
+    Поллер тикает каждые тридцать секунд; строка на тик — это фид, в котором
+    больше нечего прочитать.
+    """
+    from hub.services.steward_shadow import EVENT_ACT_REFUSED, effective_mode
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    project_id = await _project(db, "shadow-quiet")
+    await _pair(db, project_id, steward="approve", human="changes_requested")
+
+    for _ in range(5):
+        assert await effective_mode(db) == "shadow"
+
+    events = await _events(db, EVENT_ACT_REFUSED)
+    assert len(events) == 1, f"ожидалась одна запись, получено {len(events)}"
+
+    # Меняется состав причин — появляется вторая запись.
+    for _ in range(10):
+        await _pair(
+            db, project_id, steward="changes_requested", human="changes_requested"
+        )
+    assert await effective_mode(db) == "shadow"
+    assert len(await _events(db, EVENT_ACT_REFUSED)) == 2
+
+
+async def test_the_table_stands_beside_practice_metrics(db: aiosqlite.Connection):
+    """Таблица видна там же, где остальные числа практики (находка medium).
+
+    Метрика в собственном углу — метрика, которую не читают: решение об
+    автономии принимают рядом с override-rate и исходами ревью.
+    """
+    from hub.services.orchestration import practice_metrics
+
+    project_id = await _project(db, "shadow-metrics")
+    await _pair(db, project_id, steward="approve", human="changes_requested")
+
+    metrics = await practice_metrics(db, since_days=90)
+
+    block = metrics["steward_shadow"]
+    assert block["false_approve"] == 1
+    assert block["act_ready"] is False
+    assert any(item["reason"] == "false_approve" for item in block["act_refusals"])
