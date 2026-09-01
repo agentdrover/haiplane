@@ -865,6 +865,34 @@ async def api_patch_project(
                     ),
                 },
             )
+        # #1119: политика, которую нельзя исполнить, не должна храниться как
+        # исполнимая. Облачный ревьюер работает только с GitHub (измерено
+        # 31.08.2026), поэтому review=dispatch на проекте другого форжа —
+        # это не «попробуем», а гарантированный отказ на КАЖДОЙ сдаче.
+        # Отказать на записи дешевле: тут есть кому прочитать причину.
+        # Форж берётся из ПАТЧА, если он там есть, иначе из строки: иначе
+        # можно было бы переключить форж и политику одним вызовом и проскочить.
+        from hub.services.review_dispatch import CLOUD_REVIEW_FORGES
+
+        forge_after = str(
+            fields.get("forge") or project_policy.forge_of(before)
+        ).strip()
+        if (
+            fields["gate_policy"].get("review") == "dispatch"
+            and forge_after not in CLOUD_REVIEW_FORGES
+        ):
+            raise HTTPException(
+                422,
+                {
+                    "error": "cloud_review_forge_unsupported",
+                    "hint": (
+                        f"облачный ревьюер не работает с форжем «{forge_after}»: "
+                        f"он принимает только {', '.join(CLOUD_REVIEW_FORGES)} "
+                        "(проверено 31.08.2026). Оставьте review=human — "
+                        "вердикт всё равно за человеком"
+                    ),
+                },
+            )
         fields["gate_policy"] = _json.dumps(fields["gate_policy"])
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])

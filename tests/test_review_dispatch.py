@@ -444,7 +444,7 @@ async def test_alert_names_every_missing_setting(
     assert len(alerts) == 1
     assert alerts[0] == (
         "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
-        "repo проекта (репозиторий на GitHub); "
+        "repo проекта (owner/name на его форже); "
         "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера). "
         "Вердикт остаётся человеку (#757)."
     )
@@ -466,13 +466,13 @@ _ALERT_TAIL = " Вердикт остаётся человеку (#757)."
 _MISSING_COMBINATIONS: tuple[tuple[bool, bool, bool, str], ...] = (
     # (key configured, repo set, token set) -> exact alert
     (False, True, True, "CURSOR_API_KEY (ключ Cursor API)."),
-    (True, False, True, "repo проекта (репозиторий на GitHub)."),
+    (True, False, True, "repo проекта (owner/name на его форже)."),
     (True, True, False, "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)."),
     (
         False,
         False,
         True,
-        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub).",
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (owner/name на его форже).",
     ),
     (
         False,
@@ -484,14 +484,14 @@ _MISSING_COMBINATIONS: tuple[tuple[bool, bool, bool, str], ...] = (
         True,
         False,
         False,
-        "repo проекта (репозиторий на GitHub); "
+        "repo проекта (owner/name на его форже); "
         "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
     ),
     (
         False,
         False,
         False,
-        "CURSOR_API_KEY (ключ Cursor API); repo проекта (репозиторий на GitHub); "
+        "CURSOR_API_KEY (ключ Cursor API); repo проекта (owner/name на его форже); "
         "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера).",
     ),
 )

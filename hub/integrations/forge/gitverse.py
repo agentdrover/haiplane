@@ -218,6 +218,21 @@ class GitVerseForge:
     def _repo(self, gh_repo: str | None) -> str:
         return (gh_repo or config.REPO_NAME or "").strip("/")
 
+    # -- адреса --------------------------------------------------------------
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return f"https://gitverse.ru/{self._repo(gh_repo)}"
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        """Веб-адрес запроса на слияние.
+
+        ``pulls``, во МНОЖЕСТВЕННОМ числе — у GitHub тут ``pull``. Снято с
+        живого поля html_url (mrpda/snip-portal, 01.09.2026), а не выведено
+        по аналогии: единственного лишнего символа хватает, чтобы ссылка в
+        сообщении агенту выглядела рабочей и вела в никуда.
+        """
+        return f"{self.repo_url(gh_repo)}/pulls/{pr_number}"
+
     # -- pull requests ------------------------------------------------------
 
     async def create_pr(

@@ -3180,6 +3180,21 @@ async def dispatch_review(
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0)
     breadcrumb = await get_breadcrumb_str(db, task_id)
+    # Ссылка на PR собирается ЗДЕСЬ, где есть проект, а не в сборщике текста
+    # (#1119): у сборщика нет способа узнать, на каком хостинге живёт этот
+    # проект, и раньше он подставлял github.com всем подряд.
+    pr_number = task.get("pr_number")
+    pr_link = ""
+    if pr_number:
+        from hub.integrations import forge as forge_urls
+        from hub.services import project_policy
+
+        project = await repo.resolve_project_for_task(db, task_id)
+        gh_repo = (dict(project).get("repo") or "").strip() if project else ""
+        if gh_repo:
+            pr_link = forge_urls.pr_url(
+                project_policy.forge_of(project), gh_repo, int(pr_number)
+            )
     message = plugins.dispatch.build_review_message(
         task_id=task_id,
         title=task["title"],
@@ -3187,8 +3202,9 @@ async def dispatch_review(
         review_cycle=review_cycle,
         max_cycles=config.MAX_REVIEW_CYCLES,
         branch=task.get("branch", ""),
-        pr_number=task.get("pr_number"),
+        pr_number=pr_number,
         breadcrumb=breadcrumb,
+        pr_url=pr_link,
     )
     result = await plugins.dispatch.submit_task(
         message,
