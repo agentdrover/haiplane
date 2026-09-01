@@ -8,6 +8,7 @@ human_gates metric as the ``audit`` gate.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -357,6 +358,18 @@ async def test_no_steward_activity_no_digest(db: aiosqlite.Connection):
     assert await generate_due_digests(db, now=_tomorrow() + timedelta(days=1)) == 0
 
 
+def _steward_counter_cell(page_text: str) -> str:
+    """Именно та ячейка счётчика, а не любая цифра на странице.
+
+    У дайджеста четыре счётчика, и пустые списки соседей рисуют свои нули
+    честно. Проверять «нет нуля на странице» значило бы проверять их, а не
+    стюарда — первая версия этого теста так и падала.
+    """
+    found = re.search(r"суждений стюарда</dt>\s*<dd>(.*?)</dd>", page_text, re.S)
+    assert found is not None, "счётчик суждений стюарда обязан быть на странице"
+    return re.sub(r"<[^>]+>", "", found.group(1)).strip()
+
+
 async def test_a_digest_written_before_the_section_still_renders(
     db: aiosqlite.Connection, client: AsyncClient
 ):
@@ -393,4 +406,35 @@ async def test_a_digest_written_before_the_section_still_renders(
     assert "Суждения стюарда" not in page.text, (
         "у записи без суждений раздела быть не должно: пустая секция "
         "читается как «стюард смотрел и ничего не нашёл»"
+    )
+    cell = _steward_counter_cell(page.text)
+    assert "не измерялось" in cell, (
+        "день до появления раздела не измерен, и счётчик обязан это сказать"
+    )
+    assert "0" not in cell, (
+        "ноль здесь был бы утверждением о дне, в который никто не смотрел (#762, #750)"
+    )
+
+
+async def test_a_quiet_steward_is_a_measured_zero(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Ноль и «не измерялось» обязаны отличаться в обе стороны (#1143 ревью).
+
+    Зеркало предыдущего теста, и без него правка неотличима от «печатать
+    "не измерялось" всегда»: у делегирующего проекта, где стюард за день
+    не судил ничего, ноль — настоящий результат дня, а не пробел.
+    """
+    _pid, feature = await _autopilot_project(db, "dg-quiet-steward")
+    await _policy_approved_task(db, feature, "автопилот работал, стюард нет")
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = json.loads((await repo.list_digests(db))[0]["payload"])
+    assert payload["steward_judgements"] == [], "день измерен, суждений нет"
+
+    page = await client.get("/digests")
+    assert page.status_code == 200
+    cell = _steward_counter_cell(page.text)
+    assert cell == "0", (
+        f"этот день измерен: ноль тут результат, а не пробел, получено {cell!r}"
     )

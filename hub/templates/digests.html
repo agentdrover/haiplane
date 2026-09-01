@@ -17,7 +17,9 @@
         <dt>автоодобрений (DoR)</dt><dd>{{ d.data.auto_approvals | length }}</dd>
         <dt>автовердиктов</dt><dd>{{ d.data.auto_verdicts | length }}</dd>
         <dt>эскалаций</dt><dd>{{ d.data.escalations | length }}</dd>
-        <dt>суждений стюарда</dt><dd>{{ d.data.steward_judgements | length }}</dd>
+        <dt>суждений стюарда</dt>
+        <dd>{% if d.steward_state == 'measured' %}{{ d.data.steward_judgements | length }}
+            {%- else %}<span class="text-muted">не измерялось — дайджест старше раздела</span>{% endif %}</dd>
         <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
     </dl>
 

@@ -113,6 +113,31 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
 _DEBT_WINDOW = "-90 days"
 
 
+# The payload key the steward section lives under, and the question a reader
+# of an OLD digest must be able to answer: was the steward silent that day,
+# or was nobody counting? Digests written before #1143 carry no such key, and
+# a count filter reads a missing key as 0 — a measured silence where nothing
+# was measured. That is the #762/#750 mistake applied to my own section, and
+# the answer belongs in code rather than in a template, next to the grounds
+# vocabulary it mirrors.
+STEWARD_SECTION_KEY = "steward_judgements"
+
+MEASURED = "measured"
+UNMEASURED = "unmeasured"
+
+
+def steward_section_state(payload: dict) -> str:
+    """Did this digest count the steward at all?
+
+    ``measured`` — the key is there, and its length is a real number, zero
+    included: a delegating project with a quiet steward genuinely judged
+    nothing that day.
+    ``unmeasured`` — the digest predates the section. Zero would be a claim
+    about a day nobody looked at.
+    """
+    return MEASURED if STEWARD_SECTION_KEY in payload else UNMEASURED
+
+
 async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -> dict:
     """One steward decision the way the digest must show it: WITH its grounds.
 
@@ -289,7 +314,7 @@ async def generate_due_digests(
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,
-            "steward_judgements": steward,
+            STEWARD_SECTION_KEY: steward,
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
