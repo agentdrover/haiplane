@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import httpx
@@ -454,3 +455,125 @@ async def test_ready_is_not_claimed_when_the_flag_survives(patched_httpx):
     )
 
     assert await forge.mark_pr_ready(1, gh_repo="own/rep") is False
+
+
+# ---------------------------------------------------------------------------
+# Создание запросов на слияние — единственные операции, которые ПИШУТ
+# ---------------------------------------------------------------------------
+
+
+async def test_create_pr_sends_the_documented_body(patched_httpx):
+    """POST /pulls получает ровно те поля, которых ждёт форж.
+
+    Это единственные две операции адаптера, которые что-то создают, и они же
+    первыми упрутся в различия GitVerse. Непокрытыми их проверял бы первый
+    настоящий проект вместо нас.
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.append(httpx.Response(201, json={"number": 12}))
+
+    number = await forge.create_pr(
+        "feat(task): форж (#1115)", "тело", "task-1115/x", "main", gh_repo="own/rep"
+    )
+
+    assert number == 12
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.example/repos/own/rep/pulls"
+    body = json.loads(request.content)
+    assert body == {
+        "title": "feat(task): форж (#1115)",
+        "body": "тело",
+        "head": "task-1115/x",
+        "base": "main",
+    }
+
+
+async def test_create_pr_returns_the_existing_one_instead_of_failing(patched_httpx):
+    """PR на эту ветку уже есть — это не ошибка, а тот же ответ.
+
+    GitHub-адаптер узнаёт этот случай по тексту «already exists»; у GitVerse
+    формулировка своя и меняться будет отдельно от нас, поэтому адаптер не
+    гадает по тексту, а спрашивает список. Номер существующего PR — рабочий
+    ответ: без него гейт открыл бы второй PR на ту же ветку.
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend(
+        [
+            httpx.Response(422, json={"message": "pull request already exists"}),
+            httpx.Response(200, json=[{"number": 5, "head": {"ref": "task-1115/x"}}]),
+        ]
+    )
+
+    number = await forge.create_pr("t", "b", "task-1115/x", "main", gh_repo="own/rep")
+
+    assert number == 5
+    assert [r.method for r in seen] == ["POST", "GET"]
+
+
+async def test_create_pr_answers_none_when_it_truly_failed(patched_httpx):
+    """Отказ без существующего PR — None, а не выдуманный номер."""
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend([httpx.Response(403, json={}), httpx.Response(200, json=[])])
+
+    assert await forge.create_pr("t", "b", "br", "main", gh_repo="own/rep") is None
+
+
+async def test_create_pr_without_a_repo_asks_nobody(patched_httpx, monkeypatch):
+    """Репозиторий не назван — запроса нет вовсе.
+
+    Иначе адаптер сходил бы в чужой репозиторий из глобальной настройки.
+    """
+    seen, responses = patched_httpx
+    monkeypatch.setattr("hub.config.REPO_NAME", "")
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+
+    assert await forge.create_pr("t", "b", "br", "main", gh_repo=None) is None
+    assert seen == []
+
+
+async def test_open_or_update_pr_updates_instead_of_opening_a_second(patched_httpx):
+    """Идемпотентность релизного PR (#812 AC-5).
+
+    Две сессии могут доставить с разницей в секунды, и второй PR на тот же
+    диапазон разбил бы один релиз на две истории об одних коммитах.
+    """
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend(
+        [
+            httpx.Response(200, json=[{"number": 9, "head": {"ref": "release"}}]),
+            httpx.Response(200, json={"number": 9}),
+        ]
+    )
+
+    number = await forge.open_or_update_pr(
+        "main", "release", "release: 3 задачи", "тело", gh_repo="own/rep"
+    )
+
+    assert number == 9
+    assert [r.method for r in seen] == ["GET", "PATCH"]
+    patched = json.loads(seen[1].content)
+    assert patched == {"title": "release: 3 задачи", "body": "тело"}
+    assert str(seen[1].url).endswith("/repos/own/rep/pulls/9")
+
+
+async def test_open_or_update_pr_creates_when_there_is_none(patched_httpx):
+    """Ничего не нашлось — открываем, и именно из head в base."""
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.extend(
+        [httpx.Response(200, json=[]), httpx.Response(201, json={"number": 11})]
+    )
+
+    number = await forge.open_or_update_pr(
+        "main", "release", "release", "тело", gh_repo="own/rep"
+    )
+
+    assert number == 11
+    body = json.loads(seen[1].content)
+    assert body["head"] == "release" and body["base"] == "main"
