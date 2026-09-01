@@ -10,7 +10,6 @@ from hub import repository as repo
 from hub.actionable_errors import (
     steward_closed_vocabulary_detail,
     steward_escalate_reason_required_detail,
-    steward_generation_pin_detail,
     steward_judgement_exists_detail,
     steward_unknown_finding_uid_detail,
     steward_verdict_required_detail,
@@ -59,13 +58,14 @@ async def record_steward_judgement(
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
-    if expected_generation is not None and body.generation != expected_generation:
-        raise HTTPException(
-            403,
-            detail=steward_generation_pin_detail(
-                task_id, expected_generation, body.generation
-            ),
-        )
+    if expected_generation is not None:
+        # The SAME guard the evidence door uses (#1120): one rule, two
+        # entrances. A judgement filed for another generation — or for one
+        # that stopped being current while the run was thinking — is refused
+        # here, not silently stored beside the live submission.
+        from hub.services.steward_evidence import pinned_generation
+
+        pinned_generation(identity, dict(row), body.generation)
 
     submitted_verdict = (body.verdict or "").strip()
     if not submitted_verdict:

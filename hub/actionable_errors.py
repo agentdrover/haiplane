@@ -939,3 +939,30 @@ def steward_generation_pin_detail(
             "suggested_tool": None,
         }
     )
+
+
+def steward_stale_pin_detail(task_id: int, pinned: int, current: int) -> dict[str, Any]:
+    """A steward session outlived the submission it was minted for (#1120).
+
+    Not the same refusal as asking for someone else's generation: here the
+    caller asked for its OWN, and its own is the one that stopped being
+    current. Reading the old packet quietly would let the run finish and file
+    a judgement that looks exactly like a judgement about the live code.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_pin_stale",
+            "actor_hint": "none",
+            "message": (
+                f"прогон заказан на генерацию {pinned} задачи {task_id}, "
+                f"а текущая — {current}: работа пересдана, пока он думал"
+            ),
+            "hint": (
+                "Пересдача не переводит прогон на новую сдачу и не продлевает "
+                "старую: заказ на прошлую генерацию закрывается, а новую "
+                "судит новый прогон со своим кодом."
+            ),
+            "required_role": "steward",
+            "suggested_tool": None,
+        }
+    )

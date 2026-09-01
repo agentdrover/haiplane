@@ -728,3 +728,75 @@ def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
         "injection_suspected": packet.injection_suspected,
         "injection_signals": packet.injection_signals,
     }
+
+
+# ---------------------------------------------------------------------------
+# The pin, in one place (#1120, third review round)
+# ---------------------------------------------------------------------------
+#
+# This mechanism has now been wrong three times in three different ways: on
+# #1084 the pin was not passed, on the first #1120 submission it was written
+# and never read, and on the second it was read on one entrance and not on
+# the other. The pattern is not carelessness — it is that "check the pin" was
+# implemented at each door separately, so every new door started at zero.
+#
+# So there is one function, and the doors call it. Adding a third entrance
+# without calling it is then a visible omission rather than a silent one.
+
+# Every entrance a steward session can reach (#1021 allows exactly two).
+# Written down so the list can be READ — a boundary nobody can enumerate is a
+# boundary nobody can check.
+STEWARD_PINNED_ENTRANCES: tuple[str, ...] = (
+    "GET /api/tasks/{task_id}/steward-evidence",
+    "POST /api/tasks/{task_id}/steward-judgement",
+)
+
+
+def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) -> int:
+    """Which generation this caller may act on. Raises 403 when none.
+
+    Three rules, and all three are about the same thing — a run judges the
+    submission it was ORDERED for, no other:
+
+    * a caller who names a generation must name its own (the pin wins over
+      the query parameter: asking is allowed, deciding is not);
+    * a caller who names nothing gets its pin, never "whatever is current" —
+      otherwise a resubmission silently redirects a live run onto code it
+      was never ordered to judge;
+    * a pin that no longer matches the task's CURRENT generation is stale:
+      the author resubmitted while the run was thinking, and the run's
+      subject no longer exists as the thing under review. That is a refusal,
+      not a quiet read of the old packet — a judgement about a superseded
+      submission looks exactly like a judgement about the live one.
+
+    Callers without a pin (a plain steward token, an internal call) keep
+    today's behaviour: the asked generation, or the task's current one.
+    """
+    from fastapi import HTTPException, status
+
+    from hub.actionable_errors import (
+        steward_generation_pin_detail,
+        steward_stale_pin_detail,
+    )
+
+    pin = (
+        getattr(identity, "chat_pair_generation", None)
+        if getattr(identity, "chat_pair_kind", None) == "steward"
+        else None
+    )
+    current = int(task.get("submission_generation") or 0)
+    task_id = int(task.get("id") or 0)
+    if pin is None:
+        return int(asked) if asked is not None else current
+    pin = int(pin)
+    if asked is not None and int(asked) != pin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=steward_generation_pin_detail(task_id, pin, asked),
+        )
+    if pin != current:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=steward_stale_pin_detail(task_id, pin, current),
+        )
+    return pin

@@ -300,6 +300,20 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         # A human verdict on this very generation ends the run: the judgement
         # it was ordered for is no longer anybody's to make (#1022 gives such
         # a late judgement a 409, and this closes the slot behind it).
+        # #1120 review: a resubmission ends the run too. Its subject stopped
+        # being the thing under review, and a slot left open would hold the
+        # daily cap and the evidence door for code nobody is judging any more.
+        current_generation = int(task.get("submission_generation") or 0)
+        if task and current_generation > int(run["generation"]):
+            await close_run(
+                db,
+                run,
+                RUN_SUPERSEDED,
+                f"работа пересдана: генерация {current_generation} вместо "
+                f"{run['generation']} — этот прогон судил другой код",
+            )
+            closed += 1
+            continue
         verdict_generation = task.get("review_verdict_generation")
         if task and verdict_generation == run["generation"]:
             await close_run(

@@ -338,3 +338,139 @@ async def test_the_pinned_session_reads_its_own_generation(
 
     assert packet.status_code == 200, packet.text
     assert packet.json()["generation"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Находки ревью сдачи #2 (grok, отчёт 184) — третий круг вокруг пина
+# ---------------------------------------------------------------------------
+#
+# Механизм ошибался трижды по-разному: на #1084 пин не передавался, в первой
+# сдаче писался и не читался, во второй читался на одном входе и не читался
+# на другом. Значит проверять надо не «тот случай, который назвали», а ВСЕ
+# входы разом — списком, который можно прочитать и пересчитать.
+
+
+async def _pinned_call(client, method: str, task_id: int, token: str, **kw):
+    """Один вход стюарда, вызванный живым HTTP с живым токеном."""
+    auth = {"Authorization": f"Bearer {token}"}
+    if method == "GET":
+        query = kw.get("query")
+        suffix = f"?generation={query}" if query is not None else ""
+        return await client.get(
+            f"/api/tasks/{task_id}/steward-evidence{suffix}", headers=auth
+        )
+    return await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers=auth,
+        json={
+            "generation": kw.get("body_generation", 1),
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+        },
+    )
+
+
+async def test_every_pinned_entrance_is_listed(db: aiosqlite.Connection):
+    """Список входов, где пин обязан сверяться, читается и совпадает с allowlist.
+
+    Границу, которую нельзя перечислить, нельзя и проверить: каждый новый
+    вход начинал с нуля именно потому, что «проверить пин» жило в каждой
+    двери отдельно.
+    """
+    from hub.services.steward_evidence import STEWARD_PINNED_ENTRANCES
+
+    listed = {tuple(entry.split(" ", 1)) for entry in STEWARD_PINNED_ENTRANCES}
+    assert listed == set(STEWARD_OPS), (
+        "перечень пиновых входов обязан совпадать с allowlist #1021: "
+        "вход без пина — это вход, который начнёт с нуля"
+    )
+
+
+async def test_a_stale_pin_is_refused_on_every_entrance(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """После пересдачи ВСЕ входы отказывают — включая GET без query.
+
+    Это и была третья дыра: GET без параметра тихо отдавал пакет своей
+    генерации, и прогон дожёвывал код, который перестал быть предметом
+    ревью. Тихое чтение старого пакета неотличимо от чтения живого.
+    """
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+
+    # До пересдачи все входы работают.
+    assert (await _pinned_call(client, "GET", task_id, token)).status_code == 200
+
+    # Автор пересдал, пока прогон думал.
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    refusals = {
+        "GET без query": await _pinned_call(client, "GET", task_id, token),
+        "GET со своей генерацией": await _pinned_call(
+            client, "GET", task_id, token, query=1
+        ),
+        "POST со своей генерацией": await _pinned_call(
+            client, "POST", task_id, token, body_generation=1
+        ),
+    }
+    for name, resp in refusals.items():
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["reason"] == "steward_pin_stale", name
+
+
+async def test_asking_for_another_generation_is_refused_on_every_entrance(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Чужую генерацию не пускает ни один вход — даже когда пин ещё актуален."""
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+
+    asked_get = await _pinned_call(client, "GET", task_id, token, query=2)
+    asked_post = await _pinned_call(client, "POST", task_id, token, body_generation=2)
+
+    for resp in (asked_get, asked_post):
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"]["reason"] == "steward_generation_mismatch"
+
+
+async def test_a_resubmission_closes_the_run_it_outdated(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пересдача закрывает заказ прошлой генерации, а не оставляет его висеть.
+
+    Дверь отказывает — но слот, оставшийся открытым, держал бы суточный
+    потолок и выдачу пакета за прогон, который судил уже несуществующее.
+    """
+    from hub.services.steward_dispatch import (
+        RUN_SUPERSEDED,
+        close_finished_runs,
+        order_run,
+    )
+    from hub.db import fetchall
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    assert await order_run(db, task_id, 1) is not None, "заказ обязан разместиться"
+
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    closed = await close_finished_runs(db)
+
+    assert closed == 1
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE task_id=?", (task_id,))
+    row = dict(rows[0])
+    assert row["status"] == RUN_SUPERSEDED
+    assert "пересдана" in row["closed_reason"]
