@@ -541,3 +541,157 @@ async def test_empty_grounds_are_not_shown_as_a_list(db: aiosqlite.Connection, c
     assert page.status_code == 200
     assert "оснований не приложено" in page.text
     assert "[]" not in page.text
+
+
+# ---------------------------------------------------------------------------
+# #1107 — таблица 2x2 и пороги
+# ---------------------------------------------------------------------------
+
+
+async def _pair(
+    db: aiosqlite.Connection,
+    project_id: int,
+    *,
+    steward: str,
+    human: str | None,
+    generation: int = 1,
+) -> int:
+    """Одна пара «что сказал бы стюард» / «что сделал человек»."""
+    task_id = await _task(db, project_id)
+    await repo.update_task(db, task_id, submission_generation=generation)
+    await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=generation,
+        kind="verdict",
+        submitted_verdict=steward,
+        verdict=steward,
+        confidence="high",
+        escalate_reason="precondition_failed" if steward == "escalate" else "",
+        grounds="[]",
+        findings="[]",
+        closures="[]",
+        model="gpt-5.3-codex",
+        tokens_spent=None,
+        duration_ms=None,
+        submitted_by="steward-bot",
+        principal_id=42,
+    )
+    if human is not None:
+        await repo.insert_event(
+            db,
+            kind="review_verdict_recorded",
+            task_id=task_id,
+            actor="denis",
+            payload={"verdict": human, "submission_generation": generation},
+        )
+    await db.commit()
+    return task_id
+
+
+async def test_two_by_two_counts_false_approve_apart(db: aiosqlite.Connection):
+    """#1107 AC-1: четыре клетки считаются верно, false-approve — отдельно.
+
+    Он не «одно из расхождений»: это единственная неприемлемая ошибка, и
+    спрятанная внутри общего несогласия она перестаёт быть видимой.
+    """
+    from hub.services.steward_shadow import shadow_table
+
+    project_id = await _project(db, "shadow-table")
+    await _pair(db, project_id, steward="approve", human="approved")
+    await _pair(db, project_id, steward="approve", human="changes_requested")
+    await _pair(db, project_id, steward="changes_requested", human="approved")
+    await _pair(db, project_id, steward="changes_requested", human="changes_requested")
+    await _pair(db, project_id, steward="escalate", human="approved")
+    await _pair(db, project_id, steward="approve", human=None)
+
+    table = await shadow_table(db)
+
+    assert table.both_approve == 1
+    assert table.steward_approve_human_changes == 1
+    assert table.steward_changes_human_approve == 1
+    assert table.both_changes == 1
+    assert table.escalated == 1
+    # Суждение без человеческого вердикта — «данных нет», а не согласие.
+    assert table.unpaired == 1
+    assert table.false_approve == 1
+    assert table.human_changes == 2
+
+
+async def test_act_refused_until_thresholds_met(db: aiosqlite.Connection, monkeypatch):
+    """#1107 AC-2: маленькая выборка и false-approve не пускают в act.
+
+    Отказ называет недобранный критерий: «не готово» без имени нечем
+    закрывать.
+    """
+    from hub.services.steward_shadow import (
+        REASON_FALSE_APPROVE,
+        REASON_SAMPLE_TOO_SMALL,
+        act_refusals,
+        effective_mode,
+    )
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    project_id = await _project(db, "shadow-thresholds")
+    await _pair(db, project_id, steward="approve", human="changes_requested")
+
+    codes = {code for code, _ in await act_refusals(db)}
+
+    assert REASON_SAMPLE_TOO_SMALL in codes
+    assert REASON_FALSE_APPROVE in codes
+    assert await effective_mode(db) == "shadow", "act не выдаётся по просьбе"
+    details = {code: detail for code, detail in await act_refusals(db)}
+    assert "сто любых сдач" in details[REASON_SAMPLE_TOO_SMALL]
+
+
+async def test_stamping_is_refused_too(db: aiosqlite.Connection, monkeypatch):
+    """#1107 AC-3: нижняя граница коридора такая же жёсткая, как верхняя.
+
+    Судья, который не эскалирует никогда, согласен со всем подряд — то есть
+    штампует. По верхней границе его бы поймали, по нижней раньше нет.
+    """
+    from hub.services.steward_shadow import (
+        REASON_OVER_ESCALATING,
+        REASON_STAMPING,
+        act_refusals,
+    )
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    project_id = await _project(db, "shadow-stamp")
+    # Достаточная выборка, ноль false-approve, ноль эскалаций.
+    for _ in range(10):
+        await _pair(
+            db, project_id, steward="changes_requested", human="changes_requested"
+        )
+
+    codes = {code for code, _ in await act_refusals(db)}
+    assert REASON_STAMPING in codes, "штамповка обязана отказывать"
+
+    # И зеркально: судья, эскалирующий почти всё, тоже не проходит.
+    loud = await _project(db, "shadow-loud")
+    for _ in range(30):
+        await _pair(db, loud, steward="escalate", human="approved")
+    codes_loud = {code for code, _ in await act_refusals(db)}
+    assert REASON_OVER_ESCALATING in codes_loud
+
+
+async def test_act_is_granted_when_the_numbers_allow(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пороги не только запрещают: выполненные — пропускают.
+
+    Проверка, которая умеет только отказывать, неотличима от выключателя.
+    """
+    from hub.services.steward_shadow import act_refusals, effective_mode
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    project_id = await _project(db, "shadow-ready")
+    for _ in range(10):
+        await _pair(
+            db, project_id, steward="changes_requested", human="changes_requested"
+        )
+    for _ in range(2):
+        await _pair(db, project_id, steward="escalate", human="approved")
+
+    assert await act_refusals(db) == []
+    assert await effective_mode(db) == "act"
