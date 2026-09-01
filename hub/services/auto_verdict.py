@@ -42,10 +42,10 @@ import logging
 
 import aiosqlite
 
-from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict
+from hub.services import gate_grounds as grounds
 from hub.services.ci_report import VALIDATION_PASS
 
 log = logging.getLogger(__name__)
@@ -190,16 +190,6 @@ def _finding_dicts(raw: str | None) -> list[dict]:
     return [f for f in value if isinstance(f, dict)]
 
 
-def _mentions_security(findings: list[dict]) -> bool:
-    for f in findings:
-        blob = " ".join(
-            str(f.get(k, "")) for k in ("category", "title", "severity")
-        ).lower()
-        if "security" in blob or "безопасн" in blob:
-            return True
-    return False
-
-
 async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     """Issue APPROVED for the current submission when policy and facts allow.
 
@@ -248,37 +238,19 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     unresolved = _finding_dicts(review.get("unresolved"))
 
     # --- Escalation triggers: never silent -------------------------------
-    if _mentions_security(confirmed + rejected + unresolved):
-        await _escalate(
-            db,
-            task_id,
-            "security-находка в machine-review (в любом статусе — сам факт "
-            "подозрения выводит вердикт к человеку)",
-        )
-        return False
-    budget = config.REVIEW_TOKEN_BUDGET
-    if budget and (review.get("tokens_spent") or 0) > budget:
-        await _escalate(
-            db,
-            task_id,
-            f"перерасход токен-бюджета ревью: {review.get('tokens_spent')} > "
-            f"{budget} — раунд не сошёлся штатно",
-        )
-        return False
-    siblings = await fetchall(
-        db,
-        "SELECT id, findings_confirmed FROM machine_reviews "
-        "WHERE task_id=? AND submission_generation=? AND id != ?",
-        (task_id, generation, review["id"]),
-    )
-    for sibling in siblings:
-        if _finding_dicts(sibling["findings_confirmed"]):
-            await _escalate(
-                db,
-                task_id,
-                f"расхождение ревьюеров: отчёт #{sibling['id']} этой же сдачи "
-                "нёс confirmed-находки, текущий — нет",
-            )
+    #
+    # Условия живут в hub/services/gate_grounds.py (#1147): те же пять
+    # оснований обязан соблюдать стюард, когда применяет вердикт, и два
+    # описания одного правила разъехались бы в сторону мягкого.
+    for ground in (
+        grounds.security_ground(confirmed, rejected, unresolved),
+        grounds.token_budget_ground(
+            review.get("tokens_spent"), config.REVIEW_TOKEN_BUDGET
+        ),
+        await grounds.sibling_mismatch_ground(db, task_id, generation, review["id"]),
+    ):
+        if ground:
+            await _escalate(db, task_id, ground)
             return False
 
     # --- Clean grounds: silent refusals, the human gate stands -----------
@@ -389,14 +361,9 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # positive fact about the report in hand.
     self_reviewed = bool(review.get("self_reviewed"))
     solo = config.REVIEW_SELF_APPROVE == "allow"
-    if self_reviewed and not solo:
-        await _escalate(
-            db,
-            task_id,
-            "саморевью: machine-review подан тем же принципалом, который "
-            "выполнял задачу — разнородность моделей этого не ловит, "
-            "независимость проверяется по личности, а не по объявленной модели",
-        )
+    self_ground = grounds.self_review_ground(self_reviewed, solo)
+    if self_ground:
+        await _escalate(db, task_id, self_ground)
         return False
 
     # --- Model diversity (#758): no monoculture reviews -------------------
@@ -409,14 +376,9 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         # Either declaration missing: absence of data is not diversity —
         # the human gate stands, silently (the raw_count=0 principle).
         return False
-    if diversity:
-        await _escalate(
-            db,
-            task_id,
-            f"монокультура ревью: код ({implementer_model}) и ревью "
-            f"({reviewer_model}) — одно семейство моделей; коррелированные "
-            "слепые пятна проходят оба фильтра синхронно",
-        )
+    mono_ground = grounds.monoculture_ground(implementer_model, reviewer_model)
+    if mono_ground:
+        await _escalate(db, task_id, mono_ground)
         return False
 
     # --- All grounds clean: the policy issues the verdict -----------------

@@ -1,0 +1,155 @@
+"""Громкие основания гейта: одно описание на два потребителя (#1147).
+
+Автовердикт (#745) отказывается одобрять сам при пяти условиях и каждое
+называет вслух: security-находка, перерасход токен-бюджета, расхождение с
+соседним отчётом той же сдачи, саморевью и монокультура моделей. Стюард,
+получая право ПРИМЕНЯТЬ вердикт, обязан упираться в те же пять — иначе он
+получит права, которых нет у автопилота, и обход старого гейта будет
+стоить ровно одного перевода проекта на нового судью.
+
+Поэтому условия живут здесь, а не в двух местах. Второй список рядом с
+первым разъезжается, и разъезжается тот, который мягче: правило, добавленное
+в автовердикт и забытое у стюарда, тихо расширяет автономию — то есть
+ошибается в сторону, где ошибка дороже.
+
+Что здесь НЕ живёт: тихие отказы автовердикта (нет отчёта, красный CI,
+уехавшая вершина, дифф вне областей, поднявшийся класс). Они не «громкие
+основания», а предусловия, и у стюарда читаются из пакета доказательств
+(#1074) одним кодом precondition_failed. Разница не косметическая: громкое
+основание — это положительный факт об отчёте, который был прочитан, а
+предусловие — вопрос о том, можно ли вообще что-то применять.
+
+Коды берутся из закрытого словаря STEWARD_ESCALATE_REASONS (#1022) и здесь
+не изобретаются. Текст детали — тот же, что автовердикт писал в фид до этой
+задачи, дословно: сообщение, которое владелец уже научился узнавать, не
+должно меняться из-за переезда условия в другой файл.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import aiosqlite
+
+from hub.db import fetchall
+
+# Порядок здесь — тот же, в котором их проверял автовердикт, и он значим:
+# первым срабатывает то, что дешевле всего проверить и дороже всего
+# пропустить. Перечень публичный, потому что полноту проверяет тест, а не
+# внимательность читателя (#1107, #1120 — тем же приёмом).
+LOUD_GROUND_CODES: tuple[str, ...] = (
+    "report_security_finding",
+    "report_token_budget",
+    "report_sibling_mismatch",
+    "self_authored",
+    "same_family_as_reviewer",
+)
+
+
+def _finding_blob(finding: dict[str, Any]) -> str:
+    return " ".join(str(finding.get(k, "")) for k in ("category", "title", "severity"))
+
+
+def mentions_security(findings: list[dict[str, Any]]) -> bool:
+    """Есть ли среди находок security — в ЛЮБОМ статусе.
+
+    Включая отклонённые и нерассуженные: сам факт подозрения выводит
+    вердикт к человеку. Опровергнутая security-находка — это находка, по
+    которой кто-то не согласился, а не отсутствие находки.
+    """
+    return any(
+        "security" in _finding_blob(f).lower() or "безопасн" in _finding_blob(f).lower()
+        for f in findings
+    )
+
+
+def security_ground(
+    confirmed: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    unresolved: list[dict[str, Any]],
+) -> str | None:
+    if not mentions_security(confirmed + rejected + unresolved):
+        return None
+    return (
+        "security-находка в machine-review (в любом статусе — сам факт "
+        "подозрения выводит вердикт к человеку)"
+    )
+
+
+def token_budget_ground(tokens_spent: int | None, budget: int) -> str | None:
+    """Перерасход означает, что раунд не сошёлся штатно.
+
+    Ноль или None в бюджете — проверка выключена, а не пройдена: сравнивать
+    не с чем, и молчать здесь честнее, чем объявлять чистоту.
+    """
+    if not budget:
+        return None
+    if (tokens_spent or 0) <= budget:
+        return None
+    return (
+        f"перерасход токен-бюджета ревью: {tokens_spent} > {budget} — "
+        "раунд не сошёлся штатно"
+    )
+
+
+async def sibling_mismatch_ground(
+    db: aiosqlite.Connection, task_id: int, generation: int, review_id: int
+) -> str | None:
+    """Соседний отчёт той же сдачи нашёл то, чего не нашёл текущий.
+
+    Два ревьюера на одну сдачу расходятся не потому, что один ошибся, а
+    потому, что смотрели по-разному. Расхождение — это данные, и решает их
+    человек.
+    """
+    from hub.services.auto_verdict import _finding_dicts
+
+    siblings = await fetchall(
+        db,
+        "SELECT id, findings_confirmed FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND id != ?",
+        (task_id, generation, review_id),
+    )
+    for sibling in siblings:
+        if _finding_dicts(sibling["findings_confirmed"]):
+            return (
+                f"расхождение ревьюеров: отчёт #{sibling['id']} этой же сдачи "
+                "нёс confirmed-находки, текущий — нет"
+            )
+    return None
+
+
+def self_review_ground(self_reviewed: bool, solo_allowed: bool) -> str | None:
+    """Отчёт подан тем же принципалом, который делал работу (#728).
+
+    Разнородность моделей этого не ловит: объявить другую модель дешевле,
+    чем быть другим принципалом. Solo-режим не делает саморевью независимым
+    — он делает его разрешённым, и потому снимает основание, а не отменяет
+    факт.
+    """
+    if not self_reviewed or solo_allowed:
+        return None
+    return (
+        "саморевью: machine-review подан тем же принципалом, который "
+        "выполнял задачу — разнородность моделей этого не ловит, "
+        "независимость проверяется по личности, а не по объявленной модели"
+    )
+
+
+def monoculture_ground(implementer_model: str, reviewer_model: str) -> str | None:
+    """Код и ревью одного семейства — коррелированные слепые пятна (#758).
+
+    Возвращает None и при ОТСУТСТВИИ любой из деклараций: отсутствие данных
+    не есть разнородность, но и не есть монокультура. Это тихий отказ, а не
+    громкое основание, и он остаётся у вызывающего — здесь бы он превратился
+    в обвинение там, где просто нечего сравнивать (#762).
+    """
+    from hub.services.model_family import same_family
+
+    diversity = same_family(implementer_model, reviewer_model)
+    if diversity is not True:
+        return None
+    return (
+        f"монокультура ревью: код ({implementer_model}) и ревью "
+        f"({reviewer_model}) — одно семейство моделей; коррелированные "
+        "слепые пятна проходят оба фильтра синхронно"
+    )
