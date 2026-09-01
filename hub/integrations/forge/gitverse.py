@@ -80,6 +80,9 @@ class GitVerseForge:
     """Concrete forge plugin backed by the GitVerse REST API."""
 
     name = "gitverse"
+    #: Мержа в публичном API GitVerse нет вовсе — сливать обязан вызывающий,
+    #: локальным git (#1116).
+    can_merge_via_api = False
 
     def __init__(
         self,
@@ -489,9 +492,75 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool:
-        """Сводится в #1116: в публичном API GitVerse мержа нет вовсе."""
-        log.error("gitverse merge_pr отказан: %s", _MERGE_PENDING)
+        """Форж слить не может — и говорит это, а не молчит (#1116).
+
+        ``can_merge_via_api = False`` объявлено на классе, и вызывающий обязан
+        читать его ДО вызова: мерж делается локальным git в ``git_ops``. Если
+        управление дошло сюда, значит кто-то положился на попытку вместо
+        объявленной способности — и узнать об этом лучше по строке в логе, чем
+        по молча недоставленной задаче.
+        """
+        log.error(
+            "gitverse merge_pr вызван, хотя can_merge_via_api=False: "
+            "мерж на этом форже делается локальным git (#1116)"
+        )
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        """Закрыть PR, ничего не вливая.
+
+        Обязателен именно здесь: измерено 01.09.2026, что GitVerse НЕ замечает
+        мержа пушем — после merge --no-ff головы в базу PR остаётся open,
+        merged=False, merge_commit_sha=None. Незакрытый PR висел бы открытым
+        вечно, а pr_for_branch находил бы его на уже доставленной ветке и
+        заставлял гейт открывать доставку заново.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return False
+        resp = await self._request(
+            "PATCH", f"/repos/{slug}/pulls/{pr_number}", json_body={"state": "closed"}
+        )
+        if resp.ok:
+            return True
+        log.warning("PR #%d не закрыт: %s", pr_number, resp.reason or resp.status)
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """Достижим ли ``sha`` в ``branch`` на remote, или None.
+
+        Это и есть доказательство доставки на GitVerse, потому что через PR
+        его получить нельзя ни при каком условии: доставленный и брошенный PR
+        отвечают одинаково (closed, merged=False), а до закрытия — вообще
+        одинаково с недоставленным (open, /merge → 404).
+
+        Спрашивается у compare, а не у списка коммитов: список пришлось бы
+        листать страницами и решать, где остановиться, а «не нашли на первых
+        ста» неотличимо от «нет вовсе».
+        """
+        slug = self._repo(gh_repo)
+        if not slug or not sha:
+            return None
+        resp = await self._request("GET", f"/repos/{slug}/compare/{sha}...{branch}")
+        if not resp.ok or not isinstance(resp.data, dict):
+            return None
+        status = str(resp.data.get("status") or "").strip().lower()
+        if status in ("ahead", "identical"):
+            return True
+        if status in ("behind", "diverged"):
+            return False
+        # Незнакомое слово — не повод сказать «нет»: это «спросить не удалось».
+        log.warning("gitverse compare вернул нераспознанный status=%r", status)
+        return None
 
     # -- CI -----------------------------------------------------------------
     #
