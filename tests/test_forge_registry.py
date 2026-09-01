@@ -7,6 +7,7 @@ import inspect
 import pytest
 
 from hub.integrations.forge.github import GitHubForge
+from hub.integrations.forge.gitverse import GitVerseForge
 from hub.integrations.noop import NoopForge
 from hub.integrations.protocols import (
     CIProbeOutcome,
@@ -38,7 +39,7 @@ def test_forge_protocol_covers_every_implementation_method():
     в протоколе, не поймает никто — именно он и есть тихий уход контракта.
     """
     declared = _declared_on(ForgePlugin)
-    for impl in (GitHubForge, NoopForge):
+    for impl in (GitHubForge, GitVerseForge, NoopForge):
         undeclared = _declared_on(impl) - declared
         assert not undeclared, (
             f"{impl.__name__} несёт операции, которых нет в ForgePlugin: "
@@ -50,7 +51,7 @@ def test_forge_protocol_covers_every_implementation_method():
 def test_both_forge_implementations_answer_the_whole_protocol():
     """Ни одна реализация не отстаёт от контракта на метод."""
     declared = _declared_on(ForgePlugin)
-    for impl in (GitHubForge, NoopForge):
+    for impl in (GitHubForge, GitVerseForge, NoopForge):
         missing = declared - _declared_on(impl)
         assert not missing, f"{impl.__name__} не реализует: {sorted(missing)}"
 
@@ -101,4 +102,5 @@ async def test_hub_starts_with_noop_forge():
 def test_every_forge_names_itself():
     """Отказ должен называть, КТО отказал, а не только что отказали."""
     assert GitHubForge().name == "github"
+    assert GitVerseForge().name == "gitverse"
     assert NoopForge().name == "noop"

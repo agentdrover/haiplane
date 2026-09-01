@@ -5,5 +5,6 @@
 """
 
 from hub.integrations.forge.github import GitHubForge
+from hub.integrations.forge.gitverse import GitVerseForge
 
-__all__ = ["GitHubForge"]
+__all__ = ["GitHubForge", "GitVerseForge"]
