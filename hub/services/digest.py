@@ -13,6 +13,13 @@ hub_wait_events and the Stop hook can bring it into chat) and the /digests
 page in the web panel. The spot-check results flow back into the
 human_gates metric (#737) as the ``audit`` gate — the post-hoc signal the
 expand-or-roll-back decision is supposed to read.
+
+Since #1143 the steward (#994) is covered by the same digest rather than a
+second one. Its decisions arrive with their GROUNDS, because a verdict on
+its own gives a reader nothing to check, and "delegating" now means the
+policy autopilot OR the steward: a project that hands only the verdict to
+the steward used to fall outside the check and get no digest at all, which
+is indistinguishable from a quiet day.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import aiosqlite
 
 from hub.db import fetchall
 from hub import repository as repo
+from hub.services.gate_events import STEWARD_JUDGEMENT
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +41,20 @@ _AUTOPILOT_EVENT_KINDS = (
     "task_approved",
     "review_verdict_recorded",
     "verdict_escalated",
+    # #1143: the steward writes its own kind (#1023). Reading it here rather
+    # than in a second query keeps ONE project-attribution walk: two walks
+    # would eventually disagree about which project a task belongs to, and
+    # the one that disagreed silently would be the oversight half.
+    STEWARD_JUDGEMENT,
 )
+
+# Which gate_policy values mean "somebody other than a person decides here".
+# "auto" was the only one while the policy autopilot was the only delegate;
+# a project that hands the verdict to the steward has delegated exactly as
+# much, and asking for "auto" specifically refused it a digest entirely
+# (#1143). The set is the place to add the next delegate — the check reads
+# it, so a new word cannot be added to the policy and forgotten here.
+_DELEGATED_TO_MACHINE: frozenset[str] = frozenset({"auto", "steward"})
 
 
 def deterministic_sample(task_ids: list[int], digest_date: str) -> list[int]:
@@ -65,11 +86,24 @@ def deterministic_sample(task_ids: list[int], digest_date: str) -> list[int]:
 
 
 def _policy_delegates(gate_policy_raw: str | None) -> bool:
+    """Does this project let a machine decide anything at all?
+
+    True for the policy autopilot ("auto") and for the steward ("steward").
+    The digest is the oversight of delegated decisions, so the question is
+    "is anything delegated", not "is it delegated to the autopilot" — the
+    narrower reading left a steward-only project with no digest at all, and
+    a missing digest looks exactly like a quiet day (#1143).
+    """
     try:
         policy = json.loads(gate_policy_raw or "{}")
     except ValueError:
         return False
-    return isinstance(policy, dict) and "auto" in policy.values()
+    if not isinstance(policy, dict):
+        return False
+    return any(
+        isinstance(value, str) and value in _DELEGATED_TO_MACHINE
+        for value in policy.values()
+    )
 
 
 # The window the category debt is read over. Wider than a digest's own day on
@@ -77,6 +111,42 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
 # twenty-four hours, and a one-day window would report an empty debt every
 # morning (#878).
 _DEBT_WINDOW = "-90 days"
+
+
+async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -> dict:
+    """One steward decision the way the digest must show it: WITH its grounds.
+
+    A verdict on its own is not something a person can check — «одобрено»
+    tells the reader what happened and nothing about whether it should have.
+    The grounds are the whole reason a shadow decision is worth reading, so
+    they are fetched here rather than left to whoever renders the section.
+
+    Absence is spelled out. Grounds are stored as a JSON string and an empty
+    list serialises to "[]", which a template reads as truthy; a judgement
+    that attached nothing would then look exactly like one that attached
+    everything (#762). ``grounds_state`` says which of the two it is.
+    """
+    judged = await repo.get_steward_judgement(
+        db,
+        entry["task_id"],
+        int(payload.get("generation") or 0),
+        str(payload.get("kind") or ""),
+    )
+    grounds: list = []
+    if judged is not None:
+        try:
+            parsed = json.loads(dict(judged).get("grounds") or "[]")
+        except (TypeError, ValueError):
+            parsed = []
+        grounds = parsed if isinstance(parsed, list) else []
+    return {
+        **entry,
+        "verdict": str(payload.get("verdict") or ""),
+        "judgement_kind": str(payload.get("kind") or ""),
+        "generation": int(payload.get("generation") or 0),
+        "grounds": grounds,
+        "grounds_state": "present" if grounds else "absent",
+    }
 
 
 async def generate_due_digests(
@@ -112,16 +182,23 @@ async def generate_due_digests(
         if existing:
             continue
 
+        # One placeholder per entry of _AUTOPILOT_EVENT_KINDS. Written out
+        # rather than generated: building SQL by concatenation is the shape
+        # every injection review has to stop and read, and here it buys
+        # nothing — a miscount raises on the first execute, so every digest
+        # test in this suite fails loudly rather than the poller failing at
+        # midnight.
         events = await fetchall(
             db,
             "SELECT id, kind, actor, task_id, payload, created_at FROM events "
-            "WHERE kind IN (?, ?, ?) AND created_at >= ? AND created_at < ? "
+            "WHERE kind IN (?, ?, ?, ?) AND created_at >= ? AND created_at < ? "
             "ORDER BY id ASC",
             (*_AUTOPILOT_EVENT_KINDS, day_start, day_end),
         )
         approvals: list[dict] = []
         verdicts: list[dict] = []
         escalations: list[dict] = []
+        steward: list[dict] = []
         for event in events:
             if event["task_id"] is None:
                 continue
@@ -158,8 +235,15 @@ async def generate_due_digests(
                 verdicts.append(entry)
             elif event["kind"] == "verdict_escalated":
                 escalations.append(entry)
+            elif event["kind"] == STEWARD_JUDGEMENT and event["actor"] == "steward":
+                steward.append(await _steward_entry(db, entry, payload))
 
-        if not (approvals or verdicts or escalations):
+        if not (approvals or verdicts or escalations or steward):
+            # The empty-day rule now covers the steward too, in both
+            # directions: a day of steward-only activity IS a day worth a
+            # digest, and a day with neither still produces nothing. An
+            # empty report read daily stops being read within a week, and
+            # that is how oversight dies quietly (#739).
             continue
 
         merges = await fetchall(
@@ -205,6 +289,7 @@ async def generate_due_digests(
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,
+            "steward_judgements": steward,
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -228,6 +313,7 @@ async def generate_due_digests(
                 "auto_approvals": len(approvals),
                 "auto_verdicts": len(verdicts),
                 "escalations": len(escalations),
+                "steward_judgements": len(steward),
                 "audit_sample": sample,
             },
         )
@@ -235,13 +321,14 @@ async def generate_due_digests(
         created += 1
         log.info(
             "digest #%s created for project %s (%s): %d approvals, "
-            "%d verdicts, %d escalations, sample %s",
+            "%d verdicts, %d escalations, %d steward judgements, sample %s",
             digest_id,
             project["slug"],
             day,
             len(approvals),
             len(verdicts),
             len(escalations),
+            len(steward),
             sample,
         )
     return created

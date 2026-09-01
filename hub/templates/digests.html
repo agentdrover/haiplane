@@ -2,7 +2,7 @@
 {% block title %}Дайджесты автопилота{% endblock %}
 {% block content %}
 <h1>Дайджесты автопилота</h1>
-<p class="text-muted">Один дайджест на проект за сутки (UTC) с активностью автопилота (#739).
+<p class="text-muted">Один дайджест на проект за сутки (UTC) с активностью автопилота или стюарда (#739, #1143).
 Задачи из выборки помечены «на проверку» — результат фиксируется human-only вызовом
 <code>POST /api/digests/&lt;id&gt;/audit</code> и попадает в метрику human_gates гейтом <code>audit</code>.</p>
 
@@ -17,6 +17,7 @@
         <dt>автоодобрений (DoR)</dt><dd>{{ d.data.auto_approvals | length }}</dd>
         <dt>автовердиктов</dt><dd>{{ d.data.auto_verdicts | length }}</dd>
         <dt>эскалаций</dt><dd>{{ d.data.escalations | length }}</dd>
+        <dt>суждений стюарда</dt><dd>{{ d.data.steward_judgements | length }}</dd>
         <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
     </dl>
 
@@ -38,6 +39,28 @@
         <li><a href="/tasks/{{ e.task_id }}">#{{ e.task_id }}</a>
             <span class="badge badge-needs_decision">эскалация</span>
             {{ e.payload.reason }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if d.data.steward_judgements %}
+    <h3>Суждения стюарда</h3>
+    <p class="text-muted">Это рекомендации. Решение остаётся человеческим — раздел показывает, на чём стюард их построил.</p>
+    <ul>
+        {% for j in d.data.steward_judgements %}
+        <li><a href="/tasks/{{ j.task_id }}">#{{ j.task_id }}</a>
+            <span class="badge badge-draft">{{ j.verdict }}</span>
+            <span class="text-muted">сдача {{ j.generation }} · {{ j.at }}</span>
+            {% if j.grounds_state == 'present' %}
+            <ul>
+                {% for g in j.grounds %}
+                <li>{{ g.source }}{% if g.detail %} — {{ g.detail }}{% endif %}</li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="text-muted">оснований не приложено — проверить такое решение нечем</div>
+            {% endif %}
+        </li>
         {% endfor %}
     </ul>
     {% endif %}
