@@ -47,6 +47,17 @@ log = logging.getLogger(__name__)
 
 REFUSED_PRECONDITION = "precondition_failed"
 REFUSED_LADDER = "ladder_surface"
+REFUSED_UNCLOSED = "unclosed_finding"
+
+# Типы закрытия из закрытого словаря #1022, и рядом — ЧЕМ каждый
+# подтверждается. Соответствие публичное, потому что его полноту проверяет
+# тест: тип, добавленный в словарь и забытый здесь, тихо стал бы закрытием
+# без доказательства — то есть словом вместо факта.
+CLOSURE_EVIDENCE: dict[str, str] = {
+    "fixed": "коммит после отчёта тронул строки находки",
+    "human_disposition": "человек вынес диспозицию по этой находке",
+    "out_of_scope_linked": "находка вынесена в существующую связанную задачу",
+}
 
 # Факты пакета, которые обязаны быть и обязаны быть чистыми, чтобы approve
 # можно было применить. Перечень публичный: полноту проверяет тест, а не
@@ -181,6 +192,167 @@ async def loud_refusals(
     return [(code, detail) for code, detail in pairs if detail]
 
 
+async def closure_refusals(
+    db: aiosqlite.Connection, task_id: int, packet: EvidencePacket
+) -> list[tuple[str, str]]:
+    """Каждая подтверждённая находка закрыта, и КАЖДОЕ закрытие проверено.
+
+    Грязный путь существует ради случая, когда ревью что-то нашло, а работа
+    всё равно годна. Но если approve проходит, не отчитавшись по каждой
+    находке, находки перестают влиять на исход — и отчёт превращается в
+    текст, который никто не обязан читать.
+
+    Факт закрытия считает ХАБ. «Исправлено» нельзя принимать на слово:
+    модель, которая судит, и модель, которая пишет, ошибаются одинаково
+    охотно, а правку хаб умеет увидеть сам. Три типа — три разных источника
+    факта, и ни одного, который сообщал бы сам себя:
+
+    fixed
+        коммит после отчёта тронул диапазон строк находки. Считается тем
+        же расчётом, что и доказательство в карточке (#1039), и ДО
+        закреплённого sha, а не до вершины ветки: решение о сдаче читает
+        то, что сдача закрепила (урок #1150);
+    human_disposition
+        по находке уже есть запись человека (#1038). Ссылка на решение, а
+        не пересказ его;
+    out_of_scope_linked
+        находка вынесена в СУЩЕСТВУЮЩУЮ задачу: linked_task_id в записи
+        исхода, и эта задача проверяется на существование. Обещание завести
+        её потом закрытием не является.
+
+    Возвращает по одному отказу на каждую незакрытую находку, а не первый:
+    человеку, который будет разбирать, нужен список, а не первая строка из
+    него.
+    """
+    from hub.services.finding_evidence import evidence_for_report
+    from hub.services.finding_identity import finding_uids
+
+    report = packet.facts.get("machine_review_report")
+    if report is None or report.state != "present":
+        # Отчёта нет — предусловие уже отказало. Молчать здесь честнее, чем
+        # объявлять, что закрывать нечего.
+        return []
+    value = report.value or {}
+    confirmed = [f for f in (value.get("confirmed") or []) if isinstance(f, dict)]
+    if not confirmed:
+        return []
+
+    claimed = await _claimed_closures(db, task_id, packet.generation)
+    uids = finding_uids(confirmed)
+
+    touched: dict[str, str] = {}
+    if any(claimed.get(uid) == "fixed" for uid in uids):
+        # Один обход ветки на все находки: вызов на каждую сделал бы
+        # привратника непригодным на живом размере отчёта (#1042).
+        #
+        # Считаем ДО закреплённого sha, а не до вершины ветки. Вершина —
+        # движущаяся цель: к моменту вопроса она может стоять не там, где
+        # стояла сдача, и «исправлено» подтверждалось бы коммитом, которого
+        # в сдаче нет (урок #1150).
+        from hub import repository as repo
+
+        row = await repo.get_task(db, task_id)
+        pinned = ((dict(row).get("submission_sha") if row else "") or "").strip()
+        evidence = await evidence_for_report(
+            db, task_id, confirmed, generation=packet.generation, head=pinned
+        )
+        touched = {
+            uid: str(blob.get("outcome") or "") for uid, blob in evidence.items()
+        }
+
+    out: list[tuple[str, str]] = []
+    for uid, finding in zip(uids, confirmed, strict=True):
+        title = str(finding.get("title") or uid)[:80]
+        kind = claimed.get(uid)
+        if kind is None:
+            out.append(
+                (REFUSED_UNCLOSED, f"находка «{title}» ({uid}) не закрыта ничем")
+            )
+            continue
+        if kind not in CLOSURE_EVIDENCE:
+            out.append(
+                (
+                    REFUSED_UNCLOSED,
+                    f"находка «{title}» ({uid}): закрытие типа {kind!r} вне "
+                    f"словаря {sorted(CLOSURE_EVIDENCE)}",
+                )
+            )
+            continue
+        proven = await _closure_is_proven(db, task_id, packet, uid, kind, touched)
+        if not proven:
+            out.append(
+                (
+                    REFUSED_UNCLOSED,
+                    f"находка «{title}» ({uid}): закрытие {kind} объявлено, но "
+                    f"хаб его не подтверждает — ожидалось, что "
+                    f"{CLOSURE_EVIDENCE[kind]}",
+                )
+            )
+    return out
+
+
+async def _claimed_closures(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> dict[str, str]:
+    """Что стюард ЗАЯВИЛ про каждую находку — по uid, а не по позиции (#1007)."""
+    import json
+
+    from hub import repository as repo
+
+    row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+    if row is None:
+        return {}
+    try:
+        entries = json.loads(dict(row).get("closures") or "[]")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    return {
+        str(e.get("finding_uid")): str(e.get("type"))
+        for e in entries
+        if isinstance(e, dict) and e.get("finding_uid")
+    }
+
+
+async def _closure_is_proven(
+    db: aiosqlite.Connection,
+    task_id: int,
+    packet: EvidencePacket,
+    uid: str,
+    kind: str,
+    touched: dict[str, str],
+) -> bool:
+    """Подтверждает ли ХАБ это закрытие. Незнание — не подтверждение (#762)."""
+    from hub import repository as repo
+    from hub.services.finding_evidence import OUTCOME_TOUCHED
+
+    if kind == "fixed":
+        return touched.get(uid) == OUTCOME_TOUCHED
+    report = packet.facts.get("machine_review_report")
+    review_id = int(((report.value if report else None) or {}).get("review_id") or 0)
+    if kind == "human_disposition":
+        rows = await repo.list_finding_dispositions(db, review_id)
+        return any(
+            str(dict(r).get("finding_uid") or "") == uid
+            and str(dict(r).get("decided_by") or "").strip()
+            for r in rows
+        )
+    if kind == "out_of_scope_linked":
+        for row in await repo.list_finding_outcomes(db, review_id):
+            entry = dict(row)
+            if str(entry.get("finding_uid") or "") != uid:
+                continue
+            linked = entry.get("linked_task_id")
+            if not linked:
+                return False
+            # Задача обязана СУЩЕСТВОВАТЬ: ссылка на несозданное — обещание,
+            # а не вынос.
+            return await repo.get_task(db, int(linked)) is not None
+        return False
+    return False
+
+
 def ladder_refusal(packet: EvidencePacket) -> tuple[str, str] | None:
     """Ladder — по фактическому диффу, а не по заявленным областям.
 
@@ -245,6 +417,7 @@ async def apply_refusals(
 
     out = precondition_refusals(packet)
     out.extend(await loud_refusals(db, task, packet))
+    out.extend(await closure_refusals(db, task_id, packet))
     ladder = ladder_refusal(packet)
     if ladder:
         out.append(ladder)
