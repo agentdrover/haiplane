@@ -76,6 +76,7 @@ async def apply_judgement(
         raise HTTPException(404, detail=f"задачи #{task_id} нет")
     task = dict(row)
 
+    _refuse_if_the_submission_moved(task, generation)
     _refuse_if_the_verdict_is_taken(task, generation)
 
     judgement = await repo.get_steward_judgement(db, task_id, generation, "verdict")
@@ -110,6 +111,34 @@ async def apply_judgement(
 
     await _record(db, task_id, ReviewVerdict.changes_requested, generation)
     return RETURNED, f"работа возвращена автору, цикл {cycles + 1}"
+
+
+def _refuse_if_the_submission_moved(task: dict[str, Any], generation: int) -> None:
+    """Суждение о ПРОШЛОЙ сдаче не применяется к нынешней.
+
+    Найдено кросс-модельным ревью и воспроизведено: без этой проверки
+    суждение генерации 1 записывалось вердиктом на генерацию 2. Причина
+    в том, что запись вердикта привязывает его к ТЕКУЩЕЙ сдаче задачи, а
+    не к той, о которой судили, — и человеческий approve на живой сдаче
+    оказывался затёрт мнением о коде, которого на ветке уже нет.
+
+    Проверка «вердикт на эту генерацию уже стоит» этот случай не ловит и
+    не могла: она сравнивает поле с ЗАПРОШЕННОЙ генерацией, поэтому чужая
+    генерация проходит мимо неё именно потому, что чужая. Пин из #1120
+    здесь тот же: суждение о сдаче, которую уже сменили, описывает не тот
+    исход, который решается.
+    """
+    live = int(task.get("submission_generation") or 0)
+    if live == generation:
+        return
+    raise HTTPException(
+        409,
+        detail=(
+            f"суждение о сдаче {generation}, а живая сдача — {live}: "
+            "применять его значило бы записать вердикт о коде, которого "
+            "на ветке уже нет"
+        ),
+    )
 
 
 def _refuse_if_the_verdict_is_taken(task: dict[str, Any], generation: int) -> None:
@@ -173,9 +202,22 @@ async def _hand_to_the_human(
     """
     from hub.services.orchestration import log_activity
 
-    await repo.transition_status_if(
+    moved = await repo.transition_status_if(
         db, task_id, expected_from="review", new_status=ESCALATED_TO_HUMAN
     )
+    if not moved:
+        # Задача уже не в review — эскалация состоялась раньше. Второй
+        # алерт про исчерпанный бюджет не добавил бы ничего, кроме шума в
+        # карточке, и создал бы впечатление двух разных событий. Этот путь
+        # вердикта не пишет, поэтому замок «вердикт уже стоит» его не
+        # держит — держит вот этот отказ.
+        raise HTTPException(
+            409,
+            detail=(
+                "бюджет уже исчерпан и задача уже передана человеку — "
+                "повторное применение ничего не меняет"
+            ),
+        )
     await repo.add_task_update(
         db,
         task_id,
@@ -188,6 +230,18 @@ async def _hand_to_the_human(
             "клиентском пути нет — им и является это решение."
         ),
         author_kind="hub",
+    )
+    # Тем же событием, которым эскалирует канонический путь
+    # (orchestration.py, review_cycle_limit). Своё имя здесь означало бы,
+    # что счётчик исчерпанных бюджетов расходится в зависимости от того,
+    # кто вернул работу, — а весь эпик стоит на сравнении этих двух
+    # маршрутов.
+    await repo.insert_event(
+        db,
+        kind=ESCALATED_TO_HUMAN,
+        task_id=task_id,
+        actor=_STEWARD_ACTOR,
+        payload={"reason": "review_cycle_limit"},
     )
     await log_activity(
         db,

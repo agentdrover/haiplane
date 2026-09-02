@@ -226,3 +226,91 @@ async def test_an_escalation_is_not_applied(db: aiosqlite.Connection, monkeypatc
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "review", "задача не двинулась"
     assert not (task.get("review_verdict") or ""), "и вердикта не появилось"
+
+
+async def test_a_judgement_about_an_older_submission_is_refused(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Суждение о прошлой сдаче не становится вердиктом нынешней.
+
+    Найдено кросс-модельным ревью на первой сдаче #1149 и воспроизведено
+    здесь тем же сценарием: человек одобрил живую сдачу, а суждение о
+    ПРЕДЫДУЩЕЙ приходит следом. Без пина оно записывалось вердиктом на
+    текущую генерацию — потому что запись вердикта привязывает его к
+    текущей сдаче, а не к той, о которой судили.
+
+    Проверка «вердикт на эту генерацию уже стоит» этот случай пропускает
+    по устройству: она сравнивает поле с ЗАПРОШЕННОЙ генерацией, и чужая
+    проходит мимо неё именно потому, что чужая. Поэтому тест смотрит на
+    вердикт задачи ПОСЛЕ отказа — что он остался человеческим.
+    """
+    project_id = await _project(db, "applied-stale-gen")
+    task_id = await _client_task(db, project_id, submission_generation=2)
+    await _judge(db, task_id, verdict="changes_requested", generation=1)
+    await repo.update_task(
+        db,
+        task_id,
+        review_verdict="approved",
+        review_verdict_generation=2,
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await apply_judgement(db, task_id, 1)
+    assert exc.value.status_code == 409
+    assert "живая сдача" in str(exc.value.detail)
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["review_verdict"] == "approved"
+    assert row["review_verdict_generation"] == 2
+
+
+async def test_the_exhausted_budget_escalates_once(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Второе применение на исчерпанном бюджете отказывает, а не алертит снова.
+
+    Найдено ревью как unresolved и подтверждено: бюджетный путь вердикта
+    не пишет, поэтому замок «вердикт уже стоит» его не держит. Раньше
+    повтор молча проваливал переход и всё равно клал в карточку второй
+    алерт — два одинаковых события там, где произошло одно.
+
+    Заодно проверяется само событие: канонический путь эскалации пишет
+    needs_decision с причиной review_cycle_limit, и стюард обязан писать
+    ТО ЖЕ, иначе счётчик исчерпанных бюджетов разойдётся по тому, кто
+    вернул работу.
+    """
+    project_id = await _project(db, "applied-budget-once")
+    task_id = await _client_task(
+        db,
+        project_id,
+        submission_generation=1,
+        review_cycle=config.MAX_REVIEW_CYCLES,
+    )
+    await _judge(db, task_id, verdict="changes_requested", generation=1)
+
+    outcome, _ = await apply_judgement(db, task_id, 1)
+    assert outcome == ESCALATED_TO_HUMAN
+
+    events = await repo.fetchall(
+        db,
+        "SELECT kind, payload FROM events WHERE task_id = ? AND kind = ?",
+        (task_id, ESCALATED_TO_HUMAN),
+    )
+    assert len(events) == 1
+    assert "review_cycle_limit" in str(dict(events[0])["payload"])
+
+    alerts_before = await _budget_alerts(db, task_id)
+    with pytest.raises(HTTPException) as exc:
+        await apply_judgement(db, task_id, 1)
+    assert exc.value.status_code == 409
+    assert await _budget_alerts(db, task_id) == alerts_before
+
+
+async def _budget_alerts(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await repo.fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id = ? AND kind = 'alert'",
+        (task_id,),
+    )
+    return sum(1 for r in rows if "Бюджет циклов ревью исчерпан" in dict(r)["content"])
