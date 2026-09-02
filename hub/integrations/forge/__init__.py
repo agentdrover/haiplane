@@ -8,27 +8,44 @@ from hub.integrations.forge.github import GitHubForge
 from hub.integrations.forge.gitverse import GitVerseForge
 from hub.models import DEFAULT_FORGE
 
-#: Git-хост по ИМЕНИ форжа (#1118).
+#: Адаптер по ИМЕНИ форжа. ОДИН реестр на все нужды, и это не косметика.
 #:
-#: Отдельно от выбора адаптера для вызовов API (#1146) намеренно: адрес клона
-#: — чистое форматирование, ему не нужны ни токен, ни сеть, ни состояние.
-#: Отдельно и от адреса API: у GitVerse это разные точки входа
-#: (``api.gitverse.ru`` против ``gitverse.ru``) и разные credential'ы —
-#: токен для API, deploy key для git.
+#: #1119 завела здесь карту для АДРЕСОВ (ссылка — чистое форматирование, ей не
+#: нужны ни токен, ни сеть), #1118 — для провижининга, которое обязано спросить
+#: ИМЕННО тот форж, что объявлен у проекта. Две карты с одинаковым содержимым
+#: разошлись бы ровно там, где это дороже всего: добавили третий форж в одну —
+#: и ссылки на него ведут в никуда, либо провижининг клонирует не оттуда.
+#: Правило «какой форж» и так живёт в единственном читателе (#1114); второй
+#: копии таблицы «чем его обслуживать» здесь тоже не заводится.
+_BY_NAME: dict[str, type] = {"github": GitHubForge, "gitverse": GitVerseForge}
+
+#: Git-хост по имени форжа (#1118).
+#:
+#: Отдельно от адреса API: у GitVerse это разные точки входа
+#: (``api.gitverse.ru`` против ``gitverse.ru``) и разные credential'ы — токен
+#: для API, deploy key для git.
 _GIT_HOSTS: dict[str, str] = {"github": "github.com", "gitverse": "gitverse.ru"}
 
 
-#: Адаптер по имени форжа. Реестр гейтовых вызовов — задача #1146; здесь он
-#: нужен провижинингу, которое обязано спросить ИМЕННО тот форж, что объявлен
-#: у проекта: спросить не тот значит вернуться к дефекту #1118 с другой
-#: стороны. Когда #1146 заведёт свой резолвер, он заменит эту функцию, а не
-#: встанет рядом.
-_CLIENTS: dict[str, type] = {"github": GitHubForge, "gitverse": GitVerseForge}
-
-
 def client_for(forge: str):
-    """Адаптер объявленного форжа. Незнакомое имя — github (#1114)."""
-    return _CLIENTS.get(forge, _CLIENTS[DEFAULT_FORGE])()
+    """Свежий адаптер объявленного форжа.
+
+    Незнакомое имя сводится к github — то же умолчание и по той же причине,
+    что у единственного читателя (#1114): неизвестного форжа не бывает, бывает
+    необъявленный, а уронить доставку из-за строки в базе хуже, чем работать по
+    умолчанию.
+    """
+    return _BY_NAME.get(forge, _BY_NAME[DEFAULT_FORGE])()
+
+
+def repo_url(forge: str, gh_repo: str) -> str:
+    """Адрес репозитория в вебе. Незнакомый форж — как github, см. #1114."""
+    return client_for(forge).repo_url(gh_repo)
+
+
+def pr_url(forge: str, gh_repo: str, pr_number: int) -> str:
+    """Адрес запроса на слияние. У GitHub /pull/, у GitVerse /pulls/."""
+    return client_for(forge).pr_url(pr_number, gh_repo)
 
 
 def git_host(forge: str) -> str:
@@ -80,4 +97,6 @@ __all__ = [
     "clone_urls",
     "forge_of_host",
     "git_host",
+    "pr_url",
+    "repo_url",
 ]

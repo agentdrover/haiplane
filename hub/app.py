@@ -823,6 +823,55 @@ async def api_list_projects(
     return [await _project_view(r) for r in rows]
 
 
+def _refuse_unrunnable_cloud_review(before, fields: dict) -> None:
+    """Не хранить как исполнимую политику, исполнить которую нельзя (#1119).
+
+    Облачный ревьюер работает только с GitHub (измерено 31.08.2026), поэтому
+    ``review=dispatch`` на проекте другого форжа — не «попробуем», а
+    гарантированный отказ на КАЖДОЙ сдаче. Отказать на записи дешевле: тут
+    есть кому прочитать причину.
+
+    Инвариант, а не проверка поля, — и в этом была ошибка первой редакции
+    (найдено ревью, отчёт #201). Она стояла внутри ветки ``gate_policy`` и
+    поэтому смотрела только на патч политики. PATCH, который менял ОДИН
+    ``forge``, проходил мимо: проект с ``review=dispatch`` на GitHub
+    переключался на GitVerse и сохранял политику, которую больше нельзя
+    исполнить. Запрещённое состояние достижимо двумя дорогами, и закрывать
+    надо обе — поэтому оба значения берутся ПОСЛЕ патча, каждое из патча,
+    если оно там есть, иначе из строки.
+    """
+    import json as _json
+
+    from hub.services.review_dispatch import CLOUD_REVIEW_FORGES
+
+    if "forge" not in fields and "gate_policy" not in fields:
+        return
+    if "gate_policy" in fields and fields["gate_policy"] is not None:
+        review_after = str(
+            _json.loads(fields["gate_policy"]).get("review") or ""
+        ).strip()
+    else:
+        review_after = str(
+            project_policy.gate_policy_of(before).get("review") or ""
+        ).strip()
+    forge_after = str(fields.get("forge") or project_policy.forge_of(before)).strip()
+    if review_after != "dispatch" or forge_after in CLOUD_REVIEW_FORGES:
+        return
+    raise HTTPException(
+        422,
+        {
+            "error": "cloud_review_forge_unsupported",
+            "hint": (
+                f"облачный ревьюер не работает с форжем «{forge_after}»: "
+                f"он принимает только {', '.join(CLOUD_REVIEW_FORGES)} "
+                "(проверено 31.08.2026). Уберите review=dispatch — "
+                "ключ принимает off или dispatch, и вердикт всё равно за "
+                "человеком"
+            ),
+        },
+    )
+
+
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
 async def api_patch_project(
     project_id: int,
@@ -846,26 +895,36 @@ async def api_patch_project(
         import json as _json
 
         # #743: the hub never weakens oversight over itself — the default
-        # project (the hub's own repo) refuses any 'auto' at any gate, from
-        # any token. The rule lives here rather than in the model because it
-        # needs to know WHICH project is being patched.
+        # project (the hub's own repo) refuses any DELEGATING value at the
+        # gate keys, from any token. The rule lives here rather than in the
+        # model because it needs to know WHICH project is being patched.
         # #760 keeps the check on the two GATE keys by name: the policy now
         # also carries a path map and a ceiling, and "any value equals auto"
         # would quietly start meaning something else as keys are added.
+        #
+        # #1151: сравнение шло ровно со строкой "auto", и появление второго
+        # делегирующего значения сделало бы замок обходимым одним словом —
+        # verdict=steward на default включил бы на репозитории самого хаба
+        # ту автоматику, которую этот замок и запрещает. Теперь читается тот
+        # же перечень, что и у потребителей политики: новый делегат
+        # закрывается здесь в тот же момент, когда открывается там.
         if before["slug"] == "default" and any(
-            fields["gate_policy"].get(gate) == "auto" for gate in ("dor", "verdict")
+            fields["gate_policy"].get(gate) in project_policy.DELEGATED_VERDICTS
+            for gate in ("dor", "verdict")
         ):
             raise HTTPException(
                 422,
                 {
                     "error": "default_project_gate_locked",
                     "hint": (
-                        "проект default (сам хаб) не принимает автопилот ни на "
-                        "одном гейте; политика default всегда human"
+                        "проект default (сам хаб) не принимает делегирование "
+                        "ни на одном гейте — ни автопилоту, ни стюарду; "
+                        "политика default всегда human"
                     ),
                 },
             )
         fields["gate_policy"] = _json.dumps(fields["gate_policy"])
+    _refuse_unrunnable_cloud_review(before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
     if fields:

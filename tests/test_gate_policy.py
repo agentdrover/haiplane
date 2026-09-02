@@ -8,6 +8,8 @@ does not weaken oversight over itself.
 
 from __future__ import annotations
 
+import json
+
 from httpx import AsyncClient
 
 from hub import config
@@ -261,3 +263,149 @@ async def test_default_project_may_ask_for_review(client: AsyncClient):
     )
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"]["error"] == "default_project_gate_locked"
+
+
+# ---------------------------------------------------------------------------
+# #1151 — verdict=steward: композиция с автопилотом, а не замена его
+# ---------------------------------------------------------------------------
+
+
+def test_every_policy_consumer_is_enumerated():
+    """Все читатели gate_policy.verdict спрашивают ОДИН перечень.
+
+    Значение политики читают четыре независимых места, и каждое решает
+    своё. Достаточно одному прочитать «verdict больше не auto» как «здесь
+    теперь всё ручное» — и проект тихо теряет автовердикт на чистых
+    сдачах. Обнаружится это не отказом, а очередью у человека.
+
+    Проверяется перечислением: тест, трогающий одного потребителя, не
+    отличает композицию от совпадения.
+    """
+    from hub.services.digest import _policy_delegates
+    from hub.services.project_policy import (
+        DELEGATED_VERDICTS,
+        review_dispatch_enabled,
+        verdict_is_delegated,
+    )
+    from hub.services.steward_dispatch import _policy_wants_steward
+
+    assert DELEGATED_VERDICTS == frozenset({"auto", "steward"})
+
+    steward = {"verdict": "steward"}
+    assert verdict_is_delegated(steward), (
+        "автовердикт обязан считать это делегированием"
+    )
+    assert review_dispatch_enabled(steward), (
+        "стюард судит ПО ОТЧЁТУ: проект без заказанного ревью судил бы вслепую"
+    )
+    assert _policy_delegates(json.dumps(steward)), "дайджест обязан выйти"
+
+    class _Row(dict):
+        pass
+
+    assert _policy_wants_steward(_Row(gate_policy=json.dumps(steward))), (
+        "диспетчер обязан заказать прогон"
+    )
+
+    # Зеркало: чисто человеческая политика не включает НИЧЕГО. Проверка,
+    # умеющая только разрешать, неотличима от выключателя.
+    human = {"verdict": "human"}
+    assert not verdict_is_delegated(human)
+    assert not review_dispatch_enabled(human)
+    assert not _policy_delegates(json.dumps(human))
+    assert not _policy_wants_steward(_Row(gate_policy=json.dumps(human)))
+
+    # Нераспознанное значение — это человек, а не «кто-нибудь» (#835).
+    assert not verdict_is_delegated({"verdict": "stewrad"})
+
+    # Пятый потребитель, который читает тот же вопрос раньше всех: валидатор
+    # API. Пока он знал только human и auto, «verdict=steward» нельзя было
+    # СОХРАНИТЬ вовсе — рычаг перевода проекта на стюарда не существовал, и
+    # политику можно было положить только прямо в базу, мимо всех проверок.
+    from hub.services.project_policy import GATE_VALUES
+
+    assert GATE_VALUES == frozenset({"human"}) | DELEGATED_VERDICTS, (
+        "принимаемые значения и делегирующие обязаны идти одним перечнем: "
+        "иначе слово можно научиться понимать, не научив API его принимать"
+    )
+
+
+async def test_steward_composes_with_auto(client: AsyncClient):
+    """AC-1 (#1151): перевод на steward ничего не выключает.
+
+    Проверяется на живом проекте через API, а не на словаре в памяти:
+    политика хранится строкой, и путь от неё до потребителя проходит через
+    разбор JSON, где и теряются такие вещи.
+    """
+    from hub.services.project_policy import (
+        gate_policy_of,
+        review_dispatch_enabled,
+        verdict_is_delegated,
+    )
+
+    pid = await _create_project(client, "spike-steward")
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"dor": "auto", "verdict": "steward"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    listed = {p["id"]: p for p in (await client.get("/api/projects")).json()}
+    stored = listed[pid]["gate_policy"]
+    assert stored == {"dor": "auto", "verdict": "steward"}
+
+    policy = gate_policy_of({"gate_policy": json.dumps(stored)})
+    assert verdict_is_delegated(policy), (
+        "автовердикт на чистой сдаче обязан продолжать работать: стюард "
+        "добавлен на грязный путь, а не поставлен вместо автопилота"
+    )
+    assert review_dispatch_enabled(policy)
+
+
+async def test_default_project_lock_covers_every_delegating_value(client: AsyncClient):
+    """AC-3 (#1151): замок #743 закрывает КАЖДОЕ делегирующее значение.
+
+    Замок сравнивался ровно со строкой «auto». Появление второго
+    делегирующего слова сделало бы его обходимым одной буквой: verdict=
+    steward на default включил бы на репозитории самого хаба ту автоматику,
+    которую замок и запрещает. Перебор по перечню, а не два примера: третье
+    слово, добавленное в перечень и забытое здесь, повторит ту же дыру.
+    """
+    from hub.services.project_policy import DELEGATED_VERDICTS
+
+    pid = await _create_project(client, "default")
+
+    for gate in ("dor", "verdict"):
+        for value in sorted(DELEGATED_VERDICTS):
+            resp = await client.patch(
+                f"/api/projects/{pid}", json={"gate_policy": {gate: value}}
+            )
+            assert resp.status_code == 422, (
+                f"{gate}={value} обязано быть отвергнуто на проекте default: {resp.text}"
+            )
+            assert resp.json()["detail"]["error"] == "default_project_gate_locked"
+
+    # Человеческая политика по-прежнему сохраняется — замок не запрещает всё.
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"dor": "human", "verdict": "human"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_an_unknown_gate_value_is_still_refused(client: AsyncClient):
+    """Расширение словаря не превратило его в «что угодно».
+
+    Зеркало к предыдущему: раз API теперь принимает новое слово, надо
+    показать, что он по-прежнему отвергает НЕ слово. Опечатка в политике не
+    имеет права сохраниться и потом читаться как «человек» — тихо, без
+    единого признака, что владелец промахнулся.
+    """
+    pid = await _create_project(client, "spike-typo")
+
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "stewrad"}}
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "gate_policy" in resp.text

@@ -324,6 +324,12 @@ def test_review_message_points_at_the_branch_and_the_pr(
         branch="task-42/fix",
         pr_number=100,
         breadcrumb="Эпик > Фича",
+        # #1119: адрес приходит СНАРУЖИ. Раньше сборщик собирал его сам из
+        # литерала github.com и глобального REPO_NAME — то есть знал и
+        # хостинг, и репозиторий, и оба знал неверно для любого проекта,
+        # кроме одного. Прежнее ожидание закрепляло именно это: ссылку,
+        # выдуманную тем, кто не может её знать.
+        pr_url="https://github.com/mrPDA/repo/pull/100",
     )
 
     assert "#42" in msg and "Починить поллер" in msg
