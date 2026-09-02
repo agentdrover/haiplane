@@ -2350,7 +2350,13 @@ async def test_the_same_submission_on_github_does_reach_cursor(
 # ---------------------------------------------------------------------------
 
 
-async def _report_on_current(db: aiosqlite.Connection, task_id: int) -> int:
+async def _report_on_current(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    incomplete: bool = False,
+    self_reviewed: bool = False,
+) -> int:
     """Отчёт машинного ревью на текущую генерацию задачи."""
     task = dict(await repo.get_task(db, task_id))
     return await repo.insert_machine_review(
@@ -2361,7 +2367,8 @@ async def _report_on_current(db: aiosqlite.Connection, task_id: int) -> int:
         model="grok-4.6",
         raw_count=3,
         findings_confirmed=json.dumps([]),
-        incomplete=False,
+        incomplete=incomplete,
+        self_reviewed=self_reviewed,
         submitted_by="cursor-cloud-reviewer",
     )
 
@@ -2464,3 +2471,90 @@ async def test_a_submission_without_a_pinned_sha_is_not_a_match(
         )
         is None
     )
+
+
+async def test_an_incomplete_report_does_not_lock_the_sha(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполный отчёт не есть прочитанный код (#879).
+
+    Найдено кросс-модельным ревью первой сдачи, и находка бьёт в саму
+    задачу: правило, написанное ради экономии прогонов, запирало добор
+    непрочитанного. Отчёт с incomplete=true САМ говорит, что дочитал не
+    всё, — назвать его чтением значит поверить утверждению, которое он о
+    себе опровергает.
+
+    Направление ошибки то же, что и во всём правиле: лишний прогон стоит
+    денег, пропущенный — сдачи без ревью.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-incomplete-sha")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id, incomplete=True)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 2, (
+        "отчёт, объявивший себя неполным, покрытием не является — иначе "
+        "правило запирает лестницу добора #879"
+    )
+
+
+async def test_a_self_report_does_not_cancel_the_independent_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Отчёт исполнителя о себе не отменяет ревьюера со стороны.
+
+    Найдено кросс-модельным ревью. Тот же автор уже однажды закрыл чужой
+    диспетчер как выполненный своим параллельным отчётом (#1011, #1025) —
+    здесь он закрывал бы его ещё до старта, и «код прочитан» означало бы
+    «автор прочитал свой код». Независимость — весь смысл кросс-модельного
+    контура, и правило экономии не должно её покупать.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-self-report")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id, self_reviewed=True)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 2, (
+        "самоотчёт не есть независимое чтение — он не может отменить "
+        "кросс-модельного ревьюера"
+    )
+
+
+async def test_the_refusal_is_as_loud_as_the_other_dispatcher_refusals(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ пишется алертом, как остальные отказы диспетчера.
+
+    Найдено кросс-модельным ревью: я написал его как status, то есть тише
+    соседей. Отказ, который тише остальных, читается как «ничего не
+    произошло» ровно там, где ревьюера не позвали, — а не позвать
+    ревьюера это событие, а не отсутствие события.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-refusal-loud")
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    kinds = {
+        dict(u)["kind"]
+        for u in await repo.get_task_updates(db, task_id)
+        if f"отчёт #{review_id}" in dict(u)["content"]
+    }
+    assert kinds == {"alert"}, f"отказ обязан быть слышен как алерт: {kinds}"
