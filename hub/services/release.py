@@ -39,6 +39,7 @@ from hub.integrations.protocols import CIProbeOutcome, MergeabilityOutcome
 from hub.integrations.registry import plugins
 from hub.services.project_policy import (
     base_branch_of,
+    forge_of,
     gate_policy_of,
     release_auto_enabled,
     release_base_of,
@@ -190,7 +191,11 @@ async def open_release_for_range(
 
     try:
         subjects = await plugins.git_ops.release_range(
-            base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            base,
+            head,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         return None, [], [], f"диапазон релиза {head} → {base} не прочитан: {exc}"
@@ -237,6 +242,7 @@ async def open_release_for_range(
             body,
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         return None, subjects, task_ids, f"релизный PR {head} → {base} не открыт: {exc}"
@@ -266,11 +272,16 @@ async def merge_ready_release(
     project = dict(project_row)
     if not release_auto_enabled(gate_policy_of(project_row)):
         return False, ""
-    # The project row names the local clone in workspace_path and the GitHub
-    # repository in repo — the same two keys project_git_context reads.
+    # The project row names the local clone in workspace_path and the
+    # repository in repo — the same keys project_git_context reads.
+    # #1146: площадка — величина той же природы, что клон и репозиторий, и
+    # живёт в том же ctx. Отдельным именем, чтобы у неё был тип str: у форжа
+    # нет состояния «не задан», а соседние ключи допускают None.
+    forge = forge_of(project_row)
     ctx = {
         "repo": (project.get("workspace_path") or "").strip() or None,
         "gh_repo": (project.get("repo") or "").strip() or None,
+        "forge": forge,
     }
     base = release_base_of(project_row)
     head = base_branch_of(project_row)
@@ -278,12 +289,18 @@ async def merge_ready_release(
         return False, ""
     try:
         pr_number = await plugins.git_ops.pr_for_branch(
-            head, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
+            head,
+            repo=ctx["repo"],
+            gh_repo=ctx["gh_repo"],
+            forge=forge,
         )
         if not pr_number:
             return await _open_release_for_tail(db, project_row, ctx, base, head)
         ci = await plugins.git_ops.check_pr_ci(
-            pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
+            pr_number,
+            repo=ctx["repo"],
+            gh_repo=ctx["gh_repo"],
+            forge=forge,
         )
         if ci.outcome != CIProbeOutcome.passed:
             return False, (
@@ -297,7 +314,10 @@ async def merge_ready_release(
         # said no; a conflict, a revoked token and a deleted base branch all
         # produce it and none is fixed the same way.
         state, why = await plugins.git_ops.check_pr_mergeable(
-            pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"]
+            pr_number,
+            repo=ctx["repo"],
+            gh_repo=ctx["gh_repo"],
+            forge=forge,
         )
         if state != MergeabilityOutcome.mergeable:
             # Never merged on anything but a definite yes. "Not computed yet"
@@ -318,6 +338,7 @@ async def merge_ready_release(
             # default deletes the head — right for task branches, and the very
             # act that removed develop on every auto-release of 24–25.08.
             delete_branch=False,
+            forge=forge,
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         return False, f"релиз не удалось провести: {exc}"
@@ -439,7 +460,10 @@ async def _stamp_released_merges(
     """
     try:
         release_sha = await plugins.git_ops.merge_commit_sha(
-            pr_number, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            pr_number,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
         if not release_sha:
             log.warning(
@@ -488,7 +512,11 @@ async def _return_the_release(
     """
     try:
         state, detail = await plugins.git_ops.return_release_into_base(
-            base, head, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            base,
+            head,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         log.warning("release: could not return %s into %s: %s", base, head, exc)

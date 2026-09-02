@@ -46,10 +46,14 @@ async def test_a_configured_default_project_yields_its_context(client: AsyncClie
 
     ctx = await project_git_context(db, task_id)
 
+    # Четвёртый ключ пришёл с #1146. Смысл проверки не изменился: она стережёт,
+    # что НИ ОДНО настроенное владельцем значение не потеряно, а не что их
+    # ровно три.
     assert ctx == {
         "repo": "/var/lib/haiplane-hub/workspaces/hub",
         "gh_repo": "agentdrover/haiplane",
         "base_branch": "develop",
+        "forge": "github",
     }, "the owner configured these values; dropping any of them is the defect"
 
 
@@ -138,8 +142,15 @@ async def test_other_projects_context_is_untouched(client: AsyncClient, db):
 
     ctx = await project_git_context(db, epic_id)
 
+    # #1146 добавил сюда четвёртый ключ. Ожидание правлено СОЗНАТЕЛЬНО, и это
+    # не смена поведения: контекст — носитель пер-проектных значений, и форж
+    # ровно такое значение. Наблюдаемое поведение github-проекта прежнее до
+    # кода возврата — резолвер отдаёт настроенный адаптер, когда имя совпадает
+    # с ним. Изменилось то, что носитель теперь НЕСЁТ площадку, ради чего
+    # задача и заведена.
     assert ctx == {
         "repo": "/srv/ws/calc-kids",
         "gh_repo": "mrPDA/calc-kids",
         "base_branch": "master",
+        "forge": "github",
     }
