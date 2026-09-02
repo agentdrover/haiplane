@@ -15,7 +15,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
-from hub.models import STEWARD_ESCALATE_REASONS
+from hub.models import STEWARD_ESCALATE_REASONS, TaskRefine
 from hub.services import gate_grounds as grounds
 from hub.services.auto_approve import LADDER_SURFACES
 from hub.services.ci_report import VALIDATION_PASS
@@ -425,4 +425,61 @@ def test_the_gatekeeper_reads_the_diff_not_the_declaration():
     assert clean is None, (
         "дифф вне ladder-поверхностей обязан проходить: проверка, умеющая "
         "только отказывать, неотличима от выключателя"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ladder через НАСТОЯЩИЙ путь применения (#1147 ревью, отчёт 207)
+# ---------------------------------------------------------------------------
+
+
+async def test_ladder_stops_apply_through_the_real_entry(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ лестницы приходит из apply_refusals, а не только из своей функции.
+
+    Прошлая версия этой проверки звала ladder_refusal напрямую и строила
+    пакет руками. Функция была верна, а путь до неё — не проверен: в
+    окружении без клона факт диффа всегда отсутствует, и ветка ladder
+    внутри привратника не исполнялась ни одним тестом. Правило можно
+    написать правильно и не позвать — ровно это ревью и назвало.
+
+    Поэтому здесь настоящий вход: apply_refusals на задаче, чей ФАКТИЧЕСКИЙ
+    дифф трогает hub/auth.py при широко заявленной области hub/. Дифф даёт
+    подменённый git_ops — тем же способом, каким его дают тесты автовердикта:
+    подделан обход ветки, а не решение привратника.
+    """
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    class _DiffOps(NoopGitOps):
+        """Ветка, чей дифф трогает правила гейтов."""
+
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return ["hub/services/orchestration.py", "hub/auth.py"]
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return _PINNED
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    monkeypatch.setattr(plugins, "git_ops", _DiffOps())
+
+    project_id = await _project(db, "apply-ladder")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    # Область заявлена ШИРОКО — по декларации ladder не виден, и в этом
+    # весь смысл: сегодняшняя проверка автопилота такую задачу пропускает.
+    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=["hub/"]))
+    await db.commit()
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_LADDER in _codes(refusals), (
+        f"дифф трогает hub/auth.py при широко заявленном hub/ — привратник "
+        f"обязан отказать по лестнице, получено: {refusals}"
+    )
+    ladder_detail = next(d for c, d in refusals if c == REFUSED_LADDER)
+    assert "hub/auth.py" in ladder_detail, "отказ обязан назвать, что именно тронуто"
+    assert "hub/services/orchestration.py" not in ladder_detail, (
+        "остальной дифф лестницы не трогает и в отказе ему не место"
     )
