@@ -526,9 +526,14 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     slot that is already over, and ordering before starting means an order
     placed this tick is executed in the same pass rather than thirty seconds
     later — the judge is cheap to call and expensive to keep waiting.
+
+    The corridor check comes last of all (#1145): it reads judgements this
+    same pass may have just recorded closing runs above, but touches no run
+    and no order — it only ever writes an alert, never a mode.
     """
-    from hub.services.steward_shadow import start_due_runs
+    from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
     await order_due_runs(db)
     await start_due_runs(db)
+    await check_escalation_corridor(db)

@@ -460,6 +460,7 @@ async def _record_merge_and_tidy(db, task: dict, pr_num: int, mctx: dict) -> Non
             pr_num,
             repo=mworkspace,
             gh_repo=mgh_repo,
+            forge=mctx.get("forge", ""),
         )
     except Exception:
         log.exception(
@@ -521,7 +522,10 @@ async def _deliver_approved_review(db, task: dict) -> None:
         mworkspace = mctx.get("repo")
         mgh_repo = mctx.get("gh_repo")
         ci = await plugins.git_ops.check_pr_ci(
-            pr_num, repo=mworkspace, gh_repo=mgh_repo
+            pr_num,
+            repo=mworkspace,
+            gh_repo=mgh_repo,
+            forge=mctx.get("forge", ""),
         )
         if ci.outcome == CIProbeOutcome.passed:
             merged = await plugins.git_ops.merge_pr(
@@ -530,6 +534,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 task["title"],
                 repo=mworkspace,
                 gh_repo=mgh_repo,
+                forge=mctx.get("forge", ""),
             )
             if merged:
                 # Record the commit the merge produced, not
@@ -736,6 +741,7 @@ async def _ensure_pr_for_ci(db, task: dict, ctx: dict, workspace) -> bool:
             repo=workspace,
             gh_repo=ctx.get("gh_repo"),
             base_branch=ctx.get("base_branch"),
+            forge=ctx.get("forge", ""),
         )
         if pr_num:
             await repo.update_task(db, task["id"], pr_number=pr_num)
@@ -795,6 +801,7 @@ async def _sweep_ci_check(db) -> None:
                 task["pr_number"],
                 repo=workspace,
                 gh_repo=ctx.get("gh_repo"),
+                forge=ctx.get("forge", ""),
             )
             if ci.outcome == CIProbeOutcome.pending:
                 continue
@@ -868,6 +875,7 @@ async def _sweep_ci_check(db) -> None:
                         task.get("branch", ""),
                         repo=workspace,
                         gh_repo=ctx.get("gh_repo"),
+                        forge=ctx.get("forge", ""),
                     )
                     log.info(
                         "Poll: task #%d CI failed (cycle %d/%d), dispatching CI fix",

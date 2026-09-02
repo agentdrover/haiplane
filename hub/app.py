@@ -895,22 +895,31 @@ async def api_patch_project(
         import json as _json
 
         # #743: the hub never weakens oversight over itself — the default
-        # project (the hub's own repo) refuses any 'auto' at any gate, from
-        # any token. The rule lives here rather than in the model because it
-        # needs to know WHICH project is being patched.
+        # project (the hub's own repo) refuses any DELEGATING value at the
+        # gate keys, from any token. The rule lives here rather than in the
+        # model because it needs to know WHICH project is being patched.
         # #760 keeps the check on the two GATE keys by name: the policy now
         # also carries a path map and a ceiling, and "any value equals auto"
         # would quietly start meaning something else as keys are added.
+        #
+        # #1151: сравнение шло ровно со строкой "auto", и появление второго
+        # делегирующего значения сделало бы замок обходимым одним словом —
+        # verdict=steward на default включил бы на репозитории самого хаба
+        # ту автоматику, которую этот замок и запрещает. Теперь читается тот
+        # же перечень, что и у потребителей политики: новый делегат
+        # закрывается здесь в тот же момент, когда открывается там.
         if before["slug"] == "default" and any(
-            fields["gate_policy"].get(gate) == "auto" for gate in ("dor", "verdict")
+            fields["gate_policy"].get(gate) in project_policy.DELEGATED_VERDICTS
+            for gate in ("dor", "verdict")
         ):
             raise HTTPException(
                 422,
                 {
                     "error": "default_project_gate_locked",
                     "hint": (
-                        "проект default (сам хаб) не принимает автопилот ни на "
-                        "одном гейте; политика default всегда human"
+                        "проект default (сам хаб) не принимает делегирование "
+                        "ни на одном гейте — ни автопилоту, ни стюарду; "
+                        "политика default всегда human"
                     ),
                 },
             )

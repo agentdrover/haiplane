@@ -568,7 +568,10 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
         state = (
             (
                 await plugins.git_ops.pr_state(
-                    pr_number, repo=workspace or None, gh_repo=gh_repo or None
+                    pr_number,
+                    repo=workspace or None,
+                    gh_repo=gh_repo or None,
+                    forge=ctx.get("forge", ""),
                 )
                 or ""
             )

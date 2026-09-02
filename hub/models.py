@@ -1947,14 +1947,23 @@ class ProjectPatch(BaseModel):
                 f"unknown gate_policy keys: {sorted(unknown)}; "
                 f"allowed: {', '.join(GATE_POLICY_KEYS)}"
             )
+        # #1151: словарь значений гейта. До этой задачи он был {'human',
+        # 'auto'} буквально, и «verdict=steward» не принимался API вовсе —
+        # то есть рычаг, которым владелец должен переводить пилотный проект
+        # на стюарда, не существовал: политику можно было положить только
+        # прямо в базу, мимо всех проверок. Значения перечислены здесь и
+        # только здесь; делегирующие из них живут в project_policy, и оба
+        # перечня сверяются тестом.
+        from hub.services.project_policy import GATE_VALUES
+
         bad = {
             k: val
             for k, val in v.items()
-            if k in ("dor", "verdict") and val not in {"human", "auto"}
+            if k in ("dor", "verdict") and val not in GATE_VALUES
         }
         if bad:
             raise ValueError(
-                f"gate_policy values must be 'human' or 'auto', got: {bad}"
+                f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
             )
         if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
             raise ValueError(
