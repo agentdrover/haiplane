@@ -19,12 +19,13 @@ from hub.services.steward_shadow import (
     ACT_ESCALATION_CEILING,
     ACT_ESCALATION_FLOOR,
     CORRIDOR_INSIDE,
+    CORRIDOR_MIN_JUDGEMENTS,
     CORRIDOR_NO_SAMPLE,
     EVENT_CORRIDOR_ALERT,
     REASON_OVER_ESCALATING,
     REASON_STAMPING,
     check_escalation_corridor,
-    weekly_escalation_share,
+    weekly_sample,
 )
 from tests.test_steward_shadow import _pair, _project
 
@@ -45,8 +46,9 @@ async def test_escalation_corridor_alerts_both_ends(db: aiosqlite.Connection):
     """
     project_id = await _project(db, "corridor-both-ends")
 
-    # Верхняя граница: судья эскалирует почти всё подряд.
-    for _ in range(10):
+    # Верхняя граница: судья эскалирует почти всё подряд. Ровно
+    # CORRIDOR_MIN_JUDGEMENTS — с этого размера доля вообще измерима.
+    for _ in range(CORRIDOR_MIN_JUDGEMENTS):
         await _pair(db, project_id, steward="escalate", human=None)
 
     boundary = await check_escalation_corridor(db)
@@ -58,13 +60,13 @@ async def test_escalation_corridor_alerts_both_ends(db: aiosqlite.Connection):
     assert over["state"] == REASON_OVER_ESCALATING
     assert f"{ACT_ESCALATION_CEILING:.0%}" in over["detail"]
 
-    # Нижняя граница: разбавляем выборку до доли ниже пола. Прежние десять
-    # эскалаций остаются в окне — 10 из 210 суждений это уже штамповка, а не
+    # Нижняя граница: разбавляем выборку до доли ниже пола. Прежние двадцать
+    # эскалаций остаются в окне — 20 из 420 (4.8%) это уже штамповка, а не
     # избыточная эскалация.
-    for _ in range(200):
+    for _ in range(400):
         await _pair(db, project_id, steward="changes_requested", human=None)
 
-    share = await weekly_escalation_share(db)
+    share = (await weekly_sample(db)).share
     assert share is not None and share < ACT_ESCALATION_FLOOR
 
     boundary = await check_escalation_corridor(db)
@@ -86,7 +88,7 @@ async def test_empty_window_raises_nothing(db: aiosqlite.Connection):
     Пустая выборка — не ноль процентов и не обвинение в штамповке: «нет
     данных» и «ноль эскалаций» это разные состояния (#762).
     """
-    assert await weekly_escalation_share(db) is None
+    assert (await weekly_sample(db)).share is None
 
     boundary = await check_escalation_corridor(db)
 
@@ -101,7 +103,7 @@ async def test_alert_is_written_once_per_state_change(db: aiosqlite.Connection):
     больше нечего прочитать.
     """
     project_id = await _project(db, "corridor-quiet")
-    for _ in range(10):
+    for _ in range(CORRIDOR_MIN_JUDGEMENTS):
         await _pair(db, project_id, steward="escalate", human=None)
 
     for _ in range(5):
@@ -128,7 +130,7 @@ async def test_old_judgements_fall_out_of_the_week_window(db: aiosqlite.Connecti
     )
     await db.commit()
 
-    assert await weekly_escalation_share(db) is None
+    assert (await weekly_sample(db)).share is None
     assert await check_escalation_corridor(db) is None
     assert await _alerts(db) == []
 
@@ -149,21 +151,21 @@ async def test_a_second_breach_after_recovery_alerts_again(db: aiosqlite.Connect
     """
     project_id = await _project(db, "corridor-again")
 
-    for _ in range(10):
+    for _ in range(CORRIDOR_MIN_JUDGEMENTS):
         await _pair(db, project_id, steward="escalate", human=None)
     assert await check_escalation_corridor(db) == REASON_OVER_ESCALATING
     assert len(await _alerts(db)) == 1
 
-    # Возврат в коридор: доля 10/25 = 40%, внутри 5–50%.
-    for _ in range(15):
+    # Возврат в коридор: доля 20/80 = 25%, внутри 5–50%.
+    for _ in range(60):
         await _pair(db, project_id, steward="approve", human=None)
     assert await check_escalation_corridor(db) is None
     restored = await _alerts(db)
     assert len(restored) == 2, "возврат в коридор — тоже смена состояния"
     assert json.loads(restored[-1]["payload"])["state"] == CORRIDOR_INSIDE
 
-    # Повторный выход за ТУ ЖЕ границу: 50/65 ≈ 77%.
-    for _ in range(40):
+    # Повторный выход за ТУ ЖЕ границу: 120/180 ≈ 67%.
+    for _ in range(100):
         await _pair(db, project_id, steward="escalate", human=None)
     assert await check_escalation_corridor(db) == REASON_OVER_ESCALATING
 
@@ -189,7 +191,8 @@ async def test_a_silent_week_does_not_swallow_the_next_breach(
     project_id = await _project(db, "corridor-silence")
 
     task_ids = [
-        await _pair(db, project_id, steward="escalate", human=None) for _ in range(10)
+        await _pair(db, project_id, steward="escalate", human=None)
+        for _ in range(CORRIDOR_MIN_JUDGEMENTS)
     ]
     assert await check_escalation_corridor(db) == REASON_OVER_ESCALATING
     assert len(await _alerts(db)) == 1
@@ -209,7 +212,71 @@ async def test_a_silent_week_does_not_swallow_the_next_breach(
 
     # Судья возвращается и снова эскалирует всё подряд.
     assert task_ids
-    for _ in range(10):
+    for _ in range(CORRIDOR_MIN_JUDGEMENTS):
         await _pair(db, project_id, steward="escalate", human=None)
     assert await check_escalation_corridor(db) == REASON_OVER_ESCALATING
     assert len(await _alerts(db)) == 3, "после тишины нарушение обязано прозвучать"
+
+
+async def test_a_short_week_is_not_measured(db: aiosqlite.Connection):
+    """Отчёт 203: первое суждение недели не имеет права поднимать алерт.
+
+    При одном суждении доля равна 0% или 100% — обе вне коридора, и первое
+    же суждение теневой фазы писало бы алерт: approve — «штампует»,
+    escalate — «бесполезен». Пустую выборку от нуля отличили (AC-2),
+    недостаточную — нет. Проверяется по краю: на единицу меньше минимума
+    молчит, ровно минимум — измеряет.
+    """
+    project_id = await _project(db, "corridor-short")
+
+    await _pair(db, project_id, steward="approve", human=None)
+    assert await check_escalation_corridor(db) is None
+    assert await _alerts(db) == [], "одно суждение — не штамповка, а одно суждение"
+
+    for _ in range(CORRIDOR_MIN_JUDGEMENTS - 2):
+        await _pair(db, project_id, steward="approve", human=None)
+    assert await check_escalation_corridor(db) is None
+    assert await _alerts(db) == [], "на единицу меньше минимума — всё ещё не измерено"
+
+    await _pair(db, project_id, steward="approve", human=None)
+    assert await check_escalation_corridor(db) == REASON_STAMPING, (
+        "ровно минимум — доля измерима, и 0 из 20 это уже штамповка"
+    )
+
+
+def test_minimum_sample_derives_from_the_floor():
+    """Минимум не выбран, а выведен из пола: сдвинется пол — сдвинется он.
+
+    Второй константы рядом с ACT_ESCALATION_FLOOR не заводится: 5%
+    достижимы ненулевым счётчиком только от двадцати суждений.
+    """
+    import math
+
+    assert CORRIDOR_MIN_JUDGEMENTS == math.ceil(1 / ACT_ESCALATION_FLOOR)
+    assert 1 / CORRIDOR_MIN_JUDGEMENTS <= ACT_ESCALATION_FLOOR, (
+        "при минимальном размере одна эскалация обязана достигать пола"
+    )
+
+
+async def test_alert_text_does_not_round_across_the_boundary(
+    db: aiosqlite.Connection,
+):
+    """Отчёт 203: «5% ниже 5%» — противоречие, а не факт.
+
+    1 из 21 это 4.76%; округление до целого печатало 5% и утверждало, что
+    5% ниже 5%. Человеку, за которым решение (F7), уходила полуправда,
+    которая читается как «проверено». Текст обязан нести счётчик и долю с
+    десятыми — то, из чего человек сам увидит и границу, и расстояние до
+    неё.
+    """
+    project_id = await _project(db, "corridor-rounding")
+    await _pair(db, project_id, steward="escalate", human=None)
+    for _ in range(20):
+        await _pair(db, project_id, steward="approve", human=None)
+
+    assert await check_escalation_corridor(db) == REASON_STAMPING
+    detail = json.loads((await _alerts(db))[-1]["payload"])["detail"]
+
+    assert "1 из 21" in detail, "счётчик — то, что не округляется"
+    assert "4.8%" in detail, "доля с десятыми, а не с округлением к границе"
+    assert "5% — ниже 5%" not in detail and "5% ниже 5%" not in detail

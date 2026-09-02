@@ -28,6 +28,7 @@ is. A token that outlives its order buys nothing.
 from __future__ import annotations
 
 import json
+import math
 import logging
 from dataclasses import dataclass
 
@@ -750,17 +751,51 @@ CORRIDOR_NO_SAMPLE = "no_sample"
 CORRIDOR_INSIDE = "inside"
 
 
-async def weekly_escalation_share(db: aiosqlite.Connection) -> float | None:
-    """Доля эскалаций стюарда за последние CORRIDOR_WINDOW_DAYS дней.
+# Минимальный размер недельной выборки, при котором доля вообще что-то
+# значит (#1145 ревью, отчёт 203). При одном суждении доля равна 0% или 100%
+# — обе вне коридора, и первое же суждение теневой фазы поднимало бы алерт:
+# approve — «штампует», escalate — «бесполезен». Пустую выборку от нуля
+# отличили (AC-2), недостаточную — нет.
+#
+# Число не выбрано, а ВЫВЕДЕНО из пола коридора: 5% достижимы ненулевым
+# счётчиком только от двадцати суждений (1 из 20). Меньше — и «ниже пола»
+# означает ровно «ни одной эскалации», то есть измеряет не склонность
+# судьи, а размер выборки. Второй константы рядом с ACT_ESCALATION_FLOOR
+# не заводится: сдвинется пол — сдвинется и минимум.
+CORRIDOR_MIN_JUDGEMENTS = math.ceil(1 / ACT_ESCALATION_FLOOR)
+
+
+@dataclass(frozen=True)
+class WeeklySample:
+    """Сколько судили и сколько из этого эскалировали за окно."""
+
+    escalated: int
+    judged: int
+
+    @property
+    def share(self) -> float | None:
+        """Доля — или None, когда делить не на что.
+
+        None, а не 0.0 (#762): «нет данных» и «ноль эскалаций» — разные
+        состояния, и подставить второе вместо первого значит обвинить
+        молчание в штамповке.
+        """
+        return (self.escalated / self.judged) if self.judged else None
+
+    @property
+    def enough(self) -> bool:
+        return self.judged >= CORRIDOR_MIN_JUDGEMENTS
+
+
+async def weekly_sample(db: aiosqlite.Connection) -> WeeklySample:
+    """Суждения стюарда за последние CORRIDOR_WINDOW_DAYS дней — счётчиками.
 
     Не то же самое, что ShadowTable.escalation_share: там окно — вся история
     суждений, накопленная ради решения об act; здесь — скользящая неделя,
     ради вопроса «а что СЕЙЧАС», который эту историю не читает вовсе.
 
-    None, а не 0.0, когда за неделю не было ни одного суждения (#762 тем же
-    приёмом, что и у ShadowTable выше): «нет данных» и «ноль эскалаций» —
-    разные состояния, и подставить второе вместо первого значит обвинить
-    молчание в штамповке.
+    Возвращает счётчики, а не долю: доля округляет, а счётчик нет. «1 из
+    21» человек прочитает верно, «5% ниже 5%» — нет (отчёт 203).
     """
     rows = await fetchall(
         db,
@@ -768,17 +803,14 @@ async def weekly_escalation_share(db: aiosqlite.Connection) -> float | None:
         "AND created_at >= datetime('now', ?)",
         (f"-{CORRIDOR_WINDOW_DAYS} days",),
     )
-    judged = len(rows)
-    if not judged:
-        return None
     escalated = sum(1 for row in rows if (dict(row).get("verdict") or "") == "escalate")
-    return escalated / judged
+    return WeeklySample(escalated=escalated, judged=len(rows))
 
 
 CORRIDOR_BREACHES: frozenset[str] = frozenset({REASON_OVER_ESCALATING, REASON_STAMPING})
 
 
-def corridor_state(share: float | None) -> tuple[str, str]:
+def corridor_state(sample: WeeklySample) -> tuple[str, str]:
     """Состояние коридора и текст к нему — по одному тексту на состояние.
 
     Формулировки границ разные не для разнообразия: у них разное лечение.
@@ -787,33 +819,48 @@ def corridor_state(share: float | None) -> tuple[str, str]:
     согласие ничего не стоит, потому что несогласие он не пробовал НИ РАЗУ
     за неделю.
 
-    ``None`` на входе — не ноль процентов, а отсутствие данных, и у него
-    своё состояние: подставить сюда ноль значило бы обвинить молчание в
-    штамповке (#762).
+    Два случая «не измерено», и оба — одно состояние: пустая неделя и
+    неделя короче CORRIDOR_MIN_JUDGEMENTS. Подставить туда долю значило бы
+    обвинить молчание в штамповке (#762) — или обвинить в ней первое же
+    суждение, потому что 0 из 1 это 0%.
+
+    Текст несёт счётчик и долю с десятыми: округление до целого выдавало
+    «5% ниже 5%» на 1 из 21, и человек, за которым решение, получал
+    противоречие вместо факта.
     """
-    if share is None:
+    n = sample.judged
+    if n == 0:
         return (
             CORRIDOR_NO_SAMPLE,
             f"за последние {CORRIDOR_WINDOW_DAYS} дней стюард не вынес ни одного "
             "суждения — коридор не измерен, а не соблюдён",
         )
+    if not sample.enough:
+        return (
+            CORRIDOR_NO_SAMPLE,
+            f"за последние {CORRIDOR_WINDOW_DAYS} дней суждений {n}, а доля "
+            f"значима от {CORRIDOR_MIN_JUDGEMENTS}: меньше — и «ниже пола» "
+            "измеряет размер выборки, а не судью",
+        )
+    share = sample.share or 0.0
+    seen = f"{sample.escalated} из {n} ({share:.1%})"
     if share > ACT_ESCALATION_CEILING:
         return (
             REASON_OVER_ESCALATING,
-            f"недельная доля эскалаций {share:.0%} выше {ACT_ESCALATION_CEILING:.0%}: "
+            f"эскалаций за неделю {seen} — выше {ACT_ESCALATION_CEILING:.0%}: "
             "стюард возвращает человеку почти всё подряд — разбирать всё "
             "равно приходится самому, пользы от суждения сейчас нет",
         )
     if share < ACT_ESCALATION_FLOOR:
         return (
             REASON_STAMPING,
-            f"недельная доля эскалаций {share:.0%} ниже {ACT_ESCALATION_FLOOR:.0%}: "
+            f"эскалаций за неделю {seen} — ниже {ACT_ESCALATION_FLOOR:.0%}: "
             "стюард соглашается почти со всем подряд — он не пробовал "
             "не согласиться, и его согласие сейчас ничего не стоит",
         )
     return (
         CORRIDOR_INSIDE,
-        f"недельная доля эскалаций {share:.0%} в коридоре "
+        f"эскалаций за неделю {seen} — в коридоре "
         f"{ACT_ESCALATION_FLOOR:.0%}–{ACT_ESCALATION_CEILING:.0%}",
     )
 
@@ -837,9 +884,9 @@ async def check_escalation_corridor(db: aiosqlite.Connection) -> str | None:
     нарушениях: без записи о возврате внутрь повторный выход за ту же
     границу выглядел бы как отсутствие смены состояния.
     """
-    share = await weekly_escalation_share(db)
-    state, detail = corridor_state(share)
-    await _announce_corridor_state_once(db, state, share, detail)
+    sample = await weekly_sample(db)
+    state, detail = corridor_state(sample)
+    await _announce_corridor_state_once(db, state, sample, detail)
     return state if state in CORRIDOR_BREACHES else None
 
 
@@ -865,7 +912,7 @@ async def _last_corridor_state(db: aiosqlite.Connection) -> str:
 
 
 async def _announce_corridor_state_once(
-    db: aiosqlite.Connection, state: str, share: float | None, detail: str
+    db: aiosqlite.Connection, state: str, sample: WeeklySample, detail: str
 ) -> None:
     """Пишет ровно один раз на смену состояния, а не на каждый тик поллера."""
     if await _last_corridor_state(db) == state:
@@ -874,7 +921,13 @@ async def _announce_corridor_state_once(
         db,
         kind=EVENT_CORRIDOR_ALERT,
         actor="hub",
-        payload={"state": state, "share": share, "detail": detail},
+        payload={
+            "state": state,
+            "share": sample.share,
+            "escalated": sample.escalated,
+            "judged": sample.judged,
+            "detail": detail,
+        },
     )
     await db.commit()
     if state in CORRIDOR_BREACHES:
