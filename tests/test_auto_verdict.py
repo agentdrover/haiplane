@@ -562,3 +562,46 @@ async def test_lock_only_diff_with_class_still_approves(
     assert body["review_verdict"] == "approved"
     verdicts = await _events(db, "review_verdict_recorded", task_id)
     assert verdicts and verdicts[-1]["actor"] == "policy"
+
+
+async def test_steward_project_still_gets_the_clean_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1151: verdict=steward не выключает автовердикт на чистой сдаче.
+
+    Проверяется ИСПОЛНЕНИЕМ самого автовердикта, а не предикатом рядом с
+    ним. Разница не теоретическая: предикат verdict_is_delegated можно
+    написать верно и не позвать, и тогда перевод проекта на стюарда тихо
+    вернёт человеку всё, что раньше проходило само. Ровно эта мутация
+    пережила первый заход проверки.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-steward", {"verdict": "steward"})
+
+    await _post_review(client, task_id)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] == "approved", (
+        "стюард добавлен на грязный путь, а не поставлен вместо автопилота "
+        "на всех: чистая сдача обязана закрываться как прежде"
+    )
+    verdicts = await _events(db, "review_verdict_recorded", task_id)
+    assert verdicts and verdicts[-1]["actor"] == "policy"
+
+
+async def test_a_human_project_gets_no_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Зеркало: человеческая политика по-прежнему ничего не выносит.
+
+    Без этого теста расширение словаря делегирующих значений неотличимо от
+    «выносить вердикт всегда».
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-human", {"verdict": "human"})
+
+    await _post_review(client, task_id)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] is None
+    assert body["status"] == "review", "вердикт остаётся человеку"
