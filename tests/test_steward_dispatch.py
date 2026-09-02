@@ -289,7 +289,12 @@ def _touch(monkeypatch, outcome: str) -> None:
     проверкой, подделан только факт, на котором оно работает.
     """
 
-    async def _fake(db, task_id, findings, *, generation):
+    async def _fake(db, task_id, findings, *, generation, head=""):
+        assert head, (
+            "решение о сдаче обязано считаться до ЗАКРЕПЛЁННОГО sha, "
+            "а не до вершины ветки: имя ветки — движущаяся цель (#572)"
+        )
+
         from hub.services.finding_identity import finding_uids
 
         return {uid: {"outcome": outcome} for uid in finding_uids(findings)}
@@ -393,3 +398,44 @@ async def test_the_first_submission_is_never_stale(
 
     assert await order_due_runs(db) == 1
     assert await open_run(db, task_id, 1) is not None
+
+
+async def test_a_second_tick_does_not_repeat_the_refusal(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ пишется один раз на генерацию, а не на каждый тик поллера.
+
+    Поллер тикает раз в тридцать секунд, а задача стоит в review часами.
+    Отказ на каждом проходе за ночь превращает фид в сотню одинаковых
+    строк, среди которых больше нечего прочитать — а фид тут единственное
+    место, где человек вообще узнаёт, что прогона не будет.
+    """
+    project_id = await _project(db, "steward-quiet-refusal", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, task_id, 1, [_FINDING])
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+
+    for _ in range(5):
+        assert await order_due_runs(db) == 0
+
+    refusals = [
+        e
+        for e in await _events(db, EVENT_REFUSED)
+        if json.loads(e["payload"]).get("reason") == "no_new_information"
+    ]
+    assert len(refusals) == 1, f"ожидался один отказ, получено {len(refusals)}"
+
+    # Новая генерация — новое состояние, и о ней сказать надо.
+    await repo.update_task(db, task_id, submission_generation=3)
+    await _reported(db, task_id, 2, [_FINDING])
+    await db.commit()
+    assert await order_due_runs(db) == 0
+
+    refusals = [
+        e
+        for e in await _events(db, EVENT_REFUSED)
+        if json.loads(e["payload"]).get("reason") == "no_new_information"
+    ]
+    assert len(refusals) == 2, "следующая сдача — отдельный отказ, а не повтор"

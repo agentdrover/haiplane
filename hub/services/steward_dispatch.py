@@ -128,6 +128,47 @@ async def _refuse(
     await db.commit()
 
 
+async def _refuse_once(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    reason: str,
+    detail: str,
+) -> None:
+    """Отказать один раз на генерацию, а не на каждый тик поллера.
+
+    Поллер тикает раз в тридцать секунд, а задача стоит в review часами:
+    отказ, записанный на каждом проходе, за ночь превращает фид в сотню
+    одинаковых строк, среди которых больше нечего прочитать. Состояние тут
+    не меняется само — оно меняется пересдачей, а пересдача поднимает
+    генерацию, поэтому ключ и есть генерация (#1150 ревью, отчёт 209).
+
+    Тот же приём, что у _announce_refusal_once в steward_shadow (#1107):
+    писать смену состояния, а не факт очередной проверки.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? AND task_id=? "
+        "ORDER BY id DESC LIMIT 50",
+        (EVENT_REFUSED, task_id),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(dict(row).get("payload") or "{}")
+        except ValueError:
+            continue
+        if payload.get("reason") == reason and payload.get("generation") == generation:
+            return
+    await repo.insert_event(
+        db,
+        kind=EVENT_REFUSED,
+        task_id=task_id,
+        actor="hub",
+        payload={"reason": reason, "detail": detail, "generation": generation},
+    )
+    await db.commit()
+
+
 async def runs_today(db: aiosqlite.Connection, project_id: int | None) -> int:
     """Orders placed for this project within the current UTC day."""
     rows = await fetchall(
@@ -350,7 +391,21 @@ async def _nothing_new_since(
     # поведения. Проверка, которую нельзя сломать по отдельности, не
     # проверяется по отдельности, и держать её значит держать код, про
     # который нельзя сказать, работает ли он.
-    evidence = await evidence_for_report(db, task_id, confirmed, generation=previous)
+    # Считаем до ЗАКРЕПЛЁННОГО sha этой сдачи, а не до вершины ветки
+    # (#1150 ревью, отчёт 209). Имя ветки — движущаяся цель: к моменту тика
+    # поллера она может стоять не там, где стояла сдача, и ответ описывал бы
+    # код, которого никто не сдавал. Решение о сдаче читает то, что сдача
+    # закрепила.
+    task_row = await repo.get_task(db, task_id)
+    pinned = ((dict(task_row).get("submission_sha") if task_row else "") or "").strip()
+    if not pinned:
+        # Нечего закреплять — нечего и сравнивать. Прогон покупается:
+        # неизвестность стоит денег, а отказ по незнанию стоит суждения.
+        return ""
+
+    evidence = await evidence_for_report(
+        db, task_id, confirmed, generation=previous, head=pinned
+    )
     if not evidence:
         return ""
     outcomes = [str(blob.get("outcome") or "") for blob in evidence.values()]
@@ -388,7 +443,9 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         # заказа стоит ноль, отказ после — полный прогон (#1150).
         stale = await _nothing_new_since(db, task_id, generation)
         if stale:
-            await _refuse(db, task_id, REFUSED_NO_NEW_INFORMATION, stale)
+            await _refuse_once(
+                db, task_id, generation, REFUSED_NO_NEW_INFORMATION, stale
+            )
             continue
         if await order_run(db, task_id, generation) is not None:
             ordered += 1
