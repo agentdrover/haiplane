@@ -2055,7 +2055,10 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
         try:
             ctx = await project_git_context(state.db, state.task_id)
             state.discovered_pr = await plugins.git_ops.pr_for_branch(
-                state.canonical, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+                state.canonical,
+                repo=ctx.get("repo"),
+                gh_repo=ctx.get("gh_repo"),
+                forge=ctx.get("forge", ""),
             )
         except Exception as exc:  # noqa: BLE001 - best effort by contract
             log.warning(

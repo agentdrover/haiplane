@@ -8,6 +8,7 @@ human_gates metric as the ``audit`` gate.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -223,3 +224,217 @@ async def test_digest_lists_waiting_human_queue(db: aiosqlite.Connection):
     assert queue[0]["age_minutes"] == 10100
     assert queue[0]["title"] == "ждёт решения"
     assert approved not in [q["task_id"] for q in queue]
+
+
+# ---------------------------------------------------------------------------
+# #1143 — стюард виден в дайджесте (F7 #1001)
+# ---------------------------------------------------------------------------
+
+
+async def _steward_project(db: aiosqlite.Connection, slug: str) -> tuple[int, int]:
+    """Проект, делегировавший ТОЛЬКО стюарду: ни одного значения auto."""
+    pid = await repo.create_project(db, slug=slug, name=slug.title())
+    await repo.update_project(db, pid, gate_policy=json.dumps({"verdict": "steward"}))
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
+    await db.commit()
+    return pid, feature
+
+
+async def _steward_judged_task(
+    db: aiosqlite.Connection,
+    feature_id: int,
+    title: str,
+    *,
+    verdict: str = "approve",
+    grounds: list[dict] | None = None,
+) -> int:
+    """Суждение приходит контрактом #1022 — тем же путём, что у живого прогона.
+
+    Не самодельной строкой в таблице: дайджест читает то, что пишет реальный
+    записывающий, и подделка записи проверяла бы согласие теста с собой.
+    """
+    from hub.config import TokenIdentity
+    from hub.models import StewardJudgementSubmit
+    from hub.services.steward_judgement import record_steward_judgement
+
+    task_id = await _node(db, title=title, task_type="task", parent_id=feature_id)
+    await repo.update_task(db, task_id, status="review", submission_generation=1)
+    await db.commit()
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict=verdict,
+            confidence="high",
+            escalate_reason="precondition_failed" if verdict == "escalate" else None,
+            grounds=grounds or [],
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+    return task_id
+
+
+async def test_digest_covers_steward_actions(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """#1143 AC-1: раздел стюарда есть, и в нём ОСНОВАНИЯ, а не только вердикт.
+
+    Вердикт сам по себе непроверяем: «одобрено» говорит, что произошло, и
+    ничего — о том, должно ли было. Поэтому проверяются оба состояния: с
+    основаниями и без них, и второе обязано читаться как отсутствие, а не
+    как пустой список, который шаблон считает истинным (#762).
+    """
+    _pid, feature = await _autopilot_project(db, "dg-steward")
+    grounded = await _steward_judged_task(
+        db,
+        feature,
+        "судил с основаниями",
+        verdict="changes_requested",
+        grounds=[{"source": "ci_pinned_sha", "detail": "CI на закреплённом sha упал"}],
+    )
+    bare = await _steward_judged_task(db, feature, "судил молча", verdict="approve")
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = json.loads((await repo.list_digests(db))[0]["payload"])
+
+    section = {j["task_id"]: j for j in payload["steward_judgements"]}
+    assert set(section) == {grounded, bare}, "оба суждения обязаны быть в разделе"
+
+    assert section[grounded]["verdict"] == "changes_requested"
+    assert section[grounded]["grounds_state"] == "present"
+    assert section[grounded]["grounds"][0]["source"] == "ci_pinned_sha"
+
+    assert section[bare]["grounds"] == []
+    assert section[bare]["grounds_state"] == "absent", (
+        "«оснований нет» — это состояние, а не пустое значение"
+    )
+
+    events = await repo.list_events(db, since=0, kinds=["digest_created"], limit=10)
+    announced = json.loads(dict(events[-1])["payload"])
+    assert announced["steward_judgements"] == 2
+
+    page = await client.get("/digests")
+    assert page.status_code == 200
+    assert "Суждения стюарда" in page.text
+    assert "Решение остаётся человеческим" in page.text
+    assert "CI на закреплённом sha упал" in page.text
+    assert "оснований не приложено" in page.text
+
+
+async def test_steward_only_project_still_gets_a_digest(db: aiosqlite.Connection):
+    """#1143 AC-2: делегирование стюарду — тоже делегирование.
+
+    Признак делегирования искал строку "auto" среди значений gate_policy, и
+    проект, отдавший стюарду вердикт и больше ничего, признавался не
+    делегирующим ничего. Дайджеста для него не было вовсе — а отсутствие
+    дайджеста выглядит ровно как спокойный день.
+    """
+    _pid, feature = await _steward_project(db, "dg-steward-only")
+    judged = await _steward_judged_task(db, feature, "единственная работа дня")
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = json.loads((await repo.list_digests(db))[0]["payload"])
+    assert [j["task_id"] for j in payload["steward_judgements"]] == [judged]
+    assert payload["auto_approvals"] == [], "автопилот тут ничего не решал"
+
+
+async def test_no_steward_activity_no_digest(db: aiosqlite.Connection):
+    """#1143 AC-3: пустой день молчит — правило #739 не ослаблено.
+
+    Проверяется в обе стороны: делегирующий проект без единого действия
+    дайджеста не получает, и следующий (пустой) день после дня с работой —
+    тоже. Отчёт, который выходит каждый день, читать перестают.
+    """
+    _pid, feature = await _steward_project(db, "dg-steward-quiet")
+    assert await generate_due_digests(db, now=_tomorrow()) == 0
+
+    await _steward_judged_task(db, feature, "один день работы")
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    assert await generate_due_digests(db, now=_tomorrow() + timedelta(days=1)) == 0
+
+
+def _steward_counter_cell(page_text: str) -> str:
+    """Именно та ячейка счётчика, а не любая цифра на странице.
+
+    У дайджеста четыре счётчика, и пустые списки соседей рисуют свои нули
+    честно. Проверять «нет нуля на странице» значило бы проверять их, а не
+    стюарда — первая версия этого теста так и падала.
+    """
+    found = re.search(r"суждений стюарда</dt>\s*<dd>(.*?)</dd>", page_text, re.S)
+    assert found is not None, "счётчик суждений стюарда обязан быть на странице"
+    return re.sub(r"<[^>]+>", "", found.group(1)).strip()
+
+
+async def test_a_digest_written_before_the_section_still_renders(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Дайджесты, лежащие в проде, ключа steward_judgements не имеют.
+
+    Не AC, а условие выкладки: страница читается людьми каждый день, и
+    новая секция не имеет права уронить старые записи. Проверяется тем же
+    способом, каким это случилось бы — настоящим GET, а не рассуждением о
+    поведении шаблонизатора.
+    """
+    pid = await repo.create_project(db, slug="dg-legacy", name="Legacy")
+    await repo.create_digest(
+        db,
+        project_id=pid,
+        digest_date="2026-08-01",
+        payload=json.dumps(
+            {
+                "date": "2026-08-01",
+                "project": "dg-legacy",
+                "auto_approvals": [],
+                "auto_verdicts": [],
+                "escalations": [],
+                "deliveries": [],
+                "audit_sample": [],
+                "audit_results": {},
+            }
+        ),
+    )
+    await db.commit()
+
+    page = await client.get("/digests")
+    assert page.status_code == 200
+    assert "dg-legacy" in page.text
+    assert "Суждения стюарда" not in page.text, (
+        "у записи без суждений раздела быть не должно: пустая секция "
+        "читается как «стюард смотрел и ничего не нашёл»"
+    )
+    cell = _steward_counter_cell(page.text)
+    assert "не измерялось" in cell, (
+        "день до появления раздела не измерен, и счётчик обязан это сказать"
+    )
+    assert "0" not in cell, (
+        "ноль здесь был бы утверждением о дне, в который никто не смотрел (#762, #750)"
+    )
+
+
+async def test_a_quiet_steward_is_a_measured_zero(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Ноль и «не измерялось» обязаны отличаться в обе стороны (#1143 ревью).
+
+    Зеркало предыдущего теста, и без него правка неотличима от «печатать
+    "не измерялось" всегда»: у делегирующего проекта, где стюард за день
+    не судил ничего, ноль — настоящий результат дня, а не пробел.
+    """
+    _pid, feature = await _autopilot_project(db, "dg-quiet-steward")
+    await _policy_approved_task(db, feature, "автопилот работал, стюард нет")
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = json.loads((await repo.list_digests(db))[0]["payload"])
+    assert payload["steward_judgements"] == [], "день измерен, суждений нет"
+
+    page = await client.get("/digests")
+    assert page.status_code == 200
+    cell = _steward_counter_cell(page.text)
+    assert cell == "0", (
+        f"этот день измерен: ноль тут результат, а не пробел, получено {cell!r}"
+    )

@@ -92,6 +92,7 @@ class DispatchPlugin(Protocol):
         branch: str = "",
         pr_number: int | None = None,
         breadcrumb: str = "",
+        pr_url: str = "",
     ) -> str: ...
 
     def build_fix_message(
@@ -231,6 +232,7 @@ class GitOpsPlugin(Protocol):
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[str, str]: ...
     async def check_pr_mergeable(
         self,
@@ -238,6 +240,7 @@ class GitOpsPlugin(Protocol):
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
@@ -275,6 +278,7 @@ class GitOpsPlugin(Protocol):
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         base_branch: str | None = None,
     ) -> int | None: ...
     async def get_ci_failure_logs(
@@ -284,9 +288,14 @@ class GitOpsPlugin(Protocol):
         max_log_chars: int = 4000,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> dict[str, Any]: ...
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> CIProbeResult: ...
     async def branch_ci_runs(
         self,
@@ -294,6 +303,7 @@ class GitOpsPlugin(Protocol):
         limit: int = 20,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[dict[str, Any]] | None: ...
     # Читатели git и GitHub, которые вызываются из services/, но в протоколе
     # отсутствовали: реализации (git_ops, noop) их имеют, контракт — нет. То
@@ -327,21 +337,35 @@ class GitOpsPlugin(Protocol):
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None: ...
     async def merge_commit_sha(
         self,
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str: ...
     async def pr_state(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> str: ...
     async def pr_is_draft(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool: ...
     async def mark_pr_ready(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool: ...
     async def release_range(
         self,
@@ -349,6 +373,7 @@ class GitOpsPlugin(Protocol):
         head: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]: ...
     async def undelivered_release_range(
         self,
@@ -365,6 +390,7 @@ class GitOpsPlugin(Protocol):
         body: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None: ...
     async def merge_pr(
         self,
@@ -373,8 +399,24 @@ class GitOpsPlugin(Protocol):
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> bool: ...
+    # То же, но с ПРИЧИНОЙ отказа (#1116, по ревью). Булевого ответа не
+    # хватает: «слить не смогли» и «слили, но подтвердить не удалось» ведут к
+    # противоположным действиям — первое к человеку, второе к повтору через
+    # цикл. Схлопнутые в один False, они уводили доставленную работу в
+    # needs_decision, оставляя PR открытым и реестр пустым.
+    async def merge_pr_with_detail(
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+        delete_branch: bool = True,
+    ) -> tuple[bool, str]: ...
     async def delete_branch(
         self,
         branch: str,
@@ -414,6 +456,25 @@ class ForgePlugin(Protocol):
     #: Машинное имя форжа: попадает в диагностику, чтобы отказ называл, КТО
     #: отказал, а не только что отказали.
     name: str
+
+    #: Умеет ли форж СЛИТЬ pull request своими силами (#1116).
+    #:
+    #: Объявлено флагом, а не выяснено по ходу, потому что различие настоящее
+    #: и дорогое: у GitHub мерж — это вызов API, у GitVerse такого вызова нет
+    #: вовсе, и слить можно только локальным git с последующим push. Прятать
+    #: это за «попробуем и посмотрим» нельзя: измерено 01.09.2026, что после
+    #: merge --no-ff и push'а GitVerse оставляет PR в состоянии open,
+    #: merged=False, а GET /pulls/{n}/merge отвечает 404 и ДО, и ПОСЛЕ мержа.
+    #: То есть форж не сообщает об успехе даже задним числом — вызывающий
+    #: обязан знать заранее, что доказательство придётся искать в другом месте.
+    can_merge_via_api: bool
+
+    # Адрес репозитория и адрес PR в вебе (#1119). Строит форж, потому что
+    # только он знает свой хост И свою форму пути. Форма — не мелочь:
+    # у GitHub это /pull/<n>, у GitVerse /pulls/<n>, во множественном числе
+    # (снято с живого html_url, а не угадано).
+    def repo_url(self, gh_repo: str | None = None) -> str: ...
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str: ...
 
     async def create_pr(
         self,
@@ -471,6 +532,23 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool: ...
+    # Закрыть PR, ничего не вливая (#1116). Нужен там, где мерж сделан не
+    # форжем: GitVerse не замечает мержа пушем и оставляет PR открытым
+    # навсегда, а открытый PR на доставленной ветке заставит pr_for_branch
+    # находить его снова и снова.
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool: ...
+    # Достижим ли ``sha`` в ветке ``branch`` на remote — доказательство
+    # доставки, не зависящее от существования и состояния PR (#1116).
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None: ...
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...

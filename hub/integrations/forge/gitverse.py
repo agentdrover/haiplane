@@ -45,7 +45,6 @@ _RETRIES = 2
 #: Отказ по имени, а не молчаливый ``False``: преждевременно заведённый
 #: GitVerse-проект должен встать громко и с указанием, чего именно не хватает.
 _MERGE_PENDING = "мерж на GitVerse ещё не реализован — задача #1116"
-_CI_PENDING = "gitverse_ci_not_implemented"
 
 
 class GitVerseResponse:
@@ -80,6 +79,9 @@ class GitVerseForge:
     """Concrete forge plugin backed by the GitVerse REST API."""
 
     name = "gitverse"
+    #: Мержа в публичном API GitVerse нет вовсе — сливать обязан вызывающий,
+    #: локальным git (#1116).
+    can_merge_via_api = False
 
     def __init__(
         self,
@@ -110,8 +112,15 @@ class GitVerseForge:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         timeout: float = _TIMEOUT,
+        keep_text: bool = False,
     ) -> GitVerseResponse:
         """Один запрос с ретраями там, где они уместны, и только там.
+
+        ``keep_text`` отменяет обрезку тела. По умолчанию тело режется до 300
+        символов, потому что почти везде оно нужно ЛИШЬ для диагностики, и
+        целиком оно только раздувает логи. Ровно одно исключение — логи
+        упавшего джоба (#1117): там тело и есть ответ, и обрезка превратила бы
+        max_log_chars у вызывающего в украшение.
 
         Ретраится 429 (сервер сам просит подождать) и 5xx (его сторона). 4xx
         не ретраится вовсе: повторять запрос, который отвергли по существу,
@@ -177,7 +186,12 @@ class GitVerseForge:
                 )
 
             data: Any = None
-            if resp.content:
+            # При keep_text разбор JSON не делается ВОВСЕ, а не «делается и
+            # прощается». Логи джоба приходят простым текстом, и попытка
+            # разобрать их уводила ответ в ветку «невалидный JSON», где тело
+            # режется независимо от флага, — то есть флаг молча не работал
+            # ровно там, ради чего заведён. Поймано мутационной проверкой.
+            if resp.content and not keep_text:
                 try:
                     data = resp.json()
                 except ValueError:
@@ -192,7 +206,10 @@ class GitVerseForge:
                 else (f"gitverse_http_{resp.status_code}")
             )
             return GitVerseResponse(
-                resp.status_code, data=data, text=resp.text[:300], reason=reason
+                resp.status_code,
+                data=data,
+                text=resp.text if keep_text else resp.text[:300],
+                reason=reason,
             )
         return last
 
@@ -217,6 +234,21 @@ class GitVerseForge:
 
     def _repo(self, gh_repo: str | None) -> str:
         return (gh_repo or config.REPO_NAME or "").strip("/")
+
+    # -- адреса --------------------------------------------------------------
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return f"https://gitverse.ru/{self._repo(gh_repo)}"
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        """Веб-адрес запроса на слияние.
+
+        ``pulls``, во МНОЖЕСТВЕННОМ числе — у GitHub тут ``pull``. Снято с
+        живого поля html_url (mrpda/snip-portal, 01.09.2026), а не выведено
+        по аналогии: единственного лишнего символа хватает, чтобы ссылка в
+        сообщении агенту выглядела рабочей и вела в никуда.
+        """
+        return f"{self.repo_url(gh_repo)}/pulls/{pr_number}"
 
     # -- pull requests ------------------------------------------------------
 
@@ -489,22 +521,198 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool:
-        """Сводится в #1116: в публичном API GitVerse мержа нет вовсе."""
-        log.error("gitverse merge_pr отказан: %s", _MERGE_PENDING)
+        """Форж слить не может — и говорит это, а не молчит (#1116).
+
+        ``can_merge_via_api = False`` объявлено на классе, и вызывающий обязан
+        читать его ДО вызова: мерж делается локальным git в ``git_ops``. Если
+        управление дошло сюда, значит кто-то положился на попытку вместо
+        объявленной способности — и узнать об этом лучше по строке в логе, чем
+        по молча недоставленной задаче.
+        """
+        log.error(
+            "gitverse merge_pr вызван, хотя can_merge_via_api=False: "
+            "мерж на этом форже делается локальным git (#1116)"
+        )
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        """Закрыть PR, ничего не вливая.
+
+        Обязателен именно здесь: измерено 01.09.2026, что GitVerse НЕ замечает
+        мержа пушем — после merge --no-ff головы в базу PR остаётся open,
+        merged=False, merge_commit_sha=None. Незакрытый PR висел бы открытым
+        вечно, а pr_for_branch находил бы его на уже доставленной ветке и
+        заставлял гейт открывать доставку заново.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return False
+        resp = await self._request(
+            "PATCH", f"/repos/{slug}/pulls/{pr_number}", json_body={"state": "closed"}
+        )
+        if resp.ok:
+            return True
+        log.warning("PR #%d не закрыт: %s", pr_number, resp.reason or resp.status)
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """Достижим ли ``sha`` в ``branch`` на remote, или None.
+
+        Это и есть доказательство доставки на GitVerse, потому что через PR
+        его получить нельзя ни при каком условии: доставленный и брошенный PR
+        отвечают одинаково (closed, merged=False), а до закрытия — вообще
+        одинаково с недоставленным (open, /merge → 404).
+
+        Спрашивается у compare, а не у списка коммитов: список пришлось бы
+        листать страницами и решать, где остановиться, а «не нашли на первых
+        ста» неотличимо от «нет вовсе».
+        """
+        slug = self._repo(gh_repo)
+        if not slug or not sha:
+            return None
+        resp = await self._request("GET", f"/repos/{slug}/compare/{sha}...{branch}")
+        if not resp.ok or not isinstance(resp.data, dict):
+            return None
+        status = str(resp.data.get("status") or "").strip().lower()
+        if status in ("ahead", "identical"):
+            return True
+        if status in ("behind", "diverged"):
+            return False
+        # Незнакомое слово — не повод сказать «нет»: это «спросить не удалось».
+        log.warning("gitverse compare вернул нераспознанный status=%r", status)
+        return None
 
     # -- CI -----------------------------------------------------------------
     #
-    # Семантика исходов принадлежит #1117: у GitVerse нет ни commit statuses,
-    # ни check-runs, единственный источник — Actions runs, и его форма своя
-    # (поля commit_sha, status, ref, без conclusion). Пока её нет, все три
-    # читателя отвечают «спросить не удалось», а НЕ «проверок нет»: absent
-    # пустил бы доставку мимо CI, а pending заставил бы гейт ждать вечно.
+    # Единственный источник CI-факта у GitVerse — Actions runs: ни commit
+    # statuses, ни check-runs у него нет. Формы ниже сняты с живого
+    # mrpda/snip-portal 01.09.2026 (шесть настоящих прогонов), а не взяты из
+    # документации, и отличаются от GitHub тремя способами:
+    #
+    #   1. Поля ``conclusion`` НЕТ ВОВСЕ. Исход несёт сам ``status``, и
+    #      наблюдались значения "success" и "failure". То есть status у
+    #      GitVerse — это conclusion у GitHub, а не его status.
+    #   2. ``ref`` приходит ПОЛНЫМ: "refs/heads/main", а не "main".
+    #      Сравнение с именем ветки в лоб даёт пустоту, неотличимую от
+    #      «прогонов нет».
+    #   3. Голова называется по-разному в соседних endpoint'ах: у прогона
+    #      ``commit_sha``, у джоба ``head_sha``.
+
+    #: Значения ``status``, наблюдённые у ЗАВЕРШЁННЫХ прогонов.
+    _RUN_SUCCESS = ("success",)
+    _RUN_FAILURE = ("failure", "cancelled", "timed_out", "error")
+    #: Значения, при которых прогон ещё идёт. Список — предположение по
+    #: аналогии с GitHub: у живых прогонов такое состояние не наблюдалось ни
+    #: разу, все шесть были завершены. Поэтому он НЕ страховочный: всё, чего
+    #: здесь нет и нет в двух списках выше, уходит в unavailable вместе с
+    #: самим значением, а не в pending. Ошибиться в сторону «ждём» страшнее:
+    #: гейт будет ждать вечно, и никто не узнает, почему.
+    _RUN_RUNNING = ("waiting", "running", "queued", "pending", "in_progress")
+
+    @staticmethod
+    def _short_ref(ref: str) -> str:
+        """ "refs/heads/main" → "main". Всё прочее — как пришло."""
+        return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+
+    async def _runs(
+        self,
+        *,
+        gh_repo: str | None,
+        branch: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, Any]] | None:
+        """Прогоны репозитория, новые первыми, или None если спросить не вышло."""
+        slug = self._repo(gh_repo)
+        if not slug:
+            return None
+        params: dict[str, Any] = {"per_page": max(1, min(limit, 100))}
+        if branch:
+            params["branch"] = branch
+        resp = await self._request("GET", f"/repos/{slug}/actions/runs", params=params)
+        if not resp.ok or not isinstance(resp.data, dict):
+            return None
+        runs = resp.data.get("workflow_runs")
+        return runs if isinstance(runs, list) else None
+
+    def _outcome_of(self, runs: list[dict[str, Any]]) -> CIProbeResult:
+        """Свести набор прогонов в один исход, не приукрашивая незнание.
+
+        Порядок проверок тот же, что у GitHub-адаптера, и он не произволен:
+        сначала «ещё идёт», потом «упало», и только если ни одного из них —
+        «прошло». Иначе один зелёный прогон рядом с красным дал бы зелёный
+        ответ.
+        """
+        statuses = [str(r.get("status") or "").strip().lower() for r in runs]
+        if any(s in self._RUN_RUNNING for s in statuses):
+            return CIProbeResult(CIProbeOutcome.pending, "gitverse_runs_running")
+        if any(s in self._RUN_FAILURE for s in statuses):
+            return CIProbeResult(CIProbeOutcome.failed, "gitverse_runs_failed")
+        if statuses and all(s in self._RUN_SUCCESS for s in statuses):
+            return CIProbeResult(CIProbeOutcome.passed, "gitverse_runs_passed")
+        # Нераспознанное значение — НЕ повод сказать «ждём» или «прошло».
+        # Само значение уходит в details: без него следующий, кто это увидит,
+        # начнёт с того же перебора, с которого начинал я.
+        return CIProbeResult(
+            CIProbeOutcome.unavailable,
+            "gitverse_runs_unknown_state",
+            details=",".join(sorted(set(statuses))) or "нет прогонов",
+        )
+
+    async def _absent_or_missing_run(
+        self, reason: str, *, gh_repo: str | None, sha: str
+    ) -> CIProbeResult:
+        """Отличить «в репозитории нет CI» от «для этого коммита ещё нет прогона».
+
+        Схлопывание этих двух — дефект #419: первое означает, что доставке
+        нечего ждать, второе — что ждать надо ещё немного.
+        """
+        has = await self.has_workflows(gh_repo=gh_repo)
+        if has is None:
+            return CIProbeResult(
+                CIProbeOutcome.unavailable, "gitverse_workflows_unavailable"
+            )
+        if not has:
+            return CIProbeResult(CIProbeOutcome.absent, reason)
+        return CIProbeResult(CIProbeOutcome.missing_run, reason, details=sha or None)
 
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult:
-        return CIProbeResult(CIProbeOutcome.unavailable, _CI_PENDING, details="#1117")
+        """Исход CI для головы этого PR.
+
+        Отбор идёт по ``commit_sha``, а не по первому прогону в списке:
+        порядок — это «когда запустили», а вопрос — «что с ЭТИМ коммитом».
+        Ветка PR берётся у самого PR, потому что ветвь запроса могла
+        разойтись с тем, что думает вызывающий.
+        """
+        head_sha = await self.pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        if not head_sha:
+            return CIProbeResult(
+                CIProbeOutcome.unavailable,
+                "gitverse_head_sha_unavailable",
+                details=f"PR #{pr_number}",
+            )
+        _base, head_ref = await self.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        runs = await self._runs(gh_repo=gh_repo, branch=head_ref)
+        if runs is None:
+            return CIProbeResult(
+                CIProbeOutcome.unavailable, "gitverse_runs_unavailable"
+            )
+        mine = [r for r in runs if str(r.get("commit_sha") or "") == head_sha]
+        if not mine:
+            return await self._absent_or_missing_run(
+                "no_workflow_runs", gh_repo=gh_repo, sha=head_sha
+            )
+        return self._outcome_of(mine)
 
     async def branch_ci_runs(
         self,
@@ -514,7 +722,36 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
-        return None
+        """Прогоны ветки, новые первыми, или None если спросить не вышло (#929).
+
+        None, а не пустой список: «прогонов нет» и «не смогли посмотреть»
+        ведут к противоположным выводам о том, зелёная ли база (#725).
+
+        Форма приводится к той, которую уже ждут потребители, и здесь же
+        чинится главное расхождение: у GitVerse нет ``conclusion``, а исход
+        лежит в ``status``. Заполняем ОБА поля одним значением — потребитель
+        не должен знать, на каком форже он сейчас.
+        """
+        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=limit)
+        if runs is None:
+            return None
+        out: list[dict[str, Any]] = []
+        for r in runs:
+            status = str(r.get("status") or "").strip().lower()
+            out.append(
+                {
+                    "sha": str(r.get("commit_sha") or ""),
+                    # Завершённый прогон у GitVerse несёт исход в status;
+                    # потребители читают conclusion — отдаём им обе клетки.
+                    "status": (
+                        "in_progress" if status in self._RUN_RUNNING else "completed"
+                    ),
+                    "conclusion": ("" if status in self._RUN_RUNNING else status),
+                    "created_at": str(r.get("started") or ""),
+                    "name": str(r.get("name") or ""),
+                }
+            )
+        return out
 
     async def ci_failure_logs(
         self,
@@ -525,7 +762,84 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> dict[str, Any]:
-        return {"failed_checks": [], "log_summary": "", "run_url": ""}
+        """Имена упавших джобов и хвост их логов.
+
+        Пустой ответ здесь означает «не нашли, что показать», и это не
+        обвинение: вызывающий и так знает, что CI красный — он для того и
+        пришёл. Поэтому ни одна ветка не поднимает исключение.
+        """
+        result: dict[str, Any] = {"failed_checks": [], "log_summary": "", "run_url": ""}
+        slug = self._repo(gh_repo)
+        if not slug:
+            return result
+        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=20)
+        if not runs:
+            return result
+
+        # Прогон ГОЛОВЫ этого PR, а не первый в списке ветки. На ветке с
+        # историей первым лежит самый свежий прогон — возможно, чужого
+        # коммита, — и человек чинил бы по логам чужого падения. Порядок в
+        # списке отвечает на «когда запустили», а вопрос здесь — «что упало
+        # у ЭТОГО коммита».
+        head_sha = await self.pr_head_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        mine = [r for r in runs if str(r.get("commit_sha") or "") == head_sha]
+        if not mine:
+            # Головы не знаем или прогонов на неё нет: показать чужой лог
+            # хуже, чем не показать никакого — он уведёт чинить не то.
+            return result
+        failed_runs = [
+            r
+            for r in mine
+            if str(r.get("status") or "").strip().lower() in self._RUN_FAILURE
+        ]
+
+        # ПОСЛЕДНИЙ по времени запуска, а не первый в списке. Один коммит даёт
+        # несколько прогонов сплошь и рядом — перезапуск, правка workflow,
+        # флейк, — и чинить надо по свежему логу: старый может относиться к
+        # уже исправленному шагу. Живой API отдаёт новые первыми, но опираться
+        # на это нельзя: порядок нигде не обещан, а цена ошибки — человек,
+        # который час чинит то, что уже починено.
+        def _started(entry: dict[str, Any]) -> str:
+            return str(entry.get("started") or "")
+
+        run = max(failed_runs or mine, key=_started)
+        run_id = run.get("id")
+        if run_id is None:
+            return result
+        result["run_url"] = f"https://gitverse.ru/{slug}/actions/runs/{run_id}"
+
+        jobs_resp = await self._request(
+            "GET", f"/repos/{slug}/actions/runs/{run_id}/jobs"
+        )
+        jobs = []
+        if jobs_resp.ok and isinstance(jobs_resp.data, dict):
+            raw = jobs_resp.data.get("jobs")
+            jobs = raw if isinstance(raw, list) else []
+        failed = [
+            j
+            for j in jobs
+            if str(j.get("status") or "").strip().lower() in self._RUN_FAILURE
+        ]
+        result["failed_checks"] = [str(j.get("name") or "") for j in failed]
+
+        chunks: list[str] = []
+        for job in failed:
+            job_id = job.get("id")
+            if job_id is None:
+                continue
+            log_resp = await self._request(
+                "GET",
+                f"/repos/{slug}/actions/jobs/{job_id}/logs",
+                timeout=60.0,
+                keep_text=True,
+            )
+            if log_resp.ok and log_resp.text:
+                chunks.append(f"--- {job.get('name')} ---\n{log_resp.text}")
+        summary = "\n".join(chunks)
+        if len(summary) > max_log_chars:
+            summary = "... (truncated) ...\n" + summary[-max_log_chars:]
+        result["log_summary"] = summary
+        return result
 
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None

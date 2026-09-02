@@ -577,3 +577,48 @@ async def test_open_or_update_pr_creates_when_there_is_none(patched_httpx):
     assert number == 11
     body = json.loads(seen[1].content)
     assert body["head"] == "release" and body["base"] == "main"
+
+
+async def test_branch_contains_reads_compare_status(patched_httpx, monkeypatch):
+    """Достижимость коммита в ветке — три ответа, и None не значит «нет».
+
+    ahead и identical означают «коммит уже там»; behind и diverged — «нет».
+    Нераспознанное слово и ошибка дают None: «спросить не удалось» ведёт к
+    повтору, а «нет» — к разбирательству, почему push не долетел.
+    """
+    seen, responses = patched_httpx
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+
+    for status, expected in (
+        ("ahead", True),
+        ("identical", True),
+        ("behind", False),
+        ("diverged", False),
+    ):
+        responses.append(httpx.Response(200, json={"status": status}))
+        assert (
+            await forge.branch_contains("main", "abc", gh_repo="own/rep") is expected
+        ), status
+
+    responses.append(httpx.Response(200, json={"status": "неведомое"}))
+    assert await forge.branch_contains("main", "abc", gh_repo="own/rep") is None
+
+    responses.extend([httpx.Response(500)] * 3)
+    assert await forge.branch_contains("main", "abc", gh_repo="own/rep") is None
+
+    # Пустой sha спрашивать бессмысленно — и запроса не будет.
+    seen.clear()
+    assert await forge.branch_contains("main", "", gh_repo="own/rep") is None
+    assert seen == []
+
+
+async def test_close_pr_patches_state(patched_httpx):
+    """Закрытие идёт PATCH state=closed — единственный доступный путь."""
+    seen, responses = patched_httpx
+    forge = GitVerseForge(token=TOKEN, base_url="https://api.example", version="1")
+    responses.append(httpx.Response(200, json={"state": "closed"}))
+
+    assert await forge.close_pr(7, gh_repo="own/rep") is True
+    assert seen[-1].method == "PATCH"
+    assert json.loads(seen[-1].content) == {"state": "closed"}

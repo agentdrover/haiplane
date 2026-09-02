@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.git_ops import (
+    MERGE_UNCONFIRMED,
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
@@ -34,6 +36,7 @@ from hub.services.gate_events import (
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
+    forge_of,
     rearm_clone,
     release_base_of,
 )
@@ -61,6 +64,16 @@ async def project_git_context(
         ctx["gh_repo"] = d["repo"].strip()
     if (d.get("default_branch") or "").strip():
         ctx["base_branch"] = d["default_branch"].strip()
+    # #1146: форж едет тем же путём, что repo и base_branch, и по той же
+    # причине — это пер-проектная величина того же времени жизни.
+    #
+    # И по тому же ПРАВИЛУ: ключ появляется только там, где проект что-то
+    # объявил. Безусловный ключ ломал бы инвариант #604 — ненастроенный проект
+    # не отдаёт НИ ОДНОГО ключа, и git_ops падает на окружение. Форж без
+    # репозитория и означать нечего: пустое имя читается как «спроси у
+    # настроенного адаптера», то есть ровно как прежнее поведение.
+    if "gh_repo" in ctx:
+        ctx["forge"] = forge_of(row)
     # No special case for the default project (#604). One existed here —
     # an unconditional empty context, written when default had no real
     # fields and "behave like the pre-project hub" was the only correct
@@ -2035,6 +2048,11 @@ TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.unavailable.value}",
     f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
+    # #1116 (по ревью): мерж СОСТОЯЛСЯ, а подтвердить его не вышло. Раньше
+    # это давало обычный merge_failed и уводило к человеку задачу, код
+    # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
+    # нечего. Лечится следующим циклом, а не решением.
+    MERGE_UNCONFIRMED,
 )
 PR_DRAFT_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб пометит "
@@ -2109,6 +2127,36 @@ async def charge_ci_fix_budget(
     return cycle, cycle > config.MAX_CI_FIX_CYCLES
 
 
+def _merge_failure_detail(detail: str) -> str:
+    """Причина неудачного мержа в виде, пригодном для КЛАССИФИКАЦИИ (#1116).
+
+    Три случая, и они ведут к разному. Пустая деталь — форж отказал молча
+    (путь GitHub, где причины и не было): строка остаётся прежней до символа.
+    Деталь с меткой неподтверждённости — временное состояние, которое лечится
+    следующим циклом, а не человеком. Всё остальное — названная причина, и
+    она уходит наружу вместо слова «GitHub», которое на другом форже просто
+    неверно.
+    """
+    if not detail:
+        return "merge_failed: GitHub refused the merge"
+    if detail.startswith(MERGE_UNCONFIRMED):
+        return detail
+    return f"merge_failed: {detail}"
+
+
+def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
+    """SHA мержа: у форжа, а если он не знает — из детали успеха (#1116).
+
+    Форж без API-мержа о мерже пушем не знает и merge_commit_sha не
+    заполняет. Коммит при этом назвал сам мерж. Без этой подстановки строка
+    реестра писалась с пустым sha — то есть реестр переставал отличать наш
+    мерж от чужого, ради чего он и заведён (#534).
+    """
+    if merge_sha:
+        return merge_sha
+    return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -2164,7 +2212,9 @@ async def merge_before_completion(
         workspace = ctx.get("repo")
         gh_repo = ctx.get("gh_repo")
 
-        ci = await plugins.git_ops.check_pr_ci(pr_num, repo=workspace, gh_repo=gh_repo)
+        ci = await plugins.git_ops.check_pr_ci(
+            pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
+        )
         if ci.outcome == CIProbeOutcome.missing_run:
             elapsed = _seconds_since_ci_start(task.get("ci_check_started_at"))
             if elapsed is None:
@@ -2177,9 +2227,14 @@ async def merge_before_completion(
         # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
         # here is the ready signal. Asking merge_pr first collapses a draft
         # into merge_failed — a one-way door to needs_decision.
-        if await plugins.git_ops.pr_is_draft(pr_num, repo=workspace, gh_repo=gh_repo):
+        if await plugins.git_ops.pr_is_draft(
+            pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
+        ):
             marked = await plugins.git_ops.mark_pr_ready(
-                pr_num, repo=workspace, gh_repo=gh_repo
+                pr_num,
+                repo=workspace,
+                gh_repo=gh_repo,
+                forge=ctx.get("forge", ""),
             )
             if not marked:
                 return False, (
@@ -2187,23 +2242,28 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        merged = await plugins.git_ops.merge_pr(
+        merged, merge_detail = await plugins.git_ops.merge_pr_with_detail(
             pr_num,
             task_id,
             task.get("title") or "",
             repo=workspace,
             gh_repo=gh_repo,
+            forge=ctx.get("forge", ""),
         )
         if not merged:
-            return False, "merge_failed: GitHub refused the merge"
+            return False, _merge_failure_detail(merge_detail)
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
         merge_sha = ""
         try:
             merge_sha = await plugins.git_ops.merge_commit_sha(
-                pr_num, repo=workspace, gh_repo=gh_repo
+                pr_num,
+                repo=workspace,
+                gh_repo=gh_repo,
+                forge=ctx.get("forge", ""),
             )
+            merge_sha = _merge_sha_or_detail(merge_sha, merge_detail)
         except Exception:  # noqa: BLE001 - the drift guard flags it once
             log.exception(
                 "could not read the merge commit for task #%s; "
@@ -2270,7 +2330,10 @@ async def _recorded_pr_state(
     try:
         ctx = await project_git_context(db, task["id"])
         state = await plugins.git_ops.pr_state(
-            pr_number, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            pr_number,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning(
@@ -2292,7 +2355,10 @@ async def _live_pr_for_branch(
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
-            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            branch,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning("PR search failed for #%s (%s): %s", task["id"], branch, exc)
@@ -2377,6 +2443,7 @@ async def ensure_delivery_pr(
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
             base_branch=ctx.get("base_branch"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         log.warning("ensure_delivery_pr failed for #%s (%s): %s", task_id, branch, exc)
@@ -2455,7 +2522,10 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
     try:
         ctx = await project_git_context(db, task["id"])
         found = await plugins.git_ops.pr_for_branch(
-            branch, repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo")
+            branch,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure (AC-4)
         log.warning(
@@ -3017,6 +3087,7 @@ async def _route_after_done(
                 repo=git_repo,
                 gh_repo=ctx.get("gh_repo"),
                 base_branch=ctx.get("base_branch"),
+                forge=ctx.get("forge", ""),
             )
             if pr_num:
                 await repo.update_task(db, task_id, pr_number=pr_num)
@@ -3180,6 +3251,21 @@ async def dispatch_review(
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0)
     breadcrumb = await get_breadcrumb_str(db, task_id)
+    # Ссылка на PR собирается ЗДЕСЬ, где есть проект, а не в сборщике текста
+    # (#1119): у сборщика нет способа узнать, на каком хостинге живёт этот
+    # проект, и раньше он подставлял github.com всем подряд.
+    pr_number = task.get("pr_number")
+    pr_link = ""
+    if pr_number:
+        from hub.integrations import forge as forge_urls
+        from hub.services import project_policy
+
+        project = await repo.resolve_project_for_task(db, task_id)
+        gh_repo = (dict(project).get("repo") or "").strip() if project else ""
+        if gh_repo:
+            pr_link = forge_urls.pr_url(
+                project_policy.forge_of(project), gh_repo, int(pr_number)
+            )
     message = plugins.dispatch.build_review_message(
         task_id=task_id,
         title=task["title"],
@@ -3187,8 +3273,9 @@ async def dispatch_review(
         review_cycle=review_cycle,
         max_cycles=config.MAX_REVIEW_CYCLES,
         branch=task.get("branch", ""),
-        pr_number=task.get("pr_number"),
+        pr_number=pr_number,
         breadcrumb=breadcrumb,
+        pr_url=pr_link,
     )
     result = await plugins.dispatch.submit_task(
         message,

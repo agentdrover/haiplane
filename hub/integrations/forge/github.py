@@ -42,6 +42,16 @@ class GitHubForge:
     """Concrete forge plugin backed by the ``gh`` CLI."""
 
     name = "github"
+    #: gh pr merge — один вызов, форж сливает сам (#1116).
+    can_merge_via_api = True
+
+    # -- адреса --------------------------------------------------------------
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return f"https://github.com/{gh_repo or REPO_NAME}"
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        return f"{self.repo_url(gh_repo)}/pull/{pr_number}"
 
     # -- pull requests ------------------------------------------------------
 
@@ -472,6 +482,58 @@ class GitHubForge:
             return True
         log.error("Failed to merge PR #%d: %s", pr_number, err)
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        """Закрыть PR, ничего не вливая (#1116).
+
+        На GitHub этот путь не нужен для доставки — мерж закрывает PR сам, —
+        но контракт один на все форжи, и реализация обязана существовать.
+        """
+        rc, _, err = await _gh(
+            "pr",
+            "close",
+            str(pr_number),
+            "--repo",
+            gh_repo or REPO_NAME,
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            return True
+        log.warning("Failed to close PR #%d: %s", pr_number, (err or "").strip()[:200])
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        """Достижим ли ``sha`` в ``branch`` на remote, или None (#1116).
+
+        None — «спросить не удалось», и это не то же, что «не достижим»:
+        первое означает повторить вопрос, второе — что работа не доставлена.
+        """
+        if not sha:
+            return None
+        rc, out, _ = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/compare/{sha}...{branch}",
+            "--jq",
+            ".status",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return None
+        # ahead — база ушла вперёд от sha, identical — стоит ровно на нём:
+        # в обоих случаях коммит УЖЕ в ветке. behind и diverged означают, что
+        # его там нет.
+        return (out or "").strip() in ("ahead", "identical")
 
     # -- CI -----------------------------------------------------------------
 
