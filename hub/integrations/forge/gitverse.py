@@ -841,14 +841,54 @@ class GitVerseForge:
         result["log_summary"] = summary
         return result
 
+    async def repo_access(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[bool, str]:
+        """Видит ли API этот репозиторий текущим токеном (#1118, AC-3).
+
+        Второй credential, помимо deploy key. Провижининг проверяет его
+        отдельно потому, что git его не использует вовсе: репозиторий
+        прекрасно клонируется по ключу и без токена, а гейт потом не сможет ни
+        открыть PR, ни прочитать CI — и это выяснится на первой же задаче.
+
+        Причина называется, а не сводится к ``False``: «токена нет», «токен
+        не тот» и «репозитория не видно» — три разные руки.
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return False, "gitverse_repo_not_configured"
+        if not self._is_configured():
+            return False, "gitverse_token_missing"
+        resp = await self._request("GET", f"/repos/{slug}")
+        if resp.ok:
+            return True, ""
+        if resp.status is None:
+            # До сервера не дошли — это НЕ «доступа нет» (#725).
+            return False, f"gitverse_api_unreachable: {resp.reason or 'no answer'}"
+        if resp.status == 401:
+            return False, "gitverse_token_invalid"
+        if resp.status == 403:
+            return False, "gitverse_token_lacks_rights"
+        if resp.status == 404:
+            return False, "gitverse_repo_not_found_or_no_access"
+        return False, f"gitverse_api_refused_{resp.status}"
+
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None
     ) -> bool | None:
         """Есть ли в репозитории workflow — спрашивается у API, не у каталога.
 
-        Раннер GitVerse обрабатывает и ``.gitverse/workflows/``, и
-        ``.github/workflows/``, так что вопрос «есть ли тут CI», заданный
-        одному каталогу, отвечается неверно.
+        Раннер GitVerse читает ``.gitverse/workflows/``, а
+        ``.github/workflows/`` — ТОЛЬКО когда своего каталога нет. Это
+        подмена, а не объединение: измерено 02.09.2026 по истории прогонов
+        mrpda/snip-portal (коммит d02d83c8 — своего каталога нет, посеянный
+        ``haiplane-ci.yml`` прогнался зелёным; коммит af8aaac6 — каталог
+        появился, и с него прогоняется только он). Прежняя формулировка
+        здесь говорила «и тот, и другой» — неверно, и неверно в опасную
+        сторону: она делала мёртвый файл неотличимым от рабочего.
+
+        Вопрос «есть ли тут CI», заданный одному каталогу, отвечается неверно
+        в обе стороны — потому и спрашивается у API.
 
         ИЗМЕРЕНО 31.08.2026 на трёх репозиториях, и ответ зависит от их
         состояния, а не только от прав:
