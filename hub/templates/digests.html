@@ -7,7 +7,7 @@
 <code>POST /api/digests/&lt;id&gt;/audit</code> и попадает в метрику human_gates гейтом <code>audit</code>.</p>
 
 {% if not digests %}
-<p>Дайджестов пока нет — автопилот ещё не совершал переходов.</p>
+<p>Дайджестов пока нет — ни автопилот, ни стюард ещё не принимали решений.</p>
 {% endif %}
 
 {% for d in digests %}
@@ -67,7 +67,7 @@
     </ul>
     {% endif %}
 
-    <h3>Выборка на проверку (~10%)</h3>
+    <h3>Выборка на проверку (~10% решений; применённые approve — ~30%)</h3>
     <ul>
         {% for tid in d.data.audit_sample %}
         <li><a href="/tasks/{{ tid }}">#{{ tid }}</a>
