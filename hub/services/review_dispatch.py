@@ -1012,6 +1012,122 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
 CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 
 
+async def _policy_and_novelty_allow(
+    db: aiosqlite.Connection, task: dict[str, Any], project: Any
+) -> bool:
+    """Два тихих отказа диспетчера, стоящих рядом по одной причине.
+
+    Оба отвечают на «звать ли ревьюера» ДО всякой подготовки вызова, и оба
+    молчат в том смысле, что не являются поломкой: политика не просила —
+    ревью и не должно быть; код уже прочитан — второе чтение не купит
+    ничего нового.
+
+    Собраны в одну функцию, потому что maybe_dispatch_review стоит на
+    потолке сложности вплотную: 60 из 60. Любая строка, добавленная туда,
+    красит бюджет, и это верное поведение измерителя — чинить надо
+    измеряемое.
+    """
+    # #805: one reader, and it answers "call a reviewer?" — not "who signs
+    # the verdict?". Those were the same question only because they shared a
+    # key, which forced the hub's own project to choose between no review
+    # and no human.
+    if not review_dispatch_enabled(gate_policy_of(project)):
+        return False
+    return not await _this_code_was_already_read(db, task)
+
+
+async def _this_code_was_already_read(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> bool:
+    """Отказать во втором чтении того же кода, сказав об этом в карточке.
+
+    #1152: измерено на живой базе прода — 8 дублей из 87 прогонов (9%),
+    порядка 15M токенов провайдера. То есть девятый прогон из ста покупал
+    второе чтение того же диффа, и случай не единичный.
+
+    Ключ по КОДУ, а не по поколению. Пересдача поднимает поколение, и ключ
+    по нему пропустил бы ровно этот случай: генерации разные, sha тот же.
+    Именно так дубль и возникает — сорвавшийся ретрай, две сессии, дважды
+    нажатая кнопка.
+
+    Вынесено отдельной функцией не ради красоты: три строки в
+    maybe_dispatch_review подняли её с 60 до 63 при потолке 60, и бюджет
+    сложности честно покраснел. Поднять потолок значило бы починить
+    измеритель вместо измеряемого.
+    """
+    already = await _report_already_covers_this_sha(db, task)
+    if not already:
+        return False
+    await _refuse_second_read(db, int(task["id"]), already)
+    return True
+
+
+async def _report_already_covers_this_sha(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> int | None:
+    """Id отчёта, уже прочитавшего ЭТОТ коммит, или None.
+
+    Сравнивается закреплённый sha текущей сдачи со sha тех генераций, по
+    которым отчёт уже есть. Не поколение: пересдача его поднимает, и
+    дубль на неизменившемся коде выглядел бы новой работой.
+
+    Отсутствие закреплённого sha означает, что сравнивать нечего — ревью
+    заказывается. Незнание не есть совпадение (#762), и направление
+    ошибки выбрано в пользу прогона: лишнее чтение стоит денег, а
+    пропущенное — сдачи без отчёта.
+    """
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT mr.id AS review_id, s.sha AS sha "
+        "FROM machine_reviews mr "
+        "JOIN submissions s ON s.task_id = mr.task_id "
+        "AND s.generation = mr.submission_generation "
+        "WHERE mr.task_id = ? AND mr.submission_generation != ?",
+        (task_id, generation),
+    )
+    for row in rows:
+        if ((dict(row).get("sha") or "").strip()) == pinned:
+            return int(dict(row)["review_id"])
+    return None
+
+
+async def _refuse_second_read(
+    db: aiosqlite.Connection, task_id: int, review_id: int
+) -> None:
+    """Сказать в карточке, что прогона не будет, и почему.
+
+    Молчаливый отказ неотличим от сломавшегося диспетчера: человек, не
+    дождавшийся отчёта, пойдёт искать поломку там, где её нет. Отказ
+    называет отчёт, который уже покрывает этот код, — то есть даёт то,
+    ради чего прогон и заказывали бы.
+    """
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        (
+            f"Кросс-модельное ревью не заказано: этот код уже прочитан, "
+            f"отчёт #{review_id} покрывает ту же вершину. Пересдача подняла "
+            "поколение, но дифф не изменился, и второй прогон вернул бы то "
+            "же чтение за те же деньги (#1152). Если нужен второй взгляд "
+            "именно на этот код — он запрашивается человеком явно."
+        ),
+        author_kind="hub",
+    )
+    await db.commit()
+    log.info(
+        "review dispatch skipped for task #%s: report #%s covers the same sha",
+        task_id,
+        review_id,
+    )
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
 ) -> bool:
@@ -1039,11 +1155,7 @@ async def maybe_dispatch_review(
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
         return False
-    # #805: one reader, and it answers "call a reviewer?" — not "who signs
-    # the verdict?". Those were the same question only because they shared a
-    # key, which forced the hub's own project to choose between no review
-    # and no human.
-    if not review_dispatch_enabled(gate_policy_of(project)):
+    if not await _policy_and_novelty_allow(db, task, project):
         return False
 
     gh_repo = (dict(project).get("repo") or "").strip()
