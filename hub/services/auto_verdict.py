@@ -233,7 +233,14 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         policy = json.loads(project["gate_policy"] or "{}")
     except (ValueError, KeyError):
         return False
-    if not isinstance(policy, dict) or policy.get("verdict") != "auto":
+    # #1151: делегирование, а не одна строка. Проект, отдавший вердикт
+    # СТЮАРДУ, не забирал его у автопилота — он добавил второго судью на
+    # грязный путь. Автовердикт по-прежнему закрывает чистые сдачи, иначе
+    # перевод проекта на стюарда тихо вернул бы человеку всё, что раньше
+    # проходило само, и заметно это стало бы по очереди, а не по отказу.
+    from hub.services.project_policy import verdict_is_delegated
+
+    if not verdict_is_delegated(policy):
         return False
 
     review_row = await repo.get_latest_machine_review(db, task_id)
