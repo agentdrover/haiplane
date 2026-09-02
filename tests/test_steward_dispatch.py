@@ -24,6 +24,7 @@ from hub.services.steward_dispatch import (
     REFUSED_DAILY_CAP,
     REFUSED_MODE_OFF,
     RUN_OPEN,
+    RUN_REFUSED,
     RUN_SUPERSEDED,
     RUN_TIMEOUT,
     close_finished_runs,
@@ -243,3 +244,293 @@ async def test_project_without_the_policy_is_left_alone(db: aiosqlite.Connection
 
     assert await order_due_runs(db) == 0
     assert await open_run(db, task_id, 1) is None
+
+
+# ---------------------------------------------------------------------------
+# #1150 — пересдача без изменений не оплачивается
+# ---------------------------------------------------------------------------
+
+
+async def _reported(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    confirmed: list[dict],
+) -> None:
+    """Отчёт машинного ревью с подтверждёнными находками на эту генерацию."""
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="multi-agent-review",
+        harness_version=1,
+        agent_count=11,
+        tokens_spent=None,
+        duration_ms=1000,
+        orchestrator="cursor",
+        model="grok-4.6",
+        raw_count=7,
+        findings_confirmed=json.dumps(confirmed),
+        findings_rejected=json.dumps([]),
+        unresolved=json.dumps([]),
+        lost_dimensions=json.dumps([]),
+        incomplete=False,
+        submitted_by="cursor-cloud-reviewer",
+        self_reviewed=False,
+    )
+    await db.commit()
+
+
+def _touch(monkeypatch, outcome: str) -> None:
+    """Что хаб узнал про места находок — подменяется на уровне вычисления.
+
+    Настоящий ответ считает git по клону, которого в тестах нет: без
+    подмены все три случая слились бы в один — «неизвестно». Подменяется
+    ИМЕННО вычисление, а не решение диспетчера: правило остаётся под
+    проверкой, подделан только факт, на котором оно работает.
+    """
+
+    async def _fake(db, task_id, findings, *, generation, head=""):
+        assert head, (
+            "решение о сдаче обязано считаться до ЗАКРЕПЛЁННОГО sha, "
+            "а не до вершины ветки: имя ветки — движущаяся цель (#572)"
+        )
+
+        from hub.services.finding_identity import finding_uids
+
+        return {uid: {"outcome": outcome} for uid in finding_uids(findings)}
+
+    monkeypatch.setattr(
+        "hub.services.finding_evidence.evidence_for_report", _fake, raising=True
+    )
+
+
+_FINDING = {
+    "title": "страж не читает пин",
+    "severity": "high",
+    "file": "hub/services/steward_apply.py",
+    "locator": "lines",
+    "start_line": 10,
+    "end_line": 20,
+}
+
+
+async def test_resubmit_without_changes_refused_before_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1150): прогона нет ВООБЩЕ, а не «есть, но бесполезный».
+
+    Отказ до старта стоит ноль, отказ после — полтора-два миллиона токенов
+    провайдера за воспроизведение известного ответа. Поэтому проверяется
+    отсутствие СТРОКИ в steward_runs, а не отсутствие суждения: заказ,
+    который потом закроют, уже оплачен.
+    """
+    project_id = await _project(db, "steward-stale", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, task_id, 1, [_FINDING])
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+
+    ordered = await order_due_runs(db)
+
+    assert ordered == 0
+    rows = [
+        dict(r)
+        for r in await fetchall(
+            db, "SELECT status FROM steward_runs WHERE task_id=?", (task_id,)
+        )
+    ]
+    assert [r["status"] for r in rows] == [RUN_REFUSED], (
+        "ЗАКАЗА не должно появиться вовсе — он и есть оплата. Строка есть, но "
+        "это не заказ, а его невозможность: генерация закрыта отказом (отчёт "
+        "212), и открытого слота, который кто-то мог бы исполнить, нет"
+    )
+    assert await open_run(db, task_id, 2) is None
+    refusals = await _events(db, EVENT_REFUSED)
+    assert refusals, "молчаливый отказ неотличим от бага"
+    payload = json.loads(refusals[-1]["payload"])
+    assert payload["reason"] == "no_new_information"
+    assert "не тронула места находок" in payload["detail"]
+
+
+async def test_real_change_still_gets_its_run(db: aiosqlite.Connection, monkeypatch):
+    """AC-2 (#1150): отказ, умеющий только отказывать, — это выключатель.
+
+    Три случая обязаны пропускать, и каждый по своей причине: правка мест
+    находок, отсутствие подтверждённых находок у прошлой сдачи, и —
+    отдельно — неизвестность. «Хаб не смог посмотреть» не равно «ничего не
+    изменилось» (#762), и цена ошибки здесь несимметрична: лишний прогон
+    стоит денег, пропущенная правка — суждения о коде, которого никто не
+    судил.
+    """
+    project_id = await _project(db, "steward-fresh", steward=True)
+
+    touched = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, touched, 1, [_FINDING])
+    await repo.update_task(db, touched, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "touched")
+    assert await order_due_runs(db) == 1, "правка мест находок обязана купить прогон"
+
+    # Прошлая сдача без подтверждённых находок: отказывать не за что —
+    # возвращали работу не по ним.
+    clean = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, clean, 1, [])
+    await repo.update_task(db, clean, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+    assert await order_due_runs(db) == 1, "без находок прошлой сдачи отказ беспредметен"
+
+    # Неизвестность покупает прогон, а не отказ.
+    unknown = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, unknown, 1, [_FINDING])
+    await repo.update_task(db, unknown, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "unknown")
+    assert await order_due_runs(db) == 1, (
+        "«не удалось посмотреть» — не «ничего не изменилось»: неизвестность "
+        "стоит прогона, а не отказа"
+    )
+
+
+async def test_the_first_submission_is_never_stale(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Первой сдаче сравнивать не с чем, и она проходит без вопросов.
+
+    Отдельным тестом, потому что арифметика поколений — обычное место
+    ошибки на единицу: generation-1 у первой сдачи равен нулю, и «нет
+    отчёта нулевой генерации» не должно читаться как «ничего не менялось».
+    """
+    project_id = await _project(db, "steward-first", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    _touch(monkeypatch, "untouched")
+
+    assert await order_due_runs(db) == 1
+    assert await open_run(db, task_id, 1) is not None
+
+
+async def test_a_second_tick_does_not_repeat_the_refusal(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ пишется один раз на генерацию, а не на каждый тик поллера.
+
+    Поллер тикает раз в тридцать секунд, а задача стоит в review часами.
+    Отказ на каждом проходе за ночь превращает фид в сотню одинаковых
+    строк, среди которых больше нечего прочитать — а фид тут единственное
+    место, где человек вообще узнаёт, что прогона не будет.
+    """
+    project_id = await _project(db, "steward-quiet-refusal", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, task_id, 1, [_FINDING])
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+
+    for _ in range(5):
+        assert await order_due_runs(db) == 0
+
+    # Считаются ВСЕ отказы по задаче, не только no_new_information. Индекс
+    # и без короткого пути не даст второго заказа — но тогда каждый тик
+    # упирался бы в него и писал already_ordered: тишина в фиде держится не
+    # индексом, а тем, что до вычисления тик не доходит вовсе.
+    refusals = [e for e in await _events(db, EVENT_REFUSED) if e["task_id"] == task_id]
+    assert len(refusals) == 1, (
+        f"ожидался один отказ, получено {len(refusals)}: "
+        f"{[json.loads(e['payload']).get('reason') for e in refusals]}"
+    )
+    # И причина тишины — не память о событии, а закрытая строка: генерация
+    # решена, и до вычисления следующий тик не доходит (отчёт 212).
+    rows = await fetchall(
+        db,
+        "SELECT status FROM steward_runs WHERE task_id=? AND generation=2",
+        (task_id,),
+    )
+    assert [dict(r)["status"] for r in rows] == [RUN_REFUSED]
+
+    # Новая генерация — новое состояние, и о ней сказать надо.
+    await repo.update_task(db, task_id, submission_generation=3)
+    await _reported(db, task_id, 2, [_FINDING])
+    await db.commit()
+    assert await order_due_runs(db) == 0
+
+    refusals = [
+        e
+        for e in await _events(db, EVENT_REFUSED)
+        if json.loads(e["payload"]).get("reason") == "no_new_information"
+    ]
+    assert len(refusals) == 2, "следующая сдача — отдельный отказ, а не повтор"
+
+
+async def test_a_refused_generation_stays_refused_when_the_facts_flip(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отчёт 212: отказ обязан ЗАПЕРЕТЬ генерацию, а не только сказать «нет».
+
+    Событие в фиде ничего не запирало. Стоило вычислению на следующем тике
+    ответить иначе — git не прочитал дифф, «неизвестно» честно покупает
+    прогон, — и тот же заказ размещался на основании, которое минуту назад
+    отвергли. Здесь факт меняется с «не тронуто» на «неизвестно» между
+    тиками, и прогон всё равно не появляется: решение принято один раз.
+    """
+    project_id = await _project(db, "steward-refused-locked", steward=True)
+    task_id = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, task_id, 1, [_FINDING])
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    _touch(monkeypatch, "untouched")
+    assert await order_due_runs(db) == 0
+
+    _touch(monkeypatch, "unknown")
+    assert await order_due_runs(db) == 0, (
+        "«неизвестно» купило бы прогон на свежей генерации — но эта уже решена"
+    )
+    _touch(monkeypatch, "touched")
+    assert await order_due_runs(db) == 0
+    assert await open_run(db, task_id, 2) is None
+    # И ни одного ЛИШНЕГО слова: без короткого пути тик доходил бы до
+    # order_run, упирался в индекс и писал already_ordered на каждом
+    # проходе — корректно по исходу, шумно по фиду.
+    refusals = [e for e in await _events(db, EVENT_REFUSED) if e["task_id"] == task_id]
+    assert [json.loads(e["payload"])["reason"] for e in refusals] == [
+        "no_new_information"
+    ], "решённая генерация не обсуждается повторно ни под каким кодом"
+    rows = await fetchall(
+        db,
+        "SELECT status FROM steward_runs WHERE task_id=? AND generation=2",
+        (task_id,),
+    )
+    assert [dict(r)["status"] for r in rows] == [RUN_REFUSED], (
+        "ровно одна строка, и она refused: второй заказ невозможен по индексу"
+    )
+
+
+async def test_a_refusal_does_not_spend_the_daily_cap(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ — не заказ: он ничего не купил и не тратит потолок покупок.
+
+    Строка refused стоит в той же таблице, что и заказы, и потолок считает
+    по ней. Без исключения десять отказов за утро оставили бы проект без
+    прогонов до полуночи — при том, что ни один прогон не состоялся.
+    """
+    from hub.services.steward_dispatch import runs_today
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+    project_id = await _project(db, "steward-cap-refused", steward=True)
+
+    refused = await _submitted_task(db, project_id, generation=1)
+    await _reported(db, refused, 1, [_FINDING])
+    await repo.update_task(db, refused, submission_generation=2)
+    await db.commit()
+    _touch(monkeypatch, "untouched")
+    assert await order_due_runs(db) == 0
+    assert await runs_today(db, project_id) == 0, "отказ не считается заказом"
+
+    fresh = await _submitted_task(db, project_id, generation=1)
+    assert await order_due_runs(db) == 1, (
+        "потолок 1 ещё не потрачен — отказ его не съел, и свежая сдача получает прогон"
+    )
+    assert await open_run(db, fresh, 1) is not None
