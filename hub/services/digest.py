@@ -4,7 +4,8 @@ The autopilot (#744/#745) removed pre-approval clicks; this module keeps
 the OVERSIGHT: every project whose gate_policy delegates anything gets one
 digest per UTC day of autopilot activity — what the policy approved and on
 which grounds, what it escalated, what the pipeline delivered — plus a
-deterministic ~10% sample of auto-approved tasks marked for a human spot
+deterministic sample marked for a human spot check — ~10% of decisions,
+applied approvals oversampled to ~30% (#1144) — of tasks
 check. A day with no autopilot transitions produces no digest: an empty
 report read daily becomes noise, and noise is how oversight dies quietly.
 

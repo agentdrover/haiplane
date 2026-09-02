@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import aiosqlite
 from httpx import AsyncClient
@@ -34,6 +35,26 @@ from tests.test_autopilot_digest import (
     _steward_project,
     _tomorrow,
 )
+
+
+# День, к которому прижимаются события AC-1 (#1144 ревью, отчёт 202).
+# Выборка — sha256(task_id:дата) % 10, и утверждения «эскалации есть» и
+# «approve чаще» от даты ЗАВИСЯТ: перебор по календарю давал ~3.4% дней, в
+# которые тест краснел без единой правки кода. Дата фиксируется, как в AC-2:
+# зелёный прогон на случайном дне ничего не доказывал.
+_FROZEN_DAY = "2026-09-01"
+_FROZEN_NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+
+
+async def _freeze_day(db: aiosqlite.Connection) -> None:
+    """Все события этого теста — в один известный день.
+
+    Дайджест читает события по created_at, а записываются они «сейчас».
+    Чтобы дата выборки была константой, события переносятся в _FROZEN_DAY;
+    хеш и порог при этом настоящие, подделан только календарь.
+    """
+    await db.execute("UPDATE events SET created_at = ?", (f"{_FROZEN_DAY} 12:00:00",))
+    await db.commit()
 
 
 async def _policy_verdict_task(
@@ -92,8 +113,10 @@ async def test_policy_approved_verdicts_are_oversampled_too(db: aiosqlite.Connec
         for i in range(40)
     ]
 
-    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    await _freeze_day(db)
+    assert await generate_due_digests(db, now=_FROZEN_NOW) == 1
     payload = json.loads((await repo.list_digests(db))[0]["payload"])
+    assert payload["date"] == _FROZEN_DAY
     sample = set(payload["audit_sample"])
 
     picked_approved = sample & set(approved_ids)
@@ -147,8 +170,10 @@ async def test_sample_oversamples_applied_approvals(db: aiosqlite.Connection):
         for i in range(40)
     ]
 
-    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    await _freeze_day(db)
+    assert await generate_due_digests(db, now=_FROZEN_NOW) == 1
     payload = json.loads((await repo.list_digests(db))[0]["payload"])
+    assert payload["date"] == _FROZEN_DAY
     sample = set(payload["audit_sample"])
 
     picked_approved = sample & set(approved_ids)
