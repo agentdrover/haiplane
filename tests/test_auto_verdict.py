@@ -77,18 +77,28 @@ class _PinnedGitOps(NoopGitOps):
         repo=None,
         gh_repo=None,
         base_branch=None,
+        forge: str = "",
     ):
         return 41
 
-    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None):
+    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None, forge: str = ""):
         return CIProbeResult(CIProbeOutcome.passed, "checks_passed")
 
     async def merge_pr(
-        self, pr_number, task_id, title, repo=None, gh_repo=None, delete_branch=True
+        self,
+        pr_number,
+        task_id,
+        title,
+        repo=None,
+        gh_repo=None,
+        delete_branch=True,
+        forge: str = "",
     ):
         return True
 
-    async def merge_commit_sha(self, pr_number, repo=None, gh_repo=None):
+    async def merge_commit_sha(
+        self, pr_number, repo=None, gh_repo=None, forge: str = ""
+    ):
         return "b" * 40
 
     async def pull_main(self, repo=None, base_branch=None):

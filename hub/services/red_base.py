@@ -37,7 +37,7 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import log_activity
 from hub.integrations.registry import plugins
-from hub.services.project_policy import base_branch_of
+from hub.services.project_policy import base_branch_of, forge_of
 
 log = logging.getLogger("hub.red_base")
 
@@ -127,6 +127,7 @@ async def _commits_between(
             red_sha,
             repo=(project.get("workspace_path") or "").strip() or None,
             gh_repo=(project.get("repo") or "").strip() or None,
+            forge=forge_of(project),
         )
     except Exception as exc:  # noqa: BLE001 - the event must still be emitted
         log.warning("commits between %s..%s unreadable: %s", last_green, red_sha, exc)
@@ -165,6 +166,7 @@ async def check_project(db: aiosqlite.Connection, project_row: Any) -> BaseCiSta
         branch,
         repo=(project.get("workspace_path") or "").strip() or None,
         gh_repo=(project.get("repo") or "").strip() or None,
+        forge=forge_of(project),
     )
     state = read_state(branch, runs)
     if state.status != RED:

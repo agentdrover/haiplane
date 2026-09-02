@@ -1754,10 +1754,12 @@ class _BranchCIGitOps(NoopGitOps):
         self._subjects = subjects or []
         self.range_calls: list[tuple[str, str]] = []
 
-    async def branch_ci_runs(self, branch, limit=20, repo=None, gh_repo=None):
+    async def branch_ci_runs(
+        self, branch, limit=20, repo=None, gh_repo=None, forge: str = ""
+    ):
         return self._runs
 
-    async def release_range(self, base, head, repo=None, gh_repo=None):
+    async def release_range(self, base, head, repo=None, gh_repo=None, forge: str = ""):
         self.range_calls.append((base, head))
         return self._subjects
 
