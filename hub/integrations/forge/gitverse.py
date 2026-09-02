@@ -627,21 +627,59 @@ class GitVerseForge:
         self,
         *,
         gh_repo: str | None,
-        branch: str = "",
         limit: int = 20,
     ) -> list[dict[str, Any]] | None:
-        """Прогоны репозитория, новые первыми, или None если спросить не вышло."""
+        """Прогоны репозитория, новые первыми, или None если спросить не вышло.
+
+        БЕЗ СЕРВЕРНЫХ ФИЛЬТРОВ, и это не упрощение, а единственный работающий
+        способ (#1154). Измерено 02.09.2026 боевым токеном:
+
+          без параметров                    -> 200
+          ?branch=main                      -> 200
+          ?branch=task-1138/eslint-debt     -> 400
+          ?branch=task-1138%2Feslint-debt   -> 400  (кодирование не спасает)
+          ?head_sha=<sha>                   -> 400
+
+        То есть фильтр по ветке ломается на ЛЮБОМ имени со слэшем, а head_sha
+        не поддерживается вовсе. Канонические ветки хаба — ``task-<id>/<slug>``
+        — слэш несут всегда, поэтому серверная фильтрация на задачах
+        неприменима в принципе: раньше проба отвечала ``unavailable`` на
+        каждой задаче, и первая же живая (#1138) встала при двух зелёных
+        прогонах по её коммиту.
+
+        Промах, из-за которого дефект прожил: замер в #1117 делался на ``main``
+        — единственной ветке без слэша, — и один случай был обобщён на все.
+
+        ``per_page`` здесь ОКНО, а не отбор: вызывающий сужает выборку сам, по
+        ``commit_sha`` или по ``ref``. Прогон старше окна невидим — это цена
+        отсутствия серверного фильтра, а не недосмотр.
+        """
         slug = self._repo(gh_repo)
         if not slug:
             return None
         params: dict[str, Any] = {"per_page": max(1, min(limit, 100))}
-        if branch:
-            params["branch"] = branch
         resp = await self._request("GET", f"/repos/{slug}/actions/runs", params=params)
         if not resp.ok or not isinstance(resp.data, dict):
             return None
         runs = resp.data.get("workflow_runs")
         return runs if isinstance(runs, list) else None
+
+    @staticmethod
+    def _runs_of_branch(
+        runs: list[dict[str, Any]], branch: str
+    ) -> list[dict[str, Any]]:
+        """Прогоны ИМЕННО этой ветки из общего списка (#1154).
+
+        ``ref`` приходит полным: ``refs/heads/task-1138/eslint-debt`` у push,
+        ``refs/pull/3/head`` у pull_request. Сравнение с голым именем ветки в
+        лоб даёт пустоту, неотличимую от «прогонов нет» — та же ловушка, что
+        разбиралась в #1117 для фильтра по ветке.
+        """
+        wanted = (branch or "").strip()
+        if not wanted:
+            return []
+        full = wanted if wanted.startswith("refs/") else f"refs/heads/{wanted}"
+        return [r for r in runs if str(r.get("ref") or "").strip() == full]
 
     def _outcome_of(self, runs: list[dict[str, Any]]) -> CIProbeResult:
         """Свести набор прогонов в один исход, не приукрашивая незнание.
@@ -701,8 +739,11 @@ class GitVerseForge:
                 "gitverse_head_sha_unavailable",
                 details=f"PR #{pr_number}",
             )
-        _base, head_ref = await self.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
-        runs = await self._runs(gh_repo=gh_repo, branch=head_ref)
+        # Ветка PR больше не спрашивается и не шлётся серверу: фильтр по ней
+        # отвергается кодом 400 на любом имени со слэшем (#1154). Отбор ниже
+        # идёт по commit_sha, и он же — правильный вопрос: «что с ЭТИМ
+        # коммитом», а не «что на этой ветке».
+        runs = await self._runs(gh_repo=gh_repo, limit=100)
         if runs is None:
             return CIProbeResult(
                 CIProbeOutcome.unavailable, "gitverse_runs_unavailable"
@@ -732,11 +773,14 @@ class GitVerseForge:
         лежит в ``status``. Заполняем ОБА поля одним значением — потребитель
         не должен знать, на каком форже он сейчас.
         """
-        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=limit)
+        # Окно берётся широким, а сужается уже здесь: серверный фильтр по
+        # ветке на GitVerse неприменим (#1154), поэтому limit относится к
+        # прогонам ЭТОЙ ветки, а не к длине общего списка.
+        runs = await self._runs(gh_repo=gh_repo, limit=100)
         if runs is None:
             return None
         out: list[dict[str, Any]] = []
-        for r in runs:
+        for r in self._runs_of_branch(runs, branch)[:limit]:
             status = str(r.get("status") or "").strip().lower()
             out.append(
                 {
@@ -772,7 +816,10 @@ class GitVerseForge:
         slug = self._repo(gh_repo)
         if not slug:
             return result
-        runs = await self._runs(gh_repo=gh_repo, branch=branch, limit=20)
+        # Ветка серверу не шлётся: фильтр по ней отвергается кодом 400 на
+        # любом имени со слэшем (#1154). Без этого логи упавшего CI не
+        # находились бы НИ ДЛЯ ОДНОЙ задачи, и человек чинил бы вслепую.
+        runs = await self._runs(gh_repo=gh_repo, limit=100)
         if not runs:
             return result
 
