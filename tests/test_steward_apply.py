@@ -935,3 +935,83 @@ async def test_no_closures_at_all_refuses_every_finding(
     assert len(unclosed) == 2, f"по одному отказу на находку: {unclosed}"
     assert any(_uid(_FINDING_A) in d for d in unclosed)
     assert any(_uid(_FINDING_B) in d for d in unclosed)
+
+
+async def test_the_refusal_says_when_the_hub_looked_and_saw_nothing(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Вторая половина той же развилки: посмотрели и не нашли.
+
+    Прошлая сдача закрыла только ветку «посмотреть не смогли», и ревью это
+    назвало: формулировка UNTOUCHED осталась незапертой, поэтому её можно
+    было переписать или потерять, не уронив ни одного теста. Разница между
+    двумя текстами и есть смысл правки — половина проверки её не держит.
+
+    Здесь клон настоящий и коммит на месте, поэтому хаб СМОТРИТ. Он ничего
+    не находит по неизбежной причине, названной в докстринге closure_refusals:
+    отчёт относится к текущей сдаче, значит отправная точка и вершина — один
+    коммит, и коммитов между ними не бывает.
+    """
+    import subprocess
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+        "HOME": str(clone),
+    }
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(clone), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env=env,
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.email", "t@e")
+    git("config", "user.name", "t")
+    (clone / "hub" / "services").mkdir(parents=True)
+    (clone / "hub" / "services" / "x.py").write_text(
+        "".join(f"line-{i}\n" for i in range(1, 21))
+    )
+    git("add", "-A")
+    git("commit", "-m", "baseline")
+    head = git("rev-parse", "HEAD")
+
+    project_id = await repo.create_project(
+        db,
+        slug="apply-untouched",
+        name="apply-untouched",
+        workspace_path=str(clone),
+        status="active",
+    )
+    task_id = await _task(db, project_id)
+    await repo.update_task(db, task_id, project_id=project_id, submission_sha=head)
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=head, base_branch="main"
+    )
+    await db.commit()
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "fixed"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert unclosed
+    assert any("строк находки они не трогали" in d for d in unclosed), (
+        f"клон на месте — отказ обязан сказать, что хаб СМОТРЕЛ: {unclosed}"
+    )
+    assert not any("посмотреть НЕ СМОГ" in d for d in unclosed), (
+        f"наблюдение было — называть его отсутствием нельзя: {unclosed}"
+    )
