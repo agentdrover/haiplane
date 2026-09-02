@@ -53,6 +53,11 @@ REFUSED_UNCLOSED = "unclosed_finding"
 # подтверждается. Соответствие публичное, потому что его полноту проверяет
 # тест: тип, добавленный в словарь и забытый здесь, тихо стал бы закрытием
 # без доказательства — то есть словом вместо факта.
+# Не тип закрытия, а метка «стюард сказал про эту находку два разных
+# слова». Вне словаря намеренно: она обязана провалить проверку типа и
+# попасть в отказ вместе с тем, что именно не так.
+_CONTRADICTORY = "противоречивое заявление"
+
 CLOSURE_EVIDENCE: dict[str, str] = {
     "fixed": "коммит после отчёта тронул строки находки",
     "human_disposition": "человек вынес диспозицию по этой находке",
@@ -211,7 +216,17 @@ async def closure_refusals(
         коммит после отчёта тронул диапазон строк находки. Считается тем
         же расчётом, что и доказательство в карточке (#1039), и ДО
         закреплённого sha, а не до вершины ветки: решение о сдаче читает
-        то, что сдача закрепила (урок #1150);
+        то, что сдача закрепила (урок #1150).
+
+        ЗНАЕМЫЙ ПРЕДЕЛ, названный кросс-модельным ревью и проверенный:
+        отчёт всегда относится к ТЕКУЩЕЙ сдаче, поэтому отправная точка
+        расчёта и закреплённый sha — один и тот же коммит, диапазон пуст,
+        и подтвердить fixed на применении нельзя НИКОГДА. Это не случайно:
+        код под судом и есть код, который читал отчёт, и «уже исправлено»
+        про него не бывает — правка означает новую сдачу и новый отчёт.
+        Тип остаётся в словаре #1022, потому что он осмыслен на исходах
+        находок при пересдаче (#911), а не на применении. Заявленный
+        здесь, он честно отказывает и говорит, что именно хаб наблюдал;
     human_disposition
         по находке уже есть запись человека (#1038). Ссылка на решение, а
         не пересказ его;
@@ -240,7 +255,7 @@ async def closure_refusals(
     claimed = await _claimed_closures(db, task_id, packet.generation)
     uids = finding_uids(confirmed)
 
-    touched: dict[str, str] = {}
+    touched: dict[str, tuple[str, str]] = {}
     if any(claimed.get(uid) == "fixed" for uid in uids):
         # Один обход ветки на все находки: вызов на каждую сделал бы
         # привратника непригодным на живом размере отчёта (#1042).
@@ -257,7 +272,11 @@ async def closure_refusals(
             db, task_id, confirmed, generation=packet.generation, head=pinned
         )
         touched = {
-            uid: str(blob.get("outcome") or "") for uid, blob in evidence.items()
+            uid: (
+                str(blob.get("outcome") or ""),
+                str(blob.get("reason") or ""),
+            )
+            for uid, blob in evidence.items()
         }
 
     out: list[tuple[str, str]] = []
@@ -285,10 +304,36 @@ async def closure_refusals(
                     REFUSED_UNCLOSED,
                     f"находка «{title}» ({uid}): закрытие {kind} объявлено, но "
                     f"хаб его не подтверждает — ожидалось, что "
-                    f"{CLOSURE_EVIDENCE[kind]}",
+                    f"{CLOSURE_EVIDENCE[kind]}; "
+                    + _what_the_hub_saw(kind, touched.get(uid)),
                 )
             )
     return out
+
+
+def _what_the_hub_saw(kind: str, seen: tuple[str, str] | None) -> str:
+    """Наблюдённое состояние, а не только ожидание.
+
+    Найдено кросс-модельным ревью: один шаблон отказа накрывал два разных
+    случая. «Коммитов по этим строкам нет» и «в дифф заглянуть не удалось»
+    — разные вещи для того, кто будет разбирать: первое означает, что
+    правки не было, второе — что мы не смотрели. Незнание, названное
+    отсутствием, и есть та ошибка, против которой стоит #762.
+    """
+    from hub.services.finding_evidence import OUTCOME_UNKNOWN, OUTCOME_UNTOUCHED
+
+    if kind != "fixed" or seen is None:
+        return "хаб опоры не нашёл"
+    outcome, reason = seen
+    if outcome == OUTCOME_UNTOUCHED:
+        return "хаб посмотрел коммиты после отчёта: строк находки они не трогали"
+    if outcome == OUTCOME_UNKNOWN:
+        return (
+            "хаб посмотреть НЕ СМОГ"
+            + (f" ({reason})" if reason else "")
+            + " — это не «правки не было», это отсутствие наблюдения"
+        )
+    return "хаб опоры не нашёл"
 
 
 async def _claimed_closures(
@@ -308,11 +353,22 @@ async def _claimed_closures(
         return {}
     if not isinstance(entries, list):
         return {}
-    return {
-        str(e.get("finding_uid")): str(e.get("type"))
-        for e in entries
-        if isinstance(e, dict) and e.get("finding_uid")
-    }
+    claimed: dict[str, str] = {}
+    for e in entries:
+        if not isinstance(e, dict) or not e.get("finding_uid"):
+            continue
+        uid = str(e.get("finding_uid"))
+        kind = str(e.get("type"))
+        if uid in claimed and claimed[uid] != kind:
+            # Две разные записи про одну находку. Найдено кросс-модельным
+            # ревью: сборка словарём молча оставляла последнюю, то есть
+            # порядок записей решал, что считается закрытием. Заявление,
+            # противоречащее самому себе, — не закрытие, и выбирать за
+            # стюарда, какую его половину читать, хаб не должен.
+            claimed[uid] = _CONTRADICTORY
+            continue
+        claimed.setdefault(uid, kind)
+    return claimed
 
 
 async def _closure_is_proven(
@@ -321,14 +377,15 @@ async def _closure_is_proven(
     packet: EvidencePacket,
     uid: str,
     kind: str,
-    touched: dict[str, str],
+    touched: dict[str, tuple[str, str]],
 ) -> bool:
     """Подтверждает ли ХАБ это закрытие. Незнание — не подтверждение (#762)."""
     from hub import repository as repo
     from hub.services.finding_evidence import OUTCOME_TOUCHED
 
     if kind == "fixed":
-        return touched.get(uid) == OUTCOME_TOUCHED
+        seen = touched.get(uid)
+        return seen is not None and seen[0] == OUTCOME_TOUCHED
     report = packet.facts.get("machine_review_report")
     review_id = int(((report.value if report else None) or {}).get("review_id") or 0)
     if kind == "human_disposition":
@@ -345,6 +402,13 @@ async def _closure_is_proven(
                 continue
             linked = entry.get("linked_task_id")
             if not linked:
+                return False
+            if int(linked) == task_id:
+                # Ссылка на саму себя. Найдено кросс-модельным ревью:
+                # проверка существования её пропускала, потому что задача,
+                # разумеется, существует. Но «вынесено в другую задачу»
+                # означает, что работа уехала ОТСЮДА; указание на эту же
+                # задачу оставляет её здесь и при этом объявляет закрытой.
                 return False
             # Задача обязана СУЩЕСТВОВАТЬ: ссылка на несозданное — обещание,
             # а не вынос.

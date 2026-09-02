@@ -801,3 +801,137 @@ async def test_a_disposition_nobody_signed_is_not_a_human_one(
     assert REFUSED_UNCLOSED in _codes(refusals), (
         "запись без подписи — не решение человека, а строка в таблице"
     )
+
+
+async def test_a_link_to_this_very_task_carries_nothing_away(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Самоссылка не выносит работу никуда.
+
+    Найдено кросс-модельным ревью. Проверка существования связанной задачи
+    самоссылку пропускала — задача, разумеется, существует. Но
+    out_of_scope_linked означает, что работа уехала ОТСЮДА; указание на эту
+    же задачу оставляет её здесь и при этом объявляет закрытой.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-selflink")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    review_id = await _review_id(db, task_id)
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=_uid(_FINDING_A),
+        finding_index=0,
+        finding_title=_FINDING_A["title"],
+        outcome="deferred",
+        note="как будто вынесено",
+        linked_task_id=task_id,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "out_of_scope_linked"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals)
+
+
+async def test_two_words_about_one_finding_close_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Противоречивое заявление — не закрытие, и порядок записей его не решает.
+
+    Найдено кросс-модельным ревью: сборка словарём оставляла последнюю
+    запись, то есть порядок в списке решал, что считается закрытием.
+    Проверяется ОБОИМИ порядками: подтверждённое закрытие рядом с
+    неподтверждённым не должно проходить ни первым, ни вторым.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-contradiction")
+
+    good = {"finding_uid": None, "type": "human_disposition"}
+    bad = {"finding_uid": None, "type": "fixed"}
+    for order in ((good, bad), (bad, good)):
+        task_id = await _task(db, project_id)
+        await _green(db, task_id, confirmed=[_FINDING_A])
+        review_id = await _review_id(db, task_id)
+        await repo.upsert_finding_disposition(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=1,
+            finding_index=0,
+            finding_title=_FINDING_A["title"],
+            disposition="wont_fix",
+            note="человек посмотрел",
+            decided_by="Denis",
+            finding_uid=_uid(_FINDING_A),
+        )
+        await db.commit()
+        await _judged_with(
+            db,
+            task_id,
+            [{**e, "finding_uid": _uid(_FINDING_A)} for e in order],
+        )
+
+        refusals = await apply_refusals(db, task_id)
+
+        assert REFUSED_UNCLOSED in _codes(refusals), (
+            f"порядок {[e['type'] for e in order]} не должен решать исход"
+        )
+
+
+async def test_the_refusal_says_whether_the_hub_could_look(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """«Не смотрели» и «смотрели, не трогали» — разные отказы (#762).
+
+    Найдено кросс-модельным ревью: один шаблон накрывал оба случая, и
+    текст читался как «коммиты смотрели, строк они не трогали» даже когда
+    заглянуть в дифф не удалось вовсе. Для того, кто разбирает, это разница
+    между «правки не было» и «мы не наблюдали».
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unknown-vs-untouched")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "fixed"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert unclosed
+    assert any("посмотреть НЕ СМОГ" in d for d in unclosed), (
+        f"клона нет — отказ обязан назвать это отсутствием наблюдения: {unclosed}"
+    )
+
+
+async def test_no_closures_at_all_refuses_every_finding(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пустой список закрытий отказывает КАЖДУЮ находку, а не молчит.
+
+    Пробел, названный кросс-модельным ревью: соседний тест держит список
+    закрытий непустым, поэтому ранний выход «нечего проверять — пропускаем»
+    остался бы зелёным. Здесь заявлено ноль закрытий при двух находках, и
+    отказов обязано быть два.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-no-closures")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A, _FINDING_B])
+    await _judged_with(db, task_id, [])
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert len(unclosed) == 2, f"по одному отказу на находку: {unclosed}"
+    assert any(_uid(_FINDING_A) in d for d in unclosed)
+    assert any(_uid(_FINDING_B) in d for d in unclosed)
