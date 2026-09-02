@@ -34,6 +34,7 @@ import aiosqlite
 from hub.db import fetchall
 from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
+from hub.services.project_policy import DELEGATED_VERDICTS
 
 log = logging.getLogger(__name__)
 
@@ -52,9 +53,13 @@ _AUTOPILOT_EVENT_KINDS = (
 # "auto" was the only one while the policy autopilot was the only delegate;
 # a project that hands the verdict to the steward has delegated exactly as
 # much, and asking for "auto" specifically refused it a digest entirely
-# (#1143). The set is the place to add the next delegate — the check reads
-# it, so a new word cannot be added to the policy and forgotten here.
-_DELEGATED_TO_MACHINE: frozenset[str] = frozenset({"auto", "steward"})
+# (#1143).
+#
+# #1151: перечень переехал в project_policy и стал ОДНИМ на хаб — его же
+# читают автовердикт, диспетчер ревью и замок #743. Здесь стоит псевдоним
+# на общий: свой список рядом с общим означал бы, что новый делегат
+# появится в одном месте и не появится в другом.
+_DELEGATED_TO_MACHINE = DELEGATED_VERDICTS
 
 
 # Порог совпадения по модулю 10 для обычной (базовой) выборки — ~10%. Число

@@ -53,7 +53,10 @@ def _pr_states(monkeypatch: pytest.MonkeyPatch, answers: dict[int, str]) -> None
     """
 
     async def fake_pr_state(
-        pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         return answers.get(int(pr_number), "")
 
@@ -516,7 +519,7 @@ class _MergeSpy:
         self.merges = merges
         self.merged: list[int] = []
 
-    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None):
+    async def check_pr_ci(self, pr_number, repo=None, gh_repo=None, forge: str = ""):
         from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 
         outcome = (
@@ -524,13 +527,33 @@ class _MergeSpy:
         )
         return CIProbeResult(outcome=outcome, reason=f"probe says {self.ci}")
 
-    async def merge_pr(self, pr_number, task_id, title, repo=None, gh_repo=None):
+    async def merge_pr(
+        self, pr_number, task_id, title, repo=None, gh_repo=None, forge: str = ""
+    ):
         if not self.merges:
             return False
         self.merged.append(int(pr_number))
         return True
 
-    async def merge_commit_sha(self, pr_number, repo=None, gh_repo=None):
+    async def merge_pr_with_detail(
+        self,
+        pr_number,
+        task_id,
+        title,
+        repo=None,
+        gh_repo=None,
+        delete_branch=True,
+        forge: str = "",
+    ):
+        # #1116: гейт спрашивает причину отказа, а не только факт. Дублёр
+        # отвечает согласованно со своим merge_pr — иначе он рассказывал бы
+        # о доставке две разные истории.
+        ok = await self.merge_pr(pr_number, task_id, title, repo=repo, gh_repo=gh_repo)
+        return (ok, "" if ok else "")
+
+    async def merge_commit_sha(
+        self, pr_number, repo=None, gh_repo=None, forge: str = ""
+    ):
         return f"{int(pr_number):040d}"
 
     async def head_sha(self, repo, ref):
@@ -571,6 +594,9 @@ def _install(monkeypatch, spy: _MergeSpy) -> None:
     for name in (
         "check_pr_ci",
         "merge_pr",
+        # #1116: гейт зовёт детальный вариант — без него подменялся бы один
+        # метод, а работал бы другой, и дублёр молча переставал бы дублировать.
+        "merge_pr_with_detail",
         "merge_commit_sha",
         "head_sha",
         "pull_main",

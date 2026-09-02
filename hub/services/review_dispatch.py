@@ -31,8 +31,10 @@ from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
 from hub.models import RiskClass
+from hub.services import project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
@@ -993,6 +995,23 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     return dispatched
 
 
+#: Форжи, до которых дотягивается облачный ревьюер Cursor (#1119).
+#:
+#: Живёт ЗДЕСЬ, а не на форже: это факт про Cursor, а не про хостинг, и
+#: адаптер хостинга не должен знать, какие ревьюеры существуют на свете.
+#:
+#: Измерено 31.08.2026 живыми вызовами с одинаковым телом, менялся только
+#: адрес: https://gitverse.ru/... → 400 validation_error; git@gitverse.ru:... →
+#: 500 internal; контроль https://github.com/... → 201, агент создан. Плюс
+#: документация (repos[].url описан как «GitHub repository URL», endpoint
+#: списка репозиториев называется «List GitHub repositories») и прямой ответ
+#: сотрудника Cursor на форуме 21.01.2026.
+#:
+#: Если Cursor добавит хосты, этот кортеж — единственное место, где это
+#: правится, и дата выше говорит, когда проверку пора повторить.
+CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
 ) -> bool:
@@ -1028,6 +1047,28 @@ async def maybe_dispatch_review(
         return False
 
     gh_repo = (dict(project).get("repo") or "").strip()
+
+    # Отказ ДО вызова, по объявленному форжу проекта (#1119). Не «попробуем и
+    # разберём ответ»: ответы Cursor настоящую причину не называют — 400 даёт
+    # «[invalid_argument] Error», 500 не даёт ничего, а третий известный вид
+    # винит несуществующую ветку («Failed to verify existence of branch ...»).
+    # Прокинь любой из них наружу — и человек пойдёт чинить ветку, с которой
+    # всё в порядке. Отказ по форжу называет причину, которую можно устранить.
+    forge = project_policy.forge_of(project)
+    if forge not in CLOUD_REVIEW_FORGES:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Кросс-модельное ревью НЕ вызвано: облачный ревьюер не работает "
+            f"с форжем «{forge}» — он принимает только "
+            f"{', '.join(CLOUD_REVIEW_FORGES)} (проверено 31.08.2026). "
+            "Вердикт остаётся человеку (#757, #1119).",
+        )
+        await db.commit()
+        return False
+
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
     # #1083: three independent preconditions, and the message used to list all
     # three with "or" whichever one fired. Two of them live in the process
@@ -1043,7 +1084,7 @@ async def maybe_dispatch_review(
         label
         for ok, label in (
             (cursor_cloud.is_configured(), "CURSOR_API_KEY (ключ Cursor API)"),
-            (bool(gh_repo), "repo проекта (репозиторий на GitHub)"),
+            (bool(gh_repo), "repo проекта (owner/name на его форже)"),
             (
                 bool(reviewer_token),
                 "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)",
@@ -1126,7 +1167,7 @@ async def maybe_dispatch_review(
             bound_generation=generation,
         )
     created = await cursor_cloud.create_review_agent(
-        repo_url=f"https://github.com/{gh_repo}",
+        repo_url=forge_urls.repo_url(forge, gh_repo),
         starting_ref=branch,
         model_id=model_id,
         prompt_text=_review_prompt(

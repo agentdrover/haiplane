@@ -229,6 +229,37 @@ def gate_policy_of(project) -> dict:
 REVIEW_OFF = "off"
 REVIEW_DISPATCH = "dispatch"
 
+# Значения гейта, означающие «решает не человек» (#1151). Их два, и они
+# ОДИН перечень на весь хаб: его читают и потребители политики, и замок
+# #743, который такую политику не даёт сохранить на репозитории самого
+# хаба. Два списка рядом разъезжаются, и разъезжается тот, который мягче —
+# а мягче здесь означает «автоматика включилась там, где её запретили».
+#
+# steward стоит рядом с auto, а не вместо него: автопилот выносит вердикт
+# на ЧИСТОЙ сдаче, стюард судит грязный путь. Проект, отдавший вердикт
+# стюарду, не забирал его у автопилота — он добавил второго судью на те
+# случаи, где первый молчит.
+DELEGATED_VERDICTS: frozenset[str] = frozenset({"auto", "steward"})
+
+# Все значения, которые вообще принимаются на гейтах dor и verdict.
+# «human» плюс делегирующие: список один, чтобы новое делегирующее слово
+# нельзя было научиться понимать, не научив API его принимать — и наоборот,
+# нельзя было начать принимать значение, которого не понимает ни один
+# потребитель.
+GATE_VALUES: frozenset[str] = frozenset({"human"}) | DELEGATED_VERDICTS
+
+
+def verdict_is_delegated(policy: dict) -> bool:
+    """Отдан ли гейт вердикта машине — любой из них.
+
+    Нераспознанное значение сюда не попадает и попадать не должно: слово,
+    которого никто не узнал, значит «человек», а не «кто-нибудь» (#835).
+    """
+    if not isinstance(policy, dict):
+        return False
+    value = policy.get("verdict")
+    return isinstance(value, str) and value in DELEGATED_VERDICTS
+
 
 def review_dispatch_enabled(policy: dict) -> bool:
     """Whether the hub calls a reviewer for this project's submissions.
@@ -238,19 +269,23 @@ def review_dispatch_enabled(policy: dict) -> bool:
     * ``review='dispatch'`` — call the reviewer, leave the verdict to the
       human. This is the mode the hub's own project needs: the gate keeps
       its owner, but the owner finally has something to read (#804).
-    * ``verdict='auto'`` — the autopilot decides the verdict, and it decides
-      it BY READING THE REPORT (#745). A project asking for an auto verdict
-      is asking for the review that feeds it, so this keeps dispatching for
-      calc-kids and spike-bo without touching their stored policy.
+    * a DELEGATED verdict (``auto`` or ``steward``) — the machine decides,
+      and it decides BY READING THE REPORT (#745, #1151). A project asking
+      for a delegated verdict is asking for the review that feeds it, so
+      this keeps dispatching for calc-kids and spike-bo without touching
+      their stored policy. The steward case is not a nicety: its whole input
+      is the evidence packet, and the packet's central fact is that report
+      (#1074). A steward project without a dispatched review would judge
+      blind and escalate everything — an expensive way to do nothing.
 
     Note what this function is NOT: it does not weaken the default-project
-    lock (#743). That lock refuses 'auto' on the dor and verdict gates, and
-    dispatching a reviewer removes no human from anywhere — it hands the
-    human evidence. The two are opposite in direction.
+    lock (#743). That lock refuses every delegating value on the dor and
+    verdict gates, and dispatching a reviewer removes no human from anywhere
+    — it hands the human evidence. The two are opposite in direction.
     """
     if not isinstance(policy, dict):
         return False
-    if policy.get("verdict") == "auto":
+    if verdict_is_delegated(policy):
         return True
     return policy.get("review") == REVIEW_DISPATCH
 

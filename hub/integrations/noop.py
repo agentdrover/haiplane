@@ -55,6 +55,7 @@ class NoopDispatch:
         branch: str = "",
         pr_number: int | None = None,
         breadcrumb: str = "",
+        pr_url: str = "",
     ) -> str:
         return f"[noop] review #{task_id}: {title}"
 
@@ -141,6 +142,7 @@ class NoopGitOps:
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return None
 
@@ -149,6 +151,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         """No git here — "could not look" (#802).
 
@@ -162,6 +165,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         """No GitHub — "not a draft". Ignorance is not an accusation (#498)."""
         return False
@@ -171,6 +175,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> bool:
         return False
 
@@ -180,6 +185,7 @@ class NoopGitOps:
         head: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[str]:
         """No git here — an empty range means the release has nothing to say."""
         return []
@@ -202,6 +208,7 @@ class NoopGitOps:
         body: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return None
 
@@ -210,6 +217,7 @@ class NoopGitOps:
         pr_number: int,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> str:
         return ""
 
@@ -267,6 +275,7 @@ class NoopGitOps:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]:
         """No GitHub here — "could not ask", never "mergeable" (#970).
 
@@ -283,6 +292,7 @@ class NoopGitOps:
         *,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> tuple[str, str]:
         """No git here — "could not ask", never "nothing to return" (#969).
 
@@ -450,6 +460,7 @@ class NoopGitOps:
         branch: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         base_branch: str | None = None,
     ) -> int | None:
         return None
@@ -461,11 +472,16 @@ class NoopGitOps:
         max_log_chars: int = 4000,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> dict[str, Any]:
         return {}
 
     async def check_pr_ci(
-        self, pr_number: int, repo: str | None = None, gh_repo: str | None = None
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
@@ -475,6 +491,7 @@ class NoopGitOps:
         limit: int = 20,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
     ) -> list[dict] | None:
         # None, not []: this plugin cannot look, and "looked and found no
         # runs" is a different answer that would read as a green base (#929).
@@ -487,9 +504,38 @@ class NoopGitOps:
         title: str,
         repo: str | None = None,
         gh_repo: str | None = None,
+        forge: str = "",
         delete_branch: bool = True,
     ) -> bool:
         return False
+
+    async def merge_pr_with_detail(
+        self,
+        pr_number: int,
+        task_id: int,
+        title: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+        delete_branch: bool = True,
+    ) -> tuple[bool, str]:
+        """Согласован с ``merge_pr``, а не отвечает отдельно (#1116).
+
+        Делегирование здесь — не экономия строк. Заглушка служит основой для
+        тестовых дублёров, которые подменяют ОДИН метод; отвечай второй сам
+        по себе, и дублёр, настроивший merge_pr, получил бы от соседнего
+        метода противоположный ответ. Такое расхождение читается как поломка
+        доставки, а не как незаконченный дублёр.
+        """
+        ok = await self.merge_pr(
+            pr_number,
+            task_id,
+            title,
+            repo=repo,
+            gh_repo=gh_repo,
+            delete_branch=delete_branch,
+        )
+        return (ok, "" if ok else "git_ops не настроен")
 
     async def delete_branch(
         self,
@@ -518,6 +564,13 @@ class NoopForge:
     """
 
     name = "noop"
+    can_merge_via_api = False
+
+    def repo_url(self, gh_repo: str | None = None) -> str:
+        return ""
+
+    def pr_url(self, pr_number: int, gh_repo: str | None = None) -> str:
+        return ""
 
     async def create_pr(
         self,
@@ -593,6 +646,21 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> bool:
         return False
+
+    async def close_pr(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> bool:
+        return False
+
+    async def branch_contains(
+        self,
+        branch: str,
+        sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> bool | None:
+        return None
 
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
