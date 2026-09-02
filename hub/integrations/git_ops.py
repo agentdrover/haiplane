@@ -32,6 +32,7 @@ from hub.integrations.protocols import (
     MergeabilityOutcome,
 )
 from hub.mcp_envelope import enrich_error_payload
+from hub.models import DEFAULT_FORGE
 
 from hub import git_policy
 from hub.commit_scope import parse_porcelain_paths
@@ -45,6 +46,67 @@ log = logging.getLogger(__name__)
 NOOP_FORGE = "noop"
 
 _TIMEOUT_RC = proc.TIMEOUT_RC
+
+
+#: Причина, когда git отказал, но словами, которых мы не знаем (#1118, AC-3).
+#: Не «неизвестная ошибка»: отказ ЕСТЬ и его текст сохранён рядом — неизвестно
+#: только имя, под которым его учитывать.
+CLONE_CAUSE_UNNAMED = "cause_unnamed"
+
+#: Текст git → имя причины, от частного к общему (#1118, AC-3).
+#:
+#: Порядок значим: «Permission denied (publickey)» содержит и «denied», и
+#: «permission», и общее правило, поставленное выше частного, съело бы разницу
+#: между «ключа нет» и «ключ есть, прав нет» — а это разные руки и разные
+#: действия. Ровно та же ошибка, что чинила #419 для исходов CI-пробы.
+_CLONE_CAUSES: tuple[tuple[str, str], ...] = (
+    ("host key verification failed", "host_key_unpinned"),
+    ("permission denied (publickey", "no_deploy_key"),
+    ("could not read username", "no_git_credentials"),
+    ("could not read password", "no_git_credentials"),
+    ("authentication failed", "bad_git_credentials"),
+    ("invalid username or password", "bad_git_credentials"),
+    ("repository not found", "repo_not_found_or_no_access"),
+    ("does not appear to be a git repository", "repo_not_found_or_no_access"),
+    ("not found", "repo_not_found_or_no_access"),
+    ("access denied", "access_denied"),
+    ("could not resolve host", "host_unreachable"),
+    ("connection timed out", "host_unreachable"),
+    ("connection refused", "host_unreachable"),
+)
+
+
+def _clone_cause(err: str) -> str:
+    """Имя причины отказа git, или "" если ни одно правило не подошло."""
+    low = (err or "").lower()
+    for needle, cause in _CLONE_CAUSES:
+        if needle in low:
+            return cause
+    return ""
+
+
+def _origin_host(url: str) -> str:
+    """Хост из git-адреса в любой из трёх форм, или "" если хоста в нём нет.
+
+    Разбирается ``https://host/owner/repo.git``, scp-подобная
+    ``git@host:owner/repo.git`` и ``ssh://git@host/owner/repo.git``.
+    Локальный путь хоста не несёт вовсе и честно даёт "" — вызывающий обязан
+    прочесть это как «не знаю», а не как «чужой».
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "://" in url:
+        rest = url.split("://", 1)[1]
+        authority = rest.split("/", 1)[0]
+    elif ":" in url:
+        head = url.split(":", 1)[0]
+        if os.sep in head or head.startswith("."):
+            return ""
+        authority = head
+    else:
+        return ""
+    return authority.rsplit("@", 1)[-1].split("?", 1)[0].lower()
 
 
 class WorkspaceNotReadyError(Exception):
@@ -2794,7 +2856,11 @@ class GitOpsIntegration:
         return True
 
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str | None = None
+        self,
+        repo_url: str,
+        workspace_path: str,
+        base_branch: str | None = None,
+        forge: str = DEFAULT_FORGE,
     ) -> tuple[bool, str]:
         """Provision a project workspace (#347, #377). Returns (ok, detail).
 
@@ -2803,8 +2869,17 @@ class GitOpsIntegration:
         the deploy key; the detail keeps every failed attempt so a private
         repo without a key reads as a diagnosis, not a stacktrace.
         Idempotent: an existing clone is verified against the expected
-        origin (owner/repo) and fetched instead of re-cloned — the fetch
-        itself validates access, no ls-remote needed.
+        origin and fetched instead of re-cloned — the fetch itself validates
+        access, no ls-remote needed.
+
+        ``forge`` НАЗЫВАЕТ ПЛОЩАДКУ, и до #1118 его здесь не было вовсе: обе
+        строки-кандидата были захардкожены на github.com. 01.09.2026 проект
+        #8 с ``forge=gitverse`` склонировался с GitHub и отчитался
+        ``provision_status=ok`` — содержимое совпало лишь потому, что
+        репозитории пока зеркалят друг друга.
+
+        Значение по умолчанию — github, как у единственного читателя (#1114):
+        вызывающий без форжа получает ровно прежнее поведение.
         """
         base_branch = _resolve_base(base_branch)
         import os
@@ -2825,6 +2900,18 @@ class GitOpsIntegration:
                 return False, (
                     f"existing workspace origin mismatch: {origin or err} "
                     f"(expected {repo_url})"
+                )
+            # Совпадения owner/name НЕ ХВАТАЕТ, и это вторая половина дефекта
+            # #1118. Проверка выше сравнивает только слаг, а «mrpda/snip-portal»
+            # содержится в github-адресе ровно так же, как в gitverse-адресе.
+            # Значит клон с чужой площадки проходил её как годный — и прошёл бы
+            # даже после того, как клонирование научили форжу: каталог на месте,
+            # новый клон не создаётся, статус остаётся зелёным навсегда.
+            foreign = forge_registry.forge_of_host(_origin_host(origin))
+            if foreign and foreign != forge:
+                return False, (
+                    f"existing workspace clones {foreign}, project declares "
+                    f"{forge}: origin {origin.strip()}"
                 )
             rc, _, err = await _run(
                 "git",
@@ -2848,14 +2935,13 @@ class GitOpsIntegration:
             candidates = [repo_url]
         else:
             # #377: public repos need no credentials over https; ssh with
-            # the deploy key is the private-repo fallback.
-            candidates = [
-                f"https://github.com/{repo_url}.git",
-                f"git@github.com:{repo_url}.git",
-            ]
+            # the deploy key is the private-repo fallback. #1118: хост берётся
+            # у форжа, а не вписан литералом.
+            candidates = forge_registry.clone_urls(forge, repo_url)
 
         url = None
         failures: list[str] = []
+        causes: list[str] = []
         for candidate in candidates:
             rc, _, err = await _run(
                 "git",
@@ -2870,8 +2956,13 @@ class GitOpsIntegration:
                 url = candidate
                 break
             failures.append(f"{candidate}: {err[:150] or 'ls-remote failed'}")
+            causes.append(_clone_cause(err))
         if url is None:
-            return False, "remote not accessible: " + "; ".join(failures)
+            named = next((c for c in causes if c), CLONE_CAUSE_UNNAMED)
+            return False, (
+                f"remote not accessible ({named}, forge {forge}): "
+                + "; ".join(failures)
+            )
 
         os.makedirs(os.path.dirname(workspace_path) or "/", exist_ok=True)
         rc, _, err = await _run(
@@ -2894,10 +2985,14 @@ class GitOpsIntegration:
 
         transport = "https" if url.startswith("https") else "ssh"
         log.info(
-            "clone_repo: cloned %s → %s (%s, %s)",
+            "clone_repo: cloned %s → %s (%s, %s, %s)",
             repo_url,
             workspace_path,
             base_branch,
+            forge,
             transport,
         )
-        return True, f"cloned {repo_url} ({base_branch}, {transport})"
+        # Форж в детали не украшение: до #1118 строка «cloned mrpda/snip-portal
+        # (main, https)» одинаково описывала клон с любой площадки, и по ней
+        # нельзя было понять, откуда взялся репозиторий.
+        return True, f"cloned {repo_url} from {forge} ({base_branch}, {transport})"

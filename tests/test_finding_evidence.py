@@ -22,6 +22,7 @@ from hub.services.finding_evidence import (
     REASON_LOCATOR_NONE,
     REASON_NO_CLONE,
     REASON_SHA_MISSING,
+    REASON_TIP_MISSING,
     finding_touch_evidence,
 )
 
@@ -314,3 +315,80 @@ async def test_card_shows_touch_fact_not_a_fix(
     assert "Место не тронуто после отчёта" in page
     assert "Ответа нет:" in page
     assert "исправление дефекта" not in page.lower()
+
+
+# ---------------------------------------------------------------------------
+# #1150 — вершина задаётся явно, когда решение принимается О СДАЧЕ
+# ---------------------------------------------------------------------------
+
+
+async def test_an_explicit_head_bounds_the_walk(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """Явная вершина обрезает обход там, где сказано, а не на живой ветке.
+
+    Карточка и очередь спрашивают «трогал ли кто-нибудь находку с тех пор»,
+    и им нужна ветка. Решение О СДАЧЕ спрашивает другое — «несёт ли ЭТА
+    сдача правку», — и ветка тут движущаяся цель: к моменту вопроса она
+    может стоять не там, где стояла сдача (#572). Проверяется настоящим
+    репозиторием: правка есть в ветке и её нет в закреплённом коммите.
+    """
+    from hub.services.finding_evidence import evidence_for_report
+    from hub.services.finding_identity import finding_uids
+
+    clone = _init_repo(tmp_path / "clone")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="explicit head")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+
+    # Сдача закрепила коммит, в котором находка ещё не тронута.
+    _write_numbered(clone / _FILE, tweak=19)
+    _git(clone, "commit", "-am", "правка в стороне от находки")
+    pinned = _sha(clone)
+
+    # А ветка уехала дальше, и ТАМ находка тронута.
+    _write_numbered(clone / _FILE, tweak=5)
+    _git(clone, "commit", "-am", "правка ровно в месте находки")
+
+    uid = finding_uids([_FINDING_LINES])[0]
+
+    by_branch = await evidence_for_report(db, task_id, [_FINDING_LINES], generation=1)
+    assert by_branch[uid]["outcome"] == OUTCOME_TOUCHED, (
+        "по живой ветке правка видна — это ответ для карточки"
+    )
+
+    by_pinned = await evidence_for_report(
+        db, task_id, [_FINDING_LINES], generation=1, head=pinned
+    )
+    assert by_pinned[uid]["outcome"] == OUTCOME_UNTOUCHED, (
+        "сдача этой правки не несёт, и решение о ней обязано читать её sha"
+    )
+
+
+async def test_a_head_that_is_not_in_the_clone_is_unknown(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """Ненайденный коммит — «не удалось посмотреть», а не «не тронуто».
+
+    Разница здесь стоит целого прогона: отказ по незнанию отнимает у сдачи
+    суждение, а лишний прогон стоит только денег (#762).
+    """
+    from hub.services.finding_evidence import evidence_for_report
+    from hub.services.finding_identity import finding_uids
+
+    clone = _init_repo(tmp_path / "clone")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="absent head")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+
+    uid = finding_uids([_FINDING_LINES])[0]
+    out = await evidence_for_report(
+        db, task_id, [_FINDING_LINES], generation=1, head="f" * 40
+    )
+
+    assert out[uid]["outcome"] == OUTCOME_UNKNOWN
+    assert out[uid]["reason"] == REASON_TIP_MISSING, (
+        "причина обязана называть, ЧЕГО не нашли: без явной проверки ответ "
+        "всё равно приходит unknown, но с git_failed — а «коммита нет» и "
+        "«git сломался» человек чинит по-разному"
+    )

@@ -51,6 +51,18 @@ LADDER_SURFACES: tuple[str, ...] = (
     "docs/agent-context/",
     "docs/repository-rules.md",
     ".github/",
+    # #1147: границы самого судьи. Стюард получает право применять вердикт,
+    # и суждение, меняющее его собственные предусловия, режим или политику,
+    # обязано оставаться у человека по определению — иначе автономия умеет
+    # расширять себя. Перечислено путями, а не намерением: границу, которую
+    # нельзя перечислить, нельзя и проверить.
+    "hub/services/steward_apply.py",
+    "hub/services/steward_dispatch.py",
+    "hub/services/steward_evidence.py",
+    "hub/services/steward_judgement.py",
+    "hub/services/steward_shadow.py",
+    "hub/services/gate_grounds.py",
+    "hub/services/project_policy.py",
 )
 
 # The classes the switch can name. R2 stays OUT: opening it is #585, and that
@@ -61,10 +73,22 @@ LADDER_SURFACES: tuple[str, ...] = (
 _AUTO_BAND: dict[str, RiskClass] = {"r0": RiskClass.r0, "r1": RiskClass.r1}
 
 
-def _touches_ladder(areas: list[str]) -> list[str]:
+def ladder_hits(paths: list[str]) -> list[str]:
+    """Какие из путей попадают в ladder-поверхности.
+
+    Принимает ЛЮБОЙ список путей — заявленные области или фактический дифф.
+    Разница между ними существенна и решается вызывающим, а не здесь: на
+    DoR диффа ещё нет и сверять можно только декларацию, а на применении
+    вердикта дифф есть, и верить декларации там значит пропускать задачу,
+    объявившую «hub/services/» и поменявшую hub/auth.py (#1147).
+    """
     return sorted(
-        a for a in areas if any(a == s or a.startswith(s) for s in LADDER_SURFACES)
+        p for p in paths if any(p == s or p.startswith(s) for s in LADDER_SURFACES)
     )
+
+
+def _touches_ladder(areas: list[str]) -> list[str]:
+    return ladder_hits(areas)
 
 
 async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:

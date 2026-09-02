@@ -546,7 +546,11 @@ class NoopGitOps:
         return False
 
     async def clone_repo(
-        self, repo_url: str, workspace_path: str, base_branch: str | None = None
+        self,
+        repo_url: str,
+        workspace_path: str,
+        base_branch: str | None = None,
+        forge: str = "github",
     ) -> tuple[bool, str]:
         # Valid provision outcome (#347): the operator sees WHY it failed.
         return False, "git ops disabled (noop integration)"
@@ -687,6 +691,12 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> dict[str, Any]:
         return {"failed_checks": [], "log_summary": "", "run_url": ""}
+
+    async def repo_access(
+        self, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> tuple[bool, str]:
+        # «Спросить не у кого», а не «доступа нет»: форжа не настроено вовсе.
+        return False, "forge_not_configured"
 
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None

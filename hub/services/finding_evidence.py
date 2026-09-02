@@ -168,6 +168,7 @@ async def evidence_for_report(
     findings: list[dict[str, Any]],
     *,
     generation: int,
+    head: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Touch evidence for one report, keyed by ``finding_uid``.
 
@@ -175,6 +176,12 @@ async def evidence_for_report(
     walks findings one by one; the queue cannot — a call per finding is what
     would make /findings unusable at the live size (#1042). Address by uid,
     not by position (#1007). Never writes a disposition (#876).
+
+    ``head`` names the commit to stop at. Empty means the live branch tip —
+    the question the card and the queue ask. A caller deciding something
+    ABOUT A SUBMISSION passes that submission's pinned sha instead (#1150):
+    a branch name is a moving target, and by the time the question is asked
+    it may stand somewhere the submission never did.
     """
     rows = [f if isinstance(f, dict) else {} for f in findings]
     uids = finding_uids(rows)
@@ -193,7 +200,7 @@ async def evidence_for_report(
     if not placed:
         return out
 
-    shared = await _shared_lookup(db, task_id, generation)
+    shared = await _shared_lookup(db, task_id, generation, head)
     if isinstance(shared, TouchEvidence):
         blob = shared.as_dict()
         for uid, _row in placed:
@@ -253,8 +260,20 @@ async def evidence_for_report(
 
 
 async def _shared_lookup(
-    db: aiosqlite.Connection, task_id: int, generation: int
+    db: aiosqlite.Connection, task_id: int, generation: int, head: str = ""
 ) -> tuple[str, str, str] | TouchEvidence:
+    """Клон, отправная точка и ВЕРШИНА, до которой считать.
+
+    ``head`` пустой — вершина берётся по имени ветки, как было. Это верно
+    для карточки и очереди: они спрашивают «трогал ли кто-нибудь находку с
+    тех пор», и ответ про живую ветку.
+
+    ``head`` задан — считается ровно до него, и это другой вопрос. Решение,
+    принимаемое О СДАЧЕ, обязано читать закреплённый ею sha: ветка —
+    движущаяся цель, и к моменту вопроса она может стоять не там, где
+    стояла сдача (#572 и весь класс за ним). Ответ по имени ветки описывал
+    бы код, которого никто не сдавал.
+    """
     ctx = await project_git_context(db, task_id)
     clone = (ctx.get("repo") or "").strip()
     if not clone:
@@ -265,8 +284,18 @@ async def _shared_lookup(
     if not baseline:
         return _unknown(REASON_SHA_MISSING)
 
-    task = await repo.get_task(db, task_id)
-    tip = await _resolve_tip(clone, dict(task) if task is not None else {})
+    if head:
+        tip = head.strip()
+        exists_head = await _commit_exists(clone, tip)
+        if exists_head is None:
+            return _unknown(REASON_GIT_FAILED)
+        if exists_head is False:
+            # Закреплённого коммита в клоне нет: «не удалось посмотреть», а
+            # не «ничего не менялось». Разница здесь стоит целого прогона.
+            return _unknown(REASON_TIP_MISSING)
+    else:
+        task = await repo.get_task(db, task_id)
+        tip = await _resolve_tip(clone, dict(task) if task is not None else {})
     if not tip:
         return _unknown(REASON_TIP_MISSING)
 
