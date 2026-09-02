@@ -28,6 +28,7 @@ is. A token that outlives its order buys nothing.
 from __future__ import annotations
 
 import json
+import math
 import logging
 from dataclasses import dataclass
 
@@ -705,3 +706,231 @@ async def _announce_refusal_once(
         "STEWARD_MODE=act not granted: %s",
         "; ".join(f"{code}: {detail}" for code, detail in refusals),
     )
+
+
+# ---------------------------------------------------------------------------
+# Коридор эскалаций как процесс, а не точка входа (#1145)
+# ---------------------------------------------------------------------------
+#
+# act_refusals() проверяет коридор ОДИН РАЗ — в момент, когда режим act
+# запрашивают. Но включение это событие одного дня, а вырождение — процесс:
+# судья, прошедший пороги в понедельник, к пятнице может съехать в штамп или
+# в бесполезную эскалацию всего подряд, и сам по себе act не откажет — он
+# уже выдан. Если метрику никто не пойдёт и не прочитает, «я её не читал» и
+# «всё в порядке» неотличимы. Здесь — второй, повторяющийся взгляд на ту же
+# долю эскалаций, а не замена первому.
+#
+# Порогов здесь СВОИХ нет: коридор один (ACT_ESCALATION_FLOOR..CEILING),
+# заводить второй набор границ для «недельного» варианта значило бы держать
+# два источника истины об одном и том же вопросе.
+
+# Окно отчёта, не порог: раз в день у судьи может не набраться ни одного
+# суждения, и каждый такой день читался бы как REASON_NO_SAMPLE вместо того,
+# чтобы дать наблюдению накопиться. Неделя — тот же масштаб, которым уже
+# меряют себя соседние метрики практики (см. STEWARD_OVERRIDE_WINDOW_DAYS
+# в hub/services/gate_events.py); здесь она объявлена своей константой,
+# потому что смысл другой — окно отчёта, а не окно на приписывание отмены
+# человеком.
+CORRIDOR_WINDOW_DAYS = 7
+
+EVENT_CORRIDOR_ALERT = "steward_corridor_alert"
+
+# Состояний коридора четыре, а не две границы, и это прямое следствие
+# правила «одно событие на СМЕНУ состояния». Пока помнились только границы,
+# возврат ВНУТРЬ коридора следа не оставлял — и повторный выход за ту же
+# границу читался как «состояние не менялось». Алерт срабатывал один раз за
+# всю жизнь хаба на каждую сторону и молчал ровно тогда, когда наблюдение и
+# нужно: судья съехал, выправился, съехал снова.
+#
+# Начальное состояние — NO_SAMPLE: система стартует, ничего не измерив.
+# Поэтому пустая неделя на чистой базе события не пишет (no_sample →
+# no_sample сменой не является), а молчание ПОСЛЕ выхода за границу пишет:
+# неделя тишины у судьи в теневой фазе — сама по себе то, о чём стоит знать,
+# и без этой записи повторный выход снова оказался бы «без изменений».
+CORRIDOR_NO_SAMPLE = "no_sample"
+CORRIDOR_INSIDE = "inside"
+
+
+# Минимальный размер недельной выборки, при котором доля вообще что-то
+# значит (#1145 ревью, отчёт 203). При одном суждении доля равна 0% или 100%
+# — обе вне коридора, и первое же суждение теневой фазы поднимало бы алерт:
+# approve — «штампует», escalate — «бесполезен». Пустую выборку от нуля
+# отличили (AC-2), недостаточную — нет.
+#
+# Число не выбрано, а ВЫВЕДЕНО из пола коридора: 5% достижимы ненулевым
+# счётчиком только от двадцати суждений (1 из 20). Меньше — и «ниже пола»
+# означает ровно «ни одной эскалации», то есть измеряет не склонность
+# судьи, а размер выборки. Второй константы рядом с ACT_ESCALATION_FLOOR
+# не заводится: сдвинется пол — сдвинется и минимум.
+CORRIDOR_MIN_JUDGEMENTS = math.ceil(1 / ACT_ESCALATION_FLOOR)
+
+
+@dataclass(frozen=True)
+class WeeklySample:
+    """Сколько судили и сколько из этого эскалировали за окно."""
+
+    escalated: int
+    judged: int
+
+    @property
+    def share(self) -> float | None:
+        """Доля — или None, когда делить не на что.
+
+        None, а не 0.0 (#762): «нет данных» и «ноль эскалаций» — разные
+        состояния, и подставить второе вместо первого значит обвинить
+        молчание в штамповке.
+        """
+        return (self.escalated / self.judged) if self.judged else None
+
+    @property
+    def enough(self) -> bool:
+        return self.judged >= CORRIDOR_MIN_JUDGEMENTS
+
+
+async def weekly_sample(db: aiosqlite.Connection) -> WeeklySample:
+    """Суждения стюарда за последние CORRIDOR_WINDOW_DAYS дней — счётчиками.
+
+    Не то же самое, что ShadowTable.escalation_share: там окно — вся история
+    суждений, накопленная ради решения об act; здесь — скользящая неделя,
+    ради вопроса «а что СЕЙЧАС», который эту историю не читает вовсе.
+
+    Возвращает счётчики, а не долю: доля округляет, а счётчик нет. «1 из
+    21» человек прочитает верно, «5% ниже 5%» — нет (отчёт 203).
+    """
+    rows = await fetchall(
+        db,
+        "SELECT verdict FROM steward_judgements WHERE kind='verdict' "
+        "AND created_at >= datetime('now', ?)",
+        (f"-{CORRIDOR_WINDOW_DAYS} days",),
+    )
+    escalated = sum(1 for row in rows if (dict(row).get("verdict") or "") == "escalate")
+    return WeeklySample(escalated=escalated, judged=len(rows))
+
+
+CORRIDOR_BREACHES: frozenset[str] = frozenset({REASON_OVER_ESCALATING, REASON_STAMPING})
+
+
+def corridor_state(sample: WeeklySample) -> tuple[str, str]:
+    """Состояние коридора и текст к нему — по одному тексту на состояние.
+
+    Формулировки границ разные не для разнообразия: у них разное лечение.
+    Выше потолка — стюард бесполезен, человек и так разбирает всё сам,
+    эскалация ничего не экономит. Ниже пола — стюард штампует, и его
+    согласие ничего не стоит, потому что несогласие он не пробовал НИ РАЗУ
+    за неделю.
+
+    Два случая «не измерено», и оба — одно состояние: пустая неделя и
+    неделя короче CORRIDOR_MIN_JUDGEMENTS. Подставить туда долю значило бы
+    обвинить молчание в штамповке (#762) — или обвинить в ней первое же
+    суждение, потому что 0 из 1 это 0%.
+
+    Текст несёт счётчик и долю с десятыми: округление до целого выдавало
+    «5% ниже 5%» на 1 из 21, и человек, за которым решение, получал
+    противоречие вместо факта.
+    """
+    n = sample.judged
+    if n == 0:
+        return (
+            CORRIDOR_NO_SAMPLE,
+            f"за последние {CORRIDOR_WINDOW_DAYS} дней стюард не вынес ни одного "
+            "суждения — коридор не измерен, а не соблюдён",
+        )
+    if not sample.enough:
+        return (
+            CORRIDOR_NO_SAMPLE,
+            f"за последние {CORRIDOR_WINDOW_DAYS} дней суждений {n}, а доля "
+            f"значима от {CORRIDOR_MIN_JUDGEMENTS}: меньше — и «ниже пола» "
+            "измеряет размер выборки, а не судью",
+        )
+    share = sample.share or 0.0
+    seen = f"{sample.escalated} из {n} ({share:.1%})"
+    if share > ACT_ESCALATION_CEILING:
+        return (
+            REASON_OVER_ESCALATING,
+            f"эскалаций за неделю {seen} — выше {ACT_ESCALATION_CEILING:.0%}: "
+            "стюард возвращает человеку почти всё подряд — разбирать всё "
+            "равно приходится самому, пользы от суждения сейчас нет",
+        )
+    if share < ACT_ESCALATION_FLOOR:
+        return (
+            REASON_STAMPING,
+            f"эскалаций за неделю {seen} — ниже {ACT_ESCALATION_FLOOR:.0%}: "
+            "стюард соглашается почти со всем подряд — он не пробовал "
+            "не согласиться, и его согласие сейчас ничего не стоит",
+        )
+    return (
+        CORRIDOR_INSIDE,
+        f"эскалаций за неделю {seen} — в коридоре "
+        f"{ACT_ESCALATION_FLOOR:.0%}–{ACT_ESCALATION_CEILING:.0%}",
+    )
+
+
+async def check_escalation_corridor(db: aiosqlite.Connection) -> str | None:
+    """Посчитать недельную долю и поднять алерт при выходе за любую границу.
+
+    Вызывается каждый тик поллера (тем же, что запускает прогоны стюарда, —
+    раз в тридцать секунд), поэтому пишет в фид не каждый вызов, а СМЕНУ
+    состояния: тем же приёмом, что и _announce_refusal_once выше — читает
+    последнюю запись этого вида события и сравнивает границу, вместо того
+    чтобы писать вслепую на каждый тик.
+
+    НИЧЕГО не переключает. Режим стюарда этой функции не виден и не должен
+    быть виден: адрес алерта — человек, а решение сузить act до shadow по
+    метрике — его решение, не автоматика (#1145).
+
+    Возврат отвечает на «как дела СЕЙЧАС» — нарушенная граница или None,
+    когда доля внутри коридора либо мерить нечего. Запись в фид отвечает на
+    другой вопрос, «что изменилось», и потому идёт всегда, а не только на
+    нарушениях: без записи о возврате внутрь повторный выход за ту же
+    границу выглядел бы как отсутствие смены состояния.
+    """
+    sample = await weekly_sample(db)
+    state, detail = corridor_state(sample)
+    await _announce_corridor_state_once(db, state, sample, detail)
+    return state if state in CORRIDOR_BREACHES else None
+
+
+async def _last_corridor_state(db: aiosqlite.Connection) -> str:
+    """Состояние из последней записи, или NO_SAMPLE, если записей нет.
+
+    Начальное значение — не «неизвестно», а «не измеряли»: на чистой базе
+    так оно и есть, и первая же пустая неделя не должна писать событие о
+    том, что ничего не изменилось.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        (EVENT_CORRIDOR_ALERT,),
+    )
+    if not rows:
+        return CORRIDOR_NO_SAMPLE
+    try:
+        previous = json.loads(dict(rows[0]).get("payload") or "{}")
+    except ValueError:
+        return CORRIDOR_NO_SAMPLE
+    return str(previous.get("state") or CORRIDOR_NO_SAMPLE)
+
+
+async def _announce_corridor_state_once(
+    db: aiosqlite.Connection, state: str, sample: WeeklySample, detail: str
+) -> None:
+    """Пишет ровно один раз на смену состояния, а не на каждый тик поллера."""
+    if await _last_corridor_state(db) == state:
+        return
+    await repo.insert_event(
+        db,
+        kind=EVENT_CORRIDOR_ALERT,
+        actor="hub",
+        payload={
+            "state": state,
+            "share": sample.share,
+            "escalated": sample.escalated,
+            "judged": sample.judged,
+            "detail": detail,
+        },
+    )
+    await db.commit()
+    if state in CORRIDOR_BREACHES:
+        log.warning("коридор эскалаций нарушен (%s): %s", state, detail)
+    else:
+        log.info("коридор эскалаций (%s): %s", state, detail)
