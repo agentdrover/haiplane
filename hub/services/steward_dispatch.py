@@ -60,6 +60,12 @@ RUN_OPEN = "open"
 RUN_JUDGED = "judged"
 RUN_TIMEOUT = "timeout"
 RUN_SUPERSEDED = "superseded"
+# Заказ, которого не было и не будет на эту генерацию (#1150): хаб решил, что
+# пересдача не несёт новой информации. Строка в steward_runs, а не только
+# событие в фиде — и это разница между «сказали» и «закрыли»: событие не
+# мешает следующему тику решить иначе, а строка с этим ключом делает второй
+# заказ на ту же генерацию невозможным по уникальному индексу (отчёт 212).
+RUN_REFUSED = "refused"
 
 # Refusal codes. They are the vocabulary of the escalate reasons the contract
 # already closes over (#1022), so a refusal here and an escalation there mean
@@ -128,54 +134,18 @@ async def _refuse(
     await db.commit()
 
 
-async def _refuse_once(
-    db: aiosqlite.Connection,
-    task_id: int,
-    generation: int,
-    reason: str,
-    detail: str,
-) -> None:
-    """Отказать один раз на генерацию, а не на каждый тик поллера.
+async def runs_today(db: aiosqlite.Connection, project_id: int | None) -> int:
+    """Orders placed for this project within the current UTC day.
 
-    Поллер тикает раз в тридцать секунд, а задача стоит в review часами:
-    отказ, записанный на каждом проходе, за ночь превращает фид в сотню
-    одинаковых строк, среди которых больше нечего прочитать. Состояние тут
-    не меняется само — оно меняется пересдачей, а пересдача поднимает
-    генерацию, поэтому ключ и есть генерация (#1150 ревью, отчёт 209).
-
-    Тот же приём, что у _announce_refusal_once в steward_shadow (#1107):
-    писать смену состояния, а не факт очередной проверки.
+    A refusal (#1150) is not an order: it bought nothing and must not spend
+    the cap that exists to bound what is bought.
     """
     rows = await fetchall(
         db,
-        "SELECT payload FROM events WHERE kind=? AND task_id=? "
-        "ORDER BY id DESC LIMIT 50",
-        (EVENT_REFUSED, task_id),
-    )
-    for row in rows:
-        try:
-            payload = json.loads(dict(row).get("payload") or "{}")
-        except ValueError:
-            continue
-        if payload.get("reason") == reason and payload.get("generation") == generation:
-            return
-    await repo.insert_event(
-        db,
-        kind=EVENT_REFUSED,
-        task_id=task_id,
-        actor="hub",
-        payload={"reason": reason, "detail": detail, "generation": generation},
-    )
-    await db.commit()
-
-
-async def runs_today(db: aiosqlite.Connection, project_id: int | None) -> int:
-    """Orders placed for this project within the current UTC day."""
-    rows = await fetchall(
-        db,
         "SELECT COUNT(*) AS n FROM steward_runs "
-        "WHERE project_id IS ? AND date(created_at) = date('now')",
-        (project_id,),
+        "WHERE project_id IS ? AND date(created_at) = date('now') "
+        "AND status != ?",
+        (project_id, RUN_REFUSED),
     )
     return int(dict(rows[0]).get("n") or 0) if rows else 0
 
@@ -437,23 +407,83 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
             continue
         if await open_run(db, task_id, generation) is not None:
             continue
-        if await _judged(db, task_id, generation):
+        if await _settled(db, task_id, generation):
             continue
         # Пятый страж, и единственный, который экономит деньги: отказ ДО
         # заказа стоит ноль, отказ после — полный прогон (#1150).
         stale = await _nothing_new_since(db, task_id, generation)
         if stale:
-            await _refuse_once(
-                db, task_id, generation, REFUSED_NO_NEW_INFORMATION, stale
-            )
+            await _close_generation_as_refused(db, task_id, generation, stale)
             continue
         if await order_run(db, task_id, generation) is not None:
             ordered += 1
     return ordered
 
 
-async def _judged(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
-    """Has any run for this generation already been closed as judged?"""
+async def _close_generation_as_refused(
+    db: aiosqlite.Connection, task_id: int, generation: int, detail: str
+) -> None:
+    """Закрыть генерацию для заказа — строкой, а не только словом.
+
+    Отчёт 212: отказ no_new_information писался событием, и событие ничего
+    не запирало. Следующий тик считал всё заново, и стоило вычислению
+    ответить иначе — например, git не смог прочитать дифф и «неизвестно»
+    честно купило прогон, — как тот же заказ размещался на том же
+    основании, которое минуту назад отвергли. Заказ на генерацию обязан
+    быть решён один раз.
+
+    Решение здесь — строка steward_runs со статусом refused. Она стоит на
+    том же уникальном индексе (task_id, generation, kind), что и настоящие
+    заказы: второй заказ на ту же генерацию невозможен, а не маловероятен —
+    тем же приёмом, каким #1073 закрыл гонку двух тиков. Следующий тик
+    видит закрытую строку в _settled и до вычисления не доходит.
+
+    Событие пишется ОДИН раз — потому что путь сюда после строки закрыт, а
+    не потому что кто-то помнит, что уже писал.
+    """
+    project = await repo.resolve_project_for_task(db, task_id)
+    project_id = dict(project)["id"] if project is not None else None
+    try:
+        await db.execute(
+            "INSERT INTO steward_runs "
+            "(task_id, generation, kind, status, model, project_id, "
+            "deadline_at, closed_reason, closed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, datetime('now'))",
+            (
+                task_id,
+                generation,
+                KIND_VERDICT,
+                RUN_REFUSED,
+                config.STEWARD_MODEL,
+                project_id,
+                detail,
+            ),
+        )
+    except aiosqlite.IntegrityError:
+        # Генерация уже решена — заказом или отказом. Второй раз ничего не
+        # говорим: строка уже стоит, и она и есть ответ.
+        return
+    await repo.insert_event(
+        db,
+        kind=EVENT_REFUSED,
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "reason": REFUSED_NO_NEW_INFORMATION,
+            "detail": detail,
+            "generation": generation,
+        },
+    )
+    await db.commit()
+
+
+async def _settled(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+    """Is this generation already decided — judged, timed out, superseded, refused?
+
+    Anything that is not an OPEN slot counts: the question is not "did a
+    judgement land" but "is there anything left to order here", and a
+    refusal (#1150) answers it as firmly as a judgement does.
+    """
     rows = await fetchall(
         db,
         "SELECT 1 FROM steward_runs WHERE task_id=? AND generation=? "
