@@ -2343,3 +2343,296 @@ async def test_the_same_submission_on_github_does_reach_cursor(
         "при том же наборе условий и форже github вызов обязан состояться — "
         "иначе предыдущий тест зелен по посторонней причине"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1152 — второй прогон на том же коде не покупается
+# ---------------------------------------------------------------------------
+
+
+async def _report_on_current(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    incomplete: bool = False,
+    self_reviewed: bool = False,
+) -> int:
+    """Отчёт машинного ревью на текущую генерацию задачи."""
+    task = dict(await repo.get_task(db, task_id))
+    return await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=int(task["submission_generation"] or 0),
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=3,
+        findings_confirmed=json.dumps([]),
+        incomplete=incomplete,
+        self_reviewed=self_reviewed,
+        submitted_by="cursor-cloud-reviewer",
+    )
+
+
+async def test_same_sha_buys_no_second_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1152): код уже прочитан — второй прогон не заказывается.
+
+    Измерено на живой базе прода: 8 дублей из 87 прогонов, порядка 15M
+    токенов провайдера. Пересдача на неизменившемся sha — ровно тот путь,
+    которым они возникали: генерация новая, дифф прежний.
+
+    Проверяется ОТСУТСТВИЕ строки в review_dispatches, а не отсутствие
+    отчёта: заказ и есть оплата.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-same-sha")
+    assert len(recorder.calls) == 1, "первая сдача ревью получает"
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+
+    # Пересдача НА ТОМ ЖЕ коммите: поколение растёт, вершина та же.
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 1, (
+        "второй прогон на том же sha не заказывается — он вернул бы то же "
+        "чтение за те же деньги"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT id FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert len(rows) == 1, "заказа не появляется: заказ и есть оплата"
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any(f"отчёт #{review_id}" in c for c in updates), (
+        "отказ обязан назвать отчёт, который уже покрывает этот код: "
+        "молчаливый отказ неотличим от сломавшегося диспетчера"
+    )
+
+
+async def test_a_real_resubmission_still_gets_reviewed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1152): новый код ревью ПОЛУЧАЕТ, и тот же код без отчёта тоже.
+
+    Ложный отказ здесь дороже лишнего прогона: сдача, оставшаяся без
+    отчёта, уйдёт к человеку вслепую или встанет вовсе. Поэтому зеркало
+    двустороннее — сдвинулась вершина, и отдельно случай «тот же sha, но
+    отчёта по нему нет».
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+
+    # Тот же sha, но отчёта нет вовсе — сравнивать не с чем, прогон нужен.
+    fresh = await _submitted(client, db, "spike-no-report")
+    assert len(recorder.calls) == 1
+    await services.submit_for_review(
+        db, fresh, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 2, (
+        "без отчёта по этому sha отказывать не за что: незнание не есть совпадение"
+    )
+
+    # Отчёт есть, но вершина сдвинулась — это новая работа.
+    moved = await _submitted(client, db, "spike-moved")
+    assert len(recorder.calls) == 3
+    await _report_on_current(db, moved)
+    await db.commit()
+    plugins.git_ops = _PinnedGitOps("b" * 40, ["docs/notes.md"])
+    await services.submit_for_review(
+        db, moved, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 4, "новый sha — новая работа, ревью заказывается"
+
+
+async def test_a_submission_without_a_pinned_sha_is_not_a_match(
+    db: aiosqlite.Connection,
+):
+    """Незакреплённый sha — «сравнивать нечего», а не «совпало».
+
+    Ветка иначе не исполняется ни одним тестом: живая сдача всегда
+    закрепляет вершину. Но незнание не есть совпадение (#762), и цена
+    ошибки здесь несимметрична — ложный отказ отнимает у сдачи отчёт, а
+    лишний прогон стоит только денег.
+    """
+    from hub.services.review_dispatch import _report_already_covers_this_sha
+
+    assert (
+        await _report_already_covers_this_sha(
+            db, {"id": 1, "submission_generation": 2, "submission_sha": ""}
+        )
+        is None
+    )
+    assert (
+        await _report_already_covers_this_sha(
+            db, {"id": 1, "submission_generation": 2, "submission_sha": "   "}
+        )
+        is None
+    )
+
+
+async def test_an_incomplete_report_does_not_lock_the_sha(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполный отчёт не есть прочитанный код (#879).
+
+    Найдено кросс-модельным ревью первой сдачи, и находка бьёт в саму
+    задачу: правило, написанное ради экономии прогонов, запирало добор
+    непрочитанного. Отчёт с incomplete=true САМ говорит, что дочитал не
+    всё, — назвать его чтением значит поверить утверждению, которое он о
+    себе опровергает.
+
+    Направление ошибки то же, что и во всём правиле: лишний прогон стоит
+    денег, пропущенный — сдачи без ревью.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-incomplete-sha")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id, incomplete=True)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 2, (
+        "отчёт, объявивший себя неполным, покрытием не является — иначе "
+        "правило запирает лестницу добора #879"
+    )
+
+
+async def test_a_self_report_does_not_cancel_the_independent_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Отчёт исполнителя о себе не отменяет ревьюера со стороны.
+
+    Найдено кросс-модельным ревью. Тот же автор уже однажды закрыл чужой
+    диспетчер как выполненный своим параллельным отчётом (#1011, #1025) —
+    здесь он закрывал бы его ещё до старта, и «код прочитан» означало бы
+    «автор прочитал свой код». Независимость — весь смысл кросс-модельного
+    контура, и правило экономии не должно её покупать.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-self-report")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id, self_reviewed=True)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 2, (
+        "самоотчёт не есть независимое чтение — он не может отменить "
+        "кросс-модельного ревьюера"
+    )
+
+
+async def test_the_refusal_is_as_loud_as_the_other_dispatcher_refusals(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Отказ пишется алертом, как остальные отказы диспетчера.
+
+    Найдено кросс-модельным ревью: я написал его как status, то есть тише
+    соседей. Отказ, который тише остальных, читается как «ничего не
+    произошло» ровно там, где ревьюера не позвали, — а не позвать
+    ревьюера это событие, а не отсутствие события.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-refusal-loud")
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    kinds = {
+        dict(u)["kind"]
+        for u in await repo.get_task_updates(db, task_id)
+        if f"отчёт #{review_id}" in dict(u)["content"]
+    }
+    assert kinds == {"alert"}, f"отказ обязан быть слышен как алерт: {kinds}"
+
+
+async def test_the_top_up_is_not_stopped_by_the_same_sha_guard(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Добор лестницы #879 проверку новизны не проходит и не должен.
+
+    Найдено кросс-модельным ревью, и это ВТОРОЙ раз, когда правило экономии
+    мешало добору — первый был про неполный отчёт, этот про принудительный
+    профиль. Один и тот же узел с двух сторон.
+
+    Причина в том, что вопросы разные. Страж спрашивает «читали ли уже этот
+    код», и на новую сдачу это верный вопрос. Добор спрашивает «дочитал ли
+    НАШ прогон», и отчёт чужой генерации на том же sha про это не знает
+    ничего.
+
+    Проверяется РАЗНИЦА ИСХОДОВ ИЗ ОДНОГО СОСТОЯНИЯ: при совпавшем sha
+    обычный заказ отказывает, а добор проходит. Тест зовёт точку входа
+    напрямую, а не через естественную последовательность: чтобы страж
+    встретил добор, полный отчёт чужой генерации должен появиться МЕЖДУ
+    прогоном этой генерации и его добором, и такую гонку я собрать не смог.
+    Правило от этого не зависит — оно про то, какой вопрос кому задан.
+    """
+    from hub.services.review_dispatch import DEEP, maybe_dispatch_review
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-topup-guard")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id)
+    await db.commit()
+
+    # Пересдача НА ТОМ ЖЕ коммите: страж срабатывает, заказа нет.
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 1, "обычный заказ на прочитанном коде отказывает"
+
+    # То же состояние, тот же sha — но это добор.
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+
+    assert dispatched, (
+        "добор обязан пройти там, где обычный заказ отказал: у него другой "
+        "вопрос и свой потолок (REVIEW_LADDER_MAX_STEPS)"
+    )
+    assert len(recorder.calls) == 2
+    assert (await _dispatch_row(db, task_id))["profile"] == DEEP
+
+
+async def test_the_top_up_still_asks_the_policy(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Выключенный контур выключен и для лестницы.
+
+    Мутация, выжившая при первом заходе: я написал в докстринге, что добор
+    спрашивает политику, и не проверил этого. Освобождение от проверки
+    новизны легко расползается на соседний отказ, стоящий в той же
+    функции, — и тогда лестница покупала бы прогоны на проекте, который
+    ревью вообще не заказывает.
+
+    Разница между двумя отказами именно в том, на какой вопрос они
+    отвечают: «дочитал ли наш прогон» у добора свой, а «просят ли здесь
+    ревью» — общий для всех, и лестница из него не выведена.
+    """
+    from hub.services.review_dispatch import DEEP, maybe_dispatch_review
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-topup-off", policy={"review": "off"})
+    assert recorder.calls == [], "контур выключен — обычного заказа нет"
+
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+
+    assert not dispatched, (
+        "добор не обходит выключённый контур: освобождение касается только "
+        "проверки новизны"
+    )
+    assert recorder.calls == []
