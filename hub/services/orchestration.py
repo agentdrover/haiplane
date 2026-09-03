@@ -3158,6 +3158,50 @@ async def _route_after_done(
     return None
 
 
+async def _run_headless_submit_gates(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> None:
+    """Прогнать гейты сдачи headless-задачи и записать, что они дали (#1122).
+
+    Пишет отдельной записью, а не внутри транзакции перехода: маршрутов после
+    этой точки два, и у каждого своя запись статуса. Класть пиннинг в оба
+    значило бы держать одно правило в двух местах — том самом виде, из-за
+    которого расхождение путей и появилось.
+
+    НО НЕ КОММИТИТ, и это не мелочь. Первая редакция звала здесь
+    ``db.commit()``, и на pair-пути это молча снимало защиту: ``add_update``
+    открывает ``write_transaction`` и ``SAVEPOINT done_flow`` (#364), COMMIT
+    закрывает ``BEGIN IMMEDIATE`` вместе с савпоинтом, и упавший следом
+    git-хвост откатывать уже нечем — ``ROLLBACK TO SAVEPOINT`` становится
+    no-op, а ``_release_done_flow`` глотает ``OperationalError``. В базе
+    остаются строка done и бамп поколения, которых не было; повтор кладёт
+    вторую строку и бампает снова. Ровно то, что чинила #364.
+
+    Комментарий у самого савпоинта предупреждал об этом дословно: «проверено,
+    что между вставкой и git-шагами commit не выполняется; commit снял бы
+    савпоинт и молча обессмыслил откат». Правило было записано на месте — и
+    нарушено новым кодом.
+
+    Фиксирует вызывающий. Проверено по всем четырём: poller.py:271 и :616
+    коммитят следом, lifecycle.py:3890 работает внутри ``write_transaction``,
+    lifecycle.py:3979 коммитит после. Ни один не теряет запись.
+    """
+    from hub.services.lifecycle import (
+        run_headless_submit_gates,
+        write_submission_notices,
+    )
+
+    gates = await run_headless_submit_gates(db, task)
+    fields: dict[str, Any] = {}
+    if gates.submission_sha:
+        fields["submission_sha"] = gates.submission_sha
+    if gates.discovered_pr:
+        fields["pr_number"] = gates.discovered_pr
+    if fields:
+        await repo.update_task(db, task_id, **fields)
+    await write_submission_notices(gates)
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -3194,6 +3238,17 @@ async def transition_after_agent_done(
         # Unreviewed done report = a work submission (#305): bumping the
         # generation invalidates any APPROVED verdict from earlier work.
         await repo.bump_submission_generation(db, task_id)
+        # #1122: гейты сдачи для headless-пути — ЗДЕСЬ, до развилки маршрутов.
+        # Headless уходит в ревью двумя путями: конвейером auto-review
+        # (dispatch_review, с review_job_id) и Universal Review Gate ниже. Оба
+        # — сдача, и оба до #1122 проходили ноль гейтов. Если поставить проверки
+        # в один из маршрутов, второй останется без них, а какой из них
+        # сработает, решает наличие диспетчера — то есть конфигурация, а не
+        # природа сдачи.
+        #
+        # Ни один шаг не отказывает: решение владельца — warn (матрица в #1122).
+        # Отказ здесь оставил бы headless-задачу стоять без человека рядом.
+        await _run_headless_submit_gates(db, task_id, task)
 
     if (
         task.get("auto_review")
@@ -3250,6 +3305,7 @@ async def transition_after_agent_done(
         generation_num = (
             dict(task_row).get("submission_generation", 0) if task_row else 0
         )
+
         await repo.update_task(
             db,
             task_id,
@@ -3268,6 +3324,10 @@ async def transition_after_agent_done(
             "hub_submit_review (reviewer: hub_get_review_brief), then report "
             "done again.",
         )
+        # Заметки гейтов — в ленту тем же способом, что на pair-пути (#1122).
+        # Гейт, который отработал и промолчал, хуже невыполненного: читатель
+        # решит, что проверка прошла чисто.
+
         log.info("Task #%d → review after done report (review gate)", task_id)
         return "review"
 
