@@ -2558,3 +2558,81 @@ async def test_the_refusal_is_as_loud_as_the_other_dispatcher_refusals(
         if f"отчёт #{review_id}" in dict(u)["content"]
     }
     assert kinds == {"alert"}, f"отказ обязан быть слышен как алерт: {kinds}"
+
+
+async def test_the_top_up_is_not_stopped_by_the_same_sha_guard(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Добор лестницы #879 проверку новизны не проходит и не должен.
+
+    Найдено кросс-модельным ревью, и это ВТОРОЙ раз, когда правило экономии
+    мешало добору — первый был про неполный отчёт, этот про принудительный
+    профиль. Один и тот же узел с двух сторон.
+
+    Причина в том, что вопросы разные. Страж спрашивает «читали ли уже этот
+    код», и на новую сдачу это верный вопрос. Добор спрашивает «дочитал ли
+    НАШ прогон», и отчёт чужой генерации на том же sha про это не знает
+    ничего.
+
+    Проверяется РАЗНИЦА ИСХОДОВ ИЗ ОДНОГО СОСТОЯНИЯ: при совпавшем sha
+    обычный заказ отказывает, а добор проходит. Тест зовёт точку входа
+    напрямую, а не через естественную последовательность: чтобы страж
+    встретил добор, полный отчёт чужой генерации должен появиться МЕЖДУ
+    прогоном этой генерации и его добором, и такую гонку я собрать не смог.
+    Правило от этого не зависит — оно про то, какой вопрос кому задан.
+    """
+    from hub.services.review_dispatch import DEEP, maybe_dispatch_review
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-topup-guard")
+    assert len(recorder.calls) == 1
+    await _report_on_current(db, task_id)
+    await db.commit()
+
+    # Пересдача НА ТОМ ЖЕ коммите: страж срабатывает, заказа нет.
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 1, "обычный заказ на прочитанном коде отказывает"
+
+    # То же состояние, тот же sha — но это добор.
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+
+    assert dispatched, (
+        "добор обязан пройти там, где обычный заказ отказал: у него другой "
+        "вопрос и свой потолок (REVIEW_LADDER_MAX_STEPS)"
+    )
+    assert len(recorder.calls) == 2
+    assert (await _dispatch_row(db, task_id))["profile"] == DEEP
+
+
+async def test_the_top_up_still_asks_the_policy(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Выключенный контур выключен и для лестницы.
+
+    Мутация, выжившая при первом заходе: я написал в докстринге, что добор
+    спрашивает политику, и не проверил этого. Освобождение от проверки
+    новизны легко расползается на соседний отказ, стоящий в той же
+    функции, — и тогда лестница покупала бы прогоны на проекте, который
+    ревью вообще не заказывает.
+
+    Разница между двумя отказами именно в том, на какой вопрос они
+    отвечают: «дочитал ли наш прогон» у добора свой, а «просят ли здесь
+    ревью» — общий для всех, и лестница из него не выведена.
+    """
+    from hub.services.review_dispatch import DEEP, maybe_dispatch_review
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-topup-off", policy={"review": "off"})
+    assert recorder.calls == [], "контур выключен — обычного заказа нет"
+
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+
+    assert not dispatched, (
+        "добор не обходит выключённый контур: освобождение касается только "
+        "проверки новизны"
+    )
+    assert recorder.calls == []

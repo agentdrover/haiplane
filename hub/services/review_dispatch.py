@@ -1013,7 +1013,10 @@ CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 
 
 async def _policy_and_novelty_allow(
-    db: aiosqlite.Connection, task: dict[str, Any], project: Any
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    project: Any,
+    force_profile: str = "",
 ) -> bool:
     """Два тихих отказа диспетчера, стоящих рядом по одной причине.
 
@@ -1021,6 +1024,10 @@ async def _policy_and_novelty_allow(
     молчат в том смысле, что не являются поломкой: политика не просила —
     ревью и не должно быть; код уже прочитан — второе чтение не купит
     ничего нового.
+
+    Расходятся они на доборе: политику он спрашивает (выключенный контур
+    выключен и для лестницы), а проверку новизны — нет, потому что она
+    отвечает не на его вопрос.
 
     Собраны в одну функцию, потому что maybe_dispatch_review стоит на
     потолке сложности вплотную: 60 из 60. Любая строка, добавленная туда,
@@ -1033,6 +1040,22 @@ async def _policy_and_novelty_allow(
     # and no human.
     if not review_dispatch_enabled(gate_policy_of(project)):
         return False
+    if force_profile:
+        # Добор лестницы #879 проверку новизны не проходит и не должен.
+        # Найдено кросс-модельным ревью, и это второй раз, когда правило
+        # экономии мешало добору — с другой стороны механизма.
+        #
+        # Причина в том, что вопросы РАЗНЫЕ. Страж спрашивает «читали ли
+        # уже этот код», и на новую сдачу это верный вопрос. Добор
+        # спрашивает «дочитал ли НАШ прогон», и ответ на него даёт только
+        # собственное заявление прогона — отчёт чужой генерации на том же
+        # sha про это не знает ничего. Ответить вторым на первый значит
+        # закрыть лестницу утверждением не по делу.
+        #
+        # Без потолка это не оставляет: у добора свой, и он строже —
+        # REVIEW_LADDER_MAX_STEPS ограничивает число прогонов на
+        # генерацию, а подниматься выше дешёвого профиля некуда.
+        return True
     return not await _this_code_was_already_read(db, task)
 
 
@@ -1184,7 +1207,7 @@ async def maybe_dispatch_review(
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
         return False
-    if not await _policy_and_novelty_allow(db, task, project):
+    if not await _policy_and_novelty_allow(db, task, project, force_profile):
         return False
 
     gh_repo = (dict(project).get("repo") or "").strip()
