@@ -62,10 +62,27 @@ class Step(Generic[Ctx]):
     run: Callable[[Ctx], Awaitable[None]]
     mode: Callable[[], str] = lambda: ALWAYS
     refuses: bool = True
+    # Почему шаг объявлен, но НЕ выполняется на этом пути (#1122). Пустая
+    # строка — шаг рабочий. Непустая — он в списке ради того, чтобы решение
+    # «здесь этого не делаем» было записано, а не выражено отсутствием:
+    # молчание в списке неотличимо от «забыли», и именно так расхождение
+    # pair и headless прожило незамеченным до #1067.
+    inactive_reason: str = ""
+
+    @property
+    def active(self) -> bool:
+        """Выполняется ли шаг вообще. Неактивный обязан объяснить себя."""
+        return not self.inactive_reason
 
     def describe(self) -> dict[str, Any]:
-        """Строка отчёта: имя, режим сейчас, право отказывать."""
-        return {"name": self.name, "mode": self.mode(), "refuses": self.refuses}
+        """Строка отчёта: имя, режим, право отказывать, причина бездействия."""
+        return {
+            "name": self.name,
+            "mode": self.mode(),
+            "refuses": self.refuses,
+            "active": self.active,
+            "inactive_reason": self.inactive_reason,
+        }
 
 
 async def run_steps(ctx: Ctx, steps: tuple[Step[Ctx], ...]) -> None:
@@ -83,9 +100,32 @@ async def run_steps(ctx: Ctx, steps: tuple[Step[Ctx], ...]) -> None:
     бы риск ровно туда, где задача обещала его не вносить.
     """
     for step in steps:
+        if not step.active:
+            # Объявлен намеренно и не выполняется — причина записана в самом
+            # шаге и видна в describe(). Это не пропуск, а решение.
+            continue
         if step.mode() == OFF:
             continue
         await step.run(ctx)
+
+
+def capped_at_warn(name: str, default: str = "warn") -> Callable[[], str]:
+    """Политика, но не строже warn (#1122).
+
+    Нужна там, где путь получает гейт впервые: включать его сразу отказом
+    значит остановить весь поток на первой же задаче, которая раньше
+    проходила. Потолок объявлен здесь, а не спрятан внутри шага, чтобы в
+    списке было видно: этот путь читает ту же политику, но никогда не
+    отказывает по ней. Снятие потолка — правка одной строки в списке, и она
+    попадёт в дифф.
+    """
+
+    read = policy(name, default)
+
+    def capped() -> str:
+        return OFF if read() == OFF else "warn"
+
+    return capped
 
 
 def policy(name: str, default: str = "warn") -> Callable[[], str]:

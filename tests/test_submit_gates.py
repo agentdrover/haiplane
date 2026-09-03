@@ -99,6 +99,7 @@ def test_every_step_declares_a_name_and_whether_it_refuses():
 
 EXPECTED_SUBMIT_ORDER = (
     "task_is_submittable",
+    "canonical_branch",
     "branch_matches",
     "resolve_diff",
     "surfaces",
@@ -146,23 +147,13 @@ def test_the_network_walking_steps_come_last():
 
 
 # --------------------------------------------------------------------------
-# AC-4: расхождение pair и headless. Главная находка задачи.
+# Расхождение pair и headless — теперь по ДВУМ СПИСКАМ (#1122)
 # --------------------------------------------------------------------------
 
-# Гейты, которые проходит СДАЧА PAIR-ЗАДАЧИ и не проходит headless-путь.
-# Список зафиксирован здесь не как пожелание, а как факт, замеренный по коду:
-# ни диспетчер transition_after_agent_done, ни его обработчики не вызывают ни _surface_check, ни
-# finding_outcome, ни resolve_branch_tip, ни machine_review_gap, ни
-# ac_tests_gap. Headless-задача уезжает в ревью без сверки объявленной
-# области с диффом, без спроса об исходах находок прошлой сдачи, без правил
-# сдачи и без закреплённого коммита.
-#
-# Это НЕ починено здесь намеренно: задача #1067 обещала сделать расхождение
-# видимым, а не устранить его — свести пути к одному набору значит менять
-# правила, а не форму. Тест существует, чтобы расхождение перестало быть
-# незаметным и чтобы новое расхождение краснело.
-GATES_PAIR_ONLY = (
+EXPECTED_HEADLESS_ORDER = (
+    "canonical_branch",
     "branch_matches",
+    "resolve_diff",
     "surfaces",
     "finding_outcomes",
     "submit_rules",
@@ -171,52 +162,77 @@ GATES_PAIR_ONLY = (
 )
 
 
-def test_the_headless_path_runs_none_of_the_submit_gates():
-    """AC-4: headless-путь не прогоняет гейты сдачи, и это записано.
+def test_the_headless_order_is_pinned():
+    assert tuple(s.name for s in lifecycle.HEADLESS_STEPS) == EXPECTED_HEADLESS_ORDER
 
-    Проверяется по исходнику, а не по вызову: у headless-пути нет своего
-    списка шагов, который можно было бы сравнить, — в этом и состоит
-    расхождение. Если он такой список заведёт, тест придётся переписать, и
-    это правильный момент, чтобы наборы сравнили по-настоящему.
+
+def test_the_two_pipelines_are_compared_by_their_lists():
+    """#1122 AC-2: расхождение читается из двух списков, а не из исходника.
+
+    В #1067 сравнивать было не с чем — у headless-пути списка не было, и
+    страж читал текст четырёх функций. Такой страж зеленел бы от переезда
+    кода, а не от появления гейта; здесь он заменён на сопоставление.
     """
-    import inspect
+    submit = {s.name: s for s in lifecycle.SUBMIT_STEPS}
+    headless = {s.name: s for s in lifecycle.HEADLESS_STEPS}
 
-    from hub.services import orchestration
+    # task_is_submittable — единственный шаг, которого у headless нет вовсе:
+    # он проверяет, что задача pair и в статусе, из которого сдают.
+    assert set(submit) - set(headless) == {"task_is_submittable"}
+    assert set(headless) - set(submit) == set()
 
-    # Читается диспетчер И его обработчики. После #1067 тела веток живут в
-    # отдельных функциях, и чтение одного transition_after_agent_done дало бы
-    # зелёный тест по причине переезда кода, а не отсутствия гейтов — то есть
-    # ровно та тихая поломка стража, которую этот файл и должен исключать.
-    source = "".join(
-        inspect.getsource(fn)
-        for fn in (
-            orchestration.transition_after_agent_done,
-            orchestration._complete_without_review,
-            orchestration._route_after_done,
-            orchestration._deliver_completed_pair_task,
+    active_here = {n for n, s in headless.items() if s.active}
+    inactive_here = {n for n, s in headless.items() if not s.active}
+    assert inactive_here == {"branch_matches", "finding_outcomes"}, (
+        "набор неактивных на headless изменился — обновите матрицу решений в "
+        "#1122 и скажите об этом в сдаче, а не молча"
+    )
+    assert "pin_submission_sha" in active_here, (
+        "пиннинг коммита — то, ради чего #1122 заводилась: без него вердикт "
+        "относится к номеру сдачи, а не к коду"
+    )
+
+
+def test_every_inactive_headless_step_explains_itself():
+    """#1122 AC-3: объявленный и невыполняемый шаг обязан назвать причину.
+
+    Иначе «не делаем» неотличимо от «забыли» — ровно то, из-за чего
+    расхождение двух путей прожило незамеченным.
+    """
+    for step in lifecycle.HEADLESS_STEPS:
+        if step.active:
+            assert not step.inactive_reason
+            continue
+        assert len(step.inactive_reason) > 40, (
+            f"шаг {step.name} объявлен неактивным без внятной причины"
         )
-    )
-    markers = {
-        "surfaces": "_surface_check",
-        "finding_outcomes": "finding_outcome",
-        "submit_rules": "code_without_tests",
-        "pin_submission_sha": "resolve_branch_tip",
-    }
-    running = [gate for gate, marker in markers.items() if marker in source]
-    assert running == [], (
-        "headless-путь начал прогонять гейты сдачи: "
-        f"{running}. Расхождение с pair-путём изменилось — обновите "
-        "GATES_PAIR_ONLY и скажите об этом в сдаче, а не молча."
-    )
+        assert step.describe()["inactive_reason"] == step.inactive_reason
 
 
-def test_the_pair_only_gates_are_all_declared_in_the_submit_list():
-    """Список расхождения не должен разъезжаться с реальным конвейером."""
-    declared = {s.name for s in lifecycle.SUBMIT_STEPS}
-    missing = [g for g in GATES_PAIR_ONLY if g not in declared]
-    assert not missing, (
-        f"GATES_PAIR_ONLY называет шаги, которых в SUBMIT_STEPS нет: {missing}"
+async def test_an_inactive_step_never_runs():
+    ran: list[str] = []
+
+    async def never(state):
+        ran.append("never")
+
+    await run_steps(
+        object(), (Step("x", never, inactive_reason="объявлен и намеренно не делаем"),)
     )
+    assert ran == []
+
+
+def test_the_headless_gates_never_refuse():
+    """Отказ на headless оставил бы задачу стоять без человека рядом (#1122).
+
+    Решение владельца — warn: поверхности и правила стоят под потолком, а
+    остальные активные шаги не отказывают по своей природе.
+    """
+    for step in lifecycle.HEADLESS_STEPS:
+        if not step.active:
+            continue
+        assert step.mode() in ("off", "warn", "always"), (
+            f"шаг {step.name} на headless-пути может отказать: режим {step.mode()}"
+        )
 
 
 # --------------------------------------------------------------------------
