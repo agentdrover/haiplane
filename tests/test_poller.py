@@ -2900,7 +2900,10 @@ async def test_a_headless_submission_pins_its_commit(db):
 
     mock_git = NoopGitOps()
     mock_git.fetch_base = AsyncMock(return_value=(True, ""))
-    mock_git.head_sha = AsyncMock(return_value="c0ffee1234567890")
+    # НЕ hex намеренно: строку из одних шестнадцатеричных знаков сканер
+    # секретов читает как «высокая энтропия» и красит security-шаг. Тесту
+    # форма коммита безразлична — он сравнивает строки на равенство.
+    mock_git.head_sha = AsyncMock(return_value="pinned-tip-not-a-real-sha")
     mock_git.checkout = AsyncMock(return_value=True)
     mock_git.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
     plugins.git_ops = mock_git
@@ -2936,7 +2939,7 @@ async def test_a_headless_submission_pins_its_commit(db):
     # сработает — решает конфигурация. Гейты стоят до развилки именно поэтому,
     # и пиннинг обязан быть при любом из них.
     assert after["status"] != "running", "задача обязана была уйти из running"
-    assert after["submission_sha"] == "c0ffee1234567890", (
+    assert after["submission_sha"] == "pinned-tip-not-a-real-sha", (
         "коммит сдачи не закреплён — вердикт не с чем будет сверить"
     )
 

@@ -1796,6 +1796,9 @@ class SubmitContext:
     rules_mode: str = dc_field(
         default_factory=lambda: (config.SUBMIT_RULES or "warn").strip().lower()
     )
+    #: Действующий режим ТЕКУЩЕГО шага, выставляется конвейером (#1122).
+    #: Пустая строка — шаг выполняется вне конвейера; тогда читается политика.
+    gate_mode: str = ""
     rule_lines: list[str] = dc_field(default_factory=list)
     clean_lines: list[str] = dc_field(default_factory=list)
     unchecked_lines: list[str] = dc_field(default_factory=list)
@@ -1890,7 +1893,10 @@ async def _step_surfaces(state: SubmitContext) -> None:
     """Объявленная область против фактического диффа (#550, #890)."""
     # #550: before the transition, not after — a refusal has to happen while
     # there is still something to refuse.
-    surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
+    # Режим берётся у конвейера, если тот его назвал: headless объявляет
+    # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
+    # мимо потолка (#1122).
+    surfaces_mode = (state.gate_mode or (config.SDD_SURFACES or "warn")).strip().lower()
     state.surface_note = ""
     # #890: paths the submitter accepts as the real scope. Empty unless the
     # submission asked for it — the hub never widens affected_areas on its own.
@@ -2007,7 +2013,7 @@ async def _step_submit_rules(state: SubmitContext) -> None:
                     if len(code_no_tests) > 10
                     else ""
                 )
-                if state.rules_mode == "require":
+                if (state.gate_mode or state.rules_mode) == "require":
                     raise HTTPException(
                         422,
                         f"дифф меняет код и не трогает ни одного теста: "
@@ -2307,7 +2313,29 @@ async def write_submission_notices(state: SubmitContext) -> None:
 
     Раньше функция была приватной, потому что вызывающий был один. Теперь их
     два, и подчёркивание врало бы о границе.
+
+    Здесь же — сорвавшийся пиннинг, и только здесь. Пара говорит о нём в
+    тексте самой сдачи («Branch tip NOT pinned: …»), а у headless такого
+    текста нет вовсе: он зовёт только эти заметки. Без этой записи вершина не
+    закреплялась МОЛЧА — вердикт относился бы к номеру сдачи, а не к коду,
+    ровно та дыра, которую задача и закрывает (#572, #767).
+
+    Задвоения на pair-пути нет по устройству: тот зовёт приватную
+    ``_write_submission_notices`` напрямую, минуя эту обёртку.
     """
+    if not state.submission_sha:
+        # Непроверенное — это состояние, которое читатель обязан видеть, а не
+        # отсутствие новостей (#534, #572). Причина называется: «не смогли
+        # посмотреть» и «нечего было закреплять» лечатся по-разному.
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            "alert",
+            "Вершина ветки НЕ закреплена: "
+            + (state.sha_reason or "причина не названа")
+            + ". Вердикт будет относиться к номеру сдачи, а не к коду.",
+        )
     await _write_submission_notices(state)
 
 

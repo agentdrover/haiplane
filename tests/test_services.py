@@ -5788,3 +5788,64 @@ async def test_delivery_check_survives_a_git_failure(
     row = await repo.get_task(db, task_id)
     assert row["status"] == "ci_check", "a git failure keeps the ordinary path"
     assert spies["create_pr"].called
+
+
+async def test_headless_gates_do_not_release_the_done_flow_savepoint(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1122, находка отчёта #227 [high]: гейты не коммитят чужую транзакцию.
+
+    Первая редакция звала db.commit() внутри _run_headless_submit_gates, когда
+    пиннинг или PR дали значение. COMMIT закрывает BEGIN IMMEDIATE вместе с
+    SAVEPOINT done_flow (#364), и упавший следом git-хвост откатывать нечем:
+    ROLLBACK TO SAVEPOINT становится no-op, а _release_done_flow глотает
+    OperationalError. В базе оставались строка done и бамп поколения, которых
+    не было.
+
+    ПОЧЕМУ ЭТОГО НЕ ЛОВИЛИ ТЕСТЫ #364. Там git_ops — NoopGitOps: fetch_base
+    отвечает отказом, pr_for_branch ничего не находит, значит fields пуст и до
+    commit дело не доходит вовсе. Тест обязан довести гейты до НЕПУСТОГО
+    значения — иначе он зелен по построению и стережёт пустоту.
+    """
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setenv("HAIPLANE_WORKSPACE_REPO", "/tmp")
+    task_id = await _task_ready_for_done_with_git_tail(db)
+
+    # Проект с рабочим каталогом: без него project_git_context пуст и пиннинг
+    # честно отвечает «наблюдать ветку неоткуда».
+    project_id = await repo.create_project(db, slug="pin-me", name="Pin")
+    await repo.update_project(
+        db, project_id, workspace_path="/tmp/ws", default_branch="main"
+    )
+    await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (project_id, task_id))
+    await db.commit()
+
+    class _PinsThenExplodes(NoopGitOps):
+        """Пиннинг удаётся, git-хвост падает — это и есть опасный порядок."""
+
+        async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return "pinned-tip-of-the-task-branch"
+
+        async def checkout(self, *args, **kwargs):
+            raise RuntimeError("git adapter exploded mid-flight")
+
+    plugins.git_ops = _PinsThenExplodes()
+
+    with pytest.raises(RuntimeError):
+        await services.add_update(
+            db, task_id, TaskUpdateCreate(agent="dev", kind="done", content="готово")
+        )
+
+    updates = await repo.get_task_updates(db, task_id)
+    assert not [u for u in updates if u["kind"] == "done"], (
+        "гейты сдачи не должны фиксировать чужую транзакцию: строка done "
+        "пережила падение git-хвоста, значит savepoint был снят"
+    )
+    assert dict(await repo.get_task(db, task_id))["submission_generation"] == 0, (
+        "бамп поколения принадлежит той же несостоявшейся сдаче"
+    )

@@ -18,7 +18,12 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from hub import models
+import aiosqlite
+
+from hub import config, models
+from hub import repository as repo
+from hub import services
+from hub.models import TaskCreate, TaskSubmitReview
 from hub.services import lifecycle
 from hub.services.gate_pipeline import ALWAYS, OFF, Step, run_steps
 
@@ -329,3 +334,148 @@ def test_the_rules_mode_defaults_to_warn_when_the_policy_is_unset():
             body=models.TaskSubmitReview(),
         )
     assert state.rules_mode == "warn"
+
+
+# --- unresolved отчёта #227: потолок и молчание пиннинга ---
+
+
+async def test_the_warn_cap_actually_caps_a_require_policy(monkeypatch):
+    """Потолок warn обязан ГЛУШИТЬ отказ, а не только объявлять о себе.
+
+    Первая редакция объявляла capped_at_warn в списке headless-шагов, но сами
+    шаги читали политику из config мимо потолка: при SDD_SURFACES=require
+    headless-путь поднимал бы 422 вопреки докстроке потолка «этот путь читает
+    ту же политику, но никогда не отказывает по ней».
+
+    Ревью оставило это в unresolved: опровергатель снял как латентное («на
+    проде warn, ветка не берётся»), валидатор оставил. Латентность — не
+    отсутствие дефекта, а обещание, записанное и не исполненное, хуже
+    отсутствующего. Решаю замером, а не голосованием.
+    """
+    from hub.services.gate_pipeline import OFF, capped_at_warn
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    assert capped_at_warn("SDD_SURFACES")() == "warn", (
+        "политика require обязана прийти к шагу как warn"
+    )
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    assert capped_at_warn("SDD_SURFACES")() == OFF, (
+        "off остаётся off: потолок ограничивает строгость, а не включает шаг"
+    )
+
+
+async def test_the_capped_mode_reaches_the_step(monkeypatch):
+    """И потолок ДОХОДИТ до шага, а не теряется в конвейере.
+
+    Это вторая половина, и без неё первая ничего не значит: capped_at_warn
+    можно объявить верно и не передать никуда — ровно так дефект и выглядел.
+    run_steps использовал mode() только чтобы пропустить шаг при off.
+    """
+    from dataclasses import dataclass, field as dc_field
+
+    from hub.services.gate_pipeline import Step, capped_at_warn, run_steps
+
+    seen: list[str] = []
+
+    @dataclass
+    class _Ctx:
+        gate_mode: str = dc_field(default="")
+
+    async def _record(ctx: _Ctx) -> None:
+        seen.append(ctx.gate_mode)
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    await run_steps(
+        _Ctx(), (Step("surfaces", _record, mode=capped_at_warn("SDD_SURFACES")),)
+    )
+
+    assert seen == ["warn"], (
+        f"шаг обязан получить действующий режим, а не перечитывать политику: {seen}"
+    )
+
+
+async def test_the_headless_path_says_when_the_tip_was_not_pinned(
+    db: aiosqlite.Connection,
+):
+    """Сорвавшийся пиннинг на headless-пути НЕ молчит.
+
+    Пара говорит об этом в тексте самой сдачи («Branch tip NOT pinned: …»), а
+    headless такого текста не имеет вовсе — он зовёт только заметки. Ревью
+    оставило находку в unresolved: опровергатель счёл её вне скоупа («задача
+    про список гейтов»), валидатор — нарушением честности #572/#767.
+
+    В скоупе она потому, что задача как раз про РАВЕНСТВО двух путей: молча
+    незакреплённая вершина means вердикт относится к номеру сдачи, а не к коду.
+    """
+    from hub.services.lifecycle import SubmitContext, write_submission_notices
+
+    tv = await services.create_task(db, TaskCreate(title="Не закрепилось"))
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    state.submission_sha = ""
+    state.sha_reason = "could not fetch task-1/x: сеть недоступна"
+
+    await write_submission_notices(state)
+    await db.commit()
+
+    said = " ".join(u["content"] for u in await repo.get_task_updates(db, tv.id))
+    assert "НЕ закреплена" in said, "молчание о незакреплённой вершине недопустимо"
+    assert "сеть недоступна" in said, (
+        "причина обязана быть названа: «не смогли посмотреть» и «нечего было "
+        "закреплять» лечатся по-разному"
+    )
+
+
+async def test_the_surfaces_step_obeys_the_cap_instead_of_rereading_the_policy(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """И САМ ШАГ соблюдает потолок, а не перечитывает политику.
+
+    Этот тест дописан после мутационной проверки: две первые проверки —
+    «потолок считается» и «режим доходит до шага» — обе оставались зелёными,
+    когда _step_surfaces возвращали к чтению config напрямую. То есть предмет
+    находки покрыт не был, а таблица мутаций выглядела бы полной.
+
+    Ошибка атрибуции ловится только раздельной мутацией: проверять «потолок
+    объявлен» и «потолок применён» надо разными тестами, потому что сломаться
+    они могут порознь.
+    """
+    from hub.services.lifecycle import SubmitContext, _step_surfaces
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+
+    tv = await services.create_task(db, TaskCreate(title="Поверхности"))
+    await repo.update_task_structured(
+        db, tv.id, models.TaskRefine(affected_areas=["docs/notes.md"])
+    )
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    # Дифф ушёл за объявленную область — при require это отказ 422.
+    state.diff_paths = ["hub/services/somewhere_else.py"]
+    state.diff_reason = ""
+    state.gate_mode = "warn"
+
+    await _step_surfaces(state)
+
+    assert state.surface_note, (
+        "под потолком warn шаг обязан НАПИСАТЬ о расхождении, а не смолчать"
+    )
+
+    # Контроль: без потолка та же ситуация действительно отказывает, иначе
+    # предыдущее утверждение зелено по посторонней причине.
+    state.gate_mode = ""
+    with pytest.raises(HTTPException) as refused:
+        await _step_surfaces(state)
+    assert refused.value.status_code == 422
