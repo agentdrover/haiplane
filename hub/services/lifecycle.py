@@ -40,7 +40,7 @@ from hub.db import (
     write_transaction,
 )
 from hub.integrations.registry import plugins
-from hub.services.gate_pipeline import Step, policy, run_steps
+from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
@@ -1767,7 +1767,11 @@ class SubmitContext:
     db: aiosqlite.Connection
     task_id: int
     task: dict[str, Any]
-    body: TaskSubmitReview
+    # Пустое тело по умолчанию — headless-путь сдаёт без него (#1122): у
+    # done-отчёта нет ни ветки, ни accept_areas, ни исходов находок. Общий
+    # контекст позволяет обоим путям использовать ОДНИ шаги, и только поэтому
+    # два списка можно сравнивать по существу, а не по названиям.
+    body: TaskSubmitReview = dc_field(default_factory=TaskSubmitReview)
 
     resubmitted_from_review: bool = False
     replaced_sha: str = ""
@@ -1792,6 +1796,9 @@ class SubmitContext:
     rules_mode: str = dc_field(
         default_factory=lambda: (config.SUBMIT_RULES or "warn").strip().lower()
     )
+    #: Действующий режим ТЕКУЩЕГО шага, выставляется конвейером (#1122).
+    #: Пустая строка — шаг выполняется вне конвейера; тогда читается политика.
+    gate_mode: str = ""
     rule_lines: list[str] = dc_field(default_factory=list)
     clean_lines: list[str] = dc_field(default_factory=list)
     unchecked_lines: list[str] = dc_field(default_factory=list)
@@ -1821,6 +1828,18 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
 
 
+async def _step_canonical_branch(state: SubmitContext) -> None:
+    """Прочитать ветку задачи и ту, что назвал клиент (#1122).
+
+    Отделено от сверки, потому что ветка нужна ОБОИМ путям — её читает шаг
+    обнаружения PR, — а сверять её headless-пути не с чем: клиент там ветку
+    не сообщает вовсе. Пока чтение и сверка были одним шагом, headless не мог
+    взять первое, не взяв второе.
+    """
+    state.reported = (state.body.branch or "").strip()
+    state.canonical = (state.task.get("branch") or "").strip()
+
+
 async def _step_branch_matches(state: SubmitContext) -> None:
     """Клиент работал в ветке, которой владеет задача (#533)."""
     # #533: the task records a canonical branch; the client reports the one it
@@ -1836,8 +1855,6 @@ async def _step_branch_matches(state: SubmitContext) -> None:
     #
     # Pair path only: a headless task's branch belongs to the dispatch job,
     # and the client never reports one.
-    state.reported = (state.body.branch or "").strip()
-    state.canonical = (state.task.get("branch") or "").strip()
     if state.reported and state.canonical and state.reported != state.canonical:
         raise HTTPException(
             409,
@@ -1876,7 +1893,10 @@ async def _step_surfaces(state: SubmitContext) -> None:
     """Объявленная область против фактического диффа (#550, #890)."""
     # #550: before the transition, not after — a refusal has to happen while
     # there is still something to refuse.
-    surfaces_mode = (config.SDD_SURFACES or "warn").strip().lower()
+    # Режим берётся у конвейера, если тот его назвал: headless объявляет
+    # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
+    # мимо потолка (#1122).
+    surfaces_mode = (state.gate_mode or (config.SDD_SURFACES or "warn")).strip().lower()
     state.surface_note = ""
     # #890: paths the submitter accepts as the real scope. Empty unless the
     # submission asked for it — the hub never widens affected_areas on its own.
@@ -1993,7 +2013,7 @@ async def _step_submit_rules(state: SubmitContext) -> None:
                     if len(code_no_tests) > 10
                     else ""
                 )
-                if state.rules_mode == "require":
+                if (state.gate_mode or state.rules_mode) == "require":
                     raise HTTPException(
                         422,
                         f"дифф меняет код и не трогает ни одного теста: "
@@ -2107,6 +2127,7 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
 # сверить тестом и сравнить с набором headless-пути.
 SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
     Step("task_is_submittable", _step_task_is_submittable),
+    Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
@@ -2115,6 +2136,65 @@ SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
+
+
+# Порядок headless-пути (#1122). Тот же список шагов и те же функции, что у
+# сдачи pair-задачи: общий SubmitContext с пустым телом позволяет обоим путям
+# исполнять ОДНИ шаги, и только поэтому наборы можно сравнивать по существу, а
+# не по совпадению названий.
+#
+# Решение по каждому гейту принято владельцем 01.09.2026 (матрица в апдейте
+# #5206 задачи #1122). Два шага объявлены и НЕ выполняются — с причиной прямо
+# здесь: молчание в списке неотличимо от «забыли», и именно так расхождение
+# двух путей прожило незамеченным до #1067.
+#
+# Поверхности и правила стоят под потолком warn: путь получает эти гейты
+# впервые, и включить их сразу отказом значит остановить поток на первой же
+# задаче, которая раньше проходила.
+HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
+    Step("canonical_branch", _step_canonical_branch, refuses=False),
+    Step(
+        "branch_matches",
+        _step_branch_matches,
+        inactive_reason=(
+            "headless-клиент ветку не сообщает: она принадлежит dispatch-job. "
+            "Сравнивать отчёт не с чем, а проверка, которая всегда проходит, "
+            "хуже отсутствующей — она выглядит гарантией"
+        ),
+    ),
+    Step("resolve_diff", _step_resolve_diff, refuses=False),
+    Step("surfaces", _step_surfaces, mode=capped_at_warn("SDD_SURFACES")),
+    Step(
+        "finding_outcomes",
+        _step_finding_outcomes,
+        inactive_reason=(
+            "у done-отчёта нет поля finding_outcomes — ответить негде, а гейт, "
+            "который спрашивает там, где ответить нечем, либо молчит всегда, "
+            "либо ругается всегда. Поле заводится задачей #1155"
+        ),
+    ),
+    Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
+    Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step("delivery_pr", _step_delivery_pr, refuses=False),
+)
+
+
+async def run_headless_submit_gates(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> SubmitContext:
+    """Прогнать гейты сдачи для headless-задачи, уходящей в ревью (#1122).
+
+    Вызывается из orchestration в момент Universal Review Gate — там, где
+    done-отчёт превращается в сдачу. Возвращает контекст: вызывающий пишет из
+    него submission_sha и pr_number в той же транзакции, что и переход, а
+    заметки кладёт в ленту.
+
+    Ни один шаг здесь не отказывает: у headless-пути отказ означал бы
+    застрявшую задачу без человека рядом, и решение владельца — warn.
+    """
+    state = SubmitContext(db=db, task_id=task["id"], task=task)
+    await run_steps(state, HEADLESS_STEPS)
+    return state
 
 
 async def submit_for_review(
@@ -2226,6 +2306,37 @@ def _submission_update_text(
     if summary:
         content += f" {summary}"
     return agent, content
+
+
+async def write_submission_notices(state: SubmitContext) -> None:
+    """Публичное имя: заметки пишет и headless-путь (#1122).
+
+    Раньше функция была приватной, потому что вызывающий был один. Теперь их
+    два, и подчёркивание врало бы о границе.
+
+    Здесь же — сорвавшийся пиннинг, и только здесь. Пара говорит о нём в
+    тексте самой сдачи («Branch tip NOT pinned: …»), а у headless такого
+    текста нет вовсе: он зовёт только эти заметки. Без этой записи вершина не
+    закреплялась МОЛЧА — вердикт относился бы к номеру сдачи, а не к коду,
+    ровно та дыра, которую задача и закрывает (#572, #767).
+
+    Задвоения на pair-пути нет по устройству: тот зовёт приватную
+    ``_write_submission_notices`` напрямую, минуя эту обёртку.
+    """
+    if not state.submission_sha:
+        # Непроверенное — это состояние, которое читатель обязан видеть, а не
+        # отсутствие новостей (#534, #572). Причина называется: «не смогли
+        # посмотреть» и «нечего было закреплять» лечатся по-разному.
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            "alert",
+            "Вершина ветки НЕ закреплена: "
+            + (state.sha_reason or "причина не названа")
+            + ". Вердикт будет относиться к номеру сдачи, а не к коду.",
+        )
+    await _write_submission_notices(state)
 
 
 async def _write_submission_notices(state: SubmitContext) -> None:

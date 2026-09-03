@@ -18,7 +18,12 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from hub import models
+import aiosqlite
+
+from hub import config, models
+from hub import repository as repo
+from hub import services
+from hub.models import TaskCreate, TaskSubmitReview
 from hub.services import lifecycle
 from hub.services.gate_pipeline import ALWAYS, OFF, Step, run_steps
 
@@ -99,6 +104,7 @@ def test_every_step_declares_a_name_and_whether_it_refuses():
 
 EXPECTED_SUBMIT_ORDER = (
     "task_is_submittable",
+    "canonical_branch",
     "branch_matches",
     "resolve_diff",
     "surfaces",
@@ -146,23 +152,13 @@ def test_the_network_walking_steps_come_last():
 
 
 # --------------------------------------------------------------------------
-# AC-4: расхождение pair и headless. Главная находка задачи.
+# Расхождение pair и headless — теперь по ДВУМ СПИСКАМ (#1122)
 # --------------------------------------------------------------------------
 
-# Гейты, которые проходит СДАЧА PAIR-ЗАДАЧИ и не проходит headless-путь.
-# Список зафиксирован здесь не как пожелание, а как факт, замеренный по коду:
-# ни диспетчер transition_after_agent_done, ни его обработчики не вызывают ни _surface_check, ни
-# finding_outcome, ни resolve_branch_tip, ни machine_review_gap, ни
-# ac_tests_gap. Headless-задача уезжает в ревью без сверки объявленной
-# области с диффом, без спроса об исходах находок прошлой сдачи, без правил
-# сдачи и без закреплённого коммита.
-#
-# Это НЕ починено здесь намеренно: задача #1067 обещала сделать расхождение
-# видимым, а не устранить его — свести пути к одному набору значит менять
-# правила, а не форму. Тест существует, чтобы расхождение перестало быть
-# незаметным и чтобы новое расхождение краснело.
-GATES_PAIR_ONLY = (
+EXPECTED_HEADLESS_ORDER = (
+    "canonical_branch",
     "branch_matches",
+    "resolve_diff",
     "surfaces",
     "finding_outcomes",
     "submit_rules",
@@ -171,52 +167,77 @@ GATES_PAIR_ONLY = (
 )
 
 
-def test_the_headless_path_runs_none_of_the_submit_gates():
-    """AC-4: headless-путь не прогоняет гейты сдачи, и это записано.
+def test_the_headless_order_is_pinned():
+    assert tuple(s.name for s in lifecycle.HEADLESS_STEPS) == EXPECTED_HEADLESS_ORDER
 
-    Проверяется по исходнику, а не по вызову: у headless-пути нет своего
-    списка шагов, который можно было бы сравнить, — в этом и состоит
-    расхождение. Если он такой список заведёт, тест придётся переписать, и
-    это правильный момент, чтобы наборы сравнили по-настоящему.
+
+def test_the_two_pipelines_are_compared_by_their_lists():
+    """#1122 AC-2: расхождение читается из двух списков, а не из исходника.
+
+    В #1067 сравнивать было не с чем — у headless-пути списка не было, и
+    страж читал текст четырёх функций. Такой страж зеленел бы от переезда
+    кода, а не от появления гейта; здесь он заменён на сопоставление.
     """
-    import inspect
+    submit = {s.name: s for s in lifecycle.SUBMIT_STEPS}
+    headless = {s.name: s for s in lifecycle.HEADLESS_STEPS}
 
-    from hub.services import orchestration
+    # task_is_submittable — единственный шаг, которого у headless нет вовсе:
+    # он проверяет, что задача pair и в статусе, из которого сдают.
+    assert set(submit) - set(headless) == {"task_is_submittable"}
+    assert set(headless) - set(submit) == set()
 
-    # Читается диспетчер И его обработчики. После #1067 тела веток живут в
-    # отдельных функциях, и чтение одного transition_after_agent_done дало бы
-    # зелёный тест по причине переезда кода, а не отсутствия гейтов — то есть
-    # ровно та тихая поломка стража, которую этот файл и должен исключать.
-    source = "".join(
-        inspect.getsource(fn)
-        for fn in (
-            orchestration.transition_after_agent_done,
-            orchestration._complete_without_review,
-            orchestration._route_after_done,
-            orchestration._deliver_completed_pair_task,
+    active_here = {n for n, s in headless.items() if s.active}
+    inactive_here = {n for n, s in headless.items() if not s.active}
+    assert inactive_here == {"branch_matches", "finding_outcomes"}, (
+        "набор неактивных на headless изменился — обновите матрицу решений в "
+        "#1122 и скажите об этом в сдаче, а не молча"
+    )
+    assert "pin_submission_sha" in active_here, (
+        "пиннинг коммита — то, ради чего #1122 заводилась: без него вердикт "
+        "относится к номеру сдачи, а не к коду"
+    )
+
+
+def test_every_inactive_headless_step_explains_itself():
+    """#1122 AC-3: объявленный и невыполняемый шаг обязан назвать причину.
+
+    Иначе «не делаем» неотличимо от «забыли» — ровно то, из-за чего
+    расхождение двух путей прожило незамеченным.
+    """
+    for step in lifecycle.HEADLESS_STEPS:
+        if step.active:
+            assert not step.inactive_reason
+            continue
+        assert len(step.inactive_reason) > 40, (
+            f"шаг {step.name} объявлен неактивным без внятной причины"
         )
-    )
-    markers = {
-        "surfaces": "_surface_check",
-        "finding_outcomes": "finding_outcome",
-        "submit_rules": "code_without_tests",
-        "pin_submission_sha": "resolve_branch_tip",
-    }
-    running = [gate for gate, marker in markers.items() if marker in source]
-    assert running == [], (
-        "headless-путь начал прогонять гейты сдачи: "
-        f"{running}. Расхождение с pair-путём изменилось — обновите "
-        "GATES_PAIR_ONLY и скажите об этом в сдаче, а не молча."
-    )
+        assert step.describe()["inactive_reason"] == step.inactive_reason
 
 
-def test_the_pair_only_gates_are_all_declared_in_the_submit_list():
-    """Список расхождения не должен разъезжаться с реальным конвейером."""
-    declared = {s.name for s in lifecycle.SUBMIT_STEPS}
-    missing = [g for g in GATES_PAIR_ONLY if g not in declared]
-    assert not missing, (
-        f"GATES_PAIR_ONLY называет шаги, которых в SUBMIT_STEPS нет: {missing}"
+async def test_an_inactive_step_never_runs():
+    ran: list[str] = []
+
+    async def never(state):
+        ran.append("never")
+
+    await run_steps(
+        object(), (Step("x", never, inactive_reason="объявлен и намеренно не делаем"),)
     )
+    assert ran == []
+
+
+def test_the_headless_gates_never_refuse():
+    """Отказ на headless оставил бы задачу стоять без человека рядом (#1122).
+
+    Решение владельца — warn: поверхности и правила стоят под потолком, а
+    остальные активные шаги не отказывают по своей природе.
+    """
+    for step in lifecycle.HEADLESS_STEPS:
+        if not step.active:
+            continue
+        assert step.mode() in ("off", "warn", "always"), (
+            f"шаг {step.name} на headless-пути может отказать: режим {step.mode()}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -313,3 +334,198 @@ def test_the_rules_mode_defaults_to_warn_when_the_policy_is_unset():
             body=models.TaskSubmitReview(),
         )
     assert state.rules_mode == "warn"
+
+
+# --- unresolved отчёта #227: потолок и молчание пиннинга ---
+
+
+async def test_the_warn_cap_actually_caps_a_require_policy(monkeypatch):
+    """Потолок warn обязан ГЛУШИТЬ отказ, а не только объявлять о себе.
+
+    Первая редакция объявляла capped_at_warn в списке headless-шагов, но сами
+    шаги читали политику из config мимо потолка: при SDD_SURFACES=require
+    headless-путь поднимал бы 422 вопреки докстроке потолка «этот путь читает
+    ту же политику, но никогда не отказывает по ней».
+
+    Ревью оставило это в unresolved: опровергатель снял как латентное («на
+    проде warn, ветка не берётся»), валидатор оставил. Латентность — не
+    отсутствие дефекта, а обещание, записанное и не исполненное, хуже
+    отсутствующего. Решаю замером, а не голосованием.
+    """
+    from hub.services.gate_pipeline import OFF, capped_at_warn
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    assert capped_at_warn("SDD_SURFACES")() == "warn", (
+        "политика require обязана прийти к шагу как warn"
+    )
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    assert capped_at_warn("SDD_SURFACES")() == OFF, (
+        "off остаётся off: потолок ограничивает строгость, а не включает шаг"
+    )
+
+
+async def test_the_capped_mode_reaches_the_step(monkeypatch):
+    """И потолок ДОХОДИТ до шага, а не теряется в конвейере.
+
+    Это вторая половина, и без неё первая ничего не значит: capped_at_warn
+    можно объявить верно и не передать никуда — ровно так дефект и выглядел.
+    run_steps использовал mode() только чтобы пропустить шаг при off.
+    """
+    from dataclasses import dataclass, field as dc_field
+
+    from hub.services.gate_pipeline import Step, capped_at_warn, run_steps
+
+    seen: list[str] = []
+
+    @dataclass
+    class _Ctx:
+        gate_mode: str = dc_field(default="")
+
+    async def _record(ctx: _Ctx) -> None:
+        seen.append(ctx.gate_mode)
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+    await run_steps(
+        _Ctx(), (Step("surfaces", _record, mode=capped_at_warn("SDD_SURFACES")),)
+    )
+
+    assert seen == ["warn"], (
+        f"шаг обязан получить действующий режим, а не перечитывать политику: {seen}"
+    )
+
+
+async def test_the_headless_path_says_when_the_tip_was_not_pinned(
+    db: aiosqlite.Connection,
+):
+    """Сорвавшийся пиннинг на headless-пути НЕ молчит.
+
+    Пара говорит об этом в тексте самой сдачи («Branch tip NOT pinned: …»), а
+    headless такого текста не имеет вовсе — он зовёт только заметки. Ревью
+    оставило находку в unresolved: опровергатель счёл её вне скоупа («задача
+    про список гейтов»), валидатор — нарушением честности #572/#767.
+
+    В скоупе она потому, что задача как раз про РАВЕНСТВО двух путей: молча
+    незакреплённая вершина means вердикт относится к номеру сдачи, а не к коду.
+    """
+    from hub.services.lifecycle import SubmitContext, write_submission_notices
+
+    tv = await services.create_task(db, TaskCreate(title="Не закрепилось"))
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    state.submission_sha = ""
+    state.sha_reason = "could not fetch task-1/x: сеть недоступна"
+
+    await write_submission_notices(state)
+    await db.commit()
+
+    said = " ".join(u["content"] for u in await repo.get_task_updates(db, tv.id))
+    assert "НЕ закреплена" in said, "молчание о незакреплённой вершине недопустимо"
+    assert "сеть недоступна" in said, (
+        "причина обязана быть названа: «не смогли посмотреть» и «нечего было "
+        "закреплять» лечатся по-разному"
+    )
+
+
+async def test_the_surfaces_step_obeys_the_cap_instead_of_rereading_the_policy(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """И САМ ШАГ соблюдает потолок, а не перечитывает политику.
+
+    Этот тест дописан после мутационной проверки: две первые проверки —
+    «потолок считается» и «режим доходит до шага» — обе оставались зелёными,
+    когда _step_surfaces возвращали к чтению config напрямую. То есть предмет
+    находки покрыт не был, а таблица мутаций выглядела бы полной.
+
+    Ошибка атрибуции ловится только раздельной мутацией: проверять «потолок
+    объявлен» и «потолок применён» надо разными тестами, потому что сломаться
+    они могут порознь.
+    """
+    from hub.services.lifecycle import SubmitContext, _step_surfaces
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "require")
+
+    tv = await services.create_task(db, TaskCreate(title="Поверхности"))
+    await repo.update_task_structured(
+        db, tv.id, models.TaskRefine(affected_areas=["docs/notes.md"])
+    )
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    # Дифф ушёл за объявленную область — при require это отказ 422.
+    state.diff_paths = ["hub/services/somewhere_else.py"]
+    state.diff_reason = ""
+    state.gate_mode = "warn"
+
+    await _step_surfaces(state)
+
+    assert state.surface_note, (
+        "под потолком warn шаг обязан НАПИСАТЬ о расхождении, а не смолчать"
+    )
+
+    # Контроль: без потолка та же ситуация действительно отказывает, иначе
+    # предыдущее утверждение зелено по посторонней причине.
+    state.gate_mode = ""
+    with pytest.raises(HTTPException) as refused:
+        await _step_surfaces(state)
+    assert refused.value.status_code == 422
+
+
+async def test_the_rules_step_obeys_the_cap_instead_of_rereading_the_policy(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """И шаг ПРАВИЛ СДАЧИ соблюдает потолок — симметрично шагу поверхностей.
+
+    Найдено ревью (отчёт #229) и подтверждено мутацией: снятие потолка в
+    _step_submit_rules не роняло НИ ОДНОГО теста из 3184. То есть первая
+    редакция закрыла потолок у поверхностей, а у правил сдачи оставила его
+    ровно так же непроверенным, как он был до задачи.
+
+    Мой собственный урок здесь повторился: я нашёл эту дыру мутацией для
+    _step_surfaces, написал тест на него — и не проверил соседний шаг с тем
+    же потолком. Два шага объявлены через один capped_at_warn, но ломаются
+    порознь, и проверять их надо порознь.
+    """
+    from hub.services.lifecycle import SubmitContext, _step_submit_rules
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "require")
+
+    tv = await services.create_task(db, TaskCreate(title="Правила сдачи"))
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    # Код без единого теста — при require это отказ 422.
+    state.diff_paths = ["hub/services/somewhere.py"]
+    state.diff_reason = ""
+    state.gate_mode = "warn"
+
+    await _step_submit_rules(state)
+
+    assert any("Тесты рядом с кодом" in line for line in state.rule_lines), (
+        "под потолком warn шаг обязан НАПИСАТЬ о нарушении, а не смолчать: "
+        "потолок ограничивает строгость, а не выключает проверку"
+    )
+
+    # Контроль: без потолка та же ситуация действительно отказывает. Без него
+    # предыдущее утверждение было бы зелено по посторонней причине — например
+    # если бы code_without_tests вовсе ничего не нашла.
+    state.rule_lines = []
+    state.gate_mode = ""
+    with pytest.raises(HTTPException) as refused:
+        await _step_submit_rules(state)
+    assert refused.value.status_code == 422

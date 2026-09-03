@@ -2880,3 +2880,108 @@ async def test_the_tick_guard_rolls_back_a_forgotten_commit(db, db_dsn, caplog):
         assert warnings, "the guard rolled back silently"
     finally:
         await conn.close()
+
+
+# --------------------------------------------------------------------------
+# #1122: headless-сдача проходит гейты
+# --------------------------------------------------------------------------
+
+
+async def test_a_headless_submission_pins_its_commit(db):
+    """AC-1 (#1122): вердикт по headless-задаче привязан к коммиту.
+
+    До #1122 headless-задача уезжала в ревью, не пройдя ни одного гейта
+    сдачи: submission_sha оставался пустым, и «одобрено» относилось к номеру
+    сдачи, а не к коду в ветке. Ровно этот класс уже ловили на pair-пути в
+    #612 и #1019.
+    """
+    from hub.models import TaskApprove, TaskCreate
+    from hub.services import orchestration
+
+    mock_git = NoopGitOps()
+    mock_git.fetch_base = AsyncMock(return_value=(True, ""))
+    # НЕ hex намеренно: строку из одних шестнадцатеричных знаков сканер
+    # секретов читает как «высокая энтропия» и красит security-шаг. Тесту
+    # форма коммита безразлична — он сравнивает строки на равенство.
+    mock_git.head_sha = AsyncMock(return_value="pinned-tip-not-a-real-sha")
+    mock_git.checkout = AsyncMock(return_value=True)
+    mock_git.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    plugins.git_ops = mock_git
+
+    # Проекту нужен workspace: без него resolve_branch_tip честно
+    # деградирует в «не с чего наблюдать ветку», и пиннинг невозможен в
+    # принципе — как и на проде без клона.
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    await db.execute("UPDATE projects SET workspace_path='/tmp/ws'")
+    await db.commit()
+
+    task = await services.create_task(
+        db, TaskCreate(title="headless", source="agent", agent="bot")
+    )
+    await services.approve_task(db, task.id, TaskApprove(force=True))
+    await repo.update_task(
+        db,
+        task.id,
+        status="running",
+        job_id="job-1",
+        branch="task-1/headless",
+    )
+    await db.commit()
+
+    row = dict(await repo.get_task(db, task.id))
+    await orchestration.transition_after_agent_done(db, row, has_done=True)
+
+    after = dict(await repo.get_task(db, task.id))
+    # Проверяется ИНВАРИАНТ, а не маршрут: headless уходит к ревью несколькими
+    # путями (ci_check, конвейер auto-review, Universal Review Gate), и какой
+    # сработает — решает конфигурация. Гейты стоят до развилки именно поэтому,
+    # и пиннинг обязан быть при любом из них.
+    assert after["status"] != "running", "задача обязана была уйти из running"
+    assert after["submission_sha"] == "pinned-tip-not-a-real-sha", (
+        "коммит сдачи не закреплён — вердикт не с чем будет сверить"
+    )
+
+
+async def test_a_headless_submission_reports_what_the_gates_saw(db):
+    """Гейт, который отработал и промолчал, хуже невыполненного (#1122).
+
+    Правила сдачи под потолком warn: дифф меняет код и не трогает тестов —
+    это заметка в ленту, а не отказ.
+    """
+    from hub.models import TaskApprove, TaskCreate
+    from hub.services import orchestration
+
+    mock_git = NoopGitOps()
+    mock_git.fetch_base = AsyncMock(return_value=(True, ""))
+    mock_git.head_sha = AsyncMock(return_value="deadbeef00000000")
+    mock_git.checkout = AsyncMock(return_value=True)
+    mock_git.branch_diff_paths = AsyncMock(return_value=["hub/app.py"])
+    plugins.git_ops = mock_git
+
+    task = await services.create_task(
+        db, TaskCreate(title="без тестов", source="agent", agent="bot")
+    )
+    await services.approve_task(db, task.id, TaskApprove(force=True))
+    await repo.update_task(
+        db,
+        task.id,
+        status="running",
+        job_id="job-2",
+        branch="task-2/no-tests",
+    )
+    await db.commit()
+
+    row = dict(await repo.get_task(db, task.id))
+    await orchestration.transition_after_agent_done(db, row, has_done=True)
+
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task.id)
+    )
+    assert "Тесты рядом с кодом" in feed, (
+        "правила сдачи отработали и промолчали — читатель решит, что чисто"
+    )
+    assert dict(await repo.get_task(db, task.id))["status"] != "needs_decision", (
+        "гейты на headless не отказывают: решение владельца — warn"
+    )
