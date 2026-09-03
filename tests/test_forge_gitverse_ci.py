@@ -93,8 +93,7 @@ async def test_probe_matches_run_by_head_sha(patched_httpx):
     seen, responses = patched_httpx
     responses.extend(
         [
-            _pr(),  # pr_head_sha
-            _pr(),  # pr_refs
+            _pr(),  # pr_head_sha (pr_refs больше не спрашивается, #1154)
             _runs(_run("другой-коммит", "failure"), _run(HEAD, "success")),
         ]
     )
@@ -102,10 +101,13 @@ async def test_probe_matches_run_by_head_sha(patched_httpx):
     probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
 
     assert probe.outcome is CIProbeOutcome.passed
-    # И спрашивали по ветке PR, а не по чему-то ещё. Сравниваем разобранный
-    # параметр, а не строку URL: слэш в имени ветки уезжает в %2F, и проверка
-    # подстрокой краснела бы на верном коде.
-    assert seen[-1].url.params.get("branch") == "task-1/x"
+    # И НЕ спрашивали по ветке. Ожидание развёрнуто в #1154, и это не
+    # косметика: прежняя редакция требовала слать branch, то есть закрепляла
+    # дефект тестом. Сервер отвечает 400 на любое имя со слэшем, а все ветки
+    # задач — task-<id>/<slug>. Комментарий, стоявший здесь раньше, слэш даже
+    # УПОМИНАЛ — и делал из него вывод про кодирование вместо вывода про 400.
+    assert seen[-1].url.params.get("branch") is None
+    assert seen[-1].url.params.get("head_sha") is None
 
 
 async def test_status_carries_the_verdict_because_conclusion_does_not_exist(
@@ -119,12 +121,12 @@ async def test_status_carries_the_verdict_because_conclusion_does_not_exist(
     seen, responses = patched_httpx
     forge = _forge()
 
-    responses.extend([_pr(), _pr(), _runs(_run(HEAD, "failure"))])
+    responses.extend([_pr(), _runs(_run(HEAD, "failure"))])
     assert (await forge.check_pr_ci(7, gh_repo="own/rep")).outcome is (
         CIProbeOutcome.failed
     )
 
-    responses.extend([_pr(), _pr(), _runs(_run(HEAD, "success"))])
+    responses.extend([_pr(), _runs(_run(HEAD, "success"))])
     assert (await forge.check_pr_ci(7, gh_repo="own/rep")).outcome is (
         CIProbeOutcome.passed
     )
@@ -133,9 +135,7 @@ async def test_status_carries_the_verdict_because_conclusion_does_not_exist(
 async def test_red_next_to_green_is_red(patched_httpx):
     """Один упавший прогон рядом с зелёным даёт красный ответ."""
     seen, responses = patched_httpx
-    responses.extend(
-        [_pr(), _pr(), _runs(_run(HEAD, "success"), _run(HEAD, "failure"))]
-    )
+    responses.extend([_pr(), _runs(_run(HEAD, "success"), _run(HEAD, "failure"))])
 
     assert (await _forge().check_pr_ci(7, gh_repo="own/rep")).outcome is (
         CIProbeOutcome.failed
@@ -152,7 +152,7 @@ async def test_unknown_status_is_unavailable_not_pending(patched_httpx):
     сторону pending страшнее — гейт будет ждать вечно.
     """
     seen, responses = patched_httpx
-    responses.extend([_pr(), _pr(), _runs(_run(HEAD, "неведомое"))])
+    responses.extend([_pr(), _runs(_run(HEAD, "неведомое"))])
 
     probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
 
@@ -175,7 +175,6 @@ async def test_four_situations_give_four_outcomes(patched_httpx):
     responses.extend(
         [
             _pr(),
-            _pr(),
             _runs(),
             httpx.Response(200, json={"total_count": 0, "workflows": []}),
         ]
@@ -188,7 +187,6 @@ async def test_four_situations_give_four_outcomes(patched_httpx):
     responses.extend(
         [
             _pr(),
-            _pr(),
             _runs(),
             httpx.Response(200, json={"total_count": 1, "workflows": [{"name": "CI"}]}),
         ]
@@ -198,7 +196,7 @@ async def test_four_situations_give_four_outcomes(patched_httpx):
     assert probe.details == HEAD, "какой именно коммит ждёт прогона — часть ответа"
 
     # 3. Прогон идёт.
-    responses.extend([_pr(), _pr(), _runs(_run(HEAD, "running"))])
+    responses.extend([_pr(), _runs(_run(HEAD, "running"))])
     assert (await forge.check_pr_ci(7, gh_repo="own/rep")).outcome is (
         CIProbeOutcome.pending
     )
@@ -224,11 +222,11 @@ async def test_broken_workflows_endpoint_never_becomes_absent(
     monkeypatch.setattr("asyncio.sleep", _no_sleep)
     forge = _forge()
 
-    responses.extend([_pr(), _pr(), _runs()] + [httpx.Response(500)] * 3)
+    responses.extend([_pr(), _runs()] + [httpx.Response(500)] * 3)
     probe = await forge.check_pr_ci(7, gh_repo="own/rep")
     assert probe.outcome is CIProbeOutcome.unavailable
 
-    responses.extend([_pr(), _pr(), _runs(), httpx.Response(404, json={})])
+    responses.extend([_pr(), _runs(), httpx.Response(404, json={})])
     probe = await forge.check_pr_ci(7, gh_repo="own/rep")
     assert probe.outcome is CIProbeOutcome.unavailable
     assert probe.outcome is not CIProbeOutcome.absent
@@ -266,7 +264,9 @@ async def test_branch_runs_fill_conclusion_the_consumers_expect(patched_httpx):
         _runs(_run("aaa", "success"), _run("bbb", "failure"), _run("ccc", "running"))
     )
 
-    runs = await _forge().branch_ci_runs("main", gh_repo="own/rep")
+    # Имя СО СЛЭШЕМ намеренно: ref у прогонов — refs/heads/task-1/x, и
+    # именно на таких именах ломался серверный фильтр (#1154).
+    runs = await _forge().branch_ci_runs("task-1/x", gh_repo="own/rep")
 
     assert runs is not None
     assert [r["sha"] for r in runs] == ["aaa", "bbb", "ccc"]
@@ -459,7 +459,7 @@ async def test_green_then_red_on_one_sha_is_red(patched_httpx, order):
     green = {**_run(HEAD, "success"), "id": 1}
     red = {**_run(HEAD, "failure"), "id": 2}
     pair = [red, green] if order == "newest_first" else [green, red]
-    responses.extend([_pr(), _pr(), _runs(*pair)])
+    responses.extend([_pr(), _runs(*pair)])
 
     probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
 
@@ -512,3 +512,140 @@ async def test_failure_logs_take_the_latest_failed_run(patched_httpx, order):
     result = await _forge().ci_failure_logs(7, "task-1/x", gh_repo="own/rep")
 
     assert "actions/runs/2" in result["run_url"], "взят самый свежий упавший прогон"
+
+
+# ---------------------------------------------------------------------------
+# Фильтрация на своей стороне (#1154)
+# ---------------------------------------------------------------------------
+
+#: Каноническое имя ветки задачи. Слэш здесь — предмет проверки, а не деталь:
+#: сервер отвечает 400 на любое имя с ним, а `main` — единственная ветка без.
+SLASHED = "task-1138/eslint-debt"
+
+
+async def test_runs_are_read_for_a_branch_with_a_slash(patched_httpx):
+    """AC-1. Прогон ветки задачи читается, а не отвечает «спросить не удалось».
+
+    Замерено 02.09.2026 боевым токеном: ?branch=task-1138/eslint-debt даёт 400,
+    и закодированный вариант тоже. Раньше проба на этом получала None и
+    отвечала unavailable — то есть НИ ОДНА задача на GitVerse не могла быть
+    доставлена. Первая живая (#1138) встала при двух зелёных прогонах.
+
+    Тест на имени БЕЗ слэша здесь ничего не проверял бы: на main дефекта нет,
+    и именно поэтому он прожил незамеченным через всё ревью #1117.
+    """
+    seen, responses = patched_httpx
+    responses.extend([_pr(), _runs(_run(HEAD, "success", ref=f"refs/heads/{SLASHED}"))])
+
+    probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
+
+    assert probe.outcome is CIProbeOutcome.passed, probe.reason
+    asked = seen[-1].url.params
+    assert asked.get("branch") is None and asked.get("head_sha") is None, (
+        "серверу нельзя слать ни один из двух фильтров: оба дают 400 на "
+        f"ветках вида {SLASHED}"
+    )
+
+
+async def test_runs_are_matched_by_commit_not_by_ref(patched_httpx):
+    """AC-2. Отбор идёт по commit_sha, и чужие прогоны не попадают.
+
+    Форма снята с живого репозитория: у одного коммита ДВА прогона — push по
+    refs/heads/<ветка> и pull_request по refs/pull/N/head, — а рядом лежат
+    прогоны соседних коммитов. Отбор по ref потерял бы половину своих и мог бы
+    прихватить чужой; вопрос ведь «что с ЭТИМ коммитом», а не «что на ветке».
+    """
+    seen, responses = patched_httpx
+    responses.extend(
+        [
+            _pr(),
+            _runs(
+                _run("чужой-свежий-коммит", "failure", ref=f"refs/heads/{SLASHED}"),
+                _run(HEAD, "success", ref="refs/pull/3/head"),
+                _run(HEAD, "success", ref=f"refs/heads/{SLASHED}"),
+                _run("ещё-чужой", "failure", ref="refs/heads/main"),
+            ),
+        ]
+    )
+
+    probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
+
+    assert probe.outcome is CIProbeOutcome.passed, (
+        "оба прогона нашей головы зелёные; красные рядом принадлежат другим "
+        f"коммитам, и попасть в ответ не должны: {probe.reason}"
+    )
+
+
+async def test_branch_runs_filter_by_ref_not_by_bare_name(patched_httpx):
+    """Отбор ветки идёт по ПОЛНОМУ ref, а не по голому имени.
+
+    ``ref`` приходит как refs/heads/task-1138/eslint-debt. Сравнение с голым
+    именем дало бы пустоту, неотличимую от «прогонов нет», — и это была бы
+    та же ошибка, только на своей стороне вместо серверной.
+    """
+    seen, responses = patched_httpx
+    responses.append(
+        _runs(
+            _run("a", "success", ref=f"refs/heads/{SLASHED}"),
+            _run("b", "failure", ref="refs/heads/main"),
+            _run("c", "success", ref="refs/pull/3/head"),
+        )
+    )
+
+    runs = await _forge().branch_ci_runs(SLASHED, gh_repo="own/rep")
+
+    assert runs is not None
+    assert [r["sha"] for r in runs] == ["a"], (
+        "ветке принадлежит только push-прогон по её ref; main и pull-реф — чужие"
+    )
+
+
+async def test_unreadable_runs_stay_unavailable(patched_httpx, monkeypatch):
+    """AC-3. Нечитаемый ответ остаётся unavailable, а не становится absent.
+
+    Это то, что в самом дефекте сработало ВЕРНО, и починка обязана это
+    сохранить. absent пускает доставку мимо CI, unavailable говорит «спроси
+    снова» — разные решения гейта (#419, #725). Соблазн «раз не прочитали,
+    значит прогонов нет» здесь стоил бы доставки непроверенной работы.
+    """
+    seen, responses = patched_httpx
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    responses.extend([_pr()] + [httpx.Response(500)] * 3)
+
+    probe = await _forge().check_pr_ci(7, gh_repo="own/rep")
+
+    assert probe.outcome is CIProbeOutcome.unavailable
+    assert probe.outcome is not CIProbeOutcome.absent
+
+
+async def test_github_probe_is_untouched(monkeypatch):
+    """AC-4. Путь GitHub не задет: он спрашивает своим вызовом, как и спрашивал.
+
+    Проверяется ПОВЕДЕНИЕМ, а не чтением исходника. Первая редакция этого
+    теста искала подстроку в файле и была зелена по построению — то есть
+    ровно та ошибка, за которую вернули #1119: тест, переживающий удаление
+    того, что он якобы стережёт.
+
+    Здесь подменяется запуск процесса и сверяется argv: GitHub-проект
+    по-прежнему уходит в `gh pr checks`, а не в чтение списка прогонов
+    GitVerse. Одна общая правка «заодно» сломала бы каждый существующий
+    проект хаба.
+    """
+    from hub.integrations.forge.github import GitHubForge
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(cmd)
+        return (0, '[{"name": "build", "state": "SUCCESS"}]', "")
+
+    monkeypatch.setattr("hub.integrations.proc.run", fake_run)
+
+    probe = await GitHubForge().check_pr_ci(7, gh_repo="own/rep")
+
+    assert probe.outcome is CIProbeOutcome.passed
+    assert calls, "GitHub-адаптер обязан был сходить наружу"
+    argv = " ".join(calls[0])
+    assert "pr checks 7" in argv and "own/rep" in argv, (
+        f"GitHub спрашивает CI своим вызовом, а не путём GitVerse: {argv}"
+    )
