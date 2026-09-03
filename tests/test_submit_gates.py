@@ -479,3 +479,53 @@ async def test_the_surfaces_step_obeys_the_cap_instead_of_rereading_the_policy(
     with pytest.raises(HTTPException) as refused:
         await _step_surfaces(state)
     assert refused.value.status_code == 422
+
+
+async def test_the_rules_step_obeys_the_cap_instead_of_rereading_the_policy(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """И шаг ПРАВИЛ СДАЧИ соблюдает потолок — симметрично шагу поверхностей.
+
+    Найдено ревью (отчёт #229) и подтверждено мутацией: снятие потолка в
+    _step_submit_rules не роняло НИ ОДНОГО теста из 3184. То есть первая
+    редакция закрыла потолок у поверхностей, а у правил сдачи оставила его
+    ровно так же непроверенным, как он был до задачи.
+
+    Мой собственный урок здесь повторился: я нашёл эту дыру мутацией для
+    _step_surfaces, написал тест на него — и не проверил соседний шаг с тем
+    же потолком. Два шага объявлены через один capped_at_warn, но ломаются
+    порознь, и проверять их надо порознь.
+    """
+    from hub.services.lifecycle import SubmitContext, _step_submit_rules
+
+    monkeypatch.setattr(config, "SUBMIT_RULES", "require")
+
+    tv = await services.create_task(db, TaskCreate(title="Правила сдачи"))
+    await db.commit()
+
+    state = SubmitContext(
+        db=db,
+        task_id=tv.id,
+        task=dict(await repo.get_task(db, tv.id)),
+        body=TaskSubmitReview(model="claude-opus-5"),
+    )
+    # Код без единого теста — при require это отказ 422.
+    state.diff_paths = ["hub/services/somewhere.py"]
+    state.diff_reason = ""
+    state.gate_mode = "warn"
+
+    await _step_submit_rules(state)
+
+    assert any("Тесты рядом с кодом" in line for line in state.rule_lines), (
+        "под потолком warn шаг обязан НАПИСАТЬ о нарушении, а не смолчать: "
+        "потолок ограничивает строгость, а не выключает проверку"
+    )
+
+    # Контроль: без потолка та же ситуация действительно отказывает. Без него
+    # предыдущее утверждение было бы зелено по посторонней причине — например
+    # если бы code_without_tests вовсе ничего не нашла.
+    state.rule_lines = []
+    state.gate_mode = ""
+    with pytest.raises(HTTPException) as refused:
+        await _step_submit_rules(state)
+    assert refused.value.status_code == 422
