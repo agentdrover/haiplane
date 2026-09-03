@@ -29,7 +29,13 @@ from hub.mcp_envelope import (
     format_echo_response,
     merge_mutation_response,
 )
-from hub.models import AWAITING_HUMAN_STATUSES, DEFAULT_FORGE, FINAL_STATUSES
+from hub.models import (
+    AWAITING_HUMAN_STATUSES,
+    DEFAULT_FORGE,
+    FINAL_STATUSES,
+    TaskRefine,
+)
+from hub.mcp_signature import Hidden, with_model_signature
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
@@ -3704,40 +3710,35 @@ def _risk_key(risk: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+# Поля TaskRefine, которых hub_prepare_developer_task НЕ публикует (#1068).
+# Инструмент — операция аналитика над УЖЕ созданной задачей, поэтому поля
+# создания и паспорта дефекта в него не входят.
+PREPARE_HIDDEN: tuple[Hidden, ...] = (
+    Hidden("project", "привязка эпика к проекту — операция иерархии (#338)"),
+    Hidden("title", "заголовок правят через refine: доводка не переименовывает"),
+    Hidden("description", "текст постановки правят через refine (#1013)"),
+    Hidden("prepared_by", "проставляется из analyst — параметра инструмента"),
+    Hidden("prepared_at", "ставится инструментом в момент подготовки"),
+    Hidden("found_in", "паспорт дефекта (#910) заполняется отдельно от доводки"),
+    Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
+    Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
+    Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+)
+
+
 @mcp.tool()
+@with_model_signature(
+    TaskRefine,
+    leading=(("task_id", int), ("mode", str, "apply"), ("risk_mode", str, "dedupe")),
+    trailing=(("analyst", str, "analyst-agent"),),
+    hidden=PREPARE_HIDDEN,
+)
 async def hub_prepare_developer_task(
     task_id: int,
     mode: str = "apply",
     risk_mode: str = "dedupe",
-    work_type: str | None = None,
-    class_of_service: str | None = None,
-    size: str | None = None,
-    wip_tag: str | None = None,
-    due_date: str | None = None,
-    user_story: str | None = None,
-    problem_statement: str | None = None,
-    business_value: str | None = None,
-    outcome_metric: str | None = None,
-    outcome_indicator: str | None = None,
-    outcome_deadline: str | None = None,
-    outcome_revisit_condition: str | None = None,
-    redesign_decision: str | None = None,
-    redesign_rationale: str | None = None,
-    agent_fit: str | None = None,
-    technical_hints: str | None = None,
-    scope_in: list[str] | None = None,
-    scope_out: list[str] | None = None,
-    affected_areas: list[str] | None = None,
-    validation_commands: list[str] | None = None,
-    constraints: list[str] | None = None,
-    assumptions: list[str] | None = None,
-    out_of_scope_for_review: list[str] | None = None,
-    review_checklist: list[str] | None = None,
-    acceptance_criteria: list[dict[str, Any]] | None = None,
-    risks: list[dict[str, Any]] | None = None,
-    human_owner: str | None = None,
-    human_reviewer: str | None = None,
     analyst: str = "analyst-agent",
+    **fields: Any,
 ) -> str:
     """Prepare a raw task for developer handoff in one analyst operation.
 
@@ -3758,43 +3759,33 @@ async def hub_prepare_developer_task(
     if risk_mode not in {"dedupe", "append", "replace"}:
         raise ValueError("risk_mode must be 'dedupe', 'append', or 'replace'")
 
-    if wip_tag is None and (work_type is None or work_type == "feature"):
-        wip_tag = "feature_work"
-    prepared_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    # Имена, которые тело читает дальше по коду. Явно и в одном месте: раньше
+    # они приходили параметрами, и список параметров дублировал список полей.
+    work_type = fields.get("work_type")
+    acceptance_criteria = fields.get("acceptance_criteria")
+    risks = fields.get("risks")
+    validation_commands = fields.get("validation_commands")
+    problem_statement = fields.get("problem_statement")
+    business_value = fields.get("business_value")
+    scope_in = fields.get("scope_in")
+    scope_out = fields.get("scope_out")
+    affected_areas = fields.get("affected_areas")
+    review_checklist = fields.get("review_checklist")
 
-    refine_body: dict[str, Any] = {}
-    for key, val in (
-        ("work_type", work_type),
-        ("class_of_service", class_of_service),
-        ("size", size),
-        ("wip_tag", wip_tag),
-        ("due_date", due_date),
-        ("user_story", user_story),
-        ("problem_statement", problem_statement),
-        ("business_value", business_value),
-        ("outcome_metric", outcome_metric),
-        ("outcome_indicator", outcome_indicator),
-        ("outcome_deadline", outcome_deadline),
-        ("outcome_revisit_condition", outcome_revisit_condition),
-        ("redesign_decision", redesign_decision),
-        ("redesign_rationale", redesign_rationale),
-        ("agent_fit", agent_fit),
-        ("technical_hints", technical_hints),
-        ("scope_in", scope_in),
-        ("scope_out", scope_out),
-        ("affected_areas", affected_areas),
-        ("validation_commands", validation_commands),
-        ("constraints", constraints),
-        ("assumptions", assumptions),
-        ("out_of_scope_for_review", out_of_scope_for_review),
-        ("review_checklist", review_checklist),
-        ("human_owner", human_owner),
-        ("human_reviewer", human_reviewer),
-        ("prepared_by", analyst),
-        ("prepared_at", prepared_at),
-    ):
-        if val is not None:
-            refine_body[key] = val
+    if fields.get("wip_tag") is None and (work_type is None or work_type == "feature"):
+        fields["wip_tag"] = "feature_work"
+
+    # Два поля идут НЕ через refine, и это не забывчивость: критерии приёмки
+    # заменяются атомарно своим вызовом, а риски добавляются с учётом
+    # risk_mode (dedupe/append/replace). Отправить их сюда значило бы сделать
+    # обе операции обычным PATCH и потерять и атомарность, и режим.
+    refine_body: dict[str, Any] = {
+        k: v
+        for k, v in fields.items()
+        if v is not None and k not in ("acceptance_criteria", "risks")
+    }
+    refine_body["prepared_by"] = analyst
+    refine_body["prepared_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
 
     current_task = await _api_get(f"/api/tasks/{task_id}")
 
@@ -3968,49 +3959,43 @@ async def hub_prepare_developer_task(
     )
 
 
+# Поля TaskRefine, которых hub_refine_task НЕ публикует (#1068). Замерено:
+# дословная сигнатура из модели дала бы 38 свойств вместо 34 — вот эти четыре.
+# У каждого своя причина: «не публикуем» обязано быть записью, а не
+# отсутствием строки. Список без причин через полгода никто не решается
+# тронуть, потому что неизвестно, чем он был.
+REFINE_HIDDEN: tuple[Hidden, ...] = (
+    Hidden(
+        "project",
+        "привязка эпика к проекту — операция уровня иерархии, а не поле "
+        "доводки: у неё свой путь и свои проверки (#338)",
+    ),
+    Hidden(
+        "prepared_by",
+        "кто довёл задачу, проставляет сервер по личности вызывающего; "
+        "значение от клиента было бы заявлением о себе",
+    ),
+    Hidden(
+        "prepared_at",
+        "дата доводки ставится сервером при записи полей постановки (#616); "
+        "клиентская дата разошлась бы с фактом правки",
+    ),
+    Hidden(
+        "clear_caused_by",
+        "флаг очистки поля дефект-паспорта, а не поле: в плоской сигнатуре "
+        "он читался бы как ещё одно значение",
+    ),
+)
+
+
 @mcp.tool()
-async def hub_refine_task(
-    task_id: int,
-    title: str | None = None,
-    # #1013: the statement text was the one field refine could not touch, so a
-    # corrected premise lived on in the description the reviewer actually reads.
-    description: str | None = None,
-    work_type: str | None = None,
-    class_of_service: str | None = None,
-    size: str | None = None,
-    wip_tag: str | None = None,
-    due_date: str | None = None,
-    user_story: str | None = None,
-    problem_statement: str | None = None,
-    business_value: str | None = None,
-    # #609: these seven were documented in the docstring below but absent from
-    # the signature, so every value an agent passed was dropped without a word.
-    # Ordered and named exactly as in hub_prepare_developer_task, which already
-    # accepted them — two tools describing one PATCH should not look different.
-    outcome_metric: str | None = None,
-    outcome_indicator: str | None = None,
-    outcome_deadline: str | None = None,
-    outcome_revisit_condition: str | None = None,
-    redesign_decision: str | None = None,
-    redesign_rationale: str | None = None,
-    agent_fit: str | None = None,
-    technical_hints: str | None = None,
-    scope_in: list[str] | None = None,
-    scope_out: list[str] | None = None,
-    affected_areas: list[str] | None = None,
-    validation_commands: list[str] | None = None,
-    constraints: list[str] | None = None,
-    assumptions: list[str] | None = None,
-    out_of_scope_for_review: list[str] | None = None,
-    review_checklist: list[str] | None = None,
-    human_owner: str | None = None,
-    human_reviewer: str | None = None,
-    found_in: str | None = None,
-    caused_by_task_id: int | None = None,
-    detected_at: str | None = None,
-    acceptance_criteria: list[dict[str, Any]] | None = None,
-    risks: list[dict[str, Any]] | None = None,
-) -> HubRefineTaskResult:
+@with_model_signature(
+    TaskRefine,
+    leading=(("task_id", int),),
+    hidden=REFINE_HIDDEN,
+    returns=HubRefineTaskResult,
+)
+async def hub_refine_task(task_id: int, **fields: Any) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written; every list REPLACES the stored one.
@@ -4053,49 +4038,11 @@ async def hub_refine_task(
         acceptance_criteria: Full AC replacement (REST refine shape).
         risks: Full replacement (TaskRisk shape).
     """
-    body: dict[str, Any] = {}
-    for key, val in (
-        ("title", title),
-        # #1013: this list, not the signature, is what actually reaches the
-        # PATCH — a parameter present above and absent here is the #609 defect
-        # verbatim, and it fails silently.
-        ("description", description),
-        ("work_type", work_type),
-        ("class_of_service", class_of_service),
-        ("size", size),
-        ("wip_tag", wip_tag),
-        ("due_date", due_date),
-        ("user_story", user_story),
-        ("problem_statement", problem_statement),
-        ("business_value", business_value),
-        ("technical_hints", technical_hints),
-        ("scope_in", scope_in),
-        ("scope_out", scope_out),
-        ("affected_areas", affected_areas),
-        ("validation_commands", validation_commands),
-        ("constraints", constraints),
-        ("assumptions", assumptions),
-        ("out_of_scope_for_review", out_of_scope_for_review),
-        ("review_checklist", review_checklist),
-        ("human_owner", human_owner),
-        ("human_reviewer", human_reviewer),
-        ("outcome_metric", outcome_metric),
-        ("outcome_indicator", outcome_indicator),
-        ("outcome_deadline", outcome_deadline),
-        ("outcome_revisit_condition", outcome_revisit_condition),
-        ("redesign_decision", redesign_decision),
-        ("redesign_rationale", redesign_rationale),
-        ("agent_fit", agent_fit),
-        ("found_in", found_in),
-        ("caused_by_task_id", caused_by_task_id),
-        ("detected_at", detected_at),
-    ):
-        if val is not None:
-            body[key] = val
-    if acceptance_criteria is not None:
-        body["acceptance_criteria"] = acceptance_criteria
-    if risks is not None:
-        body["risks"] = risks
+    # Один источник вместо двух списков. До #1068 поля были выписаны и в
+    # сигнатуре, и здесь, а комментарий рядом называл цену расхождения:
+    # «a parameter present above and absent here is the #609 defect verbatim,
+    # and it fails silently». Списка больше нет — расходиться нечему.
+    body: dict[str, Any] = {k: v for k, v in fields.items() if v is not None}
     if not body:
         summary = (
             "Nothing to refine: pass at least one structured field, "
