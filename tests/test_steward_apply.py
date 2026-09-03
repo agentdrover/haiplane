@@ -23,6 +23,7 @@ from hub.services.steward_apply import (
     PRECONDITION_FACTS,
     REFUSED_LADDER,
     REFUSED_PRECONDITION,
+    REFUSED_UNCLOSED,
     apply_refusals,
 )
 from tests.test_steward_shadow import _project, _task
@@ -482,4 +483,535 @@ async def test_ladder_stops_apply_through_the_real_entry(
     assert "hub/auth.py" in ladder_detail, "отказ обязан назвать, что именно тронуто"
     assert "hub/services/orchestration.py" not in ladder_detail, (
         "остальной дифф лестницы не трогает и в отказе ему не место"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1148 — грязный approve только с закрытыми находками
+# ---------------------------------------------------------------------------
+
+_FINDING_A = {
+    "title": "страж не читает пин",
+    "severity": "high",
+    "category": "correctness",
+    "locator": "lines",
+    "file": "hub/services/steward_apply.py",
+    "start_line": 5,
+    "end_line": 6,
+    "line": 5,
+}
+_FINDING_B = {
+    "title": "вторая находка того же отчёта",
+    "severity": "medium",
+    "category": "correctness",
+    "locator": "lines",
+    "file": "hub/services/steward_apply.py",
+    "start_line": 15,
+    "end_line": 16,
+    "line": 15,
+}
+
+
+async def _judged_with(
+    db: aiosqlite.Connection, task_id: int, closures: list[dict]
+) -> None:
+    """Суждение стюарда с заявленными закрытиями — контрактом #1022.
+
+    Через настоящий записывающий путь, а не строкой в таблице: подделка
+    записи проверяла бы согласие теста с самим собой.
+    """
+    from hub.config import TokenIdentity
+    from hub.models import StewardJudgementSubmit
+    from hub.services.steward_judgement import record_steward_judgement
+
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="approve",
+            confidence="high",
+            closures=closures,
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+
+
+def _uid(finding: dict) -> str:
+    from hub.services.finding_identity import finding_uids
+
+    return finding_uids([finding])[0]
+
+
+async def _review_id(db: aiosqlite.Connection, task_id: int) -> int:
+    from hub import repository as repo
+
+    row = await repo.get_latest_machine_review(db, task_id)
+    return int(dict(row)["id"])
+
+
+async def test_dirty_approve_requires_closures(db: aiosqlite.Connection, monkeypatch):
+    """AC-1: одной незакрытой находки из нескольких достаточно, чтобы не пустить.
+
+    Отчёт с находками — не препятствие сам по себе: грязный путь ради того
+    и существует. Препятствие — находка, про судьбу которой не сказано
+    ничего. Проверяется на ДВУХ находках, где закрыта одна: правило про
+    каждую, а не про наличие хоть одного закрытия.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unclosed")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A, _FINDING_B])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "human_disposition"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals)
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert any(_uid(_FINDING_B) in d and "не закрыта ничем" in d for d in unclosed), (
+        f"незакрытая находка обязана назвать себя: {unclosed}"
+    )
+
+
+async def test_closure_fact_is_verified_by_the_hub(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: закрытие ОБЪЯВЛЕНО — не значит подтверждено.
+
+    Три типа, три источника факта, и ни одного, который сообщал бы сам
+    себя. Здесь каждый заявлен и ни один не подтверждён: диспозиции нет,
+    связанной задачи нет, правки в строках находки нет. Заявление без
+    факта — это слово, а грязный путь стоит на фактах.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unproven")
+
+    for kind in ("human_disposition", "out_of_scope_linked", "fixed"):
+        task_id = await _task(db, project_id)
+        await _green(db, task_id, confirmed=[_FINDING_A])
+        await _judged_with(
+            db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": kind}]
+        )
+
+        refusals = await apply_refusals(db, task_id)
+
+        unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+        assert unclosed, f"закрытие {kind} не подтверждено, но пропущено"
+        assert any(kind in d and "хаб его не подтверждает" in d for d in unclosed), (
+            f"отказ обязан назвать тип и то, чего не хватило: {unclosed}"
+        )
+
+
+async def test_a_link_to_a_task_that_does_not_exist_is_not_a_closure(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Ссылка на несозданную задачу — обещание, а не вынос.
+
+    Отдельный тест, потому что это единственный случай, где запись
+    закрытия ЕСТЬ и всё равно не считается: linked_task_id стоит, а задачи
+    по нему нет. Зеркало рядом: существующая задача закрытие подтверждает.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-dead-link")
+
+    async def _with_link(link: int) -> list[tuple[str, str]]:
+        task_id = await _task(db, project_id)
+        await _green(db, task_id, confirmed=[_FINDING_A])
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=await _review_id(db, task_id),
+            task_id=task_id,
+            submission_generation=1,
+            finding_uid=_uid(_FINDING_A),
+            finding_index=0,
+            finding_title=_FINDING_A["title"],
+            outcome="deferred",
+            note="вынесено отдельной задачей",
+            linked_task_id=link,
+            reported_by="pda_claude",
+        )
+        await db.commit()
+        await _judged_with(
+            db,
+            task_id,
+            [{"finding_uid": _uid(_FINDING_A), "type": "out_of_scope_linked"}],
+        )
+        return await apply_refusals(db, task_id)
+
+    dead = await _with_link(999_999)
+    assert REFUSED_UNCLOSED in _codes(dead), "ссылка в никуда закрытием не является"
+
+    alive = await _task(db, project_id)
+    live = await _with_link(alive)
+    assert REFUSED_UNCLOSED not in _codes(live), (
+        "существующая связанная задача закрытие подтверждает — иначе проверка "
+        "умеет только отказывать и неотличима от выключателя"
+    )
+
+
+async def test_all_closures_verified_lets_approve_through(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: подтверждённые закрытия ПРОПУСКАЮТ.
+
+    Проверка, умеющая только отказывать, неотличима от выключателя. Две
+    находки, два разных типа закрытия, оба подтверждены записями хаба — и
+    ни одного unclosed_finding в ответе привратника.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-closed")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A, _FINDING_B])
+    review_id = await _review_id(db, task_id)
+
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_title=_FINDING_A["title"],
+        disposition="wont_fix",
+        note="человек посмотрел и решил жить с этим",
+        decided_by="Denis",
+        finding_uid=_uid(_FINDING_A),
+    )
+    linked = await _task(db, project_id)
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=_uid(_FINDING_B),
+        finding_index=1,
+        finding_title=_FINDING_B["title"],
+        outcome="deferred",
+        note="вынесено отдельной задачей",
+        linked_task_id=linked,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _judged_with(
+        db,
+        task_id,
+        [
+            {"finding_uid": _uid(_FINDING_A), "type": "human_disposition"},
+            {"finding_uid": _uid(_FINDING_B), "type": "out_of_scope_linked"},
+        ],
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED not in _codes(refusals), (
+        f"оба закрытия подтверждены — по находкам претензий быть не должно: "
+        f"{[d for c, d in refusals if c == REFUSED_UNCLOSED]}"
+    )
+
+
+def test_every_closure_type_names_its_evidence():
+    """Словарь типов и перечень доказательств обязаны совпадать.
+
+    Тип, добавленный в #1022 и забытый здесь, стал бы закрытием без
+    доказательства — словом вместо факта, и молча. Проверяется
+    перечислением, а не примером (#1107, #1120 — тем же приёмом).
+    """
+    from hub.models import STEWARD_CLOSURE_TYPES
+    from hub.services.steward_apply import CLOSURE_EVIDENCE
+
+    assert set(CLOSURE_EVIDENCE) == set(STEWARD_CLOSURE_TYPES)
+    assert REFUSED_UNCLOSED in STEWARD_ESCALATE_REASONS
+
+
+async def test_an_outcome_without_a_link_closes_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Запись исхода БЕЗ linked_task_id — не вынос, а намерение.
+
+    Отдельно от мёртвой ссылки: там задача названа и не существует, здесь
+    не названа вовсе. Ветка «ссылки нет» иначе не исполняется ни одним
+    тестом — запись есть, поле пустое, и без проверки это читалось бы как
+    закрытие.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-linkless")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=await _review_id(db, task_id),
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=_uid(_FINDING_A),
+        finding_index=0,
+        finding_title=_FINDING_A["title"],
+        outcome="deferred",
+        note="починим позже, задачу пока не завёл",
+        linked_task_id=None,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "out_of_scope_linked"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals), (
+        "исход без ссылки — намерение вынести, а не вынос"
+    )
+
+
+async def test_a_disposition_nobody_signed_is_not_a_human_one(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Диспозиция с пустым decided_by человеческой не является.
+
+    Тип закрытия называется human_disposition, и человек в нём — не
+    формальность: это ссылка на чужое решение вместо собственного. Запись
+    без подписи такой ссылкой не работает, и ветка проверки подписи иначе
+    не исполняется.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unsigned")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=await _review_id(db, task_id),
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_title=_FINDING_A["title"],
+        disposition="wont_fix",
+        note="строка есть, решения за ней нет",
+        decided_by="",
+        finding_uid=_uid(_FINDING_A),
+    )
+    await db.commit()
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "human_disposition"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals), (
+        "запись без подписи — не решение человека, а строка в таблице"
+    )
+
+
+async def test_a_link_to_this_very_task_carries_nothing_away(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Самоссылка не выносит работу никуда.
+
+    Найдено кросс-модельным ревью. Проверка существования связанной задачи
+    самоссылку пропускала — задача, разумеется, существует. Но
+    out_of_scope_linked означает, что работа уехала ОТСЮДА; указание на эту
+    же задачу оставляет её здесь и при этом объявляет закрытой.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-selflink")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    review_id = await _review_id(db, task_id)
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=_uid(_FINDING_A),
+        finding_index=0,
+        finding_title=_FINDING_A["title"],
+        outcome="deferred",
+        note="как будто вынесено",
+        linked_task_id=task_id,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "out_of_scope_linked"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals)
+
+
+async def test_two_words_about_one_finding_close_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Противоречивое заявление — не закрытие, и порядок записей его не решает.
+
+    Найдено кросс-модельным ревью: сборка словарём оставляла последнюю
+    запись, то есть порядок в списке решал, что считается закрытием.
+    Проверяется ОБОИМИ порядками: подтверждённое закрытие рядом с
+    неподтверждённым не должно проходить ни первым, ни вторым.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-contradiction")
+
+    good = {"finding_uid": None, "type": "human_disposition"}
+    bad = {"finding_uid": None, "type": "fixed"}
+    for order in ((good, bad), (bad, good)):
+        task_id = await _task(db, project_id)
+        await _green(db, task_id, confirmed=[_FINDING_A])
+        review_id = await _review_id(db, task_id)
+        await repo.upsert_finding_disposition(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=1,
+            finding_index=0,
+            finding_title=_FINDING_A["title"],
+            disposition="wont_fix",
+            note="человек посмотрел",
+            decided_by="Denis",
+            finding_uid=_uid(_FINDING_A),
+        )
+        await db.commit()
+        await _judged_with(
+            db,
+            task_id,
+            [{**e, "finding_uid": _uid(_FINDING_A)} for e in order],
+        )
+
+        refusals = await apply_refusals(db, task_id)
+
+        assert REFUSED_UNCLOSED in _codes(refusals), (
+            f"порядок {[e['type'] for e in order]} не должен решать исход"
+        )
+
+
+async def test_the_refusal_says_whether_the_hub_could_look(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """«Не смотрели» и «смотрели, не трогали» — разные отказы (#762).
+
+    Найдено кросс-модельным ревью: один шаблон накрывал оба случая, и
+    текст читался как «коммиты смотрели, строк они не трогали» даже когда
+    заглянуть в дифф не удалось вовсе. Для того, кто разбирает, это разница
+    между «правки не было» и «мы не наблюдали».
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unknown-vs-untouched")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "fixed"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert unclosed
+    assert any("посмотреть НЕ СМОГ" in d for d in unclosed), (
+        f"клона нет — отказ обязан назвать это отсутствием наблюдения: {unclosed}"
+    )
+
+
+async def test_no_closures_at_all_refuses_every_finding(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пустой список закрытий отказывает КАЖДУЮ находку, а не молчит.
+
+    Пробел, названный кросс-модельным ревью: соседний тест держит список
+    закрытий непустым, поэтому ранний выход «нечего проверять — пропускаем»
+    остался бы зелёным. Здесь заявлено ноль закрытий при двух находках, и
+    отказов обязано быть два.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-no-closures")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A, _FINDING_B])
+    await _judged_with(db, task_id, [])
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert len(unclosed) == 2, f"по одному отказу на находку: {unclosed}"
+    assert any(_uid(_FINDING_A) in d for d in unclosed)
+    assert any(_uid(_FINDING_B) in d for d in unclosed)
+
+
+async def test_the_refusal_says_when_the_hub_looked_and_saw_nothing(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Вторая половина той же развилки: посмотрели и не нашли.
+
+    Прошлая сдача закрыла только ветку «посмотреть не смогли», и ревью это
+    назвало: формулировка UNTOUCHED осталась незапертой, поэтому её можно
+    было переписать или потерять, не уронив ни одного теста. Разница между
+    двумя текстами и есть смысл правки — половина проверки её не держит.
+
+    Здесь клон настоящий и коммит на месте, поэтому хаб СМОТРИТ. Он ничего
+    не находит по неизбежной причине, названной в докстринге closure_refusals:
+    отчёт относится к текущей сдаче, значит отправная точка и вершина — один
+    коммит, и коммитов между ними не бывает.
+    """
+    import subprocess
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+        "HOME": str(clone),
+    }
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(clone), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env=env,
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.email", "t@e")
+    git("config", "user.name", "t")
+    (clone / "hub" / "services").mkdir(parents=True)
+    (clone / "hub" / "services" / "x.py").write_text(
+        "".join(f"line-{i}\n" for i in range(1, 21))
+    )
+    git("add", "-A")
+    git("commit", "-m", "baseline")
+    head = git("rev-parse", "HEAD")
+
+    project_id = await repo.create_project(
+        db,
+        slug="apply-untouched",
+        name="apply-untouched",
+        workspace_path=str(clone),
+        status="active",
+    )
+    task_id = await _task(db, project_id)
+    await repo.update_task(db, task_id, project_id=project_id, submission_sha=head)
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=head, base_branch="main"
+    )
+    await db.commit()
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "fixed"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert unclosed
+    assert any("строк находки они не трогали" in d for d in unclosed), (
+        f"клон на месте — отказ обязан сказать, что хаб СМОТРЕЛ: {unclosed}"
+    )
+    assert not any("посмотреть НЕ СМОГ" in d for d in unclosed), (
+        f"наблюдение было — называть его отсутствием нельзя: {unclosed}"
     )
