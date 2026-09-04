@@ -3,9 +3,10 @@
 Задача существует против одного конкретного ограничения: суждения и
 прогоны стюарда стоят на ``(task_id, generation, kind)``, а у драфта
 поколение сдачи навсегда ноль. Поэтому тесты ниже проверяют не «работает
-ли счётчик», а три разных способа сделать его бесполезным — растущий
-всегда, не растущий никогда, и растущий так, что at-most-once из #1022
-перестаёт держать.
+ли счётчик», а разные способы сделать его бесполезным — растущий всегда,
+не растущий никогда, растущий так, что at-most-once из #1022 перестаёт
+держать, и слепой к одному из путей записи. Последний способ и сработал:
+первая редакция видела одиночный refine и не видела массовый.
 """
 
 from __future__ import annotations
@@ -14,8 +15,12 @@ import aiosqlite
 import pytest
 
 from hub import repository as repo
-from hub.models import AcceptanceCriterion, TaskRefine
-from hub.services.refinement import refine_task, upsert_acceptance_criterion
+from hub.models import AcceptanceCriterion, BulkRefine, TaskRefine
+from hub.services.refinement import (
+    refine_task,
+    refine_tasks_bulk,
+    upsert_acceptance_criterion,
+)
 from hub.services.statement_generation import STATEMENT_FIELDS
 
 
@@ -69,6 +74,128 @@ async def test_a_real_edit_moves_the_counter(db: aiosqlite.Connection):
     # факт «постановку когда-то трогали».
     await refine_task(db, task_id, TaskRefine(business_value="зачем это надо"))
     assert await _generation(db, task_id) == before + 2
+
+
+async def test_a_bulk_edit_moves_the_counter_too(db: aiosqlite.Connection):
+    """AC-1 через ВТОРОЙ путь записи: массовый refine (находка ревью #232).
+
+    Первая редакция повесила счётчик на ``recalc_readiness_inline`` и
+    потеряла ``/refine-bulk``: тот считает готовность пакетом ПОСЛЕ коммита,
+    вне ``_atomic``, и в эту функцию не заходит. Наблюдалось так: тот же
+    патч через одиночный refine давал 1, через массовый — 0 при записанном
+    тексте. Слот kind='dor' на (task_id, 0) при этом оставался занят, то
+    есть цикл «стюард вернул → автор поправил пакетом → стюард читает
+    снова» упирался в индекс именно на самом дешёвом для автора пути.
+
+    Тест берёт ДВЕ задачи в одном пакете: правило, применённое к первому
+    элементу и потерянное на остальных, — отдельный способ ошибиться, и
+    одна задача его бы не показала.
+    """
+    first = await _draft(db, "первый драфт")
+    second = await _draft(db, "второй драфт")
+    before_first = await _generation(db, first)
+    before_second = await _generation(db, second)
+
+    await refine_tasks_bulk(
+        db,
+        BulkRefine.model_validate(
+            {
+                "items": [
+                    {"task_id": first, "problem_statement": "что сломано у первого"},
+                    {"task_id": second, "problem_statement": "что сломано у второго"},
+                ]
+            }
+        ),
+    )
+
+    assert await _generation(db, first) == before_first + 1
+    assert await _generation(db, second) == before_second + 1, (
+        "второй элемент пакета — не бесплатное приложение к первому"
+    )
+    assert await _submission_generation(db, first) == 0, "поколение сдачи не задето"
+
+
+async def test_a_bulk_rewrite_without_changes_does_not(db: aiosqlite.Connection):
+    """AC-2 через массовый путь: пересохранение пакетом — не ревизия.
+
+    Без этой половины находку можно было бы «закрыть» бампом на каждый
+    заход в массовый refine: AC-1 позеленел бы, а признак «постановку
+    правили» перестал бы что-либо значить именно там, где пакетом гоняют
+    десятки задач разом.
+    """
+    task_id = await _draft(db)
+    patch = {"items": [{"task_id": task_id, "scope_in": ["первый кусок"]}]}
+    await refine_tasks_bulk(db, BulkRefine.model_validate(patch))
+    settled = await _generation(db, task_id)
+
+    await refine_tasks_bulk(db, BulkRefine.model_validate(patch))
+    await refine_tasks_bulk(db, BulkRefine.model_validate(patch))
+
+    assert await _generation(db, task_id) == settled, (
+        "тот же пакет с теми же значениями — не новая ревизия"
+    )
+
+
+async def test_reading_readiness_is_not_a_statement_edit(db: aiosqlite.Connection):
+    """Чтение готовности счётчик не двигает.
+
+    ``get_readiness`` чинит устаревшие сохранённые значения по ходу чтения и
+    пишет в строку задачи — то есть чтение карточки доходит до записи. Это
+    держится отпечатком, а не местом вызова: перенос бампа в саму запись
+    полей готовности этот тест НЕ уронит, потому что чтение постановку не
+    меняет и отпечаток совпадёт. Проверяется здесь именно гарантия
+    «просмотр не покупает стюарду прогон», а ломает её реализация «расти на
+    каждом вызове» — на ней тест краснеет.
+    """
+    from hub.services.refinement import _persisted_readiness_stale, get_readiness
+    from hub.services.recommendations import calculate_readiness_with_recommendations
+
+    task_id = await _draft(db)
+    await refine_task(db, task_id, TaskRefine(problem_statement="что именно сломано"))
+    settled = await _generation(db, task_id)
+
+    # Ленивая починка срабатывает только на РАСХОЖДЕНИИ сохранённого счёта с
+    # пересчитанным. Без этой строки тест зелёный при любой реализации: он
+    # просто не доходит до записи. Счёт правится в обход воронки — именно
+    # так и появляются устаревшие значения, ради которых починка написана.
+    await repo.update_task(db, task_id, readiness_score=1)
+    await db.commit()
+    row = await repo.get_task(db, task_id)
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    assert _persisted_readiness_stale(row, report), "предусловие: починка сработает"
+
+    await get_readiness(db, task_id)
+    await get_readiness(db, task_id, explain=True)
+
+    assert await _generation(db, task_id) == settled
+
+
+async def test_a_row_without_a_baseline_declares_one_revision(
+    db: aiosqlite.Connection,
+):
+    """Пустой отпечаток считается изменением — это решение, а не сентинел.
+
+    У задачи, созданной до колонки или без снятого базиса, отпечаток пустой,
+    и первый путь записи объявит ревизию даже при сохранении теми же
+    значениями. Дешевле обратной ошибки: «пустой значит базис, поднять
+    молча» оставило бы на нуле драфт, который стюард уже прочитал на нуле, и
+    второе чтение после настоящей правки упёрлось бы в уникальный индекс.
+    Лишний слот один раз на строку против оборванного цикла F6.
+
+    Фиксируется здесь, чтобы смена стороны была видимым изменением
+    контракта, а не молчаливым следствием сравнения с пустой строкой.
+    """
+    task_id = await _draft(db)
+    row = await repo.get_task(db, task_id)
+    assert not dict(row)["statement_fingerprint"], "предусловие: базис не снят"
+
+    # Ничего не меняющий заход: значения совпадают с тем, что уже в строке.
+    await refine_task(db, task_id, TaskRefine(title="драфт"))
+    assert await _generation(db, task_id) == 1
+
+    # А дальше правило обычное: базис снят, пересохранение не считается.
+    await refine_task(db, task_id, TaskRefine(title="драфт"))
+    assert await _generation(db, task_id) == 1
 
 
 async def test_an_edit_to_the_criteria_counts_too(db: aiosqlite.Connection):

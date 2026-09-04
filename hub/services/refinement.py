@@ -473,10 +473,24 @@ async def refine_tasks_bulk(
 
     # Readiness is computed after commit so each report reflects the final row,
     # and persisted (#250) so lists/boards can rely on the stored values.
+    #
+    # ВТОРОЙ ВХОД, А НЕ ВТОРАЯ ВОРОНКА (#1156). Массовый refine считает
+    # готовность здесь, а не через recalc_readiness_inline: тот работает
+    # ВНУТРИ ``_atomic``, а этот проход идёт после коммита пакета. Ровно на
+    # этом расхождении поколение постановки и не двигалось — правку через
+    # /refine-bulk счётчик не видел, а суждение kind='dor' по-прежнему
+    # занимало единственный слот (task_id, 0). Поэтому оба входа зовут одну
+    # ``_persist_readiness_and_revision``: правило живёт в одном месте, и
+    # третий вход, если появится, ошибётся в компиляции, а не молча.
+    #
+    # Автопилот approve сюда НЕ переносится: он висит на
+    # recalc_readiness_inline, и его отсутствие в массовом пути — поведение
+    # до этой задачи, а не следствие правки. Расширять гейт заодно с фиксом
+    # счётчика значило бы менять лестницу молча.
     async with write_transaction(db):
         for outcome in outcomes:
             report = await calculate_readiness_with_recommendations(db, outcome.task_id)
-            await _persist_readiness_fields(db, outcome.task_id, report)
+            await _persist_readiness_and_revision(db, outcome.task_id, report)
             outcome.readiness_score = report.score
             outcome.dor_passed = report.dor_passed
         await db.commit()
@@ -491,7 +505,16 @@ async def _persist_readiness_fields(
 ) -> None:
     """Write score/dor_passed/ready_at onto the task row (#250). No locking —
     the caller owns the transaction (an ``_atomic`` block or an explicit
-    write-lock + commit)."""
+    write-lock + commit).
+
+    Поколение постановки (#1156) живёт не здесь, а этажом выше — в
+    ``_persist_readiness_and_revision``, которую зовут только пути записи.
+    Эту же функцию зовёт ленивая починка в ``get_readiness``, то есть
+    обычное ЧТЕНИЕ. Вреда от бампа на чтении сегодня не было бы — он
+    сравнивает отпечаток, а чтение постановку не меняет, — но тогда счётчик
+    ревизий зависел бы от того, чинится ли счёт готовности, а это разговор
+    про другое. Разделение здесь ради того, чтобы говорить о них порознь.
+    """
     row = await repo.get_task(db, task_id)
     if row is None:
         return
@@ -515,6 +538,34 @@ async def _persist_readiness_fields(
     await repo.update_task(db, task_id, **fields)
 
 
+async def _persist_readiness_and_revision(
+    db: aiosqlite.Connection,
+    task_id: int,
+    report: ReadinessReport,
+) -> None:
+    """Записать готовность и — если постановка изменилась — двинуть её поколение.
+
+    Единственное место, где счётчик ревизий увеличивается (#1156). Мест
+    вызова два, потому что путей записи два: одиночный refine и мутации AC
+    и рисков считают готовность внутри своей транзакции
+    (``recalc_readiness_inline``), массовый refine — пакетом после коммита.
+    Правило при этом одно, и добавить путь записи, не задев его, теперь
+    нельзя: готовность без ревизии здесь не записывается.
+
+    Порядок важен: сначала готовность, потом отпечаток. Счёт готовности и
+    ``dor_passed`` в отпечаток не входят, но ложатся на ту же строку, и
+    писать их после снятия отпечатка значило бы сравнивать со строкой,
+    которой уже нет.
+    """
+    await _persist_readiness_fields(db, task_id, report)
+    # Импорт локальный по той же причине, что и у автопилота ниже: сервис
+    # поколения читает задачу через repository, а refinement импортируется
+    # из многих модулей.
+    from hub.services.statement_generation import bump_if_the_statement_changed
+
+    await bump_if_the_statement_changed(db, task_id)
+
+
 async def recalc_readiness_inline(
     db: aiosqlite.Connection,
     task_id: int,
@@ -522,18 +573,15 @@ async def recalc_readiness_inline(
     """Recompute readiness and persist it — call INSIDE an ``_atomic`` block
     (it must not re-acquire the write lock)."""
     report = await calculate_readiness_with_recommendations(db, task_id)
-    await _persist_readiness_fields(db, task_id, report)
-    # Поколение ПОСТАНОВКИ (#1156). Считается здесь, а не у вызывающих: это
-    # та же единственная воронка, ради которой ниже висит автопилот, и
-    # второй точки увеличения быть не должно.
+    # Поколение ПОСТАНОВКИ (#1156) — внутри общего помощника, а не здесь:
+    # массовый refine в эту функцию не заходит (он вне ``_atomic``), и
+    # счётчик, привязанный к ней, пропускал бы правки пакетом.
     #
-    # НЕ под условием dor_passed, в отличие от автопилота. Драфт, не
+    # НЕ под условием dor_passed, в отличие от автопилота ниже. Драфт, не
     # прошедший DoR, правят чаще прошедшего, и именно эти правки автор
     # делает по замечаниям стюарда; счётчик, молчащий до готовности, не
     # заметил бы ровно тот цикл, ради которого он заведён.
-    from hub.services.statement_generation import bump_if_the_statement_changed
-
-    await bump_if_the_statement_changed(db, task_id)
+    await _persist_readiness_and_revision(db, task_id, report)
     # Auto-approval of low-risk drafts (#584): this recalc is the only place
     # dor_passed flips to true, so hooking here covers every path a draft
     # can take to readiness. With the switch off (the default) this is a
