@@ -1694,6 +1694,13 @@ class TaskView(BaseModel):
     # A verdict only counts while review_verdict_generation matches
     # submission_generation.
     submission_generation: int = 0
+    # #1156: поколение ПОСТАНОВКИ, а не сдачи. Двигается, когда меняется
+    # текст задачи, и служит единицей счёта для суждений стюарда о драфте
+    # (kind='dor'), у которого submission_generation навсегда ноль. Два
+    # разных поколения рядом — намеренно: у сдачи своё, у постановки своё,
+    # и слияние их в одно означало бы, что правка текста обесценивает
+    # вердикт по коду.
+    statement_generation: int = 0
     # #572: the branch tip the hub observed at submission. The generation
     # binds the verdict to a NUMBER; this binds it to the CODE. Empty means
     # the tip could not be pinned (no branch, no workspace, network) — that
