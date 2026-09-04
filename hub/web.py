@@ -974,6 +974,13 @@ async def web_projects(request: Request, project_error: str = Query("")):
             "default_base_branch": config.PAIR_BASE_BRANCH,
             "forges": list(FORGES),
             "default_forge": DEFAULT_FORGE,
+            # #1163: перечень значений гейта приходит в шаблон отсюда, а не
+            # переписывается в разметке вторым списком. Шаблон получает ещё и
+            # двух читателей — «что показать выбранным» и «о чём сказать на
+            # карточке», — чтобы ответ на оба вопроса давал один перечень.
+            "gate_choices": project_policy.IMPLEMENTED_GATE_VALUES,
+            "gate_selected": project_policy.gate_form_value,
+            "gate_delegate_badge": project_policy.gate_delegate_badge,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
