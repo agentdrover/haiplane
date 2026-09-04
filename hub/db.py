@@ -1715,6 +1715,27 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_steward_runs_open "
         "ON steward_runs(status, deadline_at)",
     ),
+    (
+        # #1156: поколение ПОСТАНОВКИ, отдельное от поколения сдачи.
+        # Суждения и прогоны стюарда стоят на (task_id, generation, kind), а
+        # у драфта submission_generation равен нулю и не двигается — значит
+        # kind='dor' имел бы один слот на всю жизнь драфта, и повторное
+        # чтение после правок автора некуда было бы записать.
+        #
+        # DEFAULT 0 без пересчёта старых строк: прошлых ревизий в базе нет,
+        # и восстанавливать их не из чего. Ноль здесь означает «правок после
+        # появления счётчика не было», а не «постановку не меняли никогда».
+        "add_tasks_statement_generation",
+        "ALTER TABLE tasks ADD COLUMN statement_generation INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        # Отпечаток постановки, по которому видно, что она ИЗМЕНИЛАСЬ, а не
+        # была пересохранена. Без него счётчик рос бы на каждом пересчёте
+        # готовности, и «постановку правили» перестало бы быть признаком —
+        # а на нём стоит потолок против хождения драфта по кругу (#1161).
+        "add_tasks_statement_fingerprint",
+        "ALTER TABLE tasks ADD COLUMN statement_fingerprint TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

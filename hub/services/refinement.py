@@ -523,6 +523,17 @@ async def recalc_readiness_inline(
     (it must not re-acquire the write lock)."""
     report = await calculate_readiness_with_recommendations(db, task_id)
     await _persist_readiness_fields(db, task_id, report)
+    # Поколение ПОСТАНОВКИ (#1156). Считается здесь, а не у вызывающих: это
+    # та же единственная воронка, ради которой ниже висит автопилот, и
+    # второй точки увеличения быть не должно.
+    #
+    # НЕ под условием dor_passed, в отличие от автопилота. Драфт, не
+    # прошедший DoR, правят чаще прошедшего, и именно эти правки автор
+    # делает по замечаниям стюарда; счётчик, молчащий до готовности, не
+    # заметил бы ровно тот цикл, ради которого он заведён.
+    from hub.services.statement_generation import bump_if_the_statement_changed
+
+    await bump_if_the_statement_changed(db, task_id)
     # Auto-approval of low-risk drafts (#584): this recalc is the only place
     # dor_passed flips to true, so hooking here covers every path a draft
     # can take to readiness. With the switch off (the default) this is a

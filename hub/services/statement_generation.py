@@ -1,0 +1,144 @@
+"""Поколение ПОСТАНОВКИ: единица счёта для суждений о драфте (#1156).
+
+ЗАЧЕМ. Суждения стюарда лежат на уникальном индексе
+``(task_id, generation, kind)`` (#1022), прогоны — на таком же (#1073).
+У драфта ``submission_generation`` равен нулю и не двигается: сдач у него
+нет. Значит ``kind='dor'`` имел бы ОДИН слот на всю жизнь драфта, а цикл
+DoR-стюарда — прочитал, вернул автору, автор поправил, прочитал снова —
+во второй такт упёрся бы в индекс. Второму чтению просто некуда лечь.
+
+ПОЧЕМУ СЧЁТЧИК, А НЕ ВРЕМЯ. Ключ по времени сделал бы два чтения одной
+НЕИЗМЕНИВШЕЙСЯ постановки разными событиями — ровно то, за что уже
+дважды заплатили прогонами (#1150, #1152). Ключ обязан считать
+изменения, а не заходы.
+
+ПОЧЕМУ ОТПЕЧАТОК, А НЕ ФАКТ ВЫЗОВА. Воронка пересчёта готовности не
+знает, изменилось ли что-нибудь: её зовут и когда постановку переписали,
+и когда сохранили теми же значениями. Счётчик, растущий на каждый вызов,
+прошёл бы AC-1 и провалил AC-2 — а хуже того, «постановку меняли»
+перестало бы быть признаком, и потолок против хождения драфта по кругу
+(#1161) считать было бы нечем. Поэтому сравнивается СОДЕРЖАНИЕ: отпечаток
+постановки хранится рядом со счётчиком, и счётчик двигается только когда
+отпечаток разошёлся.
+
+Побочное следствие, ради которого это и стоит держать в одном месте:
+вызывающим ничего сообщать не нужно. Шесть точек входа — refine, массовый
+refine, добавление риска и четыре операции над AC — зовут одну функцию, и
+ни одна из них не обязана рассказывать, что именно она поменяла. Второй
+точки увеличения не появляется по устройству, а не по договорённости.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+import aiosqlite
+
+from hub import repository as repo
+from hub.db import fetchall
+
+# Колонки задачи, составляющие ПОСТАНОВКУ. Список намеренно перечислен, а
+# не выведен из всех колонок таблицы: рядом лежат поля жизненного цикла
+# (статус, ветка, поколение сдачи, счёт готовности), и их движение — не
+# правка постановки. Счётчик, растущий на смене статуса, объявил бы новую
+# ревизию там, где текст никто не трогал.
+#
+# Набор совпадает с тем, что умеет писать refine (TaskRefine), потому что
+# «постановка» и есть то, что refine правит. Поле, добавленное туда и
+# забытое здесь, стало бы правкой, которой счётчик не заметит, — поэтому
+# соответствие проверяется тестом, а не памятью.
+STATEMENT_FIELDS: tuple[str, ...] = (
+    "title",
+    "description",
+    "work_type",
+    "class_of_service",
+    "size",
+    "wip_tag",
+    "due_date",
+    "user_story",
+    "problem_statement",
+    "business_value",
+    "outcome_metric",
+    "outcome_indicator",
+    "outcome_deadline",
+    "outcome_revisit_condition",
+    "redesign_decision",
+    "redesign_rationale",
+    "agent_fit",
+    "found_in",
+    "caused_by_task_id",
+    "detected_at",
+    "scope_in",
+    "scope_out",
+    "affected_areas",
+    "technical_hints",
+    "constraints",
+    "assumptions",
+    "validation_commands",
+    "out_of_scope_for_review",
+    "review_checklist",
+    "risks",
+    "prepared_by",
+)
+
+
+async def statement_fingerprint(db: aiosqlite.Connection, task_id: int) -> str:
+    """Отпечаток постановки: её поля плюс критерии приёмки.
+
+    Критерии живут в своей таблице, но они — часть постановки, и правка
+    одного AC меняет её ровно так же, как правка scope. Читаются
+    отсортированно по ac_id: порядок строк в выдаче — свойство запроса, а
+    не постановки, и отпечаток, зависящий от него, объявлял бы ревизию на
+    ровном месте.
+    """
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return ""
+    task = dict(row)
+    payload: dict[str, Any] = {f: task.get(f) for f in STATEMENT_FIELDS}
+
+    ac_rows = await fetchall(
+        db,
+        "SELECT ac_id, given, when_clause, then_clause, verifiable_by, "
+        "test_ref, expectation_source FROM acceptance_criteria "
+        "WHERE task_id = ? ORDER BY ac_id",
+        (task_id,),
+    )
+    payload["acceptance_criteria"] = [dict(r) for r in ac_rows]
+
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    # sha256 здесь не про безопасность, а про длину и отсутствие коллизий
+    # на человеческих объёмах; bandit ругается на md5/sha1, и это верно.
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+async def bump_if_the_statement_changed(db: aiosqlite.Connection, task_id: int) -> int:
+    """Двинуть поколение постановки, если она действительно изменилась.
+
+    Возвращает действующее поколение — то самое, под которым суждение
+    ``kind='dor'`` встанет на уникальный индекс.
+
+    Пишет в транзакции вызывающего и не берёт блокировку сама: её берёт
+    воронка пересчёта готовности, из которой эта функция и вызывается.
+    """
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return 0
+    task = dict(row)
+    current = int(task.get("statement_generation") or 0)
+    stored = str(task.get("statement_fingerprint") or "")
+
+    fresh = await statement_fingerprint(db, task_id)
+    if fresh == stored:
+        return current
+
+    nxt = current + 1
+    await repo.update_task(
+        db,
+        task_id,
+        statement_generation=nxt,
+        statement_fingerprint=fresh,
+    )
+    return nxt

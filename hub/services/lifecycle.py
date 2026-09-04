@@ -651,6 +651,7 @@ def row_to_task(
         auto_review=bool(d.get("auto_review", 1)),
         review_job_id=d.get("review_job_id"),
         submission_generation=d.get("submission_generation", 0) or 0,
+        statement_generation=d.get("statement_generation", 0) or 0,
         submission_sha=d.get("submission_sha") or "",
         submission_model=d.get("submission_model") or "",
         review_verdict=d.get("review_verdict"),
