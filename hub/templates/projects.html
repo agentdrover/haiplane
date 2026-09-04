@@ -140,10 +140,16 @@
                        и «расходится» без причины читателю некуда пойти. #}
                     {% if c.clone_branch.state != 'match' %}<span class="project-admin-note">{{ c.clone_branch.reason }}</span>{% endif %}
                 </dd>
-                {% if c.project.gate_policy.get('dor') == 'auto' or c.project.gate_policy.get('verdict') == 'auto' or c.project.gate_policy.get('review') == 'dispatch' %}
+                {# #1163: витрина читает тот же перечень, что и селекторы ниже.
+                   Раньше здесь стояло сравнение со строкой 'auto', и при
+                   verdict=steward карточка молчала — гейт был отдан машине, а
+                   блок «автопилот» этого не показывал. #}
+                {% set dor_badge = gate_delegate_badge(c.project.gate_policy, 'dor') %}
+                {% set verdict_badge = gate_delegate_badge(c.project.gate_policy, 'verdict') %}
+                {% if dor_badge or verdict_badge or c.project.gate_policy.get('review') == 'dispatch' %}
                 <dt>автопилот</dt><dd>
-                    {% if c.project.gate_policy.get('dor') == 'auto' %}<span class="badge badge-running" title="DoR-апрув драфтов выполняет политика (#744)">dor: auto</span>{% endif %}
-                    {% if c.project.gate_policy.get('verdict') == 'auto' %}<span class="badge badge-running" title="Вердикт по чистым сдачам выносит политика (#745)">verdict: auto</span>{% endif %}
+                    {% if dor_badge %}<span class="badge badge-running" title="{{ dor_badge.hint }}">dor: {{ dor_badge.value }}</span>{% endif %}
+                    {% if verdict_badge %}<span class="badge badge-running" title="{{ verdict_badge.hint }}">verdict: {{ verdict_badge.value }}</span>{% endif %}
                     {% if c.project.gate_policy.get('review') == 'dispatch' %}<span class="badge badge-review" title="Хаб сам зовёт кросс-модельного ревьюера на каждую сдачу (#805)">review: dispatch</span>{% endif %}
                 </dd>
                 {% endif %}
@@ -212,15 +218,24 @@
                     <label class="task-action-label">Автопилот гейтов</label>
                     <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743)">заперт: всегда human</span>
                     {% else %}
+                    {# #1163: варианты берутся из поключевого перечня
+                       РЕАЛИЗОВАННЫХ значений, а не перечисляются здесь вторым
+                       списком — тот уже разошёлся с кодом и спрятал steward.
+                       И выбранным помечается РАВНОЕ сохранённому: прежнее
+                       условие «не auto» показывало human при verdict=steward,
+                       а обработчик читал показанное как намерение и снимал
+                       гейт первым же сохранением формы. #}
                     <label class="task-action-label">DoR-гейт (автоодобрение R0–R1 драфтов)</label>
                     <select name="gate_policy_dor" class="task-action-control">
-                        <option value="human" {% if c.project.gate_policy.get('dor') != 'auto' %}selected{% endif %}>human — одобряет владелец</option>
-                        <option value="auto" {% if c.project.gate_policy.get('dor') == 'auto' %}selected{% endif %}>auto — одобряет политика</option>
+                        {% for choice in gate_choices['dor'] %}
+                        <option value="{{ choice.value }}" {% if gate_selected(c.project.gate_policy, 'dor') == choice.value %}selected{% endif %} title="{{ choice.hint }}">{{ choice.label }}</option>
+                        {% endfor %}
                     </select>
                     <label class="task-action-label">Вердикт ревью (по чистому machine-review + CI)</label>
                     <select name="gate_policy_verdict" class="task-action-control">
-                        <option value="human" {% if c.project.gate_policy.get('verdict') != 'auto' %}selected{% endif %}>human — вердикт выносит владелец</option>
-                        <option value="auto" {% if c.project.gate_policy.get('verdict') == 'auto' %}selected{% endif %}>auto — вердикт выносит политика</option>
+                        {% for choice in gate_choices['verdict'] %}
+                        <option value="{{ choice.value }}" {% if gate_selected(c.project.gate_policy, 'verdict') == choice.value %}selected{% endif %} title="{{ choice.hint }}">{{ choice.label }}</option>
+                        {% endfor %}
                     </select>
                     <label class="task-action-label">Потолок DoR-автопилота (глобальный env остаётся верхней границей)</label>
                     <select name="gate_policy_dor_max_class" class="task-action-control">

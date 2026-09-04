@@ -7,6 +7,7 @@ from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.auth import CSRF_COOKIE_NAME
+from hub.services import project_policy
 
 
 async def test_dashboard_page(client: AsyncClient):
@@ -4574,6 +4575,151 @@ async def test_project_form_reverts_policy_to_human(client: AsyncClient):
     listed = (await client.get("/api/projects")).json()
     row = next(p for p in listed if p["id"] == pid)
     assert row["gate_policy"] == {"dor": "human", "verdict": "human"}
+
+
+# --- Поверхность выставления гейтов (#1163) ---------------------------------
+#
+# #1151 расширил множество допустимых значений вердикта, но поверхность, через
+# которую их выставляют, осталась прежней: селектор предлагал два значения из
+# трёх, а вариант human был помечен выбранным по условию «не auto» — то есть
+# при verdict=steward форма ЯВНО показывала то, чего в базе нет, и обработчик
+# записывал показанное. Гейт снимался первым же сохранением формы, без следа.
+#
+# Поэтому проверяется не разметка, а пара «показанное ↔ сохранённое», и
+# отдельно — что перечень формы выведён из перечня реализованных значений, а
+# не набран руками ещё раз.
+
+
+def _select_block(page: str, field: str) -> str:
+    found = re.search(rf'<select name="{field}".*?</select>', page, re.S)
+    assert found, f"на странице нет селектора {field}"
+    return found.group(0)
+
+
+def _offered_values(page: str, field: str) -> list[str]:
+    """Значения, которые форма ПРЕДЛАГАЕТ в этом селекторе, по порядку."""
+    return re.findall(r'<option value="([^"]*)"', _select_block(page, field))
+
+
+def _shown_value(page: str, field: str) -> str:
+    """Значение, которое форма ПОКАЗЫВАЕТ выбранным — ровно одно."""
+    block = _select_block(page, field)
+    chosen = re.findall(r'<option value="([^"]*)"[^>]*\bselected\b', block)
+    assert len(chosen) == 1, f"{field}: выбранным помечено {len(chosen)} вариантов"
+    return chosen[0]
+
+
+def _what_the_form_would_submit(page: str) -> dict[str, str]:
+    """То, что отправит браузер, если человек ничего не трогал.
+
+    Именно этот случай и терял гейт: сохранение ради имени проекта уносило с
+    собой все селекторы политики такими, какими форма их показала.
+    """
+    return {
+        f"gate_policy_{key}": _shown_value(page, f"gate_policy_{key}")
+        for key in ("dor", "verdict", "review", "release")
+    }
+
+
+async def test_the_form_can_set_verdict_steward(client: AsyncClient):
+    # AC-1: значение выставляется через форму, и проверяется это чтением
+    # проекта после сохранения, а не наличием option в разметке. Наличие
+    # варианта всё же проверяется — но как ПРЕДПОСЫЛКА выбора, а не как
+    # доказательство результата: выбрать можно только предложенное.
+    pid = await _project_with_policy(client, "spike-steward", {})
+
+    page = (await client.get("/projects")).text
+    assert "steward" in _offered_values(page, "gate_policy_verdict")
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_dor": "human", "gate_policy_verdict": "steward"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    assert await _policy_of(client, pid) == {"dor": "human", "verdict": "steward"}
+
+
+async def test_saving_the_form_does_not_roll_the_gate_back(client: AsyncClient):
+    # AC-2: форма показывает steward выбранным — потеря гейта начиналась
+    # именно с этой лжи, — и сохранение показанного его не снимает.
+    pid = await _project_with_policy(client, "spike-hold", {"verdict": "steward"})
+
+    page = (await client.get("/projects")).text
+    assert _shown_value(page, "gate_policy_verdict") == "steward"
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Переименовали, гейт не трогали"}
+        | _what_the_form_would_submit(page),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    assert (await _policy_of(client, pid))["verdict"] == "steward"
+
+
+async def test_the_form_offers_every_implemented_gate_value(client: AsyncClient):
+    # AC-3: множества совпадают поимённо для обоих ключей. Значение,
+    # добавленное в перечень и забытое в форме (или наоборот), роняет тест.
+    await _project_with_policy(client, "spike-offer", {})
+    page = (await client.get("/projects")).text
+
+    for key, choices in project_policy.IMPLEMENTED_GATE_VALUES.items():
+        assert _offered_values(page, f"gate_policy_{key}") == [
+            c.value for c in choices
+        ], f"перечень формы для {key} разошёлся с перечнем реализованных значений"
+
+
+async def test_an_unimplemented_value_is_not_offered(client: AsyncClient):
+    # AC-4: dor=steward API примет — поведения за ним нет до #1157, и форма
+    # его не предлагает. Выбор, за которым ничего не происходит, — такой же
+    # обман, как и спрятанное реализованное значение.
+    pid = await _project_with_policy(client, "spike-unimplemented", {})
+    accepted = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"dor": "steward"}}
+    )
+    assert accepted.status_code == 200, "граница приёма не сужается — это не её работа"
+
+    page = (await client.get("/projects")).text
+    assert "steward" not in _offered_values(page, "gate_policy_dor")
+    assert "steward" in _offered_values(page, "gate_policy_verdict")
+
+
+async def test_the_card_shows_the_stored_delegate(client: AsyncClient):
+    # AC-5: витрина называет делегата, а не молчит о нём. Блок «автопилот»
+    # сравнивал значение со строкой auto и при steward не рисовался вовсе.
+    await _project_with_policy(client, "spike-card", {"verdict": "steward"})
+    page = (await client.get("/projects")).text
+    assert "verdict: steward" in page
+    assert project_policy.IMPLEMENTED_GATE_VALUES["verdict"][-1].hint in page
+
+
+def test_every_implemented_value_is_accepted_and_labelled():
+    # Реализованное обязано быть принимаемым: перечень «что уже работает»
+    # живёт рядом с GATE_VALUES и сверяется с ним на включение. Значение без
+    # подписи роняет этот тест, а не исчезает из формы молча.
+    for key, choices in project_policy.IMPLEMENTED_GATE_VALUES.items():
+        assert choices, f"{key}: гейт без реализованных значений"
+        values = [c.value for c in choices]
+        assert len(values) == len(set(values)), f"{key}: значение перечислено дважды"
+        assert set(values) <= project_policy.GATE_VALUES, (
+            f"{key}: перечень предлагает значение, которого не примет API"
+        )
+        assert project_policy.GATE_HUMAN in values, f"{key}: human обязан остаться"
+        for choice in choices:
+            assert choice.label.strip(), f"{key}/{choice.value}: нет подписи в форме"
+            assert choice.hint.strip(), f"{key}/{choice.value}: нет подписи на карточке"
+
+    # Читатель политики спрашивает ровно эти гейты и спрашивает их литералами,
+    # чтобы сверка разрешённых ключей их видела. Гейт, добавленный в перечень
+    # и забытый в читателе, отсюда и виден.
+    assert set(project_policy._stored_gate_values({})) == set(
+        project_policy.IMPLEMENTED_GATE_VALUES
+    ), "перечень гейтов разошёлся с тем, что читатель спрашивает у политики"
 
 
 # --- Релизная политика в форме проекта (#926) -------------------------------
