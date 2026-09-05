@@ -1542,10 +1542,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--finding-outcomes",
         default="",
         help=(
-            "JSON list of what became of the previous submission's confirmed "
-            'findings (#911): [{"finding_uid": "...", "outcome": '
-            '"fixed|false_positive|wont_fix|deferred", "note": "..."}]. '
-            "Everything but fixed owes a note."
+            "JSON list of what became of the previous submission's findings "
+            '(#911): [{"finding_uid": "...", "outcome": "...", "note": "..."}]'
+            ". Confirmed findings take fixed|false_positive|wont_fix|deferred;"
+            " ones no adjudicator resolved take real_fixed|real_deferred|"
+            "not_a_defect|not_judged (#1085). Everything but a fix owes a note."
         ),
     )
     p_submit_review.set_defaults(func=cmd_submit_review)

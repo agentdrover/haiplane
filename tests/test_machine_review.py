@@ -208,6 +208,33 @@ async def test_a_supplied_id_is_refused(client: AsyncClient, db):
     assert "derives" in resp.text
 
 
+async def test_a_supplied_id_is_refused_in_the_unresolved_section(
+    client: AsyncClient, db
+):
+    """Тот же сторож — на втором разделе (#1085).
+
+    До того как у неразрешённой записи появилось поле finding_uid, лишний ключ
+    отсекала сама схема (extra="forbid"). Теперь поле объявлено, и отказ держит
+    только явная проверка: без неё харнесс сдал бы свой случайный id с кодом
+    200. Промаха исходов при этом не случилось бы — на чтении id всё равно
+    перевычисляется, — исчез бы сам отказ, то есть единственное место, где
+    автору говорят, что идентичность выводит хаб.
+    """
+    task_id = await _reviewable_task(client, db)
+    body = _report([{"title": "a", "severity": "low", "locator": "none"}])
+    body["unresolved"] = [
+        {
+            "title": "никто не рассудил",
+            "why": "голоса разошлись",
+            "finding_uid": "deadbeefdeadbeef",
+        }
+    ]
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=body)
+    assert resp.status_code == 422
+    assert "unresolved" in resp.text, "отказ называет РАЗДЕЛ, в котором искать"
+    assert "derives" in resp.text
+
+
 def test_two_findings_in_one_file_are_two_ids():
     # The place is part of the identity: without it these two collapse into one
     # id, and a judgement lands on whichever survives the next report.
