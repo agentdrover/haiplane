@@ -168,9 +168,12 @@ def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
 #: That separation is an UNSTATED invariant of the confirmed material's shape,
 #: and it holds only until someone adds or drops a component there. The label
 #: says out loud what the shape says by accident, and it is the half that
-#: survives such a change. A mutation removing it therefore breaks no test —
-#: verified rather than assumed — and that is a property of today's shape, not
-#: evidence that the label is decorative.
+#: survives such a change. It is pinned by a golden id taken from a live
+#: report — ``LIVE_UNRESOLVED_UID`` in tests/test_review_disposition.py — so
+#: changing the material is a red test rather than a silent renaming of every
+#: unresolved finding. (An earlier revision said a mutation removing the label
+#: broke no test. That was true of the tests that existed then, and the honest
+#: fix was the pin, not the note.)
 #:
 #: Prepended ONLY here, so every confirmed uid stays the value it already was.
 _UNRESOLVED_NAMESPACE = "unresolved"

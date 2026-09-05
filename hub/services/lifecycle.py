@@ -1978,11 +1978,7 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
         if still_open:
             if outcome_mode == "require":
                 raise HTTPException(422, finding_outcome.refusal_text(still_open))
-            state.outcome_note = (
-                f"Исходы находок: НЕ названы для {len(still_open)} "
-                "подтверждённых находок предыдущей сдачи. Режим проверки — "
-                "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
-            )
+            state.outcome_note = finding_outcome.warn_note(still_open)
 
 
 async def _step_submit_rules(state: SubmitContext) -> None:

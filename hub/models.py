@@ -2323,7 +2323,12 @@ class FindingDisposition(str, Enum):
 
 
 class FindingOutcome(str, Enum):
-    """What the AUTHOR did about a confirmed finding, said at resubmission (#911).
+    """What the AUTHOR did about a review finding, said at resubmission (#911).
+
+    TWO dictionaries in one enum, and they do not mix: the first four words
+    answer for a CONFIRMED finding, the last four for one the adjudicators
+    could not resolve (#1085). An outcome from the wrong dictionary is refused
+    rather than translated — see the section comment below for why.
 
     A different question from :class:`FindingDisposition`, asked of a different
     actor. The disposition answers "was this finding REAL" and only a human may

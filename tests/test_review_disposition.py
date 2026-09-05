@@ -14,6 +14,7 @@ import json
 import aiosqlite
 import pytest
 from httpx import AsyncClient
+from pydantic import ValidationError
 
 from hub import repository as repo
 from hub.models import FindingOutcomeItem
@@ -397,6 +398,14 @@ async def test_a_named_task_replaces_the_draft(
 #: не прод.
 LIVE_CONFIRMED_UID = "bf3c65f410eef64a"  # pragma: allowlist secret
 
+#: uid ЕДИНСТВЕННОЙ неразрешённой записи того же живого отчёта #169. Прибит по
+#: той же причине, что и соседний: материал, из которого он выводится, — это
+#: контракт с любым уже названным исходом. Заголовок взят с прода дословно.
+LIVE_UNRESOLVED_TITLE = (
+    "Хвост промпта по-прежнему велит звать MCP, когда основной путь — HTTP"
+)
+LIVE_UNRESOLVED_UID = "339943187116fd3a"  # pragma: allowlist secret
+
 
 async def _sent_back(client: AsyncClient, task_id: int) -> None:
     await client.post(
@@ -611,6 +620,28 @@ async def test_an_outcome_from_the_wrong_dictionary_is_refused(
     assert wrong.status_code == 422, wrong.text
     assert "real_fixed" in wrong.text, "отказ называет словарь, которым отвечают"
 
+    # И в обратную сторону: слово второго словаря про подтверждённую находку
+    # тоже отказывается. Проверка одного направления оставляла бы половину
+    # правила незапертой — «разобрал сам» про находку, о которой адъюдикаторы
+    # как раз договорились, читается как понижение её статуса.
+    backwards = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {"finding_uid": conf_uid, "outcome": "real_fixed"},
+                {
+                    "finding_uid": unres_uid,
+                    "outcome": "not_a_defect",
+                    "note": "разобрал",
+                },
+            ]
+        },
+    )
+    assert backwards.status_code == 422, backwards.text
+    assert "false_positive" in backwards.text, (
+        "отказ называет словарь ПОДТВЕРЖДЁННОЙ находки"
+    )
+
     right = await client.post(
         f"/api/tasks/{task_id}/submit-review",
         json={
@@ -677,8 +708,9 @@ async def test_an_unresolved_twin_of_a_confirmed_finding_is_a_separate_row(
     неразрешённая с тем же заголовком остаются двумя строками долга, и ответ
     на первую не закрывает вторую, которой автор не касался. (Материалы этих
     двух id сегодня различаются ещё и формой — пять компонент против одной, —
-    поэтому проба с удалением метки раздела тест не роняет; метка защищает от
-    изменения формы, а не от сегодняшней коллизии.)
+    поэтому от СЕГОДНЯШНЕЙ коллизии защищает форма, а метка раздела защищает от
+    её изменения. Держит метку не этот тест, а золотой uid с прода:
+    test_the_live_unresolved_record_keeps_its_id.)
     """
     monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
     task_id = await _submitted_task(client, "Twins across sections")
@@ -706,3 +738,188 @@ async def test_an_unresolved_twin_of_a_confirmed_finding_is_a_separate_row(
         },
     )
     assert partial.status_code == 422, "вторая находка осталась без ответа"
+
+
+async def test_one_answer_closes_an_unresolved_finding_in_both_ladder_reports(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Лестница #879 описывает один тупик дважды — ответ на него один.
+
+    Зеркало test_one_answer_closes_the_finding_in_both_ladder_reports для
+    второго раздела, и оно не декоративное: обход разделов идёт двумя
+    отдельными циклами, поэтому ключ по одному uid можно потерять в одном из
+    них, не тронув другой. Тогда запись второго отчёта исчезает из долга
+    навсегда — то самое исчезновение, которое считали.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Ladder answers the unresolved once")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    same = _unresolved("один и тот же тупик")
+    lite = await _report(db, task_id, 1, [], [same])
+    deep = await _report(db, task_id, 1, [], [same])
+    assert lite != deep
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    assert len(open_items) == 2, "оба отчёта несут её и оба ждут ответа"
+    uid = open_items[0]["finding_uid"]
+    assert open_items[1]["finding_uid"] == uid
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={"finding_outcomes": [{"finding_uid": uid, "outcome": "real_fixed"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(await repo.list_finding_outcomes(db, lite)) == 1
+    assert len(await repo.list_finding_outcomes(db, deep)) == 1
+
+
+async def test_two_unresolved_records_with_one_title_are_two_debts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Один заголовок дважды в одном отчёте — два ответа, а не один.
+
+    У записи unresolved нет ничего, кроме заголовка, поэтому близнецы здесь
+    вероятнее, чем у confirmed: два верификатора, не сошедшиеся по двум разным
+    поводам, могут назвать их одинаково. Без разведения по позиции один ответ
+    закрывал бы обе.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Unresolved twins")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(
+        db,
+        task_id,
+        1,
+        [],
+        [
+            _unresolved("спорное место", why="первый"),
+            _unresolved("спорное место", why="второй"),
+        ],
+    )
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    assert len({i["finding_uid"] for i in open_items}) == 2, "две записи — два uid"
+
+    partial = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {"finding_uid": open_items[0]["finding_uid"], "outcome": "real_fixed"}
+            ]
+        },
+    )
+    assert partial.status_code == 422, "ответ на одну не закрывает вторую"
+
+
+async def test_the_live_unresolved_record_keeps_its_id(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Золотое значение для второго раздела — с прода, как и у первого.
+
+    Отчёт #169 задачи #1084 несёт ровно одну неразрешённую запись. Её uid
+    прибит здесь по той же причине, по которой прибит uid подтверждённой:
+    исход, названный по этому id, обязан находить свою находку и после
+    следующей правки материала.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    task_id = await _submitted_task(client, "Live unresolved keeps its id")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(
+        db, task_id, 1, [], [_unresolved(LIVE_UNRESOLVED_TITLE, why="голоса разошлись")]
+    )
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    assert [i["finding_uid"] for i in open_items] == [LIVE_UNRESOLVED_UID]
+
+
+@pytest.mark.parametrize(
+    "outcome, needs_note, leaves_work",
+    [
+        ("real_fixed", False, False),
+        ("real_deferred", True, True),
+        ("not_a_defect", True, False),
+        ("not_judged", True, True),
+    ],
+)
+async def test_every_unresolved_outcome_keeps_its_two_promises(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    outcome: str,
+    needs_note: bool,
+    leaves_work: bool,
+):
+    """Каждое слово словаря отвечает за две вещи: нужна ли причина и остаётся ли работа.
+
+    Раньше проверялись два слова из четырёх, и три мутации проходили молча:
+    real_fixed, вычеркнутый из самоочевидных, требовал бы причину впустую;
+    not_a_defect, добавленный к оставляющим работу, заводил бы дефект-драфт на
+    находку, которую автор разобрал и отверг; real_deferred, вычеркнутый
+    оттуда же, терял бы дефект, который автор сам назвал настоящим.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, f"Promise of {outcome}")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(db, task_id, 1, [], [_unresolved(f"находка под {outcome}")])
+    await _sent_back(client, task_id)
+    uid = (await finding_outcome.open_findings(db, task_id, 1))[0]["finding_uid"]
+
+    if needs_note:
+        with pytest.raises(ValidationError):
+            FindingOutcomeItem(finding_uid=uid, outcome=outcome)
+    else:
+        assert FindingOutcomeItem(finding_uid=uid, outcome=outcome).outcome
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {"finding_uid": uid, "outcome": outcome, "note": "разобрано"}
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    drafts = await repo.list_tasks_by_status(db, "draft", limit=20)
+    spawned = [dict(r) for r in drafts if dict(r).get("caused_by_task_id") == task_id]
+    assert bool(spawned) is leaves_work, (
+        "дефект-драфт заводится ровно тогда, когда дефект остаётся в коде"
+    )
+
+
+async def test_the_warn_note_counts_the_two_sections_apart(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Смешанный долг не пересказывается одним существительным.
+
+    Заметка жила строкой «НЕ названы для N подтверждённых находок», и после
+    расширения на второй раздел N стал общим счётом: два подтверждённых и одна
+    неразрешённая читались в ленте как три подтверждённых. Соврала не проверка,
+    а её пересказ — и именно пересказ человек видит в фиде.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    task_id = await _submitted_task(client, "Warn counts sections apart")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(
+        db,
+        task_id,
+        1,
+        [_finding("первая"), _finding("вторая")],
+        [_unresolved("спорная")],
+    )
+    await _sent_back(client, task_id)
+
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+
+    updates = (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    note = next(
+        u["content"] for u in updates if "Исходы находок: НЕ названы" in u["content"]
+    )
+    assert "подтверждённых 2" in note and "неразрешённых 1" in note
+    assert "3 подтверждённых" not in note, (
+        "общий счёт не выдаётся за счёт подтверждённых"
+    )

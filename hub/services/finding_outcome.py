@@ -47,7 +47,12 @@ NO_CONFIRMED_INDEX = -1
 async def open_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> list[dict[str, Any]]:
-    """Confirmed findings of THIS generation that their author has not closed.
+    """Findings of THIS generation that their author has not closed — BOTH sections.
+
+    Confirmed findings and the ones no adjudicator could resolve (#1085). The
+    second half is not an afterthought: measured over five deep runs it carried
+    every real defect the paid harness found, while ``findings_confirmed`` was
+    empty in all five.
 
     ``generation`` is the one being resubmitted OVER — the submission whose
     report sent the work back. The report for the submission being made does
@@ -226,6 +231,30 @@ def refusal_text(open_items: list[dict[str, Any]]) -> str:
     return (
         " ".join(parts)
         + " Находка без исхода не становится неверной, она становится невидимой."
+    )
+
+
+def warn_note(open_items: list[dict[str, Any]]) -> str:
+    """Заметка режима warn, называющая разделы своими именами (#1085).
+
+    Жила в lifecycle одной строкой «НЕ названы для N подтверждённых находок»,
+    и после расширения на неразрешённые это стало ложью счётчика: смешанный
+    долг из двух подтверждённых и трёх неразрешённых читался в ленте как пять
+    подтверждённых. Текст переехал сюда, к тому месту, которое умеет отличать
+    разделы, — чтобы следующий читатель не искал, где ещё осталось старое
+    существительное.
+    """
+    confirmed = sum(1 for i in open_items if i.get("finding_kind") != KIND_UNRESOLVED)
+    unresolved = len(open_items) - confirmed
+    parts = []
+    if confirmed:
+        parts.append(f"подтверждённых {confirmed}")
+    if unresolved:
+        parts.append(f"неразрешённых {unresolved}")
+    return (
+        f"Исходы находок: НЕ названы для {len(open_items)} находок предыдущей "
+        f"сдачи ({', '.join(parts)}). Режим проверки — warn, сдача принята. "
+        + refusal_text(open_items)
     )
 
 
