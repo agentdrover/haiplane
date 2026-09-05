@@ -984,3 +984,111 @@ async def test_a_revised_draft_releases_its_old_slot(db: aiosqlite.Connection):
     runs = await _runs(db, task_id)
     assert [r["status"] for r in runs] == [RUN_SUPERSEDED]
     assert "постановку правили" in runs[0]["closed_reason"]
+
+
+# ---------------------------------------------------------------------------
+# Находки машинного ревью #238 (сдача #2)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_draft_approved_in_the_window_buys_no_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 52bd3401: статус перечитывается ПЕРЕД оплатой, а не только в выборке.
+
+    Выборка снимает id запросом status='draft' и идёт по списку. Человеческий
+    апрув с другого соединения законно приходит между выборкой и заказом, и
+    слот ложился на задачу, которая уже не драфт: строка занимает общую
+    суточную квоту, а отменить её нечем — заказ и есть оплата.
+
+    Окно воспроизводится там, где оно и есть: подмена автопилота переводит
+    статус ровно в тот момент, когда диспетчер спрашивает его перед платой,
+    и возвращает False — то есть ведёт себя как автопилот на проекте
+    dor=steward, пока апрув прилетает со стороны.
+    """
+    project_id = await _project_with_policy(db, "dor-window", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+
+    async def _approved_meanwhile(conn, tid):
+        assert conn.in_transaction, (
+            "решение по драфту обязано идти ОДНОЙ транзакцией: перечитанный "
+            "статус устаревает к следующей строке кода, и только write-лок "
+            "делает апрув с другого соединения либо видимым, либо ждущим"
+        )
+        await repo.update_task(conn, tid, status="open")
+        return False
+
+    monkeypatch.setattr(
+        "hub.services.auto_approve.maybe_auto_approve",
+        _approved_meanwhile,
+        raising=True,
+    )
+
+    assert await order_due_dor_runs(db) == 0
+    assert await _runs(db, task_id) == [], (
+        "заказ на задачу, которая уже не драфт, — оплаченное чтение "
+        "постановки, которую решили без стюарда"
+    )
+
+
+async def test_the_baseline_returns_the_revision_it_left_on_the_row(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 798d6fee: вернуть прочитанное ДО записи значит вернуть ложь.
+
+    SELECT транзакции не открывает, и между чтением счётчика и записью
+    отпечатка законно вклинивается refine: он видит пустой отпечаток,
+    считает его изменением (#1156) и двигает счётчик. Функция дописывала
+    отпечаток и возвращала прочитанный ноль — слот лёг бы на ревизию 0,
+    следующий проход закрыл бы его устаревшим, а новый тик купил бы ревизию
+    1. Две строки квоты за нетронутый текст.
+
+    Окно воспроизводится в самой его точке: подмена отпечатка двигает
+    счётчик как раз между чтением и записью. Проверяется ИНВАРИАНТ —
+    возвращённое значение описывает строку, которая лежит в базе после
+    записи, — потому что он держит и тогда, когда окно кто-нибудь откроет
+    заново.
+    """
+    from hub.services import statement_generation as sg
+
+    project_id = await _project_with_policy(db, "dor-baseline-race", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    real = sg.statement_fingerprint
+
+    async def _bumps_meanwhile(conn, tid):
+        fresh = await real(conn, tid)
+        await repo.update_task(conn, tid, statement_generation=1)
+        return fresh
+
+    monkeypatch.setattr(sg, "statement_fingerprint", _bumps_meanwhile, raising=True)
+
+    generation = await sg.baseline_if_absent(db, task_id)
+    await db.commit()
+
+    row = dict(await repo.get_task(db, task_id))
+    assert generation == row["statement_generation"] == 1, (
+        "возвращённая ревизия обязана описывать строку, которая лежит в базе "
+        "ПОСЛЕ записи, а не ту, что читали до неё"
+    )
+
+
+async def test_an_approved_draft_releases_its_open_slot(db: aiosqlite.Connection):
+    """Незакрытая находка ревью #238: слот, который больше некому исполнять.
+
+    DoR-апрув человеком меняет СТАТУС, а не вердикт, поэтому вердиктное
+    правило закрытия его не видит: слот стоял открытым до дедлайна и ждал
+    исполнителя для постановки, которую уже одобрили. Квоту закрытие не
+    возвращает — заказ оплачен, — но прогон, который никому не нужен, не
+    должен выглядеть заказанным.
+    """
+    project_id = await _project_with_policy(db, "dor-approved", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    runs = await _runs(db, task_id)
+    assert [r["status"] for r in runs] == [RUN_SUPERSEDED]
+    assert "больше не драфт" in runs[0]["closed_reason"]

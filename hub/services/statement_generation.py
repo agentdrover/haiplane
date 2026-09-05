@@ -45,7 +45,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 
 # Колонки задачи, составляющие ПОСТАНОВКУ. Список намеренно перечислен, а
 # не выведен из всех колонок таблицы: рядом лежат поля жизненного цикла
@@ -190,17 +190,39 @@ async def baseline_if_absent(db: aiosqlite.Connection, task_id: int) -> int:
     изменением» этим не отменяется: оно остаётся для строк, до которых
     диспетчер не дошёл — а дошёл он только до драфтов проекта, отдавшего
     гейт DoR стюарду.
+
+    ПРОЧИТАТЬ И ЗАПИСАТЬ — ОДНОЙ ТРАНЗАКЦИЕЙ, И ВЕРНУТЬ ПРОЧИТАННОЕ ПОСЛЕ
+    ЗАПИСИ (находка ревью #238). SELECT транзакции не открывает — write-лок
+    драйвер берёт только перед изменяющим запросом (hub/db.py, connect). То
+    есть между чтением счётчика и записью отпечатка законно вклинивается
+    refine: он берёт BEGIN IMMEDIATE, видит пустой отпечаток, считает его
+    изменением и двигает счётчик в 1. Функция дописала бы отпечаток и
+    вернула прочитанный ноль — слот лёг бы на ревизию 0, следующий проход
+    закрыл бы его как устаревший, а новый тик купил бы ревизию 1. Две
+    строки квоты за текст, которого никто не трогал: ровно то, против чего
+    стоит AC-5.
+
+    Поэтому здесь ``write_transaction`` — тот же приём, каким в #1065
+    закрыта схема «проверил — вставил», — и возвращается счётчик,
+    прочитанный ПОСЛЕ записи. Первое закрывает окно, второе делает
+    возвращаемое значение непротиворечивым даже если окно кто-нибудь
+    откроет заново. Вложенный вызов чужую транзакцию не открывает и не
+    коммитит: владелец блока — тот, кто его начал.
     """
-    row = await repo.get_task(db, task_id)
-    if row is None:
-        return 0
-    task = dict(row)
-    current = int(task.get("statement_generation") or 0)
-    if str(task.get("statement_fingerprint") or ""):
-        return current
-    await repo.update_task(
-        db,
-        task_id,
-        statement_fingerprint=await statement_fingerprint(db, task_id),
-    )
-    return current
+    async with write_transaction(db):
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            return 0
+        task = dict(row)
+        if str(task.get("statement_fingerprint") or ""):
+            return int(task.get("statement_generation") or 0)
+        await repo.update_task(
+            db,
+            task_id,
+            statement_fingerprint=await statement_fingerprint(db, task_id),
+        )
+        # Перечитано, а не выведено из прочитанного до записи: значение,
+        # которое вернут вызывающему, обязано описывать ту строку, что
+        # лежит в базе сейчас.
+        written = await repo.get_task(db, task_id)
+        return int(dict(written).get("statement_generation") or 0) if written else 0

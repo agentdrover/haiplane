@@ -50,7 +50,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub.services.project_policy import gate_policy_of
 
 log = logging.getLogger(__name__)
@@ -604,9 +604,23 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             )
             closed += 1
             continue
+        # DoR-апрув драфта человеком выглядит иначе, чем вердикт: он меняет
+        # СТАТУС. Слот, оставленный открытым после него, стоял бы до дедлайна
+        # и ждал исполнителя для постановки, которую уже одобрили или
+        # отклонили (незакрытая находка ревью #238). Квоту это не вернёт —
+        # заказ уже оплачен, и runs_today считает закрытые строки тоже, — но
+        # прогон, который никому не нужен, не должен выглядеть заказанным.
+        if task and kind == KIND_DOR and task.get("status") != "draft":
+            if await close_run(
+                db,
+                run,
+                RUN_SUPERSEDED,
+                f"драфт больше не драфт (статус {task.get('status')!r}) — "
+                "постановку уже решили без стюарда",
+            ):
+                closed += 1
+            continue
         # Человеческий вердикт — про сдачу, и закрывает он слот сдачи.
-        # DoR-апрув драфта человеком выглядит иначе (статус, а не вердикт),
-        # и закрывать по нему нечего: сюда он не приходит.
         verdict_generation = task.get("review_verdict_generation")
         if task and kind == KIND_VERDICT and verdict_generation == run["generation"]:
             if await close_run(
@@ -658,9 +672,6 @@ async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
     """
     if not dispatcher_enabled():
         return 0
-    from hub.services.auto_approve import maybe_auto_approve
-    from hub.services.statement_generation import baseline_if_absent
-
     ordered = 0
     # Сужение — в ЗАПРОСЕ, а не фильтром в памяти: драфтов в базе больше,
     # чем задач в review, и тик поллера ходит по ним каждые тридцать секунд.
@@ -671,20 +682,50 @@ async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
     for row in rows:
         task_id = int(dict(row)["id"])
         project = await repo.resolve_project_for_task(db, task_id)
+        # Политика спрашивается ДО write-лока: чужой проект не должен
+        # заставлять поллер занимать запись на каждом тике.
         if not _policy_wants_steward(project, gate="dor"):
             continue
+        if await _order_one_dor_run(db, task_id):
+            ordered += 1
+    return ordered
+
+
+async def _order_one_dor_run(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Решение по одному драфту — ЦЕЛИКОМ под write-локом (находка ревью #238).
+
+    Выборка выше снимает id запросом ``status='draft'``, и до этой правки
+    статус больше не читался: между выборкой и заказом законно вклинивался
+    человеческий апрув с другого соединения, и слот kind=dor ложился на
+    задачу, которая уже не драфт. Строка занимала общую суточную квоту, и
+    отменить это было нечем — заказ и есть оплата.
+
+    Перечитать статус мало: перечитанное устаревает к следующей строке
+    кода. Поэтому решение целиком идёт под ``BEGIN IMMEDIATE`` — тот же
+    приём, каким закрыта схема «проверил — вставил» (#1065): апрув с
+    другого соединения либо успел до нас и виден в перечитанной строке,
+    либо ждёт очереди и увидит уже размещённый заказ. Ровно этой же
+    транзакцией закрывается и окно между снятием базиса и заказом.
+    """
+    from hub.services.auto_approve import maybe_auto_approve
+    from hub.services.statement_generation import baseline_if_absent
+
+    async with write_transaction(db):
         if await maybe_auto_approve(db, task_id):
-            # Драфт снят правилом и больше не драфт. Коммит — потому что
-            # автопилот пишет в транзакции вызывающего (#584), а вызывающий
-            # здесь мы.
-            await db.commit()
-            continue
+            # Драфт снят правилом и больше не драфт. Коммитит блок: автопилот
+            # пишет в транзакции вызывающего (#584), а вызывающий здесь мы.
+            return False
+        fresh = await repo.get_task(db, task_id)
+        task = dict(fresh) if fresh is not None else {}
+        if task.get("status") != "draft" or not task.get("dor_passed"):
+            # Задачу увели, пока мы шли по списку. Платить за чтение
+            # постановки, которую уже одобрили или отклонили, нечем.
+            return False
         generation = await baseline_if_absent(db, task_id)
-        await db.commit()
         if await open_run(db, task_id, generation, KIND_DOR) is not None:
-            continue
+            return False
         if await _settled(db, task_id, generation, KIND_DOR):
-            continue
+            return False
         judged = await repo.get_steward_judgement(db, task_id, generation, KIND_DOR)
         if judged is not None:
             await _close_generation_as_refused(
@@ -696,10 +737,8 @@ async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
                 "посчитанное второй раз",
                 kind=KIND_DOR,
             )
-            continue
-        if await order_run(db, task_id, generation, KIND_DOR) is not None:
-            ordered += 1
-    return ordered
+            return False
+        return await order_run(db, task_id, generation, KIND_DOR) is not None
 
 
 async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
