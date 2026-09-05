@@ -611,7 +611,17 @@ async def _ready_draft(
         "INSERT INTO acceptance_criteria "
         "(task_id, ac_id, given, when_clause, then_clause, verifiable_by, "
         "test_ref, expectation_source, position) VALUES (?,?,?,?,?,?,?,?,?)",
-        (task_id, "AC-1", "дано", "когда", "тогда", "test", "tests/x.py::y", "requirement", 0),
+        (
+            task_id,
+            "AC-1",
+            "дано",
+            "когда",
+            "тогда",
+            "test",
+            "tests/x.py::y",
+            "requirement",
+            0,
+        ),
     )
     await db.commit()
 
@@ -650,9 +660,7 @@ async def test_a_draft_gets_one_dor_slot_per_revision(db: aiosqlite.Connection):
     assert run is not None
     assert run["status"] == RUN_OPEN
     assert run["kind"] == KIND_DOR
-    events = [
-        json.loads(e["payload"]) for e in await _events(db, EVENT_ORDERED)
-    ]
+    events = [json.loads(e["payload"]) for e in await _events(db, EVENT_ORDERED)]
     assert [e["kind"] for e in events] == [KIND_DOR]
 
     # Второй тик — по той же ревизии, и покупать ему нечего.
