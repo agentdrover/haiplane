@@ -215,3 +215,48 @@ async def test_closure_uid_must_exist_in_report(hub):
     )
     assert ok.status_code == 200, ok.text
     assert await _count(hub, task_id) == 1
+
+
+_UNRESOLVED = {
+    "title": "адъюдикаторы разошлись про порядок отказов",
+    "why": "один считает путь недостижимым, другой — живым",
+}
+
+
+@pytest.mark.asyncio
+async def test_closure_uid_may_come_from_the_unresolved_section(hub):
+    """#1170: uid неразрешённой находки — известный uid, а не unknown.
+
+    Пока множество известных строилось по одному findings_confirmed,
+    привратник применения требовал закрытий по разделу unresolved, а контракт
+    такие закрытия отклонял 422. Правило было невыполнимым по контракту:
+    отказать стюард мог, а закрыть — нет.
+    """
+    from hub.services.finding_identity import unresolved_uids
+
+    task_id = await _make_task(hub)
+    await repo.insert_machine_review(
+        hub.db,
+        task_id=task_id,
+        submission_generation=1,
+        findings_confirmed=json.dumps([]),
+        unresolved=json.dumps([_UNRESOLVED]),
+        incomplete=False,
+    )
+    await hub.db.commit()
+
+    ok = await _post(
+        hub,
+        task_id,
+        _payload(
+            closures=[
+                {
+                    "finding_uid": unresolved_uids([_UNRESOLVED])[0],
+                    "type": "author_outcome",
+                }
+            ]
+        ),
+    )
+
+    assert ok.status_code == 200, ok.text
+    assert await _count(hub, task_id) == 1

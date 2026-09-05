@@ -62,6 +62,28 @@ CLOSURE_EVIDENCE: dict[str, str] = {
     "fixed": "коммит после отчёта тронул строки находки",
     "human_disposition": "человек вынес диспозицию по этой находке",
     "out_of_scope_linked": "находка вынесена в существующую связанную задачу",
+    "author_outcome": "автор назвал судьбу неразрешённой находки на пересдаче",
+}
+
+# К каким разделам отчёта тип закрытия применим (#1170). Опись публичная по
+# той же причине, что и словарь выше, и нужна отдельно от него: тип, годный
+# везде, дал бы стюарду закрывать ПОДТВЕРЖДЁННУЮ находку тем, что автор
+# что-то про неё сказал, — а про подтверждённую находку слово автора уже
+# разобрано в #1148 и закрытием не является. Поведение confirmed этой
+# задачей не меняется, и вот строка, которая это удерживает.
+CLOSURE_SECTIONS: dict[str, tuple[str, ...]] = {
+    "fixed": grounds.ACCOUNTABLE_SECTIONS,
+    "human_disposition": grounds.ACCOUNTABLE_SECTIONS,
+    "out_of_scope_linked": grounds.ACCOUNTABLE_SECTIONS,
+    "author_outcome": ("unresolved",),
+}
+
+# Как называется находка каждого раздела в отказе. Раздел в тексте не
+# украшение: «не закрыта ничем» про подтверждённую находку и про ту, которую
+# никто не рассудил, — разные новости для того, кто будет разбирать.
+_SECTION_NOUN: dict[str, str] = {
+    "confirmed": "находка",
+    "unresolved": "неразрешённая находка",
 }
 
 # Факты пакета, которые обязаны быть и обязаны быть чистыми, чтобы approve
@@ -233,14 +255,24 @@ async def closure_refusals(
     out_of_scope_linked
         находка вынесена в СУЩЕСТВУЮЩУЮ задачу: linked_task_id в записи
         исхода, и эта задача проверяется на существование. Обещание завести
-        её потом закрытием не является.
+        её потом закрытием не является;
+    author_outcome
+        только для НЕРАЗРЕШЁННЫХ (#1170): автор назвал судьбу находки
+        словарём #1085, и хаб записал её сам на своём гейте сдачи. Стюард
+        здесь ничего не судит — находку не рассудили адъюдикаторы, и его
+        мнение стало бы третьим; он проверяет, что её рассудил АВТОР.
+
+    Разделов два, а не один (#1170). Раньше функция читала только
+    ``findings_confirmed`` и при пустом списке выходила сразу — «закрывать
+    нечего», — хотя по замеру #163-#167 (0 confirmed, 6 unresolved, все шесть
+    настоящие) закрывать было ровно всё. Опись разделов общая с автовердиктом:
+    grounds.ACCOUNTABLE_SECTIONS.
 
     Возвращает по одному отказу на каждую незакрытую находку, а не первый:
     человеку, который будет разбирать, нужен список, а не первая строка из
     него.
     """
     from hub.services.finding_evidence import evidence_for_report
-    from hub.services.finding_identity import finding_uids
 
     report = packet.facts.get("machine_review_report")
     if report is None or report.state != "present":
@@ -248,15 +280,23 @@ async def closure_refusals(
         # объявлять, что закрывать нечего.
         return []
     value = report.value or {}
-    confirmed = [f for f in (value.get("confirmed") or []) if isinstance(f, dict)]
-    if not confirmed:
+    sections = {
+        name: [f for f in (value.get(name) or []) if isinstance(f, dict)]
+        for name in grounds.ACCOUNTABLE_SECTIONS
+    }
+    owed = _findings_owing_an_account(sections)
+    if not owed:
         return []
+    confirmed = sections.get("confirmed") or []
 
     claimed = await _claimed_closures(db, task_id, packet.generation)
-    uids = finding_uids(confirmed)
 
     touched: dict[str, tuple[str, str]] = {}
-    if any(claimed.get(uid) == "fixed" for uid in uids):
+    if any(
+        claimed.get(uid) == "fixed"
+        for section, uid, _finding in owed
+        if section == "confirmed"
+    ):
         # Один обход ветки на все находки: вызов на каждую сделал бы
         # привратника непригодным на живом размере отчёта (#1042).
         #
@@ -280,20 +320,29 @@ async def closure_refusals(
         }
 
     out: list[tuple[str, str]] = []
-    for uid, finding in zip(uids, confirmed, strict=True):
+    for section, uid, finding in owed:
+        noun = _SECTION_NOUN[section]
         title = str(finding.get("title") or uid)[:80]
         kind = claimed.get(uid)
         if kind is None:
-            out.append(
-                (REFUSED_UNCLOSED, f"находка «{title}» ({uid}) не закрыта ничем")
-            )
+            out.append((REFUSED_UNCLOSED, f"{noun} «{title}» ({uid}) не закрыта ничем"))
             continue
         if kind not in CLOSURE_EVIDENCE:
             out.append(
                 (
                     REFUSED_UNCLOSED,
-                    f"находка «{title}» ({uid}): закрытие типа {kind!r} вне "
+                    f"{noun} «{title}» ({uid}): закрытие типа {kind!r} вне "
                     f"словаря {sorted(CLOSURE_EVIDENCE)}",
+                )
+            )
+            continue
+        if section not in CLOSURE_SECTIONS[kind]:
+            out.append(
+                (
+                    REFUSED_UNCLOSED,
+                    f"{noun} «{title}» ({uid}): закрытие типа {kind!r} применимо "
+                    f"только к разделам {sorted(CLOSURE_SECTIONS[kind])}, а эта "
+                    f"находка из раздела {section!r}",
                 )
             )
             continue
@@ -302,16 +351,75 @@ async def closure_refusals(
             out.append(
                 (
                     REFUSED_UNCLOSED,
-                    f"находка «{title}» ({uid}): закрытие {kind} объявлено, но "
+                    f"{noun} «{title}» ({uid}): закрытие {kind} объявлено, но "
                     f"хаб его не подтверждает — ожидалось, что "
                     f"{CLOSURE_EVIDENCE[kind]}; "
-                    + _what_the_hub_saw(kind, touched.get(uid)),
+                    + await _what_the_hub_saw(db, task_id, kind, uid, touched.get(uid)),
                 )
             )
     return out
 
 
-def _what_the_hub_saw(kind: str, seen: tuple[str, str] | None) -> str:
+def _findings_owing_an_account(
+    sections: dict[str, list[dict[str, Any]]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """(раздел, uid, находка) по каждой находке, за которую нужно отчитаться.
+
+    Идентичность выдаёт СВОЙ расчёт на каждый раздел: у подтверждённой
+    находки в материал идёт её место в коде, у неразрешённой места нет вовсе
+    (#1085), и общая функция на оба списка выдала бы для одного из них
+    уверенный, но чужой id.
+    """
+    from hub.services.finding_identity import finding_uids, unresolved_uids
+
+    per_section = {"confirmed": finding_uids, "unresolved": unresolved_uids}
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for name in grounds.ACCOUNTABLE_SECTIONS:
+        findings = sections.get(name) or []
+        if not findings:
+            continue
+        uids = per_section[name](findings)
+        out.extend(
+            (name, uid, finding) for uid, finding in zip(uids, findings, strict=True)
+        )
+    return out
+
+
+async def _author_named_the_outcome(
+    db: aiosqlite.Connection, task_id: int, uid: str
+) -> bool:
+    """Рассудил ли эту неразрешённую находку её АВТОР и записал ли это (#1170).
+
+    Факт считает хаб: строку в finding_outcomes он пишет сам, на своём гейте
+    сдачи (lifecycle._step_finding_outcomes), а не принимает от стюарда.
+    Заявление стюарда здесь не участвует вовсе — только его указание, где
+    искать.
+
+    ``not_judged`` закрытием НЕ является, и это не строгость, а смысл слова:
+    словарь #1085 завёл его ровно затем, чтобы «посмотрел и это не дефект»
+    перестало быть неотличимо от «не смотрел». Второе — не судьба находки, а
+    её отсутствие, и approve по нему был бы тем же молчаливым штампом, против
+    которого стоит вся проверка.
+    """
+    from hub import repository as repo
+    from hub.models import FindingOutcome
+    from hub.services.finding_outcome import KIND_UNRESOLVED
+
+    row = await repo.finding_outcome_for_uid(
+        db, task_id, uid, finding_kind=KIND_UNRESOLVED
+    )
+    if row is None:
+        return False
+    return str(dict(row).get("outcome") or "") != FindingOutcome.not_judged.value
+
+
+async def _what_the_hub_saw(
+    db: aiosqlite.Connection,
+    task_id: int,
+    kind: str,
+    uid: str,
+    seen: tuple[str, str] | None,
+) -> str:
     """Наблюдённое состояние, а не только ожидание.
 
     Найдено кросс-модельным ревью: один шаблон отказа накрывал два разных
@@ -319,9 +427,30 @@ def _what_the_hub_saw(kind: str, seen: tuple[str, str] | None) -> str:
     — разные вещи для того, кто будет разбирать: первое означает, что
     правки не было, второе — что мы не смотрели. Незнание, названное
     отсутствием, и есть та ошибка, против которой стоит #762.
+
+    У author_outcome та же развилка своими словами (#1170): «автор про эту
+    находку не сказал ничего» и «автор сказал not_judged» — разные новости, и
+    чинятся они по-разному.
     """
     from hub.services.finding_evidence import OUTCOME_UNKNOWN, OUTCOME_UNTOUCHED
 
+    if kind == "author_outcome":
+        from hub import repository as repo
+        from hub.services.finding_outcome import KIND_UNRESOLVED
+
+        row = await repo.finding_outcome_for_uid(
+            db, task_id, uid, finding_kind=KIND_UNRESOLVED
+        )
+        if row is None:
+            return (
+                "хаб посмотрел исходы находок задачи: про эту автор не говорил "
+                "ничего — судьба не названа, а не названа неубедительно"
+            )
+        return (
+            f"хаб посмотрел исходы находок задачи: автор назвал "
+            f"{str(dict(row).get('outcome') or '')!r} — это «никто не "
+            "разбирался», то есть отсутствие судьбы, а не судьба"
+        )
     if kind != "fixed" or seen is None:
         return "хаб опоры не нашёл"
     outcome, reason = seen
@@ -386,6 +515,8 @@ async def _closure_is_proven(
     if kind == "fixed":
         seen = touched.get(uid)
         return seen is not None and seen[0] == OUTCOME_TOUCHED
+    if kind == "author_outcome":
+        return await _author_named_the_outcome(db, task_id, uid)
     report = packet.facts.get("machine_review_report")
     review_id = int(((report.value if report else None) or {}).get("review_id") or 0)
     if kind == "human_disposition":

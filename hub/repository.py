@@ -1460,6 +1460,36 @@ async def list_finding_outcomes(
     )
 
 
+async def finding_outcome_for_uid(
+    db: aiosqlite.Connection,
+    task_id: int,
+    finding_uid: str,
+    *,
+    finding_kind: str = "",
+) -> aiosqlite.Row | None:
+    """The author's account of one defect, across every report of this task.
+
+    By ``task_id`` and not by ``review_id`` on purpose (#1170). Outcomes are
+    written at the NEXT submission, against the report that sent the work back
+    (lifecycle._step_finding_outcomes), so a row never exists for the report
+    being judged right now. What does carry across is the uid: it is derived
+    from the finding's content (#1007), so one defect raised again by the next
+    report is the same id. Asking per review would therefore always answer
+    "nothing", which is the difference between a check and an off switch.
+
+    The latest account wins: a resubmission may correct what the author said
+    last time, and the correction is the answer.
+    """
+    sql = "SELECT * FROM finding_outcomes WHERE task_id=? AND finding_uid=?"
+    params: list[object] = [task_id, finding_uid]
+    if finding_kind:
+        sql += " AND finding_kind=?"
+        params.append(finding_kind)
+    sql += " ORDER BY submission_generation DESC, rowid DESC"
+    rows = await fetchall(db, sql, tuple(params))
+    return rows[0] if rows else None
+
+
 # --- Category checks (#878) ------------------------------------------------
 
 

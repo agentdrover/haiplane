@@ -261,7 +261,14 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
             return False
 
     # --- Clean grounds: silent refusals, the human gate stands -----------
-    if confirmed or unresolved or bool(review.get("incomplete")):
+    #
+    # Which sections owe an account lives in gate_grounds (#1170), for the
+    # same reason the loud five do: the steward has to refuse where this
+    # refuses, and it did not — ``unresolved`` was invisible to it entirely.
+    # Silent here and named there is fine; two different lists would not be.
+    if grounds.unattended_blockers(
+        confirmed, unresolved, bool(review.get("incomplete"))
+    ):
         return False
     raw_count = review.get("raw_count") or 0
     proven_usage: int | None = None

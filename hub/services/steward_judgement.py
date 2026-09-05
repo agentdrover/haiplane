@@ -26,7 +26,7 @@ from hub.models import (
     StewardJudgementSubmit,
     StewardJudgementView,
 )
-from hub.services.finding_identity import finding_uids
+from hub.services.finding_identity import finding_uids, unresolved_uids
 from hub.services.gate_events import (
     STEWARD_APPLIED,
     STEWARD_ESCALATED,
@@ -184,20 +184,34 @@ async def record_steward_judgement(
 async def _refuse_unknown_closure_uids(
     db, task_id: int, generation: int, closures
 ) -> None:
+    """Закрытие может ссылаться только на находку ЭТОГО отчёта — из ЛЮБОГО раздела.
+
+    Разделов два, а не один (#1170). Пока множество известных uid строилось
+    по ``findings_confirmed``, закрытие неразрешённой находки отклонялось как
+    unknown_finding_uid — то есть привратник применения не мог бы принять
+    закрытие, которого сам же требует, и правило про unresolved осталось бы
+    невыполнимым по контракту.
+    """
     reports = await repo.machine_reviews_of_generation(db, task_id, generation)
     known: set[str] = set()
-    for report in reports:
-        raw = report["findings_confirmed"]
-        if isinstance(raw, str):
-            try:
-                entries = json.loads(raw or "[]")
-            except ValueError:
-                entries = []
-        else:
-            entries = raw or []
-        if not isinstance(entries, list):
-            continue
-        known.update(finding_uids(entries))
+    # Свой расчёт идентичности на каждый раздел: у неразрешённой записи нет
+    # ни файла, ни строки, и общий расчёт выдал бы ей чужой id (#1085).
+    for column, uids_of in (
+        ("findings_confirmed", finding_uids),
+        ("unresolved", unresolved_uids),
+    ):
+        for report in reports:
+            raw = report[column]
+            if isinstance(raw, str):
+                try:
+                    entries = json.loads(raw or "[]")
+                except ValueError:
+                    entries = []
+            else:
+                entries = raw or []
+            if not isinstance(entries, list):
+                continue
+            known.update(uids_of(entries))
     for closure in closures:
         if closure.finding_uid not in known:
             raise HTTPException(
