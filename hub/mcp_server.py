@@ -1680,10 +1680,10 @@ async def hub_submit_for_review(
         accept_areas: Fold the areas the diff ACTUALLY touched into
             affected_areas (#890), visibly.
         finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
-            what became of the findings this resubmission was sent back over
-            (#911). outcome: fixed | false_positive | wont_fix | deferred; all
-            but fixed owe a note. The last two leave a defect draft unless
-            linked_task_id names existing work.
+            what became of findings sent back over. Confirmed:
+            fixed|false_positive|wont_fix|deferred. Unresolved (author judges):
+            real_fixed|real_deferred|not_a_defect|not_judged. All but a fix
+            owe a note; one leaving the defect leaves a draft.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None

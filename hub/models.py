@@ -2127,6 +2127,12 @@ class MachineUnresolvedFinding(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=300)
     why: str = Field("", max_length=2000)
+    # The id the hub DERIVES for this record (#1085), exactly as MachineFinding
+    # carries one: empty on the way in, refused if a harness sends its own,
+    # stamped on every read. Without it the author has no way to ADDRESS an
+    # unresolved finding, and an outcome nobody can address is the silence
+    # #911 was written against.
+    finding_uid: str = Field("", max_length=64)
 
     @model_validator(mode="before")
     @classmethod
@@ -2317,7 +2323,12 @@ class FindingDisposition(str, Enum):
 
 
 class FindingOutcome(str, Enum):
-    """What the AUTHOR did about a confirmed finding, said at resubmission (#911).
+    """What the AUTHOR did about a review finding, said at resubmission (#911).
+
+    TWO dictionaries in one enum, and they do not mix: the first four words
+    answer for a CONFIRMED finding, the last four for one the adjudicators
+    could not resolve (#1085). An outcome from the wrong dictionary is refused
+    rather than translated — see the section comment below for why.
 
     A different question from :class:`FindingDisposition`, asked of a different
     actor. The disposition answers "was this finding REAL" and only a human may
@@ -2339,6 +2350,61 @@ class FindingOutcome(str, Enum):
     wont_fix = "wont_fix"
     deferred = "deferred"
 
+    # --- The unresolved section's own words (#1085) -----------------------
+    #
+    # A SECOND dictionary rather than a reuse of the four above, and the
+    # difference is not stylistic. The words above answer "what did you do
+    # about a defect we agreed on"; an unresolved finding is precisely one
+    # nobody agreed on — the adjudicators split. Calling such a record
+    # ``false_positive`` would write down that the gate confirmed a defect and
+    # the author overruled it, when the gate confirmed nothing. What actually
+    # happens is that the AUTHOR judges it, and the ledger has to say so.
+    #
+    # ``not_judged`` is here because "I looked and it is not a defect" and "I
+    # never looked" are the two answers the measurement found indistinguishable
+    # — and only one of them leaves a defect possibly sitting in the code.
+    real_fixed = "real_fixed"
+    real_deferred = "real_deferred"
+    not_a_defect = "not_a_defect"
+    not_judged = "not_judged"
+
+
+#: What an author may say about a CONFIRMED finding (#911).
+CONFIRMED_OUTCOMES: frozenset[FindingOutcome] = frozenset(
+    {
+        FindingOutcome.fixed,
+        FindingOutcome.false_positive,
+        FindingOutcome.wont_fix,
+        FindingOutcome.deferred,
+    }
+)
+
+#: What an author may say about an UNRESOLVED finding (#1085).
+UNRESOLVED_OUTCOMES: frozenset[FindingOutcome] = frozenset(
+    {
+        FindingOutcome.real_fixed,
+        FindingOutcome.real_deferred,
+        FindingOutcome.not_a_defect,
+        FindingOutcome.not_judged,
+    }
+)
+
+#: Outcomes that leave the defect in the code after this submission, whichever
+#: section it came from — so both leave something a person can schedule.
+OUTCOMES_LEAVING_WORK: frozenset[FindingOutcome] = frozenset(
+    {
+        FindingOutcome.wont_fix,
+        FindingOutcome.deferred,
+        FindingOutcome.real_deferred,
+        FindingOutcome.not_judged,
+    }
+)
+
+#: Outcomes whose truth is visible in the diff and therefore owe no sentence.
+_SELF_EVIDENT_OUTCOMES: frozenset[FindingOutcome] = frozenset(
+    {FindingOutcome.fixed, FindingOutcome.real_fixed}
+)
+
 
 class FindingOutcomeItem(BaseModel):
     """One finding closed by its author, addressed by ``finding_uid`` (#1007)."""
@@ -2352,17 +2418,18 @@ class FindingOutcomeItem(BaseModel):
 
     @model_validator(mode="after")
     def _unfixed_findings_owe_a_reason(self) -> "FindingOutcomeItem":
-        """Everything but ``fixed`` carries one line of why.
+        """Everything but a fix carries one line of why.
 
-        "Fixed" is checkable — the diff is right there. The other three are
-        claims nobody can verify from the code, and a claim without a reason is
-        the silence this whole feature exists to remove: it closes the row and
-        tells the next reader nothing.
+        A fix is checkable — the diff is right there. The rest are claims
+        nobody can verify from the code, and a claim without a reason is the
+        silence this whole feature exists to remove: it closes the row and
+        tells the next reader nothing. ``real_fixed`` joins ``fixed`` on the
+        same ground and for the same reason (#1085).
         """
-        if self.outcome is not FindingOutcome.fixed and not self.note.strip():
+        if self.outcome not in _SELF_EVIDENT_OUTCOMES and not self.note.strip():
             raise ValueError(
                 f"outcome '{self.outcome.value}' needs one line of why: "
-                "'fixed' is visible in the diff, the others are only visible "
+                "a fix is visible in the diff, the others are only visible "
                 "in what you say about them"
             )
         return self
@@ -2479,12 +2546,17 @@ class MachineReviewView(BaseModel):
         claims to identify. Every reader — card, brief, API, MCP — therefore
         gets the id from the same place the resolver will compute it.
         """
-        from hub.services.finding_identity import finding_uids
+        from hub.services.finding_identity import finding_uids, unresolved_uids
 
         for finding, uid in zip(
             self.findings_confirmed, finding_uids(self.findings_confirmed)
         ):
             finding.finding_uid = uid
+        # #1085: the unresolved section gets ids on the same terms. Measured
+        # over five deep runs it carried every real defect the paid harness
+        # found, and none of them could be addressed at all.
+        for record, uid in zip(self.unresolved, unresolved_uids(self.unresolved)):
+            record.finding_uid = uid
         return self
 
     @field_validator(

@@ -24,14 +24,35 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
-from hub.models import FindingOutcome, FindingOutcomeItem
-from hub.services.finding_identity import finding_uids
+from hub.models import (
+    CONFIRMED_OUTCOMES,
+    OUTCOMES_LEAVING_WORK,
+    UNRESOLVED_OUTCOMES,
+    FindingOutcome,
+    FindingOutcomeItem,
+)
+from hub.services.finding_identity import finding_uids, unresolved_uids
+
+#: The two sections of a report an author can be asked about (#1085).
+KIND_CONFIRMED = "confirmed"
+KIND_UNRESOLVED = "unresolved"
+
+#: Позиция в ``findings_confirmed`` — обещание колонки ``finding_index``.
+#: У неразрешённой записи такой позиции нет: она лежит в другом списке. Писать
+#: туда её индекс значило бы указать на чужую находку, поэтому пишется -1 —
+#: то же значение, которым схема помечает «индекс не назван».
+NO_CONFIRMED_INDEX = -1
 
 
 async def open_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> list[dict[str, Any]]:
-    """Confirmed findings of THIS generation that their author has not closed.
+    """Findings of THIS generation that their author has not closed — BOTH sections.
+
+    Confirmed findings and the ones no adjudicator could resolve (#1085). The
+    second half is not an afterthought: measured over five deep runs it carried
+    every real defect the paid harness found, while ``findings_confirmed`` was
+    empty in all five.
 
     ``generation`` is the one being resubmitted OVER — the submission whose
     report sent the work back. The report for the submission being made does
@@ -49,31 +70,65 @@ async def open_findings(
     out: list[dict[str, Any]] = []
     for row in reports:
         review = dict(row)
-        try:
-            confirmed = json.loads(review.get("findings_confirmed") or "[]")
-        except ValueError:
-            confirmed = []
-        if not isinstance(confirmed, list) or not confirmed:
+        confirmed = _section(review, "findings_confirmed")
+        unresolved = _section(review, "unresolved")
+        if not confirmed and not unresolved:
             continue
         answered = {
             str(dict(r)["finding_uid"])
             for r in await repo.list_finding_outcomes(db, int(review["id"]))
         }
+        review_id = int(review["id"])
         for index, (uid, finding) in enumerate(zip(finding_uids(confirmed), confirmed)):
             if uid in answered:
                 continue
             entry = finding if isinstance(finding, dict) else {}
             out.append(
                 {
-                    "review_id": int(review["id"]),
+                    "review_id": review_id,
                     "finding_index": index,
                     "finding_uid": uid,
+                    "finding_kind": KIND_CONFIRMED,
                     "title": str(entry.get("title") or ""),
                     "severity": str(entry.get("severity") or ""),
                     "file": str(entry.get("file") or ""),
                 }
             )
+        for uid, finding in zip(unresolved_uids(unresolved), unresolved):
+            if uid in answered:
+                continue
+            entry = finding if isinstance(finding, dict) else {}
+            out.append(
+                {
+                    "review_id": review_id,
+                    "finding_index": NO_CONFIRMED_INDEX,
+                    "finding_uid": uid,
+                    "finding_kind": KIND_UNRESOLVED,
+                    "title": str(entry.get("title") or ""),
+                    # An unresolved record carries neither severity nor file —
+                    # the schema has no such fields. Empty here is the absence
+                    # itself, not a value that went missing.
+                    "severity": "",
+                    "file": "",
+                    "why": str(entry.get("why") or ""),
+                }
+            )
     return out
+
+
+def _section(review: dict[str, Any], column: str) -> list[Any]:
+    """One stored findings list, or an empty one when it cannot be read.
+
+    Reports written before a column existed store nothing at all, and a report
+    that fails to parse is not a report with findings: in both cases the honest
+    answer is "no findings here", never an exception on a read path the gate
+    runs on every submission.
+    """
+    try:
+        parsed = json.loads(review.get(column) or "[]")
+    except ValueError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def plan_outcomes(
@@ -106,8 +161,11 @@ def plan_outcomes(
             # partial success: the author answered about something else.
             raise ValueError(
                 f"finding {item.finding_uid} is not an open confirmed finding "
-                f"of this submission"
+                f"of this submission, and not an open unresolved one either: "
+                f"the id is derived from the finding's own content, so check "
+                f"it against the report"
             )
+        _refuse_foreign_dictionary(rows[0], item)
         answered.add(item.finding_uid)
         writes.extend((found, item) for found in rows)
     still_open = [
@@ -116,24 +174,107 @@ def plan_outcomes(
     return writes, still_open
 
 
+def _refuse_foreign_dictionary(found: dict[str, Any], item: FindingOutcomeItem) -> None:
+    """Каждый раздел отвечает своими словами (#1085).
+
+    Словарь confirmed отвечает на вопрос «что вы сделали с дефектом, о котором
+    ДОГОВОРИЛИСЬ». У неразрешённой находки договорённости нет по определению —
+    адъюдикаторы разошлись, — и ``false_positive`` про неё записал бы, что гейт
+    находку подтвердил, а автор объявил ложной. Гейт не подтверждал ничего.
+    Молчаливый перевод одного слова в другое стёр бы ровно то различие, ради
+    которого второй словарь и заведён, поэтому чужое слово отклоняется вслух.
+    """
+    kind = str(found.get("finding_kind") or KIND_CONFIRMED)
+    allowed = UNRESOLVED_OUTCOMES if kind == KIND_UNRESOLVED else CONFIRMED_OUTCOMES
+    if item.outcome in allowed:
+        return
+    words = ", ".join(sorted(o.value for o in allowed))
+    section = (
+        "неразрешённой (адъюдикаторы не сошлись, судит автор)"
+        if kind == KIND_UNRESOLVED
+        else "подтверждённой"
+    )
+    raise ValueError(
+        f"исход '{item.outcome.value}' не из словаря {section} находки "
+        f"{item.finding_uid}: назовите одно из {words}"
+    )
+
+
 def refusal_text(open_items: list[dict[str, Any]]) -> str:
     """Name the findings, never just the count.
 
     A refusal that says "you have 9 unanswered findings" makes the author go
     looking for which nine. The gate already knows.
+
+    The two sections are listed apart (#1085) because they are answered with
+    different words, and one list under one dictionary would hand the author a
+    vocabulary that fits half of it.
     """
-    listed = "; ".join(
-        f"[{i['severity'] or 'severity не назван'}] {i['title'] or 'без заголовка'}"
-        f" (uid {i['finding_uid']})"
-        for i in open_items[:10]
-    )
-    more = f" и ещё {len(open_items) - 10}" if len(open_items) > 10 else ""
+    confirmed = [i for i in open_items if i.get("finding_kind") != KIND_UNRESOLVED]
+    unresolved = [i for i in open_items if i.get("finding_kind") == KIND_UNRESOLVED]
+    parts: list[str] = []
+    if confirmed:
+        parts.append(
+            f"не закрыты подтверждённые находки предыдущей сдачи "
+            f"({len(confirmed)}): {_listed(confirmed)}. На каждую назовите "
+            "исход — fixed, false_positive, wont_fix или deferred — и одну "
+            "строку почему для всего, кроме fixed."
+        )
+    if unresolved:
+        parts.append(
+            f"не закрыты неразрешённые находки предыдущей сдачи "
+            f"({len(unresolved)}): {_listed(unresolved)}. Их адъюдикаторы не "
+            "рассудили, поэтому судит автор: real_fixed, real_deferred, "
+            "not_a_defect или not_judged — и одну строку почему для всего, "
+            "кроме real_fixed."
+        )
     return (
-        f"не закрыты подтверждённые находки предыдущей сдачи ({len(open_items)}): "
-        f"{listed}{more}. На каждую назовите исход — fixed, false_positive, "
-        "wont_fix или deferred — и одну строку почему для всего, кроме fixed. "
-        "Находка без исхода не становится неверной, она становится невидимой."
+        " ".join(parts)
+        + " Находка без исхода не становится неверной, она становится невидимой."
     )
+
+
+def warn_note(open_items: list[dict[str, Any]]) -> str:
+    """Заметка режима warn, называющая разделы своими именами (#1085).
+
+    Жила в lifecycle одной строкой «НЕ названы для N подтверждённых находок»,
+    и после расширения на неразрешённые это стало ложью счётчика: смешанный
+    долг из двух подтверждённых и трёх неразрешённых читался в ленте как пять
+    подтверждённых. Текст переехал сюда, к тому месту, которое умеет отличать
+    разделы, — чтобы следующий читатель не искал, где ещё осталось старое
+    существительное.
+    """
+    confirmed = sum(1 for i in open_items if i.get("finding_kind") != KIND_UNRESOLVED)
+    unresolved = len(open_items) - confirmed
+    parts = []
+    if confirmed:
+        parts.append(f"подтверждённых {confirmed}")
+    if unresolved:
+        parts.append(f"неразрешённых {unresolved}")
+    return (
+        f"Исходы находок: НЕ названы для {len(open_items)} находок предыдущей "
+        f"сдачи ({', '.join(parts)}). Режим проверки — warn, сдача принята. "
+        + refusal_text(open_items)
+    )
+
+
+def _listed(items: list[dict[str, Any]]) -> str:
+    """Поимённо, до десяти, с хвостом счётом.
+
+    Severity печатается только там, где она бывает: у неразрешённой записи
+    такого поля нет в схеме, и «severity не назван» про неё читалось бы как
+    забытое поле, а не как поле, которого не существует.
+    """
+    chunks: list[str] = []
+    for i in items[:10]:
+        title = i["title"] or "без заголовка"
+        if i.get("finding_kind") == KIND_UNRESOLVED:
+            chunks.append(f"{title} (uid {i['finding_uid']})")
+            continue
+        severity = i["severity"] or "severity не назван"
+        chunks.append(f"[{severity}] {title} (uid {i['finding_uid']})")
+    more = f" и ещё {len(items) - 10}" if len(items) > 10 else ""
+    return "; ".join(chunks) + more
 
 
 async def apply_outcomes(
@@ -149,7 +290,11 @@ async def apply_outcomes(
     Returns the ids of the defect drafts created. ``wont_fix`` and ``deferred``
     both mean the defect is still in the code after this submission, so both
     leave something a person can schedule; ``false_positive`` disputes the
-    finding and ``fixed`` closes it, and neither leaves work behind.
+    finding and ``fixed`` closes it, and neither leaves work behind. The
+    unresolved dictionary splits the same way (#1085): ``real_deferred`` and
+    ``not_judged`` leave the defect where it is — the second one is the author
+    saying they never looked, which is the answer most in need of a follow-up —
+    while ``real_fixed`` and ``not_a_defect`` close the row.
 
     The draft is a DRAFT on purpose. An outcome is one agent's sentence about
     its own work, and turning that into scheduled work without a human would
@@ -170,8 +315,9 @@ async def apply_outcomes(
             note=item.note.strip(),
             linked_task_id=item.linked_task_id,
             reported_by=reported_by,
+            finding_kind=str(found.get("finding_kind") or KIND_CONFIRMED),
         )
-        if item.outcome not in (FindingOutcome.wont_fix, FindingOutcome.deferred):
+        if item.outcome not in OUTCOMES_LEAVING_WORK:
             continue
         if item.linked_task_id is not None:
             # The work already exists and the author named it. Opening a second
@@ -198,10 +344,17 @@ async def _spawn_defect_draft(
     reported_by: str,
 ) -> int:
     """A defect draft carrying the finding, its author's reason and its origin."""
-    verb = (
-        "решено не чинить"
-        if item.outcome is FindingOutcome.wont_fix
-        else "отложено на отдельную работу"
+    verb = {
+        FindingOutcome.wont_fix: "решено не чинить",
+        FindingOutcome.real_deferred: "отложено на отдельную работу",
+        FindingOutcome.not_judged: "не разбиралась",
+    }.get(item.outcome, "отложено на отдельную работу")
+    unresolved = str(found.get("finding_kind") or "") == KIND_UNRESOLVED
+    origin = (
+        "Находку никто не рассудил: адъюдикаторы разошлись, и это суждение "
+        "АВТОРА, а не подтверждение гейта.\n\n"
+        if unresolved
+        else ""
     )
     title = (found["title"] or "находка без заголовка")[:200]
     draft_id = await repo.create_task(
@@ -210,13 +363,20 @@ async def _spawn_defect_draft(
         description=(
             f"Находка машинного ревью задачи #{task_id}, которую сдача не "
             f"закрыла: {verb}.\n\n"
+            f"{origin}"
             f"Слова автора: {item.note.strip()}\n\n"
-            f"severity: {found['severity'] or 'не назван'}\n"
-            f"файл: {found['file'] or 'не назван'}\n"
-            f"finding_uid: {found['finding_uid']}\n\n"
+            + (
+                ""
+                if unresolved
+                # У неразрешённой записи этих полей нет в схеме вовсе, и
+                # «не назван» про них прочиталось бы как забытое поле.
+                else f"severity: {found['severity'] or 'не назван'}\n"
+                f"файл: {found['file'] or 'не назван'}\n"
+            )
+            + f"finding_uid: {found['finding_uid']}\n\n"
             "Заведено автоматически на сдаче (#911), чтобы находка не исчезла "
-            "вместе с решением её не чинить. Драфт, а не открытая задача: "
-            "планирует работу человек."
+            "вместе с исходом, который её не закрыл. Драфт, а не открытая "
+            "задача: планирует работу человек."
         ),
         runtime="auto",
         source="agent",

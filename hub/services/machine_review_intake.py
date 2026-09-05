@@ -90,6 +90,10 @@ async def record_machine_review(
     # later, and the gap is invisible once the report is in the ground.
     services.require_locator_decision(body.findings_confirmed)
     services.refuse_supplied_uid(body.findings_confirmed)
+    # #1085: unresolved records carry the same derived id, so they are refused
+    # on the same terms. A harness that invents one would win over the derived
+    # value silently, and an id nobody can reproduce identifies nothing.
+    services.refuse_supplied_uid(body.unresolved, section="unresolved")
     adjudicated = len(body.findings_confirmed) + len(body.findings_rejected)
     raw_count = body.raw_count
     if raw_count < adjudicated:
