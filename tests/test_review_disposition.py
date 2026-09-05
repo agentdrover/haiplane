@@ -379,6 +379,23 @@ async def test_a_named_task_replaces_the_draft(
     )
 
 
+def test_open_findings_doc_names_both_sections():
+    """Docstring is the contract callers read before the body.
+
+    The function used to return confirmed findings only, and its first line
+    still said so after #1085 started walking ``unresolved`` too. A caller
+    that trusted the docstring would skip the section that carried every
+    useful finding of the measured runs.
+    """
+    doc = finding_outcome.open_findings.__doc__ or ""
+    first = doc.strip().splitlines()[0]
+    assert "confirmed" in first.lower()
+    assert "unresolved" in first.lower(), (
+        "первая строка называет оба раздела: иначе она описывает функцию "
+        "до #1085, а не ту, что исполняется"
+    )
+
+
 # --- Находки, о которых адъюдикаторы не договорились (#1085) ----------------
 #
 # Замер по пяти отчётам подряд (#163-#167, задачи #1083 и #1084, 30-31.08.2026):
@@ -519,6 +536,10 @@ async def test_undisposed_unresolved_is_named_on_resubmission(
     notes = "\n".join(u["content"] for u in updates)
     assert "замыкание на ключе кэша" in notes, (
         "предупреждение тоже называет находку поимённо"
+    )
+    assert "подтверждённых находок предыдущей сдачи" not in notes, (
+        "предупреждение не называет неразрешённую находку подтверждённой: "
+        "адъюдикаторы о ней не договорились"
     )
 
 

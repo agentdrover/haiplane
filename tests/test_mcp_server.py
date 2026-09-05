@@ -2124,6 +2124,18 @@ async def test_hub_task_status_renders_finding_scope(
     assert "3. [low] [out-of-scope] Unlinked elsewhere" in text
 
 
+def test_hub_submit_for_review_doc_names_unresolved_outcomes() -> None:
+    """Published tools/list is what an author reads before answering (#1085).
+
+    The argument used to list only the confirmed dictionary, so a client that
+    trusted the tool description had no words for an unresolved finding.
+    """
+    doc = hub_submit_for_review.__doc__ or ""
+    assert "finding_outcomes:" in doc
+    assert "real_fixed" in doc
+    assert "not_judged" in doc
+
+
 async def test_hub_submit_for_review(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:

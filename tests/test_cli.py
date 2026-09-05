@@ -1010,6 +1010,20 @@ def test_load_payload_file_yaml_without_pyyaml(tmp_path: Path, monkeypatch) -> N
     assert exc.value.code == 2
 
 
+def test_submit_review_help_names_unresolved_outcomes(capsys) -> None:
+    """CLI help must list both outcome dictionaries (#1085).
+
+    The flag used to describe confirmed findings only, so an author answering
+    an unresolved record had no words on the surface that accepts them.
+    """
+    rc, api = _run_main(["submit-review", "--help"])
+    assert rc == 0
+    api.assert_not_called()
+    out, _ = _assert_no_traceback(capsys)
+    assert "real_fixed" in out
+    assert "not_judged" in out
+
+
 def test_cmd_submit_review() -> None:
     result = {"id": 42, "status": "review", "submission_generation": 1}
     mock_api = MagicMock(return_value=result)

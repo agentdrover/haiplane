@@ -634,7 +634,8 @@ class TaskSubmitReview(BaseModel):
     # own scope. Explicit on purpose: the hub never widens the field on its
     # own, because a field that always matches the diff is nothing to compare.
     accept_areas: bool = False
-    # #911: what became of the findings this resubmission was sent back over.
+    # #911/#1085: what became of the findings this resubmission was sent back
+    # over — confirmed and unresolved.
     # Sent with the submission rather than as a separate call because the two
     # are one act: "here is the new work, and here is what happened to what you
     # found in the old". A separate endpoint would let the submission land
@@ -2323,7 +2324,7 @@ class FindingDisposition(str, Enum):
 
 
 class FindingOutcome(str, Enum):
-    """What the AUTHOR did about a confirmed finding, said at resubmission (#911).
+    """What the AUTHOR did about a finding, said at resubmission (#911, #1085).
 
     A different question from :class:`FindingDisposition`, asked of a different
     actor. The disposition answers "was this finding REAL" and only a human may

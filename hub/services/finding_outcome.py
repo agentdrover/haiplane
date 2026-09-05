@@ -1,15 +1,19 @@
-"""Every confirmed finding ends in a named outcome, not in silence (#911).
+"""Every finding the author is asked about ends in a named outcome, not in
+silence (#911, #1085).
 
 Measured before this existed: 47 confirmed findings over seven days and zero
 judgements. A finding nobody answers does not become false — it becomes
 invisible, and the defect it named ships. Worse, the two numbers that would
 tell us whether machine review is worth its price (precision and
 ``tokens_per_fixed``) cannot be computed at all without a denominator, so the
-practice pays for reviews it cannot evaluate.
+practice pays for reviews it cannot evaluate. The same silence later hid the
+unresolved section: five deep runs left six real defects there and none in
+``findings_confirmed``, and the ledger asked about none of them.
 
 The gate asks the AUTHOR, at the moment of resubmission, what became of each
-finding the previous submission was sent back over. That is the one moment when
-the answer is cheap: the author has just been in the code.
+finding the previous submission was sent back over — confirmed or unresolved.
+That is the one moment when the answer is cheap: the author has just been in
+the code.
 
 **The author's account is not the human's judgement.** It is stored in its own
 table and never counted as a disposition — see the ``create_finding_outcomes``
@@ -47,11 +51,16 @@ NO_CONFIRMED_INDEX = -1
 async def open_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> list[dict[str, Any]]:
-    """Confirmed findings of THIS generation that their author has not closed.
+    """Confirmed and unresolved findings of THIS generation not yet closed.
 
     ``generation`` is the one being resubmitted OVER — the submission whose
     report sent the work back. The report for the submission being made does
     not exist yet, so asking about it would be asking about the future.
+
+    Both sections of that report are owed an answer (#1085). Confirmed is the
+    defect the adjudicators agreed on; unresolved is the one they split on.
+    Asking only about confirmed is how six real defects from five paid runs
+    left no row in the ledger.
 
     One ROW PER REPORT, not per uid. The profile ladder (#879) can leave a lite
     run and a deep run on one submission, and both may carry the same defect —

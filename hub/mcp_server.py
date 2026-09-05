@@ -1663,9 +1663,9 @@ async def hub_submit_for_review(
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    This does NOT complete the task, and the verdict is not yours: the
-    reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Bumps the generation, invalidating any earlier APPROVED.
+    This does NOT complete the task; the verdict is a different actor's
+    (hub_get_review_brief, hub_submit_review). Bumps the generation,
+    invalidating any earlier APPROVED.
 
     Args:
         task_id: The running pair task ID
@@ -1675,15 +1675,14 @@ async def hub_submit_for_review(
             canonical name pair-start gave you; a mismatch is refused naming
             both. Omitting it skips the check — reported, not observed (#533).
         model: The model that wrote this submission (#758) — declared, not
-            proven. The diversity rule needs it: empty keeps the verdict with
-            the human.
+            proven. Diversity needs it; empty keeps the verdict with the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
             affected_areas (#890), visibly.
         finding_outcomes: [{finding_uid, outcome, note?, linked_task_id?}] —
-            what became of the findings this resubmission was sent back over
-            (#911). outcome: fixed | false_positive | wont_fix | deferred; all
-            but fixed owe a note. The last two leave a defect draft unless
-            linked_task_id names existing work.
+            previous findings (#911, #1085). Confirmed: fixed | false_positive
+            | wont_fix | deferred. Unresolved: real_fixed | real_deferred |
+            not_a_defect | not_judged. All but a fix owe a note; leftover
+            defects leave a draft unless linked_task_id names existing work.
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None

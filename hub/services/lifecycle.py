@@ -1980,7 +1980,7 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
                 raise HTTPException(422, finding_outcome.refusal_text(still_open))
             state.outcome_note = (
                 f"Исходы находок: НЕ названы для {len(still_open)} "
-                "подтверждённых находок предыдущей сдачи. Режим проверки — "
+                "находок предыдущей сдачи. Режим проверки — "
                 "warn, сдача принята. " + finding_outcome.refusal_text(still_open)
             )
 
