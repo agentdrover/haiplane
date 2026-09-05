@@ -615,3 +615,39 @@ async def test_a_human_project_gets_no_verdict(
     body = (await client.get(f"/api/tasks/{task_id}")).json()
     assert body["review_verdict"] is None
     assert body["status"] == "review", "вердикт остаётся человеку"
+
+
+async def test_an_unresolved_finding_leaves_the_verdict_to_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1170: the unresolved section is a silent refusal too — and only it.
+
+    The rule now lives in gate_grounds so the steward reads the same list, so
+    it needs its own run on auto-verdict's live path: a twin of the clean
+    baseline differing in nothing but a non-empty ``unresolved``. The clean
+    half is what makes it a proof rather than a coincidence — otherwise a
+    setup broken for some unrelated reason would pass this test unchanged.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+
+    clean = await _submitted_task(client, db, "spike-unres-clean", {"verdict": "auto"})
+    await _post_review(client, clean)
+    assert (await client.get(f"/api/tasks/{clean}")).json()["review_verdict"] == (
+        "approved"
+    ), "the baseline must be approved, or the twin below proves nothing"
+
+    unresolved = await _submitted_task(client, db, "spike-unres", {"verdict": "auto"})
+    await _post_review(
+        client,
+        unresolved,
+        unresolved=[{"title": "adjudicators split on the poller race"}],
+    )
+
+    body = (await client.get(f"/api/tasks/{unresolved}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] != "approved", (
+        "a finding nobody could judge is not a clean report"
+    )
+    assert not await _events(db, "verdict_escalated", unresolved), (
+        "unresolved is a silent refusal, not an escalation trigger"
+    )
