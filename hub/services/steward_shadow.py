@@ -40,6 +40,7 @@ from hub.db import fetchall
 from hub.integrations import cursor_cloud
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
+    KIND_VERDICT,
     RUN_OPEN,
     close_run,
     configured_mode,
@@ -252,10 +253,23 @@ def _prompt(task_id: int, generation: int, hub_base: str, delivery: str) -> str:
 
 
 async def _open_orders_without_runs(db: aiosqlite.Connection) -> list[dict]:
+    """Открытые заказы, которые некому исполнять — ТОЛЬКО вердиктные (#1160).
+
+    С появлением второго вида заказов (``kind='dor'``) выборка без фильтра
+    стала опасной, а не просто широкой: ``start_run`` собирает пакет СДАЧИ —
+    ветку, закреплённый sha, отчёт машинного ревью — и на драфте ничего
+    этого нет. Прогон был бы оплачен и прочитал бы не то, о чём его
+    спрашивали.
+
+    Исполнитель DoR-прогонов приходит своей задачей вместе с пакетом драфта.
+    До тех пор заказ стоит открытым и закрывается по дедлайну слота: заказ,
+    который никто не исполнил, стоит ноль — в отличие от исполненного не по
+    тому пакету.
+    """
     rows = await fetchall(
         db,
-        "SELECT * FROM steward_runs WHERE status=? AND agent_id=''",
-        (RUN_OPEN,),
+        "SELECT * FROM steward_runs WHERE status=? AND agent_id='' AND kind=?",
+        (RUN_OPEN, KIND_VERDICT),
     )
     return [dict(r) for r in rows]
 
