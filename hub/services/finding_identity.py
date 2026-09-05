@@ -161,13 +161,18 @@ def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
 
 
 #: What the material of an unresolved finding's id starts with (#1085).
-#: An unresolved record carries a title and nothing else — no file, no line,
-#: no category — so a confirmed finding that also never said where it sits
-#: would hash to exactly the same material under the same title. The section
-#: therefore enters the identity: without it one author's answer about a
-#: confirmed defect would silently close an unresolved record they never
-#: looked at. It is prepended ONLY here, so every confirmed uid stays the
-#: value it already was.
+#:
+#: Honest about how much work this does. TODAY the two sections cannot collide
+#: even without it: a confirmed finding's material is five components and an
+#: unresolved one's is a title, so the shapes differ whatever the words are.
+#: That separation is an UNSTATED invariant of the confirmed material's shape,
+#: and it holds only until someone adds or drops a component there. The label
+#: says out loud what the shape says by accident, and it is the half that
+#: survives such a change. A mutation removing it therefore breaks no test —
+#: verified rather than assumed — and that is a property of today's shape, not
+#: evidence that the label is decorative.
+#:
+#: Prepended ONLY here, so every confirmed uid stays the value it already was.
 _UNRESOLVED_NAMESPACE = "unresolved"
 
 
