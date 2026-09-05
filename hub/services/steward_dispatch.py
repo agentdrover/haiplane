@@ -50,11 +50,23 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
+from hub.services.project_policy import gate_policy_of
 
 log = logging.getLogger(__name__)
 
 KIND_VERDICT = "verdict"
+# Второй вид работы того же диспетчера (#1160): суждение о ПОСТАНОВКЕ драфта,
+# а не о сдаче. Второй вид, а не второй диспетчер — второй означал бы вторую
+# суточную квоту и второй счётчик отказов, которые никто не сверяет с первыми.
+#
+# Считается ревизиями постановки (``statement_generation``, #1156), а не
+# поколениями сдачи: у драфта сдач нет, и ``submission_generation`` у него
+# навсегда ноль. Оба вида стоят на одном уникальном индексе
+# (task_id, generation, kind) — поэтому каждый читатель этой таблицы обязан
+# спрашивать kind: генерация 1 у вердикта и генерация 1 у DoR описывают
+# РАЗНЫЕ вещи, и слот одного не смеет закрывать слот другого.
+KIND_DOR = "dor"
 
 RUN_OPEN = "open"
 RUN_JUDGED = "judged"
@@ -163,6 +175,40 @@ async def open_run(
     return dict(rows[0]) if rows else None
 
 
+async def _revision_missing(
+    db: aiosqlite.Connection, task_id: int, generation: int, kind: str
+) -> str:
+    """Почему платить не за что, или "" если ревизия есть.
+
+    «Ревизия, которой нет» у двух видов работы означает разное, и разница
+    не косметическая — она про ноль.
+
+    ``verdict`` считает ПОКОЛЕНИЯ СДАЧИ, и они начинаются с единицы: ноль
+    значит «сдачи не было», судить нечего.
+
+    ``dor`` считает РЕВИЗИИ ПОСТАНОВКИ, и ноль у них законен — это первая
+    редакция драфта, которую никто не правил. Не поколение, а ОТПЕЧАТОК
+    отвечает здесь на вопрос «есть ли ревизия»: пустой означает, что базис
+    не снят (#1166), и прогон лёг бы на ревизию, которую первая же пустая
+    правка объявит другой. Диспетчер снимает базис до заказа, но проверка
+    стоит в самой оплачиваемой операции — там, где её нельзя обойти,
+    позвав ``order_run`` мимо диспетчера.
+    """
+    if kind != KIND_DOR:
+        return "" if generation > 0 else "у задачи нет закреплённой сдачи"
+    if generation < 0:
+        return "поколение постановки отрицательно"
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return "задачи нет"
+    if not str(dict(row).get("statement_fingerprint") or ""):
+        return (
+            "базис постановки не снят: отпечаток пуст, и ревизии, за которую "
+            "платят, ещё не существует"
+        )
+    return ""
+
+
 async def order_run(
     db: aiosqlite.Connection,
     task_id: int,
@@ -183,10 +229,9 @@ async def order_run(
             f"STEWARD_MODE={config.STEWARD_MODE!r} — контур закрыт",
         )
         return None
-    if generation <= 0:
-        await _refuse(
-            db, task_id, REFUSED_NO_GENERATION, "у задачи нет закреплённой сдачи"
-        )
+    missing = await _revision_missing(db, task_id, generation, kind)
+    if missing:
+        await _refuse(db, task_id, REFUSED_NO_GENERATION, missing)
         return None
 
     project = await repo.resolve_project_for_task(db, task_id)
@@ -288,19 +333,24 @@ async def close_run(
     return True
 
 
-def _policy_wants_steward(project_row: Any | None) -> bool:
-    """Does the project's own gate policy ask for a steward verdict (#743)?
+def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> bool:
+    """Does the project's own gate policy hand THIS gate to the steward (#743)?
+
+    Один вопрос на два гейта, а не два похожих читателя: вердикт и DoR
+    делегируются одним и тем же словом, и правило «нераспознанное значение
+    читается как человек» (#835) у них общее. Второй читатель рядом с первым
+    разъехался бы — и разъехался бы тот, который мягче.
 
     Resolution failures refuse toward the human, like every other read of this
     policy: a project that cannot be resolved has not asked for anything.
+
+    Сравнение со строкой ``steward`` живёт ровно здесь и нигде больше — #1157
+    заводит перечень делегирующих значений ключа ``dor`` и один читатель для
+    него, и заменить придётся одно место, а не каждое употребление.
     """
     if project_row is None:
         return False
-    try:
-        policy = json.loads(dict(project_row).get("gate_policy") or "{}")
-    except ValueError:
-        return False
-    return isinstance(policy, dict) and policy.get("verdict") == "steward"
+    return gate_policy_of(project_row).get(gate) == "steward"
 
 
 async def _nothing_new_since(
@@ -421,7 +471,13 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
 
 
 async def _close_generation_as_refused(
-    db: aiosqlite.Connection, task_id: int, generation: int, detail: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    detail: str,
+    *,
+    kind: str = KIND_VERDICT,
+    reason: str = REFUSED_NO_NEW_INFORMATION,
 ) -> None:
     """Закрыть генерацию для заказа — строкой, а не только словом.
 
@@ -452,7 +508,7 @@ async def _close_generation_as_refused(
             (
                 task_id,
                 generation,
-                KIND_VERDICT,
+                kind,
                 RUN_REFUSED,
                 config.STEWARD_MODEL,
                 project_id,
@@ -469,26 +525,37 @@ async def _close_generation_as_refused(
         task_id=task_id,
         actor="hub",
         payload={
-            "reason": REFUSED_NO_NEW_INFORMATION,
+            "reason": reason,
             "detail": detail,
             "generation": generation,
+            "kind": kind,
         },
     )
     await db.commit()
 
 
-async def _settled(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+async def _settled(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kind: str = KIND_VERDICT,
+) -> bool:
     """Is this generation already decided — judged, timed out, superseded, refused?
 
     Anything that is not an OPEN slot counts: the question is not "did a
     judgement land" but "is there anything left to order here", and a
     refusal (#1150) answers it as firmly as a judgement does.
+
+    Спрашивает KIND, потому что слот стоит на тройке (#1160). Без него
+    вердиктный прогон на поколении 1 объявлял бы решённой ревизию 1
+    ПОСТАНОВКИ — два разных счётчика, случайно совпавших числом, и драфт
+    молча остался бы непрочитанным.
     """
     rows = await fetchall(
         db,
-        "SELECT 1 FROM steward_runs WHERE task_id=? AND generation=? "
+        "SELECT 1 FROM steward_runs WHERE task_id=? AND generation=? AND kind=? "
         "AND status != ? LIMIT 1",
-        (task_id, generation, RUN_OPEN),
+        (task_id, generation, kind, RUN_OPEN),
     )
     return bool(rows)
 
@@ -512,19 +579,50 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         # #1120 review: a resubmission ends the run too. Its subject stopped
         # being the thing under review, and a slot left open would hold the
         # daily cap and the evidence door for code nobody is judging any more.
-        current_generation = int(task.get("submission_generation") or 0)
+        #
+        # #1160: у DoR-прогона тот же довод, но ДРУГОЙ счётчик — правка
+        # постановки, а не пересдача. Спросить у драфта submission_generation
+        # значило бы сравнивать его ревизию с вечным нулём: слот не закрылся
+        # бы никогда, а после первой же сдачи закрылся бы разом и не по делу.
+        kind = str(run.get("kind") or KIND_VERDICT)
+        moved_on = (
+            "submission_generation" if kind == KIND_VERDICT else "statement_generation"
+        )
+        current_generation = int(task.get(moved_on) or 0)
         if task and current_generation > int(run["generation"]):
             await close_run(
                 db,
                 run,
                 RUN_SUPERSEDED,
-                f"работа пересдана: генерация {current_generation} вместо "
-                f"{run['generation']} — этот прогон судил другой код",
+                (
+                    f"работа пересдана: генерация {current_generation} вместо "
+                    f"{run['generation']} — этот прогон судил другой код"
+                    if kind == KIND_VERDICT
+                    else f"постановку правили: ревизия {current_generation} "
+                    f"вместо {run['generation']} — этот прогон читал другой текст"
+                ),
             )
             closed += 1
             continue
+        # DoR-апрув драфта человеком выглядит иначе, чем вердикт: он меняет
+        # СТАТУС. Слот, оставленный открытым после него, стоял бы до дедлайна
+        # и ждал исполнителя для постановки, которую уже одобрили или
+        # отклонили (незакрытая находка ревью #238). Квоту это не вернёт —
+        # заказ уже оплачен, и runs_today считает закрытые строки тоже, — но
+        # прогон, который никому не нужен, не должен выглядеть заказанным.
+        if task and kind == KIND_DOR and task.get("status") != "draft":
+            if await close_run(
+                db,
+                run,
+                RUN_SUPERSEDED,
+                f"драфт больше не драфт (статус {task.get('status')!r}) — "
+                "постановку уже решили без стюарда",
+            ):
+                closed += 1
+            continue
+        # Человеческий вердикт — про сдачу, и закрывает он слот сдачи.
         verdict_generation = task.get("review_verdict_generation")
-        if task and verdict_generation == run["generation"]:
+        if task and kind == KIND_VERDICT and verdict_generation == run["generation"]:
             if await close_run(
                 db,
                 run,
@@ -549,6 +647,100 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
     return closed
 
 
+async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
+    """Заказать чтение постановки каждому драфту, который его ждёт (#1160).
+
+    Второй вид работы того же диспетчера. Всё, что делает первый — общая
+    суточная квота, at-most-once на слоте, отказ ДО старта, — здесь не
+    повторено, а ПЕРЕИСПОЛЬЗОВАНО: заказ размещает та же ``order_run``, и
+    потолок она считает по всей таблице, а не по своему виду.
+
+    Порядок стражей — это порядок цен, и он единственный правильный:
+
+    1. политика проекта: гейт DoR отдан стюарду, иначе драфт не наш;
+    2. АВТОПИЛОТ, и до всего платного. Правило снимает драфты низких классов
+       по формальным признакам (#584), и заказывать за деньги чтение того,
+       что уже снято бесплатно, значит платить за сделанную работу. Здесь же
+       и причина спрашивать его именно вызовом, а не копией условий: копия
+       разъедется, и разъедется в сторону лишнего прогона;
+    3. базис постановки — до заказа, потому что заказ на ревизию, которой
+       нет, покупает вторую ревизию сам себе (см. ``baseline_if_absent``);
+    4. слот и решённость — ровно те же, что у вердикта, но спрошенные с
+       kind: числа двух счётчиков совпадают случайно;
+    5. суждение на этой ревизии уже есть — отказ ДО старта, урок #1150:
+       отказ до заказа стоит ноль, отказ после — полный прогон.
+    """
+    if not dispatcher_enabled():
+        return 0
+    ordered = 0
+    # Сужение — в ЗАПРОСЕ, а не фильтром в памяти: драфтов в базе больше,
+    # чем задач в review, и тик поллера ходит по ним каждые тридцать секунд.
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE status='draft' AND dor_passed=1 AND archived=0",
+    )
+    for row in rows:
+        task_id = int(dict(row)["id"])
+        project = await repo.resolve_project_for_task(db, task_id)
+        # Политика спрашивается ДО write-лока: чужой проект не должен
+        # заставлять поллер занимать запись на каждом тике.
+        if not _policy_wants_steward(project, gate="dor"):
+            continue
+        if await _order_one_dor_run(db, task_id):
+            ordered += 1
+    return ordered
+
+
+async def _order_one_dor_run(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Решение по одному драфту — ЦЕЛИКОМ под write-локом (находка ревью #238).
+
+    Выборка выше снимает id запросом ``status='draft'``, и до этой правки
+    статус больше не читался: между выборкой и заказом законно вклинивался
+    человеческий апрув с другого соединения, и слот kind=dor ложился на
+    задачу, которая уже не драфт. Строка занимала общую суточную квоту, и
+    отменить это было нечем — заказ и есть оплата.
+
+    Перечитать статус мало: перечитанное устаревает к следующей строке
+    кода. Поэтому решение целиком идёт под ``BEGIN IMMEDIATE`` — тот же
+    приём, каким закрыта схема «проверил — вставил» (#1065): апрув с
+    другого соединения либо успел до нас и виден в перечитанной строке,
+    либо ждёт очереди и увидит уже размещённый заказ. Ровно этой же
+    транзакцией закрывается и окно между снятием базиса и заказом.
+    """
+    from hub.services.auto_approve import maybe_auto_approve
+    from hub.services.statement_generation import baseline_if_absent
+
+    async with write_transaction(db):
+        if await maybe_auto_approve(db, task_id):
+            # Драфт снят правилом и больше не драфт. Коммитит блок: автопилот
+            # пишет в транзакции вызывающего (#584), а вызывающий здесь мы.
+            return False
+        fresh = await repo.get_task(db, task_id)
+        task = dict(fresh) if fresh is not None else {}
+        if task.get("status") != "draft" or not task.get("dor_passed"):
+            # Задачу увели, пока мы шли по списку. Платить за чтение
+            # постановки, которую уже одобрили или отклонили, нечем.
+            return False
+        generation = await baseline_if_absent(db, task_id)
+        if await open_run(db, task_id, generation, KIND_DOR) is not None:
+            return False
+        if await _settled(db, task_id, generation, KIND_DOR):
+            return False
+        judged = await repo.get_steward_judgement(db, task_id, generation, KIND_DOR)
+        if judged is not None:
+            await _close_generation_as_refused(
+                db,
+                task_id,
+                generation,
+                f"суждение о постановке на ревизии {generation} уже есть — "
+                "текст с тех пор не менялся, и прогон вернул бы то же мнение, "
+                "посчитанное второй раз",
+                kind=KIND_DOR,
+            )
+            return False
+        return await order_run(db, task_id, generation, KIND_DOR) is not None
+
+
 async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     """One poller pass: close what is over, order what is due, start what waits.
 
@@ -556,6 +748,13 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     slot that is already over, and ordering before starting means an order
     placed this tick is executed in the same pass rather than thirty seconds
     later — the judge is cheap to call and expensive to keep waiting.
+
+    Вердикты заказываются раньше драфтов, и это решение про общую квоту
+    (#1160): когда потолка на всех не хватает, упирается в него тот, кто
+    просит вторым. Сдача, стоящая в review, ждёт суждения о коде, который
+    уже написан; драфт подождёт до завтрашних суток дешевле. Если окажется,
+    что драфты регулярно вытесняются — это разговор про величину квоты, и
+    он записан в условии пересмотра задачи, а не решается здесь молча.
 
     The corridor check comes last of all (#1145): it reads judgements this
     same pass may have just recorded closing runs above, but touches no run
@@ -565,5 +764,6 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
 
     await close_finished_runs(db)
     await order_due_runs(db)
+    await order_due_dor_runs(db)
     await start_due_runs(db)
     await check_escalation_corridor(db)

@@ -1015,3 +1015,297 @@ async def test_the_refusal_says_when_the_hub_looked_and_saw_nothing(
     assert not any("посмотреть НЕ СМОГ" in d for d in unclosed), (
         f"наблюдение было — называть его отсутствием нельзя: {unclosed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1170 — раздел unresolved: тот же счёт, что и у автовердикта
+# ---------------------------------------------------------------------------
+
+_UNRESOLVED_A = {
+    "title": "гонка в поллере: адъюдикаторы разошлись",
+    "why": "один за, один против, третий не высказался",
+}
+_UNRESOLVED_B = {
+    "title": "вторая неразрешённая того же отчёта",
+    "why": "спор о том, достижим ли путь вообще",
+}
+
+
+def _unresolved_uid(finding: dict) -> str:
+    from hub.services.finding_identity import unresolved_uids
+
+    return unresolved_uids([finding])[0]
+
+
+async def _outcome_named_by_the_author(
+    db: aiosqlite.Connection,
+    task_id: int,
+    finding: dict,
+    outcome: str,
+    *,
+    linked_task_id: int | None = None,
+) -> None:
+    """Исход неразрешённой находки, записанный так, как его пишет гейт сдачи.
+
+    Против ПРЕДЫДУЩЕГО отчёта, а не против судимого: именно так их пишет
+    lifecycle._step_finding_outcomes — генерацией до бампа. Тест, положивший
+    строку на текущий review_id, проверял бы состояние, которого в проде не
+    бывает.
+    """
+    from hub.services.finding_outcome import KIND_UNRESOLVED, NO_CONFIRMED_INDEX
+
+    previous = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=0,
+        harness_skill="multi-agent-review",
+        harness_version=1,
+        agent_count=11,
+        tokens_spent=None,
+        duration_ms=1000,
+        orchestrator="cursor",
+        model="grok-4.6",
+        raw_count=7,
+        findings_confirmed=json.dumps([]),
+        findings_rejected=json.dumps([]),
+        unresolved=json.dumps([finding]),
+        lost_dimensions=json.dumps([]),
+        incomplete=False,
+        submitted_by="cursor-cloud-reviewer",
+        self_reviewed=False,
+    )
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=int(previous),
+        task_id=task_id,
+        submission_generation=0,
+        finding_uid=_unresolved_uid(finding),
+        finding_index=NO_CONFIRMED_INDEX,
+        finding_title=str(finding["title"]),
+        outcome=outcome,
+        note="разобрано автором на пересдаче",
+        linked_task_id=linked_task_id,
+        reported_by="pda_claude",
+        finding_kind=KIND_UNRESOLVED,
+    )
+    await db.commit()
+
+
+async def test_unresolved_findings_block_a_dirty_approve(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: отчёт без confirmed, но с unresolved — approve не применяется.
+
+    Именно тот случай, который замер #163-#167 показал живым: 0
+    подтверждённых, 6 неразрешённых, и все шесть оказались настоящими
+    дефектами. До этой задачи привратник такой отчёт не отличал от чистого.
+
+    Отказ обязан назвать находки ПОИМЁННО. Отказ «у вас две неразрешённые
+    находки» заставляет человека идти искать, какие две, — а хаб уже знает.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unresolved")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[], unresolved=[_UNRESOLVED_A, _UNRESOLVED_B])
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED in _codes(refusals), (
+        f"неразрешённые находки обязаны остановить применение: {refusals}"
+    )
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    for finding in (_UNRESOLVED_A, _UNRESOLVED_B):
+        uid = _unresolved_uid(finding)
+        assert any(uid in d and str(finding["title"])[:40] in d for d in unclosed), (
+            f"находка {finding['title']!r} ({uid}) обязана назвать себя: {unclosed}"
+        )
+
+
+async def test_steward_refuses_where_auto_verdict_refuses(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: обещание «те же основания» — перечислением, а не примером.
+
+    Опись того, за что нужно отчитаться, живёт в gate_grounds и читается
+    обоими (#1170). Проверяется КАЖДЫЙ её член: основание, добавленное туда и
+    забытое у стюарда, тихо расширило бы автономию — ровно так и вышло с
+    unresolved, который автовердикт считал с самого начала, а стюард не
+    смотрел вовсе.
+
+    Через настоящий вход apply_refusals, а не через предикат рядом с ним.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-same-grounds")
+
+    # Каждый член описи заводит СВОЙ прогон, испорченный ровно им одним.
+    tripped: dict[str, dict] = {
+        "confirmed": {"confirmed": [_FINDING_A]},
+        "unresolved": {"unresolved": [_UNRESOLVED_A]},
+        "incomplete": {"incomplete": True},
+    }
+    assert set(tripped) == set(grounds.UNATTENDED_BLOCKERS), (
+        "опись оснований и этот тест обязаны совпадать: основание, "
+        f"добавленное в {grounds.UNATTENDED_BLOCKERS} и забытое здесь, "
+        "осталось бы непроверенным у стюарда"
+    )
+
+    for blocker, spoiled in tripped.items():
+        task_id = await _task(db, project_id)
+        await _green(db, task_id, **spoiled)
+
+        # То, по чему отказывает автовердикт — та самая функция, которую он
+        # вызывает, на тех же данных отчёта.
+        named = grounds.unattended_blockers(
+            spoiled.get("confirmed") or [],
+            spoiled.get("unresolved") or [],
+            bool(spoiled.get("incomplete")),
+        )
+        assert named == (blocker,), (
+            f"автовердикт обязан назвать {blocker!r} и только его: {named}"
+        )
+
+        refusals = await apply_refusals(db, task_id)
+        assert refusals, (
+            f"{blocker}: стюард обязан отказать там, где отказывает автовердикт"
+        )
+        blob = " ".join(d for _, d in refusals)
+        assert blocker in blob or REFUSED_UNCLOSED in _codes(refusals), (
+            f"{blocker}: отказ обязан быть про него, а не про что-нибудь ещё: "
+            f"{refusals}"
+        )
+
+
+async def test_clean_report_still_applies(db: aiosqlite.Connection, monkeypatch):
+    """AC-3: без подтверждённых и без неразрешённых находок — претензий нет.
+
+    Проверка, умеющая только отказывать, неотличима от выключателя. Здесь
+    зеркало правила: разделы пусты, и по находкам привратник молчит.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-clean-sections")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[], unresolved=[])
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED not in _codes(refusals), (
+        f"чистый отчёт по находкам не задерживается: "
+        f"{[d for c, d in refusals if c == REFUSED_UNCLOSED]}"
+    )
+
+
+async def test_an_author_outcome_closes_an_unresolved_finding(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Зеркало нового типа: названная автором судьба ПРОПУСКАЕТ.
+
+    Иначе правило про unresolved — выключатель контура, а не гейт, и грязный
+    путь схлопывается ровно на тех задачах, ради которых построен.
+
+    Цикл, который здесь проверяется целиком: находка доехала до автора,
+    автор назвал её судьбу словарём #1085, хаб записал строку сам — и стюард
+    опирается на эту строку, а не на собственное мнение о находке.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-author-outcome")
+    task_id = await _task(db, project_id)
+    await _outcome_named_by_the_author(db, task_id, _UNRESOLVED_A, "not_a_defect")
+    await _green(db, task_id, confirmed=[], unresolved=[_UNRESOLVED_A])
+    await _judged_with(
+        db,
+        task_id,
+        [{"finding_uid": _unresolved_uid(_UNRESOLVED_A), "type": "author_outcome"}],
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_UNCLOSED not in _codes(refusals), (
+        f"судьба названа автором и записана хабом — это закрытие: "
+        f"{[d for c, d in refusals if c == REFUSED_UNCLOSED]}"
+    )
+
+
+async def test_not_judged_is_not_a_fate(db: aiosqlite.Connection, monkeypatch):
+    """«Никто не разбирался» — не судьба находки, а её отсутствие.
+
+    Словарь #1085 завёл not_judged ровно затем, чтобы «посмотрел, не дефект»
+    перестало быть неотличимо от «не смотрел». Принять его закрытием значило
+    бы стереть различие, ради которого слово и заведено.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-not-judged")
+    task_id = await _task(db, project_id)
+    await _outcome_named_by_the_author(db, task_id, _UNRESOLVED_A, "not_judged")
+    await _green(db, task_id, confirmed=[], unresolved=[_UNRESOLVED_A])
+    await _judged_with(
+        db,
+        task_id,
+        [{"finding_uid": _unresolved_uid(_UNRESOLVED_A), "type": "author_outcome"}],
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert unclosed, "not_judged закрытием быть не может"
+    assert any("not_judged" in d for d in unclosed), (
+        f"отказ обязан сказать, ЧТО хаб увидел, а не только чего ждал: {unclosed}"
+    )
+
+
+async def test_author_outcome_does_not_close_a_confirmed_finding(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Поведение confirmed не меняется: новый тип к нему неприменим.
+
+    Про подтверждённую находку слово автора уже разобрано в #1148 и
+    закрытием не является. Тип, годный везде, тихо ослабил бы правило для
+    раздела, которого эта задача не касается.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-outcome-on-confirmed")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id, confirmed=[_FINDING_A])
+    await _judged_with(
+        db, task_id, [{"finding_uid": _uid(_FINDING_A), "type": "author_outcome"}]
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    unclosed = [d for c, d in refusals if c == REFUSED_UNCLOSED]
+    assert any("unresolved" in d and _uid(_FINDING_A) in d for d in unclosed), (
+        f"отказ обязан назвать, к какому разделу тип применим: {unclosed}"
+    )
+
+
+def test_every_closure_type_names_the_sections_it_fits():
+    """Опись применимости и словарь типов обязаны совпадать.
+
+    Тип, добавленный в #1022 и забытый здесь, упал бы на KeyError на живом
+    применении — или, если бы опись читалась мягко, стал бы годен везде.
+    Проверяется перечислением, а не примером.
+    """
+    from hub.models import STEWARD_CLOSURE_TYPES
+    from hub.services.steward_apply import CLOSURE_SECTIONS
+
+    assert set(CLOSURE_SECTIONS) == set(STEWARD_CLOSURE_TYPES)
+    for kind, sections in CLOSURE_SECTIONS.items():
+        assert sections, f"{kind}: тип без разделов применим нигде"
+        assert set(sections) <= set(grounds.ACCOUNTABLE_SECTIONS), (
+            f"{kind}: раздел вне описи {grounds.ACCOUNTABLE_SECTIONS}"
+        )
+
+
+def test_accountable_sections_are_a_subset_of_the_blockers():
+    """Разделы с находками — часть общей описи, а не список рядом с ней."""
+    from hub.services.steward_apply import _SECTION_NOUN
+
+    assert set(grounds.ACCOUNTABLE_SECTIONS) < set(grounds.UNATTENDED_BLOCKERS)
+    assert set(_SECTION_NOUN) == set(grounds.ACCOUNTABLE_SECTIONS), (
+        "у каждого раздела описи обязано быть имя в отказе: раздел, "
+        "добавленный в опись и забытый здесь, уронил бы привратника KeyError "
+        "на живом применении"
+    )
+    assert "incomplete" not in grounds.ACCOUNTABLE_SECTIONS, (
+        "incomplete — свойство прогона, а не список находок: разбирать по "
+        "одной там нечего, и у стюарда он закрыт предусловием"
+    )
