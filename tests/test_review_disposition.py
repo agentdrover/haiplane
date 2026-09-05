@@ -45,16 +45,32 @@ async def _submitted_task(client: AsyncClient, title: str) -> int:
     return task_id
 
 
+def _unresolved(title: str, why: str = "голоса разошлись") -> dict:
+    """Неразрешённая находка ровно той формы, что приходит с прода.
+
+    Ни файла, ни строки, ни категории: MachineUnresolvedFinding объявлена с
+    extra="forbid" и несёт только title и why. Проверено на живом отчёте #169
+    задачи #1084 — форма закрыта схемой, а не совпадением примера.
+    """
+    return {"title": title, "why": why}
+
+
 async def _report(
-    db: aiosqlite.Connection, task_id: int, generation: int, findings: list[dict]
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    findings: list[dict],
+    unresolved: list[dict] | None = None,
 ) -> int:
+    unresolved = unresolved or []
     await repo.insert_machine_review(
         db,
         task_id=task_id,
         submission_generation=generation,
         harness_skill="lite-diff-review",
-        raw_count=len(findings),
+        raw_count=len(findings) + len(unresolved),
         findings_confirmed=json.dumps(findings, ensure_ascii=False),
+        unresolved=json.dumps(unresolved, ensure_ascii=False),
         incomplete=False,
     )
     await db.commit()
@@ -361,3 +377,330 @@ async def test_a_named_task_replaces_the_draft(
     assert not [r for r in drafts if dict(r).get("caused_by_task_id") == task_id], (
         "работа уже названа автором — второе место учёта не заводится"
     )
+
+
+# --- Находки, о которых адъюдикаторы не договорились (#1085) ----------------
+#
+# Замер по пяти отчётам подряд (#163-#167, задачи #1083 и #1084, 30-31.08.2026):
+# 13 сырых кандидатов, 0 в findings_confirmed за все пять прогонов, 6 в
+# unresolved — и все шесть оказались настоящими дефектами. Гейт вёл себя верно
+# (auto_verdict отказывает при непустом unresolved), слепа была БУХГАЛТЕРИЯ:
+# open_findings читал ровно findings_confirmed, поэтому у неразрешённой находки
+# не было ни uid, ни исхода, ни предупреждения на пересдаче. Весь полезный
+# выход платных прогонов за две задачи не оставил в учёте ни одного следа.
+
+
+#: uid подтверждённой находки отчёта #169 задачи #1084, снятый с ПРОДА.
+#: Прибит гвоздём намеренно: материал, из которого он выводится, — контракт с
+#: уже вынесенными диспозициями. Сдвинется материал — каждое человеческое
+#: суждение перестанет находить свою находку, и упасть об этом должен тест, а
+#: не прод.
+LIVE_CONFIRMED_UID = "bf3c65f410eef64a"  # pragma: allowlist secret
+
+
+async def _sent_back(client: AsyncClient, task_id: int) -> None:
+    await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "comments": "чините",
+            "findings": [{"id": 1, "severity": "high", "message": "см отчёт"}],
+        },
+    )
+
+
+async def test_unresolved_finding_accepts_an_outcome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: у неразрешённой находки есть uid, и исход по нему принимается.
+
+    До этой правки автор задачи #1083 получал на этом месте 422: uid'ы
+    раздавались по findings_confirmed, а раздел, который нёс всю пользу
+    прогона, их не имел вовсе.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Unresolved owes an answer too")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    review_id = await _report(
+        db,
+        task_id,
+        1,
+        [],
+        [_unresolved("хвост промпта зовёт MCP, когда путь — HTTP")],
+    )
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    assert len(open_items) == 1, (
+        "неразрешённая находка ждёт ответа так же, как confirmed"
+    )
+    item = open_items[0]
+    assert item["finding_kind"] == "unresolved"
+    uid = item["finding_uid"]
+    assert uid, "у записи есть устойчивый uid"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {
+                    "finding_uid": uid,
+                    "outcome": "real_fixed",
+                    "note": "разобрал: порядок в промпте действительно жёг TTL",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    stored = [dict(r) for r in await repo.list_finding_outcomes(db, review_id)]
+    assert [r["outcome"] for r in stored] == ["real_fixed"]
+    assert [r["finding_kind"] for r in stored] == ["unresolved"], (
+        "читатель видит, что адъюдикаторы не сошлись, а решил автор"
+    )
+    assert [r["finding_uid"] for r in stored] == [uid]
+
+    # По этому же uid находку можно найти повторно: он выводится из содержания,
+    # а не выдаётся при записи.
+    again = await _report(
+        db,
+        task_id,
+        2,
+        [],
+        [
+            _unresolved(
+                "хвост промпта зовёт MCP, когда путь — HTTP", why="другими словами"
+            )
+        ],
+    )
+    assert again != review_id
+    assert [
+        i["finding_uid"] for i in await finding_outcome.open_findings(db, task_id, 2)
+    ] == [uid], (
+        "переформулированное объяснение — та же находка: why в идентичность не входит"
+    )
+
+
+async def test_undisposed_unresolved_is_named_on_resubmission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: неназванный исход неразрешённой находки НАЗЫВАЮТ поштучно.
+
+    В режиме warn сдача проходит — меняется видимость, а не жёсткость гейта, —
+    но предупреждение обязано назвать находку, а не её количество.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Warn names the unresolved")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(
+        db,
+        task_id,
+        1,
+        [],
+        [_unresolved("замыкание на ключе кэша")],
+    )
+    await _sent_back(client, task_id)
+
+    # Строгий режим идёт первым: он ничего не меняет в состоянии задачи, и та
+    # же сдача остаётся для второй половины проверки. Наоборот не выйдет —
+    # принятая сдача бампает поколение, а долг остаётся за предыдущим.
+    refused = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert refused.status_code == 422
+    assert "замыкание на ключе кэша" in refused.text, (
+        "отказ называет находку, а не её количество"
+    )
+
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, "режим warn не блокирует сдачу"
+
+    updates = (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    notes = "\n".join(u["content"] for u in updates)
+    assert "замыкание на ключе кэша" in notes, (
+        "предупреждение тоже называет находку поимённо"
+    )
+
+
+async def test_reports_written_before_the_change_still_read(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: у старого отчёта исходов нет — и это отсутствие, а не ошибка.
+
+    Золотое значение uid взято с ПРОДА: находка отчёта #169 задачи #1084
+    несёт finding_uid bf3c65f410eef64a. Если материал confirmed сдвинется
+    хоть на бит, каждая уже вынесенная человеком диспозиция перестанет
+    находить свою находку — поэтому число здесь прибито гвоздём.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    task_id = await _submitted_task(client, "Old reports keep reading")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    live = {
+        "title": (
+            "Восстановление из текста штампует отчёт текущим поколением "
+            "и обходит пин #1084"
+        ),
+        "severity": "high",
+        "category": "correctness",
+        "file": "hub/services/review_dispatch.py",
+        "line": 1433,
+        "locator": "lines",
+        "start_line": 1433,
+        "end_line": 1433,
+    }
+    review_id = await _report(
+        db, task_id, 1, [live], [_unresolved("никто не рассудил")]
+    )
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    confirmed = [i for i in open_items if i["finding_kind"] == "confirmed"]
+    assert [i["finding_uid"] for i in confirmed] == [LIVE_CONFIRMED_UID], (
+        "uid подтверждённой находки не изменился: живой отчёт #169 с прода"
+    )
+
+    assert await repo.list_finding_outcomes(db, review_id) == [], (
+        "у старого отчёта исходов нет — это отсутствие, а не ошибка чтения"
+    )
+
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert brief.status_code == 200, brief.text
+    report = brief.json()["machine_review"]
+    assert report["findings_confirmed"][0]["finding_uid"] == LIVE_CONFIRMED_UID
+    assert report["unresolved"][0]["finding_uid"], (
+        "uid проштампован на чтении и для неразрешённой находки"
+    )
+
+
+async def test_an_outcome_from_the_wrong_dictionary_is_refused(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Словарь confirmed отвечает про дефект, о котором ДОГОВОРИЛИСЬ.
+
+    Назвать неразрешённую находку false_positive значит записать, что гейт её
+    подтвердил, а автор объявил ложной. Гейт не подтверждал ничего — поэтому
+    чужое слово отклоняется, а не переводится молча.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Dictionaries do not mix")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(db, task_id, 1, [_finding("настоящая")], [_unresolved("спорная")])
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    conf_uid = next(
+        i["finding_uid"] for i in open_items if i["finding_kind"] == "confirmed"
+    )
+    unres_uid = next(
+        i["finding_uid"] for i in open_items if i["finding_kind"] == "unresolved"
+    )
+
+    wrong = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {"finding_uid": conf_uid, "outcome": "fixed"},
+                {
+                    "finding_uid": unres_uid,
+                    "outcome": "false_positive",
+                    "note": "её тут нет",
+                },
+            ]
+        },
+    )
+    assert wrong.status_code == 422, wrong.text
+    assert "real_fixed" in wrong.text, "отказ называет словарь, которым отвечают"
+
+    right = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {"finding_uid": conf_uid, "outcome": "fixed"},
+                {
+                    "finding_uid": unres_uid,
+                    "outcome": "not_a_defect",
+                    "note": "разобрал построчно: описанного пути нет",
+                },
+            ]
+        },
+    )
+    assert right.status_code == 200, right.text
+
+
+async def test_an_unexamined_unresolved_finding_leaves_a_defect_draft(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """«Не разбирал» — ответ, и он оставляет работу, а не тишину.
+
+    Отличие от «разобрал и отверг» — то самое, ради которого заведён свой
+    словарь: после not_judged дефект может быть в коде, и это надо кому-то
+    планировать.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Not judged leaves work")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await _report(db, task_id, 1, [], [_unresolved("подозрительный кэш")])
+    await _sent_back(client, task_id)
+    uid = (await finding_outcome.open_findings(db, task_id, 1))[0]["finding_uid"]
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [
+                {
+                    "finding_uid": uid,
+                    "outcome": "not_judged",
+                    "note": "не хватило времени на разбор, оставляю следующему",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    drafts = await repo.list_tasks_by_status(db, "draft", limit=20)
+    spawned = [dict(r) for r in drafts if dict(r).get("caused_by_task_id") == task_id]
+    assert len(spawned) == 1, "неразобранная находка остаётся работой"
+    assert "не разбиралась" in spawned[0]["description"], (
+        "драфт говорит, ЧТО с находкой произошло"
+    )
+    assert "адъюдикаторы" in spawned[0]["description"], (
+        "и что суждение здесь авторское: гейт находку не подтверждал"
+    )
+
+
+async def test_an_unresolved_twin_of_a_confirmed_finding_is_a_separate_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Один заголовок в двух разделах — две находки, а не одна.
+
+    У неразрешённой записи нет ни файла, ни строки, поэтому подтверждённая
+    находка без места и с тем же заголовком дала бы ровно тот же материал для
+    хеша. Раздел входит в идентичность именно поэтому: иначе ответ автора на
+    одну закрывал бы вторую, которой он не касался.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id = await _submitted_task(client, "Twins across sections")
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    same = "одна и та же формулировка"
+    await _report(
+        db,
+        task_id,
+        1,
+        [{"title": same, "severity": "high", "category": "", "locator": "none"}],
+        [_unresolved(same)],
+    )
+    await _sent_back(client, task_id)
+
+    open_items = await finding_outcome.open_findings(db, task_id, 1)
+    uids = {i["finding_kind"]: i["finding_uid"] for i in open_items}
+    assert len(open_items) == 2 and len(set(uids.values())) == 2, (
+        "разделы не схлопываются в один uid"
+    )
+
+    partial = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "finding_outcomes": [{"finding_uid": uids["confirmed"], "outcome": "fixed"}]
+        },
+    )
+    assert partial.status_code == 422, "вторая находка осталась без ответа"

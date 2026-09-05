@@ -1675,6 +1675,18 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON finding_outcomes(task_id, submission_generation)",
     ),
     (
+        # Which section of the report the answered finding came from (#1085).
+        # 'confirmed' for every row written before this column existed, which
+        # is what they all were: until now only confirmed findings could be
+        # answered at all. The kind is stored rather than inferred from the
+        # outcome word — the two dictionaries do not overlap TODAY, and a
+        # reader that leans on that keeps working only until someone adds a
+        # word to either one.
+        "add_finding_outcomes_kind",
+        "ALTER TABLE finding_outcomes ADD COLUMN finding_kind TEXT NOT NULL "
+        "DEFAULT 'confirmed'",
+    ),
+    (
         # Steward run orders (#1073). The hub places them; the steward never
         # does — a judge that can order its own run is a judge nobody called.
         # status: open → judged | timeout | superseded. #1075 already reads
@@ -2737,6 +2749,14 @@ category питает метрики повторяемости — исполь
 принадлежит `findings_rejected`. Лишние ключи отвергаются, а не отбрасываются
 молча (#553) — перепутанное имя раньше давало сохранённую находку с пустым
 объяснением.
+
+`finding_uid` не присылается и для `unresolved` (#1085): хаб выводит его из
+одного заголовка — больше у такой записи ничего и нет — и возвращает на каждом
+чтении отчёта, как у confirmed. `why` в id не входит: два прогона, описавшие
+один и тот же тупик разными словами, описали один тупик. Замер пяти отчётов
+подряд (#163–#167) показал, зачем это: 13 сырых кандидатов, 0 подтверждённых и
+6 неразрешённых — и все шесть оказались настоящими дефектами. Раздел, несущий
+всю пользу прогона, до этого нельзя было даже адресовать.
 """
 
 

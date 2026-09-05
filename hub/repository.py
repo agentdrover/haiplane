@@ -1411,6 +1411,7 @@ async def upsert_finding_outcome(
     note: str,
     linked_task_id: int | None,
     reported_by: str,
+    finding_kind: str = "confirmed",
 ) -> None:
     """Record one finding's fate as its author tells it.
 
@@ -1427,11 +1428,12 @@ async def upsert_finding_outcome(
     await db.execute(
         "INSERT INTO finding_outcomes (review_id, task_id, submission_generation, "
         "finding_uid, finding_index, finding_title, outcome, note, linked_task_id, "
-        "reported_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "reported_by, finding_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(review_id, finding_uid) DO UPDATE SET "
         "outcome=excluded.outcome, note=excluded.note, "
         "linked_task_id=excluded.linked_task_id, "
-        "reported_by=excluded.reported_by, reported_at=datetime('now')",
+        "reported_by=excluded.reported_by, finding_kind=excluded.finding_kind, "
+        "reported_at=datetime('now')",
         (
             review_id,
             task_id,
@@ -1443,6 +1445,7 @@ async def upsert_finding_outcome(
             note,
             linked_task_id,
             reported_by,
+            finding_kind,
         ),
     )
 

@@ -78,6 +78,7 @@ def _as_mapping(entry: Mapping[str, Any] | Any) -> Mapping[str, Any]:
             "start_line",
             "end_line",
             "line",
+            "why",
             "finding_uid",
         )
     }
@@ -159,6 +160,57 @@ def finding_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:_UID_CHARS]
 
 
+#: What the material of an unresolved finding's id starts with (#1085).
+#: An unresolved record carries a title and nothing else — no file, no line,
+#: no category — so a confirmed finding that also never said where it sits
+#: would hash to exactly the same material under the same title. The section
+#: therefore enters the identity: without it one author's answer about a
+#: confirmed defect would silently close an unresolved record they never
+#: looked at. It is prepended ONLY here, so every confirmed uid stays the
+#: value it already was.
+_UNRESOLVED_NAMESPACE = "unresolved"
+
+
+def unresolved_uid(entry: Mapping[str, Any] | Any, ordinal: int = 0) -> str:
+    """Content-derived id of one finding nobody managed to judge (#1085).
+
+    Measured over five deep runs (#163-#167): 13 raw candidates, zero
+    confirmed, six unresolved — and all six were real defects. Every one of
+    them was invisible to the outcome ledger, because ids were handed out over
+    ``findings_confirmed`` alone.
+
+    The material is the title and nothing else, because the record itself is
+    the title and nothing else: :class:`hub.models.MachineUnresolvedFinding`
+    forbids extra keys and declares exactly ``title`` and ``why``. ``why`` is
+    deliberately left out — it holds what the adjudicators said as they failed
+    to agree, and two runs describing one standoff in different words are
+    still one standoff. The cost is the same one confirmed ids pay: a reworded
+    title reads as a different finding, which is an honest miss rather than a
+    confident mismatch.
+    """
+    entry = _as_mapping(entry)
+    material = "\x1f".join((_UNRESOLVED_NAMESPACE, _normalised(entry.get("title"))))
+    if ordinal:
+        material = f"{material}\x1f{ordinal}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:_UID_CHARS]
+
+
+def unresolved_uids(entries: Sequence[Any]) -> list[str]:
+    """Ids for a whole ``unresolved`` list, twins disambiguated by position.
+
+    Same rule as :func:`finding_uids`, for the same reason: two records that
+    say the same thing are two rows an author has to answer separately.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for entry in entries:
+        base = unresolved_uid(entry)
+        ordinal = seen.get(base, 0)
+        out.append(base if ordinal == 0 else unresolved_uid(entry, ordinal))
+        seen[base] = ordinal + 1
+    return out
+
+
 def finding_uids(entries: Sequence[Any]) -> list[str]:
     """Ids for a whole ``findings_confirmed`` list, twins disambiguated.
 
@@ -204,7 +256,7 @@ def require_locator_decision(findings: Sequence[Any]) -> None:
     )
 
 
-def refuse_supplied_uid(findings: Sequence[Any]) -> None:
+def refuse_supplied_uid(findings: Sequence[Any], section: str = "confirmed") -> None:
     """Refuse a report that brings its own finding ids (#1007).
 
     The id is derived from content precisely so that two runs of a harness with
@@ -212,6 +264,10 @@ def refuse_supplied_uid(findings: Sequence[Any]) -> None:
     random by construction and would quietly win over the derived one, which is
     the failure this whole change exists to prevent — so it is refused loudly
     instead of ignored silently (#553).
+
+    ``section`` names the list being checked, because since #1085 unresolved
+    records carry the field too: a refusal that says "confirmed findings" about
+    an unresolved one sends the caller looking in the wrong list.
     """
     supplied = [
         idx
@@ -223,7 +279,7 @@ def refuse_supplied_uid(findings: Sequence[Any]) -> None:
     listed = ", ".join(f"#{i}" for i in supplied)
     raise HTTPException(
         422,
-        f"confirmed findings {listed} carry a finding_uid: the hub derives "
+        f"{section} findings {listed} carry a finding_uid: the hub derives "
         "that id from the finding's own content, so a submitted one is "
         "random by construction. Drop the field — the id comes back on every "
         "read of the report.",
@@ -235,4 +291,6 @@ __all__ = [
     "finding_uids",
     "refuse_supplied_uid",
     "require_locator_decision",
+    "unresolved_uid",
+    "unresolved_uids",
 ]
