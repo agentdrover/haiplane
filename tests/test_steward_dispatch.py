@@ -20,15 +20,19 @@ from hub.db import fetchall
 from hub.services.steward_dispatch import (
     EVENT_ORDERED,
     EVENT_REFUSED,
+    KIND_DOR,
     REFUSED_ALREADY_ORDERED,
     REFUSED_DAILY_CAP,
     REFUSED_MODE_OFF,
+    REFUSED_NO_GENERATION,
+    REFUSED_NO_NEW_INFORMATION,
     RUN_OPEN,
     RUN_REFUSED,
     RUN_SUPERSEDED,
     RUN_TIMEOUT,
     close_finished_runs,
     open_run,
+    order_due_dor_runs,
     order_due_runs,
     order_run,
 )
@@ -534,3 +538,557 @@ async def test_a_refusal_does_not_spend_the_daily_cap(
         "потолок 1 ещё не потрачен — отказ его не съел, и свежая сдача получает прогон"
     )
     assert await open_run(db, fresh, 1) is not None
+
+
+# ---------------------------------------------------------------------------
+# #1160 — второй вид работы того же диспетчера: чтение постановки драфта
+# ---------------------------------------------------------------------------
+
+
+async def _project_with_policy(
+    db: aiosqlite.Connection, slug: str, policy: dict
+) -> int:
+    """Проект с ПРОИЗВОЛЬНОЙ политикой гейтов.
+
+    Отдельно от ``_project`` выше, который умеет один ключ: смешанный день
+    (AC-3) требует проекта, отдавшего стюарду ОБА гейта, а граница —
+    проекта, отдавшего только вердикт.
+    """
+    project_id = await repo.create_project(
+        db, slug=slug, name=slug, workspace_path="", status="active"
+    )
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?",
+        (json.dumps(policy), project_id),
+    )
+    await db.commit()
+    return project_id
+
+
+_DOR_FIELDS: dict[str, object] = {
+    "work_type": "feature",
+    "user_story": "как владелец, я хочу X, чтобы Y",
+    "problem_statement": "что именно сломано",
+    "business_value": "зачем это надо",
+    "size": "S",
+    "wip_tag": "feature_work",
+    "scope_in": json.dumps(["hub/services/steward_dispatch.py"]),
+    "affected_areas": json.dumps(["hub/services/steward_dispatch.py"]),
+    "validation_commands": json.dumps(["uv run pytest -q"]),
+}
+
+
+async def _ready_draft(
+    db: aiosqlite.Connection, project_id: int, *, title: str = "драфт на прочтение"
+) -> int:
+    """Драфт, дошедший до dor_passed БЕЗ ЕДИНОГО refine.
+
+    Ровно тот случай, что воспроизведён в постановке на develop 6c22332:
+    задача создана целиком (у ``create_task_full`` тот же эффект — один
+    INSERT), поля постановки уже в строке, а базис не снят, потому что
+    снимают его пути ПРАВКИ. Готовность дописывается ленивой починкой при
+    чтении карточки (#1166) — она пишет dor_passed и не трогает отпечаток.
+
+    Поэтому здесь колонки пишутся напрямую, а не через ``refine_task``:
+    refine снял бы базис и сделал бы предусловие AC-5 недостижимым.
+    """
+    task_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, task_id, project_id=project_id, **_DOR_FIELDS)
+    await db.execute(
+        "INSERT INTO acceptance_criteria "
+        "(task_id, ac_id, given, when_clause, then_clause, verifiable_by, "
+        "test_ref, expectation_source, position) VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            "AC-1",
+            "дано",
+            "когда",
+            "тогда",
+            "test",
+            "tests/x.py::y",
+            "requirement",
+            0,
+        ),
+    )
+    await db.commit()
+
+    from hub.services.refinement import get_readiness
+
+    await get_readiness(db, task_id)
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["dor_passed"], "предусловие: драфт прошёл DoR"
+    assert row["statement_generation"] == 0, "предусловие: правок не было"
+    assert not row["statement_fingerprint"], "предусловие: базис не снят"
+    return task_id
+
+
+async def _runs(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    rows = await fetchall(
+        db, "SELECT * FROM steward_runs WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_a_draft_gets_one_dor_slot_per_revision(db: aiosqlite.Connection):
+    """AC-1: один слот kind=dor на текущую ревизию, и второй тик его не удваивает.
+
+    At-most-once здесь тот же, что у вердикта, но ключ другой: ревизия
+    ПОСТАНОВКИ (#1156). Дубль стоил бы второго оплаченного прогона за один и
+    тот же текст.
+    """
+    project_id = await _project_with_policy(db, "dor-one", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+
+    ordered = await order_due_dor_runs(db)
+
+    assert ordered == 1
+    run = await open_run(db, task_id, 0, KIND_DOR)
+    assert run is not None
+    assert run["status"] == RUN_OPEN
+    assert run["kind"] == KIND_DOR
+    events = [json.loads(e["payload"]) for e in await _events(db, EVENT_ORDERED)]
+    assert [e["kind"] for e in events] == [KIND_DOR]
+
+    # Второй тик — по той же ревизии, и покупать ему нечего.
+    assert await order_due_dor_runs(db) == 0
+    assert len(await _runs(db, task_id)) == 1
+
+
+async def test_the_autopilot_is_asked_before_paying(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: драфт, который снимает правило, платного прогона не получает.
+
+    Проверяются два разных утверждения, и второе — про ПОРЯДОК. Мало не
+    заказать прогон для снятого драфта: автопилот обязан быть спрошен ДО
+    того, как в таблице появилась хоть одна строка. Поэтому подмена сама
+    смотрит в steward_runs в момент вызова — иначе тест прошёл бы и на
+    реализации «сначала заказать, потом сообразить».
+
+    Подменяется именно автопилот, а не политика: композиция dor=steward с
+    автопилотом — предмет соседней задачи (#1157), а предмет ЭТОЙ — что
+    диспетчер спрашивает его вызовом и подчиняется ответу.
+    """
+    project_id = await _project_with_policy(db, "dor-autopilot", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    asked: list[int] = []
+
+    async def _approves(conn, tid):
+        rows = await fetchall(conn, "SELECT 1 FROM steward_runs", ())
+        assert not rows, (
+            "автопилот обязан быть спрошен ДО заказа: платить за работу, "
+            "которую снимает правило, нечем"
+        )
+        asked.append(tid)
+        await repo.update_task(conn, tid, status="open")
+        return True
+
+    monkeypatch.setattr(
+        "hub.services.auto_approve.maybe_auto_approve", _approves, raising=True
+    )
+
+    assert await order_due_dor_runs(db) == 0
+
+    assert asked == [task_id], "автопилот обязан быть спрошен, а не угадан"
+    assert await _runs(db, task_id) == []
+    assert dict(await repo.get_task(db, task_id))["status"] == "open"
+
+
+async def test_the_daily_cap_is_shared(db: aiosqlite.Connection, monkeypatch):
+    """AC-3: потолок один на два вида прогонов — проверено СМЕШАННЫМ днём.
+
+    Два отдельных дня ничего не доказали бы: своя квота у каждого вида
+    прошла бы такую проверку целиком. Здесь вердиктные прогоны выбирают
+    потолок, и DoR-прогон обязан упереться в него — в чужой, с его точки
+    зрения, счёт.
+    """
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 2)
+    project_id = await _project_with_policy(
+        db, "dor-cap", {"verdict": "steward", "dor": "steward"}
+    )
+    await _submitted_task(db, project_id)
+    await _submitted_task(db, project_id)
+    draft = await _ready_draft(db, project_id)
+
+    assert await order_due_runs(db) == 2, "вердиктные прогоны выбрали потолок"
+
+    assert await order_due_dor_runs(db) == 0
+    assert await _runs(db, draft) == [], "заказа нет вовсе — потолок общий"
+    refusals = [
+        json.loads(e["payload"])
+        for e in await _events(db, EVENT_REFUSED)
+        if e["task_id"] == draft
+    ]
+    assert [r["reason"] for r in refusals] == [REFUSED_DAILY_CAP]
+
+
+async def test_an_unchanged_draft_buys_no_run(db: aiosqlite.Connection):
+    """AC-4: суждение на этой ревизии уже есть — отказ ДО старта, и без квоты.
+
+    Урок #1150 дословно, только про постановку: прогон без новой информации
+    вернул бы то же мнение, посчитанное второй раз. Отказ до заказа стоит
+    ноль, отказ после — полный прогон, поэтому проверяется отсутствие
+    ЗАКАЗА, а не отсутствие суждения.
+    """
+    from hub.services.steward_dispatch import runs_today
+
+    project_id = await _project_with_policy(db, "dor-unchanged", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    # Базис снимает диспетчер, поэтому ревизия у суждения — та же, на
+    # которую он придёт: 0.
+    from hub.services.statement_generation import baseline_if_absent
+
+    generation = await baseline_if_absent(db, task_id)
+    await db.commit()
+    assert await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=generation,
+        kind=KIND_DOR,
+        submitted_verdict="approved",
+        verdict="approved",
+    )
+    await db.commit()
+
+    assert await order_due_dor_runs(db) == 0
+
+    assert [r["status"] for r in await _runs(db, task_id)] == [RUN_REFUSED], (
+        "строка есть, но это не заказ, а его невозможность: ревизия закрыта"
+    )
+    assert await open_run(db, task_id, generation, KIND_DOR) is None
+    assert await runs_today(db, project_id) == 0, "отказ не занимает квоту"
+    refusals = [
+        json.loads(e["payload"])
+        for e in await _events(db, EVENT_REFUSED)
+        if e["task_id"] == task_id
+    ]
+    assert [r["reason"] for r in refusals] == [REFUSED_NO_NEW_INFORMATION]
+    assert refusals[0]["kind"] == KIND_DOR
+
+
+async def test_a_draft_that_never_was_refined_buys_one_run(db: aiosqlite.Connection):
+    """AC-5: пустая правка после заказа второго прогона НЕ покупает.
+
+    Воспроизведено на develop 6c22332: драфт, приехавший готовым, лежит с
+    поколением 0 и ПУСТЫМ отпечатком, а чтение карточки его не снимает
+    (#1166). Без снятия базиса диспетчером первый же refine — в том числе
+    ничего не меняющий — сдвинул бы счётчик в 1, потому что пустая строка
+    не равна sha256 ни от чего, и купил бы второй платный прогон за
+    нетронутый текст.
+    """
+    project_id = await _project_with_policy(db, "dor-never-refined", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+
+    assert await order_due_dor_runs(db) == 1
+    assert [r["generation"] for r in await _runs(db, task_id)] == [0]
+    row = dict(await repo.get_task(db, task_id))
+    assert row["statement_generation"] == 0, (
+        "снятие базиса НЕ двигает счётчик: иначе сам заказ прогона стал бы "
+        "ревизией постановки и купил бы себе следующий"
+    )
+    assert row["statement_fingerprint"], "базис снят — ревизия 0 стала настоящей"
+
+    # Ничего не меняющий refine: те же значения, что уже в строке.
+    from hub.models import TaskRefine
+    from hub.services.refinement import refine_task
+
+    await refine_task(db, task_id, TaskRefine(title=row["title"]))
+
+    assert dict(await repo.get_task(db, task_id))["statement_generation"] == 0
+    assert await order_due_dor_runs(db) == 0
+    assert len(await _runs(db, task_id)) == 1, (
+        "пустая правка нового мнения не покупает — второй платный прогон за "
+        "текст, которого никто не трогал"
+    )
+
+
+async def test_a_real_edit_after_the_baseline_still_buys_a_run(
+    db: aiosqlite.Connection,
+):
+    """AC-6: снятие базиса гасит ЛОЖНУЮ ревизию, а не настоящую.
+
+    Обратная сторона AC-5, и без неё та проверка описывала бы выключатель:
+    механизм, который научился не покупать, обязан по-прежнему покупать
+    там, где текст действительно изменился.
+    """
+    project_id = await _project_with_policy(db, "dor-real-edit", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    from hub.models import TaskRefine
+    from hub.services.refinement import refine_task
+
+    await refine_task(
+        db, task_id, TaskRefine(problem_statement="постановку переписали")
+    )
+
+    assert dict(await repo.get_task(db, task_id))["statement_generation"] == 1
+    assert await order_due_dor_runs(db) == 1
+    assert [r["generation"] for r in await _runs(db, task_id)] == [0, 1]
+
+
+async def test_a_project_without_the_dor_policy_is_left_alone(
+    db: aiosqlite.Connection,
+):
+    """Граница: гейт вердикта, отданный стюарду, гейта постановки не отдаёт.
+
+    Два ключа политики — два разных решения владельца, и молчаливое
+    распространение одного на другой означало бы, что проект получил
+    делегирование, которого не просил (#743).
+    """
+    verdict_only = await _project_with_policy(db, "dor-none", {"verdict": "steward"})
+    task_id = await _ready_draft(db, verdict_only)
+
+    assert await order_due_dor_runs(db) == 0
+    assert await _runs(db, task_id) == []
+
+
+async def test_a_verdict_run_does_not_settle_a_draft_revision(
+    db: aiosqlite.Connection,
+):
+    """Числа двух счётчиков совпадают случайно — слот различает их видом.
+
+    Регрессия на способ ошибиться, который живёт в самом устройстве слота:
+    ``(task_id, generation, kind)``. Проверка решённости, забывшая про kind,
+    прочитала бы вердиктный прогон на поколении 1 как «ревизия 1 постановки
+    уже решена» — и драфт молча остался бы непрочитанным.
+    """
+    project_id = await _project_with_policy(
+        db, "dor-kind-leak", {"verdict": "steward", "dor": "steward"}
+    )
+    task_id = await _ready_draft(db, project_id)
+    # Тот же драфт правят: ревизия становится 1 — тем же числом, что и
+    # поколение сдачи ниже.
+    from hub.models import TaskRefine
+    from hub.services.refinement import refine_task
+
+    await refine_task(db, task_id, TaskRefine(problem_statement="правка"))
+    await repo.update_task(db, task_id, dor_passed=1)
+    await db.commit()
+    # Вердиктный прогон на поколении 1 той же задачи, закрытый суждением.
+    await db.execute(
+        "INSERT INTO steward_runs (task_id, generation, kind, status, model, "
+        "project_id, deadline_at) VALUES (?, ?, ?, ?, '', ?, datetime('now'))",
+        (task_id, 1, "verdict", "judged", project_id),
+    )
+    await db.commit()
+
+    assert await order_due_dor_runs(db) == 1, (
+        "решённое поколение СДАЧИ ничего не говорит о ревизии ПОСТАНОВКИ"
+    )
+    assert await open_run(db, task_id, 1, KIND_DOR) is not None
+
+
+async def test_a_dor_order_does_not_open_the_verdict_evidence_door(
+    db: aiosqlite.Connection,
+):
+    """Заказ чтения драфта не отпирает пакет СДАЧИ.
+
+    Дверь к пакету открывает открытый прогон на генерацию (#1074), и до
+    второго вида заказов вопрос имел один ответ. Теперь у совпавших чисел
+    два смысла, и заказ, открывший чужую дверь, расширил бы вход судьи
+    ровно на этот путь — а вход судьи и есть граница безопасности.
+    """
+    from hub.services.steward_evidence import open_run_exists
+
+    project_id = await _project_with_policy(db, "dor-door", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    assert await open_run_exists(db, task_id, 0) is False
+
+
+async def test_a_dor_order_is_not_started_as_a_verdict_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Исполнитель вердиктов DoR-заказ не берёт.
+
+    ``start_run`` собирает пакет СДАЧИ — ветку, закреплённый sha, отчёт
+    ревью, — и на драфте ничего этого нет. Прогон был бы оплачен и прочитал
+    бы не то, о чём его спрашивали. Исполнитель для драфта приезжает своей
+    задачей; до тех пор заказ ждёт и закрывается по дедлайну слота.
+    """
+    from hub.services import steward_shadow
+
+    started: list[dict] = []
+
+    async def _start(conn, order):
+        started.append(order)
+        return True
+
+    monkeypatch.setattr(steward_shadow, "start_run", _start, raising=True)
+    project_id = await _project_with_policy(db, "dor-start", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    assert await steward_shadow.start_due_runs(db) == 0
+    assert started == []
+    assert await open_run(db, task_id, 0, KIND_DOR) is not None, (
+        "заказ остаётся открытым: неисполненный стоит ноль, исполненный не "
+        "по тому пакету — полный прогон"
+    )
+
+
+async def test_an_unbaselined_revision_is_never_paid_for(db: aiosqlite.Connection):
+    """Прогон не заказывается на ревизии, которой нет, — даже мимо диспетчера.
+
+    Проверка стоит в самой оплачиваемой операции, а не только в отборе:
+    пустой отпечаток означает «базис не снят», и первая же пустая правка
+    объявила бы эту ревизию другой.
+    """
+    project_id = await _project_with_policy(db, "dor-unbaselined", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+
+    assert await order_run(db, task_id, 0, KIND_DOR) is None
+    assert await _runs(db, task_id) == []
+    refusals = [
+        json.loads(e["payload"])
+        for e in await _events(db, EVENT_REFUSED)
+        if e["task_id"] == task_id
+    ]
+    assert [r["reason"] for r in refusals] == [REFUSED_NO_GENERATION]
+
+
+async def test_a_revised_draft_releases_its_old_slot(db: aiosqlite.Connection):
+    """Открытый слот на старой ревизии закрывается, а не держит квоту.
+
+    Тот же довод, что у пересдачи (#1120): прогон читал текст, которого
+    больше нет. Счётчик при этом ДРУГОЙ — правка постановки, а не сдача:
+    спросить у драфта поколение сдачи значило бы сравнивать его ревизию с
+    вечным нулём, и слот не закрылся бы никогда.
+    """
+    project_id = await _project_with_policy(db, "dor-superseded", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    from hub.models import TaskRefine
+    from hub.services.refinement import refine_task
+
+    await refine_task(db, task_id, TaskRefine(problem_statement="другой текст"))
+
+    assert await close_finished_runs(db) == 1
+    runs = await _runs(db, task_id)
+    assert [r["status"] for r in runs] == [RUN_SUPERSEDED]
+    assert "постановку правили" in runs[0]["closed_reason"]
+
+
+# ---------------------------------------------------------------------------
+# Находки машинного ревью #238 (сдача #2)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_draft_approved_in_the_window_buys_no_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 52bd3401: статус перечитывается ПЕРЕД оплатой, а не только в выборке.
+
+    Выборка снимает id запросом status='draft' и идёт по списку. Человеческий
+    апрув с другого соединения законно приходит между выборкой и заказом, и
+    слот ложился на задачу, которая уже не драфт: строка занимает общую
+    суточную квоту, а отменить её нечем — заказ и есть оплата.
+
+    Окно воспроизводится там, где оно и есть: подмена автопилота переводит
+    статус ровно в тот момент, когда диспетчер спрашивает его перед платой,
+    и возвращает False — то есть ведёт себя как автопилот на проекте
+    dor=steward, пока апрув прилетает со стороны.
+    """
+    project_id = await _project_with_policy(db, "dor-window", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+
+    async def _approved_meanwhile(conn, tid):
+        assert conn.in_transaction, (
+            "решение по драфту обязано идти ОДНОЙ транзакцией: перечитанный "
+            "статус устаревает к следующей строке кода, и только write-лок "
+            "делает апрув с другого соединения либо видимым, либо ждущим"
+        )
+        await repo.update_task(conn, tid, status="open")
+        return False
+
+    monkeypatch.setattr(
+        "hub.services.auto_approve.maybe_auto_approve",
+        _approved_meanwhile,
+        raising=True,
+    )
+
+    assert await order_due_dor_runs(db) == 0
+    assert await _runs(db, task_id) == [], (
+        "заказ на задачу, которая уже не драфт, — оплаченное чтение "
+        "постановки, которую решили без стюарда"
+    )
+
+
+async def test_the_baseline_returns_the_revision_it_left_on_the_row(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 798d6fee: вернуть прочитанное ДО записи значит вернуть ложь.
+
+    SELECT транзакции не открывает, и между чтением счётчика и записью
+    отпечатка законно вклинивается refine: он видит пустой отпечаток,
+    считает его изменением (#1156) и двигает счётчик. Функция дописывала
+    отпечаток и возвращала прочитанный ноль — слот лёг бы на ревизию 0,
+    следующий проход закрыл бы его устаревшим, а новый тик купил бы ревизию
+    1. Две строки квоты за нетронутый текст.
+
+    Окно воспроизводится в самой его точке: подмена отпечатка двигает
+    счётчик как раз между чтением и записью. Проверяется ИНВАРИАНТ —
+    возвращённое значение описывает строку, которая лежит в базе после
+    записи, — потому что он держит и тогда, когда окно кто-нибудь откроет
+    заново.
+    """
+    from hub.services import statement_generation as sg
+
+    project_id = await _project_with_policy(db, "dor-baseline-race", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    real = sg.statement_fingerprint
+
+    async def _bumps_meanwhile(conn, tid):
+        fresh = await real(conn, tid)
+        await repo.update_task(conn, tid, statement_generation=1)
+        return fresh
+
+    monkeypatch.setattr(sg, "statement_fingerprint", _bumps_meanwhile, raising=True)
+
+    generation = await sg.baseline_if_absent(db, task_id)
+    await db.commit()
+
+    row = dict(await repo.get_task(db, task_id))
+    assert generation == row["statement_generation"] == 1, (
+        "возвращённая ревизия обязана описывать строку, которая лежит в базе "
+        "ПОСЛЕ записи, а не ту, что читали до неё"
+    )
+
+
+async def test_an_approved_draft_releases_its_open_slot(db: aiosqlite.Connection):
+    """Незакрытая находка ревью #238: слот, который больше некому исполнять.
+
+    DoR-апрув человеком меняет СТАТУС, а не вердикт, поэтому вердиктное
+    правило закрытия его не видит: слот стоял открытым до дедлайна и ждал
+    исполнителя для постановки, которую уже одобрили. Квоту закрытие не
+    возвращает — заказ оплачен, — но прогон, который никому не нужен, не
+    должен выглядеть заказанным.
+    """
+    project_id = await _project_with_policy(db, "dor-approved", {"dor": "steward"})
+    task_id = await _ready_draft(db, project_id)
+    assert await order_due_dor_runs(db) == 1
+
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    runs = await _runs(db, task_id)
+    assert [r["status"] for r in runs] == [RUN_SUPERSEDED]
+    assert "больше не драфт" in runs[0]["closed_reason"]

@@ -660,6 +660,13 @@ def quote(source: str, author: str, text: str) -> QuotedText:
 
 STEWARD_RUNS_TABLE = "steward_runs"
 RUN_OPEN = "open"
+# Дверь открывает заказ ВЕРДИКТА, и только он (#1160). С появлением второго
+# вида заказов вопрос «есть ли открытый прогон на эту генерацию» перестал
+# иметь один ответ: у ``kind='dor'`` генерация считает ревизии постановки, а
+# не поколения сдачи, и число 1 у них общее только по написанию. Заказ
+# чтения драфта, открывший дверь к пакету сдачи, расширил бы вход судьи
+# ровно на этот путь — а вход судьи и есть граница безопасности.
+KIND_VERDICT = "verdict"
 
 
 async def open_run_exists(
@@ -690,8 +697,8 @@ async def open_run_exists(
     open_runs = await fetchall(
         db,
         "SELECT 1 FROM steward_runs "
-        "WHERE task_id=? AND generation=? AND status=? LIMIT 1",
-        (task_id, generation, RUN_OPEN),
+        "WHERE task_id=? AND generation=? AND kind=? AND status=? LIMIT 1",
+        (task_id, generation, KIND_VERDICT, RUN_OPEN),
     )
     return bool(open_runs)
 
