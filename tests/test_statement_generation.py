@@ -170,6 +170,53 @@ async def test_reading_readiness_is_not_a_statement_edit(db: aiosqlite.Connectio
     assert await _generation(db, task_id) == settled
 
 
+async def test_viewing_an_unbaselined_row_buys_no_revision(db: aiosqlite.Connection):
+    """AC-1: просмотр карточки БЕЗ СНЯТОГО БАЗИСА ревизией не является.
+
+    Отличие от соседнего теста — в одной строке, которой здесь нет: он
+    начинается с ``refine_task``, то есть читает уже базированную строку, и
+    перенос бампа в саму запись полей готовности его не уронит — отпечаток
+    совпадёт, бампа не будет. Здесь отпечаток ПУСТ, а пустая строка не равна
+    sha256 ни от чего, поэтому бамп на этом пути объявил бы ревизию — при
+    том, что постановку никто не трогал.
+
+    Цена ошибки — не косметика: ``get_readiness`` чинит устаревший счёт по
+    ходу чтения и пишет в строку, так что обычный GET карточки дал бы
+    поколение 0 → 1, а слот ``kind='dor'`` на этой ревизии оказался бы
+    потрачен просмотром, а не правкой. Стюард, уже высказавшийся на нуле,
+    потерял бы место для следующего суждения.
+    """
+    from hub.services.refinement import _persisted_readiness_stale, get_readiness
+    from hub.services.recommendations import calculate_readiness_with_recommendations
+
+    task_id = await _draft(db)
+    row = await repo.get_task(db, task_id)
+    assert not dict(row)["statement_fingerprint"], "предусловие: базис не снят"
+    assert await _generation(db, task_id) == 0
+
+    # Ленивая починка срабатывает только на РАСХОЖДЕНИИ сохранённого счёта с
+    # пересчитанным. Без этих строк тест зелёный при любой реализации: он не
+    # доходит до записи, а проверять нечего именно в записи.
+    await repo.update_task(db, task_id, readiness_score=1)
+    await db.commit()
+    row = await repo.get_task(db, task_id)
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    assert _persisted_readiness_stale(row, report), "предусловие: починка сработает"
+
+    await get_readiness(db, task_id)
+
+    row = await repo.get_task(db, task_id)
+    assert dict(row)["readiness_score"] == report.score, (
+        "предусловие проверено фактом: чтение действительно записало в строку"
+    )
+    assert await _generation(db, task_id) == 0, (
+        "просмотр небазированной карточки не покупает стюарду прогон"
+    )
+    assert not dict(row)["statement_fingerprint"], (
+        "и базиса чтение не снимает: отпечаток берут пути записи"
+    )
+
+
 async def test_a_row_without_a_baseline_declares_one_revision(
     db: aiosqlite.Connection,
 ):
