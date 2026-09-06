@@ -671,29 +671,6 @@ STACK_ANCESTRY_UNRELATED = "unrelated"
 STACK_ANCESTRY_UNKNOWN = "unknown"
 
 
-async def _is_ancestor(maybe_ancestor: str, descendant: str, repo: str) -> bool | None:
-    """True/False from ``merge-base --is-ancestor``; None when git could not say.
-
-    git answers 0 for yes and 1 for no, and anything else is a failure — a
-    missing object, a broken repo. Collapsing that third case into False would
-    turn "could not check" into "not an ancestor", which is exactly the kind of
-    invented answer this check exists to remove.
-    """
-    rc, _, _ = await _git(
-        "merge-base",
-        "--is-ancestor",
-        maybe_ancestor,
-        descendant,
-        repo=repo,
-        check=False,
-    )
-    if rc == 0:
-        return True
-    if rc == 1:
-        return False
-    return None
-
-
 def _resolve_base(base_branch: str | None) -> str:
     """The base a task's work is cut from AND its PR targets (#362 I4).
 
@@ -775,8 +752,9 @@ class GitOpsIntegration:
         other branch merges first), the head is the ancestor (the head merges
         first), the two are unrelated by ancestry (no order to name), or the
         question could not be answered. Never raises and never guesses: an
-        unresolvable ref or a git failure is ``unknown``, which the caller
-        must report as "order not determined" rather than fall back to a side.
+        unresolvable ref, an unreadable repository or a commit this clone does
+        not carry is ``unknown``, which the caller must report as "order not
+        determined" rather than fall back to a side.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -790,8 +768,11 @@ class GitOpsIntegration:
         if not (head and other):
             return STACK_ANCESTRY_UNKNOWN
 
-        head_is_descendant = await _is_ancestor(other, head, repo)
-        head_is_ancestor = await _is_ancestor(head, other, repo)
+        # is_ancestor (#497) already answers this question for the whole hub,
+        # with the same three answers — and a second primitive for one
+        # question is how a pair of disagreeing answers gets built.
+        head_is_descendant = await self.is_ancestor(repo, other, head)
+        head_is_ancestor = await self.is_ancestor(repo, head, other)
         if head_is_descendant is None or head_is_ancestor is None:
             return STACK_ANCESTRY_UNKNOWN
         if head_is_descendant and head_is_ancestor:

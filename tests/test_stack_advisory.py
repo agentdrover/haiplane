@@ -424,17 +424,24 @@ async def test_git_ops_merged_base_branch_not_stacked() -> None:
 # --- ancestry between two branches (patched _git, no real repo) ---
 
 
-def _ancestry_git_factory(is_ancestor: dict[tuple[str, str], int]):
+def _ancestry_git_factory(
+    is_ancestor: dict[tuple[str, str], int],
+    missing_commits: frozenset[str] = frozenset(),
+):
     """Fake _git answering rev-parse and merge-base --is-ancestor.
 
     ``is_ancestor`` maps (maybe_ancestor_sha, descendant_sha) to git's exit
-    code: 0 yes, 1 no, anything else a failure. Missing pairs answer 1.
+    code: 0 yes, 1 no. Missing pairs answer 1. ``missing_commits`` makes
+    ``cat-file -e`` fail — the clone does not carry that commit, which is how
+    "git cannot answer" actually reaches this code (#497 guards).
     """
 
     async def fake_git(*args, repo=None, check=True, **kw):
         if args[0] == "rev-parse" and "--verify" in args:
             sha = _shas().get(args[-1])
             return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "cat-file":
+            return (1 if args[-1].split("^")[0] in missing_commits else 0, "", "")
         if args[0] == "merge-base" and "--is-ancestor" in args:
             return (is_ancestor.get((args[-2], args[-1]), 1), "", "")
         return (0, "", "")
@@ -442,10 +449,13 @@ def _ancestry_git_factory(is_ancestor: dict[tuple[str, str], int]):
     return fake_git
 
 
-async def _ancestry(is_ancestor: dict[tuple[str, str], int]) -> str:
+async def _ancestry(
+    is_ancestor: dict[tuple[str, str], int],
+    missing_commits: frozenset[str] = frozenset(),
+) -> str:
     with patch(
         "hub.integrations.git_ops._git",
-        side_effect=_ancestry_git_factory(is_ancestor),
+        side_effect=_ancestry_git_factory(is_ancestor, missing_commits),
     ):
         return await GitOpsIntegration().branch_ancestry(
             "task-424/fix", "task-392/base", repo="/tmp/repo"
@@ -477,8 +487,10 @@ async def test_branch_ancestry_same_tip_names_no_side() -> None:
 
 
 async def test_branch_ancestry_git_failure_is_unknown() -> None:
-    # Exit code 128 is "could not check", not "not an ancestor".
-    assert await _ancestry({("bbb222", "aaa111"): 128}) == "unknown"
+    # The clone does not carry the other branch's commit. "Could not check"
+    # must not be read as "neither is an ancestor" — that would name a third
+    # outcome from a question git never answered.
+    assert await _ancestry({}, missing_commits=frozenset({"bbb222"})) == "unknown"
 
 
 async def test_branch_ancestry_unresolvable_ref_is_unknown() -> None:
