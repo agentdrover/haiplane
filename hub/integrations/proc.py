@@ -33,6 +33,19 @@ def repo_root() -> str:
     return str(p)
 
 
+# Чем подписывается коммит, который делает ХАБ, а не человек (#1192). Мерж
+# доставки, авто-коммит и сквош создают коммиты, и git отказывается их
+# создавать, пока не знает, кто автор. На боевом хосте identity не задана
+# нигде, а вывести её git не может: у vm-5c8197 нет домена, и кандидат
+# <служебный-пользователь>@vm-5c8197.(none) отвергается. Итог — доставка на
+# GitVerse встала целиком: мержу было нечем подписаться.
+#
+# Значения те же, что уже коммитят workflow-шаблоны (#476): личность хаба
+# одна на репозиторий, две разных в git log читались бы как два автора.
+HUB_GIT_NAME = "Haiplane Hub"
+HUB_GIT_EMAIL = "hub@haiplane.local"
+
+
 def git_env() -> dict[str, str]:
     """Build env dict with SSH key for GitHub push."""
     env = os.environ.copy()
@@ -42,6 +55,18 @@ def git_env() -> dict[str, str]:
     # #377: anonymous https against a private repo must fail fast, not hang
     # waiting for credentials on a headless server.
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Identity едет ЗДЕСЬ, в окружении процесса, а не пишется в конфиг машины
+    # (#1192): хаб разворачивают и в контейнере, и на чужом сервере, и правка
+    # ~/.gitconfig чинит ровно одну машину до первого переезда. setdefault, а
+    # не присвоение: развёртывание, объявившее свою личность через окружение,
+    # остаётся при ней.
+    for key, value in (
+        ("GIT_AUTHOR_NAME", HUB_GIT_NAME),
+        ("GIT_AUTHOR_EMAIL", HUB_GIT_EMAIL),
+        ("GIT_COMMITTER_NAME", HUB_GIT_NAME),
+        ("GIT_COMMITTER_EMAIL", HUB_GIT_EMAIL),
+    ):
+        env.setdefault(key, value)
     return env
 
 
