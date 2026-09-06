@@ -38,6 +38,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
+from hub.services import project_policy
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     KIND_VERDICT,
@@ -285,6 +286,54 @@ async def start_due_runs(db: aiosqlite.Connection) -> int:
     return started
 
 
+def _only_the_reviewer_is_missing(
+    steward: str, implementer: str, reviewer: str
+) -> bool:
+    """Отказал бы гейт, будь ревьюер объявлен, — или дело только в нём.
+
+    Спрашивается тем же примитивом, которым решает сам гейт: ``False`` от
+    :func:`same_family` означает «обе стороны опознаны и семейства разные»,
+    то есть пара стюард—исполнитель проходит. Разбирать вместо этого текст
+    отказа было бы решением по строке, написанной для человека, — способ
+    ошибиться, уже проверенный на практике.
+
+    Пустая строка ревьюера здесь обязательна: непонятное имя — это ответ
+    «не опознан», и ждать его повторения незачем.
+    """
+    if reviewer.strip() or not steward.strip():
+        return False
+    return same_family(steward, implementer) is False
+
+
+async def _reviewer_still_coming(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> bool:
+    """Ждёт ли эта сдача ревьюера, которого ещё не позвали.
+
+    Два условия, и оба обязательны. Политика проекта должна ПРОСИТЬ ревью —
+    иначе ревьюер не появится никогда, и ожидание стало бы вечно открытым
+    слотом на проектах, где кросс-модельного контура нет вовсе. И строки
+    диспетча на это поколение не должно быть: именно её отсутствие, а не
+    пустое имя модели, означает «ещё не позвали».
+
+    Читается запись хаба о том, что сделал он сам, а не чей-то отчёт о
+    себе: ревьюера запускает хаб, поэтому наличие заказа — факт, которым он
+    владеет (#1008).
+    """
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None or not project_policy.review_dispatch_enabled(
+        project_policy.gate_policy_of(project)
+    ):
+        return False
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? LIMIT 1",
+        (task_id, generation),
+    )
+    return not rows
+
+
 async def _refuse_transiently(
     db: aiosqlite.Connection, order: dict, code: str, detail: str
 ) -> None:
@@ -339,6 +388,34 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     steward = (order.get("model") or config.STEWARD_MODEL or "").strip()
     implementer = (task.get("submission_model") or "").strip()
     reviewer = await reviewer_model(db, task_id, generation)
+
+    # «Ревьюера ещё не позвали» и «модель ревьюера не опознана» приходят
+    # сюда одной пустой строкой, а означают противоположное (#1185).
+    #
+    # Сдача видна как review раньше, чем вызов провайдера вернулся: путь
+    # сдачи коммитит статус и только потом зовёт ревьюера по HTTP. Тик,
+    # попавший в это окно, видел пустую строку и закрывал слот НАВСЕГДА —
+    # наблюдено на #1175 поколения 3, где ревьюера позвали через секунды
+    # после отказа; на соседней #1183 порядок сложился обратный, и прогон
+    # пошёл. Исход зависел от того, куда попал тик, а не от моделей.
+    #
+    # Ждать — только когда ревьюер и есть единственное недостающее, и
+    # только пока его заказ ещё не появился. Гейт от этого не слабеет: ни
+    # одна из трёх деклараций не считается объявленной, отсрочен лишь
+    # момент вопроса.
+    if _only_the_reviewer_is_missing(steward, implementer, reviewer) and (
+        await _reviewer_still_coming(db, task_id, generation)
+    ):
+        await _refuse_transiently(
+            db,
+            order,
+            REFUSED_UNDECLARED_MODEL,
+            "кросс-модельного ревьюера ещё не позвали — заказ ждёт его "
+            "появления: «пока неизвестно» не то же самое, что «неизвестно "
+            "никогда»",
+        )
+        return False
+
     refusal = family_refusal(steward, implementer, reviewer)
     if refusal is not None:
         # NOT retryable: the same three declarations would refuse again on
