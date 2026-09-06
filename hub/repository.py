@@ -2186,6 +2186,24 @@ async def increment_ci_no_pr_attempts(
     return int(row[0]) if row else 0
 
 
+async def mark_ci_run_requested(
+    db: aiosqlite.Connection,
+    task_id: int,
+    sha: str,
+) -> None:
+    """Записать, что прогон по ``sha`` уже был запрошен (#1197).
+
+    Пишется ТОЛЬКО после принятого форжем запроса: неудавшийся вызов не
+    должен съедать единственную попытку. Как и остальная бухгалтерия
+    конвейера, не трогает ``updated_at`` — иначе запрос сбрасывал бы
+    вахту по зависшим задачам.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_run_requested_sha=? WHERE id=?",
+        (sha, task_id),
+    )
+
+
 async def reset_ci_check_state(
     db: aiosqlite.Connection,
     task_id: int,

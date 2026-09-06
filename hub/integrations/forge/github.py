@@ -22,6 +22,8 @@ from hub.integrations import proc
 from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
+    CIRunRequestOutcome,
+    CIRunRequestResult,
     MergeabilityOutcome,
 )
 
@@ -718,6 +720,101 @@ class GitHubForge:
             CIProbeOutcome.unavailable,
             "workflow_runs_unknown_state",
             details=",".join(sorted(set(conclusions) | set(statuses))),
+        )
+
+    #: The refusal GitHub gives when the ref's own workflow file declares no
+    #: manual trigger. Observed verbatim on 06.09.2026 against a branch cut
+    #: before #1196 landed, while the same call on develop was accepted: the
+    #: trigger is read from the DISPATCHED REF, not only from the default
+    #: branch. It is a sensible "no", not a fault — see request_ci_run.
+    _NO_DISPATCH_TRIGGER = "does not have 'workflow_dispatch' trigger"
+
+    async def request_ci_run(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        """Ask GitHub for a run on ``branch`` as it stands (#1197).
+
+        The workflow to dispatch is DISCOVERED, never named: satellites carry
+        the same file under another name (``brand.SEEDED_CI``), so a hardcoded
+        "ci.yml" would work here and silently nowhere else. Two filters make
+        the discovery honest — ``state`` must be active, and ``path`` must
+        actually live in ``.github/workflows/``. The second is not decoration:
+        GitHub lists Dependabot's pseudo-workflows in the same array under
+        paths like ``dynamic/dependabot/update-graph``, which correspond to no
+        file and cannot be dispatched. Anything other than exactly one
+        candidate is DECLINED by name rather than guessed at — picking a
+        workflow for the caller is how a request lands on the wrong pipeline.
+        """
+        if not (branch or "").strip():
+            return CIRunRequestResult(CIRunRequestOutcome.declined, "no_branch_named")
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable,
+                "workflows_unreadable",
+                details=(err or "").strip() or None,
+            )
+        try:
+            payload = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable, "workflows_invalid_json"
+            )
+        entries = payload.get("workflows") if isinstance(payload, dict) else None
+        candidates = [
+            w
+            for w in (entries or [])
+            if isinstance(w, dict)
+            and str(w.get("state") or "").lower() == "active"
+            and str(w.get("path") or "").startswith(".github/workflows/")
+        ]
+        if not candidates:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.declined, "no_dispatchable_workflow"
+            )
+        if len(candidates) > 1:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.declined,
+                "several_dispatchable_workflows",
+                details=",".join(sorted(str(w.get("path") or "") for w in candidates)),
+            )
+        workflow_id = candidates[0].get("id")
+        if not workflow_id:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable, "workflow_without_id"
+            )
+        rc, _out, err = await _gh(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows/{workflow_id}/dispatches",
+            "-f",
+            f"ref={branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.requested,
+                "workflow_dispatched",
+                details=str(candidates[0].get("path") or ""),
+            )
+        detail = (err or "").strip()
+        if self._NO_DISPATCH_TRIGGER in detail.lower():
+            return CIRunRequestResult(
+                CIRunRequestOutcome.declined,
+                "workflow_dispatch_not_declared_on_ref",
+                details=detail[:200] or None,
+            )
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unavailable,
+            "dispatch_call_failed",
+            details=detail[:200] or None,
         )
 
     async def check_pr_ci(

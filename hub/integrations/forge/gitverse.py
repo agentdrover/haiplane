@@ -32,6 +32,8 @@ from hub import config
 from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
+    CIRunRequestOutcome,
+    CIRunRequestResult,
     MergeabilityOutcome,
 )
 
@@ -919,6 +921,22 @@ class GitVerseForge:
         if resp.status == 404:
             return False, "gitverse_repo_not_found_or_no_access"
         return False, f"gitverse_api_refused_{resp.status}"
+
+    async def request_ci_run(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        """GitVerse не просят о прогоне — граница, а не недоделка (#1197).
+
+        Решение владельца от 06.09.2026: механизм делается только для GitHub.
+        Здесь свой probe со своим no_workflow_runs и свой способ запускать
+        проверки, и трогать его этой задачей не разрешено ни в одну сторону.
+        Метод существует, потому что протокол общий, и отвечает НАЗВАННЫМ
+        «не поддерживается» — молчаливый возврат читался бы как неудачный
+        запрос, то есть как попытка, которой не было.
+        """
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "gitverse_run_request_not_supported"
+        )
 
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None

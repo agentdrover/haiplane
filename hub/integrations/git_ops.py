@@ -28,6 +28,7 @@ from hub.integrations import proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     CIProbeResult,
+    CIRunRequestResult,
     ForgePlugin,
     MergeabilityOutcome,
 )
@@ -2194,6 +2195,24 @@ class GitOpsIntegration:
     ) -> CIProbeResult:
         return await self._forge_for(forge).check_pr_ci(
             pr_number, repo=repo, gh_repo=gh_repo
+        )
+
+    async def request_ci_run(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> CIRunRequestResult:
+        """Попросить форж о прогоне на вершине ``branch`` (#1197).
+
+        Роутинг тот же, что у всех остальных вопросов к форжу: кто умеет,
+        тот отвечает, а кто не умеет — говорит об этом словом
+        ``unsupported``. Ветвления по имени форжа здесь нет намеренно —
+        оно жило бы в вызывающем и разъезжалось бы с реализациями.
+        """
+        return await self._forge_for(forge).request_ci_run(
+            branch, repo=repo, gh_repo=gh_repo
         )
 
     async def pr_for_branch(

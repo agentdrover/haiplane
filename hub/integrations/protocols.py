@@ -65,6 +65,35 @@ class CIProbeResult:
     details: str | None = None
 
 
+class CIRunRequestOutcome(str, Enum):
+    """Every observable result of ASKING a forge for a run (#1197).
+
+    Four, not two, because the three ways a request can fail call for
+    different responses. ``declined`` is the forge answering sensibly — the
+    ref carries no manual trigger, or there is no single workflow to name —
+    and no retry will change it. ``unavailable`` is the call itself not
+    landing: network, 5xx, unreadable answer, curable by asking again.
+    ``unsupported`` is a forge that has no such capability at all, which is
+    a fact about the plugin and not about this task. Collapsing any of them
+    into one would either burn the single attempt on a blinking network or
+    keep asking a forge that cannot answer.
+    """
+
+    requested = "requested"
+    declined = "declined"  # the forge said no, and means it
+    unsupported = "unsupported"  # this forge cannot be asked at all
+    unavailable = "unavailable"  # the call did not land — ask again
+
+
+@dataclass(frozen=True)
+class CIRunRequestResult:
+    """A run-request outcome plus a stable, machine-usable reason (#1197)."""
+
+    outcome: CIRunRequestOutcome
+    reason: str
+    details: str | None = None
+
+
 @runtime_checkable
 class DispatchPlugin(Protocol):
     def is_available(self) -> bool: ...
@@ -303,6 +332,13 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> CIProbeResult: ...
+    async def request_ci_run(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> CIRunRequestResult: ...
     async def branch_ci_runs(
         self,
         branch: str,
@@ -562,6 +598,12 @@ class ForgePlugin(Protocol):
     async def check_pr_ci(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> CIProbeResult: ...
+    # #1197: породить прогон на УЖЕ существующем коммите. Форж умеет это
+    # по-разному или не умеет вовсе, поэтому ответ типизирован, а не булев:
+    # «отказано осмысленно» и «вызов не долетел» лечатся разными руками.
+    async def request_ci_run(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult: ...
     async def branch_ci_runs(
         self,
         branch: str,

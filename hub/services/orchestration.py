@@ -21,7 +21,11 @@ from hub.integrations.git_ops import (
     WorkspaceBranchMismatchError,
     WorkspaceNotReadyError,
 )
-from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
+from hub.integrations.protocols import (
+    CIProbeOutcome,
+    CIProbeResult,
+    CIRunRequestOutcome,
+)
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import workflow_seed
@@ -2159,6 +2163,101 @@ def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
     return (datetime.now(UTC) - started).total_seconds()
 
 
+async def request_missing_ci_run(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    ci: CIProbeResult,
+) -> tuple[bool, str]:
+    """Ask the forge for the run this commit never got — at most once (#1197).
+
+    Returns ``(requested, note)``. ``requested`` is True only when the forge
+    ACCEPTED the request; the caller then gives the run a window to appear
+    instead of escalating this cycle. ``note`` names why nothing was asked, in
+    words, for whoever reads the refusal.
+
+    Called from the ``missing_run`` branch and from nowhere else, and that is
+    the whole of AC-2's guarantee: a SHA whose run ended in failure, cancelled,
+    timed_out, startup_failure or action_required probes as ``failed``, never
+    as ``missing_run`` (see ``_workflow_runs_probe``), so a finished verdict
+    cannot be replayed by any ordering of calls. Everything after the gate —
+    the grace window, ``ci_untested``, the hand-off to a human — is untouched:
+    this step stands BEFORE the backstop, not instead of it.
+    """
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return (
+            False,
+            "ветка задачи не записана — на каком ref просить прогон, неизвестно",
+        )
+
+    # The SHA the gate will read the outcome by. `ci.details` is the head the
+    # probe JUST looked at and found no runs for; `submission_sha` is what the
+    # review approved. Dispatch travels by REF, so these must agree before a
+    # run is paid for: a branch that moved on would produce a run for a commit
+    # nobody pinned, and the probe would keep answering missing_run anyway.
+    pinned = (task.get("submission_sha") or "").strip()
+    observed = (ci.details or "").strip()
+    if not pinned:
+        return (
+            False,
+            "коммит сдачи не закреплён — по какому SHA засчитывать прогон, неизвестно",
+        )
+    if not observed:
+        return False, "вершина ветки не прочитана — просить прогон вслепую нельзя"
+    if pinned != observed:
+        return False, (
+            f"ветка на {observed[:12]}, а закреплён {pinned[:12]} — прогон по "
+            f"чужому коммиту ничего не даст, запроса нет"
+        )
+
+    if (task.get("ci_run_requested_sha") or "").strip() == pinned:
+        return False, (
+            f"прогон по {pinned[:12]} уже запрашивался — вторая попытка "
+            f"превращала бы исход в свойство числа попыток"
+        )
+
+    result = await plugins.git_ops.request_ci_run(
+        branch,
+        repo=ctx.get("repo"),
+        gh_repo=ctx.get("gh_repo"),
+        forge=ctx.get("forge", ""),
+    )
+    if result.outcome != CIRunRequestOutcome.requested:
+        # Neither a declined request nor a call that never landed spends the
+        # single attempt: the column stays empty and the next cycle may try
+        # again. They are still told apart in the text, because "the ref has
+        # no manual trigger" is cured by a different hand than "the network
+        # blinked".
+        detail = f" ({result.details})" if result.details else ""
+        return (
+            False,
+            f"запрос прогона не сделан: {result.outcome.value}/{result.reason}{detail}",
+        )
+
+    await repo.mark_ci_run_requested(db, task["id"], pinned)
+    await repo.add_task_update(
+        db,
+        task["id"],
+        "hub",
+        "status",
+        (
+            f"Прогон CI запрошен хабом: ветка {branch}, коммит {pinned[:12]}, "
+            f"workflow {result.details or 'не назван'}. Прогонов по этому "
+            f"коммиту не было ни одного, поэтому запрос законен — переиграть "
+            f"им нечего. Попытка на этот коммит одна: если прогон так и не "
+            f"появится, задача уйдёт к человеку прежним путём."
+        ),
+    )
+    log.info(
+        "Task #%s: CI run requested on %s for %s",
+        task.get("id"),
+        branch,
+        pinned[:12],
+    )
+    return True, ""
+
+
 def _missing_run_gate_detail(ci: CIProbeResult, *, elapsed: float) -> str:
     """Within the grace window this is a wait; after it, a named fact (#1041)."""
     sha = (ci.details or "").strip() or "unknown"
@@ -2166,6 +2265,41 @@ def _missing_run_gate_detail(ci: CIProbeResult, *, elapsed: float) -> str:
     if elapsed < config.CI_GRACE_PERIOD:
         return f"ci_{ci.outcome.value}: {ci.reason}"
     return f"ci_untested: {named}"
+
+
+async def _missing_run_gate_step(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    ci: CIProbeResult,
+) -> str:
+    """The gate's whole answer to "this commit has no run" (#1041, #1197).
+
+    Extracted rather than inlined: ``merge_before_completion`` is at its
+    complexity budget, and a step that grew a request inside it would have
+    been paid for with an exception in the ledger instead of a shape.
+    """
+    task_id = task["id"]
+    elapsed = _seconds_since_ci_start(task.get("ci_check_started_at"))
+    if elapsed is None:
+        await repo.mark_ci_check_started(db, task_id)
+        elapsed = 0.0
+    # Before the grace runs out on a commit that has no run at all, ask for
+    # one. At most once per SHA, and only from this branch — the request
+    # produces an EVENT, never a verdict: the outcome is still read from a run
+    # on the pinned commit by the same rules.
+    requested, why_not = await request_missing_ci_run(db, task, ctx, ci)
+    if requested:
+        # The window restarts so the run just asked for has time to appear;
+        # without it the very next cycle would escalate and the request would
+        # have bought nothing. Bounded by construction: the attempt is spent,
+        # so the wait can be extended once per commit and never again.
+        await repo.mark_ci_check_started(db, task_id)
+        elapsed = 0.0
+    detail = _missing_run_gate_detail(ci, elapsed=elapsed)
+    if why_not and elapsed >= config.CI_GRACE_PERIOD:
+        detail = f"{detail}; {why_not}"
+    return detail
 
 
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
@@ -2350,11 +2484,7 @@ async def merge_before_completion(
             pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
         )
         if ci.outcome == CIProbeOutcome.missing_run:
-            elapsed = _seconds_since_ci_start(task.get("ci_check_started_at"))
-            if elapsed is None:
-                await repo.mark_ci_check_started(db, task_id)
-                elapsed = 0.0
-            return False, _missing_run_gate_detail(ci, elapsed=elapsed)
+            return False, await _missing_run_gate_step(db, task, ctx, ci)
         if ci.outcome != CIProbeOutcome.passed:
             return False, f"ci_{ci.outcome.value}: {ci.reason}"
 

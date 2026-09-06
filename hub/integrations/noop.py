@@ -15,6 +15,8 @@ import aiosqlite
 from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
+    CIRunRequestOutcome,
+    CIRunRequestResult,
     MergeabilityOutcome,
 )
 
@@ -495,6 +497,17 @@ class NoopGitOps:
     ) -> CIProbeResult:
         return CIProbeResult(CIProbeOutcome.pending, "noop")
 
+    async def request_ci_run(
+        self,
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> CIRunRequestResult:
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "noop_git_ops_requests_nothing"
+        )
+
     async def branch_ci_runs(
         self,
         branch: str,
@@ -707,6 +720,13 @@ class NoopForge:
     ) -> tuple[bool, str]:
         # «Спросить не у кого», а не «доступа нет»: форжа не настроено вовсе.
         return False, "forge_not_configured"
+
+    async def request_ci_run(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unsupported, "noop_forge_requests_nothing"
+        )
 
     async def has_workflows(
         self, *, repo: str | None = None, gh_repo: str | None = None
