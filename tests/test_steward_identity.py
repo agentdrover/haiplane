@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -474,3 +475,224 @@ async def test_a_resubmission_closes_the_run_it_outdated(
     row = dict(rows[0])
     assert row["status"] == RUN_SUPERSEDED
     assert "пересдана" in row["closed_reason"]
+
+
+# --- #1194: команды задания проверяются ЗАПУСКОМ, а не чтением ------------
+#
+# Наблюдено 06.09.2026: обмен кода проходил, сессия была жива, а следующий
+# запрос получал 401 — шесть заказов, ноль суждений. Тест, читающий текст
+# блока, этого бы не поймал: сломанная форма выглядела правдоподобно и
+# читалась как правильная. Поэтому здесь команды ИСПОЛНЯЮТСЯ, и каждая —
+# своим вызовом bash, как это делает облачный агент.
+
+_STUB_CURL = """#!/bin/bash
+# Подставной curl: на обмен отдаёт заготовленный ответ, на всё остальное
+# записывает увиденный заголовок Authorization и молчит.
+for ((i = 1; i <= $#; i++)); do
+  arg="${!i}"
+  if [[ "$arg" == "-H" ]]; then
+    next=$((i + 1))
+    header="${!next}"
+    if [[ "$header" == Authorization:* ]]; then
+      printf '%s\\n' "$header" >> "$SEEN_AUTH"
+    fi
+  fi
+done
+for arg in "$@"; do
+  if [[ "$arg" == *chat-pair/redeem* ]]; then
+    # Код одноразовый: второй обмен получает отказ БЕЗ поля token — именно
+    # такое тело и обрезало живой допуск до пустоты (находка ревью №260).
+    if [[ -f "$REDEEMED" ]]; then
+      printf '%s' '{"detail":"code invalid or already used"}'
+      exit 0
+    fi
+    touch "$REDEEMED"
+    printf '%s' '{"token":"tok-SECRET-42","expires_at":"2026-09-06T12:00:00"}'
+    exit 0
+  fi
+done
+printf '%s' '{"ok":true}'
+"""
+
+
+def _run_each_in_its_own_shell(commands, workdir, env):
+    """Выполнить команды ОТДЕЛЬНЫМИ оболочками и собрать весь вывод.
+
+    Общей оболочки нет намеренно: она сохранила бы переменные между шагами
+    и воспроизвела бы не тот случай — тест прошёл бы на сломанном коде.
+    """
+    import subprocess
+
+    output = []
+    for command in commands:
+        done = subprocess.run(
+            ["bash", "-c", command],
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        output.append(done.stdout)
+        output.append(done.stderr)
+    return "".join(output)
+
+
+@pytest.fixture
+def _stub_curl(tmp_path):
+    """PATH с подставным curl и чистым файлом токена."""
+    import os
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text(_STUB_CURL)
+    curl.chmod(0o755)
+    seen = tmp_path / "seen-auth"
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["SEEN_AUTH"] = str(seen)
+    env["REDEEMED"] = str(tmp_path / "redeemed")
+    return env, seen
+
+
+def _commands(tmp_path):
+    """Команды задания с файлом допуска внутри tmp_path.
+
+    Настоящий путь — в домашнем каталоге прогона (CREDENTIAL_PATH); в тесте
+    он подменяется, чтобы параллельные прогоны не толкались об один файл и
+    не трогали домашний каталог того, кто запускает тесты.
+    """
+    token_file = str(tmp_path / "steward.credential")
+    with patch.object(sh, "CREDENTIAL_PATH", token_file):
+        return sh.delivery_commands(1190, "AH-7K2M9QRS", "https://hub.example"), (
+            token_file
+        )
+
+
+async def test_the_token_survives_a_new_shell(tmp_path, _stub_curl):
+    """#1194 AC-1: токен доезжает до следующей команды.
+
+    Проверяется не «блок упоминает файл», а то, что в заголовке Authorization
+    второй и третьей команды стоит ИМЕННО выданный обменом токен — не пустое
+    значение и не сам одноразовый код.
+    """
+    env, seen = _stub_curl
+    commands, _token_file = _commands(tmp_path)
+
+    _run_each_in_its_own_shell(commands, tmp_path, env)
+
+    headers = seen.read_text().splitlines()
+    assert headers, "ни один запрос не предъявил Authorization — команды не дошли"
+    assert headers == ["Authorization: Bearer tok-SECRET-42"] * 2, (
+        f"допуск не пережил переход к следующей команде: {headers}"
+    )
+    assert "AH-7K2M9QRS" not in "".join(headers), (
+        "предъявлен одноразовый код вместо токена — вторая ветка того же дефекта"
+    )
+
+
+async def test_the_token_never_reaches_the_output(tmp_path, _stub_curl):
+    """#1194 AC-2: способ сохранить токен не стал способом его разгласить."""
+    env, _seen = _stub_curl
+    commands, token_file = _commands(tmp_path)
+
+    output = _run_each_in_its_own_shell(commands, tmp_path, env)
+
+    assert "tok-SECRET-42" not in output, "токен утёк в вывод команды"
+    # Файл всё же появился, иначе предыдущее утверждение выполнялось бы
+    # тривиально — на командах, которые ничего не сделали.
+    import pathlib
+
+    stored = pathlib.Path(token_file)
+    assert stored.read_text().strip() == "tok-SECRET-42"
+    assert stored.stat().st_mode & 0o077 == 0, "файл токена читаем посторонним"
+
+
+def test_no_command_depends_on_a_previous_one(tmp_path):
+    """#1194 AC-4: правило самодостаточности закреплено, а не на честном слове.
+
+    Ссылка на переменную от предыдущей команды — ровно то, что сломалось.
+    Проверяется по всем командам, кроме первой: подстановка $(cat ...) живёт
+    внутри своей команды и зависимостью не является.
+    """
+    import re
+
+    commands, _token_file = _commands(tmp_path)
+    for command in commands[1:]:
+        without_substitutions = re.sub(r"\$\([^)]*\)", "", command)
+        leftover = re.findall(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", without_substitutions)
+        assert not leftover, (
+            f"команда полагается на переменную от предыдущей: {leftover} в {command}"
+        )
+
+
+def test_the_block_shows_exactly_the_commands_that_are_tested(tmp_path):
+    """Шов между проверенным и показанным закрыт.
+
+    Тест гоняет delivery_commands, а агент читает delivery_block. Разойдись
+    они — проверяли бы одно, а исполнялось бы другое.
+    """
+    token_file = str(tmp_path / "steward.credential")
+    with patch.object(sh, "CREDENTIAL_PATH", token_file):
+        commands = sh.delivery_commands(1190, "AH-7K2M9QRS", "https://hub.example")
+        block = sh.delivery_block(1190, "AH-7K2M9QRS", "https://hub.example")
+    for command in commands:
+        assert command in block, f"команда не показана прогону: {command}"
+
+
+async def test_a_spent_code_is_still_refused(db: aiosqlite.Connection, monkeypatch):
+    """#1194 AC-3: хранение чинится не превращением кода в многоразовый.
+
+    Самый дешёвый способ «починить» потерю токена — разрешить обменять код
+    ещё раз. Он снял бы симптом и снял бы заодно одноразовость, ради которой
+    код и заведён (#1084): предъявленный дважды код — это код, который можно
+    предъявить и в третий раз, уже не тому.
+
+    Проверяется настоящим redeem_code, а не подставкой: подставка подтвердила
+    бы решимость автора, а не поведение кода.
+    """
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db)
+
+    block = await sh.identity_delivery(db, task_id, 1, "https://hub.example")
+    code = re.search(r'"code":"([^"]+)"', block)
+    assert code, "код обязан быть в блоке"
+
+    first = await chat_pair.redeem_code(db, code.group(1))
+    assert first is not None, "первый обмен обязан пройти"
+
+    second = await chat_pair.redeem_code(db, code.group(1))
+    assert second is None, "потраченный код обменялся повторно — одноразовость снята"
+
+
+async def test_a_repeated_redeem_does_not_destroy_a_live_credential(
+    tmp_path, _stub_curl
+):
+    """#1194, находка ревью №260: повтор не уносит уже добытый допуск.
+
+    Прямое ``>`` обрезало бы цель ДО разбора: повторный обмен на потраченном
+    коде отдаёт отказ без поля token, разбор молчит, и рабочий допуск
+    превращается в пустоту — то есть в тот самый 401, ради которого задача и
+    заведена. Инструкция повтора не предполагает, но журнал прода показывает
+    redeem 200 и следом redeem 401: агенты повторяют.
+    """
+    env, seen = _stub_curl
+    commands, token_file = _commands(tmp_path)
+    redeem, check, evidence, _judgement = commands
+
+    _run_each_in_its_own_shell([redeem], tmp_path, env)
+    import pathlib as _pathlib
+
+    stored = _pathlib.Path(token_file)
+    assert stored.read_text().strip() == "tok-SECRET-42"
+
+    # Тот же шаг ещё раз — так поступает агент, решивший, что первый не удался.
+    _run_each_in_its_own_shell([redeem], tmp_path, env)
+
+    assert stored.read_text().strip() == "tok-SECRET-42", (
+        "повторный обмен затёр живой допуск — воспроизведён исходный дефект"
+    )
+
+    # И проверка, и следующий запрос по-прежнему работают.
+    _run_each_in_its_own_shell([check, evidence], tmp_path, env)
+    assert seen.read_text().splitlines()[-1] == "Authorization: Bearer tok-SECRET-42"
