@@ -48,3 +48,26 @@ def test_no_legacy_names_anywhere() -> None:
     assert LEGACY_PREFIX not in _text().upper(), (
         "Wave 5: the workflow must reference no legacy secret or env name"
     )
+
+
+def test_manual_runs_buy_checks_not_a_deploy() -> None:
+    """#1196: ручной запуск не должен становиться дорогой к выкату.
+
+    Триггер ``workflow_dispatch`` добавлен, чтобы получить прогон на УЖЕ
+    существующем коммите (наблюдённый тупик #1185). Джоба ``deploy`` при этом
+    обязана остаться недостижимой: её условие требует push-события, а
+    ``workflow_dispatch`` им не является. Условие читается ТЕКСТОМ по той же
+    причине, что и остальной файл: расширение ``if`` до ручного события
+    оставит CI зелёным и молча превратит проверку в выкат.
+    """
+    text = _text()
+    assert "  workflow_dispatch:\n" in text, (
+        "триггер ручного запуска должен быть объявлен — без него прогон на "
+        "существующем коммите родить нечем"
+    )
+    assert (
+        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in text
+    ), (
+        "deploy обязан требовать push в main: ручной запуск покупает проверки, "
+        "а не выкат"
+    )
