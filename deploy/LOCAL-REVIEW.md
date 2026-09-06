@@ -37,6 +37,30 @@ URL» (#1119). Локальный запускает агентский CLI на
 Песочница обязательна: пустая `LOCAL_REVIEW_SANDBOX` означает «локального пути
 нет», а не «запускай как есть».
 
+## Требование к обёртке: `--scope`, а не transient service
+
+Обёртка обязана оставлять CLI **прямым потомком хаба**. Это не стилистика, а
+два разных отказа, найденных ревью на первой редакции этого документа:
+
+* `systemd-run` без `--scope` поднимает transient **service** — родителем CLI
+  становится PID 1. Хаб убивает группу СВОЕГО процесса, то есть клиента
+  systemd-run, юнит при этом продолжает работать, а в ленте задачи стоит
+  «процесс и вся его группа убиты». Управление, которое отчитывается об
+  убийстве, ничего не убив, — хуже отсутствующего;
+* тот же сервисный режим не передаёт полезной нагрузке ни `cwd`, ни окружение:
+  каталог-однодневка и белый список переменных оседают на клиенте. Ревьюер
+  пошёл бы работать в свой unix-home, а не в одноразовый каталог.
+
+`--scope` закрывает оба: процесс остаётся ребёнком хаба, наследует cwd,
+окружение и stdin, а лимиты (`--property=MemoryMax`, `CPUQuota`) на scope
+работают так же, как на service. `--pipe` при этом не нужен и не указывается:
+stdin наследуется напрямую.
+
+Хаб проверяет ровно этот случай и ОТКАЗЫВАЕТСЯ запускать `systemd-run` без
+`--scope`, называя причину в карточке. Проверка знает один инструмент и один
+флаг — это факт про systemd-run, а не догадка про песочницы вообще; любую
+другую обёртку хаб пропустит, и требование к ней остаётся на вас.
+
 ## Настройка
 
 Четыре обязательные переменные (drop-in `systemd`, `chmod 600`):
@@ -44,7 +68,7 @@ URL» (#1119). Локальный запускает агентский CLI на
 ```ini
 [Service]
 Environment=LOCAL_REVIEW_CMD=<argv агентского CLI>
-Environment=LOCAL_REVIEW_SANDBOX=/usr/bin/systemd-run --quiet --pipe --collect --uid=haiplane-reviewer --property=MemoryMax=4G --property=CPUQuota=200% --property=PrivateTmp=yes --
+Environment=LOCAL_REVIEW_SANDBOX=/usr/bin/systemd-run --scope --quiet --collect --uid=haiplane-reviewer --property=MemoryMax=4G --property=CPUQuota=200% --
 Environment=LOCAL_REVIEW_SCRATCH_DIR=/var/lib/haiplane-review/scratch
 Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-reviewer>
 ```
@@ -64,8 +88,9 @@ Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-review
    тем, чей токен его принёс (#728), а отзывать локального ревьюера надо уметь
    отдельно — он исполняется на хосте хаба.
 4. **CLI.** Ставится ПОД ПОЛЬЗОВАТЕЛЕМ ревьюера, а не глобально. Промт уходит
-   ему в stdin (`--pipe` в примере выше обязателен): аргументы видны в `ps`
-   любому пользователю хоста, а промт несёт одноразовый код доступа к хабу.
+   ему в stdin: аргументы видны в `ps` любому пользователю хоста, а промт
+   несёт одноразовый код доступа к хабу. Со `--scope` stdin наследуется как
+   есть, отдельного флага для этого не нужно.
 5. **Политика проекта.** `gate_policy.review = dispatch` — та же, что у
    облачного пути. Локальный путь ей подчиняется, отдельного тумблера нет.
 
@@ -77,7 +102,7 @@ Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-review
 ```bash
 sudo -u haiplane-reviewer cat /opt/haiplane-hub/secrets.env        # ожидается Permission denied
 sudo -u haiplane-reviewer touch /var/lib/haiplane-hub/workspaces/snip-portal/PROBE
-sudo -u haiplane-reviewer systemd-run --quiet --pipe --uid=haiplane-reviewer --property=MemoryMax=4G true
+sudo -u haiplane-reviewer systemd-run --scope --quiet --uid=haiplane-reviewer --property=MemoryMax=4G true
 ```
 
 Первые две команды обязаны отказать, третья — пройти. Если отказала третья,
@@ -91,6 +116,8 @@ sudo -u haiplane-reviewer systemd-run --quiet --pipe --uid=haiplane-reviewer --p
   недостающих настроек>» — имена, никогда не значения;
 * потолок: «потолок стоимости исчерпан: на задачу уже потрачено N токенов при
   потолке M»;
+* обёртка отсоединяет процесс: «systemd-run без --scope запускает transient
+  service…» — прогон не начинается вовсе;
 * зависший прогон: «снято по таймауту (N с): процесс и вся его группа убиты»;
 * перезапуск хаба посреди прогона: «Локальное машинное ревью потеряно…».
 

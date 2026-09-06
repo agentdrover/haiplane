@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -1388,7 +1389,9 @@ async def maybe_dispatch_review(
         # #1180: отсюда путь больше не кончается. Форж, до которого облако не
         # дотягивается, — причина позвать ревьюера ИНАЧЕ, а не причина
         # остаться без второго читателя вовсе.
-        return await dispatch_local_review(db, task, forge, branch, generation)
+        return await dispatch_local_review(
+            db, task, forge, branch, generation, force_profile
+        )
 
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
     # #1083: three independent preconditions, and the message used to list all
@@ -1540,6 +1543,7 @@ async def dispatch_local_review(
     forge: str,
     branch: str,
     generation: int,
+    force_profile: str = "",
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -1575,12 +1579,17 @@ async def dispatch_local_review(
             "(LOCAL_REVIEW_TOKEN_CEILING). Прогон не запущен — это НЕ "
             "«прочитано и чисто» (#1152)",
         )
+    # #1180 + находка 7ed386a8: добор лестницы (#879) обязан доехать сюда
+    # ТЕМ ЖЕ профилем, каким его заказали. Без проброса локальный путь снова
+    # выбирал профиль сам и покупал второй однопроходный прогон вместо
+    # харнесса — то есть лестница на не-GitHub не поднималась ни на ступень,
+    # молча и за деньги.
     order = await prepare_review_order(
         db,
         task,
         branch=branch,
         generation=generation,
-        force_profile="",
+        force_profile=force_profile,
         principal_id=principal_id,
     )
     run_id = uuid.uuid4().hex[:12]
@@ -1699,9 +1708,28 @@ async def _start_local_run(
 
 
 async def wait_for_local_runs() -> None:
-    """Дождаться прогонов этого процесса. Для тестов и остановки хаба."""
+    """Дождаться прогонов этого процесса — их естественного конца. Для тестов."""
     while _LOCAL_RUNS:
         await asyncio.gather(*list(_LOCAL_RUNS.values()), return_exceptions=True)
+
+
+async def cancel_local_runs() -> None:
+    """Снять прогоны при остановке хаба (найдено ревью, находка d478b896).
+
+    ЖДАТЬ на остановке нельзя: прогон живёт до получаса, а хаб на выключении
+    имеет секунды. Отмена доходит до ревьюера настоящим убийством группы —
+    ``local_reviewer`` ловит CancelledError и снимает процесс, — а не просто
+    бросает корутину, оставив CLI жить сиротой.
+
+    Прежняя редакция называла ``wait_for_local_runs`` функцией «для тестов и
+    остановки хаба», но из lifespan её никто не звал: заявленная остановка,
+    которой не было.
+    """
+    tasks = list(_LOCAL_RUNS.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _main_db_path(db: aiosqlite.Connection) -> str:
@@ -1780,7 +1808,7 @@ async def _settle_local_run(
         return
     from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT
 
-    report = parse_report_block(run.stdout if run else None)
+    report = parse_report_block(run.output if run else None)
     if report is not None and await _store_report(
         db, dispatch, report, ORIGIN_LOCAL_TEXT
     ):
@@ -1817,11 +1845,14 @@ def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
             "убиты, хаб продолжает работу, отчёта нет. Вердикт остаётся "
             "человеку (#1180)."
         )
-    tail = (run.stderr or run.stdout or "").strip()[-1500:]
+    tail = (run.output or "").strip()[-1500:]
+    dropped = (
+        f", {run.dropped} байт вывода выброшено сверх лимита" if run.dropped else ""
+    )
     return (
         f"Локальное машинное ревью завершилось без отчёта: код возврата "
-        f"{run.rc}, прогон занял {run.duration_ms // 1000} с, разбираемого "
-        "блока в выводе нет. Вердикт остаётся человеку (#1180)."
+        f"{run.rc}, прогон занял {run.duration_ms // 1000} с{dropped}, "
+        "разбираемого блока в выводе нет. Вердикт остаётся человеку (#1180)."
         + (f"\n\nХвост вывода:\n{tail}" if tail else "")
     )
 
@@ -2076,11 +2107,19 @@ async def _sweep_orphan_local(
         await repo.set_review_dispatch_status(db, dispatch_id, "done")
         await db.commit()
         return
+    # Grace НЕ короче собственного таймаута прогона (найдено ревью, раздел
+    # unresolved: 4c9701ec). Облачные 15 минут против получасового локального
+    # таймаута означали бы, что свип объявляет потерянным прогон, который
+    # честно работает и ещё имеет право сдать отчёт. «Не дождались» и
+    # «не состоялось» — разные вещи, и первое не должно печататься вторым.
+    minutes = config.CURSOR_REVIEW_GRACE_MINUTES + math.ceil(
+        config.LOCAL_REVIEW_TIMEOUT_SEC / 60
+    )
     grace = await fetchall(
         db,
         "SELECT 1 FROM review_dispatches WHERE id=? "
         "AND created_at <= datetime('now', ?)",
-        (dispatch_id, f"-{config.CURSOR_REVIEW_GRACE_MINUTES} minutes"),
+        (dispatch_id, f"-{minutes} minutes"),
     )
     if not grace:
         return
@@ -2091,7 +2130,7 @@ async def _sweep_orphan_local(
         "alert",
         "Локальное машинное ревью потеряно: прогон запускал другой процесс "
         "хаба, и после перезапуска досматривать его некому — отчёта за "
-        f"{config.CURSOR_REVIEW_GRACE_MINUTES} мин не пришло. Это НЕ «ревью "
+        f"{minutes} мин не пришло (таймаут прогона плюс grace). Это НЕ «ревью "
         "ничего не нашло»: вердикт остаётся человеку (#1180).",
     )
     await repo.set_review_dispatch_status(db, dispatch_id, "failed")

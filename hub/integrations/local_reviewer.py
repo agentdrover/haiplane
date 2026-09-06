@@ -44,6 +44,7 @@ github.com — 201 (измерено 31.08.2026, #1119). Следствие на
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shlex
@@ -51,6 +52,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from hub import config
 from hub.process_kill import kill_process_group
@@ -82,11 +84,18 @@ class LocalRun:
     таймауту не сказал ничего, и в ленте это две разные причины. Слить их в
     одну значило бы отправить человека читать пустой вывод в поисках ошибки,
     которой там нет.
+
+    ``output`` — оба потока вместе, обрезанные ДО ``OUTPUT_CAP`` (найдено
+    ревью, находка 30a65c79): раздельные stdout и stderr означали бы двух
+    читателей и вдвое больше способов заблокировать ребёнка на полной трубе,
+    а разделять их всё равно некому — обе стороны идут в одну и ту же ленту.
+    ``dropped`` считает выброшенное, потому что «вывод кончился» и «вывод
+    обрезан» — разные факты.
     """
 
     rc: int
-    stdout: str
-    stderr: str
+    output: str
+    dropped: int
     timed_out: bool
     duration_ms: int
 
@@ -113,7 +122,38 @@ def not_ready() -> list[str]:
             ),
         )
         if not (value or "").strip()
-    ]
+    ] + detaching_sandbox()
+
+
+# Песочница, которая ОТСОЕДИНЯЕТ полезную нагрузку от хаба (найдено ревью,
+# находка a6aaffbc). ``systemd-run`` без ``--scope`` поднимает transient
+# service: родителем CLI становится PID 1, наш процесс — всего лишь клиент,
+# и SIGKILL по его группе юнит не останавливает. Хаб при этом честно
+# напишет в ленту «процесс и вся его группа убиты» — то есть скажет
+# неправду, а ревьюер продолжит жечь CPU и сможет прислать отчёт по уже
+# закрытому прогону. Ровно класс #509/#544, только на чужом менеджере
+# процессов.
+#
+# Проверка узкая и по имени: она знает ОДИН инструмент и ОДИН его флаг,
+# потому что это факт про systemd-run, а не догадка про песочницы вообще.
+# Всё, чего она не знает, она пропускает — и об этом сказано в документе
+# выката прямым требованием к обёртке.
+_DETACHING_HINT = (
+    "LOCAL_REVIEW_SANDBOX: systemd-run без --scope запускает transient "
+    "service — полезная нагрузка становится потомком PID 1, и снять её по "
+    "таймауту хаб не сможет, хотя напишет в ленту, что снял. Добавьте "
+    "--scope (тогда CLI остаётся прямым потомком хаба и наследует cwd, "
+    "окружение и stdin) — см. deploy/LOCAL-REVIEW.md"
+)
+
+
+def detaching_sandbox() -> list[str]:
+    """Названная причина, если обёртка запуска отсоединяет процесс."""
+    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
+    runs_unit = any(part.rsplit("/", 1)[-1] == "systemd-run" for part in parts)
+    if runs_unit and "--scope" not in parts:
+        return [_DETACHING_HINT]
+    return []
 
 
 def is_configured() -> bool:
@@ -172,7 +212,10 @@ async def _spawn(prompt: str, workdir: str, limit: int, started: float) -> Local
         *argv(),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        # Оба потока в одну трубу: читателя два — значит и способов
+        # заблокировать ребёнка на полной трубе два, а разделять вывод
+        # некому — обе стороны идут в одну ленту.
+        stderr=asyncio.subprocess.STDOUT,
         cwd=workdir,
         env=_clean_env(workdir),
         # Своя сессия процесса — обязательное условие kill_process_group:
@@ -181,22 +224,78 @@ async def _spawn(prompt: str, workdir: str, limit: int, started: float) -> Local
         start_new_session=True,
     )
     try:
-        out, err = await asyncio.wait_for(
-            proc.communicate(prompt.encode()), timeout=limit
-        )
+        out, dropped = await asyncio.wait_for(_pump(proc, prompt), timeout=limit)
     except asyncio.TimeoutError:
         await kill_process_group(proc)
         return LocalRun(
             rc=TIMEOUT_RC,
-            stdout="",
-            stderr="",
+            output="",
+            dropped=0,
             timed_out=True,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
+    except asyncio.CancelledError:
+        # Хаб останавливают или прогон отменяют (найдено ревью, находка
+        # d478b896). CancelledError наследует BaseException и мимо
+        # перехвата таймаута проходит насквозь — а ревьюер остаётся жить,
+        # уже никем не досматриваемый. Снимаем группу и отдаём отмену
+        # дальше: глотать её нельзя, это чужое решение остановиться.
+        await kill_process_group(proc)
+        raise
     return LocalRun(
         rc=proc.returncode or 0,
-        stdout=out.decode(errors="replace")[-OUTPUT_CAP:],
-        stderr=err.decode(errors="replace")[-OUTPUT_CAP:],
+        output=out.decode(errors="replace"),
+        dropped=dropped,
         timed_out=False,
         duration_ms=int((time.monotonic() - started) * 1000),
     )
+
+
+async def _pump(proc: Any, prompt: str) -> tuple[bytes, int]:
+    """Скормить промт и вычитать вывод, не дав ребёнку встать на трубе.
+
+    Одновременно, а не по очереди: промт больше буфера трубы (64 КБ), и
+    последовательная запись встала бы до того, как ревьюер начнёт читать, —
+    а он не начнёт, пока мы не дочитаем его вывод.
+    """
+    feeding = asyncio.create_task(_feed(proc, prompt))
+    try:
+        return await _collect(proc)
+    finally:
+        feeding.cancel()
+
+
+async def _feed(proc: Any, prompt: str) -> None:
+    """Отдать промт в stdin и закрыть его. Отказ ревьюера читать — не ошибка."""
+    try:
+        proc.stdin.write(prompt.encode())
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError, AttributeError):
+        pass
+    finally:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+            proc.stdin.close()
+
+
+async def _collect(proc: Any) -> tuple[bytes, int]:
+    """Читать вывод до ``OUTPUT_CAP``, остальное сливать и считать (#509).
+
+    Именно СЛИВАТЬ, а не перестать читать: замолчавший читатель оставляет
+    ребёнка стоять на полной трубе, и тот умрёт только по таймауту — то есть
+    экономия памяти обернулась бы получасом впустую. Приём взят у
+    validation_run._collect, где этот же дефект уже закрыт.
+    """
+    kept: list[bytes] = []
+    size = 0
+    dropped = 0
+    while True:
+        chunk = await proc.stdout.read(65536)
+        if not chunk:
+            break
+        room = OUTPUT_CAP - size
+        if room > 0:
+            kept.append(chunk[:room])
+            size += min(room, len(chunk))
+        dropped += max(0, len(chunk) - max(room, 0))
+    await proc.wait()
+    return b"".join(kept), dropped

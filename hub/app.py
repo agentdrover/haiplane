@@ -310,6 +310,13 @@ async def lifespan(app: FastAPI):
             yield
     finally:
         poll_task.cancel()
+        # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
+        # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
+        # он доработает, попробует сдать отчёт по прогону, за которым больше
+        # некому смотреть, и всё это время будет жечь процессор.
+        from hub.services.review_dispatch import cancel_local_runs
+
+        await cancel_local_runs()
         set_telemetry_sink(None)
         await app.state.db.close()
 

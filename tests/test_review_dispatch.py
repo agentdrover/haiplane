@@ -7,6 +7,7 @@ report whose tokens disagree with the provider's usage is flagged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -3053,3 +3054,251 @@ async def test_a_local_run_lost_to_a_restart_fails_with_its_own_cause(
         if dict(u)["kind"] == "alert"
     ]
     assert any("потеряно" in a and "перезапуска" in a for a in alerts), alerts
+
+
+# --- Находки ревью по сдаче #1 (отчёт #258) ----------------------------------
+#
+# Шесть подтверждённых находок про этот же локальный путь. Тесты ниже названы
+# по дефекту, а не по фиксу: каждый обязан падать на коде ДО правки, иначе он
+# не ловит класс, ради которого написан.
+
+
+async def test_the_local_top_up_keeps_the_profile_it_was_ordered_with(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 7ed386a8: добор лестницы на не-GitHub снова покупал lite.
+
+    maybe_dispatch_review получал force_profile=DEEP, а до prepare_review_order
+    он не доезжал — локальный путь выбирал профиль заново и заказывал второй
+    однопроходный прогон вместо харнесса. Молча и за деньги: в карточке стоит
+    «профиль lite», как будто так и заказывали.
+    """
+    from hub.services.review_dispatch import (
+        DEEP,
+        maybe_dispatch_review,
+        wait_for_local_runs,
+    )
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-tu"}, "run": {"id": "r-tu"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(
+        monkeypatch, tmp_path, _reporting_stub({**_LOCAL_REPORT, "tokens_spent": 1000})
+    )
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-topup",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    await wait_for_local_runs()
+    await db.commit()
+
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT profile, channel FROM review_dispatches WHERE task_id=? "
+            "ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert len(rows) == 2 and rows[1]["channel"] == "local"
+    assert rows[1]["profile"] == DEEP, (
+        "добор заказан deep — локальный путь обязан исполнить заказанное, а не "
+        f"выбрать профиль заново: {rows}"
+    )
+
+
+async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
+    """Находка aa620d54: AC-3 проверял ТЕКСТ в ленте, а не смерть процесса.
+
+    kill_process_group никогда не бросает, поэтому прежний тест оставался
+    зелёным и при живом ревьюере — он читал только слова хаба о самом себе.
+    Здесь доказательство внешнее: полезная нагрузка пишет маркер ПОСЛЕ
+    таймаута, и файла быть не должно.
+
+    Хвост `; :` не украшение (#544): одна простая команда была бы заменена
+    шеллом через exec, полезная нагрузка стала бы тем самым pid, который мы
+    сигналим, и тест прошёл бы на macOS при живом процессе на Linux.
+    Составная команда заставляет sh форкнуться — до внука дотягивается только
+    убийство группы.
+    """
+    import shlex
+    import shutil
+    import sys
+
+    marker = tmp_path / "still_alive"
+    payload = (
+        f"{sys.executable} -c "
+        + shlex.quote(
+            "import time, pathlib, sys; sys.stdin.read(); time.sleep(2.5); "
+            f"pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        + "; :"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    run = await local_reviewer.run_review("промт", timeout=1)
+
+    assert run is not None and run.timed_out
+    await asyncio.sleep(3.0)
+    assert not marker.exists(), (
+        "ревьюер пережил собственный таймаут: хаб написал в ленту, что снял "
+        "процесс, и это было бы неправдой"
+    )
+
+
+async def test_stopping_the_hub_kills_the_local_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка d478b896: отмена проходила мимо перехвата и оставляла сироту.
+
+    CancelledError наследует BaseException, поэтому except на таймаут его не
+    видел, а wait_for_local_runs, объявленная «для остановки хаба», из
+    lifespan никем не звалась. Проверяется тем же внешним маркером.
+    """
+    from hub.services.review_dispatch import cancel_local_runs
+
+    import shlex
+    import shutil
+    import sys
+
+    marker = tmp_path / "outlived_the_hub"
+    payload = (
+        f"{sys.executable} -c "
+        + shlex.quote(
+            "import time, pathlib, sys; sys.stdin.read(); time.sleep(2.5); "
+            f"pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        + "; :"
+    )
+    recorder = _DispatchRecorder({"agent": {"id": "bc-st"}, "run": {"id": "r-st"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+
+    await _submitted(
+        client,
+        db,
+        "spike-local-stop",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await asyncio.sleep(0.3)
+
+    await cancel_local_runs()
+
+    await asyncio.sleep(3.0)
+    assert not marker.exists(), (
+        "хаб остановился, а ревьюер продолжил работать сиротой — и мог бы ещё "
+        "прислать отчёт по прогону, за которым больше некому смотреть"
+    )
+
+
+async def test_a_chatty_reviewer_does_not_grow_the_hub(monkeypatch, tmp_path):
+    """Находка 30a65c79: лимит применялся ПОСЛЕ чтения всего вывода в память.
+
+    communicate() читает оба потока до EOF, и OUTPUT_CAP резал уже собранную
+    строку — то есть не ограничивал ничего. Лимит памяти при этом стоит на
+    слайсе ревьюера, а росла память ХАБА.
+    """
+    import shlex
+    import shutil
+    import sys
+
+    monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_CMD",
+        shlex.join(
+            [sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 500000)"]
+        ),
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    run = await local_reviewer.run_review("промт", timeout=30)
+
+    assert run is not None and not run.timed_out
+    assert len(run.output) <= 1000, "в памяти остаётся только хвост под лимитом"
+    assert run.dropped > 400_000, (
+        "выброшенное считается: «вывод кончился» и «вывод обрезан» — разные "
+        "факты, и второй должен быть виден в ленте"
+    )
+
+
+async def test_a_detaching_sandbox_is_refused_by_name(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находки a6aaffbc и 7897d52c: песочница из документа отсоединяла процесс.
+
+    systemd-run без --scope поднимает transient service: родитель CLI — PID 1,
+    таймаут его не снимет, а cwd и белый список окружения осядут на клиенте.
+    Хаб не имеет права запускать прогон, снять который он не сможет, — и
+    обязан назвать причину, а не промолчать.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ds"}, "run": {"id": "r-ds"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    runs: list[str] = []
+
+    async def _never(prompt, *, timeout=None):
+        runs.append(prompt)
+        return None
+
+    monkeypatch.setattr(local_reviewer, "run_review", _never)
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --quiet --pipe --uid=haiplane-reviewer --",
+    )
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-detach",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+
+    assert runs == [], "прогон, который нельзя снять, не запускается вовсе"
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("--scope" in a for a in alerts), (
+        f"отказ обязан назвать недостающий флаг, а не «песочница неверна»: {alerts}"
+    )
