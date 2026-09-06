@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 
 from hub import brand
+from hub.integrations.proc import HUB_GIT_EMAIL, HUB_GIT_NAME
 
 log = logging.getLogger(__name__)
 
@@ -382,10 +383,12 @@ def _seed(
 
     rc, out = _git(
         workspace,
+        # Личность хаба одна на репозиторий и живёт в одном месте (#1192):
+        # две разных читались бы в git log как два разных автора.
         "-c",
-        "user.name=Haiplane Hub",
+        f"user.name={HUB_GIT_NAME}",
         "-c",
-        "user.email=hub@haiplane.local",
+        f"user.email={HUB_GIT_EMAIL}",
         "commit",
         "-m",
         "ci: add Haiplane workflows (hub provisioning, #476)",

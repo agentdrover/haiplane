@@ -15,6 +15,7 @@ import pytest
 
 from hub import config
 from hub import repository as repo
+from hub.integrations import cursor_cloud
 from hub.db import fetchall
 from hub.services import steward_shadow as sh
 from hub.services.steward_dispatch import (
@@ -35,6 +36,10 @@ from hub.services.steward_shadow import (
 )
 
 _CREATED = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
+
+# Провал, который НЕ означает недоступность модели: связь. Судью он не
+# меняет (#1182), поэтому в тестах, проверяющих отказ старта, стоит именно он.
+_TRANSPORT = cursor_cloud.Refusal(detail="соединение оборвалось")
 
 # Канал доставки идентичности появится своей задачей (#1084 для ревьюера —
 # отдельная работа); здесь он подменяется, чтобы тесты проверяли СТАРТ, а не
@@ -143,8 +148,8 @@ async def test_open_order_starts_one_run(db: aiosqlite.Connection, with_identity
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 1
 
@@ -178,8 +183,8 @@ async def test_three_family_rule_refuses_run(db: aiosqlite.Connection, monkeypat
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 
@@ -207,8 +212,8 @@ async def test_missing_declaration_is_not_diversity(db: aiosqlite.Connection):
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 
@@ -237,8 +242,8 @@ async def test_run_starts_at_most_once_per_order(
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 1
         assert await start_due_runs(db) == 0
@@ -253,7 +258,7 @@ async def test_run_starts_at_most_once_per_order(
     stale = dict(runs[0])
     stale["agent_id"] = ""
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
+        "hub.integrations.cursor_cloud.create_agent_attempt",
         new=AsyncMock(return_value={"agent": {"id": "agent-2"}, "run": {}}),
     ) as raced:
         assert await start_run(db, stale) is False
@@ -287,8 +292,8 @@ async def test_a_transient_failure_leaves_the_order_open(
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=None),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(None, _TRANSPORT)),
     ):
         assert await start_due_runs(db) == 0
 
@@ -300,8 +305,8 @@ async def test_a_transient_failure_leaves_the_order_open(
 
     # И следующий тик действительно стартует, когда провайдер ожил.
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ):
         assert await start_due_runs(db) == 1
     assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
@@ -321,8 +326,8 @@ async def test_missing_config_does_not_burn_the_slot(
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 
@@ -345,8 +350,8 @@ async def test_no_identity_channel_means_no_paid_run(db: aiosqlite.Connection):
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 
@@ -852,6 +857,287 @@ async def test_the_table_stands_beside_practice_metrics(db: aiosqlite.Connection
     assert any(item["reason"] == "false_approve" for item in block["act_refusals"])
 
 
+_CAPACITY = cursor_cloud.Refusal(
+    status=400, code="usage_limit_exceeded", detail="Usage-based pricing required"
+)
+
+
+async def test_a_capacity_refusal_moves_to_the_next_model(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """AC-1: «эта модель недоступна» переводит прогон на замену, а не тратит слот.
+
+    Наблюдённый случай 06.09.2026: провайдер отвечал usage_limit_exceeded,
+    хаб повторял ТУ ЖЕ модель каждые 32 секунды семнадцать минут, и слот
+    истёк. Замена существовала и проходила гейт — её просто некому было
+    выбрать.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5",))
+    project_id = await _project(db, "shadow-fallback")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        if kwargs["model_id"] == "gpt-5.3-codex":
+            return None, _CAPACITY
+        return _CREATED, None
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 1
+
+    assert attempts == ["gpt-5.3-codex", "composer-2.5"], (
+        "основной пробуется первым, замена — только после отказа по недоступности"
+    )
+    run = (await _runs(db, task_id))[0]
+    assert run["model"] == "composer-2.5", (
+        "строка прогона называет того, кто СУДИЛ, — по ней считает надзор F7"
+    )
+
+
+async def test_the_list_is_walked_past_a_second_refusal(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Перечень замен — перечень, а не одна запасная (находка ревью №249).
+
+    Раскол адъюдикации: цикл выглядит прямолинейно, но ни один тест не
+    заставлял ПЕРВУЮ замену тоже отказать, и мутация «break после первой
+    замены» оставалась зелёной. Перечень, из которого проверена одна
+    позиция, — одна запасная модель с видом списка; лимит у провайдера
+    приходит сразу ко всем моделям одного тарифа, так что второй отказ
+    подряд — обычный случай, а не экзотический.
+    """
+    monkeypatch.setattr(
+        config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5", "gemini-3.1-pro")
+    )
+    project_id = await _project(db, "shadow-fallback-second")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        # Предел заходов: перебор без памяти о пробованных не падал бы, а
+        # ВИС — в CI это повешенный прогон вместо названного дефекта.
+        assert len(attempts) <= 4, f"перебор не кончается: {attempts}"
+        if kwargs["model_id"] == "gemini-3.1-pro":
+            return _CREATED, None
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 1
+
+    assert attempts == ["gpt-5.3-codex", "composer-2.5", "gemini-3.1-pro"], (
+        "перебор идёт по порядку предпочтения и не останавливается на первой "
+        "замене: каждая пробуется ровно раз"
+    )
+    run = (await _runs(db, task_id))[0]
+    assert run["model"] == "gemini-3.1-pro"
+
+
+async def test_an_exhausted_list_stops_instead_of_looping(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Оборотная сторона: перебор конечен, и каждая модель пробуется однажды.
+
+    Без этого «идти дальше по списку» превращается в круг по нему же —
+    деньги тратятся на повтор того, что уже отказало.
+    """
+    monkeypatch.setattr(
+        config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5", "gemini-3.1-pro")
+    )
+    project_id = await _project(db, "shadow-fallback-exhausted")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        # Предел заходов: перебор без памяти о пробованных не падал бы, а
+        # ВИС — в CI это повешенный прогон вместо названного дефекта.
+        assert len(attempts) <= 4, f"перебор не кончается: {attempts}"
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+
+    assert attempts == ["gpt-5.3-codex", "composer-2.5", "gemini-3.1-pro"]
+    run = (await _runs(db, task_id))[0]
+    # Заказ остаётся ОТКРЫТЫМ: лимит провайдера — состояние временное, а
+    # UNIQUE(task_id, generation, kind) сжёг бы единственное суждение
+    # поколения окончательно.
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == ""
+
+
+async def test_a_same_family_substitute_is_skipped(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """AC-2: экономия не покупается снятием гейта разнообразия.
+
+    Ревьюер на этой сдаче — grok, и замена grok прошла бы «успешно», дав
+    судью, наследующего слепые зоны того, кого он судит. Проверяется
+    ПОРЯДОК вызовов: однофамилец не должен быть даже опробован, иначе
+    правило работает постфактум и уже потратило деньги.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("grok-4.6", "composer-2.5"))
+    project_id = await _project(db, "shadow-samefamily")
+    task_id = await _task(db, project_id, reviewer="grok-4.6")
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        if kwargs["model_id"] == "gpt-5.3-codex":
+            return None, _CAPACITY
+        return _CREATED, None
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 1
+
+    assert "grok-4.6" not in attempts, (
+        "однофамилец ревьюера не пробуется вовсе, а не отвергается после вызова"
+    )
+    assert attempts == ["gpt-5.3-codex", "composer-2.5"]
+
+
+async def test_a_transport_error_keeps_the_judge(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """AC-3: оборвавшаяся связь судью НЕ меняет.
+
+    Судья, зависящий от качества сети, невоспроизводим: завтра тот же обрыв
+    даст другого судью на той же сдаче, и сравнивать суждения будет не с чем.
+    Заказ остаётся открытым — следующий тик пробует ТУ ЖЕ модель.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5",))
+    project_id = await _project(db, "shadow-transport")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        return None, _TRANSPORT
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+
+    assert attempts == ["gpt-5.3-codex"], "замена на сетевую ошибку не берётся"
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == "open", "заказ остаётся открытым для следующего тика"
+    assert run["model"] == "gpt-5.3-codex", "и модель в записи не подменена"
+
+
+async def test_the_substitution_is_recorded(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """AC-4: подмена названа — и в записи прогона, и в карточке, и в событии.
+
+    Судья, которого никто не выбирал и который нигде не назван, делает
+    статистику надзора ложной вернее, чем отсутствие суждения: в таблице
+    2x2 суждение окажется приписано модели, не работавшей ни минуты.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5",))
+    project_id = await _project(db, "shadow-recorded")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    async def _attempt(**kwargs):
+        if kwargs["model_id"] == "gpt-5.3-codex":
+            return None, _CAPACITY
+        return _CREATED, None
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 1
+
+    started = await _events(db, "steward_run_started")
+    payload = json.loads(started[-1]["payload"])
+    assert payload["model"] == "composer-2.5", "событие называет того, кто судит"
+    assert payload["requested_model"] == "gpt-5.3-codex", (
+        "и того, кого просили: без этого подмену не отличить от выбора"
+    )
+
+    updates = await fetchall(
+        db, "SELECT content FROM task_updates WHERE task_id=?", (task_id,)
+    )
+    said = [dict(u)["content"] for u in updates]
+    assert any("Судья заменён" in c and "composer-2.5" in c for c in said), (
+        f"человек, читающий карточку, должен знать, кто судил и почему: {said}"
+    )
+
+
+async def test_no_eligible_substitute_is_an_honest_refusal(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Годной замены нет — отказ, а не однофамилец ради состоявшегося прогона.
+
+    Оборотная сторона AC-2: правило, умеющее только подменять, рано или
+    поздно подменит на того, кого гейт не пускает. Здесь перечень состоит
+    ровно из однофамильцев сторон, и прогон обязан не состояться.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("grok-4.6",))
+    project_id = await _project(db, "shadow-nosub")
+    task_id = await _task(db, project_id, reviewer="grok-4.6")
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+
+    assert attempts == ["gpt-5.3-codex"], (
+        "однофамилец не пробуется даже как последний шанс"
+    )
+    assert (await _runs(db, task_id))[0]["status"] == "open"
+
+
+async def test_a_5xx_naming_a_limit_is_still_transport(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Транспортный провал остаётся транспортным, даже если назвал код лимита.
+
+    Мутация, выжившая при первом заходе: страж is_transport был написан и
+    ничем не проверен — в соседнем тесте обрыв связи отсекается раньше, по
+    пустому коду ошибки, и до стража дело не доходит. Случай, ради которого
+    он существует, здесь: провайдер отдаёт 503 и В ТЕЛЕ называет
+    usage_limit_exceeded. Судить по коду, не посмотрев на статус, значило бы
+    менять судью на временном сбое — и завтра тот же сбой дал бы другого
+    судью на той же сдаче.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5",))
+    project_id = await _project(db, "shadow-5xx")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    flaky = cursor_cloud.Refusal(
+        status=503, code="usage_limit_exceeded", detail="upstream unavailable"
+    )
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        return None, flaky
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+
+    assert attempts == ["gpt-5.3-codex"], (
+        "код лимита на пятисотке — сбой провайдера, а не недоступность модели"
+    )
+    assert (await _runs(db, task_id))[0]["model"] == "gpt-5.3-codex"
+
+
 async def _no_dispatch(db: aiosqlite.Connection, task_id: int) -> None:
     """Убрать запись о заказе ревьюера — состояние окна гонки (#1185)."""
     await db.execute("DELETE FROM review_dispatches WHERE task_id=?", (task_id,))
@@ -873,8 +1159,8 @@ async def test_a_reviewer_not_yet_dispatched_is_waited_for(
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 
@@ -893,8 +1179,8 @@ async def test_a_reviewer_not_yet_dispatched_is_waited_for(
     )
     await db.commit()
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 1
     assert started.await_count == 1
@@ -953,8 +1239,8 @@ async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
 
     # И следующий тик доводит дело до конца, уже видя настоящую модель.
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         await start_due_runs(db)
     assert started.await_count == 1
@@ -975,8 +1261,8 @@ async def test_an_unrecognised_reviewer_still_closes_the_slot(
     await order_run(db, task_id, 1)
 
     with patch(
-        "hub.integrations.cursor_cloud.create_review_agent",
-        new=AsyncMock(return_value=_CREATED),
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
     ) as started:
         assert await start_due_runs(db) == 0
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 import logging
+from typing import Any
 from dataclasses import dataclass
 
 import aiosqlite
@@ -98,6 +99,60 @@ async def steward_principal_id(db: aiosqlite.Connection) -> int | None:
     return int(dict(rows[0])["principal_id"]) if rows else None
 
 
+#: Куда прогон кладёт свой допуск. Домашний каталог, а не /tmp: вне рабочего
+#: дерева (иначе короткий допуск уедет в артефакты прогона), но и не в общем
+#: каталоге, где предсказуемое имя — приглашение подменить файл симлинком.
+#: Тильда, а не $HOME, намеренно: правило «ни одна команда не полагается на
+#: переменную» остаётся без исключений, которые потом придётся объяснять.
+CREDENTIAL_PATH = "~/.haiplane-steward.credential"
+
+
+def delivery_commands(task_id: int, code: str, base_url: str) -> tuple[str, ...]:
+    """Команды, которые прогон выполняет, — каждая самодостаточна (#1194).
+
+    Прежняя форма велела «сохранить токен в переменную», а дальше все команды
+    ссылались на ``$TOKEN``. Наблюдено 06.09.2026: обмен кода проходил, сессия
+    была жива, а СЛЕДУЮЩИЙ ЖЕ запрос получал 401 — за день шесть заказов и
+    ноль суждений. Почему именно допуск не доезжал, журнал не различает:
+    переменная не пережила переход к следующей команде, либо токен вовсе не
+    был захвачен из ответа. Обе ветки — один дефект, и обе лечит одно
+    правило: команде, которой нужен токен, велено добывать его самой.
+
+    Поэтому здесь список, а не сплошной текст. Прозу читает агент, а
+    выполняются ровно эти строки — тест гоняет их, а не пересказ.
+
+    ``umask 077`` стоит ДО перенаправления: файл рождается с режимом 600, без
+    окна между созданием и chmod. Разбор через ``sed`` намеренно: ``jq`` на
+    образе провайдера может не оказаться, а отсутствующий разборщик выглядел
+    бы как пустой токен — то есть как ровно тот отказ, который чиним.
+
+    Обмен пишет во ВРЕМЕННЫЙ файл и переносит его только после проверки на
+    непустоту (находка ревью №260). Прямое ``>`` обрезает цель ДО того, как
+    отработает разбор: повтори агент первую команду — а журнал прода
+    показывает ровно это, redeem 200 и следом redeem 401, — тело отказа поля
+    ``token`` не содержит, разбор молчит, и ЖИВОЙ допуск затирается пустотой.
+    Дальше пустой ``Bearer`` и тот самый 401, ради которого всё и затевалось.
+    Повтор не предусмотрен инструкцией, но агенты повторяют; починка, которую
+    ломает повтор, ненадёжна ровно там, где нужнее всего.
+    """
+    return (
+        f"umask 077 && curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
+        "-H 'Content-Type: application/json' "
+        f'-d \'{{"code":"{code}"}}\' '
+        '| sed -n \'s/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' '
+        f"> {CREDENTIAL_PATH}.new "
+        f"&& test -s {CREDENTIAL_PATH}.new "
+        f"&& mv {CREDENTIAL_PATH}.new {CREDENTIAL_PATH}",
+        f"test -s {CREDENTIAL_PATH} && wc -c < {CREDENTIAL_PATH}",
+        f"curl -sS {base_url}/api/tasks/{task_id}/steward-evidence "
+        f'-H "Authorization: Bearer $(cat {CREDENTIAL_PATH})"',
+        f"curl -sS -X POST {base_url}/api/tasks/{task_id}/steward-judgement "
+        f'-H "Authorization: Bearer $(cat {CREDENTIAL_PATH})" '
+        "-H 'Content-Type: application/json' "
+        "-d '<суждение по контракту>'",
+    )
+
+
 def delivery_block(task_id: int, code: str, base_url: str) -> str:
     """How the run reaches the hub without MCP (#1084's lesson, #1120).
 
@@ -106,21 +161,22 @@ def delivery_block(task_id: int, code: str, base_url: str) -> str:
     """
     if not code or not base_url:
         return ""
+    redeem, check, evidence, judgement = delivery_commands(task_id, code, base_url)
     return (
         "ДОСТУП К ХАБУ — ПЕРВОЕ ДЕЙСТВИЕ. Инструментов MCP у тебя нет, всё "
         "идёт обычным HTTP. Код ниже живёт МИНУТЫ, а прогон дольше — обменяй "
         "его сразу:\n"
-        f"  curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
-        "-H 'Content-Type: application/json' "
-        f'-d \'{{"code":"{code}"}}\'\n'
-        "В ответе поле token — сохрани в переменную, в вывод не печатай. "
-        "Пакет доказательств читается им же:\n"
-        f"  curl -sS {base_url}/api/tasks/{task_id}/steward-evidence "
-        '-H "Authorization: Bearer $TOKEN"\n'
+        f"  {redeem}\n"
+        "Токен ушёл в файл и в вывод не попал. НЕ переноси его в переменную "
+        "оболочки: каждая команда ниже берёт его из файла сама, потому что "
+        "переменная не переживает переход к следующей команде — на этом уже "
+        "потерян целый день суждений (#1194).\n"
+        "Убедись, что файл непустой (печатается РАЗМЕР, не содержимое):\n"
+        f"  {check}\n"
+        "Пакет доказательств:\n"
+        f"  {evidence}\n"
         "Суждение сдаётся туда же:\n"
-        f"  curl -sS -X POST {base_url}/api/tasks/{task_id}/steward-judgement "
-        "-H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' "
-        "-d '<суждение по контракту>'\n"
+        f"  {judgement}\n"
         "Больше этим токеном не открыто НИЧЕГО: две операции, обе про эту "
         "задачу. Это не ограничение прогона, а граница, на которой держится "
         "допуск твоего суждения к действию."
@@ -190,6 +246,59 @@ async def reviewer_model(
     if not reports:
         return ""
     return (dict(reports[0]).get("model") or "").strip()
+
+
+#: Коды провайдера, означающие «ЭТА модель здесь недоступна» (#1182).
+#: Список узкий намеренно: незнакомый код сигналом не считается, потому что
+#: незнание — не повод менять судью. Сеть, таймаут и 5xx сюда не входят по
+#: устройству — их отбирает Refusal.is_transport раньше.
+CAPACITY_CODES: frozenset[str] = frozenset(
+    {
+        "usage_limit_exceeded",
+        "model_not_available",
+        "model_unavailable",
+        "insufficient_quota",
+    }
+)
+
+
+def is_capacity_refusal(refusal: object) -> bool:
+    """Отказ означает недоступность ИМЕННО ЭТОЙ модели, а не сбой связи.
+
+    Транспортный провал исключается первым и явно: судья, меняющийся от
+    оборвавшегося соединения, невоспроизводим — завтра тот же обрыв даст
+    другого судью на той же сдаче, и сравнивать суждения будет не с чем.
+    """
+    if refusal is None:
+        return False
+    if getattr(refusal, "is_transport", False):
+        return False
+    return str(getattr(refusal, "code", "") or "").strip() in CAPACITY_CODES
+
+
+def pick_substitute(
+    tried: list[str], implementer: str, reviewer: str, candidates: list[str]
+) -> str:
+    """Первая замена, которую пропускает ГЕЙТ, а не первая по списку.
+
+    Выбор идёт через тот же ``family_refusal``, что решает судьбу основной
+    модели, — не через второе правило рядом. Второе правило разошлось бы с
+    первым, и разошлось бы в сторону «пропустить»: экономия всегда громче
+    осторожности.
+
+    Пустая строка означает «годной замены нет». Это законный исход, а не
+    неудача: на сдаче, где ревьюер и исполнитель уже заняли два семейства,
+    список может не содержать третьего, и брать однофамильца ради того,
+    чтобы прогон состоялся, значило бы купить прогон ценой того, ради чего
+    он затевался.
+    """
+    for candidate in candidates:
+        name = (candidate or "").strip()
+        if not name or name in tried:
+            continue
+        if family_refusal(name, implementer, reviewer) is None:
+            return name
+    return ""
 
 
 def family_refusal(
@@ -491,14 +600,34 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         return False
     await db.commit()
 
-    created = await cursor_cloud.create_review_agent(
-        repo_url=f"https://github.com/{gh_repo}",
-        starting_ref=(task.get("branch") or "").strip() or "HEAD",
-        model_id=steward,
-        prompt_text=_prompt(task_id, generation, hub_base, delivery),
-        hub_mcp_url=f"{hub_base}/mcp",
-        reviewer_token=token,
-    )
+    # Перебор судей: основной, затем замены (#1182). Замена берётся ТОЛЬКО
+    # на отказ, означающий недоступность этой модели, и только та, что
+    # проходит гейт семейств для ЭТОЙ сдачи — выбор идёт через pick_substitute,
+    # то есть через тот же family_refusal, что решал судьбу основного.
+    prompt_text = _prompt(task_id, generation, hub_base, delivery)
+    tried: list[str] = []
+    judge = steward
+    created: dict[str, Any] | None = None
+    denial: cursor_cloud.Refusal | None = None
+    while judge:
+        tried.append(judge)
+        created, denial = await cursor_cloud.create_agent_attempt(
+            repo_url=f"https://github.com/{gh_repo}",
+            starting_ref=(task.get("branch") or "").strip() or "HEAD",
+            model_id=judge,
+            prompt_text=prompt_text,
+            hub_mcp_url=f"{hub_base}/mcp",
+            reviewer_token=token,
+        )
+        if ((created or {}).get("agent") or {}).get("id"):
+            break
+        if not is_capacity_refusal(denial):
+            # Сеть, таймаут, незнакомый код — та же модель, следующий тик.
+            break
+        judge = pick_substitute(
+            tried, implementer, reviewer, list(config.STEWARD_MODEL_FALLBACKS)
+        )
+
     agent_id = ((created or {}).get("agent") or {}).get("id") or ""
     if not agent_id:
         # The provider did not take it. Release the claim rather than close
@@ -513,11 +642,32 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         )
         return False
     run_id = ((created or {}).get("run") or {}).get("id") or ""
+    judge = tried[-1]
 
+    # Модель пишется ТОЙ ЖЕ записью, что называет агента, и под той же
+    # меткой захвата. Отдельным UPDATE она досталась бы и тому, кто слот не
+    # брал, а строка прогона — это то, по чему надзор F7 считает, кто судил.
+    # Судья, которого никто не выбирал и который нигде не назван, делает
+    # статистику ложной вернее, чем отсутствие суждения.
     await db.execute(
-        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=? AND agent_id=?",
-        (agent_id, run_id, order["id"], claim),
+        "UPDATE steward_runs SET agent_id=?, run_id=?, model=? "
+        "WHERE id=? AND agent_id=?",
+        (agent_id, run_id, judge, order["id"], claim),
     )
+    if judge != steward:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            (
+                f"Судья заменён: {steward} провайдер запустить не смог "
+                f"(недоступность модели), прогон идёт на {judge}. Замена "
+                "выбрана по тому же правилу семейств, что и основной судья "
+                "(#1182)."
+            ),
+            author_kind="hub",
+        )
     await repo.insert_event(
         db,
         kind=EVENT_RUN_STARTED,
@@ -527,7 +677,8 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
             "run_id": order["id"],
             "generation": generation,
             "agent_id": agent_id,
-            "model": steward,
+            "model": judge,
+            "requested_model": steward,
             "implementer_model": implementer,
             "reviewer_model": reviewer,
         },

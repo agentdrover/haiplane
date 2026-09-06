@@ -153,6 +153,12 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool: ...
+    async def branch_ancestry(
+        self,
+        branch: str,
+        other_branch: str,
+        repo: str | None = None,
+    ) -> str: ...
     async def create_branch(
         self, task_id: int, title: str, repo: str | None = None
     ) -> str: ...
