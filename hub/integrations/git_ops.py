@@ -662,6 +662,38 @@ async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     return None
 
 
+# Ancestry between two task branches (#1184). The names say which side of the
+# pair the HEAD branch — the one being submitted — sits on, so a caller never
+# has to remember argument order to read the answer.
+STACK_ANCESTRY_HEAD_IS_DESCENDANT = "head_is_descendant"
+STACK_ANCESTRY_HEAD_IS_ANCESTOR = "head_is_ancestor"
+STACK_ANCESTRY_UNRELATED = "unrelated"
+STACK_ANCESTRY_UNKNOWN = "unknown"
+
+
+async def _is_ancestor(maybe_ancestor: str, descendant: str, repo: str) -> bool | None:
+    """True/False from ``merge-base --is-ancestor``; None when git could not say.
+
+    git answers 0 for yes and 1 for no, and anything else is a failure — a
+    missing object, a broken repo. Collapsing that third case into False would
+    turn "could not check" into "not an ancestor", which is exactly the kind of
+    invented answer this check exists to remove.
+    """
+    rc, _, _ = await _git(
+        "merge-base",
+        "--is-ancestor",
+        maybe_ancestor,
+        descendant,
+        repo=repo,
+        check=False,
+    )
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
 def _resolve_base(base_branch: str | None) -> str:
     """The base a task's work is cut from AND its PR targets (#362 I4).
 
@@ -722,6 +754,55 @@ class GitOpsIntegration:
     async def current_branch(self, repo: str | None = None) -> str:
         rc, out, _ = await _git("branch", "--show-current", repo=repo, check=False)
         return out if rc == 0 else "unknown"
+
+    async def branch_ancestry(
+        self,
+        branch: str,
+        other_branch: str,
+        repo: str | None = None,
+    ) -> str:
+        """Which of two branches stands on the other (#1184).
+
+        ``branch_contains_unmerged_commits_of`` answers whether two branches
+        INTERSECT, and that answer is symmetric: for a stacked pair it is true
+        read in either direction, because both branches carry the ancestor's
+        commits. The advisory built on it therefore named the merge order from
+        whichever task happened to be submitting, and flipped when the other
+        one submitted. The order is a property of the branches, so ask git
+        about it directly.
+
+        Returns one of ``STACK_ANCESTRY_*``: the head is the descendant (the
+        other branch merges first), the head is the ancestor (the head merges
+        first), the two are unrelated by ancestry (no order to name), or the
+        question could not be answered. Never raises and never guesses: an
+        unresolvable ref or a git failure is ``unknown``, which the caller
+        must report as "order not determined" rather than fall back to a side.
+        """
+        if repo is None:
+            reason = await _default_workspace_error()
+            if reason:
+                return STACK_ANCESTRY_UNKNOWN
+        repo = repo or _repo_root()
+        # Remote-first for the same reason as the stacking check itself
+        # (#1046 / #762): a stale local ref is not the branch under judgement.
+        head = await _resolve_ref_remote_first(branch, repo)
+        other = await _resolve_ref_remote_first(other_branch, repo)
+        if not (head and other):
+            return STACK_ANCESTRY_UNKNOWN
+
+        head_is_descendant = await _is_ancestor(other, head, repo)
+        head_is_ancestor = await _is_ancestor(head, other, repo)
+        if head_is_descendant is None or head_is_ancestor is None:
+            return STACK_ANCESTRY_UNKNOWN
+        if head_is_descendant and head_is_ancestor:
+            # Same commit under two branch names: both answers are yes and
+            # neither names an order.
+            return STACK_ANCESTRY_UNRELATED
+        if head_is_descendant:
+            return STACK_ANCESTRY_HEAD_IS_DESCENDANT
+        if head_is_ancestor:
+            return STACK_ANCESTRY_HEAD_IS_ANCESTOR
+        return STACK_ANCESTRY_UNRELATED
 
     async def branch_contains_unmerged_commits_of(
         self,

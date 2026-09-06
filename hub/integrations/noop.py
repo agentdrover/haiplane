@@ -338,6 +338,16 @@ class NoopGitOps:
         # No repo access — the advisory stacking check is silently skipped.
         return False
 
+    async def branch_ancestry(
+        self,
+        branch: str,
+        other_branch: str,
+        repo: str | None = None,
+    ) -> str:
+        # No repo access — no ancestry to report. "unknown", not a side:
+        # the caller must say the order was not determined (#1184).
+        return "unknown"
+
     async def create_branch(
         self,
         task_id: int,
