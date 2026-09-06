@@ -373,6 +373,7 @@ async def test_same_tip_names_no_merge_order(db: aiosqlite.Connection):
     )
 
     hint = await _stacking_hint(view)
+    assert f"#{other_id}" in hint
     assert f"'{branch}' contains unmerged commits" not in hint
     # Case-insensitive on purpose: an earlier version of this test looked for
     # the lowercase sentence only, and a mutation that named a side with a
