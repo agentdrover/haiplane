@@ -24,7 +24,7 @@ URL» (#1119). Локальный запускает агентский CLI на
 
 | Вред | Чем закрывается |
 |---|---|
-| Чтение секретов (`secrets.env`, ключ Cursor, deploy key, админские токены) | Отдельный unix-пользователь: `secrets.env` лежит `0600 root:openclaw`, чужой пользователь его не прочтёт. Плюс окружение процесса собирается белым списком, а не копией окружения хаба |
+| Чтение секретов (`secrets.env`, ключ Cursor, deploy key, админские токены) | Отдельный unix-пользователь: `secrets.env` лежит `0600 root:haiplane`, чужой пользователь его не прочтёт. Плюс окружение процесса собирается белым списком, а не копией окружения хаба |
 | Порча рабочего клона, которому доверяет гейт доставки | Клон ревьюеру **не даётся вовсе**: дифф уезжает ему инлайном в промте, а предмет ревью он читает по HTTP через `review-brief`, который берёт данные из клона хаба и к форжу не ходит (проверено вызовом на GitVerse-задаче #1138) |
 | Съедание CPU и памяти (харнесс — это 4–25 агентов) | Лимиты systemd-слайса на запуске |
 | Затаскивание зависимостей (node и окружение CLI) на хост, который намеренно держится без node и npm | **Только здесь контейнер даёт настоящую выгоду.** Если выбранный CLI тянет node — берите контейнер как обёртку запуска (`LOCAL_REVIEW_SANDBOX`), но ради изоляции зависимостей, а не «чтобы прод не пострадал»: контейнер делит с хабом ядро, диск и процессор |
@@ -55,7 +55,7 @@ Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-review
 Порядок:
 
 1. **Пользователь.** `useradd --system --home /var/lib/haiplane-review
-   haiplane-reviewer`. Он НЕ входит в группу `openclaw`.
+   haiplane-reviewer`. Он НЕ входит в группу `haiplane`, под которой работает хаб.
 2. **Каталог прогонов.** `/var/lib/haiplane-review/scratch`, владелец
    `haiplane-reviewer`, группа общая с хабом, режим `2770`: каталог-однодневку
    создаёт хаб, а работает в нём ревьюер. Хаб удаляет его после прогона.
@@ -76,7 +76,7 @@ Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-review
 
 ```bash
 sudo -u haiplane-reviewer cat /opt/haiplane-hub/secrets.env        # ожидается Permission denied
-sudo -u haiplane-reviewer touch /var/lib/openclaw-hub/workspaces/snip-portal/PROBE
+sudo -u haiplane-reviewer touch /var/lib/haiplane-hub/workspaces/snip-portal/PROBE
 sudo -u haiplane-reviewer systemd-run --quiet --pipe --uid=haiplane-reviewer --property=MemoryMax=4G true
 ```
 
