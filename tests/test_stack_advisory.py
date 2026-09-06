@@ -373,9 +373,12 @@ async def test_same_tip_names_no_merge_order(db: aiosqlite.Connection):
     )
 
     hint = await _stacking_hint(view)
-    assert f"merge task #{other_id}'s branch first" not in hint
     assert f"'{branch}' contains unmerged commits" not in hint
-    assert "FIRST" not in hint
+    # Case-insensitive on purpose: an earlier version of this test looked for
+    # the lowercase sentence only, and a mutation that named a side with a
+    # capital M walked straight past it. "first" appears nowhere in an honest
+    # same-tip advisory, so its absence is the whole property.
+    assert "first" not in hint.lower()
     # Without this the test passes on an unhandled outcome too: "order could
     # not be determined" also names no side, and a guard that green-lights
     # the bug it guards against is not a guard.
