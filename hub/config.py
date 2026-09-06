@@ -180,6 +180,41 @@ CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
 CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
 CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
 CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
+# Локальный ревьюер (#1180): ВТОРОЙ СПОСОБ ДОБЫТЬ тот же отчёт, а не второй
+# механизм ревью. Облачный агент Cursor принимает только GitHub (измерено
+# 31.08.2026), поэтому на любом другом форже независимого машинного ревью не
+# бывает вовсе — отчёт может подать только тот, кто делал работу, и при
+# REVIEW_SELF_APPROVE=forbid гейт его не засчитает (наблюдено на #1128).
+#
+# Ни одна из этих настроек не имеет рабочего умолчания, и это намеренно:
+# запуск агентского CLI без песочницы на хосте, где лежат secrets.env, ключ
+# Cursor и deploy key, — не «настройка по умолчанию», а инцидент. Пустая
+# LOCAL_REVIEW_SANDBOX означает «локального пути нет», а не «запускай как
+# есть».
+#
+# LOCAL_REVIEW_CMD — argv агентского CLI (shlex). Промт уходит ему в STDIN, не
+# аргументом: аргументы видны в ps любому пользователю хоста, а промт несёт
+# одноразовый код доступа к хабу.
+LOCAL_REVIEW_CMD = env_get("LOCAL_REVIEW_CMD", "")
+# LOCAL_REVIEW_SANDBOX — префикс-обёртка, под которой запускается CLI: смена
+# пользователя и лимиты ресурсов. Пример для systemd в deploy/LOCAL-REVIEW.md.
+LOCAL_REVIEW_SANDBOX = env_get("LOCAL_REVIEW_SANDBOX", "")
+# LOCAL_REVIEW_SCRATCH_DIR — база для одноразовых каталогов прогона. Должна
+# быть доступна на запись И хабу, И пользователю ревьюера (общая группа,
+# 2770): каталог создаёт хаб, работает в нём чужой пользователь.
+LOCAL_REVIEW_SCRATCH_DIR = env_get("LOCAL_REVIEW_SCRATCH_DIR", "")
+# Токен принципала ревьюера — тот же смысл, что у CURSOR_REVIEWER_HUB_TOKEN:
+# отчёт обязан лечь НЕ под принципалом исполнителя, иначе self_reviewed=1 и
+# прогон оплачен впустую. Пустой токен = локального пути нет.
+LOCAL_REVIEWER_HUB_TOKEN = env_get("LOCAL_REVIEWER_HUB_TOKEN", "")
+# Сколько секунд прогону дано. Зависший ревьюер снимается с процессом всей
+# группы, задача получает названную причину.
+LOCAL_REVIEW_TIMEOUT_SEC = int(env_get("LOCAL_REVIEW_TIMEOUT_SEC", "1800"))
+# Потолок стоимости на задачу, в токенах отчётов. Замеры харнесса: 332k на
+# #1128 при 4 агентах, 350k на #549, 1.1M на #362 при 25. Потолок считается по
+# сумме уже потраченного на ЭТУ задачу: без него автозапуск обошёл бы механизм
+# экономии #1152 с другой стороны.
+LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"))
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #

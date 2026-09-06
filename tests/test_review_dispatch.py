@@ -18,12 +18,14 @@ from hub import config
 from hub import repository as repo
 from hub import services
 from hub.integrations import cursor_cloud
+from hub.integrations import local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.model_family import family
 from hub.services.review_dispatch import (
+    DEEP,
     _REVIEW_MODEL_PREFERENCES,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
@@ -2636,3 +2638,418 @@ async def test_the_top_up_still_asks_the_policy(
         "проверки новизны"
     )
     assert recorder.calls == []
+
+
+# --- Локальный ревьюер: второй способ добыть отчёт (#1180) --------------------
+#
+# Облачный агент Cursor принимает только GitHub (измерено 31.08.2026), поэтому
+# на GitVerse независимого машинного ревью не бывает вовсе: отчёт может подать
+# только тот, кто делал работу, и гейт его не засчитывает при
+# REVIEW_SELF_APPROVE=forbid. Наблюдено на живой задаче #1128 — настоящий
+# прогон с семью находками не был засчитан, задача простояла девять часов.
+#
+# Здесь проверяется ПОВЕДЕНИЕ, а не форма настроек: вместо агентского CLI
+# запускается python-заглушка, и всё, что тесты утверждают, они утверждают по
+# строкам в базе, по ленте задачи и по тому, что заглушка увидела о себе сама.
+
+_LOCAL_REPORT = {
+    "harness_skill": "lite-diff-review",
+    "harness_version": 8,
+    "raw_count": 3,
+    "findings_confirmed": [],
+    "findings_rejected": [],
+    "incomplete": False,
+    "unresolved": [],
+    "lost_dimensions": [],
+    "agent_count": 4,
+    "tokens_spent": 1_500_000,
+    "duration_ms": 61_000,
+    "orchestrator": "local-stub",
+    "model": "grok-4.6",
+}
+
+
+def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
+    """Локальный ревьюер = python-заглушка под настоящим префиксом.
+
+    Префикс здесь — системный ``env``: он ничего не изолирует, и в этом весь
+    смысл. Тест не может завести на машине разработчика второго unix-
+    пользователя, но может доказать, что префикс ДЕЙСТВИТЕЛЬНО применяется к
+    командной строке: заглушка видит себя запущенной через него. Настоящая
+    изоляция — свойство выката (deploy/LOCAL-REVIEW.md), и её проверка
+    попыткой названа в AC-2 ручной честно, а не подменена этим тестом.
+    """
+    import shlex
+    import shutil
+    import sys
+
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join([sys.executable, "-c", script])
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+
+
+async def _local_principal(db, monkeypatch) -> int:
+    """Принципал локального ревьюера — тот, чей токен подпишет отчёт."""
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    pid, token = await _agent_key(db, "local-reviewer")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", token)
+    return pid
+
+
+def _reporting_stub(report: dict | None = None) -> str:
+    """Заглушка, оставляющая отчёт блоком в собственном выводе."""
+    payload = json.dumps(report or _LOCAL_REPORT, ensure_ascii=False)
+    return (
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "print('```haiplane-review')\n"
+        f"print({payload!r})\n"
+        "print('```')\n"
+    )
+
+
+async def test_local_review_lands_an_independent_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (#1180): на форже без облака отчёт всё равно появляется, и он чужой.
+
+    Проверяется СТРОКОЙ В БАЗЕ, а не намерением запуска: отчёт текущего
+    поколения, ``self_reviewed=0``, непустые agent_count и tokens_spent. Это и
+    есть то, чего на GitVerse не бывало вовсе.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-report",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert recorder.calls == [], "облако на этом форже не зовут (#1119)"
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1, "прогон обязан оставить ровно один отчёт"
+    report = reports[0]
+    assert report["principal_id"] == reviewer_pid, (
+        "отчёт принадлежит принципалу ревьюера — независимость держит токен, "
+        "а не машина (#728)"
+    )
+    assert not report["self_reviewed"], (
+        "ровно это и не получалось на #1128: отчёт автора гейт не засчитывает "
+        "при REVIEW_SELF_APPROVE=forbid"
+    )
+    assert report["agent_count"] == 4 and report["tokens_spent"] == 1_500_000, (
+        "пустые метрики — признак отчёта без исполнения (харнесс v8)"
+    )
+    dispatch = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+            )
+        )[-1]
+    )
+    assert dispatch["channel"] == "local" and dispatch["status"] == "done"
+
+
+async def test_the_local_reviewer_gets_neither_hub_secrets_nor_the_clone(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2, машинная часть: процесс не получает ни секретов, ни клона.
+
+    Проверяется ПОПЫТКОЙ, а не чтением конфига: секрет кладётся в окружение
+    хаба по-настоящему, заглушка честно печатает про себя всё, что видит, и
+    утверждение делается по её собственному свидетельству. Настройка, о
+    которой только заявлено, защитой не является.
+
+    Ручная половина AC-2 — попытка прочитать secrets.env и записать в рабочий
+    клон ПОД ПОЛЬЗОВАТЕЛЕМ ревьюера — этим тестом не закрывается и за
+    закрытую не выдаётся: на машине разработчика второго пользователя нет.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    probe = tmp_path / "probe.json"
+    recorder = _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "r-x"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    monkeypatch.setenv("CURSOR_API_KEY", "secret-cursor-key")
+    monkeypatch.setenv("HAIPLANE_HUB_TOKEN", "secret-hub-token")
+    monkeypatch.setenv("HUB_ENV_CANARY", "canary-value")
+    _stub_reviewer(
+        monkeypatch,
+        tmp_path,
+        "import json, os, sys\n"
+        "prompt = sys.stdin.read()\n"
+        f"open({str(probe)!r}, 'w').write(json.dumps("
+        "{'env': dict(os.environ), 'cwd': os.getcwd(), 'argv': sys.argv, "
+        "'prompt': prompt}))\n",
+    )
+
+    await _submitted(
+        client,
+        db,
+        "spike-local-env",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+
+    seen = json.loads(probe.read_text())
+    assert "CURSOR_API_KEY" not in seen["env"], (
+        "ключ провайдера лежит в окружении хаба и не имеет права уехать в "
+        "чужой процесс: окружение собирается белым списком, а не копией"
+    )
+    assert "HAIPLANE_HUB_TOKEN" not in seen["env"]
+    assert "secret-cursor-key" not in json.dumps(seen["env"]), (
+        "проверка по ЗНАЧЕНИЮ, а не только по имени: переименованный секрет "
+        "утёк бы мимо проверки по ключу"
+    )
+    assert "canary-value" not in json.dumps(seen["env"]), (
+        "канарейка положена в окружение хаба специально: если она доехала, "
+        "значит окружение копируется, а не собирается"
+    )
+    # Утверждать «в ребёнке ровно наш набор» нельзя, и это не придирка:
+    # интерпретатор ребёнка и macOS заводят себе переменные сами (LC_CTYPE,
+    # __CF_USER_TEXT_ENCODING), причём с теми же значениями, что у родителя, —
+    # обе стороны вычислили их одинаково, а не унаследовали. Поэтому что хаб
+    # ПЕРЕДАЁТ, спрашивается у сборщика окружения, а что доехало — у ребёнка.
+    passed = local_reviewer._clean_env("/scratch/run")
+    assert set(passed) <= {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TMPDIR"}, (
+        f"передаётся только названный список, а не {sorted(passed)}"
+    )
+    assert passed["HOME"] == passed["TMPDIR"] == "/scratch/run"
+    assert seen["env"]["HOME"] == seen["cwd"], "дом ревьюера — каталог прогона"
+    assert seen["cwd"].startswith(str(tmp_path / "scratch")), (
+        "работа идёт в одноразовом каталоге, а не в клоне проекта"
+    )
+    assert not any("/tmp/ws" in str(a) for a in seen["argv"]), (
+        "путь к рабочему клону проекта процессу не передаётся вовсе"
+    )
+    assert "не коммить" in seen["prompt"], "промт тот же, что уходит в облако"
+    assert not any("haiplane-review" in str(a) for a in seen["argv"]), (
+        "промт уходит в stdin: аргументы видны в ps, а промт несёт "
+        "одноразовый код доступа к хабу"
+    )
+    assert not (tmp_path / "scratch").exists() or not list(
+        (tmp_path / "scratch").iterdir()
+    ), "каталог прогона одноразовый — после прогона от него ничего не остаётся"
+
+
+async def test_a_dead_local_reviewer_names_its_cause(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-3: зависший прогон снят, хаб жив, причина названа.
+
+    «Ревью не состоялось» и «ревью ничего не нашло» — разные исходы (#419,
+    #725). Молчаливый пропуск здесь означал бы, что вердикт выносится по
+    отсутствию отчёта, принятому за чистоту.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-h"}, "run": {"id": "r-h"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, "import time\ntime.sleep(120)\n")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1)
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-hang",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("снято по таймауту" in a for a in alerts), (
+        f"причина обязана быть названа, а не выведена читателем: {alerts}"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert dict(rows[-1])["status"] == "failed"
+    _, probe_token = await _agent_key(db, "liveness-probe")
+    alive = await client.get(
+        f"/api/tasks/{task_id}", headers={"Authorization": f"Bearer {probe_token}"}
+    )
+    assert alive.status_code == 200, "снятый ревьюер не трогает доступность хаба"
+
+
+async def test_local_review_obeys_policy_and_cost_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4: без просьбы политики и сверх потолка прогона нет, и это сказано.
+
+    Потолок проверяется на ДОБОРЕ (#879) — единственном месте, где второй
+    прогон по той же задаче вообще возможен: проверка новизны отказала бы
+    раньше и по другой причине, и тест тогда был бы зелен не за то.
+    """
+    from hub.services.review_dispatch import maybe_dispatch_review, wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r-c"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+
+    runs: list[str] = []
+    real_run = local_reviewer.run_review
+
+    async def _counting(prompt, *, timeout=None):
+        runs.append(prompt)
+        return await real_run(prompt, timeout=timeout)
+
+    monkeypatch.setattr(local_reviewer, "run_review", _counting)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    off_id = await _submitted(
+        client,
+        db,
+        "spike-local-off",
+        policy={"review": "off"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    assert runs == [], "политика ревью не просила — прогона нет"
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (off_id,)
+    )
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-ceiling",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert len(runs) == 1, "первый прогон состоялся и стоил 1.5M токенов"
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TOKEN_CEILING", 1_000_000)
+    dispatched = await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+
+    assert not dispatched and len(runs) == 1, "сверх потолка прогон не покупается"
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("потолок стоимости исчерпан" in a for a in alerts), alerts
+    assert any("1500000" in a and "1000000" in a for a in alerts), (
+        "названы обе величины: потраченное и потолок — иначе причину нельзя "
+        "проверить, не залезая в конфиг"
+    )
+
+
+async def test_github_still_goes_to_the_cloud_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-5: на GitHub облачный путь остаётся первым и единственным.
+
+    Контрольный тест ко всем остальным: локальный путь настроен полностью, и
+    именно поэтому его молчание здесь что-то значит.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gh"}, "run": {"id": "r-gh"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    runs: list[str] = []
+
+    async def _never(prompt, *, timeout=None):
+        runs.append(prompt)
+        return None
+
+    monkeypatch.setattr(local_reviewer, "run_review", _never)
+
+    task_id = await _submitted(
+        client, db, "spike-github-stays", policy={"review": "dispatch"}
+    )
+
+    assert len(recorder.calls) == 1, "GitHub уходит в облако, как и раньше"
+    assert runs == [], "локальный прогон на GitHub не запускается"
+    rows = await db.execute_fetchall(
+        "SELECT channel FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert dict(rows[-1])["channel"] == "cloud"
+
+
+async def test_a_local_run_lost_to_a_restart_fails_with_its_own_cause(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Прогон, начатый другим процессом хаба, не висит активным вечно.
+
+    И, что важнее формы отказа, свип НЕ идёт за его судьбой в Cursor:
+    облачный API про локальный прогон знает только то, что такого агента у
+    него нет, — то есть вернул бы ложную причину. Отличать канал по строке
+    базы, а не по виду идентификатора, только ради этого и стоило.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r"}, "run": {"id": "r-r"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, "import sys\nsys.stdin.read()\n")
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-restart",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    # Прогон закрылся своей корутиной; возвращаем строку в состояние
+    # «активна и старше grace» — так она выглядит после перезапуска хаба.
+    await db.execute(
+        "UPDATE review_dispatches SET status='active', "
+        "created_at = datetime('now', '-60 minutes') WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    asked: list[str] = []
+
+    async def _get_run(agent_id, run_id):
+        asked.append(agent_id)
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+
+    await sweep_review_dispatches(db)
+
+    assert asked == [], "про локальный прогон облачный API не спрашивают"
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert dict(rows[-1])["status"] == "failed"
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("потеряно" in a and "перезапуска" in a for a in alerts), alerts

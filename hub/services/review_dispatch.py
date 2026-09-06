@@ -19,9 +19,12 @@ stamps with data instead of discipline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import uuid
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -31,6 +34,7 @@ from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
+from hub.integrations import local_reviewer
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
 from hub.models import RiskClass
@@ -1011,6 +1015,14 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
 #: правится, и дата выше говорит, когда проверку пора повторить.
 CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 
+# Каким способом добыт отчёт (#1180). Колонка, а не префикс в agent_id:
+# свип спрашивает Cursor про КАЖДУЮ активную строку, и локальный прогон,
+# отличимый только по виду идентификатора, стоил бы запроса к чужому API на
+# каждом тике — и получал бы в ответ «такого агента нет», то есть ложную
+# причину вместо своей.
+CLOUD_CHANNEL = "cloud"
+LOCAL_CHANNEL = "local"
+
 
 async def _policy_and_novelty_allow(
     db: aiosqlite.Connection,
@@ -1206,6 +1218,133 @@ async def _refuse_second_read(
     )
 
 
+@dataclass(frozen=True)
+class ReviewOrder:
+    """Готовый заказ ревью: всё, что ревьюер получает, кроме транспорта (#1180).
+
+    Существует затем, чтобы «позвать ревьюера в облако» и «позвать ревьюера
+    локально» не стали двумя описаниями одного заказа. Расходиться им нельзя:
+    профиль, правила репозитория, предмет ревью и предпас — это то, ЧТО
+    прочитано, и две копии этого знания рано или поздно ответят по-разному на
+    вопрос «было ли чтение».
+    """
+
+    model: str
+    profile: str
+    reasons: list[str]
+    prompt: str
+    rules_note: str
+    diff_note: str
+    prepass: Any
+
+
+async def prepare_review_order(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    branch: str,
+    generation: int,
+    force_profile: str,
+    principal_id: int | None,
+) -> ReviewOrder:
+    """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
+
+    ``principal_id`` — принципал ТОГО ревьюера, который будет исполнять заказ:
+    под ним минтуется одноразовый код доступа, и его же ждёт диспетчер как
+    владельца отчёта (#1025). Разные транспорты — разные принципалы, и это
+    единственное, что заказу нужно знать о том, кто его исполнит.
+    """
+    task_id = int(task["id"])
+    model_id = pick_review_model((task.get("submission_model") or "").strip())
+    # #820: the profile is decided against the SUBMITTED diff, not against the
+    # areas the author declared — self-assessment cannot exempt work from
+    # oversight (#582). An unreadable diff buys deep, it does not excuse it.
+    diff = await _submission_diff(db, task_id, branch)
+    if force_profile:
+        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+    else:
+        profile, profile_reasons = pick_review_profile(task, diff)
+    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
+    # #874: which base the reviewer diffs against. Unknown base falls back to
+    # the configured one rather than to nothing — a command the reviewer cannot
+    # run would send it back to inventing its own, which is what we are fixing.
+    ctx = await _git_context(db, task_id)
+    base = ctx[1] if ctx else config.PAIR_BASE_BRANCH
+    # #880: a resubmission reads what changed since the previous generation,
+    # not the whole branch again. Every reason the delta cannot be trusted
+    # falls back to the full diff and says so.
+    delta_paths, delta_note = await generation_delta(db, task, base)
+    prior = await previous_findings(db, task_id, generation)
+    diff_block, diff_note = diff_plan(
+        diff, base, branch, delta_paths, delta_note, prior
+    )
+    # #875: what the toolchain already proved on THIS commit. Built from the
+    # task row the caller already read, so no extra query for the common case.
+    # Imported here, not at module level: review_evidence reaches back into
+    # this module's siblings, and the top-level cycle is the reason every
+    # other cross-service call in this file is local too.
+    from hub.services import review_evidence
+
+    prepass = await review_evidence.prepass_state(db, task)
+    hub_base = instance_base_url().rstrip("/")
+    code = await _access_code(db, task_id, generation, principal_id)
+    return ReviewOrder(
+        model=model_id,
+        profile=profile,
+        reasons=profile_reasons,
+        prompt=_review_prompt(
+            task_id,
+            branch,
+            model_id,
+            profile,
+            rules_block,
+            diff_block,
+            review_evidence.prepass_block(prepass),
+            _delivery_block(task_id, code, hub_base),
+        ),
+        rules_note=rules_note,
+        diff_note=diff_note,
+        prepass=prepass,
+    )
+
+
+async def _access_code(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> str:
+    """Одноразовый код доступа ревьюера к хабу, или пустая строка (#1084).
+
+    Cursor теряет mcpServers по дороге в облачный ран, поэтому заголовок с
+    токеном до рана не доезжает — а сеть доезжает: ран отчитался 401 ОТ этого
+    хаба, то есть запрос дошёл и вернулся. Локальный прогон живёт под теми же
+    правилами по другой причине: класть токен в argv нельзя (виден в ``ps``),
+    а класть в окружение — значит завести второй способ выдать ревьюеру
+    идентичность и второе место, где его отзывают.
+
+    Нет принципала (токен пуст, отозван или открытый режим) — нет кода: ран
+    оставит отчёт текстом, ровно как до #1084.
+    """
+    if principal_id is None:
+        return ""
+    from hub.services import chat_pair
+
+    code, _ttl = await chat_pair.issue_code(
+        db,
+        principal_id,
+        kind="reviewer",
+        bound_task_id=task_id,
+        # THE pin. Without it every guard below is dead code: issue_code
+        # stores NULL, redeem_code skips the comparison, the session
+        # carries no generation and the intake check is falsy. The tests
+        # that "covered" this minted their codes by hand WITH a generation
+        # and so agreed with a path production never took.
+        bound_generation=generation,
+    )
+    return code
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
 ) -> bool:
@@ -1246,18 +1385,10 @@ async def maybe_dispatch_review(
     # всё в порядке. Отказ по форжу называет причину, которую можно устранить.
     forge = project_policy.forge_of(project)
     if forge not in CLOUD_REVIEW_FORGES:
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            f"Кросс-модельное ревью НЕ вызвано: облачный ревьюер не работает "
-            f"с форжем «{forge}» — он принимает только "
-            f"{', '.join(CLOUD_REVIEW_FORGES)} (проверено 31.08.2026). "
-            "Вердикт остаётся человеку (#757, #1119).",
-        )
-        await db.commit()
-        return False
+        # #1180: отсюда путь больше не кончается. Форж, до которого облако не
+        # дотягивается, — причина позвать ревьюера ИНАЧЕ, а не причина
+        # остаться без второго читателя вовсе.
+        return await dispatch_local_review(db, task, forge, branch, generation)
 
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
     # #1083: three independent preconditions, and the message used to list all
@@ -1295,82 +1426,26 @@ async def maybe_dispatch_review(
         await db.commit()
         return False
 
-    model_id = pick_review_model((task.get("submission_model") or "").strip())
-    # #820: the profile is decided against the SUBMITTED diff, not against the
-    # areas the author declared — self-assessment cannot exempt work from
-    # oversight (#582). An unreadable diff buys deep, it does not excuse it.
-    diff = await _submission_diff(db, task_id, branch)
-    if force_profile:
-        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
-    else:
-        profile, profile_reasons = pick_review_profile(task, diff)
-    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
-    # #874: which base the reviewer diffs against. Unknown base falls back to
-    # the configured one rather than to nothing — a command the reviewer cannot
-    # run would send it back to inventing its own, which is what we are fixing.
-    ctx = await _git_context(db, task_id)
-    base = ctx[1] if ctx else config.PAIR_BASE_BRANCH
-    # #880: a resubmission reads what changed since the previous generation,
-    # not the whole branch again. Every reason the delta cannot be trusted
-    # falls back to the full diff and says so.
-    delta_paths, delta_note = await generation_delta(db, task, base)
-    prior = await previous_findings(db, task_id, generation)
-    diff_block, diff_note = diff_plan(
-        diff, base, branch, delta_paths, delta_note, prior
-    )
-    # #875: what the toolchain already proved on THIS commit. Built from the
-    # task row the caller already read, so no extra query for the common case.
-    # Imported here, not at module level: review_evidence reaches back into
-    # this module's siblings, and the top-level cycle is the reason every
-    # other cross-service call in this file is local too.
-    from hub.services import review_evidence
-
-    prepass = await review_evidence.prepass_state(db, task)
-    prepass_block = review_evidence.prepass_block(prepass)
-    hub_base = instance_base_url().rstrip("/")
-    hub_mcp_url = f"{hub_base}/mcp"
-    # #1084: the identity the run can actually carry. Cursor drops mcpServers
-    # on the way into a cloud run, so the header holding the reviewer token
-    # never arrives — but the network does: a run reported a 401 FROM this hub,
-    # which is a request that got there and came back. So the hub mints a
-    # one-time, task-bound code and puts THAT in the prompt.
-    #
-    # Under the pinned principal on purpose: the report then arrives as the
-    # identity #1025 already waits for, with no second rule about who owns it.
-    # No principal (unset or rotated token) means no code — the run falls back
-    # to leaving its report in the text, exactly as before this change.
+    # #1180: подготовка вызова — общая для обоих способов добыть отчёт.
+    # Профиль, правила репозитория, дифф-план, предпас и одноразовый код
+    # ревьюер получает один и тот же, где бы он ни исполнялся; расходятся
+    # только транспорт и то, чей принципал подпишет отчёт.
     expected_principal = await reviewer_principal_id(db)
-    reviewer_code = ""
-    if expected_principal is not None:
-        from hub.services import chat_pair
-
-        reviewer_code, _code_ttl = await chat_pair.issue_code(
-            db,
-            expected_principal,
-            kind="reviewer",
-            bound_task_id=task_id,
-            # THE pin. Without it every guard below is dead code: issue_code
-            # stores NULL, redeem_code skips the comparison, the session
-            # carries no generation and the intake check is falsy. The tests
-            # that "covered" this minted their codes by hand WITH a generation
-            # and so agreed with a path production never took.
-            bound_generation=generation,
-        )
+    order = await prepare_review_order(
+        db,
+        task,
+        branch=branch,
+        generation=generation,
+        force_profile=force_profile,
+        principal_id=expected_principal,
+    )
+    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
     created = await cursor_cloud.create_review_agent(
         repo_url=forge_urls.repo_url(forge, gh_repo),
         starting_ref=branch,
         model_id=model_id,
-        prompt_text=_review_prompt(
-            task_id,
-            branch,
-            model_id,
-            profile,
-            rules_block,
-            diff_block,
-            prepass_block,
-            _delivery_block(task_id, reviewer_code, hub_base),
-        ),
-        hub_mcp_url=hub_mcp_url,
+        prompt_text=order.prompt,
+        hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
         reviewer_token=reviewer_token,
     )
     agent_info = (created or {}).get("agent") or {}
@@ -1426,9 +1501,9 @@ async def maybe_dispatch_review(
         f"Кросс-модельное ревью вызвано хабом: модель {model_id} "
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
         f"{profile_note}, агент {agent_id}. Правила репозитория: "
-        f"{rules_note} (#873). Предмет ревью: {diff_note} (#874). "
-        f"Предпас: {prepass.state}"
-        + (f" ({', '.join(prepass.passed)})" if prepass.passed else "")
+        f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
+        f"Предпас: {order.prepass.state}"
+        + (f" ({', '.join(order.prepass.passed)})" if order.prepass.passed else "")
         + " (#875). "
         + "Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
@@ -1459,6 +1534,298 @@ async def maybe_dispatch_review(
     return True
 
 
+async def dispatch_local_review(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    forge: str,
+    branch: str,
+    generation: int,
+) -> bool:
+    """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
+
+    Каждый отказ здесь НАЗЫВАЕТ причину в карточке. Молчаливый отказ на этом
+    месте — это ровно то, что задача #1180 закрывает: на GitVerse вердикт
+    выносился вообще без второго читателя, и по карточке это выглядело как
+    «ревью не потребовалось».
+    """
+    task_id = int(task["id"])
+    principal_id = await local_reviewer_principal_id(db)
+    missing = local_reviewer.not_ready()
+    if principal_id is None:
+        # Отдельной причиной, а не «одной из недостающих настроек»: токен
+        # может БЫТЬ и не разрешаться в принципала (отозван, открытый режим).
+        # Отчёт под принципалом автора даёт self_reviewed=1, гейт его не
+        # засчитает при REVIEW_SELF_APPROVE=forbid — прогон был бы оплачен
+        # впустую, ровно как на #1128.
+        missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
+    if missing:
+        return await _refuse_local_review(
+            db,
+            task_id,
+            f"облачный ревьюер не работает с форжем «{forge}» (проверено "
+            f"31.08.2026, #1119), а локальный не настроен: " + "; ".join(missing),
+        )
+    spent = await _tokens_already_spent(db, task_id)
+    if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
+        return await _refuse_local_review(
+            db,
+            task_id,
+            f"потолок стоимости исчерпан: на задачу уже потрачено {spent} "
+            f"токенов при потолке {config.LOCAL_REVIEW_TOKEN_CEILING} "
+            "(LOCAL_REVIEW_TOKEN_CEILING). Прогон не запущен — это НЕ "
+            "«прочитано и чисто» (#1152)",
+        )
+    order = await prepare_review_order(
+        db,
+        task,
+        branch=branch,
+        generation=generation,
+        force_profile="",
+        principal_id=principal_id,
+    )
+    run_id = uuid.uuid4().hex[:12]
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id=f"local:{run_id}",
+        run_id=run_id,
+        model=order.model,
+        profile=order.profile,
+        reviewer_principal_id=principal_id,
+        channel=LOCAL_CHANNEL,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Машинное ревью запущено ЛОКАЛЬНО: форж «{forge}» облачному ревьюеру "
+        f"недоступен, прогон идёт на хосте хаба под песочницей (#1180). "
+        f"Профиль {order.profile}, прогон {run_id}. Правила репозитория: "
+        f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
+        "Отчёт придёт по контракту от принципала локального ревьюера — "
+        "его независимость держит токен, а не машина (#728).",
+    )
+    await repo.insert_event(
+        db,
+        kind="review_dispatched",
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "model": order.model,
+            "agent_id": f"local:{run_id}",
+            "run_id": run_id,
+            "generation": generation,
+            "profile": order.profile,
+            "profile_reasons": order.reasons,
+            "channel": LOCAL_CHANNEL,
+        },
+    )
+    await db.commit()
+    await _start_local_run(db, dispatch_id, task_id, generation, order.prompt)
+    return True
+
+
+async def _refuse_local_review(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> bool:
+    """Один алерт с названной причиной, и ничего больше. Всегда False."""
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Машинное ревью НЕ вызвано: {reason}. Вердикт остаётся человеку "
+        "(#757, #1180).",
+    )
+    await db.commit()
+    log.info("local review refused for task #%s: %s", task_id, reason)
+    return False
+
+
+async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
+    """Сколько токенов задача уже стоила по отчётам ревью.
+
+    Считается по ОТЧЁТАМ, а не по числу прогонов: прогон, о котором ревьюер
+    не отчитался, деньги всё равно стоил, но назвать сумму мы можем только
+    там, где она сказана. Незнание здесь склоняется в сторону прогона —
+    пропущенное ревью дороже лишнего, — и это тот же выбор направления
+    ошибки, что в #762.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(SUM(COALESCE(provider_tokens, tokens_spent, 0)), 0) AS total "
+        "FROM machine_reviews WHERE task_id = ?",
+        (task_id,),
+    )
+    return int(dict(rows[0])["total"]) if rows else 0
+
+
+# Прогоны, за которыми смотрит ЭТОТ процесс хаба. Ссылка держится намеренно:
+# задача без ссылки может быть собрана сборщиком мусора посреди работы, и
+# ревьюер тогда умрёт молча. Тесты ждут прогоны через wait_for_local_runs().
+_LOCAL_RUNS: dict[int, asyncio.Task[None]] = {}
+
+
+async def _start_local_run(
+    db: aiosqlite.Connection,
+    dispatch_id: int,
+    task_id: int,
+    generation: int,
+    prompt: str,
+) -> None:
+    """Запустить прогон фоном и вернуть управление сдаче.
+
+    Фоном, потому что прогон живёт минуты и десятки минут, а зовут нас из
+    обработчика сдачи: ждать его там значило бы держать HTTP-запрос автора всё
+    ревью. Своё соединение к базе — по той же причине, по которой его берут
+    провижининг и поллер (#1065): соединение запроса закрывается сразу после
+    ответа, и фон писал бы в закрытое.
+    """
+    path = await _main_db_path(db)
+    task = asyncio.create_task(
+        _supervise_local_run(
+            db_path=path,
+            live_db=None if path else db,
+            dispatch_id=dispatch_id,
+            task_id=task_id,
+            generation=generation,
+            prompt=prompt,
+        )
+    )
+    _LOCAL_RUNS[dispatch_id] = task
+    task.add_done_callback(lambda _t: _LOCAL_RUNS.pop(dispatch_id, None))
+
+
+async def wait_for_local_runs() -> None:
+    """Дождаться прогонов этого процесса. Для тестов и остановки хаба."""
+    while _LOCAL_RUNS:
+        await asyncio.gather(*list(_LOCAL_RUNS.values()), return_exceptions=True)
+
+
+async def _main_db_path(db: aiosqlite.Connection) -> str:
+    """Файл базы, с которым работает ЭТО соединение, или пустая строка.
+
+    Спрашивается у соединения, а не берётся из конфига намеренно: фон обязан
+    писать в ту же базу, где живёт задача, а не в ту, что назначена в
+    окружении. База в памяти файла не имеет — тогда фон работает на переданном
+    соединении, потому что второго к ней не бывает.
+    """
+    try:
+        rows = await fetchall(db, "PRAGMA database_list")
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not read the database path: %s", exc)
+        return ""
+    for row in rows:
+        entry = dict(row)
+        if entry.get("name") == "main":
+            return (entry.get("file") or "").strip()
+    return ""
+
+
+async def _supervise_local_run(
+    *,
+    db_path: str,
+    live_db: aiosqlite.Connection | None,
+    dispatch_id: int,
+    task_id: int,
+    generation: int,
+    prompt: str,
+) -> None:
+    run = await local_reviewer.run_review(prompt)
+    conn = None
+    try:
+        if db_path:
+            from hub import db as db_module
+
+            conn = await db_module.connect(db_path)
+        target = conn if conn is not None else live_db
+        if target is None:
+            log.error(
+                "local review #%s finished with nowhere to record it", dispatch_id
+            )
+            return
+        await _settle_local_run(target, dispatch_id, task_id, generation, run)
+    except Exception:  # noqa: BLE001 - фон не имеет права уронить хаб
+        log.exception("could not settle the local review of task #%s", task_id)
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
+async def _settle_local_run(
+    db: aiosqlite.Connection,
+    dispatch_id: int,
+    task_id: int,
+    generation: int,
+    run: local_reviewer.LocalRun | None,
+) -> None:
+    """Закрыть локальный прогон: отчёт по контракту, текстом или причина.
+
+    Три исхода и ни одного молчаливого. «Ревью не состоялось» и «ревью ничего
+    не нашло» — разные вещи (#419, #725), и здесь они не сливаются даже когда
+    процесс умер, не сказав ни слова.
+    """
+    rows = await fetchall(
+        db, "SELECT * FROM review_dispatches WHERE id = ?", (dispatch_id,)
+    )
+    if not rows:
+        return
+    dispatch = dict(rows[0])
+    review = await _dispatch_report(db, task_id, generation, dispatch)
+    if review is not None:
+        await repo.set_review_dispatch_status(db, dispatch_id, "done")
+        await db.commit()
+        return
+    from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT
+
+    report = parse_report_block(run.stdout if run else None)
+    if report is not None and await _store_report(
+        db, dispatch, report, ORIGIN_LOCAL_TEXT
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            "Отчёт локального ревью восстановлен из вывода прогона: по "
+            "контракту он не пришёл, и агент оставил его блоком в тексте. "
+            "Записан с пометкой происхождения — это слабее сданного по "
+            "контракту: прогон писал его о себе сам (#1036).",
+        )
+        await repo.set_review_dispatch_status(db, dispatch_id, "done")
+        await db.commit()
+        return
+    await repo.add_task_update(db, task_id, "hub", "alert", _local_failure_reason(run))
+    await repo.set_review_dispatch_status(db, dispatch_id, "failed")
+    await db.commit()
+
+
+def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
+    """Почему прогона нет — по имени, а не «что-то пошло не так»."""
+    if run is None:
+        return (
+            "Локальное машинное ревью НЕ состоялось: прогон не удалось "
+            "запустить — нет каталога, бинаря или прав (детали в логе хаба). "
+            "Это не «прочитано и чисто»: вердикт остаётся человеку (#1180)."
+        )
+    if run.timed_out:
+        return (
+            f"Локальное машинное ревью снято по таймауту "
+            f"({config.LOCAL_REVIEW_TIMEOUT_SEC} с): процесс и вся его группа "
+            "убиты, хаб продолжает работу, отчёта нет. Вердикт остаётся "
+            "человеку (#1180)."
+        )
+    tail = (run.stderr or run.stdout or "").strip()[-1500:]
+    return (
+        f"Локальное машинное ревью завершилось без отчёта: код возврата "
+        f"{run.rc}, прогон занял {run.duration_ms // 1000} с, разбираемого "
+        "блока в выводе нет. Вердикт остаётся человеку (#1180)."
+        + (f"\n\nХвост вывода:\n{tail}" if tail else "")
+    )
+
+
 def instance_base_url() -> str:
     """This hub's own public base URL, as this installation is configured.
 
@@ -1474,13 +1841,28 @@ def instance_base_url() -> str:
 
 
 async def reviewer_principal_id(db: aiosqlite.Connection) -> int | None:
-    """The principal behind CURSOR_REVIEWER_HUB_TOKEN, or None (#1025).
+    """The principal behind CURSOR_REVIEWER_HUB_TOKEN, or None (#1025)."""
+    return await principal_of_token(db, config.CURSOR_REVIEWER_HUB_TOKEN)
+
+
+async def local_reviewer_principal_id(db: aiosqlite.Connection) -> int | None:
+    """The principal behind LOCAL_REVIEWER_HUB_TOKEN, or None (#1180).
+
+    Свой токен, а не общий с облачным: независимость отчёта держится тем, чей
+    токен его принёс (#728), и отзывать локального ревьюера надо уметь
+    отдельно — он исполняется на хосте хаба, а облачный нет.
+    """
+    return await principal_of_token(db, config.LOCAL_REVIEWER_HUB_TOKEN)
+
+
+async def principal_of_token(db: aiosqlite.Connection, raw: str) -> int | None:
+    """Кому принадлежит токен, или None (#1025).
 
     The same hash lookup auth performs, without its side effects. None — an
     empty token, an env-map token, a rotated key — leaves the dispatch under
     the old task+generation matching rule rather than inventing an identity.
     """
-    token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
+    token = (raw or "").strip()
     if not token:
         return None
     # Open mode never reads the bearer header, so every report lands with
@@ -1655,22 +2037,9 @@ async def _recover_report_from_run(
                 f"подтверждены (#1036):\n\n{tail[:4000]}",
             )
         return False
-    from hub.services.machine_review_intake import (
-        ORIGIN_RUN_TEXT,
-        record_machine_review,
-    )
+    from hub.services.machine_review_intake import ORIGIN_RUN_TEXT
 
-    try:
-        await record_machine_review(
-            db,
-            task_id,
-            report,
-            principal_id=dispatch.get("reviewer_principal_id"),
-            username=(dispatch.get("model") or "cursor-cloud-reviewer"),
-            origin=ORIGIN_RUN_TEXT,
-        )
-    except Exception:  # noqa: BLE001 - the sweep must survive a bad report
-        log.exception("could not record the report recovered for task #%s", task_id)
+    if not await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT):
         return False
     await repo.add_task_update(
         db,
@@ -1685,6 +2054,86 @@ async def _recover_report_from_run(
     return True
 
 
+async def _sweep_orphan_local(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> None:
+    """Локальная строка, за которой больше некому смотреть.
+
+    Живой прогон этого процесса пропускается: его закроет собственная
+    корутина, и вмешательство свипа отняло бы у неё исход. Всё остальное —
+    прогон, начатый ДРУГИМ процессом хаба до перезапуска, — по истечении
+    того же grace, что у облака, закрывается названной причиной. Оставить
+    такую строку активной значило бы навсегда занять место в лестнице (#879)
+    прогоном, которого уже нет.
+    """
+    dispatch_id = int(dispatch["id"])
+    if dispatch_id in _LOCAL_RUNS:
+        return
+    task_id = int(dispatch["task_id"])
+    generation = int(dispatch["submission_generation"] or 0)
+    review = await _dispatch_report(db, task_id, generation, dispatch)
+    if review is not None:
+        await repo.set_review_dispatch_status(db, dispatch_id, "done")
+        await db.commit()
+        return
+    grace = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE id=? "
+        "AND created_at <= datetime('now', ?)",
+        (dispatch_id, f"-{config.CURSOR_REVIEW_GRACE_MINUTES} minutes"),
+    )
+    if not grace:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        "Локальное машинное ревью потеряно: прогон запускал другой процесс "
+        "хаба, и после перезапуска досматривать его некому — отчёта за "
+        f"{config.CURSOR_REVIEW_GRACE_MINUTES} мин не пришло. Это НЕ «ревью "
+        "ничего не нашло»: вердикт остаётся человеку (#1180).",
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "failed")
+    await db.commit()
+
+
+async def _store_report(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    report: Any,
+    origin: str,
+) -> bool:
+    """Записать отчёт, оставленный прогоном в СВОЁМ тексте. True — записан.
+
+    Владелец отчёта берётся из строки диспетчера, а не из того, как отчёт
+    называет себя сам: иначе он прочитался бы как чужой собственному вызову —
+    дефект, закрытый в #1025. Происхождение пишется в данные: отчёт,
+    переписанный хабом из текста, — факт слабее сданного по контракту, и
+    метрики со стюардом должны уметь взвесить их по-разному (#1036).
+
+    Одна реализация на оба канала намеренно: облачный и локальный прогон
+    оставляют текст по одной и той же причине и с одинаковой доказательной
+    силой, и две копии этого правила разошлись бы на первой же правке.
+    """
+    task_id = int(dispatch["task_id"])
+    from hub.services.machine_review_intake import record_machine_review
+
+    try:
+        await record_machine_review(
+            db,
+            task_id,
+            report,
+            principal_id=dispatch.get("reviewer_principal_id"),
+            username=(dispatch.get("model") or "cursor-cloud-reviewer"),
+            origin=origin,
+        )
+    except Exception:  # noqa: BLE001 - the sweep must survive a bad report
+        log.exception("could not record the report recovered for task #%s", task_id)
+        return False
+    return True
+
+
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     """Poller pass over active dispatches: settle finished runs.
 
@@ -1696,6 +2145,13 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
+        if dispatch.get("channel") == LOCAL_CHANNEL:
+            # Локальный прогон досматривает своя корутина (#1180). Свипу тут
+            # остаётся один случай — процесс хаба, перезапущенный посреди
+            # прогона: корутины больше нет, и без этой ветки строка осталась
+            # бы «активной» навсегда.
+            await _sweep_orphan_local(db, dispatch)
+            continue
         review = await _dispatch_report(
             db, task_id, dispatch["submission_generation"], dispatch
         )

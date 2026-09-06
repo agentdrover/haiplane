@@ -33,6 +33,10 @@ log = logging.getLogger("hub")
 # the hub transcribing what a run left behind, and says so in the stored row.
 ORIGIN_MCP = "mcp"
 ORIGIN_RUN_TEXT = "cursor-cloud-result"
+# #1180: тот же вид факта — отчёт, переписанный хабом из текста прогона, — но
+# с локального ревьюера. Отдельная метка, а не общая с облачной: канал добычи
+# должен быть виден в данных, иначе метрики сложат два разных источника в один.
+ORIGIN_LOCAL_TEXT = "local-reviewer-result"
 
 
 async def record_machine_review(

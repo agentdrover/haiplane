@@ -1547,6 +1547,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE review_dispatches ADD COLUMN provider_tokens INTEGER",
     ),
     (
+        # #1180: каким способом добыт отчёт — cloud или local. Умолчание
+        # 'cloud' описывает историю правдиво: до этой колонки другого способа
+        # не было вовсе.
+        "add_review_dispatches_channel",
+        "ALTER TABLE review_dispatches ADD COLUMN channel TEXT NOT NULL "
+        "DEFAULT 'cloud'",
+    ),
+    (
         # #1015: how many argument names Pydantic extra=ignore dropped on this
         # call. A count, not the names and never the values — the table has
         # nowhere a payload can land (#780). NULL is "never measured" (rows
