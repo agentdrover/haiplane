@@ -2812,9 +2812,36 @@ class GitOpsIntegration:
                 check=False,
             )
             if rc != 0:
-                files = await self._conflicting_files(head, base, repo=workspace)
-                named = f": {', '.join(files)}" if files else ""
-                return (False, f"{head} не сливается с {base} без конфликта{named}")
+                # Конфликт РАСПОЗНАЁТСЯ по индексу, а не по коду возврата и не
+                # по тексту. Код у конфликта rc=1, но его же отдают и другие
+                # отказы; текст локализован — на боевом хосте git пишет
+                # «КОНФЛИКТ», и поиск слова conflict его не найдёт. Неслитые
+                # пути в индексе есть только у настоящего конфликта, и они же
+                # и есть список файлов, который отказ обязан назвать.
+                _, unmerged, _ = await _git(
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                    repo=path,
+                    check=False,
+                )
+                files = [f for f in (unmerged or "").split("\n") if f.strip()]
+                if files:
+                    return (
+                        False,
+                        f"{head} не сливается с {base} без конфликта: "
+                        f"{', '.join(files)}",
+                    )
+                # Любой другой отказ мержа НЕ конфликт, и звать его конфликтом
+                # дороже, чем не назвать причину вовсе: #1192 встал на том, что
+                # `git merge` падал с «identity unknown» (rc=128), а хаб час
+                # отправлял человека искать конфликт, которого не было. Вывод
+                # git тут единственный, кто причину знает, — он и едет в деталь.
+                said = (err or "").strip() or "git ничего не написал в stderr"
+                return (
+                    False,
+                    f"мерж {head} в {base} не прошёл (git rc={rc}): {said[:150]}",
+                )
 
             rc, merged_sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
             merged_sha = (merged_sha or "").strip()

@@ -78,6 +78,48 @@ def _forge(*, contains: bool | None = True, closed: bool = True) -> AsyncMock:
     return forge
 
 
+@pytest.fixture
+def repo_pair_without_ambient_identity(
+    repo_pair, tmp_path, monkeypatch
+) -> tuple[Path, Path]:
+    """Клон без git-identity — тот же случай, что на боевом хосте (#1192).
+
+    Три вещи, и ни одну нельзя снять, иначе тест перестаёт быть измерением:
+
+    1. В клоне нет ``user.name``/``user.email`` — как в
+       рабочем клоне snip-portal на боевом хосте.
+    2. Глобальный и системный конфиги пусты. Одного пункта 3 НЕ хватает:
+       замерено на дев-машине с личностью в ~/.gitconfig — ``useConfigOnly``
+       её принимает (флаг запрещает ДОГАДЫВАТЬСЯ, а не читать конфиг), мерж
+       проходит и на непочиненном коде.
+    3. ``useConfigOnly=true``. Без него git выведет identity из пользователя
+       ОС, и коммит опять пройдёт без правки. На vm-5c8197 выводить не из
+       чего: хост без домена, и кандидат вида ``служебный@vm-5c8197.(none)`` git
+       отвергает сам — флаг воспроизводит именно это.
+
+    Окружение правится через ``os.environ``, потому что проверяемый код
+    собирает env подпроцесса из него (``proc.git_env``): подменять надо то,
+    что git действительно увидит.
+    """
+    bare, work = repo_pair
+    _git(work, "config", "--unset", "user.name")
+    _git(work, "config", "--unset", "user.email")
+    _git(work, "config", "user.useConfigOnly", "true")
+    empty = tmp_path / "empty.gitconfig"
+    empty.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(empty))
+    for leftover in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+    ):
+        monkeypatch.delenv(leftover, raising=False)
+    return bare, work
+
+
 async def test_delivery_is_proven_by_the_base_branch_not_the_pr(repo_pair):
     """AC-1. Доставка подтверждается коммитом в базе, а не ответом про PR.
 
@@ -196,8 +238,13 @@ async def test_protected_base_names_the_cause(repo_pair):
     assert "main" in detail
 
 
-async def test_conflict_names_the_files(repo_pair):
-    """Конфликт называет файлы, а не только факт (#970)."""
+async def test_a_real_conflict_is_still_named_a_conflict_with_its_files(repo_pair):
+    """AC-3. Конфликт называет файлы, а не только факт (#970, #1192).
+
+    Вторая половина #1192: перестать звать конфликтом всё подряд легко ценой
+    того, что настоящий конфликт перестанет называться. Здесь ветки
+    действительно расходятся по содержимому — и отказ обязан остаться прежним.
+    """
     bare, work = repo_pair
     # Обе ветки трогают один файл по-разному — гарантированный конфликт.
     _git(work, "checkout", "-q", "main")
@@ -430,3 +477,69 @@ async def test_the_delivery_oracle_is_the_base_branch_and_the_ledger(repo_pair):
     # 3. Тот же коммит — то, что уйдёт в реестр мержей: деталь успеха и есть
     #    SHA, а не текст. Пустой реестр не отличил бы наш мерж от чужого.
     assert merged_sha and merged_sha == sha
+
+
+async def test_merge_commits_without_ambient_git_identity(
+    repo_pair_without_ambient_identity,
+):
+    """AC-1. Мерж подписывается сам, а не конфигом машины (#1192).
+
+    Это и была остановка доставки на snip-portal: ``merge --no-ff`` обязан
+    создать коммит, а git-identity не задана ни в клоне, ни в конфиге
+    пользователя. Инструмент, которому положено коммитить, не может зависеть
+    от того, что кто-то однажды выполнил ``git config --global`` на этой
+    машине: тот же дефект приезжает с новым сервером, с контейнером и с
+    каждым, кто развернёт хаб у себя.
+    """
+    bare, work = repo_pair_without_ambient_identity
+    forge = _forge()
+
+    ok, detail = await GitOpsIntegration(forge=forge).merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok, detail
+    _git(work, "fetch", "-q", "origin")
+    assert "feat(task): работа (#1)" in _git(
+        work, "log", "--format=%s", "-3", "origin/main"
+    )
+    # Подписался ИМЕННО хаб: авторство мержа принадлежит тому, кто его сделал,
+    # а не человеку, чью задачу он доставляет.
+    assert (
+        _git(work, "log", "-1", "--format=%an <%ae>", "origin/main")
+        == "Haiplane Hub <hub@haiplane.local>"
+    )
+
+
+async def test_a_merge_failure_that_is_not_a_conflict_does_not_claim_one(
+    repo_pair, monkeypatch
+):
+    """AC-2. Отказ мержа называет СВОЮ причину, а не чужую (#1192).
+
+    Прежний код возвращал «не сливается без конфликта» на любой ненулевой код
+    возврата и выбрасывал вывод git — тот самый, который прямым текстом писал
+    «identity unknown». Час ушёл на поиск конфликта, которого не существовало:
+    отказ, называющий неверную причину, хуже отказа, не называющего никакой.
+    """
+    from hub.integrations import git_ops as git_ops_mod
+
+    bare, work = repo_pair
+    real_git = git_ops_mod._git
+
+    async def merge_fails_on_identity(*args, **kw):
+        if args and args[0] == "merge":
+            return (128, "", "fatal: Committer identity unknown")
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", merge_fails_on_identity)
+
+    ok, detail = await GitOpsIntegration(forge=_forge()).merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok is False
+    assert "конфликт" not in detail.lower(), (
+        "не-конфликтный отказ не имеет права называться конфликтом"
+    )
+    assert "identity unknown" in detail, "вывод git — единственный, кто знает причину"
+    assert "rc=128" in detail
