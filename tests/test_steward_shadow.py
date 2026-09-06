@@ -892,6 +892,83 @@ async def test_a_capacity_refusal_moves_to_the_next_model(
     )
 
 
+async def test_the_list_is_walked_past_a_second_refusal(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Перечень замен — перечень, а не одна запасная (находка ревью №249).
+
+    Раскол адъюдикации: цикл выглядит прямолинейно, но ни один тест не
+    заставлял ПЕРВУЮ замену тоже отказать, и мутация «break после первой
+    замены» оставалась зелёной. Перечень, из которого проверена одна
+    позиция, — одна запасная модель с видом списка; лимит у провайдера
+    приходит сразу ко всем моделям одного тарифа, так что второй отказ
+    подряд — обычный случай, а не экзотический.
+    """
+    monkeypatch.setattr(
+        config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5", "gemini-3.1-pro")
+    )
+    project_id = await _project(db, "shadow-fallback-second")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        # Предел заходов: перебор без памяти о пробованных не падал бы, а
+        # ВИС — в CI это повешенный прогон вместо названного дефекта.
+        assert len(attempts) <= 4, f"перебор не кончается: {attempts}"
+        if kwargs["model_id"] == "gemini-3.1-pro":
+            return _CREATED, None
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 1
+
+    assert attempts == ["gpt-5.3-codex", "composer-2.5", "gemini-3.1-pro"], (
+        "перебор идёт по порядку предпочтения и не останавливается на первой "
+        "замене: каждая пробуется ровно раз"
+    )
+    run = (await _runs(db, task_id))[0]
+    assert run["model"] == "gemini-3.1-pro"
+
+
+async def test_an_exhausted_list_stops_instead_of_looping(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """Оборотная сторона: перебор конечен, и каждая модель пробуется однажды.
+
+    Без этого «идти дальше по списку» превращается в круг по нему же —
+    деньги тратятся на повтор того, что уже отказало.
+    """
+    monkeypatch.setattr(
+        config, "STEWARD_MODEL_FALLBACKS", ("composer-2.5", "gemini-3.1-pro")
+    )
+    project_id = await _project(db, "shadow-fallback-exhausted")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        # Предел заходов: перебор без памяти о пробованных не падал бы, а
+        # ВИС — в CI это повешенный прогон вместо названного дефекта.
+        assert len(attempts) <= 4, f"перебор не кончается: {attempts}"
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+
+    assert attempts == ["gpt-5.3-codex", "composer-2.5", "gemini-3.1-pro"]
+    run = (await _runs(db, task_id))[0]
+    # Заказ остаётся ОТКРЫТЫМ: лимит провайдера — состояние временное, а
+    # UNIQUE(task_id, generation, kind) сжёг бы единственное суждение
+    # поколения окончательно.
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == ""
+
+
 async def test_a_same_family_substitute_is_skipped(
     db: aiosqlite.Connection, with_identity, monkeypatch
 ):
