@@ -160,6 +160,22 @@ STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
 # implementer's and from the reviewer's. Declared on the order so the
 # diversity rule has something to check before the run starts.
 STEWARD_MODEL = env_get("STEWARD_MODEL", "gpt-5.3-codex")
+# Запасные судьи на случай, когда провайдер не может запустить основного
+# (#1182). Порядок — предпочтение; берётся первая, проходящая гейт
+# монокультуры ДЛЯ КОНКРЕТНОЙ сдачи, поэтому список не обязан быть
+# согласован с ревьюером заранее.
+#
+# Имена проверены у провайдера через list_models 06.09.2026: composer-2
+# не существует, существует composer-2.5. Непроверенное имя здесь — это
+# молчаливый пропуск замены, поэтому список пополняется только тем, что
+# наблюдалось в выдаче провайдера.
+STEWARD_MODEL_FALLBACKS = tuple(
+    m.strip()
+    for m in env_get("STEWARD_MODEL_FALLBACKS", "composer-2.5,gemini-3.1-pro").split(
+        ","
+    )
+    if m.strip()
+)
 # The hub token the steward run authenticates with (#1105). Same shape as
 # CURSOR_REVIEWER_HUB_TOKEN: the run reaches the hub's own MCP as the steward
 # principal, whose allowlist is two operations (#1021). Unset means no run —
