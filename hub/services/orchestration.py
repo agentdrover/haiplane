@@ -1931,10 +1931,18 @@ async def detect_branch_stacking(
 ) -> dict[str, Any] | None:
     """Advisory branch-stacking detection at submission time (#438).
 
-    Checks — via the project's git repo — whether ``branch`` contains
-    commits of ANOTHER unmerged task branch in running/review status.
-    Returns ``{"base_task_id", "base_task_branch", "base_task_status",
-    "message"}`` for the first stacked base found, or None.
+    Checks — via the project's git repo — whether ``branch`` shares unmerged
+    commits with ANOTHER task branch in running/review status. Returns
+    ``{"base_task_id", "base_task_branch", "base_task_status", "relation",
+    "message"}`` for the first stacked pair found, or None.
+
+    Two questions, not one (#1184). Whether the branches are stacked at all
+    is symmetric and answered by ``branch_contains_unmerged_commits_of``.
+    WHICH ONE MERGES FIRST is not symmetric, and reading it off the same
+    predicate made the advice depend on which task was submitting: the same
+    pair got opposite orders minutes apart. The side comes from ancestry —
+    ``relation`` — and when ancestry cannot be established the message says
+    the order is undetermined instead of naming one.
 
     Advisory by design: a stack can be a deliberate decision, so this never
     blocks and never raises. Graceful degradation: no branch, no plugin
@@ -1974,23 +1982,95 @@ async def detect_branch_stacking(
         if stacked:
             other_id = other["id"]
             other_status = other.get("status") or ""
-            message = (
-                f"ADVISORY branch stacking: '{branch}' contains unmerged "
-                f"commits of task #{other_id} branch '{other_branch}' "
-                f"(status: {other_status}). This branch cannot be verified "
-                f"against '{base}' on its own and the merge order is "
-                f"implicit. Alternatives: wait for task #{other_id} to merge "
-                f"into '{base}', rebase, and resubmit — or, if the stack is "
-                f"deliberate, merge task #{other_id}'s branch first and "
-                f"state the merge order explicitly."
-            )
+            relation = await _stack_ancestry(task_id, branch, other_branch, repo_path)
             return {
                 "base_task_id": other_id,
                 "base_task_branch": other_branch,
                 "base_task_status": other_status,
-                "message": message,
+                "relation": relation,
+                "message": _stacking_message(
+                    relation, branch, other_branch, other_id, other_status, base
+                ),
             }
     return None
+
+
+async def _stack_ancestry(
+    task_id: int, branch: str, other_branch: str, repo_path: str | None
+) -> str:
+    """Ask git which branch stands on which; "unknown" when it cannot say."""
+    resolver = getattr(plugins.git_ops, "branch_ancestry", None)
+    if resolver is None:
+        return git_ops_mod.STACK_ANCESTRY_UNKNOWN
+    try:
+        return await resolver(branch, other_branch, repo=repo_path)
+    except Exception:  # noqa: BLE001 — advisory only; never break the caller
+        log.debug(
+            "branch ancestry unavailable for #%d (%s vs %s)",
+            task_id,
+            branch,
+            other_branch,
+            exc_info=True,
+        )
+        return git_ops_mod.STACK_ANCESTRY_UNKNOWN
+
+
+def _stacking_message(
+    relation: str,
+    branch: str,
+    other_branch: str,
+    other_id: int,
+    other_status: str,
+    base: str,
+) -> str:
+    """The advisory text for one stacked pair, worded by ancestry (#1184).
+
+    Four outcomes, four sentences. The two that name a merge order name it
+    from ancestry, and the two that cannot say so plainly — an advisory read
+    at the moment of an irreversible merge must not offer a guessed side.
+    """
+    pair = (
+        f"'{branch}' and task #{other_id} branch '{other_branch}' "
+        f"(status: {other_status})"
+    )
+    if relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
+        return (
+            f"ADVISORY branch stacking: '{branch}' contains unmerged "
+            f"commits of task #{other_id} branch '{other_branch}' "
+            f"(status: {other_status}). This branch cannot be verified "
+            f"against '{base}' on its own and the merge order is "
+            f"implicit. Alternatives: wait for task #{other_id} to merge "
+            f"into '{base}', rebase, and resubmit — or, if the stack is "
+            f"deliberate, merge task #{other_id}'s branch first and "
+            f"state the merge order explicitly."
+        )
+    if relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_ANCESTOR:
+        return (
+            f"ADVISORY branch stacking: task #{other_id} branch "
+            f"'{other_branch}' (status: {other_status}) is built ON TOP of "
+            f"'{branch}' — it carries this branch's commits, not the other "
+            f"way round. Merge order follows ancestry: '{branch}' merges "
+            f"into '{base}' FIRST, then #{other_id} rebases onto the new "
+            f"'{base}'. Merging #{other_id} first would carry this branch's "
+            f"diff into '{base}' under the other task's number and leave "
+            f"this one with an empty PR."
+        )
+    if relation == git_ops_mod.STACK_ANCESTRY_UNRELATED:
+        return (
+            f"ADVISORY branch stacking: {pair} share unmerged commits, but "
+            f"neither branch is an ancestor of the other, so no merge order "
+            f"follows from ancestry. Neither branch can be verified against "
+            f"'{base}' on its own. Decide the order deliberately and state "
+            f"it — the hub is not naming a side here."
+        )
+    return (
+        f"ADVISORY branch stacking: {pair} share unmerged commits, but the "
+        f"merge order could NOT be determined — git did not answer about "
+        f"ancestry (branch missing from the hub's clone, or the query "
+        f"failed). Check it yourself before merging: "
+        f"`git merge-base --is-ancestor <a> <b>`, asked both ways. The hub "
+        f"is not guessing a side."
+    )
 
 
 def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
