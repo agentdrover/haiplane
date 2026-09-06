@@ -124,13 +124,24 @@ def delivery_commands(task_id: int, code: str, base_url: str) -> tuple[str, ...]
     окна между созданием и chmod. Разбор через ``sed`` намеренно: ``jq`` на
     образе провайдера может не оказаться, а отсутствующий разборщик выглядел
     бы как пустой токен — то есть как ровно тот отказ, который чиним.
+
+    Обмен пишет во ВРЕМЕННЫЙ файл и переносит его только после проверки на
+    непустоту (находка ревью №260). Прямое ``>`` обрезает цель ДО того, как
+    отработает разбор: повтори агент первую команду — а журнал прода
+    показывает ровно это, redeem 200 и следом redeem 401, — тело отказа поля
+    ``token`` не содержит, разбор молчит, и ЖИВОЙ допуск затирается пустотой.
+    Дальше пустой ``Bearer`` и тот самый 401, ради которого всё и затевалось.
+    Повтор не предусмотрен инструкцией, но агенты повторяют; починка, которую
+    ломает повтор, ненадёжна ровно там, где нужнее всего.
     """
     return (
         f"umask 077 && curl -sS -X POST {base_url}/api/auth/chat-pair/redeem "
         "-H 'Content-Type: application/json' "
         f'-d \'{{"code":"{code}"}}\' '
         '| sed -n \'s/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' '
-        f"> {CREDENTIAL_PATH}",
+        f"> {CREDENTIAL_PATH}.new "
+        f"&& test -s {CREDENTIAL_PATH}.new "
+        f"&& mv {CREDENTIAL_PATH}.new {CREDENTIAL_PATH}",
         f"test -s {CREDENTIAL_PATH} && wc -c < {CREDENTIAL_PATH}",
         f"curl -sS {base_url}/api/tasks/{task_id}/steward-evidence "
         f'-H "Authorization: Bearer $(cat {CREDENTIAL_PATH})"',

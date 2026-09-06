@@ -500,6 +500,13 @@ for ((i = 1; i <= $#; i++)); do
 done
 for arg in "$@"; do
   if [[ "$arg" == *chat-pair/redeem* ]]; then
+    # Код одноразовый: второй обмен получает отказ БЕЗ поля token — именно
+    # такое тело и обрезало живой допуск до пустоты (находка ревью №260).
+    if [[ -f "$REDEEMED" ]]; then
+      printf '%s' '{"detail":"code invalid or already used"}'
+      exit 0
+    fi
+    touch "$REDEEMED"
     printf '%s' '{"token":"tok-SECRET-42","expires_at":"2026-09-06T12:00:00"}'
     exit 0
   fi
@@ -544,14 +551,16 @@ def _stub_curl(tmp_path):
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["SEEN_AUTH"] = str(seen)
+    env["REDEEMED"] = str(tmp_path / "redeemed")
     return env, seen
 
 
 def _commands(tmp_path):
-    """Команды задания с файлом токена внутри tmp_path.
+    """Команды задания с файлом допуска внутри tmp_path.
 
-    Настоящий путь — /tmp на машине прогона; в тесте он подменяется, чтобы
-    параллельные прогоны не толкались об один файл.
+    Настоящий путь — в домашнем каталоге прогона (CREDENTIAL_PATH); в тесте
+    он подменяется, чтобы параллельные прогоны не толкались об один файл и
+    не трогали домашний каталог того, кто запускает тесты.
     """
     token_file = str(tmp_path / "steward.credential")
     with patch.object(sh, "CREDENTIAL_PATH", token_file):
@@ -654,3 +663,36 @@ async def test_a_spent_code_is_still_refused(db: aiosqlite.Connection, monkeypat
 
     second = await chat_pair.redeem_code(db, code.group(1))
     assert second is None, "потраченный код обменялся повторно — одноразовость снята"
+
+
+async def test_a_repeated_redeem_does_not_destroy_a_live_credential(
+    tmp_path, _stub_curl
+):
+    """#1194, находка ревью №260: повтор не уносит уже добытый допуск.
+
+    Прямое ``>`` обрезало бы цель ДО разбора: повторный обмен на потраченном
+    коде отдаёт отказ без поля token, разбор молчит, и рабочий допуск
+    превращается в пустоту — то есть в тот самый 401, ради которого задача и
+    заведена. Инструкция повтора не предполагает, но журнал прода показывает
+    redeem 200 и следом redeem 401: агенты повторяют.
+    """
+    env, seen = _stub_curl
+    commands, token_file = _commands(tmp_path)
+    redeem, check, evidence, _judgement = commands
+
+    _run_each_in_its_own_shell([redeem], tmp_path, env)
+    import pathlib as _pathlib
+
+    stored = _pathlib.Path(token_file)
+    assert stored.read_text().strip() == "tok-SECRET-42"
+
+    # Тот же шаг ещё раз — так поступает агент, решивший, что первый не удался.
+    _run_each_in_its_own_shell([redeem], tmp_path, env)
+
+    assert stored.read_text().strip() == "tok-SECRET-42", (
+        "повторный обмен затёр живой допуск — воспроизведён исходный дефект"
+    )
+
+    # И проверка, и следующий запрос по-прежнему работают.
+    _run_each_in_its_own_shell([check, evidence], tmp_path, env)
+    assert seen.read_text().splitlines()[-1] == "Authorization: Bearer tok-SECRET-42"
