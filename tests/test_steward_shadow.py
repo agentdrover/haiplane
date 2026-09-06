@@ -900,6 +900,67 @@ async def test_a_reviewer_not_yet_dispatched_is_waited_for(
     assert started.await_count == 1
 
 
+async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
+    db: aiosqlite.Connection, with_identity
+):
+    """Находка ревью №254: строка диспетча ложится МЕЖДУ чтениями.
+
+    Сдача идёт по тому же asyncio-циклу, что и поллер, поэтому каждый
+    ``await`` внутри решения отдаёт управление. Первая правка #1185 читала
+    модель ревьюера снимком, потом спрашивала про строку диспетча — и если
+    строка появлялась в этом промежутке, ожидание отменялось, а гейт судил
+    по СТАРОЙ пустой строке и закрывал слот навсегда.
+
+    Мои AC-тесты этого не ловили: они не перемежают INSERT с этими await.
+    Здесь вставка происходит ровно внутри решения.
+    """
+    project_id = await _project(db, "shadow-race-interleaved")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    original = repo.resolve_project_for_task
+    landed = False
+
+    async def _resolve_and_land(conn, tid):
+        nonlocal landed
+        project = await original(conn, tid)
+        if not landed:
+            landed = True
+            await conn.execute(
+                "INSERT INTO review_dispatches "
+                "(task_id, submission_generation, agent_id, model, status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tid, 1, "rev-agent", "grok-4.6", "running"),
+            )
+            await conn.commit()
+        return project
+
+    with (
+        patch("hub.repository.resolve_project_for_task", new=_resolve_and_land),
+        patch(
+            "hub.integrations.cursor_cloud.create_review_agent",
+            new=AsyncMock(return_value=_CREATED),
+        ),
+    ):
+        await start_due_runs(db)
+
+    assert landed, "подставка не сработала — тест не проверил то, ради чего написан"
+    run = (await _runs(db, task_id))[0]
+    # Слот НЕ сожжён: ревьюер существует, и решение по устаревшему снимку
+    # закрыло бы поколение навсегда — UNIQUE(task_id, generation, kind).
+    assert run["status"] != RUN_REFUSED, run["closed_reason"]
+
+    # И следующий тик доводит дело до конца, уже видя настоящую модель.
+    with patch(
+        "hub.integrations.cursor_cloud.create_review_agent",
+        new=AsyncMock(return_value=_CREATED),
+    ) as started:
+        await start_due_runs(db)
+    assert started.await_count == 1
+    assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
+
+
 async def test_an_unrecognised_reviewer_still_closes_the_slot(
     db: aiosqlite.Connection, with_identity
 ):
