@@ -124,3 +124,81 @@ async def test_api_errors_degrade_to_none(monkeypatch, _configured):
         _patch_transport(monkeypatch, recorder)
         assert await cursor_cloud.list_models() is None
         assert await cursor_cloud.get_usage("bc-1", "run-1") is None
+
+
+async def test_the_incident_body_becomes_a_capacity_refusal(monkeypatch, _configured):
+    """Настоящий ответ провайдера доходит до решения о замене (#1182).
+
+    Находка ревью №249, high: механизм замены был проверен, а СИГНАЛ,
+    который его включает, — нет. Все AC-тесты подставляли Refusal руками,
+    поэтому разбор тела не проверял никто: мутация ``_error_code`` в вечную
+    пустую строку оставляла сюит зелёным, а в проде давала код, не
+    попадающий в CAPACITY_CODES, — тот самый повтор одной и той же модели,
+    против которого задача и заведена.
+
+    Тело здесь — дословно ответ Cursor от 06.09.2026 на #1175.
+    """
+    from hub.services.steward_shadow import is_capacity_refusal
+
+    recorder = _Recorder(
+        httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "usage_limit_exceeded",
+                    "message": (
+                        "Usage-based pricing required. Background Agent "
+                        "requires at least $2 remaining until your hard limit."
+                    ),
+                }
+            },
+        )
+    )
+    _patch_transport(monkeypatch, recorder)
+
+    created, refusal = await cursor_cloud.create_agent_attempt(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id="gpt-5.3-codex",
+        prompt_text="judge",
+        hub_mcp_url="https://agenthai.ru/mcp",
+        reviewer_token="t",
+    )
+
+    assert created is None
+    assert refusal is not None
+    assert refusal.status == 400
+    assert refusal.code == "usage_limit_exceeded"
+    assert refusal.is_transport is False
+    # Цепочка целиком: тело → код → решение. Проверять только поле кода
+    # значило бы снова остановиться на шаг раньше места, где решают.
+    assert is_capacity_refusal(refusal) is True
+
+
+async def test_an_unnamed_error_is_not_a_capacity_signal(monkeypatch, _configured):
+    """Тело без кода не выдумывает код (#762: отсутствие — не значение).
+
+    Три формы, каждая встречается у беты: ошибка строкой, ошибка без поля
+    code, нечитаемое тело. Ни одна не должна дать имя, по которому меняют
+    судью: незнание — не повод считать модель недоступной.
+    """
+    from hub.services.steward_shadow import is_capacity_refusal
+
+    for canned in (
+        httpx.Response(403, json={"error": "nope"}),
+        httpx.Response(400, json={"error": {"message": "no code here"}}),
+        httpx.Response(400, text="not json at all"),
+    ):
+        recorder = _Recorder(canned)
+        _patch_transport(monkeypatch, recorder)
+        _created, refusal = await cursor_cloud.create_agent_attempt(
+            repo_url="https://github.com/o/r",
+            starting_ref="task-1/x",
+            model_id="gpt-5.3-codex",
+            prompt_text="judge",
+            hub_mcp_url="https://agenthai.ru/mcp",
+            reviewer_token="t",
+        )
+        assert refusal is not None
+        assert refusal.code == ""
+        assert is_capacity_refusal(refusal) is False
