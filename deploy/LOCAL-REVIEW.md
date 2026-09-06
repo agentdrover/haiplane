@@ -96,17 +96,38 @@ Environment=LOCAL_REVIEWER_HUB_TOKEN=<ключ принципала local-review
 
 ## Проверка попыткой, а не чтением конфига (AC-2 задачи #1180)
 
-Настройка, о которой только заявлено, защитой не является. Под пользователем
-ревьюера:
+Настройка, о которой только заявлено, защитой не является.
+
+**Пути спрашиваются у системы, а не берутся из этого документа.** Первая
+редакция называла их литералами — и оба промахнулись мимо живой установки
+(найдено ревью, находки 85870ae1 и cab0aab3). Промах здесь дороже, чем
+кажется: `cat` несуществующего файла тоже отказывает, и проба, которая не
+отличает «нет прав» от «нет файла», доказывает пустоту, а не защиту. Плюс
+каталог службы на этом проде до сих пор носит имя времён до ребрендинга,
+которого в тексте репозитория быть не может, — ещё одна причина не писать
+такие пути литералом.
 
 ```bash
-sudo -u haiplane-reviewer cat /opt/haiplane-hub/secrets.env        # ожидается Permission denied
-sudo -u haiplane-reviewer touch /var/lib/haiplane-hub/workspaces/snip-portal/PROBE
-sudo -u haiplane-reviewer systemd-run --scope --quiet --uid=haiplane-reviewer --property=MemoryMax=4G true
+HUB_UNIT=<имя systemd-юнита хаба>
+SECRETS=$(systemctl show "$HUB_UNIT" -p EnvironmentFile --value \
+          | tr ' ' '\n' | grep -i secrets | tr -d '-')
+WORKSPACE=<workspace_path проекта — со страницы /projects или GET /api/projects>
+
+# 0. Сначала убедиться, что цели СУЩЕСТВУЮТ: иначе отказ ниже не значит ничего.
+sudo test -f "$SECRETS"  && echo "файл секретов на месте: $SECRETS"
+sudo test -d "$WORKSPACE" && echo "рабочий клон на месте: $WORKSPACE"
+
+# 1. Под пользователем ревьюера обе попытки обязаны отказать ПО ПРАВАМ.
+sudo -u haiplane-reviewer cat "$SECRETS"            # ожидается Permission denied
+sudo -u haiplane-reviewer touch "$WORKSPACE/PROBE"  # ожидается Permission denied
+
+# 2. А сама песочница обязана пройти.
+sudo -u haiplane-reviewer systemd-run --scope --quiet \
+     --uid=haiplane-reviewer --property=MemoryMax=4G true
 ```
 
-Первые две команды обязаны отказать, третья — пройти. Если отказала третья,
-песочница не запустится и хаб честно напишет в карточку, что прогона не было.
+Если отказала третья команда, песочница не запустится — и хаб честно напишет в
+карточку, что прогона не было, а не сделает вид, что ревью прошло.
 
 ## Что видно в карточке задачи
 
