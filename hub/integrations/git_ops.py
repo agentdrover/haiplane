@@ -668,6 +668,12 @@ async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
 STACK_ANCESTRY_HEAD_IS_DESCENDANT = "head_is_descendant"
 STACK_ANCESTRY_HEAD_IS_ANCESTOR = "head_is_ancestor"
 STACK_ANCESTRY_UNRELATED = "unrelated"
+# One commit under two branch names (#1193). Kept apart from "unrelated"
+# because the two facts are opposite: there each branch is outside the
+# other's history, here each IS the other's history. Both name no merge
+# order, and that shared answer is exactly what let the false explanation
+# hide — the caller words them differently.
+STACK_ANCESTRY_SAME_TIP = "same_tip"
 STACK_ANCESTRY_UNKNOWN = "unknown"
 
 
@@ -776,9 +782,10 @@ class GitOpsIntegration:
         if head_is_descendant is None or head_is_ancestor is None:
             return STACK_ANCESTRY_UNKNOWN
         if head_is_descendant and head_is_ancestor:
-            # Same commit under two branch names: both answers are yes and
-            # neither names an order.
-            return STACK_ANCESTRY_UNRELATED
+            # Both answers yes is only possible for one commit: a commit is
+            # its own ancestor, and two DIFFERENT commits cannot each contain
+            # the other. No third git question is needed to know this.
+            return STACK_ANCESTRY_SAME_TIP
         if head_is_descendant:
             return STACK_ANCESTRY_HEAD_IS_DESCENDANT
         if head_is_ancestor:

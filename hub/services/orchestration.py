@@ -2025,9 +2025,13 @@ def _stacking_message(
 ) -> str:
     """The advisory text for one stacked pair, worded by ancestry (#1184).
 
-    Four outcomes, four sentences. The two that name a merge order name it
-    from ancestry, and the two that cannot say so plainly — an advisory read
-    at the moment of an irreversible merge must not offer a guessed side.
+    Five outcomes, five sentences. The two that name a merge order name it
+    from ancestry, and the three that cannot say so plainly — an advisory
+    read at the moment of an irreversible merge must not offer a guessed
+    side. Naming no side is not the same as having no explanation: the same
+    commit under two names and two genuinely diverged branches both leave
+    the order open, and telling the reader which one they are looking at is
+    the whole value of the message (#1193).
     """
     pair = (
         f"'{branch}' and task #{other_id} branch '{other_branch}' "
@@ -2054,6 +2058,16 @@ def _stacking_message(
             f"'{base}'. Merging #{other_id} first would carry this branch's "
             f"diff into '{base}' under the other task's number and leave "
             f"this one with an empty PR."
+        )
+    if relation == git_ops_mod.STACK_ANCESTRY_SAME_TIP:
+        return (
+            f"ADVISORY branch stacking: {pair} point at the SAME commit — "
+            f"one commit under two branch names, not two lines of work. "
+            f"There is no merge order to name: whichever you merge into "
+            f"'{base}' carries the same diff, and the other's PR is empty "
+            f"afterwards. Check that this is what you meant — usually it "
+            f"means one branch was cut from the other and has no commits "
+            f"of its own yet."
         )
     if relation == git_ops_mod.STACK_ANCESTRY_UNRELATED:
         return (
