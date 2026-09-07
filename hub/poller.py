@@ -528,6 +528,19 @@ async def _deliver_approved_review(db, task: dict) -> None:
             forge=mctx.get("forge", ""),
         )
         if ci.outcome == CIProbeOutcome.passed:
+            # #1186: the pair gate asks this inside merge_before_completion;
+            # this conveyor calls merge_pr itself, so it asks here. A stacked
+            # base is a WAIT, handled like a pending CI right below: return
+            # and come back, never the needs_decision branch further down —
+            # that one is for refusals a human has to resolve, and this one
+            # resolves itself when the base merges.
+            stacked = await services.stacking_gate_step(db, task)
+            if stacked:
+                # Said once, not once per sweep — the same dedup the pair
+                # path uses, for the same reason: a line every thirty
+                # seconds is how a real signal gets muted (#534).
+                await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
+                return
             merged = await plugins.git_ops.merge_pr(
                 pr_num,
                 task["id"],

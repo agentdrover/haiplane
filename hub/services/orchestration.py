@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -25,6 +26,8 @@ from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
+    StackProbeOutcome,
+    stacking_probe_from_predicate,
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
@@ -1928,36 +1931,102 @@ async def switch_pair_workspace_to_task(
 STACK_ADVISORY_STATUSES = ["running", "review"]
 
 
-async def detect_branch_stacking(
+# #1186: the three answers the delivery gate needs and the advisory hint
+# never did. "clear" and "unknown" were one value (None) for as long as the
+# only consumers were advisories — a missing hint costs nothing. A merge
+# decided on the same value costs the base task its work, so they are split
+# here, once, rather than at each consumer.
+STACK_STACKED = "stacked"
+STACK_CLEAR = "clear"
+STACK_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class StackAssessment:
+    """Whether this branch stands on another task's unmerged branch (#1186).
+
+    ``outcome`` is one of ``stacked`` / ``clear`` / ``unknown``. ``unknown``
+    carries ``retryable``: git that blinked answers next cycle, a plugin
+    with no repository never will, and the two call for opposite handling —
+    the same split #1197 drew between ``unavailable`` and ``unsupported``.
+    """
+
+    outcome: str
+    reason: str = ""
+    retryable: bool = False
+    base_task_id: int | None = None
+    base_task_branch: str = ""
+    base_task_status: str = ""
+    relation: str = ""
+    message: str = ""
+
+    def as_advisory(self) -> dict[str, Any] | None:
+        """The pre-#1186 shape: a dict for a stack, None for anything else."""
+        if self.outcome != STACK_STACKED:
+            return None
+        return {
+            "base_task_id": self.base_task_id,
+            "base_task_branch": self.base_task_branch,
+            "base_task_status": self.base_task_status,
+            "relation": self.relation,
+            "message": self.message,
+        }
+
+
+async def assess_branch_stacking(
     db: aiosqlite.Connection,
     task_id: int,
     branch: str,
-) -> dict[str, Any] | None:
-    """Advisory branch-stacking detection at submission time (#438).
+) -> StackAssessment:
+    """Is ``branch`` stacked on another task's unmerged branch — or unknown (#1186)?
 
-    Checks — via the project's git repo — whether ``branch`` shares unmerged
-    commits with ANOTHER task branch in running/review status. Returns
-    ``{"base_task_id", "base_task_branch", "base_task_status", "relation",
-    "message"}`` for the first stacked pair found, or None.
+    Same walk as the advisory check has always done: every OTHER task whose
+    branch is unmerged and in running/review, asked of the project's git repo.
 
-    Two questions, not one (#1184). Whether the branches are stacked at all
-    is symmetric and answered by ``branch_contains_unmerged_commits_of``.
-    WHICH ONE MERGES FIRST is not symmetric, and reading it off the same
-    predicate made the advice depend on which task was submitting: the same
-    pair got opposite orders minutes apart. The side comes from ancestry —
-    ``relation`` — and when ancestry cannot be established the message says
-    the order is undetermined instead of naming one.
+    Two questions, not one (#1184). WHETHER the branches are stacked is
+    symmetric and answered by the probe. WHICH ONE MERGES FIRST is not, and
+    reading it off the same predicate made the advice depend on which task was
+    asking: the same pair got opposite orders minutes apart. The side comes
+    from ancestry — ``relation`` — and when ancestry cannot be established the
+    message says the order is undetermined instead of naming one.
 
-    Advisory by design: a stack can be a deliberate decision, so this never
-    blocks and never raises. Graceful degradation: no branch, no plugin
-    support, or any git failure silently skips the check.
+    What is new in #1186 is that not getting an answer has its own outcome. A probe
+    that cannot resolve the refs, a git call that fails, a plugin with no
+    repository — each used to be indistinguishable from "checked, and they
+    are independent", because the predicate returned ``bool``.
+
+    That collapse was harmless while the only readers were advisories, and it
+    is not harmless at a merge: on 06.09.2026 task #1183's PR was squash-merged
+    over #1175's unmerged branch, carrying #1175's whole diff into main under
+    #1183's number. The order is deliberate — a single ``unknown`` anywhere in
+    the walk outranks the ``clear`` verdicts around it, because one branch we
+    could not look at is exactly the one that might be underneath us.
     """
     branch = (branch or "").strip()
     if not branch:
-        return None
-    checker = getattr(plugins.git_ops, "branch_contains_unmerged_commits_of", None)
-    if checker is None:
-        return None
+        # Nothing to compare. Not "clear": we did not look at anything.
+        return StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason="no_branch_recorded",
+            retryable=False,
+        )
+    probe = getattr(plugins.git_ops, "branch_stacking_probe", None)
+    legacy = None
+    if probe is None:
+        # A plugin that predates the probe still answers the advisory
+        # question — the same graceful degradation branch_ancestry already
+        # gets. What it cannot answer is the delivery one: its ``False``
+        # means "not stacked OR could not look", and _as_probe turns that
+        # honestly into unknown rather than inventing a "clear" the bool
+        # never carried.
+        legacy = getattr(plugins.git_ops, "branch_contains_unmerged_commits_of", None)
+        if legacy is None:
+            return StackAssessment(
+                outcome=STACK_UNKNOWN,
+                reason="probe_unsupported",
+                retryable=False,
+            )
+        probe = functools.partial(stacking_probe_from_predicate, legacy)
 
     ctx = await project_git_context(db, task_id)
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
@@ -1965,38 +2034,74 @@ async def detect_branch_stacking(
     rows = await repo.list_unmerged_branch_tasks(
         db, exclude_task_id=task_id, statuses=STACK_ADVISORY_STATUSES
     )
+    unknown: StackAssessment | None = None
     for row in rows:
         other = dict(row)
         other_branch = (other.get("branch") or "").strip()
         if not other_branch or other_branch == branch:
             continue
         try:
-            stacked = await checker(
-                branch, other_branch, base_branch=base, repo=repo_path
-            )
-        except Exception:  # noqa: BLE001 — advisory only; never break the caller
+            result = await probe(branch, other_branch, base_branch=base, repo=repo_path)
+        except Exception:  # noqa: BLE001 — a raise is not an answer either
             log.debug(
-                "branch stacking check skipped for #%d (%s vs %s)",
+                "branch stacking probe raised for #%d (%s vs %s)",
                 task_id,
                 branch,
                 other_branch,
                 exc_info=True,
             )
-            return None
-        if stacked:
+            unknown = unknown or StackAssessment(
+                outcome=STACK_UNKNOWN,
+                reason=f"probe_raised: {other_branch}",
+                retryable=True,
+            )
+            continue
+        if result.outcome is StackProbeOutcome.stacked:
             other_id = other["id"]
             other_status = other.get("status") or ""
             relation = await _stack_ancestry(task_id, branch, other_branch, repo_path)
-            return {
-                "base_task_id": other_id,
-                "base_task_branch": other_branch,
-                "base_task_status": other_status,
-                "relation": relation,
-                "message": _stacking_message(
+            return StackAssessment(
+                outcome=STACK_STACKED,
+                reason=result.reason,
+                base_task_id=other_id,
+                base_task_branch=other_branch,
+                base_task_status=other_status,
+                relation=relation,
+                message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
                 ),
-            }
-    return None
+            )
+        if result.outcome is not StackProbeOutcome.clear:
+            # Remembered, not returned: a later row may still be a definite
+            # stack, and a definite stack is the more useful answer. Only
+            # after the whole walk finds none does the unknown stand.
+            unknown = unknown or StackAssessment(
+                outcome=STACK_UNKNOWN,
+                reason=f"{result.reason}: {other_branch}",
+                retryable=result.outcome is StackProbeOutcome.unavailable,
+            )
+    if unknown is not None:
+        return unknown
+    return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
+
+
+async def detect_branch_stacking(
+    db: aiosqlite.Connection,
+    task_id: int,
+    branch: str,
+) -> dict[str, Any] | None:
+    """Advisory branch-stacking detection at submission time (#438).
+
+    The ADVISORY face of :func:`assess_branch_stacking`: the same dict for a
+    stack, None for everything else. Its two callers — the submit path and
+    the review brief — address a human, who reads "no hint" the same whether
+    the branches are independent or git was mute. Delivery cannot afford that
+    reading and asks the assessment directly (#1186).
+
+    Advisory by design: a stack can be a deliberate decision, so this never
+    blocks and never raises.
+    """
+    return (await assess_branch_stacking(db, task_id, branch)).as_advisory()
 
 
 async def _stack_ancestry(
@@ -2325,6 +2430,61 @@ async def _missing_run_gate_step(
     return detail
 
 
+async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """The gate's whole answer to "is this branch standing on another" (#1186).
+
+    Returns a refusal detail, or "" to merge. Three answers, three handlings:
+
+    * stacked on a branch still in running/review — refuse, transiently. The
+      base merges on its own schedule and this delivery becomes possible the
+      moment it does, so this is a wait, not a decision (#951).
+    * clear — merge, exactly as before.
+    * unknown — never read as clear, but the two kinds part ways. Git that
+      blinked or a branch missing from the clone is a call that did not land:
+      refuse and ask again. A plugin with no repository at all is a fact about
+      the deployment, not about this task, and no cycle will change it —
+      refusing would stall every delivery on such a forge forever, which is
+      the one thing the constraint forbids. So it merges, and says out loud
+      that the stack could not be checked: the reader can tell that from
+      "checked, and there was none", which today they cannot (#1197 drew the
+      same line between ``unavailable`` and ``unsupported``).
+
+    A merged base is not a stack: ``list_unmerged_branch_tasks`` only offers
+    branches still in running/review, so a delivered base leaves nothing to
+    compare against and the walk comes back clear on its own.
+    """
+    assessment = await assess_branch_stacking(db, task["id"], task.get("branch") or "")
+    if assessment.outcome == STACK_STACKED:
+        return (
+            f"{STACKED_BASE_PREFIX}: ветка стоит на несмерженной ветке задачи "
+            f"#{assessment.base_task_id} '{assessment.base_task_branch}' "
+            f"(статус: {assessment.base_task_status}). Мерж сейчас унёс бы "
+            f"работу #{assessment.base_task_id} в базовую ветку под этим "
+            f"номером. Ждём доставки #{assessment.base_task_id}"
+        )
+    if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
+        return (
+            f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
+            f"несмерженной ветке, не удалось ({assessment.reason}). Это не то "
+            f"же самое, что «стопки нет», поэтому мерж отложен"
+        )
+    if assessment.outcome == STACK_UNKNOWN:
+        # Merged, but never silently: the alert is the whole difference
+        # between "we looked" and "we could not look".
+        await repo.add_task_update(
+            db,
+            task["id"],
+            "hub",
+            "alert",
+            f"Стопку веток проверить было нечем ({assessment.reason}) — "
+            f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
+            f"значит, что вопрос никто не задал. Если ветка отведена от чужой "
+            f"несмерженной ветки, её работа уедет в базовую ветку под номером "
+            f"этой задачи (#1186).",
+        )
+    return ""
+
+
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
 # human". Built from the same enum merge_before_completion prints, so the
 # prefix contract between the two spots of this file cannot silently drift.
@@ -2334,11 +2494,20 @@ async def _missing_run_gate_step(
 # there are no new commits, so hub_submit_for_review would stale the verdict
 # (#612) and recreate the one-way door #1030 closed.
 PR_DRAFT_PREFIX = "pr_draft"
+# #1186: the base of a stack is not a decision to make — it merges on its own
+# schedule and this delivery becomes possible the moment it does. Same class as
+# a pending CI: come back next cycle. The unknown sits here too, but only the
+# retryable kind; see _stacking_gate_step for why the other kind does not
+# refuse at all.
+STACKED_BASE_PREFIX = "stacked_base"
+STACK_UNKNOWN_PREFIX = "stack_unknown"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
     f"ci_{CIProbeOutcome.missing_run.value}",
     PR_DRAFT_PREFIX,
+    STACKED_BASE_PREFIX,
+    STACK_UNKNOWN_PREFIX,
     # #1116 (по ревью): мерж СОСТОЯЛСЯ, а подтвердить его не вышло. Раньше
     # это давало обычный merge_failed и уводило к человеку задачу, код
     # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
@@ -2510,6 +2679,16 @@ async def merge_before_completion(
             return False, await _missing_run_gate_step(db, task, ctx, ci)
         if ci.outcome != CIProbeOutcome.passed:
             return False, f"ci_{ci.outcome.value}: {ci.reason}"
+
+        # #1186: mergeable is not deliverable. A green, conflict-free PR whose
+        # branch stands on ANOTHER task's unmerged branch carries that task's
+        # commits, and a squash merge lands all of them under this task's
+        # number — irreversibly, as #1183 did to #1175 on 06.09.2026. Asked
+        # here, after the CI (no point pricing a delivery that will not happen)
+        # and before mark_pr_ready, so a held delivery has mutated nothing.
+        stacked = await stacking_gate_step(db, task)
+        if stacked:
+            return False, stacked
 
         # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
         # here is the ready signal. Asking merge_pr first collapses a draft

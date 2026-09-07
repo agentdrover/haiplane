@@ -215,3 +215,172 @@ async def test_missing_run_after_window_escalates_with_named_fact(
     assert "ci_absent: no_workflow_runs" not in body
     assert "workflow есть" in body
     assert "head-sha-not-hex" in body
+
+
+# ---- #1186: mergeable is not deliverable when the base is still unmerged ----
+#
+# The incident, 06.09.2026 on spike-bo: task #1183's branch was cut from
+# #1175's, #1183 got an auto verdict and a green CI, and the gate squash-merged
+# its PR while #1175 was still in review. All five commits of the stack landed
+# in main under #1183's number; #1175's PR went empty and DIRTY, its task stuck
+# in review with a diff there was nowhere left to apply, and the attribution
+# is gone for good. The signal existed the whole time — detect_branch_stacking
+# — but only ever addressed a human. The gate asked about CI and mergeability
+# and merged, and said so in the feed: "Условия доставки были выполнены
+# целиком, ждать было нечего."
+
+
+async def _base_task_in_review(db: aiosqlite.Connection, branch: str) -> int:
+    """Another task whose branch is alive and unmerged — a stack's base."""
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title="Base of the stack"))
+    await repo.update_task(db, tv.id, status="review", branch=branch)
+    await db.commit()
+    return tv.id
+
+
+def _probes(g, outcome, reason: str = "scripted"):
+    """Script the stacking probe on a git double (#1186)."""
+    from hub.integrations.protocols import StackProbeResult
+
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(outcome=outcome, reason=reason)
+    )
+    return g
+
+
+async def test_delivery_holds_while_the_base_branch_is_unmerged(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1: approved, green CI, mergeable — and the branch stands on the
+    # unmerged branch of a task still in review. The merge is the irreversible
+    # step, so it does not happen, and the feed names WHICH task is being
+    # waited for. A hold, not an escalation: the base merges on its own and
+    # this delivery becomes possible the moment it does.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "an unmerged base is a wait, not a decision: needs_decision is a door "
+        "that only opens outward (#1030)"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "the feed must name the task being waited for"
+    assert "task-1175/image-capture" in body
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_delivery_proceeds_once_the_base_has_merged(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-2: the same stack, after the base has been delivered. A completed
+    # task owns no unmerged branch, so there is nothing left to compare
+    # against and the hold lifts by itself — no second signal to maintain.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_in_review(db, "task-1175/image-capture")
+    await repo.update_task(db, base_id, status="completed")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+
+
+async def test_delivery_unaffected_without_a_stack(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-3: another task's branch IS alive, and the probe looked and found
+    # them independent. Delivery behaves exactly as it did before #1186 —
+    # the new condition must not start holding ordinary deliveries.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.clear)
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-900/unrelated-work")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "стопк" not in body.lower(), (
+        "a delivery that was checked and found independent says nothing new"
+    )
+
+
+async def test_unknown_stacking_is_not_read_as_no_stacking(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-4. The trap this whole task is about, and the one the statement
+    # named one layer too shallow: the predicate returned a bool, so a git
+    # that could not answer — refs missing from the clone, rev-list failing,
+    # no workspace — came back with the very same False that means "checked,
+    # and they are independent". Advisory, that cost a missing hint. As a
+    # delivery condition it costs the base task its work.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+    )
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "a call that did not land is cured by asking again, not by a human"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ref_unresolved" in body, "the reason it could not look is named"
+
+
+async def test_bool_only_plugin_is_unknown_rather_than_clear(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-4, the other half: a plugin that predates the probe answers only
+    # True/False, and its False cannot distinguish the two. Delivery goes
+    # ahead — refusing would stall every delivery on such a plugin forever,
+    # which is the constraint's other side — but it is said out loud, so a
+    # reader can tell "we could not look" from "we looked and there was
+    # nothing". Today the two are the same silence.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    # A pre-#1186 plugin, declared the way this repo already declares one
+    # (tests/test_stack_advisory.py does the same to branch_ancestry): the
+    # attribute is simply not there to be found.
+    g.branch_stacking_probe = None
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "an unanswerable plugin must not stall"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "проверить было нечем" in body
+    assert "legacy_bool_predicate" in body

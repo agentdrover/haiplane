@@ -31,6 +31,8 @@ from hub.integrations.protocols import (
     CIRunRequestResult,
     ForgePlugin,
     MergeabilityOutcome,
+    StackProbeOutcome,
+    StackProbeResult,
 )
 from hub.mcp_envelope import enrich_error_payload
 from hub.models import DEFAULT_FORGE
@@ -802,26 +804,67 @@ class GitOpsIntegration:
     ) -> bool:
         """True when ``branch`` carries commits unique to ``other_branch`` (#438).
 
+        The advisory predicate, unchanged for its two advisory callers: a
+        stack is True, everything else — including every way the question
+        could not be answered — is False. It no longer OWNS that judgement,
+        it reads it off ``branch_stacking_probe`` (#1186), so there is one
+        place where the git work is done and one place to fix when it is
+        wrong. What "False" hides is exactly what the probe spells out.
+        """
+        probe = await self.branch_stacking_probe(
+            branch, other_branch, base_branch=base_branch, repo=repo
+        )
+        return probe.outcome is StackProbeOutcome.stacked
+
+    async def branch_stacking_probe(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> StackProbeResult:
+        """Does ``branch`` carry commits unique to ``other_branch`` (#438, #1186)?
+
         Merge-base analysis against ``base_branch``: ``other_branch`` owns the
         commits reachable from it but not from base; if ``branch`` contains
         any of them, the branches are stacked and ``branch`` cannot be
         verified against base independently. Refs are resolved remote-first
         (#1046 / #762): a stale local develop must not invent a stack.
-        Best-effort: unresolvable refs or any git failure return False
-        (advisory check, never an error).
+
+        Every way of NOT getting an answer is ``unavailable`` with the reason
+        named, never ``clear``. The distinction is free for the advisory
+        callers and load-bearing for the delivery gate, which merges on it.
         """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
-                return False
+                return StackProbeResult(
+                    outcome=StackProbeOutcome.unavailable,
+                    reason="workspace_unavailable",
+                    details=reason,
+                )
         repo = repo or _repo_root()
         # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
         # local develop turn independent branches into a false stack.
         head = await _resolve_ref_remote_first(branch, repo)
         other = await _resolve_ref_remote_first(other_branch, repo)
-        base = await _resolve_ref_remote_first(_resolve_base(base_branch), repo)
+        base_name = _resolve_base(base_branch)
+        base = await _resolve_ref_remote_first(base_name, repo)
         if not (head and other and base):
-            return False
+            unresolved = [
+                name
+                for name, ref in (
+                    (branch, head),
+                    (other_branch, other),
+                    (base_name, base),
+                )
+                if not ref
+            ]
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=", ".join(unresolved),
+            )
 
         rc, total, _ = await _git(
             "rev-list", "--count", other, f"^{base}", repo=repo, check=False
@@ -830,14 +873,31 @@ class GitOpsIntegration:
             "rev-list", "--count", other, f"^{base}", f"^{head}", repo=repo, check=False
         )
         if rc != 0 or rc2 != 0:
-            return False
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="rev_list_failed",
+                details=f"rc={rc}/{rc2} for {other} ^{base}",
+            )
         try:
             total_n = int(total.strip() or "0")
             excluded_n = int(excluded.strip() or "0")
         except ValueError:
-            return False
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="rev_list_unparseable",
+                details=f"{total.strip()!r}/{excluded.strip()!r}",
+            )
         # other_branch has unmerged commits, and at least one is inside branch.
-        return total_n > 0 and excluded_n < total_n
+        if total_n > 0 and excluded_n < total_n:
+            return StackProbeResult(
+                outcome=StackProbeOutcome.stacked,
+                reason="shares_unmerged_commits",
+                details=f"{total_n - excluded_n} of {total_n} commits shared",
+            )
+        return StackProbeResult(
+            outcome=StackProbeOutcome.clear,
+            reason="no_shared_unmerged_commits",
+        )
 
     async def create_branch(
         self,

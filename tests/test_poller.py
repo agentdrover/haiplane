@@ -2985,3 +2985,61 @@ async def test_a_headless_submission_reports_what_the_gates_saw(db):
     assert dict(await repo.get_task(db, task.id))["status"] != "needs_decision", (
         "гейты на headless не отказывают: решение владельца — warn"
     )
+
+
+# ---- #1186: the headless conveyor merges outside merge_before_completion ----
+
+
+async def test_headless_delivery_holds_while_the_base_branch_is_unmerged(db):
+    """AC-1 на четвёртом пути доставки: _deliver_approved_review мержит сам.
+
+    Гейт пары спрашивает про стопку внутри merge_before_completion, а этот
+    конвейер зовёт merge_pr напрямую — правка только в общем гейте оставила
+    бы его нетронутым. Условие проверяется здесь отдельно, потому что здесь
+    отдельный код, а не потому что путей должно быть два.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+
+    task_id = await _make_review_task(db)
+    await repo.record_review_verdict(db, task_id, "approved")
+    await repo.update_task(db, task_id, pr_number=42, branch="task-1183/refusal-text")
+    base_id = await repo.create_task(
+        db,
+        title="Base of the stack",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, base_id, branch="task-1175/image-capture")
+    await db.commit()
+
+    g = NoopGitOps()
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_pass")
+    )
+    g.merge_pr = AsyncMock(return_value=True)
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+        )
+    )
+    plugins.git_ops = g
+    plugins.dispatch = _dispatch_with({"status": "completed", "exit_code": 0})
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _sweep_review(db)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "review", "удержание — ожидание, а не решение человека"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "в ленте названо, какой задачи ждут"
+    assert "task-1175/image-capture" in body
