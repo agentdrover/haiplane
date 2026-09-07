@@ -3565,6 +3565,40 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
         "предсказуемый заранее"
     )
 
+    # ЧИСЛОВОЙ --uid: systemd-run принимает и его, а getpwnam("1") бросает
+    # KeyError — то есть проверка на таком значении молча ничего не проверяла
+    # (найдено ревью, неразрешённая 534e16e4). uid 1 есть на обеих системах,
+    # где это гоняется, и в группе каталога он не состоит.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=1 --"
+    )
+    assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
+        "числовая форма --uid обязана проверяться так же, как именная: "
+        "иначе один синтаксис обходит проверку целиком"
+    )
+
+    # Свой uid числом — доступ есть, претензий нет: проверка не должна
+    # отказывать всем подряд, иначе она не проверка, а запрет.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={os.getuid()} --",
+    )
+    assert local_reviewer.not_ready() == [], "владелец каталога проходит по группе"
+
+    # Пользователь, которого в системе нет: «не смогли проверить» — это тоже
+    # причина, а не разрешение (неразрешённая 36a63d6b). Пустой not_ready()
+    # означает «настроено», и вернуть его, ничего не проверив, значит
+    # пообещать работу там, где ревьюер упрётся в EACCES.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 --",
+    )
+    assert any("не разрешается в системе" in r for r in local_reviewer.not_ready()), (
+        "неудача проверки не имеет права читаться как «настроено»"
+    )
+
 
 async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp_path):
     """Неразрешённая e021e4bf: прежний тест был зелёным и для communicate().

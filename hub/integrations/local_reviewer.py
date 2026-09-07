@@ -215,24 +215,53 @@ def scratch_problem() -> list[str]:
     return _uid_outside_group(base, st.st_gid)
 
 
+def _resolve_user(user: str) -> Any | None:
+    """Пользователь песочницы: ИМЯ или ЧИСЛО. Не разрешился — None.
+
+    Числовая форма — не экзотика: ``--uid`` у systemd-run принимает и её, а
+    ``getpwnam("65534")`` бросает KeyError, то есть проверка группы на таком
+    значении молча ничего не проверяла (найдено ревью, неразрешённая
+    534e16e4).
+    """
+    try:
+        return pwd.getpwuid(int(user)) if user.isdigit() else pwd.getpwnam(user)
+    except (KeyError, ValueError, OverflowError):
+        return None
+
+
 def _uid_outside_group(base: str, gid: int) -> list[str]:
-    """Ревьюер из песочницы не состоит в группе каталога — назвать это."""
+    """Ревьюер из песочницы не состоит в группе каталога — назвать это.
+
+    Неудача проверки — тоже причина, а не разрешение (найдено ревью,
+    неразрешённая 36a63d6b). Пустой список из ``not_ready()`` означает
+    «настроено», и вернуть его, ничего не проверив, значит пообещать
+    работу там, где ревьюер упрётся в EACCES уже внутри чужого процесса —
+    а в карточке будет «завершилось без отчёта» вместо названной причины,
+    которую документ обещает.
+    """
     user = sandbox_uid()
     if not user:
         return []  # песочница не называет пользователя — судить не о чем
+    entry = _resolve_user(user)
     try:
         group = grp.getgrgid(gid)
-        member = user in group.gr_mem or pwd.getpwnam(user).pw_gid == gid
-    except (KeyError, OSError) as exc:
-        log.warning("cannot resolve %s or group %s: %s", user, gid, exc)
-        return []
-    if member:
+    except (KeyError, OSError):
+        group = None
+    if entry is None or group is None:
+        unknown = f"пользователь «{user}»" if entry is None else f"группа {gid}"
+        return [
+            f"LOCAL_REVIEW_SCRATCH_DIR: {unknown} не разрешается в системе, "
+            f"поэтому проверить доступ ревьюера к {base} нельзя. Запуск "
+            "вслепую кончится отказом внутри чужого процесса, где причину "
+            "уже никто не назовёт"
+        ]
+    if entry.pw_name in group.gr_mem or entry.pw_gid == gid:
         return []
     return [
-        f"LOCAL_REVIEW_SCRATCH_DIR: пользователь «{user}» из песочницы не "
-        f"состоит в группе «{group.gr_name}», которой принадлежит {base}. "
-        "Права 0770 на каталог прогона даются именно группе — иначе ревьюер "
-        "получит отказ на свой рабочий каталог"
+        f"LOCAL_REVIEW_SCRATCH_DIR: пользователь «{entry.pw_name}» из "
+        f"песочницы не состоит в группе «{group.gr_name}», которой "
+        f"принадлежит {base}. Права 0770 на каталог прогона даются именно "
+        "группе — иначе ревьюер получит отказ на свой рабочий каталог"
     ]
 
 
