@@ -144,6 +144,7 @@ from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import project_policy
+from hub.services.review_dispatch import cancel_local_runs
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
 from hub.services.refinement import (
@@ -314,8 +315,6 @@ async def lifespan(app: FastAPI):
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
         # некому смотреть, и всё это время будет жечь процессор.
-        from hub.services.review_dispatch import cancel_local_runs
-
         await cancel_local_runs()
         set_telemetry_sink(None)
         await app.state.db.close()

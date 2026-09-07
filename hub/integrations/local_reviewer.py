@@ -191,6 +191,18 @@ async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | N
     try:
         os.makedirs(base, exist_ok=True)
         workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=base)
+        # Каталог создаёт ХАБ, а работать в нём чужому пользователю (найдено
+        # ревью, находка 92eba4f8 — и это регрессия, которую открыл фикс
+        # предыдущей). Пока песочница отсоединяла процесс, домом ревьюера был
+        # его passwd-home и права этого каталога никого не задевали. С --scope
+        # cwd, HOME и TMPDIR доезжают по-настоящему — а mkdtemp всегда даёт
+        # 0700 владельца-создателя, то есть ревьюер получил бы EACCES на
+        # собственный рабочий каталог и упал бы, не начав.
+        #
+        # 0770, а не 0777: доступ даётся ГРУППЕ, общей у хаба и ревьюера, —
+        # setgid на родителе (2770) проставляет её сам. Права «всем» открыли
+        # бы промт с одноразовым кодом любому пользователю хоста.
+        os.chmod(workdir, 0o770)  # nosec B103 - права даны ГРУППЕ, не миру
     except OSError as exc:
         log.warning("local reviewer: no scratch dir under %s: %s", base, exc)
         return None

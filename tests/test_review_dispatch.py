@@ -3302,3 +3302,199 @@ async def test_a_detaching_sandbox_is_refused_by_name(
     assert any("--scope" in a for a in alerts), (
         f"отказ обязан назвать недостающий флаг, а не «песочница неверна»: {alerts}"
     )
+
+
+# --- Находки ревью по сдаче #3 (отчёт #265) ----------------------------------
+#
+# Первая из них — регрессия, которую открыл фикс предыдущей: пока песочница
+# отсоединяла процесс, права каталога-однодневки никого не задевали, а с
+# --scope они стали решающими. Ровно то, что харнесс называет
+# fix-induced-regression.
+
+
+async def test_the_scratch_dir_is_writable_by_the_reviewer(monkeypatch, tmp_path):
+    """Находка 92eba4f8: mkdtemp даёт 0700, и ревьюеру закрыт его же каталог.
+
+    С --scope cwd, HOME и TMPDIR доезжают до CLI по-настоящему — значит
+    каталог, созданный ХАБОМ, должен быть доступен ЧУЖОМУ пользователю по
+    общей группе. 0700 владельца-создателя означал бы EACCES на собственный
+    рабочий каталог: CLI упал бы, не начав, а в ленте стояло бы «завершилось
+    без отчёта» вместо успешного прогона.
+
+    Проверяется правами, снятыми САМИМ процессом со своего cwd, а не
+    вычислением по коду: второго unix-пользователя на машине разработчика нет,
+    но режим каталога — это ровно то, что решает исход.
+    """
+    import shlex
+    import shutil
+    import sys
+
+    probe = tmp_path / "mode.txt"
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_CMD",
+        shlex.join(
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; sys.stdin.read(); "
+                f"open({str(probe)!r}, 'w').write(oct(os.stat(os.getcwd()).st_mode & 0o777))",
+            ]
+        ),
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    run = await local_reviewer.run_review("промт", timeout=30)
+
+    assert run is not None and not run.timed_out
+    assert probe.read_text() == "0o770", (
+        "каталог прогона обязан быть доступен группе, общей у хаба и ревьюера: "
+        f"получено {probe.read_text()}"
+    )
+
+
+async def test_stopping_the_hub_closes_the_dispatch_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 30e3ac32: процесс убивали, а строку прогона не закрывали.
+
+    _supervise_local_run ждал run_review ДО try, поэтому CancelledError
+    проходил мимо except Exception и _settle_local_run не вызывался. Итог:
+    процесс мёртв, а карточка в настоящем времени говорит «Машинное ревью
+    запущено ЛОКАЛЬНО», и свип назовёт это потерей только минут через сорок
+    пять. «Ещё идёт» и «снято при остановке» — разные факты.
+    """
+    from hub.services.review_dispatch import cancel_local_runs
+
+    import shlex
+    import shutil
+    import sys
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-sd"}, "run": {"id": "r-sd"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_CMD",
+        shlex.join(
+            [sys.executable, "-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]
+        ),
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-local-shutdown",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await asyncio.sleep(0.3)
+
+    await cancel_local_runs()
+    await db.commit()
+
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert dict(rows[-1])["status"] == "failed", (
+        "снятый прогон не имеет права остаться активным: активная строка "
+        "означает «ревью идёт»"
+    )
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("остановке хаба" in a for a in alerts), (
+        f"причина обязана быть названа, а не выведена из тишины: {alerts}"
+    )
+
+
+def test_the_lifespan_cancels_local_runs_on_shutdown():
+    """Находка 6e4d7e6b: тест снятия звал функцию, а не путь, которым она живёт.
+
+    Сними две строки из finally в lifespan — и прогоны снова переживут хаб,
+    а тест, зовущий cancel_local_runs напрямую, останется зелёным. Здесь
+    проверяется именно ВЫЗОВ из lifespan.
+
+    Читается исходник, а не поведение, и это осознанный размен: настоящий
+    подъём lifespan открывает боевую базу по HUB_DB_PATH и поднимает
+    MCP-транспорт, то есть тест трогал бы установку разработчика. Приём в
+    репозитории принятый — так же сверяются с исходником страж имени бренда
+    и проверка читателя политики.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parent.parent / "hub" / "app.py"
+    tree = ast.parse(source.read_text())
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan"
+    )
+    finalizers = [
+        n for node in ast.walk(fn) if isinstance(node, ast.Try) for n in node.finalbody
+    ]
+    called = {
+        n.func.id
+        for block in finalizers
+        for n in ast.walk(block)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "cancel_local_runs" in called, (
+        "остановка хаба обязана снимать локальные прогоны: без вызова в finally "
+        "агентский CLI переживёт процесс, который его породил"
+    )
+
+
+async def test_the_collector_keeps_reading_past_the_cap(monkeypatch):
+    """Находка cc48162a: тест лимита не отличал чтение чанками от communicate().
+
+    dropped = len(всё) - cap считается и после полного чтения в память, так
+    что прежний тест был зелёным и для той реализации, которую находка 30a65c79
+    просила убрать. Здесь проверяется САМО поведение читателя: он берёт поток
+    по кускам и, перебрав лимит, ПРОДОЛЖАЕТ читать — иначе ребёнок встанет на
+    полной трубе и умрёт только по таймауту.
+    """
+
+    class _Stream:
+        def __init__(self, chunks: list[bytes]):
+            self.chunks = chunks
+            self.reads = 0
+
+        async def read(self, _n: int) -> bytes:
+            self.reads += 1
+            return self.chunks.pop(0) if self.chunks else b""
+
+    class _Proc:
+        def __init__(self, stream):
+            self.stdout = stream
+            self.waited = False
+
+        async def wait(self):
+            self.waited = True
+
+    monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 500)
+    stream = _Stream([b"a" * 400, b"b" * 400, b"c" * 400])
+    proc = _Proc(stream)
+
+    kept, dropped = await local_reviewer._collect(proc)
+
+    assert len(kept) == 500 and kept.endswith(b"b"), "в памяти остаётся ровно лимит"
+    assert dropped == 700, f"выброшенное считается поштучно, а не на глаз: {dropped}"
+    assert stream.reads >= 4, (
+        "читатель обязан вычитать поток до конца кусками, а не остановиться "
+        f"на лимите: замолчавший читатель оставляет ребёнка на полной трубе "
+        f"(чтений {stream.reads})"
+    )
+    assert proc.waited, "процесс должен быть дождан, иначе останется зомби"

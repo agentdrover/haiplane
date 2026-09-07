@@ -1671,10 +1671,26 @@ async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
     return int(dict(rows[0])["total"]) if rows else 0
 
 
-# Прогоны, за которыми смотрит ЭТОТ процесс хаба. Ссылка держится намеренно:
-# задача без ссылки может быть собрана сборщиком мусора посреди работы, и
-# ревьюер тогда умрёт молча. Тесты ждут прогоны через wait_for_local_runs().
-_LOCAL_RUNS: dict[int, asyncio.Task[None]] = {}
+@dataclass(frozen=True)
+class _LocalRunHandle:
+    """Прогон, за которым смотрит ЭТОТ процесс хаба.
+
+    Кроме самой задачи хранит координаты строки диспетчера: при остановке
+    хаба её надо ЗАКРЫТЬ, а сделать это изнутри отменяемой корутины нельзя —
+    там уже нет права ждать (найдено ревью, находка 30e3ac32).
+    """
+
+    task: asyncio.Task[None]
+    db_path: str
+    dispatch_id: int
+    task_id: int
+    generation: int
+
+
+# Ссылка на задачу держится намеренно: задача без ссылки может быть собрана
+# сборщиком мусора посреди работы, и ревьюер тогда умрёт молча. Тесты ждут
+# прогоны через wait_for_local_runs().
+_LOCAL_RUNS: dict[int, _LocalRunHandle] = {}
 
 
 async def _start_local_run(
@@ -1703,33 +1719,88 @@ async def _start_local_run(
             prompt=prompt,
         )
     )
-    _LOCAL_RUNS[dispatch_id] = task
+    _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
+        task=task,
+        db_path=path,
+        dispatch_id=dispatch_id,
+        task_id=task_id,
+        generation=generation,
+    )
     task.add_done_callback(lambda _t: _LOCAL_RUNS.pop(dispatch_id, None))
 
 
 async def wait_for_local_runs() -> None:
     """Дождаться прогонов этого процесса — их естественного конца. Для тестов."""
     while _LOCAL_RUNS:
-        await asyncio.gather(*list(_LOCAL_RUNS.values()), return_exceptions=True)
+        await asyncio.gather(
+            *[h.task for h in _LOCAL_RUNS.values()], return_exceptions=True
+        )
 
 
 async def cancel_local_runs() -> None:
-    """Снять прогоны при остановке хаба (найдено ревью, находка d478b896).
+    """Снять прогоны при остановке хаба и ЗАКРЫТЬ их строки.
 
     ЖДАТЬ на остановке нельзя: прогон живёт до получаса, а хаб на выключении
     имеет секунды. Отмена доходит до ревьюера настоящим убийством группы —
     ``local_reviewer`` ловит CancelledError и снимает процесс, — а не просто
-    бросает корутину, оставив CLI жить сиротой.
+    бросает корутину, оставив CLI жить сиротой (#d478b896).
 
-    Прежняя редакция называла ``wait_for_local_runs`` функцией «для тестов и
-    остановки хаба», но из lifespan её никто не звал: заявленная остановка,
-    которой не было.
+    Строку диспетчера закрывает ЭТА функция, а не отменённая корутина
+    (найдено ревью, находка 30e3ac32): у отменённой нет права ждать, а
+    оставленная активной строка говорит «ревью идёт» о прогоне, который
+    только что убили. Свип назвал бы это потерей лишь через сорок пять
+    минут, и всё это время карточка врала бы в настоящем времени.
     """
-    tasks = list(_LOCAL_RUNS.values())
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    handles = list(_LOCAL_RUNS.values())
+    for handle in handles:
+        handle.task.cancel()
+    if not handles:
+        return
+    await asyncio.gather(*[h.task for h in handles], return_exceptions=True)
+    for handle in handles:
+        await _close_cancelled_run(handle)
+
+
+async def _close_cancelled_run(handle: _LocalRunHandle) -> None:
+    """Отметить снятый при остановке прогон — по имени причины."""
+    if not handle.db_path:
+        return
+    from hub import db as db_module
+
+    conn = None
+    try:
+        conn = await db_module.connect(handle.db_path)
+        rows = await fetchall(
+            conn, "SELECT * FROM review_dispatches WHERE id = ?", (handle.dispatch_id,)
+        )
+        if not rows:
+            return
+        # Строку читаем целиком, а не подставляем один id: сопоставление
+        # отчёта с прогоном идёт по принципалу ревьюера (#1025), и заглушка
+        # без него молча вернула бы к старому правилу «любой отчёт этой
+        # генерации» — то есть могла бы закрыть прогон чужой работой.
+        review = await _dispatch_report(
+            conn, handle.task_id, handle.generation, dict(rows[0])
+        )
+        if review is None:
+            await repo.add_task_update(
+                conn,
+                handle.task_id,
+                "hub",
+                "alert",
+                "Локальное машинное ревью снято при остановке хаба: процесс "
+                "убит вместе с хабом, отчёта нет. Это НЕ «ревью ничего не "
+                "нашло» — вердикт остаётся человеку (#1180).",
+            )
+        await repo.set_review_dispatch_status(
+            conn, handle.dispatch_id, "done" if review is not None else "failed"
+        )
+        await conn.commit()
+    except Exception:  # noqa: BLE001 - остановка хаба не падает из-за уборки
+        log.exception("could not close the cancelled local run #%s", handle.dispatch_id)
+    finally:
+        if conn is not None:
+            await conn.close()
 
 
 async def _main_db_path(db: aiosqlite.Connection) -> str:
