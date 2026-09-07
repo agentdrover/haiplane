@@ -2670,6 +2670,21 @@ _LOCAL_REPORT = {
 }
 
 
+def _scratch(tmp_path) -> str:
+    """Каталог прогонов, как его требует выкат: существует и setgid.
+
+    Тесты обязаны описывать прод, а не удобство: на проде каталог создаёт
+    оператор с группой, общей у хаба и ревьюера, и хаб отказывается работать
+    без setgid — без него подкаталог унаследовал бы основную группу хаба.
+    """
+    import os
+
+    path = tmp_path / "scratch"
+    path.mkdir(exist_ok=True)
+    os.chmod(path, 0o2770)
+    return str(path)
+
+
 def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
     """Локальный ревьюер = python-заглушка под настоящим префиксом.
 
@@ -2690,7 +2705,7 @@ def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_CMD", shlex.join([sys.executable, "-c", script])
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
 
 async def _local_principal(db, monkeypatch) -> int:
@@ -3149,7 +3164,7 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     run = await local_reviewer.run_review("промт", timeout=1)
@@ -3195,7 +3210,7 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
     await _submitted(
         client,
@@ -3238,7 +3253,7 @@ async def test_a_chatty_reviewer_does_not_grow_the_hub(monkeypatch, tmp_path):
             [sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 500000)"]
         ),
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     run = await local_reviewer.run_review("промт", timeout=30)
@@ -3345,7 +3360,7 @@ async def test_the_scratch_dir_is_writable_by_the_reviewer(monkeypatch, tmp_path
             ]
         ),
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     run = await local_reviewer.run_review("промт", timeout=30)
@@ -3387,7 +3402,7 @@ async def test_stopping_the_hub_closes_the_dispatch_row(
             [sys.executable, "-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]
         ),
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
     task_id = await _submitted(
         client,
@@ -3498,3 +3513,103 @@ async def test_the_collector_keeps_reading_past_the_cap(monkeypatch):
         f"(чтений {stream.reads})"
     )
     assert proc.waited, "процесс должен быть дождан, иначе останется зомби"
+
+
+# --- Находки ревью по сдаче #4 (отчёт #267) ----------------------------------
+
+
+def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp_path):
+    """Неразрешённая 45971e09: 0770 без верной группы — всё тот же отказ.
+
+    Валидатор прав в существе: хаб ставит каталогу прогона 0770, то есть даёт
+    доступ ГРУППЕ, а если группа не та, ревьюер получит EACCES — и тест на
+    режим этого не увидит, потому что владелец проходит сам. Проверять
+    членство чужого пользователя в группе на машине разработчика нельзя, но
+    можно проверить то, ОТ ЧЕГО оно зависит, и отказать заранее с названной
+    причиной. Три дороги в одно и то же состояние, и все три названы.
+    """
+    import os
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "missing"))
+    assert any("каталога" in r for r in local_reviewer.not_ready()), (
+        "каталог, созданный хабом на лету, получит группу хаба — то есть ту, "
+        "куда ревьюеру хода нет; это причина, а не мелочь"
+    )
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    os.chmod(plain, 0o770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(plain))
+    assert any("setgid" in r for r in local_reviewer.not_ready()), (
+        "без setgid подкаталог унаследует основную группу хаба, и права 0770 "
+        "достанутся не тому"
+    )
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(shared))
+    assert local_reviewer.not_ready() == [], "правильный каталог претензий не вызывает"
+
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=nobody --",
+    )
+    assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
+        "пользователь песочницы вне группы каталога — тот же EACCES, только "
+        "предсказуемый заранее"
+    )
+
+
+async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp_path):
+    """Неразрешённая e021e4bf: прежний тест был зелёным и для communicate().
+
+    Валидатор прав: len(output) и dropped сходятся и после полного чтения в
+    память, поэтому старая проверка не отличала чтение чанками от «прочитали
+    всё и обрезали», а unit-тест на _collect этого пути не видел вовсе.
+
+    Здесь измеряется то, ради чего правка и делалась: пиковая память САМОГО
+    процесса хаба. communicate() собрал бы весь вывод одним объектом, чтение
+    кусками держит в памяти только лимит.
+    """
+    import shlex
+    import shutil
+    import sys
+    import tracemalloc
+
+    monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_CMD",
+        shlex.join(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdin.read(); sys.stdout.write('x' * 8_000_000)",
+            ]
+        ),
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    tracemalloc.start()
+    try:
+        run = await local_reviewer.run_review("промт", timeout=60)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert run is not None and not run.timed_out
+    assert run.dropped > 7_000_000, "почти весь вывод обязан быть выброшен"
+    assert peak < 2_000_000, (
+        f"вывод ревьюера не имеет права оседать в памяти хаба целиком: пик "
+        f"{peak} байт при выводе 8 МБ и лимите 1000"
+    )

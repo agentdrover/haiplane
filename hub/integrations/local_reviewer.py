@@ -46,9 +46,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import grp
 import os
+import pwd
 import shlex
 import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -107,22 +110,29 @@ def not_ready() -> list[str]:
     настройки, которое и так написано открытым текстом в hub/config.py. Ни
     значения, ни префикса, ни длины — длина это суженная догадка.
     """
-    return [
-        name
-        for name, value in (
-            ("LOCAL_REVIEW_CMD (команда агентского CLI)", config.LOCAL_REVIEW_CMD),
-            ("LOCAL_REVIEW_SANDBOX (песочница запуска)", config.LOCAL_REVIEW_SANDBOX),
-            (
-                "LOCAL_REVIEW_SCRATCH_DIR (каталог для одноразовых прогонов)",
-                config.LOCAL_REVIEW_SCRATCH_DIR,
-            ),
-            (
-                "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера)",
-                config.LOCAL_REVIEWER_HUB_TOKEN,
-            ),
-        )
-        if not (value or "").strip()
-    ] + detaching_sandbox()
+    return (
+        [
+            name
+            for name, value in (
+                ("LOCAL_REVIEW_CMD (команда агентского CLI)", config.LOCAL_REVIEW_CMD),
+                (
+                    "LOCAL_REVIEW_SANDBOX (песочница запуска)",
+                    config.LOCAL_REVIEW_SANDBOX,
+                ),
+                (
+                    "LOCAL_REVIEW_SCRATCH_DIR (каталог для одноразовых прогонов)",
+                    config.LOCAL_REVIEW_SCRATCH_DIR,
+                ),
+                (
+                    "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера)",
+                    config.LOCAL_REVIEWER_HUB_TOKEN,
+                ),
+            )
+            if not (value or "").strip()
+        ]
+        + detaching_sandbox()
+        + scratch_problem()
+    )
 
 
 # Песочница, которая ОТСОЕДИНЯЕТ полезную нагрузку от хаба (найдено ревью,
@@ -154,6 +164,76 @@ def detaching_sandbox() -> list[str]:
     if runs_unit and "--scope" not in parts:
         return [_DETACHING_HINT]
     return []
+
+
+def sandbox_uid() -> str:
+    """Пользователь, названный в песочнице (``--uid=X`` или ``--uid X``), или ""."""
+    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
+    for i, part in enumerate(parts):
+        if part.startswith("--uid="):
+            return part.split("=", 1)[1]
+        if part == "--uid" and i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
+
+
+def scratch_problem() -> list[str]:
+    """Названная причина, если каталог прогонов не даст ревьюеру работать.
+
+    Проверка родилась из ревью (неразрешённая 45971e09) и закрывает его
+    возражение по существу: режим 0770, который хаб ставит каталогу прогона,
+    даёт доступ ГРУППЕ — и если группа не та, ревьюер всё равно получит
+    EACCES, а тест на права пройдёт, потому что владелец проходит сам.
+
+    Группа берётся у РОДИТЕЛЯ через setgid, поэтому проверяется именно он:
+    без setgid подкаталог унаследует основную группу хаба, в которой ревьюера
+    заведомо нет — так и задумано (deploy/LOCAL-REVIEW.md, шаг 1).
+
+    Каталог, которого нет, — тоже причина, а не мелочь: созданный хабом «на
+    лету» он получит группу хаба, то есть ровно ту, которая ревьюеру
+    недоступна. Раньше хаб создавал его молча и тем самым готовил отказ,
+    который проявлялся уже внутри чужого процесса.
+    """
+    base = (config.LOCAL_REVIEW_SCRATCH_DIR or "").strip()
+    if not base:
+        return []  # отсутствие настройки уже названо в not_ready()
+    try:
+        st = os.stat(base)
+    except OSError:
+        return [
+            f"LOCAL_REVIEW_SCRATCH_DIR: каталога {base} нет. Создайте его "
+            "заранее, с setgid и группой, общей с пользователем ревьюера: "
+            "созданный хабом на лету, он получит группу хаба, куда ревьюеру "
+            "хода нет — см. deploy/LOCAL-REVIEW.md"
+        ]
+    if not st.st_mode & stat.S_ISGID:
+        return [
+            f"LOCAL_REVIEW_SCRATCH_DIR: на {base} нет setgid (нужен режим "
+            "2770). Без него каталог прогона унаследует основную группу хаба, "
+            "и ревьюер получит отказ на собственный рабочий каталог"
+        ]
+    return _uid_outside_group(base, st.st_gid)
+
+
+def _uid_outside_group(base: str, gid: int) -> list[str]:
+    """Ревьюер из песочницы не состоит в группе каталога — назвать это."""
+    user = sandbox_uid()
+    if not user:
+        return []  # песочница не называет пользователя — судить не о чем
+    try:
+        group = grp.getgrgid(gid)
+        member = user in group.gr_mem or pwd.getpwnam(user).pw_gid == gid
+    except (KeyError, OSError) as exc:
+        log.warning("cannot resolve %s or group %s: %s", user, gid, exc)
+        return []
+    if member:
+        return []
+    return [
+        f"LOCAL_REVIEW_SCRATCH_DIR: пользователь «{user}» из песочницы не "
+        f"состоит в группе «{group.gr_name}», которой принадлежит {base}. "
+        "Права 0770 на каталог прогона даются именно группе — иначе ревьюер "
+        "получит отказ на свой рабочий каталог"
+    ]
 
 
 def is_configured() -> bool:
@@ -189,7 +269,6 @@ async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | N
     limit = timeout if timeout is not None else config.LOCAL_REVIEW_TIMEOUT_SEC
     base = config.LOCAL_REVIEW_SCRATCH_DIR.strip()
     try:
-        os.makedirs(base, exist_ok=True)
         workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=base)
         # Каталог создаёт ХАБ, а работать в нём чужому пользователю (найдено
         # ревью, находка 92eba4f8 — и это регрессия, которую открыл фикс
