@@ -17,11 +17,14 @@ import logging
 import re
 from typing import Any
 
+from hub import brand
 from hub.config import GH_BIN, REPO_NAME
 from hub.integrations import proc
 from hub.integrations.protocols import (
     CIProbeOutcome,
     CIProbeResult,
+    CIRunRequestOutcome,
+    CIRunRequestResult,
     MergeabilityOutcome,
 )
 
@@ -718,6 +721,115 @@ class GitHubForge:
             CIProbeOutcome.unavailable,
             "workflow_runs_unknown_state",
             details=",".join(sorted(set(conclusions) | set(statuses))),
+        )
+
+    #: The CI pipelines the hub owns or ships, in preference order. These are
+    #: not guesses about a stranger's repository: the first is the file the hub
+    #: itself writes into every satellite it provisions, the second is this
+    #: repository's own. A repository carrying neither gets a named refusal.
+    _CI_WORKFLOW_PATHS = (
+        f".github/workflows/{brand.SEEDED_CI}",
+        ".github/workflows/ci.yml",
+    )
+
+    #: The refusal GitHub gives when the ref's own workflow file declares no
+    #: manual trigger. Observed verbatim on 06.09.2026 against a branch cut
+    #: before #1196 landed, while the same call on develop was accepted: the
+    #: trigger is read from the DISPATCHED REF, not only from the default
+    #: branch. It is a sensible "no", not a fault — see request_ci_run.
+    _NO_DISPATCH_TRIGGER = "does not have 'workflow_dispatch' trigger"
+
+    async def request_ci_run(
+        self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> CIRunRequestResult:
+        """Ask GitHub for a run on ``branch`` as it stands (#1197).
+
+        Only a workflow the hub KNOWS to be the CI pipeline is dispatched, and
+        the reason is not tidiness. The delivery gate reads every run for the
+        pinned SHA and passes on success|neutral|skipped, so dispatching the
+        wrong workflow does not merely fail to help — it MANUFACTURES a green
+        run for a commit whose tests never executed, and the gate believes it.
+        A repository can hold several real workflows: the hub itself seeds two
+        into every satellite (``brand.SEEDED_CI`` and ``brand.SEEDED_STALE``,
+        and the stale sweeper is a genuine Actions workflow). So "dispatch the
+        only one there is" is both wrong on satellites and unsafe in general.
+
+        The list is still read from GitHub rather than assumed — a name the
+        repository does not carry must not be dispatched — and paths outside
+        ``.github/workflows/`` are dropped: GitHub returns Dependabot's
+        pseudo-workflows in the same array under ``dynamic/dependabot/...``,
+        which correspond to no file and cannot be dispatched at all.
+
+        An unknown set is DECLINED by name. Guessing here buys a green tick,
+        which is worse than buying nothing.
+        """
+        if not (branch or "").strip():
+            return CIRunRequestResult(CIRunRequestOutcome.declined, "no_branch_named")
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable,
+                "workflows_unreadable",
+                details=(err or "").strip() or None,
+            )
+        try:
+            payload = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable, "workflows_invalid_json"
+            )
+        entries = payload.get("workflows") if isinstance(payload, dict) else None
+        active = {
+            str(w.get("path") or ""): w
+            for w in (entries or [])
+            if isinstance(w, dict)
+            and str(w.get("state") or "").lower() == "active"
+            and str(w.get("path") or "").startswith(".github/workflows/")
+        }
+        chosen = next((active[p] for p in self._CI_WORKFLOW_PATHS if p in active), None)
+        if chosen is None:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.declined,
+                "no_known_ci_workflow",
+                details=",".join(sorted(active)) or None,
+            )
+        workflow_id = chosen.get("id")
+        if not workflow_id:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.unavailable, "workflow_without_id"
+            )
+        rc, _out, err = await _gh(
+            "api",
+            "--method",
+            "POST",
+            f"repos/{gh_repo or REPO_NAME}/actions/workflows/{workflow_id}/dispatches",
+            "-f",
+            f"ref={branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc == 0:
+            return CIRunRequestResult(
+                CIRunRequestOutcome.requested,
+                "workflow_dispatched",
+                details=str(chosen.get("path") or ""),
+            )
+        detail = (err or "").strip()
+        if self._NO_DISPATCH_TRIGGER in detail.lower():
+            return CIRunRequestResult(
+                CIRunRequestOutcome.declined,
+                "workflow_dispatch_not_declared_on_ref",
+                details=detail[:200] or None,
+            )
+        return CIRunRequestResult(
+            CIRunRequestOutcome.unavailable,
+            "dispatch_call_failed",
+            details=detail[:200] or None,
         )
 
     async def check_pr_ci(
