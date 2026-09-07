@@ -820,12 +820,30 @@ async def _sweep_ci_check(db) -> None:
                 # is how #505–#510 landed untested (#1041).
                 sha = (ci.details or "").strip() or "unknown"
                 named = f"workflow есть, прогона по {sha} нет"
+                # #1197: ask for the missing run once before handing the task
+                # to a human, who would only be pressing the same button. A
+                # granted request restarts the window instead of escalating;
+                # the attempt is spent per SHA, so the next cycle escalates
+                # exactly as it does today.
+                requested, why_not = await services.request_missing_ci_run(
+                    db, task, ctx, ci
+                )
+                if requested:
+                    await repo.mark_ci_check_started(db, task["id"])
+                    await db.commit()
+                    log.info(
+                        "Poll: task #%d CI run requested for %s, waiting",
+                        task["id"],
+                        sha,
+                    )
+                    continue
                 await repo.add_task_update(
                     db,
                     task["id"],
                     "hub",
                     "alert",
-                    f"CI: {named} — код не проверялся.",
+                    f"CI: {named} — код не проверялся."
+                    + (f" Запрос прогона не сделан: {why_not}" if why_not else ""),
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
                 await repo.insert_event(

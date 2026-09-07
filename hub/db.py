@@ -565,6 +565,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_ci_no_pr_attempts_column",
         "ALTER TABLE tasks ADD COLUMN ci_no_pr_attempts INTEGER NOT NULL DEFAULT 0",
     ),
+    # ---- Один запрос прогона на коммит (#1197): SHA, по которому хаб уже
+    # просил CI породить прогон. Ключ — сам коммит, а не счётчик: «одна
+    # попытка на SHA» тогда читается как «записанный ≠ текущий» и не требует
+    # сброса при смене вершины, то есть не заводит второго места, где можно
+    # ошибиться. reset_ci_check_state эту колонку НЕ чистит намеренно — очистка
+    # вернула бы вторую попытку по тому же коммиту, а с ней ферму флейков.
+    (
+        "add_ci_run_requested_sha_column",
+        "ALTER TABLE tasks ADD COLUMN ci_run_requested_sha TEXT NOT NULL DEFAULT ''",
+    ),
     (
         "backfill_status_entered_at",
         "UPDATE tasks SET status_entered_at = datetime('now') "

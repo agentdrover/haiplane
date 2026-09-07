@@ -2186,6 +2186,51 @@ async def increment_ci_no_pr_attempts(
     return int(row[0]) if row else 0
 
 
+async def claim_ci_run_request(
+    db: aiosqlite.Connection,
+    task_id: int,
+    sha: str,
+) -> bool:
+    """Занять единственную попытку запроса прогона по ``sha`` (#1197).
+
+    Возвращает True, только если попытка по этому коммиту ещё не занята.
+    Заявка ставится ОДНИМ атомарным UPDATE и ДО платного вызова наружу — как
+    у claim_arbiter_dispatch (#421), и по той же причине. Проверить снимок
+    задачи, а потом сходить в сеть — это check-then-act через await: два
+    вызывающих (тик поллера и отчёт о готовности) работают на разных
+    соединениях, оба увидели бы пустую колонку и оба заказали бы прогон.
+    Заявка вместо проверки убирает саму возможность, а не сужает окно.
+
+    Вызывающий обязан закоммитить перед внешним вызовом, иначе заявки не
+    видит никто, кроме него. Как и остальная бухгалтерия конвейера, не
+    трогает ``updated_at``.
+    """
+    cur = await db.execute(
+        "UPDATE tasks SET ci_run_requested_sha=? WHERE id=? AND "
+        "(ci_run_requested_sha IS NULL OR ci_run_requested_sha != ?)",
+        (sha, task_id, sha),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+async def release_ci_run_request(
+    db: aiosqlite.Connection,
+    task_id: int,
+    sha: str,
+) -> None:
+    """Вернуть незанятой попытку, за которой не последовало запроса (#1197).
+
+    Неудавшийся вызов не должен съедать единственный шанс. Условие по ``sha``
+    обязательно: снимать можно ТОЛЬКО свою заявку — иначе освобождение
+    затирало бы чужую, поставленную между заявкой и неудачей.
+    """
+    await db.execute(
+        "UPDATE tasks SET ci_run_requested_sha='' WHERE id=? "
+        "AND ci_run_requested_sha=?",
+        (task_id, sha),
+    )
+
+
 async def reset_ci_check_state(
     db: aiosqlite.Connection,
     task_id: int,
