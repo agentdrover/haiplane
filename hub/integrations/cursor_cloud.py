@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -95,8 +95,13 @@ async def _attempt(
             return None, Refusal(status=resp.status_code, detail="тело не объект")
         return body, None
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
-        log.warning("cursor cloud %s %s failed: %s", method, path, exc)
-        return None, Refusal(detail=str(exc)[:300])
+        # Класс, а не только текст (#1199). У таймаутов httpx/httpcore
+        # ``str(exc)`` ПУСТ — в журнале оставалось «failed:» и ничего, и
+        # причину пришлось восстанавливать по арифметике времени. Класс
+        # называет её сразу: ReadTimeout и ConnectError — разные разговоры.
+        detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        log.warning("cursor cloud %s %s failed: %s", method, path, detail)
+        return None, Refusal(detail=detail[:300])
 
 
 def _error_code(resp: httpx.Response) -> str:
@@ -132,6 +137,85 @@ async def _request(
     return body
 
 
+#: Префикс имени, по которому хаб узнаёт агента, которого заказал сам.
+#: Провайдер иначе придумывает имя из промта, и полагаться на него нельзя:
+#: из трёх осиротевших агентов 06.09 двое не называли задачу вовсе
+#: («Суждение стюарда гейта», «Код-ревью задачи haiplane»).
+AGENT_MARKER_PREFIX = "haiplane"
+
+
+def agent_marker(kind: str, task_id: int, generation: int) -> str:
+    """Имя агента: читаемое человеку и разбираемое машиной (#1199).
+
+    Одна строка служит двум разным читателям, и это осознанный компромисс,
+    а не небрежность: имя видно в интерфейсе Cursor, где по нему ищет
+    человек, и оно же — единственный признак, по которому хаб может узнать
+    СВОЙ заказ, если ответ на создание не дошёл. Отдельного поля под метку
+    у провайдера нет: тело запроса проверяется строго, незнакомый ключ
+    отвергается с ``Unrecognized key(s)`` (проверено пробой 07.09.2026).
+
+    Формат намеренно скучный и без пробелов вокруг разделителей — по нему
+    сравнивают на равенство, а не разбирают регулярным выражением.
+    """
+    return f"{AGENT_MARKER_PREFIX}:{kind}:t{int(task_id)}:g{int(generation)}"
+
+
+async def list_agents(limit: int = 50, cursor: str = "") -> dict[str, Any] | None:
+    """Страница списка агентов; ``None`` — не смогли спросить.
+
+    Ответ несёт ключ ``items`` (НЕ ``agents`` и не ``data``) и ``nextCursor``
+    для следующей страницы — проверено вызовом 06.09.2026. Разбирать надо
+    именно эту форму: выдуманная дала бы пустой список, а пустой список
+    здесь означал бы «агента нет» и разрешил бы купить второго.
+    """
+    path = f"/v1/agents?limit={int(limit)}"
+    if cursor:
+        path += f"&cursor={cursor}"
+    return await _request("GET", path)
+
+
+class Reconciliation(NamedTuple):
+    """Чем кончилась сверка с провайдером (#1199).
+
+    Два поля, потому что вопросов два, и один ответ на оба уже стоил нам
+    поколения: «агента нет» разрешает повторить вызов, а «не смогли
+    спросить» не разрешает ничего — угаданный агент хуже пропущенного.
+    Возвращать на оба случая один ``None`` значило бы повторить ошибку
+    #1185 в новом месте.
+    """
+
+    #: Идентификатор нашего агента; пусто — не найден.
+    agent_id: str
+    #: Удалось ли вообще прочитать список. False — ответа нет, а не «нет».
+    asked: bool
+
+
+async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
+    """Найти агента с ТОЧНО таким именем и сказать, спросить ли удалось.
+
+    Сравнение на РАВЕНСТВО, не на вхождение: «похожий» агент хуже второго
+    агента, потому что второй хотя бы честно свой. Метка соседнего
+    поколения отличается одним символом, и вхождение отдало бы сдаче
+    чужого судью.
+    """
+    if not name:
+        return Reconciliation("", True)
+    cursor = ""
+    for _ in range(max(1, pages)):
+        page = await list_agents(cursor=cursor)
+        if page is None:
+            return Reconciliation("", False)
+        for item in page.get("items") or []:
+            if isinstance(item, dict) and item.get("name") == name:
+                found = str(item.get("id") or "").strip()
+                if found:
+                    return Reconciliation(found, True)
+        cursor = str(page.get("nextCursor") or "")
+        if not cursor:
+            break
+    return Reconciliation("", True)
+
+
 async def create_review_agent(
     *,
     repo_url: str,
@@ -140,6 +224,7 @@ async def create_review_agent(
     prompt_text: str,
     hub_mcp_url: str,
     reviewer_token: str,
+    name: str = "",
 ) -> dict[str, Any] | None:
     """Queue a cloud agent that reviews ``starting_ref`` of ``repo_url``.
 
@@ -156,6 +241,7 @@ async def create_review_agent(
         prompt_text=prompt_text,
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
+        name=name,
     )
     return created
 
@@ -168,6 +254,7 @@ async def create_agent_attempt(
     prompt_text: str,
     hub_mcp_url: str,
     reviewer_token: str,
+    name: str = "",
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
     """То же, что :func:`create_review_agent`, но с причиной отказа (#1182).
 
@@ -192,6 +279,11 @@ async def create_agent_attempt(
             }
         ],
     }
+    if name:
+        # Метка кладётся ТОЛЬКО когда её попросили: пустое имя означает, что
+        # вызывающий подбирать не собирается, и придумывать за него метку —
+        # значит обещать восстановление, которого никто не делает.
+        body["name"] = name
     return await _attempt("POST", "/v1/agents", body)
 
 

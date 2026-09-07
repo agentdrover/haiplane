@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 import aiosqlite
 
@@ -1206,6 +1206,122 @@ async def _refuse_second_read(
     )
 
 
+#: Сколько раз хаб пробует создать ревьюера, когда ответ не дошёл, а сверка
+#: показала, что агента нет. Потолок, а не настойчивость: на #1175 хаб
+#: повторял одну и ту же неудачу семнадцать минут подряд.
+_LOST_ANSWER_ATTEMPTS = 2
+
+
+class _Started(NamedTuple):
+    """Чем кончилась попытка получить ревьюера (#1199)."""
+
+    agent_id: str
+    run_id: str
+    adopted: bool
+    blind: bool
+    attempts: int
+    refusal: cursor_cloud.Refusal | None
+
+
+def _lost_call_detail(started: _Started) -> str:
+    """Причина НАБЛЮДЁННАЯ, а не сочинённая (#1199).
+
+    Прежний текст утверждал «Cloud Agents API не принял запрос» там, где
+    ответа не было вовсе, и отправлял читающего проверять схему беты вместо
+    времени ответа. Сообщение, называющее чужую причину, дороже отсутствия
+    сообщения: оно уводит.
+    """
+    refusal = started.refusal
+    if started.blind:
+        return (
+            "ответ провайдера не дошёл, и СПРОСИТЬ его, создался ли агент, "
+            "тоже не вышло — подбирать вслепую нельзя, повторять тоже "
+            f"({refusal.detail if refusal else 'причина не названа'})"
+        )
+    if refusal is not None and refusal.is_transport:
+        return (
+            "ответ провайдера не дошёл, и агента с нашей меткой у него не "
+            f"нашлось за попыток: {started.attempts} "
+            f"({refusal.detail or 'причина не названа'})"
+        )
+    if refusal is not None:
+        return f"провайдер отказал: HTTP {refusal.status}" + (
+            f", {refusal.code}" if refusal.code else ""
+        )
+    return "ответ провайдера не содержал идентификатора агента"
+
+
+async def _create_or_adopt(
+    marker: str,
+    *,
+    task_id: int,
+    repo_url: str,
+    starting_ref: str,
+    model_id: str,
+    prompt_text: str,
+    hub_mcp_url: str,
+    reviewer_token: str,
+) -> _Started:
+    """Создать ревьюера, а если ответ не дошёл — спросить, не создан ли он.
+
+    Измерено 06.09.2026: три «отказа» подряд, и по каждому у провайдера
+    нашёлся живой оплаченный агент (08:49:06Z, 08:50:53Z, 11:28:05Z).
+    Наивный повтор покупал бы второго каждый раз, поэтому порядок такой:
+    спросить, подобрать, и только на подтверждённой пустоте повторить.
+    """
+    adopted = False
+    blind = False
+    attempts = 1
+
+    async def _attempt() -> tuple[str, str, cursor_cloud.Refusal | None]:
+        created, refusal = await cursor_cloud.create_agent_attempt(
+            repo_url=repo_url,
+            starting_ref=starting_ref,
+            model_id=model_id,
+            prompt_text=prompt_text,
+            hub_mcp_url=hub_mcp_url,
+            reviewer_token=reviewer_token,
+            name=marker,
+        )
+        agent = (created or {}).get("agent") or {}
+        run = (created or {}).get("run") or {}
+        # Идентификатор прогона разрешается ЗДЕСЬ, где известны обе половины
+        # ответа: провайдер кладёт его то в run.id, то в agent.latestRunId.
+        return (
+            str(agent.get("id") or ""),
+            str(run.get("id") or agent.get("latestRunId") or ""),
+            refusal,
+        )
+
+    agent_id, run_id, refusal = await _attempt()
+    while not agent_id and refusal is not None and refusal.is_transport:
+        seen = await cursor_cloud.find_agent_by_name(marker)
+        if not seen.asked:
+            # «Не смогли спросить» — не «агента нет». Повторить сейчас
+            # значило бы купить второго вслепую, подобрать похожего —
+            # отдать сдаче чужого судью. Оба хуже, чем сказать как есть.
+            blind = True
+            break
+        if seen.agent_id:
+            agent_id = seen.agent_id
+            adopted = True
+            log.info(
+                "review dispatch for #%s: answer lost, agent %s adopted",
+                task_id,
+                seen.agent_id,
+            )
+            break
+        # Сверка прошла и агента нет — вызов действительно не состоялся,
+        # повторить его безопасно. Потолок обязателен: семнадцать минут
+        # одной и той же неудачи уже наблюдались на #1175.
+        if attempts >= _LOST_ANSWER_ATTEMPTS:
+            break
+        attempts += 1
+        agent_id, run_id, refusal = await _attempt()
+
+    return _Started(agent_id, run_id, adopted, blind, attempts, refusal)
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
 ) -> bool:
@@ -1356,35 +1472,43 @@ async def maybe_dispatch_review(
             # and so agreed with a path production never took.
             bound_generation=generation,
         )
-    created = await cursor_cloud.create_review_agent(
+    # Метка, по которой хаб узнает СВОЙ заказ, если ответ на создание не
+    # дойдёт (#1199). Ставится до вызова: после обрыва спрашивать будет уже
+    # нечем — имя надо знать заранее, а не выводить из ответа, которого нет.
+    prompt_text = _review_prompt(
+        task_id,
+        branch,
+        model_id,
+        profile,
+        rules_block,
+        diff_block,
+        prepass_block,
+        _delivery_block(task_id, reviewer_code, hub_base),
+    )
+    started = await _create_or_adopt(
+        cursor_cloud.agent_marker("review", task_id, generation),
+        task_id=task_id,
         repo_url=forge_urls.repo_url(forge, gh_repo),
         starting_ref=branch,
         model_id=model_id,
-        prompt_text=_review_prompt(
-            task_id,
-            branch,
-            model_id,
-            profile,
-            rules_block,
-            diff_block,
-            prepass_block,
-            _delivery_block(task_id, reviewer_code, hub_base),
-        ),
+        prompt_text=prompt_text,
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
     )
-    agent_info = (created or {}).get("agent") or {}
-    run_info = (created or {}).get("run") or {}
-    agent_id = agent_info.get("id") or ""
+    agent_id, run_id = started.agent_id, started.run_id
+
     if not agent_id:
+        # Причина называется наблюдённая, а не сочинённая. Прежний текст
+        # утверждал отказ API там, где ответа не было вовсе, и отправлял
+        # читающего проверять схему беты вместо времени ответа.
+        detail = _lost_call_detail(started)
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            "Кросс-модельное ревью НЕ вызвано: Cloud Agents API не принял "
-            "запрос (бета могла измениться). Вердикт остаётся человеку; "
-            "детали в логе хаба (#757).",
+            f"Кросс-модельное ревью НЕ вызвано: {detail}. Вердикт остаётся "
+            "человеку; детали в логе хаба (#757).",
         )
         await db.commit()
         return False
@@ -1405,7 +1529,7 @@ async def maybe_dispatch_review(
         task_id=task_id,
         submission_generation=generation,
         agent_id=agent_id,
-        run_id=run_info.get("id") or agent_info.get("latestRunId") or "",
+        run_id=run_id,
         model=model_id,
         profile=profile,
         reviewer_principal_id=expected_principal,
@@ -1432,7 +1556,13 @@ async def maybe_dispatch_review(
         + " (#875). "
         + "Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
-        "(#757, #807).",
+        "(#757, #807)."
+        + (
+            " Ответ на создание не дошёл, и агент подобран по метке заказа "
+            "(#1199): прогон был оплачен, второго не покупали."
+            if started.adopted
+            else ""
+        ),
     )
     await repo.insert_event(
         db,
@@ -1442,7 +1572,8 @@ async def maybe_dispatch_review(
         payload={
             "model": model_id,
             "agent_id": agent_id,
-            "run_id": run_info.get("id") or "",
+            "adopted": started.adopted,
+            "run_id": run_id,
             "generation": generation,
             "profile": profile,
             "profile_reasons": profile_reasons,
