@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import pytest
 
+from hub import brand
 from hub import repository as repo
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.forge.gitverse import GitVerseForge
@@ -96,6 +97,10 @@ async def test_a_commit_without_any_run_gets_one_request(db: aiosqlite.Connectio
     task = dict(await repo.get_task(db, task_id))
     assert task["ci_run_requested_sha"] == PINNED, (
         "факт запроса держится ДАННЫМИ и ключом ему служит сам коммит"
+    )
+    assert task["ci_check_started_at"], (
+        "окно грейса отсчитывается от этой отметки; без неё заказанному "
+        "прогону не отводится времени появиться"
     )
     assert task["status"] == "running", "запрос не доставляет и не судит"
     g.merge_pr.assert_not_awaited()
@@ -405,6 +410,8 @@ async def test_the_poller_asks_before_it_calls_a_human(mock_sleep, db):
     )
     plugins.git_ops = mock_git
 
+    before = dict(await repo.get_task(db, task_id))["ci_check_started_at"]
+
     with pytest.raises(_BreakLoop):
         await _poll_running_tasks(_make_app(db))
 
@@ -413,6 +420,15 @@ async def test_the_poller_asks_before_it_calls_a_human(mock_sleep, db):
     assert row["ci_run_requested_sha"] == PINNED
     assert mock_git.request_ci_run.await_count == 1
     assert await _events_for(db, task_id, "needs_decision") == []
+    # Само по себе «остались в ci_check» ничего не стоит: поллер щупает PR
+    # только после грейса, а окно здесь уже состарено на 30 минут. Без
+    # перезапуска следующий тик через POLL_INTERVAL увидит потраченную попытку
+    # и уведёт задачу к человеку раньше, чем заказанный прогон успеет
+    # появиться, — то есть запрос не купит ничего. Проверяем ЧАСЫ, а не
+    # статус: без этой строки удаление перезапуска оставляло сюиту зелёной.
+    assert row["ci_check_started_at"] != before, (
+        "окно грейса обязано начаться заново после удавшегося запроса"
+    )
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
@@ -444,3 +460,166 @@ async def test_the_poller_still_reaches_the_human_on_the_next_tick(mock_sleep, d
     row = dict(await repo.get_task(db, task_id))
     assert row["status"] == "needs_decision"
     mock_git.request_ci_run.assert_not_awaited()
+
+
+async def test_the_gate_restarts_the_window_only_after_a_granted_request(
+    db: aiosqlite.Connection,
+):
+    """Продление окна — не бесплатная добавка, а следствие потраченной попытки.
+
+    Отказ форжа НЕ должен двигать часы: иначе задача с необъявленным триггером
+    получала бы свежий грейс на каждом круге и никогда не доходила до человека
+    — то есть конечное ожидание стало бы тихим бесконечным циклом.
+    """
+    _gate_seeing_no_runs(
+        request=CIRunRequestResult(
+            CIRunRequestOutcome.declined, "workflow_dispatch_not_declared_on_ref"
+        )
+    )
+    task_id = await _approved_pair_task(db)
+    await _pin(db, task_id)
+    await _report_done(db, task_id)
+    await _age_the_window(db, task_id)
+    aged = dict(await repo.get_task(db, task_id))["ci_check_started_at"]
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["ci_check_started_at"] == aged, (
+        "отказ не продлевает ожидание — иначе backstop не наступает никогда"
+    )
+    assert task["status"] == "needs_decision"
+
+
+# ---- Заявка ставится ДО платного вызова, а не после ----
+
+
+async def test_the_attempt_is_reserved_before_the_paid_call(db: aiosqlite.Connection):
+    """Два вызывающих на разных соединениях не должны оплатить два прогона.
+
+    Проверяется не «мы вызвали claim», а НАБЛЮДАЕМОЕ следствие: пока запрос в
+    полёте, попытка уже занята в базе. Соперник, читающий колонку в этот
+    момент, видит занято — а при прежней форме (проверка по снимку, запись
+    после await) видел бы пусто и заказал бы второй прогон.
+    """
+    seen: dict[str, str | None] = {}
+
+    async def slow_request(branch, **kw):
+        row = await db.execute_fetchall(
+            "SELECT ci_run_requested_sha FROM tasks WHERE submission_sha=?", (PINNED,)
+        )
+        seen["mid_flight"] = dict(row[0])["ci_run_requested_sha"]
+        return CIRunRequestResult(CIRunRequestOutcome.requested, "workflow_dispatched")
+
+    g = _gate_seeing_no_runs()
+    g.request_ci_run = AsyncMock(side_effect=slow_request)
+    task_id = await _approved_pair_task(db)
+    await _pin(db, task_id)
+
+    await _report_done(db, task_id)
+
+    assert seen["mid_flight"] == PINNED, (
+        "во время платного вызова попытка обязана быть уже занята"
+    )
+
+
+# ---- Очистка состояния конвейера не возвращает вторую попытку ----
+
+
+async def test_leaving_the_conveyor_does_not_refund_the_attempt(
+    db: aiosqlite.Connection,
+):
+    """reset_ci_check_state чистит часы и счётчик PR — но НЕ занятую попытку.
+
+    Путь, на котором это стоит денег, живой: поллер эскалирует и чистит
+    состояние → человек отправляет в доработку → задача возвращается в
+    ci_check с ТЕМ ЖЕ закреплённым коммитом. Вернув попытку, хаб оплатил бы по
+    тому же SHA второй прогон, и «одна попытка на коммит» держалась бы только
+    на том, что этим путём редко ходят.
+    """
+    task_id = await _make_ci_task(db)
+    await _pin(db, task_id)
+    assert await repo.claim_ci_run_request(db, task_id, PINNED)
+    await db.commit()
+
+    await repo.reset_ci_check_state(db, task_id)
+    await db.commit()
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["ci_check_started_at"] is None, "часы конвейера чистятся, как и раньше"
+    assert row["ci_run_requested_sha"] == PINNED, (
+        "попытка привязана к коммиту, а не к заходу на конвейер"
+    )
+    assert not await repo.claim_ci_run_request(db, task_id, PINNED), (
+        "второй заявки по тому же коммиту не бывает"
+    )
+
+
+# ---- Поиск workflow: спутник хаба несёт ДВА, и это норма ----
+
+
+async def test_a_hub_seeded_satellite_still_gets_its_run(monkeypatch):
+    """Спутник, выданный хабом, несёт haiplane-ci.yml И haiplane-stale.yml.
+
+    Правило «ровно один кандидат» отказывало бы на КАЖДОМ таком репозитории —
+    то есть механизм был бы мёртв ровно там, где комментарий о поиске обещал
+    его работу. Дёргается тот workflow, который хаб сам туда положил как CI.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(cmd)
+        argv = " ".join(cmd)
+        if "actions/workflows" in argv and "dispatches" not in argv:
+            return (
+                0,
+                '{"workflows": ['
+                '{"id": 5, "state": "active",'
+                f' "path": ".github/workflows/{brand.SEEDED_STALE}"}},'
+                '{"id": 9, "state": "active",'
+                f' "path": ".github/workflows/{brand.SEEDED_CI}"}}]}}',
+                "",
+            )
+        return (0, "", "")
+
+    monkeypatch.setattr("hub.integrations.proc.run", fake_run)
+
+    result = await GitHubForge().request_ci_run("task-1/x", gh_repo="own/rep")
+
+    assert result.outcome is CIRunRequestOutcome.requested
+    assert "actions/workflows/9/dispatches" in " ".join(calls[-1]), (
+        "дёрнут должен быть CI, а не подметальщик просроченных"
+    )
+
+
+async def test_an_unknown_workflow_set_is_declined_not_guessed(monkeypatch):
+    """Незнакомый набор — отказ по имени, и это НЕ перестраховка.
+
+    Гейт читает ЛЮБОЙ прогон по закреплённому коммиту и пропускает
+    success|neutral|skipped. Значит дёрнутый наугад посторонний workflow не
+    просто не помогает: он изготавливает зелёный прогон для коммита, чьи тесты
+    не выполнялись, и гейт этому верит. Догадка здесь покупает галочку, что
+    хуже, чем не купить ничего.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*cmd, **kw):
+        calls.append(cmd)
+        if "dispatches" in " ".join(cmd):
+            raise AssertionError("посторонний workflow дёргать нельзя")
+        return (
+            0,
+            '{"workflows": [{"id": 3, "state": "active",'
+            ' "path": ".github/workflows/release-please.yml"}]}',
+            "",
+        )
+
+    monkeypatch.setattr("hub.integrations.proc.run", fake_run)
+
+    result = await GitHubForge().request_ci_run("task-1/x", gh_repo="own/rep")
+
+    assert result.outcome is CIRunRequestOutcome.declined
+    assert result.reason == "no_known_ci_workflow"
+    assert "release-please.yml" in (result.details or ""), (
+        "отказ обязан назвать, что именно он видел"
+    )

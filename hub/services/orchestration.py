@@ -2211,11 +2211,19 @@ async def request_missing_ci_run(
             f"чужому коммиту ничего не даст, запроса нет"
         )
 
-    if (task.get("ci_run_requested_sha") or "").strip() == pinned:
+    # The attempt is RESERVED before the paid call, never checked against a
+    # snapshot and then spent after an await. Two callers share this population
+    # by design — the poller's delivery sweep and a done report — on separate
+    # connections, so a check-then-act would let both read an empty column and
+    # both order a run for one commit. The claim commits here for the same
+    # reason claim_arbiter_dispatch commits (#421): a reservation nobody else
+    # can see reserves nothing.
+    if not await repo.claim_ci_run_request(db, task["id"], pinned):
         return False, (
             f"прогон по {pinned[:12]} уже запрашивался — вторая попытка "
             f"превращала бы исход в свойство числа попыток"
         )
+    await db.commit()
 
     result = await plugins.git_ops.request_ci_run(
         branch,
@@ -2225,17 +2233,18 @@ async def request_missing_ci_run(
     )
     if result.outcome != CIRunRequestOutcome.requested:
         # Neither a declined request nor a call that never landed spends the
-        # single attempt: the column stays empty and the next cycle may try
-        # again. They are still told apart in the text, because "the ref has
-        # no manual trigger" is cured by a different hand than "the network
+        # single attempt: the reservation is handed back and the next cycle may
+        # try again. They are still told apart in the text, because "the ref
+        # has no manual trigger" is cured by a different hand than "the network
         # blinked".
+        await repo.release_ci_run_request(db, task["id"], pinned)
+        await db.commit()
         detail = f" ({result.details})" if result.details else ""
         return (
             False,
             f"запрос прогона не сделан: {result.outcome.value}/{result.reason}{detail}",
         )
 
-    await repo.mark_ci_run_requested(db, task["id"], pinned)
     await repo.add_task_update(
         db,
         task["id"],

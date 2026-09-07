@@ -17,6 +17,7 @@ import logging
 import re
 from typing import Any
 
+from hub import brand
 from hub.config import GH_BIN, REPO_NAME
 from hub.integrations import proc
 from hub.integrations.protocols import (
@@ -722,6 +723,15 @@ class GitHubForge:
             details=",".join(sorted(set(conclusions) | set(statuses))),
         )
 
+    #: The CI pipelines the hub owns or ships, in preference order. These are
+    #: not guesses about a stranger's repository: the first is the file the hub
+    #: itself writes into every satellite it provisions, the second is this
+    #: repository's own. A repository carrying neither gets a named refusal.
+    _CI_WORKFLOW_PATHS = (
+        f".github/workflows/{brand.SEEDED_CI}",
+        ".github/workflows/ci.yml",
+    )
+
     #: The refusal GitHub gives when the ref's own workflow file declares no
     #: manual trigger. Observed verbatim on 06.09.2026 against a branch cut
     #: before #1196 landed, while the same call on develop was accepted: the
@@ -734,16 +744,24 @@ class GitHubForge:
     ) -> CIRunRequestResult:
         """Ask GitHub for a run on ``branch`` as it stands (#1197).
 
-        The workflow to dispatch is DISCOVERED, never named: satellites carry
-        the same file under another name (``brand.SEEDED_CI``), so a hardcoded
-        "ci.yml" would work here and silently nowhere else. Two filters make
-        the discovery honest — ``state`` must be active, and ``path`` must
-        actually live in ``.github/workflows/``. The second is not decoration:
-        GitHub lists Dependabot's pseudo-workflows in the same array under
-        paths like ``dynamic/dependabot/update-graph``, which correspond to no
-        file and cannot be dispatched. Anything other than exactly one
-        candidate is DECLINED by name rather than guessed at — picking a
-        workflow for the caller is how a request lands on the wrong pipeline.
+        Only a workflow the hub KNOWS to be the CI pipeline is dispatched, and
+        the reason is not tidiness. The delivery gate reads every run for the
+        pinned SHA and passes on success|neutral|skipped, so dispatching the
+        wrong workflow does not merely fail to help — it MANUFACTURES a green
+        run for a commit whose tests never executed, and the gate believes it.
+        A repository can hold several real workflows: the hub itself seeds two
+        into every satellite (``brand.SEEDED_CI`` and ``brand.SEEDED_STALE``,
+        and the stale sweeper is a genuine Actions workflow). So "dispatch the
+        only one there is" is both wrong on satellites and unsafe in general.
+
+        The list is still read from GitHub rather than assumed — a name the
+        repository does not carry must not be dispatched — and paths outside
+        ``.github/workflows/`` are dropped: GitHub returns Dependabot's
+        pseudo-workflows in the same array under ``dynamic/dependabot/...``,
+        which correspond to no file and cannot be dispatched at all.
+
+        An unknown set is DECLINED by name. Guessing here buys a green tick,
+        which is worse than buying nothing.
         """
         if not (branch or "").strip():
             return CIRunRequestResult(CIRunRequestOutcome.declined, "no_branch_named")
@@ -766,24 +784,21 @@ class GitHubForge:
                 CIRunRequestOutcome.unavailable, "workflows_invalid_json"
             )
         entries = payload.get("workflows") if isinstance(payload, dict) else None
-        candidates = [
-            w
+        active = {
+            str(w.get("path") or ""): w
             for w in (entries or [])
             if isinstance(w, dict)
             and str(w.get("state") or "").lower() == "active"
             and str(w.get("path") or "").startswith(".github/workflows/")
-        ]
-        if not candidates:
-            return CIRunRequestResult(
-                CIRunRequestOutcome.declined, "no_dispatchable_workflow"
-            )
-        if len(candidates) > 1:
+        }
+        chosen = next((active[p] for p in self._CI_WORKFLOW_PATHS if p in active), None)
+        if chosen is None:
             return CIRunRequestResult(
                 CIRunRequestOutcome.declined,
-                "several_dispatchable_workflows",
-                details=",".join(sorted(str(w.get("path") or "") for w in candidates)),
+                "no_known_ci_workflow",
+                details=",".join(sorted(active)) or None,
             )
-        workflow_id = candidates[0].get("id")
+        workflow_id = chosen.get("id")
         if not workflow_id:
             return CIRunRequestResult(
                 CIRunRequestOutcome.unavailable, "workflow_without_id"
@@ -802,7 +817,7 @@ class GitHubForge:
             return CIRunRequestResult(
                 CIRunRequestOutcome.requested,
                 "workflow_dispatched",
-                details=str(candidates[0].get("path") or ""),
+                details=str(chosen.get("path") or ""),
             )
         detail = (err or "").strip()
         if self._NO_DISPATCH_TRIGGER in detail.lower():
