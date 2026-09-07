@@ -11,6 +11,7 @@ from hub.services.test_existence import (
     UNPARSEABLE,
     collect_test_nodeids,
     resolve_ac_locators,
+    resolve_locator_in_source,
 )
 
 
@@ -138,3 +139,91 @@ def test_unreadable_file_stays_unknown():
     res = resolve_ac_locators(acs, None, {"tests/test_a.py": None})[0]
     assert res["status"] == UNKNOWN
     assert res["status"] != MISSING
+
+
+# ---- A locator of another runner is never called missing (#1203) ----
+
+_VITEST_FILE = "frontend/src/lib/recent-inspections.test.ts"
+_VITEST_NAME = "still toggles when the storage object itself is unreachable"
+_VITEST_LOCATOR = f"{_VITEST_FILE}::{_VITEST_NAME}"
+_VITEST_SOURCE = """import { describe, it } from "vitest";
+
+describe("признак раскрытия подсписка", () => {
+  it("still toggles when the storage object itself is unreachable", () => {});
+});
+"""
+
+
+def test_foreign_runner_locator_is_never_missing():
+    # AC-1. The measured defect: `collected` comes from pytest and speaks only
+    # for pytest, but every locator was judged against it. On #1202 that
+    # answered `missing`, "locator does not match any collected test", about a
+    # test written three lines into the file — the false missing this module's
+    # own docstring promises never to produce.
+    pytest_collected = {"tests/test_poller.py::test_a"}
+    ac = [_AC("AC-1", "test", _VITEST_LOCATOR)]
+
+    # Path 1: pytest collection ran and (of course) does not list this test.
+    with_source = resolve_ac_locators(
+        ac, pytest_collected, {_VITEST_FILE: _VITEST_SOURCE}
+    )[0]
+    assert with_source["status"] == RESOLVABLE
+    assert BY_SOURCE in with_source["reason"]
+
+    # Path 2: collection ran, but the file itself could not be read. Unknown
+    # with a stated reason — "could not look" is not "the answer is no" (#725).
+    unread = resolve_ac_locators(ac, pytest_collected, {_VITEST_FILE: None})[0]
+    assert unread["status"] == UNKNOWN
+    assert _VITEST_FILE in unread["reason"]
+
+    # Path 3: no collection at all — the pre-existing fallback route.
+    no_collection = resolve_ac_locators(ac, None, {_VITEST_FILE: _VITEST_SOURCE})[0]
+    assert no_collection["status"] == RESOLVABLE
+
+    # And the guard is not blanket silence: when the file is readable and the
+    # test really is absent, `missing` is still the honest answer.
+    absent = resolve_ac_locators(
+        [_AC("AC-1", "test", f"{_VITEST_FILE}::a test nobody wrote")],
+        pytest_collected,
+        {_VITEST_FILE: _VITEST_SOURCE},
+    )[0]
+    assert absent["status"] == MISSING
+
+
+def test_vitest_source_reading_finds_the_named_test():
+    # The vitest resolver answers existence by reading, exactly as BY_SOURCE
+    # claims — no stronger. It must survive the quote styles and the decorated
+    # forms that appear in real suites.
+    src = """
+it.each([1, 2])("parametrised %i", () => {});
+test('single quoted name', () => {});
+it(`backticked name`, () => {});
+it("name with \\"quotes\\" inside", () => {});
+"""
+    for name in (
+        "parametrised %i",
+        "single quoted name",
+        "backticked name",
+        'name with "quotes" inside',
+    ):
+        status, reason = resolve_locator_in_source(src, f"a/b.test.ts::{name}")
+        assert status == RESOLVABLE, (name, reason)
+
+
+def test_vitest_names_keep_characters_pytest_would_trim():
+    # A pytest node is trimmed at "[" and read after the last "::"; a vitest
+    # name owns both characters. Trimming them would send the resolver hunting
+    # for a different test and report a real one as absent.
+    src = 'it("renders [draft] :: with a colon", () => {});\n'
+    status, _ = resolve_locator_in_source(
+        src, "a/b.test.ts::renders [draft] :: with a colon"
+    )
+    assert status == RESOLVABLE
+
+
+def test_unknown_runner_says_so_instead_of_unparseable():
+    # Before #1203 every file went through ast, so a TypeScript test came back
+    # `unparseable` — true in the letter, useless in fact, because the file
+    # parses perfectly for the tool that owns it.
+    status, reason = resolve_locator_in_source(_VITEST_SOURCE, _VITEST_LOCATOR)
+    assert status != UNPARSEABLE

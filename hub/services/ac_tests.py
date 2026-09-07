@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable
 from hub import repository as repo
 from hub.services.orchestration import project_git_context
 from hub.services.refinement import row_to_ac
-from hub.services.test_locator import parse_test_locator
+from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
 
 log = logging.getLogger("hub")
 
@@ -103,6 +103,36 @@ async def test_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
     return out
 
 
+async def runnable_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
+    """{ac_id: nodeid} for the test-AC this hub can actually RUN (#1203).
+
+    Today that is pytest and only pytest. Handing a vitest locator to
+    ``uv run pytest`` produced ``not_found`` — the same word a genuinely
+    missing test gets — so the author was told their test was absent when the
+    truth was that nothing had tried to run it.
+    """
+    return {
+        ac_id: nodeid
+        for ac_id, nodeid in (await test_ac_nodeids(db, task_id)).items()
+        if runner_of(nodeid) == PYTEST
+    }
+
+
+async def unrunnable_ac_locators(db: Any, task_id: int) -> dict[str, str]:
+    """{ac_id: nodeid} for well-formed locators of a runner we cannot run.
+
+    Their own outcome, never folded into the missing/not-green ones: the
+    criterion is properly written and the test may well exist and pass. What
+    is absent is the hub's ability to run it, and only a sentence that says so
+    tells the author there is nothing for them to fix (#419).
+    """
+    return {
+        ac_id: nodeid
+        for ac_id, nodeid in (await test_ac_nodeids(db, task_id)).items()
+        if runner_of(nodeid) != PYTEST
+    }
+
+
 # collector(nodeids, repo_path) -> the subset pytest could COLLECT, or None
 # when the collection itself could not run. Separate from TestRunner on
 # purpose: this asks whether a test exists, not whether it passes.
@@ -175,7 +205,9 @@ async def unresolved_locators(
     different defect, already refused by the refine gate where the policy
     requires it.
     """
-    nodeid_by_ac = await test_ac_nodeids(db, task_id)
+    # Only locators this hub can collect: a foreign one is not "dead", it is
+    # unasked, and reporting it here would be an accusation (#1203).
+    nodeid_by_ac = await runnable_ac_nodeids(db, task_id)
     if not nodeid_by_ac:
         return {}, True
     ctx = await project_git_context(db, task_id)
@@ -224,7 +256,9 @@ async def run_ac_tests(
     recorded results. Non-test AC and AC without a valid locator are skipped.
     """
     runner = runner or default_test_runner
-    nodeid_by_ac = await test_ac_nodeids(db, task_id)
+    # An unrunnable locator gets no row at all rather than a not_found one:
+    # a recorded not_found is read as "the test is not there" (#1203).
+    nodeid_by_ac = await runnable_ac_nodeids(db, task_id)
     if not nodeid_by_ac:
         return []
 
@@ -261,6 +295,15 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
     if not test_acs:
         return None
     unlocatable = [ac.id for ac in test_acs if not parse_test_locator(ac.test_ref)]
+    # Well-formed, but for a runner this hub cannot run. Kept apart from both
+    # other groups: the author has nothing to fix, and a line that lumps it in
+    # with "локатор не разрешается" sends them editing a correct locator
+    # (#419, #1203).
+    unrunnable = {
+        ac.id: runner_of(ac.test_ref)
+        for ac in test_acs
+        if ac.id not in unlocatable and runner_of(ac.test_ref) != PYTEST
+    }
     generation = task.get("submission_generation") or 0
     rows = {
         dict(r)["ac_id"]: dict(r) for r in await repo.list_ac_test_results(db, task_id)
@@ -269,6 +312,7 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
         ac.id
         for ac in test_acs
         if ac.id not in unlocatable
+        and ac.id not in unrunnable
         and (
             (r := rows.get(ac.id)) is None
             or r["submission_generation"] != generation
@@ -284,6 +328,12 @@ async def ac_tests_gap(db: Any, task: dict) -> str | None:
         gaps.append(
             "AC объявлены verifiable_by=test, но локатор теста не разрешается: "
             + ", ".join(unlocatable)
+        )
+    if unrunnable:
+        named = ", ".join(f"{ac_id} ({runner})" for ac_id, runner in unrunnable.items())
+        gaps.append(
+            "AC объявлены verifiable_by=test, локатор верен, но его раннер хаб "
+            "прогнать не умеет — правки локатора это не требует: " + named
         )
     return "; ".join(gaps) if gaps else None
 
