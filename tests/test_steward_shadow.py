@@ -18,7 +18,12 @@ from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.db import fetchall
 from hub.services import steward_shadow as sh
-from hub.services.steward_dispatch import RUN_OPEN, order_run
+from hub.services.steward_dispatch import (
+    RUN_OPEN,
+    RUN_TIMEOUT,
+    close_finished_runs,
+    order_run,
+)
 from hub.services.steward_shadow import (
     EVENT_RUN_STARTED,
     REFUSED_SAME_FAMILY_IMPLEMENTER,
@@ -1131,3 +1136,219 @@ async def test_a_5xx_naming_a_limit_is_still_transport(
         "код лимита на пятисотке — сбой провайдера, а не недоступность модели"
     )
     assert (await _runs(db, task_id))[0]["model"] == "gpt-5.3-codex"
+
+
+async def _no_dispatch(db: aiosqlite.Connection, task_id: int) -> None:
+    """Убрать запись о заказе ревьюера — состояние окна гонки (#1185)."""
+    await db.execute("DELETE FROM review_dispatches WHERE task_id=?", (task_id,))
+    await db.commit()
+
+
+async def test_a_reviewer_not_yet_dispatched_is_waited_for(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1185 AC-1: пока ревьюера не позвали, заказ ждёт, а не закрывается.
+
+    Путь сдачи коммитит статус review и только потом зовёт ревьюера по HTTP.
+    Тик, попавший в это окно, видел пустое имя модели и закрывал слот
+    навсегда: наблюдено на #1175 поколения 3.
+    """
+    project_id = await _project(db, "shadow-race")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 0
+
+    assert started.await_count == 0
+    run = (await _runs(db, task_id))[0]
+    # Слот ЖИВ: закрыть его — значит потерять суждение из-за порядка тиков.
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == ""
+
+    # И когда ревьюер появляется, тот же заказ стартует без вмешательства.
+    await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, model, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, 1, "rev-agent", "grok-4.6", "done"),
+    )
+    await db.commit()
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 1
+    assert started.await_count == 1
+
+
+async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
+    db: aiosqlite.Connection, with_identity
+):
+    """Находка ревью №254: строка диспетча ложится МЕЖДУ чтениями.
+
+    Сдача идёт по тому же asyncio-циклу, что и поллер, поэтому каждый
+    ``await`` внутри решения отдаёт управление. Первая правка #1185 читала
+    модель ревьюера снимком, потом спрашивала про строку диспетча — и если
+    строка появлялась в этом промежутке, ожидание отменялось, а гейт судил
+    по СТАРОЙ пустой строке и закрывал слот навсегда.
+
+    Мои AC-тесты этого не ловили: они не перемежают INSERT с этими await.
+    Здесь вставка происходит ровно внутри решения.
+    """
+    project_id = await _project(db, "shadow-race-interleaved")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    original = repo.resolve_project_for_task
+    landed = False
+
+    async def _resolve_and_land(conn, tid):
+        nonlocal landed
+        project = await original(conn, tid)
+        if not landed:
+            landed = True
+            await conn.execute(
+                "INSERT INTO review_dispatches "
+                "(task_id, submission_generation, agent_id, model, status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tid, 1, "rev-agent", "grok-4.6", "running"),
+            )
+            await conn.commit()
+        return project
+
+    with (
+        patch("hub.repository.resolve_project_for_task", new=_resolve_and_land),
+        patch(
+            "hub.integrations.cursor_cloud.create_review_agent",
+            new=AsyncMock(return_value=_CREATED),
+        ),
+    ):
+        await start_due_runs(db)
+
+    assert landed, "подставка не сработала — тест не проверил то, ради чего написан"
+    run = (await _runs(db, task_id))[0]
+    # Слот НЕ сожжён: ревьюер существует, и решение по устаревшему снимку
+    # закрыло бы поколение навсегда — UNIQUE(task_id, generation, kind).
+    assert run["status"] != RUN_REFUSED, run["closed_reason"]
+
+    # И следующий тик доводит дело до конца, уже видя настоящую модель.
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        await start_due_runs(db)
+    assert started.await_count == 1
+    assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
+
+
+async def test_an_unrecognised_reviewer_still_closes_the_slot(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1185 AC-2: ожидание не ослабляет гейт монокультуры.
+
+    Ждут ОТСУТСТВИЯ заказа. Заказ, который есть, а модель в нём не
+    опознаётся, — это ответ «не знаю, кто судил», и он по-прежнему
+    окончательный отказ: отсрочка касается момента вопроса, а не ответа.
+    """
+    project_id = await _project(db, "shadow-race-garbage")
+    task_id = await _task(db, project_id, reviewer="my-model-42")
+    await order_run(db, task_id, 1)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 0
+
+    assert started.await_count == 0
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_REFUSED
+    assert REFUSED_UNDECLARED_MODEL in run["closed_reason"]
+
+    # Имя может прийти и из отчёта, когда строки диспетча нет вовсе: ревьюер
+    # уже отработал, ждать его «появления» бессмысленно, а имя непонятно.
+    named_id = await _task(db, project_id)
+    await _no_dispatch(db, named_id)
+    await order_run(db, named_id, 1)
+    await db.execute(
+        "INSERT INTO machine_reviews "
+        "(task_id, submission_generation, model, submitted_by) "
+        "VALUES (?, ?, ?, ?)",
+        (named_id, 1, "my-model-42", "rev"),
+    )
+    await db.commit()
+    assert await start_due_runs(db) == 0
+    named = (await _runs(db, named_id))[0]
+    assert named["status"] == RUN_REFUSED
+    assert REFUSED_UNDECLARED_MODEL in named["closed_reason"]
+
+    # И семейное совпадение тоже закрывает, а не ждёт.
+    other_id = await _task(db, project_id, reviewer="gpt-5.2")
+    await order_run(db, other_id, 1)
+    assert await start_due_runs(db) == 0
+    assert (await _runs(db, other_id))[0]["closed_reason"].startswith(
+        REFUSED_SAME_FAMILY_REVIEWER
+    )
+
+
+async def test_waiting_for_a_reviewer_still_ends(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1185 AC-3: ожидание ограничено дедлайном слота, вечных нет.
+
+    Ревьюер может не появиться никогда — провайдер отказал, диспетч выключен
+    после заказа. Открытый слот тогда закрывает та же уборка дедлайнов, что
+    и всегда: у ожидания нет собственного таймера, и заводить второй было бы
+    вторым источником правды о том же сроке.
+    """
+    project_id = await _project(db, "shadow-race-forever")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    # Срок ставится ДО тика ожидания: поставь его после — тест починил бы
+    # собственную проверку и не заметил ожидания, которое двигает дедлайн.
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert await start_due_runs(db) == 0
+    assert (await _runs(db, task_id))[0]["status"] == RUN_OPEN
+
+    assert await close_finished_runs(db) == 1
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_TIMEOUT
+
+
+async def test_waiting_needs_a_project_that_asks_for_review(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1185 AC-1, вторая половина: ждут не всегда, а только когда есть кого.
+
+    На проекте, где кросс-модельного ревью нет вовсе, ревьюер не появится
+    ни через минуту, ни через час. Ожидание там — не осторожность, а слот,
+    открытый до дедлайна ради заведомо пустого места.
+    """
+    project_id = await _project(db, "shadow-race-no-review")
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?",
+        (json.dumps({"verdict": "human", "review": "off"}), project_id),
+    )
+    await db.commit()
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    assert await start_due_runs(db) == 0
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_REFUSED
+    assert REFUSED_UNDECLARED_MODEL in run["closed_reason"]
