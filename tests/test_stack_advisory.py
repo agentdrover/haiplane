@@ -39,9 +39,11 @@ class FakeStackingGitOps(NoopGitOps):
         error: bool = False,
         shared_pairs: set[tuple[str, str]] | None = None,
         ancestry_error: bool = False,
+        same_tip_pairs: set[tuple[str, str]] | None = None,
     ):
         self.stacked_pairs = stacked_pairs or set()
         self.shared_pairs = shared_pairs or set()
+        self.same_tip_pairs = same_tip_pairs or set()
         self.error = error
         self.ancestry_error = ancestry_error
         self.calls: list[tuple[str, str, str, str | None]] = []
@@ -54,6 +56,8 @@ class FakeStackingGitOps(NoopGitOps):
             or (b, a) in self.stacked_pairs
             or (a, b) in self.shared_pairs
             or (b, a) in self.shared_pairs
+            or (a, b) in self.same_tip_pairs
+            or (b, a) in self.same_tip_pairs
         )
 
     async def branch_contains_unmerged_commits_of(
@@ -77,6 +81,14 @@ class FakeStackingGitOps(NoopGitOps):
         if self.ancestry_error:
             raise RuntimeError("branch missing from the clone")
         self.ancestry_calls.append((branch, other_branch))
+        if (
+            branch,
+            other_branch,
+        ) in self.same_tip_pairs or (
+            other_branch,
+            branch,
+        ) in self.same_tip_pairs:
+            return "same_tip"
         if (branch, other_branch) in self.stacked_pairs:
             return "head_is_descendant"
         if (other_branch, branch) in self.stacked_pairs:
@@ -319,6 +331,62 @@ async def test_shared_commits_without_ancestry_are_named_not_sided(
     assert "FIRST" not in hint
 
 
+async def test_same_tip_is_named_as_the_same_commit(db: aiosqlite.Connection):
+    """Two names on one commit is not a diamond, and must not read as one.
+
+    A branch cut from another task's branch carries its commits and has none
+    of its own yet: the tips are equal, so is_ancestor answers yes BOTH ways.
+    The honest word for that is "the same commit" — saying "neither is an
+    ancestor of the other" states the reverse of the fact and sends the
+    reader to check by hand what the hub already computed (#1193).
+    """
+    task_id, branch = await _pair_running_task(db, "Branch cut from a branch")
+    other_branch = "task-392/the-same-commit"
+    other_id = await _base_task_in_review(db, other_branch)
+    plugins.git_ops = FakeStackingGitOps(same_tip_pairs={(branch, other_branch)})
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(agent="dev-agent")
+    )
+
+    hint = await _stacking_hint(view)
+    assert "ADVISORY branch stacking" in hint
+    assert f"#{other_id}" in hint
+    assert "point at the SAME commit" in hint
+    # The sentence this task exists to remove.
+    assert "neither branch is an ancestor of the other" not in hint
+
+
+async def test_same_tip_names_no_merge_order(db: aiosqlite.Connection):
+    """The wording changes; the behaviour does not.
+
+    Naming a side here would be worse than the false explanation it replaces:
+    there is no order between one commit and itself.
+    """
+    task_id, branch = await _pair_running_task(db, "Same tip, no order")
+    other_branch = "task-392/twin"
+    other_id = await _base_task_in_review(db, other_branch)
+    plugins.git_ops = FakeStackingGitOps(same_tip_pairs={(branch, other_branch)})
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(agent="dev-agent")
+    )
+
+    hint = await _stacking_hint(view)
+    assert f"#{other_id}" in hint
+    assert f"'{branch}' contains unmerged commits" not in hint
+    # Case-insensitive on purpose: an earlier version of this test looked for
+    # the lowercase sentence only, and a mutation that named a side with a
+    # capital M walked straight past it. "first" appears nowhere in an honest
+    # same-tip advisory, so its absence is the whole property.
+    assert "first" not in hint.lower()
+    # Without this the test passes on an unhandled outcome too: "order could
+    # not be determined" also names no side, and a guard that green-lights
+    # the bug it guards against is not a guard.
+    assert "could NOT be determined" not in hint
+    assert "point at the SAME commit" in hint
+
+
 async def test_unresolvable_ancestry_does_not_pick_a_side(db: aiosqlite.Connection):
     task_id, branch = await _pair_running_task(db, "Ancestry unavailable")
     other_branch = "task-392/base-work"
@@ -480,9 +548,12 @@ async def test_branch_ancestry_unrelated_branches() -> None:
 
 async def test_branch_ancestry_same_tip_names_no_side() -> None:
     # Two names on one commit: both answers are yes and neither is an order.
+    # The name still holds — no side is named — but the outcome is its own
+    # (#1193): folding it into "unrelated" is what let the advisory claim
+    # neither branch was an ancestor of the other, the reverse of the fact.
     assert (
         await _ancestry({("aaa111", "bbb222"): 0, ("bbb222", "aaa111"): 0})
-        == "unrelated"
+        == "same_tip"
     )
 
 

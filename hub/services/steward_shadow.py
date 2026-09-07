@@ -39,6 +39,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
+from hub.services import project_policy
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     KIND_VERDICT,
@@ -394,6 +395,54 @@ async def start_due_runs(db: aiosqlite.Connection) -> int:
     return started
 
 
+def _only_the_reviewer_is_missing(
+    steward: str, implementer: str, reviewer: str
+) -> bool:
+    """Отказал бы гейт, будь ревьюер объявлен, — или дело только в нём.
+
+    Спрашивается тем же примитивом, которым решает сам гейт: ``False`` от
+    :func:`same_family` означает «обе стороны опознаны и семейства разные»,
+    то есть пара стюард—исполнитель проходит. Разбирать вместо этого текст
+    отказа было бы решением по строке, написанной для человека, — способ
+    ошибиться, уже проверенный на практике.
+
+    Пустая строка ревьюера здесь обязательна: непонятное имя — это ответ
+    «не опознан», и ждать его повторения незачем.
+    """
+    if reviewer.strip() or not steward.strip():
+        return False
+    return same_family(steward, implementer) is False
+
+
+async def _project_expects_a_reviewer(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Придёт ли на этот проект кросс-модельный ревьюер вообще.
+
+    Единственный вопрос, который здесь ещё нужно задать. «Позвали ли его
+    уже» НЕ спрашивается, и это исправление находки ревью №254: тот вопрос
+    отвечался вторым чтением, а решение принималось по первому. Строка
+    диспетча ложится между ними — сдача идёт по тому же asyncio-циклу, что
+    и поллер, и любой ``await`` отдаёт управление, — ожидание отменялось, а
+    гейт получал СТАРУЮ пустую строку и закрывал слот навсегда. Тот же
+    ожог #1175, сдвинутый в окно поуже.
+
+    Перечитать модель после проверки строки окно сузило бы, но не закрыло:
+    строка может лечь и после перечитывания. Поэтому вопросов остаётся
+    один, и оба исхода читаются из ОДНОГО снимка модели: пусто — значит
+    ждём, названо и не опознано — значит отказ. Ни один порядок событий
+    больше не закрывает слот на ревьюере, который существует.
+
+    Цена — заказ на проекте, где ревью включено, а провайдер молчит,
+    доживёт до дедлайна слота вместо немедленного отказа. Прогон при этом
+    не запускается ни в том, ни в другом случае, так что цена нулевая.
+    """
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return False
+    return project_policy.review_dispatch_enabled(
+        project_policy.gate_policy_of(project)
+    )
+
+
 async def _refuse_transiently(
     db: aiosqlite.Connection, order: dict, code: str, detail: str
 ) -> None:
@@ -448,6 +497,37 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     steward = (order.get("model") or config.STEWARD_MODEL or "").strip()
     implementer = (task.get("submission_model") or "").strip()
     reviewer = await reviewer_model(db, task_id, generation)
+
+    # «Ревьюера ещё не позвали» и «модель ревьюера не опознана» приходят
+    # сюда одной пустой строкой, а означают противоположное (#1185).
+    #
+    # Сдача видна как review раньше, чем вызов провайдера вернулся: путь
+    # сдачи коммитит статус и только потом зовёт ревьюера по HTTP. Тик,
+    # попавший в это окно, видел пустую строку и закрывал слот НАВСЕГДА —
+    # наблюдено на #1175 поколения 3, где ревьюера позвали через секунды
+    # после отказа; на соседней #1183 порядок сложился обратный, и прогон
+    # пошёл. Исход зависел от того, куда попал тик, а не от моделей.
+    #
+    # Ждать — когда ревьюер и есть единственное недостающее, и проект
+    # вообще просит ревью. Оба исхода читаются из ОДНОГО снимка модели:
+    # пусто — ждём, названо и не опознано — отказываем. Второе чтение,
+    # решающее судьбу первого, и было находкой ревью №254.
+    #
+    # Гейт от этого не слабеет: ни одна из трёх деклараций не считается
+    # объявленной, отсрочен лишь момент вопроса.
+    if _only_the_reviewer_is_missing(steward, implementer, reviewer) and (
+        await _project_expects_a_reviewer(db, task_id)
+    ):
+        await _refuse_transiently(
+            db,
+            order,
+            REFUSED_UNDECLARED_MODEL,
+            "кросс-модельного ревьюера ещё не позвали — заказ ждёт его "
+            "появления: «пока неизвестно» не то же самое, что «неизвестно "
+            "никогда»",
+        )
+        return False
+
     refusal = family_refusal(steward, implementer, reviewer)
     if refusal is not None:
         # NOT retryable: the same three declarations would refuse again on
