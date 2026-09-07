@@ -6006,3 +6006,228 @@ async def test_web_create_refuses_an_unknown_forge(client: AsyncClient, db):
     from hub import repository as repo_module
 
     assert await repo_module.get_project_by_slug(db, "bad-forge") is None
+
+
+# --- Форма и запись спрашивают одно: чем ревью можно добыть (#1188) ----------
+#
+# До #1180 ответ сводился к форжу, и каждый спрашивал его сам. #1180 доставила
+# локальный путь, работающий на любом форже, — и инвариант записи, оставшийся
+# на прежнем признаке, стал отказывать В ЗАПИСИ политике, которую хаб уже умел
+# ИСПОЛНЯТЬ. Форма же предлагала dispatch всем подряд, не спросив никого.
+
+
+def _card(page: str, slug: str) -> str:
+    """Кусок разметки от карточки этого проекта до начала следующей.
+
+    Резать приходится потому, что утверждения здесь — о МЕСТЕ: «предлагается
+    на этом проекте» и «отказ показан у этой карточки» на целой странице
+    неотличимы от «есть где-то на странице», а это ровно тот дефект, который
+    задача закрывает.
+    """
+    start = page.index(slug)
+    tail = page[start:]
+    nxt = tail.find("project-admin-actions", tail.find("project-admin-actions") + 1)
+    return tail if nxt < 0 else tail[:nxt]
+
+
+async def _local_reviewer_ready(db, monkeypatch, tmp_path) -> None:
+    """Настроить локальный путь так, как его требует выкат (#1180).
+
+    Конфигурация — настоящая, включая права каталога прогонов: именно её
+    читает страж, и подменять её значило бы проверять не то. А вот разрешение
+    токена в принципала подменяется: настоящее требует закрытого режима
+    аутентификации, в котором сама страница /projects отвечает 401, и тест
+    проверял бы уже не форму. Идентичность ревьюера закреплена там, где она
+    решает, — tests/test_forge_links.py на пути записи.
+    """
+    import os
+
+    from hub import config
+    from hub.services import review_dispatch
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(exist_ok=True)
+    os.chmod(scratch, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "reviewer-key")
+
+    async def _principal(_db):
+        return 7
+
+    monkeypatch.setattr(review_dispatch, "local_reviewer_principal_id", _principal)
+
+
+async def test_review_dispatch_is_not_offered_when_nothing_can_run_it(
+    client: AsyncClient, db
+):
+    """AC-1: нечем исполнить — не предлагаем, и говорим почему.
+
+    Проверяется рендером страницы и ответом API, а не чтением кода: селект,
+    который предлагает невыполнимое, выглядит в коде так же, как рабочий.
+    """
+    created = await client.post(
+        "/api/projects", json={"slug": "reach-none", "name": "Reach None"}
+    )
+    pid = created.json()["id"]
+    assert (
+        await client.patch(f"/api/projects/{pid}", json={"forge": "gitverse"})
+    ).status_code == 200
+
+    card = _card((await client.get("/projects")).text, "reach-none")
+
+    assert 'name="gate_policy_review"' in card, "селект на месте"
+    assert 'value="dispatch"' not in card, (
+        "выбор, который этот проект не исполнит, предлагать нельзя — человек "
+        "выберет существующий пункт меню и получит отказ"
+    )
+    assert "dispatch недоступен" in card and "gitverse" in card, (
+        "молча убранный пункт — такой же обман, как пункт без исполнения: "
+        "причина обязана стоять рядом"
+    )
+    refused = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"review": "dispatch"}}
+    )
+    assert refused.status_code == 422, "и запись отказана той же причиной"
+    assert refused.json()["detail"]["error"] == "review_unrunnable_here"
+
+
+async def test_review_dispatch_is_offered_when_the_local_reviewer_is_ready(
+    client: AsyncClient, db, monkeypatch, tmp_path
+):
+    """AC-2 со стороны формы: настроенный локальный путь возвращает выбор."""
+    created = await client.post(
+        "/api/projects", json={"slug": "reach-local", "name": "Reach Local"}
+    )
+    pid = created.json()["id"]
+    assert (
+        await client.patch(f"/api/projects/{pid}", json={"forge": "gitverse"})
+    ).status_code == 200
+    await _local_reviewer_ready(db, monkeypatch, tmp_path)
+
+    card = _card((await client.get("/projects")).text, "reach-local")
+
+    assert 'value="dispatch"' in card, (
+        "локальный ревьюер настроен — значит ревью здесь добывается, и "
+        "прятать выбор больше не за что (#1180)"
+    )
+    assert "dispatch недоступен" not in card
+
+
+async def test_review_dispatch_is_still_offered_on_github(client: AsyncClient):
+    """AC-3, контроль: без него AC-1 был бы зелён и при удалённом селекте."""
+    created = await client.post(
+        "/api/projects", json={"slug": "reach-github", "name": "Reach GitHub"}
+    )
+    pid = created.json()["id"]
+
+    card = _card((await client.get("/projects")).text, "reach-github")
+    assert 'value="dispatch"' in card
+    assert "dispatch недоступен" not in card
+
+    saved = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"review": "dispatch"}}
+    )
+    assert saved.status_code == 200 and saved.json()["gate_policy"]["review"] == (
+        "dispatch"
+    )
+
+
+async def test_the_form_shows_the_stored_review_value_even_when_unoffered(
+    client: AsyncClient, db
+):
+    """AC-4: сужение перечня не имеет права лгать о сохранённом (#1163)."""
+    created = await client.post(
+        "/api/projects", json={"slug": "reach-stored", "name": "Reach Stored"}
+    )
+    pid = created.json()["id"]
+    assert (
+        await client.patch(
+            f"/api/projects/{pid}", json={"gate_policy": {"review": "dispatch"}}
+        )
+    ).status_code == 200
+    # Форж меняем в обход инварианта — именно так это состояние и достижимо
+    # в жизни: политику поставили, когда способ был, а потом он пропал.
+    await repo.update_project(db, pid, forge="gitverse")
+    await db.commit()
+
+    card = _card((await client.get("/projects")).text, "reach-stored")
+
+    assert 'value="dispatch"' in card and "selected" in card, (
+        "хранимое значение показывается выбранным, даже когда его больше не "
+        "предлагают: иначе форма утверждает то, чего в базе нет"
+    )
+
+
+async def test_a_refused_project_edit_is_shown_at_that_project(client: AsyncClient):
+    """AC-5: отказ показан у карточки, а не под всеми проектами.
+
+    Мера — ПОЛОЖЕНИЕ: до правки нота стояла последним блоком страницы (символ
+    15925 из 18038 при двух проектах), и «есть на странице» выполнялось,
+    когда дефект был в полном разгаре.
+    """
+    first = await client.post(
+        "/api/projects", json={"slug": "refused-here", "name": "Refused Here"}
+    )
+    pid = first.json()["id"]
+    assert (
+        await client.patch(f"/api/projects/{pid}", json={"forge": "gitverse"})
+    ).status_code == 200
+    await client.post(
+        "/api/projects", json={"slug": "zz-other", "name": "Other Project"}
+    )
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Refused Here", "gate_policy_review": "dispatch"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    page = (await client.get(resp.headers["location"])).text
+
+    card = _card(page, "refused-here")
+    assert "project-error-note" in card, (
+        "нота обязана стоять внутри карточки своего проекта, а не под всеми: "
+        "до правки она была последним блоком страницы — символ 15925 из 18038 "
+        "при двух проектах"
+    )
+    assert "project-error-note" not in _card(page, "zz-other"), (
+        "чужая карточка про этот отказ ничего не знает"
+    )
+    assert page.count("project-error-note") == 1, (
+        "второго экземпляра того же текста внизу страницы быть не должно"
+    )
+    assert '<details class="project-admin-edit" open' in card, (
+        "форма открыта: схлопнувшаяся после редиректа, она показывала прежние "
+        "значения и читалась как «ничего не произошло»"
+    )
+
+
+async def test_the_refusal_names_the_project_and_the_field(client: AsyncClient):
+    """AC-6: из текста видно проект, поле и цену отказа."""
+    created = await client.post(
+        "/api/projects", json={"slug": "refusal-text", "name": "Refusal Text"}
+    )
+    pid = created.json()["id"]
+    assert (
+        await client.patch(f"/api/projects/{pid}", json={"forge": "gitverse"})
+    ).status_code == 200
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"name": "Refusal Text", "gate_policy_review": "dispatch"},
+        follow_redirects=False,
+    )
+    page = (await client.get(resp.headers["location"])).text
+    note = page[page.index("project-error-note") :][:900]
+
+    assert "refusal-text" in note, "какой из девяти проектов — должно быть сказано"
+    assert "Агентское ревью на сдаче" in note, (
+        "поле названо тем же именем, каким подписано в форме: иначе человек "
+        "перебирает всё подряд"
+    )
+    assert "НИЧЕГО из этой отправки не сохранено" in note, (
+        "цена отказа — вся отправка, и молчать об этом значит оставить человека "
+        "с мыслью, что сохранилось хоть что-то"
+    )

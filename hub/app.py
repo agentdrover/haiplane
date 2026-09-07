@@ -829,13 +829,20 @@ async def api_list_projects(
     return [await _project_view(r) for r in rows]
 
 
-def _refuse_unrunnable_cloud_review(before, fields: dict) -> None:
+async def _refuse_unrunnable_review(db, before, fields: dict) -> None:
     """Не хранить как исполнимую политику, исполнить которую нельзя (#1119).
 
-    Облачный ревьюер работает только с GitHub (измерено 31.08.2026), поэтому
-    ``review=dispatch`` на проекте другого форжа — не «попробуем», а
+    ``review=dispatch`` там, где ревью НЕЧЕМ добыть, — не «попробуем», а
     гарантированный отказ на КАЖДОЙ сдаче. Отказать на записи дешевле: тут
     есть кому прочитать причину.
+
+    #1188: «нечем» перестало означать «не тот форж». До #1180 других способов
+    не было, и проверка форжа была этим вопросом целиком; после — локальный
+    ревьюер работает на любом форже, и инвариант, оставшийся на старом
+    признаке, отказывал В ЗАПИСИ политике, которую хаб уже умел ИСПОЛНЯТЬ.
+    Включить ревью на GitVerse-проекте было нельзя ни через UI, ни через API.
+    Поэтому вопрос задаётся общему читателю (review_dispatch.review_reach) —
+    тому же, которого спрашивают диспетчер и форма проекта.
 
     Инвариант, а не проверка поля, — и в этом была ошибка первой редакции
     (найдено ревью, отчёт #201). Она стояла внутри ветки ``gate_policy`` и
@@ -848,7 +855,7 @@ def _refuse_unrunnable_cloud_review(before, fields: dict) -> None:
     """
     import json as _json
 
-    from hub.services.review_dispatch import CLOUD_REVIEW_FORGES
+    from hub.services.review_dispatch import review_reach
 
     if "forge" not in fields and "gate_policy" not in fields:
         return
@@ -861,18 +868,22 @@ def _refuse_unrunnable_cloud_review(before, fields: dict) -> None:
             project_policy.gate_policy_of(before).get("review") or ""
         ).strip()
     forge_after = str(fields.get("forge") or project_policy.forge_of(before)).strip()
-    if review_after != "dispatch" or forge_after in CLOUD_REVIEW_FORGES:
+    if review_after != "dispatch":
+        return
+    reach = await review_reach(db, forge_after)
+    if reach.runnable:
         return
     raise HTTPException(
         422,
         {
-            "error": "cloud_review_forge_unsupported",
+            # Имя кода сменилось вместе со смыслом (#1188): «форж не тот» было
+            # ЕДИНСТВЕННОЙ причиной, пока способ добычи был один. Оставить
+            # старое имя значило бы назвать отказ по недостающей конфигурации
+            # проблемой форжа — то есть отправить человека чинить не то.
+            "error": "review_unrunnable_here",
             "hint": (
-                f"облачный ревьюер не работает с форжем «{forge_after}»: "
-                f"он принимает только {', '.join(CLOUD_REVIEW_FORGES)} "
-                "(проверено 31.08.2026). Уберите review=dispatch — "
-                "ключ принимает off или dispatch, и вердикт всё равно за "
-                "человеком"
+                reach.reason + ". Пока способа нет, поле review принимает только off; "
+                "вердикт в любом случае остаётся за человеком"
             ),
         },
     )
@@ -930,7 +941,7 @@ async def api_patch_project(
                 },
             )
         fields["gate_policy"] = _json.dumps(fields["gate_policy"])
-    _refuse_unrunnable_cloud_review(before, fields)
+    await _refuse_unrunnable_review(db, before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
     if fields:
