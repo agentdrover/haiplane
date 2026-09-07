@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from hub import config
@@ -702,6 +703,92 @@ async def note_completion_without_delivery(
         return None
 
 
+#: Событие, которым реестр говорит сам, не дожидаясь вопроса (#1198).
+DISCREPANCY_EVENT = "delivery_discrepancy"
+
+#: Возрастные рубежи расхождения в часах. Их немного и они редеют намеренно:
+#: рубеж — это повод сказать «это длится дольше, чем вы думали», а не
+#: расписание напоминаний. Замер, из которого выросла задача, жил 73 часа.
+AGE_BUCKETS_HOURS = (24, 72, 168)
+
+
+def _age_hours(task: dict[str, Any], prior: dict[str, Any]) -> int:
+    """Сколько часов длится расхождение — тем же счётом, что и в реестре."""
+    started = (task.get("completed_at") or "").strip() or (
+        prior.get("first_seen_at") or ""
+    ).strip()
+    if not started:
+        return 0
+    try:
+        began = datetime.strptime(started[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return 0
+    return max(int((datetime.now(UTC) - began).total_seconds() // 3600), 0)
+
+
+def _crossed_bucket(age_hours: int) -> int:
+    """Наибольший пройденный рубеж, или 0 — ни одного."""
+    passed = [b for b in AGE_BUCKETS_HOURS if age_hours >= b]
+    return max(passed) if passed else 0
+
+
+def _discrepancy_voice(
+    task: dict[str, Any], answer: dict[str, Any], prior: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Говорить ли сейчас — и что именно (#1198).
+
+    ``None`` означает молчание, и молчание здесь имеет три разные причины,
+    которые нельзя путать:
+
+    * расхождение признано человеком законным — заткнули по решению, а не по
+      усталости; строка остаётся в реестре с причиной;
+    * об этом состоянии уже сказали, и возрастной рубеж с тех пор не пройден —
+      повтор на каждом тике превращает карточку в ленту одинаковых строк, и
+      это ровно тот способ убить сигнал, от которого задача защищает;
+    * состояние вообще не повод говорить.
+
+    UNKNOWN звучит СВОИМИ словами. Сегодняшний код объявлял его текстом
+    «работа не доставлена» — то есть выдавал незнание за факт, ровно то, что
+    реестр в своей выдаче делать отказывается.
+    """
+    if (prior.get("acknowledged_at") or "").strip():
+        return None
+    state = answer["state"]
+    if state not in (PR_OPEN, UNKNOWN):
+        return None
+
+    age_hours = _age_hours(task, prior)
+    bucket = _crossed_bucket(age_hours)
+    said_state = (prior.get("alerted_state") or "").strip()
+    said_bucket = int(prior.get("alerted_age_bucket") or 0)
+    if said_state == state and bucket <= said_bucket:
+        return None
+
+    pr = answer["pr_number"]
+    where = f"PR #{pr}" if pr else "PR не закреплён"
+    aged = (
+        f"Расхождению {age_hours} ч."
+        if age_hours
+        else "Расхождение только что найдено."
+    )
+    if state == UNKNOWN:
+        text = (
+            f"Доставку подтвердить НЕ УДАЛОСЬ, и это не то же самое, что "
+            f"«не доставлено»: {answer['reason']}. Задача #{task['id']}, "
+            f"{where}. {aged} Хаб не знает ответа и не выдаёт незнание за факт "
+            f"— проверьте вручную (#1198)."
+        )
+    else:
+        text = (
+            f"Задача числится completed, но работа НЕ доставлена: "
+            f"{answer['reason']}. Задача #{task['id']}, {where}. {aged} "
+            f"Расхождение видно в списке недоставленных завершённых задач "
+            f"(#897). Если так и задумано — признайте его законным с "
+            f"причиной, и оно замолчит, оставшись в реестре (#1198)."
+        )
+    return {"text": text, "bucket": bucket, "age_hours": age_hours}
+
+
 async def scan_completed_deliveries(
     db: Any, *, lookback_days: int = 30, limit: int = 100
 ) -> list[dict[str, Any]]:
@@ -727,11 +814,8 @@ async def scan_completed_deliveries(
         task_id = int(task["id"])
         try:
             answer = await task_delivery(db, task)
-            prior = await repo.get_delivery_discrepancy(db, task_id)
-            already = (prior or {}).get("alerted_state") or ""
-            should_alert = answer["state"] in (PR_OPEN, UNKNOWN) and (
-                already != answer["state"]
-            )
+            prior = await repo.get_delivery_discrepancy(db, task_id) or {}
+            voice = _discrepancy_voice(task, answer, prior)
             await repo.record_delivery_discrepancy(
                 db,
                 task_id=task_id,
@@ -739,17 +823,28 @@ async def scan_completed_deliveries(
                 reason=answer["reason"],
                 pr_number=answer["pr_number"],
                 delivery_path=answer["delivery_path"],
-                alerted_state=(answer["state"] if should_alert else None),
+                alerted_state=(answer["state"] if voice else None),
+                alerted_age_bucket=(voice["bucket"] if voice else None),
             )
-            if should_alert:
-                await repo.add_task_update(
+            if voice:
+                await repo.add_task_update(db, task_id, "hub", "alert", voice["text"])
+                # #1198: the alert lands on the card of a task that is already
+                # completed — a page nobody returns to, which is exactly how
+                # #1138 sat unread. The events feed is the channel that WAKES
+                # someone (hub_wait_events, the stop hook), and the acceptance
+                # path next door has always written one. The sweep, which is
+                # the half that finds discrepancies on its own, wrote none.
+                await repo.insert_event(
                     db,
-                    task_id,
-                    "hub",
-                    "alert",
-                    f"Задача числится completed, но работа не доставлена: "
-                    f"{answer['reason']}. Расхождение видно в списке "
-                    "недоставленных завершённых задач (#897).",
+                    kind=DISCREPANCY_EVENT,
+                    task_id=task_id,
+                    actor="hub",
+                    payload={
+                        "state": answer["state"],
+                        "pr": answer["pr_number"],
+                        "age_hours": voice["age_hours"],
+                        "reason": answer["reason"],
+                    },
                 )
                 await db.commit()
             if answer["state"] == PR_OPEN:

@@ -1639,6 +1639,17 @@ class TaskDependencies(BaseModel):
     unblocks: list[TaskDependencyRef] = Field(default_factory=list)
 
 
+class DeliveryAcknowledgement(BaseModel):
+    """Признание расхождения доставки законным (#1198).
+
+    ``min_length=3`` на причине — не вежливость, а сама суть: признание без
+    причины есть выключатель, которым первый же неудобный сигнал глушится
+    молча. Схема отвергает пустое до того, как оно доедет до базы.
+    """
+
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+
 class DeployCallback(BaseModel):
     """What CI reports after a deploy attempt (#495).
 

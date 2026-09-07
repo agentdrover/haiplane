@@ -4253,6 +4253,7 @@ async def record_delivery_discrepancy(
     disposition: str | None = None,
     accepted_via: str | None = None,
     alerted_state: str | None = None,
+    alerted_age_bucket: int | None = None,
 ) -> None:
     """Store the latest answer about one task's delivery.
 
@@ -4279,6 +4280,8 @@ async def record_delivery_discrepancy(
             disposition   = COALESCE(?, delivery_discrepancies.disposition),
             accepted_via  = COALESCE(?, delivery_discrepancies.accepted_via),
             alerted_state = COALESCE(?, delivery_discrepancies.alerted_state),
+            alerted_age_bucket =
+                COALESCE(?, delivery_discrepancies.alerted_age_bucket),
             checked_at    = datetime('now')
         """,
         (
@@ -4293,9 +4296,44 @@ async def record_delivery_discrepancy(
             disposition,
             accepted_via,
             alerted_state,
+            alerted_age_bucket,
         ),
     )
     await db.commit()
+
+
+async def acknowledge_delivery_discrepancy(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    by: str,
+    reason: str,
+) -> bool:
+    """Признать расхождение законным: замолкает, но остаётся видимым (#1198).
+
+    Возвращает False, если строки нет или причина пуста. Пустую причину
+    отвергает СХЕМА вызова, а не совесть вызывающего: признание без причины —
+    это выключатель, а он превращает механизм в способ глушить неудобное.
+    Ровно тот риск назван в постановке, и держать его комментарием мало.
+
+    Запись не удаляется и состояние не подменяется: реестр по-прежнему
+    показывает расхождение, к нему лишь приписано, кто и почему считает его
+    законным. Заткнуть можно, стереть нельзя.
+    """
+    if not (reason or "").strip():
+        return False
+    cur = await db.execute(
+        """
+        UPDATE delivery_discrepancies
+           SET acknowledged_at = datetime('now'),
+               acknowledged_by = ?,
+               ack_reason = ?
+         WHERE task_id = ?
+        """,
+        ((by or "").strip(), reason.strip(), task_id),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
 
 
 async def get_delivery_discrepancy(
@@ -4342,6 +4380,7 @@ async def list_delivery_discrepancies(
         SELECT
             d.task_id, d.pr_number, d.state, d.reason, d.delivery_path,
             d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
+            d.acknowledged_at, d.acknowledged_by, d.ack_reason,
             t.title, t.status, t.completed_at, t.human_owner, t.assigned_agent,
             CAST(
                 (julianday('now') - julianday(
