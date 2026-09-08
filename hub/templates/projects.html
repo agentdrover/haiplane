@@ -178,7 +178,17 @@
                 </form>
                 {% endif %}
             </div>
-            <details class="project-admin-edit">
+            {% if project_error_id == c.project.id %}
+            {# #1188: отказ живёт у формы, которую отклонили, а не последним
+               блоком страницы под всеми карточками — там его не видят.
+               Форма при этом открыта: схлопнувшаяся после редиректа, она
+               показывала прежние значения и читалась как «ничего не
+               произошло». #}
+            <div class="task-action-note task-action-note--warning project-error-note">
+                {{ project_error }}
+            </div>
+            {% endif %}
+            <details class="project-admin-edit" {% if project_error_id == c.project.id %}open{% endif %}>
                 <summary class="project-edit-summary">Изменить</summary>
                 <form method="post" action="/projects/{{ c.project.id }}/web-edit" class="task-action-stack project-form">
                     <label class="task-action-label">Name</label>
@@ -199,12 +209,27 @@
                     <textarea name="default_branch_policy" class="task-action-control task-action-textarea">{{ c.project.default_branch_policy if c.project.default_branch_policy and c.project.default_branch_policy != '{}' else '' }}</textarea>
                     {# #805: запуск ревьюера — не автопилот гейта, а его топливо:
                        вердикт остаётся человеку. Поэтому селект доступен и
-                       проекту default, замок #743 он не ослабляет. #}
+                       проекту default, замок #743 он не ослабляет.
+
+                       #1188: dispatch предлагается только там, где ревью есть
+                       чем добыть — облаком по форжу или локальным ревьюером
+                       (#1180). Где нечем, пункта нет, а рядом стоит причина:
+                       молча убранный выбор — такой же обман, как выбор без
+                       исполнения. Сохранённое значение показывается выбранным
+                       в любом случае (#1163): сужение перечня не имеет права
+                       превращаться в ложь о сохранённом. #}
+                    {% set reach = review_reach.get(c.project.id) %}
+                    {% set stored_review = c.project.gate_policy.get('review') %}
                     <label class="task-action-label">Агентское ревью на сдаче (вердикт остаётся человеку)</label>
                     <select name="gate_policy_review" class="task-action-control">
-                        <option value="off" {% if c.project.gate_policy.get('review') != 'dispatch' %}selected{% endif %}>off — ревьюера не запускать</option>
-                        <option value="dispatch" {% if c.project.gate_policy.get('review') == 'dispatch' %}selected{% endif %}>dispatch — хаб зовёт кросс-модельного ревьюера</option>
+                        <option value="off" {% if stored_review != 'dispatch' %}selected{% endif %}>off — ревьюера не запускать</option>
+                        {% if (reach and reach.runnable) or stored_review == 'dispatch' %}
+                        <option value="dispatch" {% if stored_review == 'dispatch' %}selected{% endif %}>dispatch — хаб зовёт кросс-модельного ревьюера</option>
+                        {% endif %}
                     </select>
+                    {% if reach and not reach.runnable %}
+                    <span class="project-admin-note">dispatch недоступен: {{ reach.reason }}</span>
+                    {% endif %}
                     {# #926: релизная политика — тоже не автопилот гейта:
                        содержимое релиза одобрено по задачам, а мерж develop→main
                        решений не принимает (#812). Поэтому селект доступен всем
@@ -275,7 +300,10 @@
 </details>
 {% endif %}
 
-{% if project_error %}
+{# Общая нота осталась для отказов, у которых проекта нет: форма создания и
+   разбор адреса. Отказ, привязанный к проекту, печатается у его карточки
+   (#1188) — здесь он был бы вторым экземпляром того же текста. #}
+{% if project_error and not project_error_id %}
 <div class="task-action-note task-action-note--warning project-error-note">
     {{ project_error }}
 </div>
