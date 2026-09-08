@@ -889,3 +889,108 @@ async def test_a_stranded_task_built_on_top_of_us_does_not_block_us(
         "мы основание: ждать нечего и решать нечего, мержимся первыми"
     )
     assert g.merge_pr.await_count == 1
+
+
+async def test_a_stranded_base_outranks_an_undetermined_order(
+    db: aiosqlite.Connection,
+) -> None:
+    """Порядок двух проверок — решение, а не случайность, и оно закреплено.
+
+    Найдено измерением test-adequacy: оба теста выше фиксируют ancestry в
+    head_is_descendant, то есть проверяют лишь один из двух путей к этому
+    исходу. Между тем застрявшее основание вполне может стоять с любым
+    отношением — например указывать на тот же коммит. Если порядок проверок
+    когда-нибудь поменяют местами, читатель получит «порядок мержа из истории
+    не следует» вместо «ждать нечего, основание принято без доставки»: совет
+    установить порядок там, где никакой порядок не поможет.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="same_tip")
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "Ждать нечего" in body
+    assert "порядок мержа из истории не следует" not in body, (
+        "у ветки, которую не доставят, порядок называть незачем"
+    )
+
+
+async def test_the_advisory_walk_does_not_see_stranded_bases(
+    db: aiosqlite.Connection,
+) -> None:
+    """Единственная граница между двумя вопросами — и она была без теста.
+
+    Застрявшие основания подмешиваются в обход ТОЛЬКО когда передан перечень
+    статусов, то есть только на пути доставки. Advisory-потребители (сдача и
+    бриф ревью) спрашивают другое — «работает ли кто-то поверх меня прямо
+    сейчас», — и задача, которую уже приняли, к этому вопросу не относится.
+    Снятие условия протащило бы её в подсказку человеку, и ни один из тестов
+    выше этого бы не заметил: все они идут через гейт доставки.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+    from hub.services import orchestration as orch
+
+    _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+    task = dict(await repo.get_task(db, task_id))
+
+    advisory = await orch.assess_branch_stacking(db, task_id, task["branch"] or "")
+    delivery = await orch.assess_branch_stacking(
+        db,
+        task_id,
+        task["branch"] or "",
+        statuses=orch.STACK_DELIVERY_STATUSES,
+    )
+
+    assert advisory.outcome == orch.STACK_CLEAR, (
+        "принятая задача не входит в вопрос «кто работает поверх меня»"
+    )
+    assert advisory.as_advisory() is None
+    assert delivery.outcome == orch.STACK_STACKED, (
+        "тот же обход на пути доставки её видит — иначе тест выше проходил бы "
+        "по причине, не имеющей отношения к границе"
+    )
+    assert delivery.base_can_deliver_itself is False
+
+
+async def test_a_nearer_ordinary_base_does_not_mask_a_stranded_one(
+    db: aiosqlite.Connection,
+) -> None:
+    """Обход отвечает первой найденной стопкой, значит порядок и есть приоритет.
+
+    Трёхуровневая стопка: под текущей задачей ветка A (в review, доставится
+    сама), а под A — ветка B, которую человек принял без доставки. Ветка
+    текущей задачи транзитивно содержит немерженные коммиты обеих. Пока
+    застрявшие строки шли в конце списка, ответом становилась A: читатель
+    получал «ждём доставки #A» — молчаливый повтор, — а под ним лежало
+    основание, которого не дождётся никто.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    ordinary = await _base_task_in_review(db, "task-A/still-in-review")
+    stranded = await _stranded_base(db, "task-B/accepted-never-delivered")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert task["status"] == "needs_decision", (
+        "нижнее основание не доставится никогда — это вопрос, а не ожидание"
+    )
+    assert f"#{stranded}" in body
+    assert f"Ждём доставки #{ordinary}" not in body, (
+        "ближнее основание не должно закрывать собой то, которого не дождаться"
+    )
