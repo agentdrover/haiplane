@@ -320,6 +320,13 @@
            выключатель, а не решение. #}
         <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
               class="inbox-item-actions inbox-ack-form">
+            {# Фильтр проекта переживает нажатие — так же, как его переживает
+               batch-approve выше и ссылка «Разобрать» ниже. Без этого поля
+               человек, разбирающий расхождения по одному проекту, после
+               каждого признания оказывается в общем списке и ищет следующую
+               строку заново (#1210). Слаг едет как ДАННЫЕ, а не как адрес:
+               обработчик подставляет его в один известный путь. #}
+            <input type="hidden" name="return_project" value="{{ filter_project or '' }}">
             <input type="text" name="reason" required minlength="3" maxlength="1000"
                    class="inbox-ack-reason"
                    placeholder="Почему это законно — без причины не признать">

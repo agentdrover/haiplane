@@ -782,3 +782,108 @@ async def test_a_settled_row_hears_about_a_new_fact_once_and_not_on_every_thresh
         await _age(db, task_id, hours)
         await scan_completed_deliveries(db)
     assert len(await _alerts(db, task_id)) == after_news, await _alerts(db, task_id)
+
+
+# ---- #1210: разбор списком не теряет список ----
+
+
+async def test_acknowledging_keeps_the_project_filter(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Фильтр проекта переживает признание (#1210, AC-1).
+
+    Расхождения разбирают списком, и фильтр в нём несущий: возврат на голый
+    "/" отправлял человека в общий перечень, где следующую строку надо искать
+    заново. Соседние действия того же инбокса это уже умеют — batch-approve
+    везёт проект скрытым полем, ссылка «Разобрать» кладёт его в адрес.
+    """
+    await db.execute("INSERT INTO projects (id, slug, name) VALUES (1, 'alpha', 'A')")
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    await db.execute("UPDATE tasks SET project_id=1 WHERE id=?", (task_id,))
+    await db.commit()
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    page = await client.get("/partials/inbox?project=alpha")
+    assert "web-acknowledge-delivery" in page.text, (
+        "строка видна под фильтром — иначе тест проверяет пустоту"
+    )
+    assert 'name="return_project" value="alpha"' in page.text, (
+        "форма обязана знать, из какого вида её нажали"
+    )
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={
+            "reason": "PR держим открытым до релиза платы",
+            "return_project": "alpha",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/?project=alpha", (
+        "возврат в тот же отфильтрованный вид, а не в общий список"
+    )
+
+
+async def test_acknowledging_without_a_filter_still_lands_on_the_board(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Без фильтра поведение прежнее — и без пустого ?project= в адресе (#1210, AC-2)."""
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": "PR держим открытым до релиза платы", "return_project": "  "},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/", (
+        "пустой фильтр не становится пустым параметром: адрес прежний"
+    )
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["acknowledged_at"], "признание записано и без фильтра"
+
+
+async def test_the_project_field_steers_the_redirect_and_nothing_else(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Поле приходит от клиента и не смеет быть ничем, кроме адреса (#1210, AC-3).
+
+    Два разных вопроса, и оба обязаны иметь ответ «нет». Первый: может ли
+    подменённое значение увести на чужой хост — слаг подставляется в один
+    известный путь и экранируется, поэтому не может. Второй: может ли оно
+    сменить строку, которую признают, — запись идёт по task_id из адреса
+    маршрута, а не по чему-либо из формы.
+    """
+    mine = await _completed_task(db, client, title="Left open", pr=444)
+    other = await _completed_task(db, client, title="Someone else", pr=445)
+    _pr_states(monkeypatch, {444: "open", 445: "open"})
+    await scan_completed_deliveries(db)
+
+    resp = await client.post(
+        f"/tasks/{mine}/web-acknowledge-delivery",
+        data={
+            "reason": "PR держим открытым до релиза платы",
+            "return_project": "//evil.example/steal",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    where = resp.headers["location"]
+    assert where.startswith("/?project="), "адрес возврата остаётся внутренним"
+    assert "/" not in where[len("/?project=") :], (
+        "слаг едет экранированным ЦЕЛИКОМ: он данные, а не кусок пути"
+    )
+
+    assert (await repo.get_delivery_discrepancy(db, mine))["acknowledged_at"], (
+        "признана строка из адреса маршрута"
+    )
+    assert not (
+        (await repo.get_delivery_discrepancy(db, other))["acknowledged_at"] or ""
+    ), "поле формы не выбирает, чью строку признать"
