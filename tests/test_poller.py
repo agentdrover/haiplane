@@ -3030,6 +3030,10 @@ async def test_headless_delivery_holds_while_the_base_branch_is_unmerged(db):
             outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
         )
     )
+    # Сценарий этого теста — «наша ветка СТОИТ НА основании», а это ровно то,
+    # что называет ancestry. Без неё исход был бы «порядок не выводится», то
+    # есть другой случай и другой тест.
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
     plugins.git_ops = g
     plugins.dispatch = _dispatch_with({"status": "completed", "exit_code": 0})
 
@@ -3043,3 +3047,65 @@ async def test_headless_delivery_holds_while_the_base_branch_is_unmerged(db):
     body = " ".join(u.get("content") or "" for u in updates)
     assert f"#{base_id}" in body, "в ленте названо, какой задачи ждут"
     assert "task-1175/image-capture" in body
+
+
+async def test_headless_delivery_calls_a_human_when_waiting_cannot_help(db):
+    """Не всякий отказ — ожидание, и безголовый путь это упускал.
+
+    Найдено облачным ревьюером. Комментарий, стоявший здесь, говорил «стопка
+    это ожидание» — верно, пока удержание было единственным исходом. Рядом
+    появились два, которые зовут ЧЕЛОВЕКА (порядок, который ancestry назвать
+    не может; основание, которое никто не доставит), а ветка продолжала
+    считать молчаливым повтором любой из них. То есть на этом конвейере
+    дедлок, ради предотвращения которого разведение и заведено, возвращался
+    целиком, а лента при этом говорила «ждём» о том, чего не дождаться.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+
+    task_id = await _make_review_task(db)
+    await repo.record_review_verdict(db, task_id, "approved")
+    await repo.update_task(db, task_id, pr_number=77, branch="task-X/ours")
+    base_id = await repo.create_task(
+        db,
+        title="Same commit under another name",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="review",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, base_id, branch="task-Y/same-tip")
+    await db.commit()
+
+    g = NoopGitOps()
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_pass")
+    )
+    g.merge_pr = AsyncMock(return_value=True)
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+        )
+    )
+    # Порядок мержа из истории не следует — ждать нечего и некого.
+    g.branch_ancestry = AsyncMock(return_value="same_tip")
+    plugins.git_ops = g
+    plugins.dispatch = _dispatch_with({"status": "completed", "exit_code": 0})
+
+    with patch("hub.poller.services.maybe_destroy_vast", new_callable=AsyncMock):
+        await _sweep_review(db)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "молчаливое ожидание здесь не кончится ничем — нужен человек"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "Ожидание здесь ничего не решит" in body
+    assert "Доставка отложена" not in body, "это не отложенная доставка"

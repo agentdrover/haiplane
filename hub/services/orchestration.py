@@ -1963,6 +1963,11 @@ STACK_DELIVERY_STATUSES = [
     "ci_check",
     "fix_requested",
     "needs_decision",
+    # Found by the dispatched cross-model review: the same door as
+    # needs_decision, and missed for the same reason — the list was written
+    # from the statuses I had in mind rather than from the enum. A task
+    # waiting to report owns a pushed branch like any other.
+    "pending_report",
 ]
 
 

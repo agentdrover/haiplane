@@ -639,3 +639,62 @@ async def test_being_someones_base_does_not_excuse_standing_on_someone_else(
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     body = " ".join(u.get("content") or "" for u in updates)
     assert f"#{real_base.id}" in body, "названо то основание, что под нами"
+
+
+async def test_every_status_in_the_delivery_list_is_actually_seen(
+    db: aiosqlite.Connection,
+) -> None:
+    """Перечень статусов проверяется целиком, а не одним членом.
+
+    Мутационная проверка показала дыру: удаление pending_report из перечня не
+    роняло ни одного теста. То есть список рос от правки к правке, а держало
+    его только моё внимание — ровно то, что правило «правишь член множества —
+    проверь всё множество» и запрещает. Тест перебирает КАЖДЫЙ член, поэтому
+    удаление любого из них теперь видно.
+
+    Сам pending_report найден облачным ревьюером: та же дверь, что
+    needs_decision, и упущена по той же причине — список писался из тех
+    статусов, что были в голове, а не из перечисления.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+    from hub.services.orchestration import STACK_DELIVERY_STATUSES
+
+    # Перечень выписан ЗДЕСЬ, а не взят из проверяемого кода. Первая версия
+    # этого теста перебирала сам STACK_DELIVERY_STATUSES — и удаление члена
+    # меняло разом и код, и тест, поэтому мутация его не роняла. Тест,
+    # сверяющий код с самим собой, зелен по построению и не держит ничего.
+    expected = (
+        "running",
+        "review",
+        "ci_check",
+        "fix_requested",
+        "needs_decision",
+        "pending_report",
+    )
+    assert set(STACK_DELIVERY_STATUSES) == set(expected), (
+        "член добавлен или убран — решение осознанное, значит и здесь его надо "
+        "назвать, а не унаследовать молча"
+    )
+
+    for status in expected:
+        g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+        g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+        task_id = await _approved_pair_task(db)
+        base_id = await _base_task_in_review(db, f"task-base/{status}")
+        await repo.update_task(db, base_id, status=status)
+        await db.commit()
+
+        await _report_done(db, task_id)
+
+        g.merge_pr.assert_not_awaited()
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        body = " ".join(u.get("content") or "" for u in updates)
+        assert f"#{base_id}" in body, (
+            f"основание в статусе {status} владеет несмерженной веткой, "
+            f"и условие обязано его видеть"
+        )
+        # Обе строки — из перечня кандидатов долой, иначе следующий круг
+        # ответит основанием предыдущего и проверит тот же статус заново.
+        await repo.update_task(db, base_id, status="completed", branch="")
+        await repo.update_task(db, task_id, status="completed", branch="")
+        await db.commit()
