@@ -816,24 +816,20 @@ async def scan_completed_deliveries(
             answer = await task_delivery(db, task)
             prior = await repo.get_delivery_discrepancy(db, task_id) or {}
             voice = _discrepancy_voice(task, answer, prior)
-            await repo.record_delivery_discrepancy(
-                db,
-                task_id=task_id,
-                state=answer["state"],
-                reason=answer["reason"],
-                pr_number=answer["pr_number"],
-                delivery_path=answer["delivery_path"],
-                alerted_state=(answer["state"] if voice else None),
-                alerted_age_bucket=(voice["bucket"] if voice else None),
-            )
             if voice:
+                # Сказать РАНЬШЕ, чем пометить сказанным. record_... коммитит,
+                # и в прежнем порядке упавшая запись голоса оставляла строку
+                # уже помеченной: сигнал терялся навсегда, потому что второй
+                # попытки правило не даёт (#1198, находка ревью). Теперь обе
+                # записи голоса и отметка о нём укладываются в один коммит —
+                # либо сказано и помечено, либо не случилось ничего.
                 await repo.add_task_update(db, task_id, "hub", "alert", voice["text"])
-                # #1198: the alert lands on the card of a task that is already
-                # completed — a page nobody returns to, which is exactly how
-                # #1138 sat unread. The events feed is the channel that WAKES
-                # someone (hub_wait_events, the stop hook), and the acceptance
-                # path next door has always written one. The sweep, which is
-                # the half that finds discrepancies on its own, wrote none.
+                # Алерт ложится на карточку УЖЕ ЗАКРЫТОЙ задачи — страницу, на
+                # которую не возвращаются, и именно так #1138 осталась
+                # непрочитанной. Лента событий — канал, который БУДИТ
+                # (hub_wait_events, Stop-хук); соседний путь ручного принятия
+                # событие писал всегда, а свип — половина, которая находит
+                # расхождения сама, — не писал ни одного.
                 await repo.insert_event(
                     db,
                     kind=DISCREPANCY_EVENT,
@@ -846,7 +842,16 @@ async def scan_completed_deliveries(
                         "reason": answer["reason"],
                     },
                 )
-                await db.commit()
+            await repo.record_delivery_discrepancy(
+                db,
+                task_id=task_id,
+                state=answer["state"],
+                reason=answer["reason"],
+                pr_number=answer["pr_number"],
+                delivery_path=answer["delivery_path"],
+                alerted_state=(answer["state"] if voice else None),
+                alerted_age_bucket=(voice["bucket"] if voice else None),
+            )
             if answer["state"] == PR_OPEN:
                 found.append({"task_id": task_id, **answer})
         except Exception:  # noqa: BLE001 - one bad row must not stop the sweep

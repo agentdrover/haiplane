@@ -905,7 +905,13 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         # #897: a completed task with an open PR belongs in the count the owner
         # glances at. Left out of it, the section would be a thing you only see
         # if you already scrolled to where you were not looking.
-        + len(inbox["undelivered"])
+        #
+        # #1198: acknowledged rows are excluded. They stay in the section — the
+        # record is never erased — but a discrepancy the owner has already
+        # judged legitimate must not keep pushing the badge up: a counter that
+        # never returns to zero is a counter nobody reads, which is the exact
+        # death this task exists to prevent.
+        + len([d for d in inbox["undelivered"] if not (d.get("acknowledged_at") or "")])
     )
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session

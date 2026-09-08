@@ -274,13 +274,14 @@
 {% if undelivered %}
 <section class="inbox-group inbox-undelivered">
     <h3 class="inbox-group-title">
-        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ undelivered|length }}</span>
+        {% set unacked = undelivered | rejectattr("acknowledged_at") | list %}
+        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ unacked|length }}</span>
     </h3>
     {% for d in undelivered %}
     <article class="inbox-item" id="inbox-undelivered-{{ d.task_id }}">
         <div class="inbox-item-header">
             <a href="/tasks/{{ d.task_id }}" class="inbox-item-link">#{{ d.task_id }} {{ d.title[:60] }}{% if d.title|length > 60 %}…{% endif %}</a>
-            <span class="badge badge-failed">PR #{{ d.pr_number }} открыт</span>
+            <span class="badge {% if d.acknowledged_at %}badge-muted{% else %}badge-failed{% endif %}">PR #{{ d.pr_number }} открыт</span>
         </div>
         <div class="inbox-item-meta">
             расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}

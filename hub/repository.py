@@ -4315,8 +4315,8 @@ async def record_delivery_discrepancy(
         """
         INSERT INTO delivery_discrepancies
             (task_id, pr_number, state, reason, delivery_path,
-             disposition, accepted_via, alerted_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             disposition, accepted_via, alerted_state, alerted_age_bucket)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id) DO UPDATE SET
             pr_number     = excluded.pr_number,
             state         = excluded.state,
@@ -4338,6 +4338,11 @@ async def record_delivery_discrepancy(
             disposition or "",
             accepted_via or "",
             alerted_state or "",
+            # Рубеж обязан ехать и в INSERT, а не только в ветку обновления:
+            # расхождение, найденное СРАЗУ старше суток, иначе записывалось бы
+            # с нулём, и следующий свип посчитал бы рубеж непройденным и
+            # заговорил во второй раз (#1198, находка ревью).
+            alerted_age_bucket or 0,
             disposition,
             accepted_via,
             alerted_state,

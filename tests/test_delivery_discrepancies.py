@@ -276,3 +276,122 @@ async def test_the_inbox_button_refuses_an_empty_reason(
     assert resp.status_code == 422
     row = await repo.get_delivery_discrepancy(db, task_id)
     assert not (row["acknowledged_at"] or "")
+
+
+# ---- Находки машинного ревью по сдаче #1 ----
+
+
+async def test_a_discrepancy_found_already_old_speaks_once_not_twice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Расхождение, впервые увиденное УЖЕ старше рубежа, звучит один раз.
+
+    Находка ревью, severity high, и она верна: INSERT не перечислял
+    alerted_age_bucket, поэтому первая запись ложилась с нулём независимо от
+    того, какой рубеж посчитал голос. Следующий свип видел «рубеж не
+    отзвучал» и говорил второй раз. Случай не выдуманный: хаб смотрит на
+    закрытые задачи за 30 дней назад, так что первое знакомство со старым
+    расхождением — обычное дело, а не край.
+    """
+    task_id = await _completed_task(db, client, title="Old and open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await _age(db, task_id, 100)  # старше суток и старше трёх
+
+    await scan_completed_deliveries(db)
+    await scan_completed_deliveries(db)
+
+    assert len(await _events(db, task_id)) == 1, (
+        "первый же голос обязан запомнить пройденный рубеж"
+    )
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["alerted_age_bucket"] == 72, "рубеж записан тем же, что произнесён"
+
+
+async def test_a_voice_that_fails_to_land_is_not_marked_as_said(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Отметка «сказано» не должна опережать сам голос.
+
+    Находка ревью: record_delivery_discrepancy коммитит, и в прежнем порядке
+    упавшая запись события оставляла строку уже помеченной — сигнал терялся
+    навсегда, потому что второй попытки правило не даёт. Проверяется
+    поведением: ломаем запись события и смотрим, что следующий свип
+    ГОВОРИТ, а не молчит.
+    """
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+
+    boom = {"fail": True}
+    real_insert = repo.insert_event
+
+    async def flaky_insert(db_, **kw):
+        if boom["fail"] and kw.get("kind") == DISCREPANCY_EVENT:
+            raise RuntimeError("лента событий недоступна")
+        return await real_insert(db_, **kw)
+
+    monkeypatch.setattr(repo, "insert_event", flaky_insert)
+    await scan_completed_deliveries(db)  # свип не падает: строка одна из многих
+    assert await _events(db, task_id) == []
+
+    boom["fail"] = False
+    await scan_completed_deliveries(db)
+
+    assert len(await _events(db, task_id)) == 1, (
+        "неудавшийся голос не считается сказанным и повторяется"
+    )
+
+
+async def test_acknowledging_a_task_with_no_discrepancy_is_a_404(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    """Признать нечего — так и сказать, а не сделать вид, что признали.
+
+    Находка ревью: ветки отказа не исполнялись ни одним тестом. Молчаливое
+    «ок» на признание несуществующей строки — это ложное чувство, что
+    расхождение закрыто.
+    """
+    task_id = (await client.post("/api/tasks", json={"title": "No PR here"})).json()[
+        "id"
+    ]
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": "нечего признавать"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 404
+
+    api = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/acknowledge",
+        json={"reason": "нечего признавать"},
+    )
+    assert api.status_code == 404
+
+
+async def test_an_acknowledged_row_stops_pushing_the_badge(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Признанное перестаёт кричать и цветом, и счётчиком.
+
+    Находка ревью: строку было видно, но она по-прежнему считалась опасной.
+    Счётчик, который никогда не возвращается к нулю, перестают читать — то
+    есть ровно та смерть сигнала, против которой задача и заведена.
+    """
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    page = await client.get("/partials/inbox")
+    assert "badge-failed" in page.text
+
+    await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": "PR держим открытым до релиза платы"},
+        follow_redirects=False,
+    )
+
+    page = await client.get("/partials/inbox")
+    assert "badge-muted" in page.text, "это уже не тревога, а запись о решении"
+    assert 'class="inbox-count inbox-count-danger">0<' in page.text, (
+        "счётчик обязан вернуться к нулю, иначе его перестанут читать"
+    )

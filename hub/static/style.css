@@ -1478,6 +1478,10 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
 .badge-needs_decision { background: var(--red-dim); color: var(--red); }
 .badge-pending_report { background: var(--orange-dim); color: var(--orange); }
 .badge-stale { background: var(--red-dim); color: var(--red); }
+/* #1198: расхождение, признанное владельцем законным. Красный здесь был бы
+   ложью: это уже не тревога, а запись о принятом решении — но и исчезнуть
+   строка не должна, иначе тишина неотличима от забывчивости. */
+.badge-muted { background: var(--surface-hover); color: var(--text-secondary); }
 .badge-arbitration { background: var(--red-dim); color: var(--red); }
 .badge-alert { background: var(--red-dim); color: var(--red); }
 .badge-question { background: var(--yellow-dim); color: var(--yellow); }
