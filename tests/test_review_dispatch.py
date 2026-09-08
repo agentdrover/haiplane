@@ -2905,3 +2905,105 @@ async def test_the_retry_stops_at_the_cap(
         (task_id,),
     )
     assert any("не нашлось за попыток: 2" in dict(r)["content"] for r in rows)
+
+
+# --- находки ревью №269 ---------------------------------------------------
+
+
+async def test_a_top_up_does_not_adopt_the_first_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269 high: добор той же генерации — другой заказ, и метка это знает.
+
+    Лестница (#879) заказывает второго ревьюера на ТУ ЖЕ генерацию. Метка
+    без номера попытки совпала бы с первой, и сверка после оборвавшегося
+    добора подобрала бы агента дешёвого прогона: второго POST нет, но
+    судья чужой, а настоящий остался бы сиротой.
+    """
+    first = _DispatchRecorder({"agent": {"id": "bc-first"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, first)
+    task_id = await _submitted(client, db, "spike-topup-marker")
+    assert len(first.calls) == 1
+    first_marker = first.calls[0]["name"]
+
+    # Добор: POST обрывается, а в выдаче стоит агент ПЕРВОГО заказа.
+    lost = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", lost)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [{"id": "bc-first", "name": first_marker, "latestRunId": "run-1"}],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    await maybe_dispatch_review(db, task_id, force_profile="deep")
+
+    assert lost.calls, "добор вообще пробовал создать агента"
+    assert lost.calls[0]["name"] != first_marker, (
+        "метка добора обязана отличаться от метки первого заказа"
+    )
+    rows = await repo.list_active_review_dispatches(db)
+    agents = {dict(r)["agent_id"] for r in rows}
+    assert agents == {"bc-first"}, (
+        "агент первого прогона не должен стать исполнителем добора"
+    )
+
+
+async def test_the_adopted_agent_brings_its_run_id(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269: подбор без run_id — половина потери.
+
+    Без него свип бьёт в /v1/agents/{id}/runs/ с пустым хвостом: не видит
+    статус, не восстанавливает отчёт из текста прогона и не ставит расход.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [
+                {
+                    "id": "bc-adopted",
+                    "name": recorder.calls[0]["name"],
+                    "latestRunId": "run-adopted",
+                }
+            ],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    await _submitted(client, db, "spike-adopt-runid")
+
+    row = dict((await repo.list_active_review_dispatches(db))[0])
+    assert row["agent_id"] == "bc-adopted"
+    assert row["run_id"] == "run-adopted", "идентификатор прогона едет с агентом"
+
+
+async def test_a_body_of_the_wrong_shape_is_not_an_empty_answer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269: чужая форма ответа — «не смог спросить», а не «агента нет».
+
+    page.get('items') or [] на теле без items давал пустой обход и в конце
+    подтверждённую пустоту, которая разрешает купить второго агента. Это
+    ровно #762 в новом месте: отсутствие данных снова стало бы значением.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        return {"agents": [], "next": ""}  # схема беты изменилась
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(client, db, "spike-wrong-shape")
+
+    assert len(recorder.calls) == 1, "на нечитаемой сверке второго POST быть не должно"
+    assert not await repo.list_active_review_dispatches(db)
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"

@@ -288,3 +288,44 @@ async def test_the_name_reaches_the_request_body(monkeypatch, _configured):
         "без метки поля быть не должно: пустое имя обещало бы подбор, "
         "которого никто не делает"
     )
+
+
+async def test_creating_an_agent_waits_longer_than_a_plain_call(monkeypatch):
+    """#269: у создания свой срок — наблюдённые 59 секунд против общих 30.
+
+    Брошенный на тридцатой секунде запрос всё равно создавал агента, и хаб
+    терял его идентификатор. Отдельный срок убирает большую часть таких
+    случаев до всякой сверки.
+    """
+    seen: dict[str, float] = {}
+
+    async def _capture(method, path, json_body=None, timeout=cursor_cloud._TIMEOUT):
+        seen["timeout"] = timeout
+        return {"agent": {"id": "bc-1"}}, None
+
+    monkeypatch.setattr(cursor_cloud, "_attempt", _capture)
+    await cursor_cloud.create_agent_attempt(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id="grok-4",
+        prompt_text="review",
+        hub_mcp_url="https://agenthai.ru/mcp",
+        reviewer_token="t",
+    )
+
+    assert seen["timeout"] == cursor_cloud._CREATE_TIMEOUT
+    assert cursor_cloud._CREATE_TIMEOUT > cursor_cloud._TIMEOUT, (
+        "срок создания обязан быть больше общего, иначе разделение бессмысленно"
+    )
+
+
+async def test_the_marker_separates_a_top_up_from_the_first_order():
+    """#269: номер попытки входит в метку.
+
+    Без него добор той же генерации неотличим от первого заказа, и сверка
+    подберёт чужого судью.
+    """
+    first = cursor_cloud.agent_marker("review", 1199, 1, 1)
+    top_up = cursor_cloud.agent_marker("review", 1199, 1, 2)
+    assert first != top_up
+    assert cursor_cloud.agent_marker("review", 1199, 1, 1) == first

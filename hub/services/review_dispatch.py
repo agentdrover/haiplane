@@ -1251,6 +1251,28 @@ def _lost_call_detail(started: _Started) -> str:
     return "ответ провайдера не содержал идентификатора агента"
 
 
+async def _attempt_ordinal(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """Какой это по счёту заказ ревью на эту сдачу (#269).
+
+    Метка без номера попытки не различала бы добор лестницы (#879): он
+    заказывает ВТОРОГО ревьюера на ту же генерацию, то есть под тем же
+    именем. Сверка после оборвавшегося добора подобрала бы агента первого,
+    дешёвого прогона — чужого судью вместо своего.
+
+    Считается по строкам, которые хаб уже завёл, а не по счётчику в памяти:
+    после перезапуска счётчик начался бы заново, а строки остаются.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=?",
+        (task_id, generation),
+    )
+    return int(dict(rows[0]).get("n") or 0) + 1 if rows else 1
+
+
 async def _create_or_adopt(
     marker: str,
     *,
@@ -1304,6 +1326,11 @@ async def _create_or_adopt(
             break
         if seen.agent_id:
             agent_id = seen.agent_id
+            # Идентификатор прогона забирается вместе с агентом (#269):
+            # без него свип не видит статус, не восстанавливает отчёт из
+            # текста прогона и не ставит расход. Подбор половины — это не
+            # подбор, а половина потери.
+            run_id = seen.run_id or run_id
             adopted = True
             log.info(
                 "review dispatch for #%s: answer lost, agent %s adopted",
@@ -1486,7 +1513,12 @@ async def maybe_dispatch_review(
         _delivery_block(task_id, reviewer_code, hub_base),
     )
     started = await _create_or_adopt(
-        cursor_cloud.agent_marker("review", task_id, generation),
+        cursor_cloud.agent_marker(
+            "review",
+            task_id,
+            generation,
+            await _attempt_ordinal(db, task_id, generation),
+        ),
         task_id=task_id,
         repo_url=forge_urls.repo_url(forge, gh_repo),
         starting_ref=branch,
