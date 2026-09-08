@@ -26,6 +26,7 @@ from hub.services.steward_dispatch import (
     REFUSED_MODE_OFF,
     REFUSED_NO_GENERATION,
     REFUSED_NO_NEW_INFORMATION,
+    RUN_JUDGED,
     RUN_OPEN,
     RUN_REFUSED,
     RUN_SUPERSEDED,
@@ -92,6 +93,48 @@ async def _submitted_task(
 async def _events(db: aiosqlite.Connection, kind: str) -> list[dict]:
     rows = await fetchall(db, "SELECT * FROM events WHERE kind=?", (kind,))
     return [dict(r) for r in rows]
+
+
+async def _started(db: aiosqlite.Connection, run_id: int, agent: str = "bc-1") -> None:
+    """Отметить прогон начатым так же, как это делает захват слота.
+
+    Стоял ниже, у тестов #1181; поднят сюда, когда тот же признак понадобился
+    #1201 — помощник, употребляемый за тысячу строк до своего определения,
+    работает и читается неверно.
+    """
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=?",
+        (agent, "run-1", run_id),
+    )
+    await db.commit()
+
+
+async def _verdict(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    actor: str = "policy",
+    verdict: str = "approved",
+) -> None:
+    """Вердикт так, как он ложится в жизни: строка задачи И запись в ленте.
+
+    Автора помнит только лента (#1201): в строке задачи его нет вовсе.
+    """
+    await repo.update_task(
+        db,
+        task_id,
+        review_verdict=verdict,
+        review_verdict_generation=generation,
+    )
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor=actor,
+        payload={"verdict": verdict, "submission_generation": generation},
+    )
+    await db.commit()
 
 
 async def test_review_entry_orders_one_run(db: aiosqlite.Connection):
@@ -218,10 +261,14 @@ async def test_hung_run_closes_on_timeout(db: aiosqlite.Connection):
 
 
 async def test_human_verdict_closes_slot(db: aiosqlite.Connection):
-    """#1073 AC-6: человеческий вердикт на эту генерацию закрывает слот.
+    """#1073 AC-6: вердикт на эту генерацию закрывает НЕНАЧАТЫЙ слот.
 
-    Человек всегда старше: суждение, пришедшее после него, получает 409 по
-    контракту F1, а слот, ради которого его ждали, больше ничего не ждёт.
+    Заказ, за который ещё не платили, снимать не жалко: ждали его ради
+    решения, а решение состоялось.
+
+    Начатый прогон с #1201 живёт дальше, и суждение после вердикта не
+    отвергается — ни здесь, ни на приёме: раньше эта строка обещала ему 409,
+    которого в коде нет. Отдельные тесты обоих случаев — ниже.
     """
     project_id = await _project(db, "steward-human", steward=True)
     task_id = await _submitted_task(db, project_id)
@@ -241,6 +288,228 @@ async def test_human_verdict_closes_slot(db: aiosqlite.Connection):
     rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
     assert dict(rows[0])["status"] == RUN_SUPERSEDED
     assert await open_run(db, task_id, 1) is None
+
+
+async def test_a_started_run_outlives_the_verdict(db: aiosqlite.Connection):
+    """#1201 AC-1: начатый прогон не снимается вердиктом — он доживает до суждения.
+
+    Измерено на #1183: агент bc-060ae97b стартовал в 07:44:43, автовердикт
+    закрыл чистую сдачу в 07:47:45, слот сняли в 07:48:11. Прогон прожил три
+    минуты двадцать восемь секунд, за агента заплачено, суждение выброшено.
+
+    Выброшена при этом не только цена. В теневой фазе суждение на вердикт не
+    влияет вовсе — оно нужно надзору F7 как пара «суждение против исхода», и
+    снималось оно ровно на ЧИСТЫХ сдачах: на грязной автовердикт не
+    срабатывает и слот никто не трогает. Выборка надзора оставалась без
+    чистых сдач по устройству.
+
+    Проверяется СТАТУС строки, а не текст причины: причина — слова, статус —
+    то, доживёт ли прогон до своего суждения.
+    """
+    project_id = await _project(db, "steward-started", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _started(db, run["id"])
+    await _verdict(db, task_id, actor="policy")
+
+    closed = await close_finished_runs(db)
+
+    assert closed == 0
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    assert dict(rows[0])["status"] == RUN_OPEN
+    # Дверь пакета (#1075) спрашивает именно открытый слот: закрытый слот
+    # означал бы, что суждение не только не нужно, но и невозможно.
+    assert await open_run(db, task_id, 1) is not None
+
+
+async def test_a_started_run_still_dies_at_the_deadline(db: aiosqlite.Connection):
+    """#1201: потолок остался потолком — вечно открытых прогонов не появилось.
+
+    Граница предыдущего теста, и без неё он опасен: «не снимать вердиктом»
+    ровно на шаг отстоит от «не закрывать никогда». Закрывает дедлайн, и
+    закрывает он как таймаут — этот судья работал.
+    """
+    project_id = await _project(db, "steward-started-deadline", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _started(db, run["id"])
+    await _verdict(db, task_id, actor="policy")
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at = datetime('now', '-1 minute') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+
+    closed = await close_finished_runs(db)
+
+    assert closed == 1
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    assert dict(rows[0])["status"] == RUN_TIMEOUT
+
+
+async def test_an_unstarted_order_is_still_superseded(db: aiosqlite.Connection):
+    """#1201 AC-2: заказ, который не начинался, вердикт снимает как и раньше.
+
+    Платить за суждение по решённому вопросу незачем: агента ещё нет, и
+    сохранять здесь нечего — ни наблюдения, ни денег. Метка захвата
+    ``pending:`` к начатым не относится: это обещание заплатить, а не агент.
+    """
+    project_id = await _project(db, "steward-unstarted", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _verdict(db, task_id, actor="policy")
+
+    closed = await close_finished_runs(db)
+
+    assert closed == 1
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    assert dict(rows[0])["status"] == RUN_SUPERSEDED
+    assert await open_run(db, task_id, 1) is None
+
+
+async def test_a_claimed_but_unstarted_order_is_superseded_too(
+    db: aiosqlite.Connection,
+):
+    """#1201 AC-2, вторая половина: метка захвата — не начатый прогон.
+
+    Отдельным тестом, потому что именно здесь признак «начат» ломается тише
+    всего: непустой agent_id выглядит как работающий агент, а означает
+    захваченный слот, за который ещё не платили.
+    """
+    project_id = await _project(db, "steward-claimed", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _started(db, run["id"], agent=f"{PENDING_PREFIX}{run['id']}")
+    await _verdict(db, task_id, actor="policy")
+
+    closed = await close_finished_runs(db)
+
+    assert closed == 1
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    assert dict(rows[0])["status"] == RUN_SUPERSEDED
+
+
+async def test_a_late_judgement_is_recorded_but_changes_nothing(
+    db: aiosqlite.Connection,
+):
+    """#1201 AC-3: суждение после вердикта записывается и ничего не решает.
+
+    Ради этого прогон и оставлен жить: наблюдение доезжает до надзора. И
+    ровно поэтому же теневая фаза обязана остаться теневой — суждение,
+    пришедшее после вердикта, не повод пересмотреть решённое.
+
+    Заодно снимается допущение постановки, проверенное чтением ДО кода:
+    приём суждения не отказывает из-за уже вынесенного вердикта. Единственная
+    проверка поколения на этом пути (``pinned_generation``) отказывает только
+    на ПЕРЕСДАЧЕ, а вердикт генерацию не двигает.
+    """
+    from hub.config import TokenIdentity
+    from hub.models import StewardJudgementSubmit
+    from hub.services.steward_judgement import record_steward_judgement
+
+    project_id = await _project(db, "steward-late", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _started(db, run["id"])
+    await _verdict(db, task_id, actor="policy", verdict="approved")
+    await close_finished_runs(db)
+    before = dict(await repo.get_task(db, task_id))
+
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=1,
+            kind="verdict",
+            verdict="changes_requested",
+            confidence="high",
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+
+    judgements = await fetchall(
+        db,
+        "SELECT * FROM steward_judgements WHERE task_id=? AND generation=?",
+        (task_id, 1),
+    )
+    assert len(judgements) == 1, "наблюдение доехало до надзора"
+    assert dict(judgements[0])["verdict"] == "changes_requested"
+    after = dict(await repo.get_task(db, task_id))
+    assert after["review_verdict"] == before["review_verdict"] == "approved"
+    assert after["review_verdict_generation"] == 1
+    assert after["status"] == before["status"], "судьба сдачи не изменилась"
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    assert dict(rows[0])["status"] == RUN_JUDGED, "слот закрыт своим суждением"
+
+
+async def test_the_closing_reason_names_who_decided(db: aiosqlite.Connection):
+    """#1201 AC-4: причина снятия называет автора вердикта верно.
+
+    Правило писалось под человека, который думает часами, и говорило
+    «человеческий вердикт» всегда. На делегированном проекте решает политика
+    через минуты после сдачи — и запись приписывала решение тому, кого там
+    не было, ровно как «отказ API» в #1199.
+    """
+    project_id = await _project(db, "steward-author", steward=True)
+
+    by_policy = await _submitted_task(db, project_id)
+    policy_run = await order_run(db, by_policy, 1)
+    assert policy_run is not None
+    await _verdict(db, by_policy, actor="policy")
+
+    by_human = await _submitted_task(db, project_id)
+    human_run = await order_run(db, by_human, 1)
+    assert human_run is not None
+    await _verdict(db, by_human, actor="mrPDA")
+
+    await close_finished_runs(db)
+
+    rows = await fetchall(
+        db, "SELECT * FROM steward_runs WHERE id=?", (policy_run["id"],)
+    )
+    policy_reason = dict(rows[0])["closed_reason"]
+    assert "policy" in policy_reason
+    # Корень, а не слово: старая формулировка звучала «человеческий вердикт»,
+    # и проверка на «человек» пропустила бы ровно её — то самое враньё.
+    assert "человеч" not in policy_reason, "политика не выдаётся за человека"
+
+    rows = await fetchall(
+        db, "SELECT * FROM steward_runs WHERE id=?", (human_run["id"],)
+    )
+    human_reason = dict(rows[0])["closed_reason"]
+    assert "человек" in human_reason
+    assert "mrPDA" in human_reason
+
+
+async def test_an_unnamed_verdict_invents_no_author(db: aiosqlite.Connection):
+    """#1201 AC-4, граница: автора нечем назвать — значит его не называют.
+
+    Вердикт без записи в ленте бывает: строку задачи мог поставить путь,
+    который событие не пишет. Догадка «раз не политика, значит человек» и
+    была бы тем самым враньём, только с другой стороны.
+    """
+    project_id = await _project(db, "steward-unnamed", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await repo.update_task(
+        db, task_id, review_verdict="approved", review_verdict_generation=1
+    )
+    await db.commit()
+
+    await close_finished_runs(db)
+
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
+    reason = dict(rows[0])["closed_reason"]
+    assert dict(rows[0])["status"] == RUN_SUPERSEDED
+    assert "человеч" not in reason
+    assert "автоматика" not in reason
 
 
 async def test_project_without_the_policy_is_left_alone(db: aiosqlite.Connection):
@@ -1106,15 +1375,6 @@ async def test_an_approved_draft_releases_its_open_slot(db: aiosqlite.Connection
 # 06:50:50 с причиной «не вернул суждение». Семнадцать минут съели повторные
 # попытки старта, судье досталось двенадцать минут из тридцати — и вина
 # досталась ему же.
-
-
-async def _started(db: aiosqlite.Connection, run_id: int, agent: str = "bc-1") -> None:
-    """Отметить прогон начатым так же, как это делает захват слота."""
-    await db.execute(
-        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=?",
-        (agent, "run-1", run_id),
-    )
-    await db.commit()
 
 
 async def test_never_started_closes_as_never_started(
