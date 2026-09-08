@@ -865,20 +865,22 @@ async def test_hub_create_task_structured_content_matches_rest(
     assert "Task #99 created" in _mcp_text(out)
 
 
+REFINE_REST_TASK = {
+    "id": 42,
+    "work_type": "bug",
+    "scope_in": ["auth"],
+    "acceptance_criteria": [],
+    "risks": [],
+    "readiness_score": 70,
+    "dor_passed": False,
+}
+
+
 async def test_hub_refine_task_structured_content_matches_rest(
     mock_api_post: AsyncMock,
 ) -> None:
     # REST /refine returns the full TaskView, not an audit dict.
-    rest_task = {
-        "id": 42,
-        "work_type": "bug",
-        "scope_in": ["auth"],
-        "acceptance_criteria": [],
-        "risks": [],
-        "readiness_score": 70,
-        "dor_passed": False,
-    }
-    mock_api_post.return_value = rest_task
+    mock_api_post.return_value = dict(REFINE_REST_TASK)
     out = await hub_refine_task(42, work_type="bug", scope_in=["auth"])
     structured = _mcp_structured(out)
     assert structured is not None
@@ -887,7 +889,46 @@ async def test_hub_refine_task_structured_content_matches_rest(
     assert structured["fields_set"] == ["scope_in", "work_type"]
     assert structured["readiness_score"] == 70
     assert structured["dor_passed"] is False
-    assert structured["task"] == rest_task
+
+
+async def test_refine_omits_full_task_by_default(
+    mock_api_post: AsyncMock,
+) -> None:
+    """#711: no include_task — no task object, and the summary loses nothing."""
+    mock_api_post.return_value = dict(REFINE_REST_TASK)
+    out = await hub_refine_task(42, work_type="bug", scope_in=["auth"])
+    structured = _mcp_structured(out)
+    assert structured["task"] is None
+    # Every summary field the response carried before stays where it was.
+    assert structured["task_id"] == 42
+    assert structured["fields_set"] == ["scope_in", "work_type"]
+    assert structured["acceptance_criteria_count"] is None
+    assert structured["risks_count"] is None
+    assert structured["readiness_score"] == 70
+    assert structured["dor_passed"] is False
+    assert "Task #42 refined" in _mcp_text(out)
+    # include_task is a tool parameter, not a task field: it must not reach REST.
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"work_type": "bug", "scope_in": ["auth"]},
+    )
+
+
+async def test_refine_include_task_opt_in(
+    mock_api_post: AsyncMock,
+) -> None:
+    """#711: asked for, the full task comes back exactly as REST returned it."""
+    mock_api_post.return_value = dict(REFINE_REST_TASK)
+    out = await hub_refine_task(
+        42, work_type="bug", scope_in=["auth"], include_task=True
+    )
+    structured = _mcp_structured(out)
+    assert structured["task"] == REFINE_REST_TASK
+    assert structured["readiness_score"] == 70
+    mock_api_post.assert_awaited_once_with(
+        "/api/tasks/42/refine",
+        {"work_type": "bug", "scope_in": ["auth"]},
+    )
 
 
 async def test_hub_refine_task_reports_ac_changes_without_false_no_op(
