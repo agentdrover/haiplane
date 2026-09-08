@@ -395,3 +395,38 @@ async def test_an_acknowledged_row_stops_pushing_the_badge(
     assert 'class="inbox-count inbox-count-danger">0<' in page.text, (
         "счётчик обязан вернуться к нулю, иначе его перестанут читать"
     )
+
+
+@pytest.mark.parametrize("reason", ["   ", "  a", "\t\n "])
+async def test_whitespace_never_buys_an_acknowledgement(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    """Пробелы не проходят порог причины ни одним из двух входов.
+
+    Валидатор ревью назвал дыру точнее, чем сама находка: схема считала длину
+    ДО обрезки, поэтому три пробела проходили порог и получали 404 «строки
+    нет» — отказ, называющий не ту причину, — а «  a» записывало причину в
+    один символ. Форма в инбоксе обрезала сама, API нет: два входа в один
+    глагол вели себя по-разному, и это худший вид расхождения.
+    """
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    api = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/acknowledge", json={"reason": reason}
+    )
+    assert api.status_code == 422, "порог считается по обрезанной причине"
+
+    web = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": reason},
+        follow_redirects=False,
+    )
+    assert web.status_code == 422
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert not (row["acknowledged_at"] or ""), "пробелами расхождение не заткнуть"

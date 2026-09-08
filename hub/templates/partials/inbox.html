@@ -307,7 +307,7 @@
            выключатель, а не решение. #}
         <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
               class="inbox-item-actions inbox-ack-form">
-            <input type="text" name="reason" required maxlength="1000"
+            <input type="text" name="reason" required minlength="3" maxlength="1000"
                    class="inbox-ack-reason"
                    placeholder="Почему это законно — без причины не признать">
             <button type="submit" class="btn btn-secondary btn-xs">Признать законным</button>

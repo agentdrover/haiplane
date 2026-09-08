@@ -46,6 +46,7 @@ from hub.services.finding_identity import finding_uids
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
+    DeliveryAcknowledgement,
     DEFAULT_FORGE,
     FORGES,
     FindingDisposition,
@@ -1256,9 +1257,18 @@ async def web_acknowledge_delivery(task_id: int, request: Request):
     identity = require_human_or_admin(request)
     db = _db(request)
     form = await request.form()
-    reason = str(form.get("reason") or "").strip()
-    if not reason:
-        raise HTTPException(422, "признание без причины — выключатель, а не решение")
+    # Порог причины живёт ОДНИМ определением — в схеме. Свой strip и своя
+    # проверка здесь уже разошлись с API: форма пропускала «  a», то есть
+    # причину в один символ, а API её отвергал. Два входа в один глагол,
+    # ведущие себя по-разному, — худший вид расхождения, потому что оба
+    # выглядят рабочими (#1198, находка ревью).
+    try:
+        checked = DeliveryAcknowledgement(reason=str(form.get("reason") or ""))
+    except ValidationError as exc:
+        raise HTTPException(
+            422, "причина признания — предложение, а не пробелы"
+        ) from exc
+    reason = checked.reason
     if not await repo.acknowledge_delivery_discrepancy(
         db, task_id, by=identity.username, reason=reason
     ):
