@@ -6,8 +6,10 @@ import pytest
 from fastapi import HTTPException
 
 from hub.services.test_locator import (
+    RUNNERS,
     is_valid_test_locator,
     parse_test_locator,
+    runner_of,
     validate_test_locators,
 )
 
@@ -125,3 +127,76 @@ async def test_rejected_refine_leaves_structured_fields_untouched(client, monkey
     row = (await client.get(f"/api/tasks/{task['id']}")).json()
     assert row["problem_statement"] == "written before the rejection"
     assert row["business_value"] == ""
+
+
+# ---- The hub knows more than one test runner (#1203) ----
+
+
+def test_accepted_shape_always_has_a_resolver():
+    # AC-2. Not a style rule. Widening the accepted shape without teaching the
+    # hub to look inside that kind of file was MEASURED to be worse than
+    # refusing outright: with the shape widened alone, resolve_ac_locators
+    # answered `missing`, "locator does not match any collected test", about a
+    # test that plainly existed in the repository. An honest "I do not know
+    # this form" became a false accusation (#725, #498).
+    #
+    # So the two registries are bound together here: a runner added to RUNNERS
+    # with no entry in SOURCE_RESOLVERS fails this test rather than shipping.
+    from hub.services.test_existence import SOURCE_RESOLVERS
+
+    for runner in RUNNERS:
+        assert runner.name in SOURCE_RESOLVERS, (
+            f"runner {runner.name} is accepted by the locator shape but nothing "
+            "can look inside its files — that combination reports existing "
+            "tests as missing"
+        )
+        # The registry must also be self-consistent: an entry whose own example
+        # does not parse as its own runner would let a shape through that no
+        # resolver is ever handed.
+        assert runner_of(runner.example) == runner.name
+        assert is_valid_test_locator(runner.example)
+
+
+def test_vitest_locators_are_accepted_with_free_text_names():
+    # A vitest test name is whatever was passed to it()/test(): spaces,
+    # punctuation, non-Latin scripts. Carrying pytest's identifier rule across
+    # would reject nearly every real name while looking like a shape check.
+    assert is_valid_test_locator("src/lib/recent.test.ts::still toggles")
+    assert is_valid_test_locator("src/a.test.tsx::раскрывает подсписок")
+    assert is_valid_test_locator("src/a.spec.js::renders <Foo /> once")
+    assert runner_of("src/a.test.ts::x") == "vitest"
+    # An empty or blank node names no test, whatever the runner.
+    assert not is_valid_test_locator("src/a.test.ts::")
+    assert not is_valid_test_locator("src/a.test.ts::   ")
+    # A file no runner in the registry owns is still not a locator.
+    assert not is_valid_test_locator("docs/testing.md::some heading")
+    assert runner_of("docs/testing.md::some heading") == ""
+
+
+@pytest.mark.parametrize(
+    "value, ok",
+    [
+        ("tests/test_poller.py::test_ci_absent", True),
+        ("hub/tests/test_x.py::TestClass::test_method", True),
+        ("tests/test_a.py::test_b[param-1]", True),
+        ("tests/test_a.py::test_b[id with spaces]", True),
+        ("tests/test_a.py", False),
+        ("tests/test_a.py::", False),
+        ("test_ci", False),
+        ("some free text hint", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_python_locators_unchanged(value, ok):
+    # AC-4. Adding a second runner must be observably empty for Python
+    # projects: the same answers, and the same (path, nodeid) split. This
+    # repeats the table above on purpose — if a future change to the shared
+    # shape machinery moves a Python answer, the criterion that promised
+    # nothing would move has to fail, not the general table alone.
+    assert is_valid_test_locator(value) is ok
+    assert runner_of(value) in ("pytest", "")
+    if ok:
+        assert parse_test_locator(value) == (value.split("::", 1)[0], value)
+    else:
+        assert parse_test_locator(value) is None

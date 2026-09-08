@@ -13,10 +13,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import re
 from typing import Any
 
 from hub.process_kill import kill_process_group
-from hub.services.test_locator import parse_test_locator
+from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
 
 log = logging.getLogger("hub")
 
@@ -30,6 +31,11 @@ UNPARSEABLE = "unparseable"
 # reading the file proves only that a function by that name is written there.
 BY_COLLECTION = "test found by collection"
 BY_SOURCE = "test found in the file, read without running it"
+# Why an answer could not be given. Never merged into BY_SOURCE's silence:
+# "this runner is not one I can look into" is a fact about the hub, and a
+# reader who cannot tell it from "the test is not there" is being accused
+# on the hub's behalf (#1203).
+NO_RESOLVER = "no way to look inside a {runner} test file"
 
 _COLLECT_TIMEOUT = 90
 
@@ -98,8 +104,16 @@ def _base_nodeids(collected: set[str]) -> set[str]:
 
 
 def _wanted_name(nodeid: str) -> str:
-    """The test's own name: the last segment, minus any ``[param]`` suffix."""
-    return nodeid.split("::")[-1].split("[", 1)[0]
+    """The test's own name, read the way its runner writes names (#1203).
+
+    For pytest that is the last ``::`` segment without its ``[param]`` suffix.
+    For a runner whose test names are free text it is everything after the
+    FIRST ``::``, verbatim: a name may legitimately contain ``::`` or square
+    brackets, and pytest's trimming would quietly hunt for a different test.
+    """
+    if runner_of(nodeid) == PYTEST:
+        return nodeid.split("::")[-1].split("[", 1)[0]
+    return nodeid.split("::", 1)[1] if "::" in nodeid else nodeid
 
 
 def _defines_test(tree: ast.AST, name: str) -> int | None:
@@ -137,17 +151,40 @@ def resolve_locator_absent_file(nodeid: str) -> tuple[str, str]:
     return MISSING, f"the submission contains no file {rel}"
 
 
-def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
-    """``(status, reason)`` from the file's own text — no imports, no pytest (#764).
+# A vitest test declaration: it("name"), test('name'), it.only(`name`) and
+# the table forms, where an argument list sits between the token and the name:
+# it.each([1, 2])("name"). That optional group allows one level of nesting, so
+# a table of objects or a call inside it does not hide the name behind it.
+#
+# The quote style is captured and back-referenced, so the OTHER two quote
+# characters are ordinary text inside a name — which they are, in real suites.
+_VITEST_DECL = re.compile(
+    r"""\b(?:it|test)(?:\.\w+)*\s*"""
+    r"""(?:\((?:[^()]|\([^()]*\))*\)\s*)?"""
+    r"""\(\s*(?P<q>['"`])(?P<name>(?:\\.|(?!(?P=q)).)*)(?P=q)""",
+    re.DOTALL,
+)
 
-    The fallback for when collection cannot run: the project's dependencies
-    are not installed, the task's tree was retired, or no tree ever held this
-    branch. ``text`` is the file as of the submitted commit; ``None`` means it
-    could not be read, which is ``unknown`` and never ``missing``.
+
+def _unescape(raw: str) -> str:
+    return re.sub(r"\\(.)", r"\1", raw)
+
+
+def _declares_vitest_test(text: str, name: str) -> int | None:
+    """Line where a vitest test called ``name`` is declared, or ``None``.
+
+    The counterpart of :func:`_defines_test`, and deliberately no stronger: it
+    answers existence by reading the file, exactly what ``BY_SOURCE`` claims.
+    Nesting inside describe blocks needs no handling — the locator names the
+    test's own name, which is the string this call takes.
     """
-    rel = nodeid.split("::", 1)[0]
-    if text is None:
-        return UNKNOWN, f"could not read {rel} at the submitted commit"
+    for m in _VITEST_DECL.finditer(text):
+        if _unescape(m.group("name")) == name:
+            return text.count("\n", 0, m.start()) + 1
+    return None
+
+
+def _resolve_python_source(text: str, rel: str, name: str) -> tuple[str, str]:
     try:
         tree = ast.parse(text, filename=rel)
     except (SyntaxError, ValueError) as exc:
@@ -155,11 +192,99 @@ def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
         # test is not there" are different facts, and a blanket unknown for
         # both is what taught reviewers to skip this block.
         return UNPARSEABLE, f"could not parse {rel}: {type(exc).__name__}"
-    name = _wanted_name(nodeid)
     line = _defines_test(tree, name)
     if line is None:
         return MISSING, f"{rel} defines no test named {name}"
     return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
+
+
+# Where a test declaration BEGINS, without any claim to read its name. The
+# gap between this count and the names actually extracted is the reader's own
+# blind spot, and it is the only thing that separates "the test is not here"
+# from "I could not read how this file declares its tests" (#1203).
+_VITEST_DECL_START = re.compile(r"\b(?:it|test)(?:\.\w+)*\s*[(`]")
+
+
+def _resolve_vitest_source(text: str, rel: str, name: str) -> tuple[str, str]:
+    """Existence by reading, and a refusal that never poses as an absence.
+
+    ``ast`` makes "not found" trustworthy for Python: a real parser saw the
+    whole file. Here the reader is a regular expression, and a form it cannot
+    follow — a tagged template, a table built by a call, a name held in a
+    variable — looks exactly like a test that was never written. Reporting
+    that as ``missing`` is the false accusation this whole change exists to
+    remove, so the reader counts what it could not follow and says so.
+    """
+    line = _declares_vitest_test(text, name)
+    if line is not None:
+        return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
+    started = len(_VITEST_DECL_START.findall(text))
+    named = sum(1 for _ in _VITEST_DECL.finditer(text))
+    if started > named:
+        # Erring towards unknown on a false start inside a string or comment
+        # is the safe direction: it withholds an answer instead of inventing
+        # one against the author.
+        return UNKNOWN, (
+            f"{rel} declares {started - named} test(s) in a form this reader "
+            f"cannot follow, so the absence of {name} is not established"
+        )
+    return MISSING, f"{rel} defines no test named {name}"
+
+
+# One resolver per runner the locator registry accepts. The pairing is not
+# decoration: a shape accepted upstream with no entry here is exactly the
+# state where the hub reports a real test as absent, so the two registries are
+# checked against each other by test (#1203).
+SOURCE_RESOLVERS = {
+    PYTEST: _resolve_python_source,
+    "vitest": _resolve_vitest_source,
+}
+
+
+def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
+    """``(status, reason)`` from the file's own text — no imports, no runner (#764).
+
+    The fallback for when collection cannot run: the project's dependencies
+    are not installed, the task's tree was retired, or no tree ever held this
+    branch. ``text`` is the file as of the submitted commit; ``None`` means it
+    could not be read, which is ``unknown`` and never ``missing``.
+
+    Reading is per runner (#1203). It used to parse every file with ``ast``,
+    so a TypeScript test came back ``unparseable`` — true in the letter and
+    useless in fact, because the file parses perfectly well for the tool that
+    owns it.
+    """
+    rel = nodeid.split("::", 1)[0]
+    if text is None:
+        return UNKNOWN, f"could not read {rel} at the submitted commit"
+    runner = runner_of(nodeid)
+    resolver = SOURCE_RESOLVERS.get(runner)
+    if resolver is None:
+        return UNKNOWN, NO_RESOLVER.format(runner=runner or "unknown")
+    return resolver(text, rel, _wanted_name(nodeid))
+
+
+def needs_source_reading(acs: Any, collected: set[str] | None) -> bool:
+    """Whether resolving ``acs`` will need file text as well as ``collected``.
+
+    The caller used to read files only when collection failed outright, which
+    starved every locator collection cannot speak for: pytest collected its
+    own tests, so no text was fetched, and the resolver — right to refuse to
+    judge a vitest locator by a pytest collection — then had nothing to read
+    and answered "could not read at the submitted commit". Nobody had tried.
+
+    The predicate lives beside the resolver on purpose. The defect was not
+    that either side was wrong on its own; it was that the rule for when text
+    is needed existed twice and the two copies disagreed (#1203).
+    """
+    if collected is None:
+        return True
+    return any(
+        runner_of(getattr(ac, "test_ref", None)) != PYTEST
+        for ac in acs
+        if _verifiable_by(ac) == "test"
+        and parse_test_locator(getattr(ac, "test_ref", None))
+    )
 
 
 def resolve_ac_locators(
@@ -185,15 +310,21 @@ def resolve_ac_locators(
             continue
         locator = getattr(ac, "test_ref", None)
         parsed = parse_test_locator(locator)
+        # ``collected`` came from pytest and speaks only for pytest, so it is
+        # usable for a pytest locator and for nothing else. Judging a locator
+        # of another runner against it reported a test that plainly exists as
+        # absent — measured on #1202 — so a foreign one takes the
+        # no-collection route whether or not pytest ran (#1203).
+        usable = collected if runner_of(locator) == PYTEST else None
         if parsed is None:
-            status, reason = MISSING, "no valid pytest locator in test_ref"
-        elif collected is None and parsed[0] in (absent_files or set()):
+            status, reason = MISSING, "no valid test locator in test_ref"
+        elif usable is None and parsed[0] in (absent_files or set()):
             status, reason = resolve_locator_absent_file(parsed[1])
-        elif collected is None:
+        elif usable is None:
             status, reason = resolve_locator_in_source(
                 (sources or {}).get(parsed[0]), parsed[1]
             )
-        elif parsed[1] in collected or parsed[1] in bases:
+        elif parsed[1] in usable or parsed[1] in bases:
             status, reason = RESOLVABLE, BY_COLLECTION
         else:
             status, reason = MISSING, "locator does not match any collected test"

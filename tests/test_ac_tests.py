@@ -8,6 +8,7 @@ from hub.services.ac_tests import (
     FAIL,
     NOT_FOUND,
     PASS,
+    ac_tests_gap,
     current_ac_test_results,
     run_ac_tests,
 )
@@ -189,3 +190,127 @@ async def test_missing_ci_report_is_unknown_not_fail(db):
     # And in none of the three cases was a fail recorded for the AC.
     rows = [dict(r) for r in await repo.list_ac_test_results(db, task_id)]
     assert rows == [], "absence of a report must never be stored as a result"
+
+
+# ---- Three outcomes, three sentences (#1203) ----
+
+
+async def test_gap_distinguishes_unsupported_runner_from_missing_test(db):
+    # AC-3. Three different situations used to reach the author as at most two
+    # sentences, and the third one — a perfectly good locator for a runner the
+    # hub cannot run — was folded into "AC-тесты не зелёные". That sends
+    # someone to fix a criterion that has nothing wrong with it (#419).
+    task_id = await repo.create_task(
+        db,
+        title="t",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            # Runnable, but no result recorded for this generation.
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
+            ),
+            # Not a locator at all.
+            AcceptanceCriterion(
+                id="AC-2",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="see the frontend suite",
+            ),
+            # A good locator this hub cannot run.
+            AcceptanceCriterion(
+                id="AC-3",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="src/lib/recent.test.ts::still toggles",
+            ),
+        ],
+    )
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+
+    gap = await ac_tests_gap(db, task)
+    assert gap is not None
+    parts = gap.split("; ")
+    assert len(parts) == 3, gap
+
+    by_ac = {ac: [p for p in parts if ac in p] for ac in ("AC-1", "AC-2", "AC-3")}
+    # Each criterion is named in exactly one sentence: a criterion appearing in
+    # two of them is the merge this criterion forbids.
+    assert all(len(v) == 1 for v in by_ac.values()), gap
+
+    runner_line = by_ac["AC-3"][0]
+    assert "vitest" in runner_line
+    # The author must be told there is nothing to fix in the locator itself,
+    # which is precisely what the "не разрешается" sentence would imply.
+    assert "не разрешается" not in runner_line
+    assert "не зелёные" not in runner_line
+
+
+async def test_unrunnable_locator_gets_no_recorded_result(db):
+    # A recorded not_found is read as "the test is not there". A locator the
+    # hub never handed to any runner has earned no such row.
+    task_id = await repo.create_task(
+        db,
+        title="t",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="src/lib/recent.test.ts::still toggles",
+            )
+        ],
+    )
+    await db.commit()
+
+    handed_to_runner: list[list[str]] = []
+
+    async def _runner(nodeids, repo_path):
+        handed_to_runner.append(list(nodeids))
+        return {n: True for n in nodeids}
+
+    recorded = await run_ac_tests(db, task_id, runner=_runner)
+    assert recorded == []
+    # And the runner was never called with it — not called and told "missing"
+    # are different facts, and only one of them is true here.
+    assert handed_to_runner == []
