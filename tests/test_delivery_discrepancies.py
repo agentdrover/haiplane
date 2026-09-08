@@ -430,3 +430,102 @@ async def test_whitespace_never_buys_an_acknowledgement(
 
     row = await repo.get_delivery_discrepancy(db, task_id)
     assert not (row["acknowledged_at"] or ""), "пробелами расхождение не заткнуть"
+
+
+# ---- находки ревью №281: обещание в комментарии против обещания в коде ----
+
+
+async def test_a_failed_voice_leaves_nothing_behind(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Голос и отметка о нём — одно целое, и это держит откат, а не комментарий.
+
+    add_task_update и insert_event не коммитят; коммитит record_delivery_
+    discrepancy. Значит исключение МЕЖДУ голосом и отметкой оставляло алерт
+    незакоммиченным, но живым в открытой транзакции, — и первый же коммит
+    следующего кандидата записывал его БЕЗ отметки. Расхождение звучало бы
+    дважды, а обещание «либо сказано и помечено, либо не случилось ничего»
+    оказалось бы неправдой.
+
+    Проверяется двумя кандидатами в одном проходе: на первом голос падает,
+    второй проходит и коммитит. Без отката алерт первого уезжает в базу на
+    чужом коммите — одного кандидата для этого мало, и потому его здесь два.
+
+    Исключение намеренно ПИТОНОВСКОЕ, а не ошибка SQLite: та оборвала бы
+    транзакцию сама, и дыры не было бы видно. Здоровая грязная транзакция —
+    ровно тот случай, ради которого откат и стоит.
+    """
+    broken = await _completed_task(db, client, title="Voice fails", pr=555)
+    intact = await _completed_task(db, client, title="Voice lands", pr=556)
+    _pr_states(monkeypatch, {555: "open", 556: "open"})
+
+    real_insert = repo.insert_event
+
+    async def _fail_for_the_first(db_, **kwargs):
+        if kwargs.get("task_id") == broken:
+            raise RuntimeError("голос не записался")
+        return await real_insert(db_, **kwargs)
+
+    monkeypatch.setattr(repo, "insert_event", _fail_for_the_first)
+    await scan_completed_deliveries(db)
+
+    assert await _alerts(db, broken) == [], (
+        "упавший голос не оставляет следов: алерт без отметки прозвучал бы "
+        "снова следующим проходом"
+    )
+    assert await repo.get_delivery_discrepancy(db, broken) is None, (
+        "и строки реестра тоже нет — откат откатывает целиком"
+    )
+    assert len(await _alerts(db, intact)) == 1, (
+        "соседний кандидат не пострадал: один плохой ряд не валит свип"
+    )
+
+
+async def test_an_acknowledged_row_stops_pushing_the_glance_badge(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Счётчик на ГЛАВНОЙ, а не только в разделе инбокса.
+
+    Исключение признанных строк живёт в двух местах: в секции и в топбаре на
+    «/». Тесты трогали лишь /partials/inbox, поэтому вернуть исключение в
+    топбаре можно было, не уронив ни одного теста, — и бейдж продолжал бы
+    считать то, что владелец уже разобрал. Счётчик, который не возвращается
+    к нулю, никто не читает: это та самая смерть сигнала, против которой
+    задача и заведена.
+    """
+    task_id = await _completed_task(db, client, title="Left open", pr=777)
+    _pr_states(monkeypatch, {777: "open"})
+    await scan_completed_deliveries(db)
+
+    page = await client.get("/")
+    assert page.status_code == 200
+    before = page.text
+
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="PR оставлен открытым намеренно"
+    )
+
+    page = await client.get("/")
+    assert page.status_code == 200
+    assert page.text != before, "признание обязано быть видно на главной"
+    # Считаем не текст бейджа, а сам факт: до признания строка в счётчике
+    # была, после — нет. Сравнение по числу устойчивее, чем по вёрстке.
+    assert _inbox_badge(page.text) < _inbox_badge(before), (
+        "признанная строка продолжает толкать бейдж на главной"
+    )
+
+
+def _inbox_badge(html: str) -> int:
+    """Число в топбаре у ярлыка Inbox на «/».
+
+    Читается прицельно из блока самого счётчика, а не поиском ближайшей
+    цифры за словом: соседние числа на дашборде сделали бы тест зелёным
+    по случайности.
+    """
+    import re
+
+    block = re.search(r"topbar-stat--inbox.*?</a>", html, re.S)
+    assert block, "на главной нет счётчика Inbox — разметка изменилась"
+    number = re.search(r'topbar-stat-value">\s*(\d+)', block.group(0))
+    assert number, "у счётчика Inbox нет значения"
+    return int(number.group(1))

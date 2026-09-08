@@ -528,6 +528,59 @@ async def _deliver_approved_review(db, task: dict) -> None:
             forge=mctx.get("forge", ""),
         )
         if ci.outcome == CIProbeOutcome.passed:
+            # #1186: the pair gate asks this inside merge_before_completion;
+            # this conveyor calls merge_pr itself, so it asks here.
+            #
+            # NOT every refusal is a wait, and this is where that was got
+            # wrong — found by the dispatched cross-model review. The comment
+            # that stood here said "a stacked base is a WAIT", which was true
+            # when holding was the only outcome. Two outcomes that call a
+            # HUMAN were added beside it (an order ancestry cannot name, a
+            # base nobody will ever deliver) and this branch kept treating
+            # every one of them as a silent retry — so on this conveyor the
+            # deadlock the split exists to prevent came straight back, and
+            # the feed said "waiting" about something nothing would resolve.
+            # The prefix tuple is the one the pair path reads, so the two
+            # conveyors cannot drift into two ideas of what waiting means.
+            stacked = await services.stacking_gate_step(db, task)
+            if stacked and stacked.startswith(services.TRANSIENT_GATE_PREFIXES):
+                # Said once, not once per sweep — the same dedup the pair
+                # path uses, for the same reason: a line every thirty
+                # seconds is how a real signal gets muted (#534).
+                await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
+                return
+            if stacked:
+                await repo.add_task_update(
+                    db,
+                    task["id"],
+                    "hub",
+                    "blocker",
+                    f"Доставка остановлена: PR #{pr_num} — {stacked}. "
+                    "Ожидание здесь ничего не решит, поэтому задача передана "
+                    "человеку (hub_decide_task).",
+                )
+                await repo.update_task(db, task["id"], status="needs_decision")
+                await repo.insert_event(
+                    db,
+                    kind="needs_decision",
+                    task_id=task["id"],
+                    actor="hub",
+                    payload={"reason": "stacking", "detail": stacked, "pr": pr_num},
+                )
+                await db.commit()
+                log.warning(
+                    "Poll: task #%d delivery stopped, human needed (%s)",
+                    task["id"],
+                    stacked,
+                )
+                await services.maybe_destroy_vast(db, task)
+                return
+            # The hold is over. Clearing the ledger entry is what the pair path
+            # does on its own success (line ~1678); writing into a shared dict
+            # from a second path without clearing it there too is how the dict
+            # grows for the lifetime of the process — and how the NEXT hold on
+            # this task would be silently swallowed as a repeat of this one.
+            _pair_delivery_waits.pop(task["id"], None)
             merged = await plugins.git_ops.merge_pr(
                 pr_num,
                 task["id"],

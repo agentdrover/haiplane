@@ -47,7 +47,11 @@ from hub.services import call_sites, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
 from hub.services.statement_freshness import statement_freshness
-from hub.services.test_existence import collect_test_nodeids, resolve_ac_locators
+from hub.services.test_existence import (
+    collect_test_nodeids,
+    needs_source_reading,
+    resolve_ac_locators,
+)
 
 log = logging.getLogger("hub")
 
@@ -287,7 +291,13 @@ async def build_review_brief(
         # which is why the reason says which one answered.
         sources: dict[str, str | None] | None = None
         absent: set[str] = set()
-        if collected is None:
+        # Not "only when collection failed" (#1203): a collection speaks for
+        # the runner that produced it and for no other, so a locator of any
+        # other runner needs the text even when pytest answered for its own.
+        # The condition is asked of the resolver's own module so the two
+        # cannot drift apart again — they already did once, and the cost was
+        # a "could not read" about a file nobody had opened.
+        if needs_source_reading(ac_models, collected):
             sources, absent = await _locator_sources(
                 db, task_id, task_view, ctx, ac_models
             )

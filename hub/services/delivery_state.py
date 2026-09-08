@@ -855,6 +855,19 @@ async def scan_completed_deliveries(
             if answer["state"] == PR_OPEN:
                 found.append({"task_id": task_id, **answer})
         except Exception:  # noqa: BLE001 - one bad row must not stop the sweep
+            # Откат ОБЯЗАТЕЛЕН, и без него обещание строкой выше было
+            # комментарием. add_task_update и insert_event не коммитят —
+            # коммитит record_delivery_discrepancy; значит исключение между
+            # голосом и отметкой оставляло алерт незакоммиченным, но ЖИВЫМ в
+            # открытой транзакции, и первый же коммит следующего кандидата
+            # записывал его без отметки. Расхождение звучало бы снова, а
+            # «либо сказано и помечено, либо не случилось ничего» оказалось
+            # бы неправдой (находка ревью №281, раскол адъюдикации).
+            #
+            # Оговорка рефутера верна лишь наполовину: ошибка SQLite и правда
+            # обрывает транзакцию сама, но исключение уровня Python — нет,
+            # и именно оно оставляет транзакцию здоровой и грязной.
+            await db.rollback()
             log.exception("delivery sweep failed for #%s", task_id)
     return found
 

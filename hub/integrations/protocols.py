@@ -94,6 +94,65 @@ class CIRunRequestResult:
     details: str | None = None
 
 
+class StackProbeOutcome(str, Enum):
+    """Every observable answer to "does this branch stand on that one" (#1186).
+
+    The predicate used to be a bare ``bool``, and a bool has no room for the
+    third answer. Unresolvable refs, a git failure, a missing workspace and a
+    plugin with no repo at all all came back ``False`` — the same value that
+    means "checked, and they are independent". Advisory that was harmless:
+    the worst case was a missing hint. As a DELIVERY condition it is not:
+    "could not look" reading as "nothing there" is what merges a branch over
+    an unmerged base, and that merge is irreversible.
+
+    ``unsupported`` and ``unavailable`` are kept apart for the reason #1197
+    kept them apart: one is a fact about the plugin and no retry will change
+    it, the other is a call that did not land and asking again will.
+    """
+
+    stacked = "stacked"  # branch carries unmerged commits of the other branch
+    clear = "clear"  # looked, and the branches are independent
+    unsupported = "unsupported"  # this plugin cannot answer at all
+    unavailable = "unavailable"  # refs or git did not answer — ask again
+
+
+@dataclass(frozen=True)
+class StackProbeResult:
+    """A stacking-probe outcome plus a stable, machine-usable reason (#1186)."""
+
+    outcome: StackProbeOutcome
+    reason: str
+    details: str | None = None
+
+
+async def stacking_probe_from_predicate(
+    predicate: Callable[..., Awaitable[bool]],
+    branch: str,
+    other_branch: str,
+    base_branch: str | None = None,
+    repo: str | None = None,
+) -> StackProbeResult:
+    """Read a pre-#1186 bool predicate as a probe, without lying about False.
+
+    Defined once, here, because both sides need it and neither may import the
+    other: ``NoopGitOps`` uses it so a subclass that overrides only the old
+    predicate still answers the new question, and the delivery gate uses it
+    for any duck-typed plugin that predates the probe entirely.
+
+    ``True`` is a definite stack. ``False`` is the collapsed value this whole
+    change is about — "independent" and "could not look" written the same way
+    — so it comes back ``unsupported`` rather than ``clear``: not retryable,
+    because asking the same bool again returns the same bool.
+    """
+    if await predicate(branch, other_branch, base_branch=base_branch, repo=repo):
+        return StackProbeResult(
+            outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+        )
+    return StackProbeResult(
+        outcome=StackProbeOutcome.unsupported, reason="legacy_bool_predicate"
+    )
+
+
 @runtime_checkable
 class DispatchPlugin(Protocol):
     def is_available(self) -> bool: ...
@@ -182,6 +241,13 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> bool: ...
+    async def branch_stacking_probe(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> StackProbeResult: ...
     async def branch_ancestry(
         self,
         branch: str,

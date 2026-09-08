@@ -126,6 +126,13 @@ async def test_dispatch_policy_refused_for_unreachable_forge(client):
     Это и есть разница между проверкой поля и инвариантом: поле проверяют там,
     где его пишут, а инвариант — везде, откуда в запрещённое состояние можно
     попасть.
+
+    #1188: код отказа переименован из cloud_review_forge_unsupported в
+    review_unrunnable_here вместе со сменой СМЫСЛА — «не тот форж» было
+    единственной причиной, пока способ добычи был один. Сила проверки не
+    ослаблена: здесь по-прежнему не настроено НИЧЕГО, и все три дороги обязаны
+    отказывать. Что происходит, когда локальный путь настроен, проверяет
+    test_dispatch_policy_allowed_when_the_local_reviewer_is_ready.
     """
     human = {"Authorization": "Bearer human-token"}
 
@@ -149,7 +156,7 @@ async def test_dispatch_policy_refused_for_unreachable_forge(client):
         headers=human,
     )
     assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["error"] == "cloud_review_forge_unsupported"
+    assert resp.json()["detail"]["error"] == "review_unrunnable_here"
 
     # Дорога 2 — та, что была открыта: политика стоит, переключают форж.
     assert (
@@ -171,7 +178,7 @@ async def test_dispatch_policy_refused_for_unreachable_forge(client):
         "переключение форжа обязано отказать, пока политика просит облачного "
         "ревьюера: иначе в базе останется политика, которую нельзя исполнить"
     )
-    assert resp.json()["detail"]["error"] == "cloud_review_forge_unsupported"
+    assert resp.json()["detail"]["error"] == "review_unrunnable_here"
 
     # Дорога 3: оба поля одним вызовом — проскочить между проверками нечем.
     relax = await client.patch(
@@ -186,3 +193,70 @@ async def test_dispatch_policy_refused_for_unreachable_forge(client):
         headers=human,
     )
     assert resp.status_code == 422, resp.text
+
+
+async def test_dispatch_policy_allowed_when_the_local_reviewer_is_ready(
+    client, db, monkeypatch, tmp_path
+):
+    """AC-2 (#1188): политику, которую хаб УМЕЕТ исполнить, он обязан хранить.
+
+    До #1180 отказ по форжу отвечал на вопрос «исполнимо ли ревью здесь»
+    целиком — других способов не было. #1180 доставила локальный путь,
+    работающий на любом форже, а инвариант остался на прежнем признаке: хаб
+    отказывал в ЗАПИСИ того, что уже умел ИСПОЛНЯТЬ, и включить ревью на
+    GitVerse-проекте было нельзя ни через UI, ни через API.
+
+    Проверяется ЗАПИСЬЮ в базу, а не отсутствием исключения: 200 можно
+    получить и не сохранив ничего.
+    """
+    import os
+
+    from hub import auth as hub_auth
+    from hub import config
+    from hub.services import admin as admin_svc
+
+    # Аутентификация настоящая: в открытом режиме принципалов нет вовсе, и
+    # токен ревьюера ни в кого не разрешается — то есть проверять было бы
+    # нечего. Поэтому здесь заводятся оба: человек, который правит проект, и
+    # ревьюер, чьим токеном держится независимость отчёта (#728).
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    owner = await admin_svc.create_principal(db, kind="human", username="owner-1188")
+    owner_key = await admin_svc.create_api_key(db, owner["id"], name="owner")
+    principal = await admin_svc.create_principal(
+        db, kind="agent", username="local-reviewer-1188"
+    )
+    key = await admin_svc.create_api_key(db, principal["id"], name="local-reviewer")
+    await db.commit()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    os.chmod(scratch, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", key["plaintext_key"])
+
+    human = {"Authorization": f"Bearer {owner_key['plaintext_key']}"}
+    created = await client.post(
+        "/api/projects",
+        json={"slug": "forge-local-ok", "name": "FLO", "repo": "mrpda/snip-portal"},
+        headers=human,
+    )
+    assert created.status_code == 200, created.text
+    pid = created.json()["id"]
+    assert (
+        await client.patch(
+            f"/api/projects/{pid}", json={"forge": "gitverse"}, headers=human
+        )
+    ).status_code == 200
+
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"review": "dispatch"}},
+        headers=human,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gate_policy"].get("review") == "dispatch", (
+        "политика, исполнимая локальным ревьюером, обязана сохраниться — "
+        "иначе доставленный механизм нечем попросить"
+    )

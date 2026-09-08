@@ -2284,12 +2284,13 @@ async def create_review_dispatch(
     model: str,
     profile: str = "",
     reviewer_principal_id: int | None = None,
+    channel: str = "cloud",
 ) -> int:
     cur = await db.execute(
         "INSERT INTO review_dispatches "
         "(task_id, submission_generation, agent_id, run_id, model, profile, "
-        "reviewer_principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "reviewer_principal_id, channel) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -2298,6 +2299,7 @@ async def create_review_dispatch(
             model,
             profile,
             reviewer_principal_id,
+            channel,
         ),
     )
     return inserted_id(cur)

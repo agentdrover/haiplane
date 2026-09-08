@@ -43,6 +43,7 @@ from hub.services import project_policy
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     KIND_VERDICT,
+    PENDING_PREFIX,
     RUN_OPEN,
     close_run,
     configured_mode,
@@ -65,11 +66,6 @@ EVENT_RUN_REFUSED = "steward_run_refused"
 EVENT_ACT_REFUSED = "steward_act_refused"
 
 RUN_REFUSED = "refused"
-
-# The lock is taken BEFORE the provider is called and holds this marker until
-# the real agent id replaces it. Anything else would pay first and claim
-# second — the inversion of claim_arbiter_dispatch (#421).
-PENDING_PREFIX = "pending:"
 
 
 async def steward_principal_id(db: aiosqlite.Connection) -> int | None:
@@ -649,10 +645,25 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     # брал, а строка прогона — это то, по чему надзор F7 считает, кто судил.
     # Судья, которого никто не выбирал и который нигде не назван, делает
     # статистику ложной вернее, чем отсутствие суждения.
+    #
+    # Рабочее окно ставится ЭТОЙ ЖЕ записью (#1181). До сих пор дедлайн
+    # отмерялся от заказа, и повторные попытки старта ели время судьи: на
+    # первом прогоне стюарда семнадцать минут ушли на отказы провайдера, а
+    # закрылся он с формулировкой «не вернул суждение» — обвинением того,
+    # кто работал двенадцать минут из тридцати. Отдельным UPDATE окно
+    # досталось бы и тому, кто слот не брал: условие agent_id=claim здесь
+    # не украшение, а то, что делает запись принадлежащей захватившему.
     await db.execute(
-        "UPDATE steward_runs SET agent_id=?, run_id=?, model=? "
-        "WHERE id=? AND agent_id=?",
-        (agent_id, run_id, judge, order["id"], claim),
+        "UPDATE steward_runs SET agent_id=?, run_id=?, model=?, "
+        "deadline_at=datetime('now', ?) WHERE id=? AND agent_id=?",
+        (
+            agent_id,
+            run_id,
+            judge,
+            f"+{config.STEWARD_RUN_DEADLINE_MIN} minutes",
+            order["id"],
+            claim,
+        ),
     )
     if judge != steward:
         await repo.add_task_update(

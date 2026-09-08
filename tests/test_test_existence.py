@@ -10,7 +10,9 @@ from hub.services.test_existence import (
     UNKNOWN,
     UNPARSEABLE,
     collect_test_nodeids,
+    needs_source_reading,
     resolve_ac_locators,
+    resolve_locator_in_source,
 )
 
 
@@ -138,3 +140,141 @@ def test_unreadable_file_stays_unknown():
     res = resolve_ac_locators(acs, None, {"tests/test_a.py": None})[0]
     assert res["status"] == UNKNOWN
     assert res["status"] != MISSING
+
+
+# ---- A locator of another runner is never called missing (#1203) ----
+
+_VITEST_FILE = "frontend/src/lib/recent-inspections.test.ts"
+_VITEST_NAME = "still toggles when the storage object itself is unreachable"
+_VITEST_LOCATOR = f"{_VITEST_FILE}::{_VITEST_NAME}"
+_VITEST_SOURCE = """import { describe, it } from "vitest";
+
+describe("признак раскрытия подсписка", () => {
+  it("still toggles when the storage object itself is unreachable", () => {});
+});
+"""
+
+
+def test_foreign_runner_locator_is_never_missing():
+    # AC-1. The measured defect: `collected` comes from pytest and speaks only
+    # for pytest, but every locator was judged against it. On #1202 that
+    # answered `missing`, "locator does not match any collected test", about a
+    # test written three lines into the file — the false missing this module's
+    # own docstring promises never to produce.
+    pytest_collected = {"tests/test_poller.py::test_a"}
+    ac = [_AC("AC-1", "test", _VITEST_LOCATOR)]
+
+    # Path 1: pytest collection ran and (of course) does not list this test.
+    with_source = resolve_ac_locators(
+        ac, pytest_collected, {_VITEST_FILE: _VITEST_SOURCE}
+    )[0]
+    assert with_source["status"] == RESOLVABLE
+    assert BY_SOURCE in with_source["reason"]
+
+    # Path 2: collection ran, but the file itself could not be read. Unknown
+    # with a stated reason — "could not look" is not "the answer is no" (#725).
+    unread = resolve_ac_locators(ac, pytest_collected, {_VITEST_FILE: None})[0]
+    assert unread["status"] == UNKNOWN
+    assert _VITEST_FILE in unread["reason"]
+
+    # Path 3: no collection at all — the pre-existing fallback route.
+    no_collection = resolve_ac_locators(ac, None, {_VITEST_FILE: _VITEST_SOURCE})[0]
+    assert no_collection["status"] == RESOLVABLE
+
+    # And the guard is not blanket silence: when the file is readable and the
+    # test really is absent, `missing` is still the honest answer.
+    absent = resolve_ac_locators(
+        [_AC("AC-1", "test", f"{_VITEST_FILE}::a test nobody wrote")],
+        pytest_collected,
+        {_VITEST_FILE: _VITEST_SOURCE},
+    )[0]
+    assert absent["status"] == MISSING
+
+
+def test_vitest_source_reading_finds_the_named_test():
+    # The vitest resolver answers existence by reading, exactly as BY_SOURCE
+    # claims — no stronger. It must survive the quote styles and the decorated
+    # forms that appear in real suites.
+    src = """
+it.each([1, 2])("parametrised %i", () => {});
+test('single quoted name', () => {});
+it(`backticked name`, () => {});
+it("name with \\"quotes\\" inside", () => {});
+"""
+    for name in (
+        "parametrised %i",
+        "single quoted name",
+        "backticked name",
+        'name with "quotes" inside',
+    ):
+        status, reason = resolve_locator_in_source(src, f"a/b.test.ts::{name}")
+        assert status == RESOLVABLE, (name, reason)
+
+
+def test_vitest_names_keep_characters_pytest_would_trim():
+    # A pytest node is trimmed at "[" and read after the last "::"; a vitest
+    # name owns both characters. Trimming them would send the resolver hunting
+    # for a different test and report a real one as absent.
+    src = 'it("renders [draft] :: with a colon", () => {});\n'
+    status, _ = resolve_locator_in_source(
+        src, "a/b.test.ts::renders [draft] :: with a colon"
+    )
+    assert status == RESOLVABLE
+
+
+def test_unknown_runner_says_so_instead_of_unparseable():
+    # Before #1203 every file went through ast, so a TypeScript test came back
+    # `unparseable` — true in the letter, useless in fact, because the file
+    # parses perfectly for the tool that owns it.
+    status, reason = resolve_locator_in_source(_VITEST_SOURCE, _VITEST_LOCATOR)
+    assert status != UNPARSEABLE
+
+
+def test_unreadable_declaration_form_is_unknown_not_missing():
+    # #1203, вторая находка ревью. ast делает "не нашёл" достоверным для
+    # Python: настоящий парсер видел весь файл. Здесь читает регулярное
+    # выражение, и форма, которую оно не осилило, выглядит ровно как тест,
+    # которого не писали. Все три случая ниже воспроизведены ревьюером на
+    # первой сдаче — до правки каждый отвечал `missing` про существующий тест.
+    forms = [
+        ('it.each`\n  $a | $b\n`("adds $a and $b", () => {});', "adds $a and $b"),
+        (
+            'it.each(items.map(x => foo(x)))("maps then names", () => {});',
+            "maps then names",
+        ),
+        ('const n = "still toggles";\nit(n, () => {});', "still toggles"),
+    ]
+    for src, name in forms:
+        status, reason = resolve_locator_in_source(src, f"a/b.test.ts::{name}")
+        assert status == UNKNOWN, (name, status, reason)
+        # И причина обязана назвать, ЧТО именно помешало: "не смог прочитать
+        # эту форму" — ответ, а "теста нет" на том же месте было обвинением.
+        assert "cannot follow" in reason, (name, reason)
+
+
+def test_missing_survives_where_it_is_honest():
+    # Осторожность не должна выродиться в вечное молчание: когда все
+    # объявления в файле читаемы, а нужного имени среди них нет, `missing` —
+    # правда, и она обязана остаться. Ложное "тест есть" хуже ложного
+    # "теста нет", потому что первое никто не заметит.
+    plain = 'it("a", () => {});\ntest("b", () => {});\n'
+    assert resolve_locator_in_source(plain, "a/b.test.ts::c")[0] == MISSING
+    assert resolve_locator_in_source(plain, "a/b.test.ts::b")[0] == RESOLVABLE
+
+
+def test_source_reading_is_needed_when_collection_speaks_for_another_runner():
+    # #1203: правило "когда нужен текст файла" жило в двух местах и копии
+    # разошлись — brief читал файлы только при провале сборки. Теперь правило
+    # одно и стоит рядом с резолвером, который им пользуется.
+    collected = {"tests/test_poller.py::test_a"}
+    vitest = [_AC("AC-1", "test", "a/b.test.ts::still toggles")]
+    pytest_only = [_AC("AC-1", "test", "tests/test_a.py::test_ok")]
+
+    assert needs_source_reading(vitest, collected) is True
+    assert needs_source_reading(pytest_only, collected) is False
+    # Провал сборки по-прежнему требует чтения — прежнее поведение цело.
+    assert needs_source_reading(pytest_only, None) is True
+    # Негодный локатор ничего не требует: его судьба решается формой.
+    assert needs_source_reading([_AC("AC-1", "test", "free text")], collected) is False
+    # Не-test критерий тоже: ему тест не нужен вовсе.
+    assert needs_source_reading([_AC("AC-1", "manual", None)], collected) is False
