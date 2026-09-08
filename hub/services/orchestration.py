@@ -2087,7 +2087,11 @@ def _stranded_with_a_dead_ref(
     machine-level failure was being reported to a human as "that task's branch
     is gone". The probe itself now refreshes a missing ref once before saying
     it is missing, so surviving this check really does mean origin does not
-    have it either.
+    have it either. And only ``ref_unresolved`` qualifies: a refresh that got
+    NO ANSWER comes back as ``remote_unreachable`` (#1204, machine review of
+    submission #4) and falls through to the retryable unknown below — a
+    timeout or a fetch lock is about this machine, hits every candidate alike,
+    and must not be told to a human as "origin does not have that branch".
     """
     if int(other["id"]) not in stranded:
         return None
@@ -2767,8 +2771,8 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
             f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
             f"доставив (её PR открыт и не влит), а её ветку "
-            f"'{assessment.base_task_branch}' не разрешается даже после "
-            f"прицельного обновления ссылки — на origin её нет, обычно так "
+            f"'{assessment.base_task_branch}' не разрешается, а origin на "
+            f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
             f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
             f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
             f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "

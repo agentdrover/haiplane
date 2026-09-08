@@ -15,6 +15,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -1233,4 +1234,46 @@ async def test_a_broken_clone_is_not_blamed_on_the_stranded_task(
     body = " ".join(u.get("content") or "" for u in updates)
     assert "ждать бесполезно" not in body, (
         "человеку не сообщают как факт то, чего хаб не установил"
+    )
+
+
+@pytest.mark.parametrize(
+    "details",
+    ["task-1138/eslint-debt: ls-remote rc=124: git молчит", "task-1138/eslint-debt"],
+    ids=["as_the_probe_writes_it", "bare_name"],
+)
+async def test_an_unanswered_origin_is_not_blamed_on_the_stranded_task(
+    db: aiosqlite.Connection, details: str
+) -> None:
+    # #1204, найдено машинным ревью сдачи №4. Проба теперь различает «origin
+    # ответил, что ветки нет» (ref_unresolved) и «origin не ответил»
+    # (remote_unreachable: таймаут, lock, auth). Второе — про эту машину, а не
+    # про ту задачу: оно проходит само и обязано остаться повторяемым
+    # ожиданием. Решает REASON, а не форма details: второй вариант кормит
+    # голое имя кандидата, чтобы классификатор не держался на том, что
+    # проба дописывает к имени текст ошибки. Мутация «зовём человека и на
+    # remote_unreachable» роняет этот тест.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="remote_unreachable",
+        details=details,
+    )
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "origin не ответил — это повторяемое ожидание, а не вопрос человеку"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ждать бесполезно" not in body
+    assert "на origin её нет" not in body, (
+        "«на origin её нет» утверждается только после ответа origin"
     )

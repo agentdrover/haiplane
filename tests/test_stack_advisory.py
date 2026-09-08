@@ -8,6 +8,7 @@ stacked on the unmerged task-392 branch and nothing warned about it).
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import patch
 
 import aiosqlite
@@ -660,6 +661,9 @@ async def test_probe_refreshes_a_missing_ref_before_calling_it_missing() -> None
         if args[0] == "rev-parse" and "--verify" in args:
             sha = present.get(args[-1])
             return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            # origin answers: that head exists.
+            return (0, f"bbb222\t{args[-1]}\n", "")
         if args[0] == "fetch":
             fetched.append(args[-1])
             present["task-392/base^{commit}"] = "bbb222"
@@ -685,12 +689,19 @@ async def test_probe_still_says_unresolved_when_the_refresh_does_not_help() -> N
     # Обратная сторона того же: ветки нет и на origin. Тогда ref_unresolved
     # остаётся, но теперь он значит «сервер её тоже не знает», а не «мы не
     # смотрели» — и только на таком ответе гейту можно что-то утверждать.
+    # «Не знает» здесь — ОТВЕТ origin (ls-remote отработал, вывод пустой), а
+    # не отсутствие ответа: сдача №4 моделировала fetch с rc=0 и тем закрепляла
+    # ложную посылку, что сбой fetch неотличим от пустого origin.
+    asked: list[str] = []
     fetched: list[str] = []
 
     async def fake_git(*args, repo=None, check=True, **kw):
         if args[0] == "rev-parse" and "--verify" in args:
             sha = _shas().get(args[-1])
             return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            asked.append(args[-1])
+            return (0, "", "")
         if args[0] == "fetch":
             fetched.append(args[-1])
             return (0, "", "")
@@ -701,9 +712,84 @@ async def test_probe_still_says_unresolved_when_the_refresh_does_not_help() -> N
             "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
         )
 
-    assert fetched, "попытка обновления обязана быть сделана до вывода"
+    assert asked == ["refs/heads/task-999/gone"], (
+        "origin обязан быть спрошен именно про эту ветку до вывода"
+    )
+    assert fetched == [], "нечего тянуть: origin ответил, что такой ветки нет"
     assert probe.outcome is StackProbeOutcome.unavailable
     assert probe.reason == "ref_unresolved"
     assert (probe.details or "").strip() == "task-999/gone", (
         "в details только то, что не разрешилось ПОСЛЕ обновления"
     )
+
+
+@pytest.mark.parametrize(
+    ("rc", "err"),
+    [
+        (124, ""),
+        (
+            128,
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host",
+        ),
+        (128, "fatal: Authentication failed"),
+    ],
+    ids=["timeout", "host_unreachable", "auth"],
+)
+async def test_probe_does_not_call_a_branch_gone_when_origin_did_not_answer(
+    rc: int, err: str
+) -> None:
+    # #1204, найдено машинным ревью сдачи №4. Сбой самого обновления —
+    # таймаут в 60 с, auth, моргание origin — выбрасывался: check=False и
+    # возврат _git не читался, после чего утверждалось «на origin её нет, ждать
+    # бесполезно». Рядом в этом же файле ls-remote --heads различает «не
+    # ответил» (rc != 0) и «ветки нет» (пустой вывод), а пробный merge на
+    # rc 124/128 отвечает «спросить не удалось». Теперь и проба так: сбой —
+    # отдельный исход, не ref_unresolved, и гейт по нему человека не зовёт.
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            return (rc, "", err)
+        if args[0] == "fetch":
+            raise AssertionError("после неотвеченного ls-remote тянуть нечего")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "remote_unreachable", (
+        "сбой обновления — не «ветки нет на origin»"
+    )
+    assert "task-999/gone" in (probe.details or "")
+    assert f"rc={rc}" in (probe.details or "")
+
+
+async def test_probe_treats_a_failed_fetch_as_no_answer_too() -> None:
+    # origin ответил, что ветка есть, а сам fetch упал — lock параллельного
+    # fetch, обрыв на середине. Это тоже «спросить не удалось», не «ветки нет».
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            return (0, f"eee555\t{args[-1]}\n", "")
+        if args[0] == "fetch":
+            return (
+                128,
+                "",
+                "fatal: Unable to create '.git/FETCH_HEAD.lock': File exists",
+            )
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "remote_unreachable"
+    assert "FETCH_HEAD.lock" in (probe.details or "")
