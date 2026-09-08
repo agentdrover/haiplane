@@ -101,19 +101,28 @@ async def _node(
 
 
 class _DispatchRecorder:
-    def __init__(self, result):
+    """Подставка провайдера: помнит вызовы, отдаёт заготовленный исход.
+
+    Возвращает ПАРУ (тело, отказ) — шов сместился на create_agent_attempt
+    в #1199, потому что путь ревью обязан отличать обрыв связи от отказа
+    провайдера. Подставка, оставшаяся на старом шве, молча пропускала бы
+    вызовы в настоящий Cursor.
+    """
+
+    def __init__(self, result, refusal=None):
         self.result = result
+        self.refusal = refusal
         self.calls: list[dict] = []
 
     async def __call__(self, **kwargs):
         self.calls.append(kwargs)
-        return self.result
+        return self.result, self.refusal
 
 
 def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
     monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
     monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
-    monkeypatch.setattr(cursor_cloud, "create_review_agent", recorder)
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", recorder)
 
     async def _no_usage(agent_id, run_id=None):
         # Default: the API did not answer. Sweep must not hit the network
@@ -3647,3 +3656,365 @@ async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp
         f"вывод ревьюера не имеет права оседать в памяти хаба целиком: пик "
         f"{peak} байт при выводе 8 МБ и лимите 1000"
     )
+
+
+# --- #1199: ответ не дошёл, но агент создан -------------------------------
+#
+# Измерено 06.09.2026: три «отказа» подряд, и по каждому у провайдера нашёлся
+# живой оплаченный агент (08:49:06Z, 08:50:53Z, 11:28:05Z). Хаб при этом
+# писал «Cloud Agents API не принял запрос» и уводил вердикт к человеку.
+# Наивный повтор покупал бы второго агента каждый раз.
+
+_LOST_ANSWER = cursor_cloud.Refusal(status=0, detail="ReadTimeout: ")
+_REAL_REFUSAL = cursor_cloud.Refusal(
+    status=400, code="invalid_model", detail="Model is not available"
+)
+
+
+class _Listing:
+    """Подставка списка агентов у провайдера.
+
+    Форма ответа — ключ `items` и `nextCursor`, как у настоящего API
+    (проверено вызовом 06.09). Выдуманная форма дала бы пустой список, а
+    пустой список здесь означает «агента нет» и разрешает купить второго.
+    """
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = 0
+
+    async def __call__(self, limit=50, cursor=""):
+        self.calls += 1
+        if self.pages is None:
+            return None
+        index = int(cursor or 0)
+        if index >= len(self.pages):
+            return {"items": [], "nextCursor": ""}
+        nxt = str(index + 1) if index + 1 < len(self.pages) else ""
+        return {"items": self.pages[index], "nextCursor": nxt}
+
+
+async def test_an_agent_created_behind_a_lost_answer_is_adopted(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199 AC-1: агент подбирается, а второй НЕ покупается.
+
+    Проверяется не только исход, но и число обращений к созданию: подбор
+    обязан заменить второй POST, а не сопровождать его.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    marker_seen: list[str] = []
+
+    async def _listing(limit=50, cursor=""):
+        # Имя берём из того же запроса, который «не ответил» — так его
+        # увидел бы и провайдер.
+        marker = recorder.calls[0]["name"]
+        marker_seen.append(marker)
+        return {"items": [{"id": "bc-adopted", "name": marker}], "nextCursor": ""}
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+
+    task_id = await _submitted(client, db, "spike-adopt")
+
+    assert len(recorder.calls) == 1, "второй POST — это второй оплаченный агент"
+    assert marker_seen and marker_seen[0] == cursor_cloud.agent_marker(
+        "review", task_id, 1
+    )
+    rows = await repo.list_active_review_dispatches(db)
+    assert len(rows) == 1 and dict(rows[0])["agent_id"] == "bc-adopted", (
+        "подобранный агент записан как исполнитель этого диспетча"
+    )
+
+
+async def test_the_adoption_is_named_not_silent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199: подбор виден человеку и надзору.
+
+    Тихий подбор прячет оплаченный прогон ровно так же, как его прятал
+    потерянный идентификатор.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [{"id": "bc-adopted", "name": recorder.calls[0]["name"]}],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(client, db, "spike-adopt-visible")
+
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='status'",
+        (task_id,),
+    )
+    assert any("подобран по метке" in dict(r)["content"] for r in rows), (
+        "карточка обязана назвать подбор"
+    )
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE task_id=? AND kind='review_dispatched'",
+        (task_id,),
+    )
+    assert any(json.loads(dict(e)["payload"]).get("adopted") for e in events), (
+        "надзор считает подборы по событию, а не по тексту карточки"
+    )
+
+
+async def test_a_real_refusal_is_neither_reconciled_nor_retried(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199 AC-3: ответ БЫЛ и он отрицательный — спрашивать нечего.
+
+    Сверка на настоящем отказе — лишний запрос, а повтор — лишние деньги
+    на заведомо тот же исход.
+    """
+    recorder = _DispatchRecorder(None, refusal=_REAL_REFUSAL)
+    _wire(monkeypatch, recorder)
+    listing = _Listing([[{"id": "bc-x", "name": "чужой"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-real-refusal")
+
+    assert listing.calls == 0, "на настоящем отказе провайдера сверка не нужна"
+    assert len(recorder.calls) == 1, "повтор на 400 покупает тот же отказ"
+    assert not await repo.list_active_review_dispatches(db)
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "провайдер отказал" in alerts and "HTTP 400" in alerts
+    assert "не принял запрос (бета" not in alerts, (
+        "прежний текст утверждал причину, которой не было"
+    )
+
+
+async def test_an_unreadable_reconciliation_never_guesses(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199 AC-4: «не смогли спросить» — это не «агента нет».
+
+    Сверка сама оборвалась. Подобрать нельзя: любой похожий агент был бы
+    угадан. Состояние называется человеку как есть — правило #762 в его
+    исходной форме, отсутствие данных не есть значение.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    listing = _Listing(None)  # провайдер не ответил и на список
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-blind")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert not await repo.list_active_review_dispatches(db), (
+        "неопознанный агент хуже пропущенного: записывать нечего"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "ответ провайдера не дошёл" in alerts, "причина названа наблюдённая"
+    assert "ReadTimeout" in alerts, "класс исключения доезжает до человека"
+
+
+async def test_a_similar_agent_is_not_close_enough(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199: сравнение имени на РАВЕНСТВО, а не на вхождение.
+
+    Метка соседнего поколения отличается одним символом. Подобрать её
+    значило бы отдать сдаче чужого судью — хуже, чем не подобрать никого.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        mine = recorder.calls[0]["name"]
+        return {
+            "items": [
+                {"id": "bc-other-gen", "name": mine + "9"},
+                {"id": "bc-prefix", "name": mine[:-1]},
+            ],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(client, db, "spike-similar")
+
+    assert not await repo.list_active_review_dispatches(db)
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    assert any("не нашлось" in dict(r)["content"] for r in rows)
+
+
+class _FlakyThenFine:
+    """Первый вызов обрывается, второй проходит — самый частый исход."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return None, _LOST_ANSWER
+        return {"agent": {"id": "bc-second"}, "run": {"id": "run-2"}}, None
+
+
+async def test_a_lost_answer_without_an_agent_is_retried_within_a_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199 AC-2: сверка сказала «агента нет» — повторяем, а не сдаёмся.
+
+    Вердикт не уходит к человеку с первого же обрыва. Повтор безопасен
+    ИМЕННО потому, что сверка прошла и показала пустоту: без неё он купил
+    бы второго агента.
+    """
+    flaky = _FlakyThenFine()
+    _wire(monkeypatch, flaky)
+    listing = _Listing([[]])  # спросили, ответ пустой: агента нет
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-retry")
+
+    assert len(flaky.calls) == 2, "ровно один повтор после подтверждённой пустоты"
+    assert listing.calls == 1, "спрашиваем перед повтором, а не после"
+    assert flaky.calls[0]["name"] == flaky.calls[1]["name"], (
+        "повтор идёт под ТОЙ ЖЕ меткой — иначе подобрать его потом нечем"
+    )
+    rows = await repo.list_active_review_dispatches(db)
+    assert len(rows) == 1 and dict(rows[0])["agent_id"] == "bc-second"
+    alerts = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    assert not any("НЕ вызвано" in dict(r)["content"] for r in alerts), (
+        "успешный повтор не оставляет жалобы"
+    )
+
+
+async def test_the_retry_stops_at_the_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1199: потолок держит. Иначе это семнадцать минут одной неудачи."""
+    always_lost = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, always_lost)
+    listing = _Listing([[]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-cap")
+
+    assert len(always_lost.calls) == 2, "две попытки, не больше"
+    assert not await repo.list_active_review_dispatches(db)
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    assert any("не нашлось за попыток: 2" in dict(r)["content"] for r in rows)
+
+
+# --- находки ревью №269 ---------------------------------------------------
+
+
+async def test_a_top_up_does_not_adopt_the_first_reviewer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269 high: добор той же генерации — другой заказ, и метка это знает.
+
+    Лестница (#879) заказывает второго ревьюера на ТУ ЖЕ генерацию. Метка
+    без номера попытки совпала бы с первой, и сверка после оборвавшегося
+    добора подобрала бы агента дешёвого прогона: второго POST нет, но
+    судья чужой, а настоящий остался бы сиротой.
+    """
+    first = _DispatchRecorder({"agent": {"id": "bc-first"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, first)
+    task_id = await _submitted(client, db, "spike-topup-marker")
+    assert len(first.calls) == 1
+    first_marker = first.calls[0]["name"]
+
+    # Добор: POST обрывается, а в выдаче стоит агент ПЕРВОГО заказа.
+    lost = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", lost)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [{"id": "bc-first", "name": first_marker, "latestRunId": "run-1"}],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    await maybe_dispatch_review(db, task_id, force_profile="deep")
+
+    assert lost.calls, "добор вообще пробовал создать агента"
+    assert lost.calls[0]["name"] != first_marker, (
+        "метка добора обязана отличаться от метки первого заказа"
+    )
+    rows = await repo.list_active_review_dispatches(db)
+    agents = {dict(r)["agent_id"] for r in rows}
+    assert agents == {"bc-first"}, (
+        "агент первого прогона не должен стать исполнителем добора"
+    )
+
+
+async def test_the_adopted_agent_brings_its_run_id(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269: подбор без run_id — половина потери.
+
+    Без него свип бьёт в /v1/agents/{id}/runs/ с пустым хвостом: не видит
+    статус, не восстанавливает отчёт из текста прогона и не ставит расход.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [
+                {
+                    "id": "bc-adopted",
+                    "name": recorder.calls[0]["name"],
+                    "latestRunId": "run-adopted",
+                }
+            ],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    await _submitted(client, db, "spike-adopt-runid")
+
+    row = dict((await repo.list_active_review_dispatches(db))[0])
+    assert row["agent_id"] == "bc-adopted"
+    assert row["run_id"] == "run-adopted", "идентификатор прогона едет с агентом"
+
+
+async def test_a_body_of_the_wrong_shape_is_not_an_empty_answer(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#269: чужая форма ответа — «не смог спросить», а не «агента нет».
+
+    page.get('items') or [] на теле без items давал пустой обход и в конце
+    подтверждённую пустоту, которая разрешает купить второго агента. Это
+    ровно #762 в новом месте: отсутствие данных снова стало бы значением.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+
+    async def _listing(limit=50, cursor=""):
+        return {"agents": [], "next": ""}  # схема беты изменилась
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(client, db, "spike-wrong-shape")
+
+    assert len(recorder.calls) == 1, "на нечитаемой сверке второго POST быть не должно"
+    assert not await repo.list_active_review_dispatches(db)
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"

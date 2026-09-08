@@ -202,3 +202,130 @@ async def test_an_unnamed_error_is_not_a_capacity_signal(monkeypatch, _configure
         assert refusal is not None
         assert refusal.code == ""
         assert is_capacity_refusal(refusal) is False
+
+
+async def test_a_silent_exception_still_names_its_class(
+    monkeypatch, _configured, caplog
+):
+    """#1199 AC-5: у таймаутов текст пуст, и без класса запись бесполезна.
+
+    06.09 в журнале осталось «cursor cloud POST /v1/agents failed:» и
+    ничего. Причину пришлось восстанавливать по арифметике времени — час
+    работы там, где хватило бы одного слова. Пустой str() — подпись именно
+    таймаута: у ConnectError и RemoteProtocolError текст есть.
+    """
+    import logging
+
+    recorder = _Recorder(httpx.ReadTimeout(""))
+    _patch_transport(monkeypatch, recorder)
+
+    with caplog.at_level(logging.WARNING, logger="hub.integrations.cursor_cloud"):
+        body, refusal = await cursor_cloud.create_agent_attempt(
+            repo_url="https://github.com/o/r",
+            starting_ref="task-1/x",
+            model_id="grok-4",
+            prompt_text="review",
+            hub_mcp_url="https://agenthai.ru/mcp",
+            reviewer_token="t",
+        )
+
+    assert body is None and refusal is not None
+    assert refusal.is_transport, "таймаут — повторяемый сбой, а не отказ"
+    assert "ReadTimeout" in refusal.detail, "класс доезжает до вызывающего"
+    assert "ReadTimeout" in caplog.text, "и до журнала"
+    assert not caplog.text.rstrip().endswith("failed:"), (
+        "запись, обрывающаяся на «failed:», не называет ничего"
+    )
+
+
+async def test_the_marker_is_exact_and_carries_the_generation():
+    """#1199: метка различает поколения одной задачи.
+
+    Подбор сравнивает имена на равенство; если метка не несёт поколение,
+    вторая сдача подберёт агента первой и получит суждение о старом коде.
+    """
+    first = cursor_cloud.agent_marker("review", 1199, 1)
+    second = cursor_cloud.agent_marker("review", 1199, 2)
+    steward = cursor_cloud.agent_marker("steward", 1199, 1)
+
+    assert first != second, "поколение обязано входить в метку"
+    assert first != steward, "разные виды заказов не путаются между собой"
+    assert first == cursor_cloud.agent_marker("review", 1199, 1), "метка устойчива"
+    assert " " not in first, "по метке сравнивают, а не читают — без сюрпризов"
+
+
+async def test_the_name_reaches_the_request_body(monkeypatch, _configured):
+    """#1199: метка действительно уезжает провайдеру.
+
+    Схема провайдера отвергает незнакомые ключи («Unrecognized key(s)»,
+    проверено пробой 07.09), поэтому поле обязано быть именно `name` —
+    и обязано отсутствовать, когда метку не просили.
+    """
+    import json as _json
+
+    # Транспорт подставляется ОДИН раз: второй вызов _patch_transport
+    # перекрыл бы сам себя, и запрос ушёл бы в первый рекордер.
+    recorder = _Recorder(httpx.Response(200, json={"agent": {"id": "bc-1"}}))
+    _patch_transport(monkeypatch, recorder)
+
+    async def _attempt_with(name: str):
+        await cursor_cloud.create_agent_attempt(
+            repo_url="https://github.com/o/r",
+            starting_ref="task-1/x",
+            model_id="grok-4",
+            prompt_text="review",
+            hub_mcp_url="https://agenthai.ru/mcp",
+            reviewer_token="t",
+            name=name,
+        )
+        return _json.loads(recorder.request.content)
+
+    marked = await _attempt_with("haiplane:review:t1:g1")
+    assert marked["name"] == "haiplane:review:t1:g1"
+
+    plain = await _attempt_with("")
+    assert "name" not in plain, (
+        "без метки поля быть не должно: пустое имя обещало бы подбор, "
+        "которого никто не делает"
+    )
+
+
+async def test_creating_an_agent_waits_longer_than_a_plain_call(monkeypatch):
+    """#269: у создания свой срок — наблюдённые 59 секунд против общих 30.
+
+    Брошенный на тридцатой секунде запрос всё равно создавал агента, и хаб
+    терял его идентификатор. Отдельный срок убирает большую часть таких
+    случаев до всякой сверки.
+    """
+    seen: dict[str, float] = {}
+
+    async def _capture(method, path, json_body=None, timeout=cursor_cloud._TIMEOUT):
+        seen["timeout"] = timeout
+        return {"agent": {"id": "bc-1"}}, None
+
+    monkeypatch.setattr(cursor_cloud, "_attempt", _capture)
+    await cursor_cloud.create_agent_attempt(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id="grok-4",
+        prompt_text="review",
+        hub_mcp_url="https://agenthai.ru/mcp",
+        reviewer_token="t",
+    )
+
+    assert seen["timeout"] == cursor_cloud._CREATE_TIMEOUT
+    assert cursor_cloud._CREATE_TIMEOUT > cursor_cloud._TIMEOUT, (
+        "срок создания обязан быть больше общего, иначе разделение бессмысленно"
+    )
+
+
+async def test_the_marker_separates_a_top_up_from_the_first_order():
+    """#269: номер попытки входит в метку.
+
+    Без него добор той же генерации неотличим от первого заказа, и сверка
+    подберёт чужого судью.
+    """
+    first = cursor_cloud.agent_marker("review", 1199, 1, 1)
+    top_up = cursor_cloud.agent_marker("review", 1199, 1, 2)
+    assert first != top_up
+    assert cursor_cloud.agent_marker("review", 1199, 1, 1) == first
