@@ -19,6 +19,7 @@ from hub.integrations import cursor_cloud
 from hub.db import fetchall
 from hub.services import steward_shadow as sh
 from hub.services.steward_dispatch import (
+    RUN_NEVER_STARTED,
     RUN_OPEN,
     RUN_TIMEOUT,
     close_finished_runs,
@@ -496,7 +497,7 @@ async def test_the_deadline_never_overwrites_a_judgement(db: aiosqlite.Connectio
     затереть уже вынесенный вердикт: ответ лежал в строке, а состояние
     говорило «прогон не ответил».
     """
-    from hub.services.steward_dispatch import RUN_JUDGED, RUN_TIMEOUT, close_run
+    from hub.services.steward_dispatch import RUN_JUDGED, close_run
 
     project_id = await _project(db, "shadow-deadline-race")
     task_id = await _task(db, project_id)
@@ -1326,7 +1327,9 @@ async def test_waiting_for_a_reviewer_still_ends(
 
     assert await close_finished_runs(db) == 1
     run = (await _runs(db, task_id))[0]
-    assert run["status"] == RUN_TIMEOUT
+    # Заказ ждал ревьюера и не начинался — с #1181 это отдельный исход, а не
+    # таймаут судьи: обвинять того, кто не работал, статистика не должна.
+    assert run["status"] == RUN_NEVER_STARTED
 
 
 async def test_waiting_needs_a_project_that_asks_for_review(
@@ -1352,3 +1355,86 @@ async def test_waiting_needs_a_project_that_asks_for_review(
     run = (await _runs(db, task_id))[0]
     assert run["status"] == RUN_REFUSED
     assert REFUSED_UNDECLARED_MODEL in run["closed_reason"]
+
+
+async def test_the_window_belongs_to_whoever_holds_the_claim(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """#1181: рабочее окно достаётся только захватившему слот.
+
+    Между меткой захвата и подтверждением лежит вызов провайдера — секунды,
+    в которые строку может занять кто-то другой. Запись, ставящая окно
+    ОТДЕЛЬНО от agent_id, отдала бы его тому, кто слот не брал, и надзор
+    считал бы судью, которого никто не выбирал. Условие agent_id=claim в
+    той же записи — это и есть принадлежность.
+    """
+    # Окна РАЗВЕДЕНЫ намеренно: при равных умолчаниях пересчёт даёт ровно то
+    # же значение, что стояло при заказе, и проверка «дедлайн не сдвинулся»
+    # слепа — мутация с отдельной записью проходила бы незамеченной.
+    monkeypatch.setattr(config, "STEWARD_RUN_DEADLINE_MIN", 90)
+    project_id = await _project(db, "shadow-stolen-claim")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    before = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],)))[0]
+    )["deadline_at"]
+
+    async def _steal_then_answer(**_kwargs):
+        # Пока провайдер «думает», слот уводят.
+        await db.execute(
+            "UPDATE steward_runs SET agent_id='bc-thief' WHERE id=?", (order["id"],)
+        )
+        await db.commit()
+        return _CREATED, None
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt", new=_steal_then_answer
+    ):
+        await start_due_runs(db)
+
+    row = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],)))[0]
+    )
+    assert row["agent_id"] == "bc-thief", "чужой захват не перезаписывается"
+    assert row["deadline_at"] == before, (
+        "окно ушло тому, кто слот не брал — записи разошлись"
+    )
+
+
+async def test_the_working_deadline_starts_when_work_does(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """#1181 AC-1: судья получает полное окно с минуты, когда начал.
+
+    Проверяется НАСТОЯЩИМ путём старта, а не записью, сделанной руками в
+    тесте: первая версия этого теста ставила захват сама и потому не
+    замечала, есть пересчёт в рабочем коде или нет.
+
+    Заказ здесь уже просрочен по своему ожиданию — и всё равно стартует,
+    потому что выборка смотрит на статус и пустой agent_id, а не на срок.
+    Если окно отмеряется от работы, уборка его больше не закроет.
+    """
+    monkeypatch.setattr(config, "STEWARD_RUN_DEADLINE_MIN", 30)
+    project_id = await _project(db, "shadow-window")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') WHERE id=?",
+        (order["id"],),
+    )
+    await db.commit()
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ):
+        assert await start_due_runs(db) == 1
+
+    assert await close_finished_runs(db) == 0, (
+        "по старому правилу окно уже истекло бы: оно текло, пока заказ ждал"
+    )
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == "agent-1"

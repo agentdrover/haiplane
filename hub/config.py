@@ -156,6 +156,12 @@ STEWARD_DAILY_CAP = int(env_get("STEWARD_DAILY_CAP", "20"))
 # human-owned slot with no deadline of its own, so a hung cloud agent would
 # otherwise never escalate — it would just sit there looking ordered.
 STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
+#: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
+#: суждения (#1181). Одно число на два вопроса делало ответ на второй
+#: зависимым от того, как долго не отвечали на первый: на первом прогоне
+#: стюарда семнадцать минут ушли на повторные попытки, и судье досталось
+#: двенадцать минут из тридцати.
+STEWARD_START_DEADLINE_MIN = int(env_get("STEWARD_START_DEADLINE_MIN", "30"))
 # The model the steward runs on (#994 §4): a third family, distinct from the
 # implementer's and from the reviewer's. Declared on the order so the
 # diversity rule has something to check before the run starts.
