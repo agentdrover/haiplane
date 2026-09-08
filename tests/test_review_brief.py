@@ -731,3 +731,49 @@ async def test_call_sites_read_on_a_branch_only_in_origin(
     assert not report["diff_note"], (
         "with the diff read there is nothing to excuse: the volume is the answer"
     )
+
+
+class _OnTaskBranch(_RealFiles):
+    """Real file reads, and the tree standing on the task's own branch."""
+
+    async def current_branch(self, repo: str | None = None) -> str:
+        return "task-42/work"
+
+
+async def test_foreign_locator_is_read_even_when_collection_succeeded(
+    db, client: AsyncClient, workspace, monkeypatch
+):
+    """#1203: a successful pytest collection does not excuse reading the file.
+
+    The resolver is right to refuse to judge a vitest locator by a pytest
+    collection. But the brief fetched file text ONLY when collection had
+    failed, so on the path that actually runs in production the resolver was
+    handed nothing and answered "could not read at the submitted commit" —
+    about a file no one had opened. The resolver's own unit test passed a
+    collection AND the sources together, which is exactly why it could not
+    see this: the defect lived between the two, not inside either.
+    """
+    (workspace / "frontend").mkdir()
+    (workspace / "frontend" / "recent.test.ts").write_text(
+        'it("still toggles", () => {});\n'
+    )
+    _git(workspace, "add", ".")
+    _git(workspace, "commit", "-m", "a vitest test the submission adds")
+
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "frontend/recent.test.ts::still toggles"
+    )
+
+    async def _collection_succeeds(path):
+        return {"tests/test_a.py::test_ok"}
+
+    monkeypatch.setattr(
+        "hub.services.review_brief.collect_test_nodeids", _collection_succeeds
+    )
+    plugins.git_ops = _OnTaskBranch()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+
+    resolution = brief["locator_resolution"][0]
+    assert resolution["status"] == "resolvable", resolution
+    assert "could not read" not in resolution["reason"], resolution

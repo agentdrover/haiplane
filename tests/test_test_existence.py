@@ -10,6 +10,7 @@ from hub.services.test_existence import (
     UNKNOWN,
     UNPARSEABLE,
     collect_test_nodeids,
+    needs_source_reading,
     resolve_ac_locators,
     resolve_locator_in_source,
 )
@@ -227,3 +228,53 @@ def test_unknown_runner_says_so_instead_of_unparseable():
     # parses perfectly for the tool that owns it.
     status, reason = resolve_locator_in_source(_VITEST_SOURCE, _VITEST_LOCATOR)
     assert status != UNPARSEABLE
+
+
+def test_unreadable_declaration_form_is_unknown_not_missing():
+    # #1203, вторая находка ревью. ast делает "не нашёл" достоверным для
+    # Python: настоящий парсер видел весь файл. Здесь читает регулярное
+    # выражение, и форма, которую оно не осилило, выглядит ровно как тест,
+    # которого не писали. Все три случая ниже воспроизведены ревьюером на
+    # первой сдаче — до правки каждый отвечал `missing` про существующий тест.
+    forms = [
+        ('it.each`\n  $a | $b\n`("adds $a and $b", () => {});', "adds $a and $b"),
+        (
+            'it.each(items.map(x => foo(x)))("maps then names", () => {});',
+            "maps then names",
+        ),
+        ('const n = "still toggles";\nit(n, () => {});', "still toggles"),
+    ]
+    for src, name in forms:
+        status, reason = resolve_locator_in_source(src, f"a/b.test.ts::{name}")
+        assert status == UNKNOWN, (name, status, reason)
+        # И причина обязана назвать, ЧТО именно помешало: "не смог прочитать
+        # эту форму" — ответ, а "теста нет" на том же месте было обвинением.
+        assert "cannot follow" in reason, (name, reason)
+
+
+def test_missing_survives_where_it_is_honest():
+    # Осторожность не должна выродиться в вечное молчание: когда все
+    # объявления в файле читаемы, а нужного имени среди них нет, `missing` —
+    # правда, и она обязана остаться. Ложное "тест есть" хуже ложного
+    # "теста нет", потому что первое никто не заметит.
+    plain = 'it("a", () => {});\ntest("b", () => {});\n'
+    assert resolve_locator_in_source(plain, "a/b.test.ts::c")[0] == MISSING
+    assert resolve_locator_in_source(plain, "a/b.test.ts::b")[0] == RESOLVABLE
+
+
+def test_source_reading_is_needed_when_collection_speaks_for_another_runner():
+    # #1203: правило "когда нужен текст файла" жило в двух местах и копии
+    # разошлись — brief читал файлы только при провале сборки. Теперь правило
+    # одно и стоит рядом с резолвером, который им пользуется.
+    collected = {"tests/test_poller.py::test_a"}
+    vitest = [_AC("AC-1", "test", "a/b.test.ts::still toggles")]
+    pytest_only = [_AC("AC-1", "test", "tests/test_a.py::test_ok")]
+
+    assert needs_source_reading(vitest, collected) is True
+    assert needs_source_reading(pytest_only, collected) is False
+    # Провал сборки по-прежнему требует чтения — прежнее поведение цело.
+    assert needs_source_reading(pytest_only, None) is True
+    # Негодный локатор ничего не требует: его судьба решается формой.
+    assert needs_source_reading([_AC("AC-1", "test", "free text")], collected) is False
+    # Не-test критерий тоже: ему тест не нужен вовсе.
+    assert needs_source_reading([_AC("AC-1", "manual", None)], collected) is False

@@ -198,11 +198,37 @@ def _resolve_python_source(text: str, rel: str, name: str) -> tuple[str, str]:
     return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
 
 
+# Where a test declaration BEGINS, without any claim to read its name. The
+# gap between this count and the names actually extracted is the reader's own
+# blind spot, and it is the only thing that separates "the test is not here"
+# from "I could not read how this file declares its tests" (#1203).
+_VITEST_DECL_START = re.compile(r"\b(?:it|test)(?:\.\w+)*\s*[(`]")
+
+
 def _resolve_vitest_source(text: str, rel: str, name: str) -> tuple[str, str]:
+    """Existence by reading, and a refusal that never poses as an absence.
+
+    ``ast`` makes "not found" trustworthy for Python: a real parser saw the
+    whole file. Here the reader is a regular expression, and a form it cannot
+    follow — a tagged template, a table built by a call, a name held in a
+    variable — looks exactly like a test that was never written. Reporting
+    that as ``missing`` is the false accusation this whole change exists to
+    remove, so the reader counts what it could not follow and says so.
+    """
     line = _declares_vitest_test(text, name)
-    if line is None:
-        return MISSING, f"{rel} defines no test named {name}"
-    return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
+    if line is not None:
+        return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
+    started = len(_VITEST_DECL_START.findall(text))
+    named = sum(1 for _ in _VITEST_DECL.finditer(text))
+    if started > named:
+        # Erring towards unknown on a false start inside a string or comment
+        # is the safe direction: it withholds an answer instead of inventing
+        # one against the author.
+        return UNKNOWN, (
+            f"{rel} declares {started - named} test(s) in a form this reader "
+            f"cannot follow, so the absence of {name} is not established"
+        )
+    return MISSING, f"{rel} defines no test named {name}"
 
 
 # One resolver per runner the locator registry accepts. The pairing is not
@@ -236,6 +262,29 @@ def resolve_locator_in_source(text: str | None, nodeid: str) -> tuple[str, str]:
     if resolver is None:
         return UNKNOWN, NO_RESOLVER.format(runner=runner or "unknown")
     return resolver(text, rel, _wanted_name(nodeid))
+
+
+def needs_source_reading(acs: Any, collected: set[str] | None) -> bool:
+    """Whether resolving ``acs`` will need file text as well as ``collected``.
+
+    The caller used to read files only when collection failed outright, which
+    starved every locator collection cannot speak for: pytest collected its
+    own tests, so no text was fetched, and the resolver — right to refuse to
+    judge a vitest locator by a pytest collection — then had nothing to read
+    and answered "could not read at the submitted commit". Nobody had tried.
+
+    The predicate lives beside the resolver on purpose. The defect was not
+    that either side was wrong on its own; it was that the rule for when text
+    is needed existed twice and the two copies disagreed (#1203).
+    """
+    if collected is None:
+        return True
+    return any(
+        runner_of(getattr(ac, "test_ref", None)) != PYTEST
+        for ac in acs
+        if _verifiable_by(ac) == "test"
+        and parse_test_locator(getattr(ac, "test_ref", None))
+    )
 
 
 def resolve_ac_locators(

@@ -118,21 +118,6 @@ async def runnable_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
     }
 
 
-async def unrunnable_ac_locators(db: Any, task_id: int) -> dict[str, str]:
-    """{ac_id: nodeid} for well-formed locators of a runner we cannot run.
-
-    Their own outcome, never folded into the missing/not-green ones: the
-    criterion is properly written and the test may well exist and pass. What
-    is absent is the hub's ability to run it, and only a sentence that says so
-    tells the author there is nothing for them to fix (#419).
-    """
-    return {
-        ac_id: nodeid
-        for ac_id, nodeid in (await test_ac_nodeids(db, task_id)).items()
-        if runner_of(nodeid) != PYTEST
-    }
-
-
 # collector(nodeids, repo_path) -> the subset pytest could COLLECT, or None
 # when the collection itself could not run. Separate from TestRunner on
 # purpose: this asks whether a test exists, not whether it passes.
