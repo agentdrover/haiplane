@@ -2495,6 +2495,24 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         db, task["id"], task.get("branch") or "", statuses=STACK_DELIVERY_STATUSES
     )
     if assessment.outcome == STACK_STACKED:
+        if assessment.relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_ANCESTOR:
+            # The other branch is built ON TOP of this one, not the other way
+            # round: this IS the base of the stack. Ancestry names an order and
+            # it puts us first, so there is nothing to wait for and nothing to
+            # decide — merging carries only this branch's own commits, which
+            # is exactly what makes the stack resolvable at all.
+            #
+            # Found reviewing #1204 and verified on a real repository, not
+            # reasoned: the predicate is symmetric (the base sees its own
+            # child as "stacked"), so the first version of this gate lumped
+            # head_is_ancestor in with the shapes that name no order and sent
+            # the BASE of every deliberate stack to a human. Its own advisory
+            # said the opposite in the same breath — "'{branch}' merges into
+            # '{base}' FIRST" (#1184) — and the gate refused it anyway. It
+            # would have fired on this very change: #1204's branch stands on
+            # this one, so delivering this task would have escalated instead
+            # of merging.
+            return ""
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting
             # is only an answer when there is a side to wait FOR. When the two

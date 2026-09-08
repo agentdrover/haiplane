@@ -494,3 +494,36 @@ async def test_a_held_delivery_is_not_told_to_wait_for_a_green_ci(
         "CI уже зелёный — ждут доставки другой задачи, а не проверки"
     )
     assert "Пересдавать НЕ нужно" in body
+
+
+async def test_the_base_of_a_stack_merges_first_instead_of_asking(
+    db: aiosqlite.Connection,
+) -> None:
+    """Нижняя ветка стопки доставляется, а не эскалируется.
+
+    Предикат стопки симметричен: основание видит собственного потомка как
+    «стопку». Первая версия этого гейта свалила head_is_ancestor в одну кучу
+    с формами, у которых порядок не выводится, и отправляла к человеку
+    ОСНОВАНИЕ каждой сознательной стопки — при том что собственная подсказка
+    хаба в этот же момент говорит обратное: «'{branch}' merges into '{base}'
+    FIRST» (#1184).
+
+    Проверено на настоящем репозитории, а не выведено: для нижней ветки
+    rev-list даёт total=2, excluded=1, то есть stacked=True, ancestry даёт
+    head_is_ancestor, а git diff develop..нижняя показывает ровно её
+    собственный файл. Мерж безопасен, ждать нечего, решать нечего.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_ancestor")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1204/built-on-top-of-me")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "у основания стопки нет ни того, кого ждать, ни того, что решать"
+    )
+    assert g.merge_pr.await_count == 1
