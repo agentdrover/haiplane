@@ -217,3 +217,62 @@ async def test_unknown_is_not_dressed_as_a_discrepancy(
     assert json.loads(events[0]["payload"])["state"] == "unknown", (
         "событие называет состояние, а не сваливает оба в одно"
     )
+
+
+# ---- Кнопка там, где строку читают ----
+
+
+async def test_the_owner_can_acknowledge_from_the_inbox(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Признание живёт рядом со строкой, а не в отдельном месте.
+
+    Владелец читает расхождения в инбоксе, а не в каталоге MCP. Кнопка,
+    доступная только оттуда, куда он не ходит, — это отсутствующая кнопка.
+    """
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    page = await client.get("/partials/inbox")
+    assert f"/tasks/{task_id}/web-acknowledge-delivery" in page.text, (
+        "признать законным можно там же, где расхождение видно"
+    )
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": "PR держим открытым до релиза платы"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    await _age(db, task_id, 200)
+    await scan_completed_deliveries(db)
+    assert len(await _events(db, task_id)) == 1, "после признания голос смолк"
+
+    page = await client.get("/partials/inbox")
+    assert "признано законным" in page.text and "релиза платы" in page.text, (
+        "строка осталась видимой, и видно, чьё это решение и почему"
+    )
+    assert f"/tasks/{task_id}/web-acknowledge-delivery" not in page.text, (
+        "признавать дважды нечего"
+    )
+
+
+async def test_the_inbox_button_refuses_an_empty_reason(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пустая форма — выключатель. Отказ здесь, а не только в схеме API."""
+    task_id = await _completed_task(db, client, title="Left open", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+    await scan_completed_deliveries(db)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-acknowledge-delivery",
+        data={"reason": "   "},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 422
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert not (row["acknowledged_at"] or "")

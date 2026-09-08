@@ -286,9 +286,32 @@
             расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}
         </div>
         <div class="inbox-item-desc">{{ d.reason }}</div>
+        {% if d.acknowledged_at %}
+        {# Признанное расхождение не исчезает из списка: заткнуть можно,
+           стереть нельзя. Оно лишь перестаёт кричать — и видно, ЧЬЁ это
+           решение и почему, иначе тишина неотличима от забывчивости. #}
+        <div class="inbox-item-meta">
+            признано законным{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }}
+        </div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ d.task_id }}" class="btn btn-secondary btn-xs">Открыть</a>
+        </div>
+        {% else %}
         <div class="inbox-item-actions">
             <a href="/tasks/{{ d.task_id }}" class="btn btn-warning btn-xs">Разобрать</a>
         </div>
+        {# Признание стоит здесь, а не на отдельной странице: решать «так и
+           задумано» имеет смысл там, где видно возраст и номер PR. Причина —
+           обязательное поле, потому что признание без причины есть
+           выключатель, а не решение. #}
+        <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
+              class="inbox-item-actions inbox-ack-form">
+            <input type="text" name="reason" required maxlength="1000"
+                   class="inbox-ack-reason"
+                   placeholder="Почему это законно — без причины не признать">
+            <button type="submit" class="btn btn-secondary btn-xs">Признать законным</button>
+        </form>
+        {% endif %}
     </article>
     {% endfor %}
 </section>

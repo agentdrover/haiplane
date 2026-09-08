@@ -1234,6 +1234,42 @@ async def web_request_machine_review(task_id: int, request: Request):
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 
+@router.post("/tasks/{task_id}/web-acknowledge-delivery")
+async def web_acknowledge_delivery(task_id: int, request: Request):
+    """Владелец говорит: расхождение доставки законно (#1198).
+
+    Кнопка живёт РЯДОМ СО СТРОКОЙ реестра, а не в отдельном месте: признание
+    имеет смысл там, где расхождение читают, и требует того же взгляда на
+    возраст и номер PR, который в строке уже есть.
+
+    Причина обязательна и здесь, а не только в схеме API: пустая форма — это
+    выключатель, а выключатель превращает механизм в способ глушить
+    неудобное. Строка после признания не исчезает: она остаётся в реестре с
+    причиной и именем, потому что заткнуть можно, а стереть нельзя.
+    """
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    form = await request.form()
+    reason = str(form.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(422, "признание без причины — выключатель, а не решение")
+    if not await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by=identity.username, reason=reason
+    ):
+        raise HTTPException(404, "по этой задаче расхождение не записано")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Расхождение доставки признано законным: {reason} "
+        f"(признал: {identity.username}). Сигнал замолчал, запись осталась "
+        "в реестре — заткнуть можно, стереть нельзя (#1198).",
+    )
+    await db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
 @router.post("/tasks/{task_id}/web-finding-dispositions")
 async def web_finding_dispositions(task_id: int, request: Request):
     """The gate says what each confirmed finding turned out to be (#876).
