@@ -955,13 +955,39 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
     return TEMPLATES.TemplateResponse(request, "dashboard.html", ctx)
 
 
+async def _review_reach_by_project(db, rows) -> dict[int, Any]:
+    """Досягаемость ревью по проектам, посчитанная ПО ФОРЖАМ (#1188).
+
+    Ответ зависит от форжа и от конфигурации хаба, а не от строки проекта,
+    поэтому на девять проектов из трёх форжей приходится три вычисления, а
+    не девять: каждое трогает файловую систему (каталог прогонов) и базу
+    (принципал ревьюера).
+    """
+    from hub.services.review_dispatch import review_reach
+
+    by_forge: dict[str, Any] = {}
+    out: dict[int, Any] = {}
+    for row in rows:
+        project = dict(row)
+        forge = project_policy.forge_of(project)
+        if forge not in by_forge:
+            by_forge[forge] = await review_reach(db, forge)
+        out[int(project["id"])] = by_forge[forge]
+    return out
+
+
 @router.get("/projects", response_class=HTMLResponse)
-async def web_projects(request: Request, project_error: str = Query("")):
+async def web_projects(
+    request: Request,
+    project_error: str = Query(""),
+    project_error_id: int = Query(0),
+):
     """Project list with create/edit/archive forms (#339, #344)."""
     rows = await repo.list_projects(_db(request), include_archived=True)
     # #567: the page stops being a routing table — each project carries its live
     # epics and three numbers, computed server-side.
     cards = await services.get_project_cards(_db(request))
+    reach = await _review_reach_by_project(_db(request), rows)
     return TEMPLATES.TemplateResponse(
         request,
         "projects.html",
@@ -969,6 +995,7 @@ async def web_projects(request: Request, project_error: str = Query("")):
             "projects": [dict(r) for r in rows],
             "cards": cards,
             "project_error": project_error,
+            "project_error_id": project_error_id,
             # #475: the create form must prefill the branch the hub would
             # actually fall back to, not a literal that stops matching it.
             "default_base_branch": config.PAIR_BASE_BRANCH,
@@ -981,6 +1008,13 @@ async def web_projects(request: Request, project_error: str = Query("")):
             "gate_choices": project_policy.IMPLEMENTED_GATE_VALUES,
             "gate_selected": project_policy.gate_form_value,
             "gate_delegate_badge": project_policy.gate_delegate_badge,
+            # #1188: чем ревью МОЖЕТ быть добыто на каждом проекте. Форма
+            # спрашивает того же читателя, что диспетчер и инвариант записи:
+            # предлагать выбор, которого этот проект не исполнит, — тот же
+            # обман, что и значение без поведения (#1163), только по другой
+            # оси. Причина едет рядом, потому что молча убранный пункт
+            # ничем не лучше пункта, который отказывает.
+            "review_reach": reach,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -1013,9 +1047,46 @@ _FORM_GATE_POLICY_KEYS = frozenset(
 )
 
 
-def _projects_error_redirect(message: str) -> RedirectResponse:
+# Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
+# нота внизу страницы остаётся для отказов, у которых проекта нет, — форма
+# создания и разбор адреса; она же страховка от 500, ради которой всё это
+# заводилось (#344).
+def _projects_error_redirect(
+    message: str, project_id: int | None = None
+) -> RedirectResponse:
+    tail = f"&project_error_id={project_id}" if project_id else ""
     return RedirectResponse(
-        f"/projects?project_error={quote(message)}", status_code=303
+        f"/projects?project_error={quote(message)}{tail}", status_code=303
+    )
+
+
+# Поле, которого касается отказ, — по коду ошибки, а не по догадке из текста.
+# Имя поля человек ищет глазами в форме, и «что-то не сохранилось» отправляет
+# его перебирать всё подряд.
+_ERROR_FIELD_LABELS: dict[str, str] = {
+    "review_unrunnable_here": "Агентское ревью на сдаче",
+    "default_project_gate_locked": "Автопилот гейтов",
+    "cloud_review_forge_unsupported": "Агентское ревью на сдаче",
+}
+
+
+def _refusal_text(slug: str, detail: Any) -> str:
+    """Отказ, из которого видно проект, поле и цену (#1188).
+
+    Раньше сюда доезжал один hint: ни проекта (а на странице их девять), ни
+    поля, ни того, что вместе с отвергнутым ключом не сохранилось НИЧЕГО из
+    отправки. Из такого текста «UI не сохраняет настройки» — вывод разумный.
+    """
+    if isinstance(detail, dict):
+        message = str(detail.get("hint") or detail.get("error") or "")
+        field = _ERROR_FIELD_LABELS.get(str(detail.get("error") or ""), "")
+    else:
+        message, field = str(detail), ""
+    where = f"«{slug}», поле «{field}»" if field else f"«{slug}»"
+    return (
+        f"Проект {where}: {message or 'запрос отклонён'}. "
+        "НИЧЕГО из этой отправки не сохранено — форма несёт правку целиком, "
+        "поэтому повторите её вместе с остальными полями."
     )
 
 
@@ -1079,7 +1150,7 @@ async def web_edit_project(project_id: int, request: Request):
             fields[key] = value
     policy, err = _parse_policy_form(str(form.get("default_branch_policy") or ""))
     if err:
-        return _projects_error_redirect(err)
+        return _projects_error_redirect(err, project_id)
     if policy is not None:
         fields["default_branch_policy"] = policy
     # Gate policy selects (#753). Present only for non-default projects in
@@ -1132,7 +1203,9 @@ async def web_edit_project(project_id: int, request: Request):
             gate_policy["dor_max_class"] = ceiling
         risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
         if err:
-            return _projects_error_redirect(err.replace("policy:", "risk_map:"))
+            return _projects_error_redirect(
+                err.replace("policy:", "risk_map:"), project_id
+            )
         if risk_map is not None:
             gate_policy["risk_map"] = risk_map
         # Keys the form does not offer (#886: ci_runner) are carried
@@ -1155,7 +1228,9 @@ async def web_edit_project(project_id: int, request: Request):
     except ValidationError as exc:
         first = exc.errors()[0]
         loc = ".".join(str(p) for p in first.get("loc", ()))
-        return _projects_error_redirect(f"{loc}: {first.get('msg', 'invalid')}")
+        return _projects_error_redirect(
+            f"{loc}: {first.get('msg', 'invalid')}", project_id
+        )
     try:
         await _web_patch_project(request, project_id, body)
     except HTTPException as exc:
@@ -1166,13 +1241,9 @@ async def web_edit_project(project_id: int, request: Request):
         # is tested on.
         if exc.status_code != 422:
             raise
-        detail = exc.detail
-        message = (
-            detail.get("hint") or detail.get("error")
-            if isinstance(detail, dict)
-            else str(detail)
-        )
-        return _projects_error_redirect(message or "запрос отклонён")
+        stored = await repo.get_project(_db(request), project_id)
+        slug = dict(stored)["slug"] if stored is not None else str(project_id)
+        return _projects_error_redirect(_refusal_text(slug, exc.detail), project_id)
     return RedirectResponse("/projects", status_code=303)
 
 
@@ -1203,7 +1274,13 @@ async def web_provision_project(project_id: int, request: Request):
         return _projects_error_redirect("project not found")
     result = await services.provision_project(db, project_id, actor=identity.username)
     if result["provision_status"] != "ok":
-        return _projects_error_redirect(f"Provision: {result['provision_detail']}")
+        # Проект известен — значит отказ показывается У ЕГО КАРТОЧКИ, как и
+        # отказ формы (найдено ревью, находка cbab9718). Инвариант, введённый
+        # этой же задачей, нарушался соседним вызовом в том же файле: нота
+        # снова уезжала последним блоком страницы, где её и не видят.
+        return _projects_error_redirect(
+            f"Provision: {result['provision_detail']}", project_id
+        )
     return RedirectResponse("/projects", status_code=303)
 
 

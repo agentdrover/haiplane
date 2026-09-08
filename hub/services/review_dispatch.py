@@ -1537,6 +1537,61 @@ async def maybe_dispatch_review(
     return True
 
 
+@dataclass(frozen=True)
+class ReviewReach:
+    """Чем ревью на ЭТОМ проекте вообще может быть добыто (#1188).
+
+    Один читатель на троих: диспетчер (звать ли и кого), инвариант записи
+    (хранить ли политику) и форма проекта (предлагать ли выбор). До #1180
+    ответ сводился к форжу, и каждый спрашивал его сам; после — складывается
+    из двух способов, и три копии этого знания разошлись бы на первой правке.
+    Разошлись они уже: #1180 научила хаб исполнять dispatch на любом форже, а
+    инвариант записи продолжал отказывать по форжу — политику, которую хаб
+    умеет исполнить, нельзя было сохранить.
+
+    ``reason`` заполнен ровно тогда, когда ``ways`` пуст: это то, что
+    показывают человеку вместо выбора и печатают в отказе. Молча убранный
+    пункт меню — такой же обман, как пункт без исполнения.
+    """
+
+    ways: tuple[str, ...]
+    reason: str
+
+    @property
+    def runnable(self) -> bool:
+        return bool(self.ways)
+
+
+async def review_reach(db: aiosqlite.Connection, forge: str) -> ReviewReach:
+    """Каким способом ревью добывается на проекте этого форжа, или почему никаким.
+
+    Аргумент — ФОРЖ, а не строка проекта: инвариант записи судит о состоянии
+    ПОСЛЕ патча, где форж может меняться тем же запросом, и подсунуть ему
+    сохранённую строку значило бы проверить не то состояние (#1119 закрывала
+    ровно эту дорогу).
+
+    Облако спрашивается по форжу — это факт про Cursor с датой замера
+    (#1119). Локальный путь — по конфигурации И по принципалу: токен может
+    БЫТЬ и не разрешаться (отозван, открытый режим), а отчёт под принципалом
+    автора гейт не засчитает при REVIEW_SELF_APPROVE=forbid, то есть прогон
+    был бы оплачен впустую (#1128).
+    """
+    if forge in CLOUD_REVIEW_FORGES:
+        return ReviewReach((CLOUD_CHANNEL,), "")
+    missing = local_reviewer.not_ready()
+    if await local_reviewer_principal_id(db) is None:
+        missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
+    if not missing:
+        return ReviewReach((LOCAL_CHANNEL,), "")
+    return ReviewReach(
+        (),
+        f"облачный ревьюер не работает с форжем «{forge}» (проверено "
+        "31.08.2026, #1119), а локальный не настроен: "
+        + "; ".join(missing)
+        + ". Порядок включения — deploy/LOCAL-REVIEW.md",
+    )
+
+
 async def dispatch_local_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -1553,22 +1608,13 @@ async def dispatch_local_review(
     «ревью не потребовалось».
     """
     task_id = int(task["id"])
+    reach = await review_reach(db, forge)
+    if not reach.runnable:
+        # Причина та же, что увидит человек в форме проекта и в отказе на
+        # записи: у неё один автор (#1188), иначе три места объясняли бы
+        # одно состояние тремя разными словами.
+        return await _refuse_local_review(db, task_id, reach.reason)
     principal_id = await local_reviewer_principal_id(db)
-    missing = local_reviewer.not_ready()
-    if principal_id is None:
-        # Отдельной причиной, а не «одной из недостающих настроек»: токен
-        # может БЫТЬ и не разрешаться в принципала (отозван, открытый режим).
-        # Отчёт под принципалом автора даёт self_reviewed=1, гейт его не
-        # засчитает при REVIEW_SELF_APPROVE=forbid — прогон был бы оплачен
-        # впустую, ровно как на #1128.
-        missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
-    if missing:
-        return await _refuse_local_review(
-            db,
-            task_id,
-            f"облачный ревьюер не работает с форжем «{forge}» (проверено "
-            f"31.08.2026, #1119), а локальный не настроен: " + "; ".join(missing),
-        )
     spent = await _tokens_already_spent(db, task_id)
     if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
         return await _refuse_local_review(
