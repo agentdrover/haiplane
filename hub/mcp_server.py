@@ -3992,10 +3992,13 @@ REFINE_HIDDEN: tuple[Hidden, ...] = (
 @with_model_signature(
     TaskRefine,
     leading=(("task_id", int),),
+    trailing=(("include_task", bool, False),),
     hidden=REFINE_HIDDEN,
     returns=HubRefineTaskResult,
 )
-async def hub_refine_task(task_id: int, **fields: Any) -> HubRefineTaskResult:
+async def hub_refine_task(
+    task_id: int, include_task: bool = False, **fields: Any
+) -> HubRefineTaskResult:
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written; every list REPLACES the stored one.
@@ -4037,6 +4040,7 @@ async def hub_refine_task(task_id: int, **fields: Any) -> HubRefineTaskResult:
         human_reviewer: Who accepts the result.
         acceptance_criteria: Full AC replacement (REST refine shape).
         risks: Full replacement (TaskRisk shape).
+        include_task: Echo the whole task back too; off by default.
     """
     # Один источник вместо двух списков. До #1068 поля были выписаны и в
     # сигнатуре, и здесь, а комментарий рядом называл цену расхождения:
@@ -4085,7 +4089,11 @@ async def hub_refine_task(task_id: int, **fields: Any) -> HubRefineTaskResult:
             risks_count=risks_count,
             readiness_score=readiness_score,
             dor_passed=dor_passed,
-            task=result,
+            # #711: the full task is opt-in. Echoing it back cost a caller one
+            # whole task object per refine — 72 of them on a backlog build,
+            # each carrying the description just written — and the work moved
+            # to raw REST. The summary above already says what was applied.
+            task=result if include_task else None,
         ),
     )
 
@@ -4094,13 +4102,12 @@ async def hub_refine_task(task_id: int, **fields: Any) -> HubRefineTaskResult:
 async def hub_refine_tasks(items: list[dict[str, Any]]) -> HubRefineTasksResult:
     """Bulk-refine many tasks in ONE atomic call (replaces N hub_refine_task).
 
-    Either every item lands or none does. Use this to bring a batch of tasks
-    to DoR without a request per task.
+    Either every item lands or none does. The response is a per-task audit,
+    never the tasks themselves.
 
     Args:
-        items: List of dicts, each with ``task_id`` plus any TaskRefine fields
-            (e.g. work_type, scope_in, problem_statement, size,
-            acceptance_criteria, risks). ``acceptance_criteria``/``risks``
+        items: List of dicts, each with ``task_id`` plus any TaskRefine
+            field hub_refine_task documents. ``acceptance_criteria``/``risks``
             replace the full list for that task.
     """
     if not items:
