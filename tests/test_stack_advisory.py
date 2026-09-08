@@ -17,6 +17,7 @@ from hub import repository as repo
 from hub import services
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.noop import NoopGitOps
+from hub.integrations.protocols import StackProbeOutcome
 from hub.integrations.registry import plugins
 from hub.models import TaskCreate, TaskSubmitReview
 
@@ -487,6 +488,79 @@ async def test_git_ops_merged_base_branch_not_stacked() -> None:
             "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
         )
     assert stacked is False
+
+
+# --- #1186: the probe's OWN outcomes, on the real git body ---
+#
+# Найдено измерением test-adequacy при машинном ревью #1186: тесты гейта
+# доставки скриптуют branch_stacking_probe целиком через AsyncMock, поэтому
+# настоящее тело GitOpsIntegration.branch_stacking_probe в них не исполняется
+# ни разу. А ведь именно оно решает, будет ли исход unavailable (гейт держит
+# и спрашивает снова) или clear (гейт мержит) — то есть ошибка ровно здесь
+# вернула бы молчаливый мерж поверх несмерженной ветки, ради запрета которого
+# заведена #1186. Тесты ниже гоняют это тело с подменённым _git, как уже
+# сделано выше для bool-предиката.
+
+
+async def test_probe_names_a_stack_rather_than_just_asserting_one() -> None:
+    with patch("hub.integrations.git_ops._git", side_effect=_fake_git_factory("1")):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+    assert probe.outcome is StackProbeOutcome.stacked
+    assert "2 of 3" in (probe.details or ""), "сколько коммитов общих — часть ответа"
+
+
+async def test_probe_says_clear_only_after_actually_looking() -> None:
+    with patch("hub.integrations.git_ops._git", side_effect=_fake_git_factory("3")):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+    assert probe.outcome is StackProbeOutcome.clear
+
+
+async def test_probe_reports_an_unresolvable_ref_as_unavailable_not_clear() -> None:
+    # Ветки нет в клоне. До #1186 это давало ровно тот же False, что и
+    # «проверил, независимы», и гейт мержил бы. Теперь исход другой И несёт
+    # имя ветки, которую не удалось разрешить.
+    with patch("hub.integrations.git_ops._git", side_effect=_fake_git_factory("0")):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "ref_unresolved"
+    assert "task-999/gone" in (probe.details or "")
+
+
+async def test_probe_reports_a_failed_rev_list_as_unavailable_not_clear() -> None:
+    # git ответил ненулевым кодом. Тоже не «стопки нет».
+    async def failing_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "rev-list":
+            return (128, "", "fatal: bad revision")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=failing_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "rev_list_failed"
+
+
+async def test_probe_reports_unreadable_counts_as_unavailable_not_clear() -> None:
+    # rev-list вернул ноль, но не число. Ни «стопка», ни «независимы».
+    with patch(
+        "hub.integrations.git_ops._git",
+        side_effect=_fake_git_factory("не число", total_count="тоже не число"),
+    ):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "rev_list_unparseable"
 
 
 # --- ancestry between two branches (patched _git, no real repo) ---

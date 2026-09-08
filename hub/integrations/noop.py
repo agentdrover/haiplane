@@ -18,6 +18,8 @@ from hub.integrations.protocols import (
     CIRunRequestOutcome,
     CIRunRequestResult,
     MergeabilityOutcome,
+    StackProbeResult,
+    stacking_probe_from_predicate,
 )
 
 
@@ -339,6 +341,32 @@ class NoopGitOps:
     ) -> bool:
         # No repo access — the advisory stacking check is silently skipped.
         return False
+
+    async def branch_stacking_probe(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> StackProbeResult:
+        """No git here — a delivery must read this as "cannot check", never
+        as "not stacked" (#1186), the same way fetch_base refuses to read as
+        "clean" (#534). ``unsupported``, not ``unavailable``: no retry gives
+        this plugin a repository.
+
+        Routed through this class's OWN predicate rather than answering
+        outright, because subclasses exist that override the predicate and
+        nothing else. Answering for them would overrule the one method they
+        did implement — and for a bare NoopGitOps the predicate is False
+        anyway, so the honest "cannot check" is what still comes back.
+        """
+        return await stacking_probe_from_predicate(
+            self.branch_contains_unmerged_commits_of,
+            branch,
+            other_branch,
+            base_branch=base_branch,
+            repo=repo,
+        )
 
     async def branch_ancestry(
         self,
