@@ -241,12 +241,17 @@ async def _base_task_in_review(db: aiosqlite.Connection, branch: str) -> int:
     return tv.id
 
 
-def _probes(g, outcome, reason: str = "scripted"):
-    """Script the stacking probe on a git double (#1186)."""
+def _probes(g, outcome, reason: str = "scripted", details: str = ""):
+    """Script the stacking probe on a git double (#1186).
+
+    ``details`` matters for ``ref_unresolved``: the real probe puts the names
+    it could not resolve there, and #1204 reads them to tell "that candidate's
+    branch is gone" from "this machine could not answer at all".
+    """
     from hub.integrations.protocols import StackProbeResult
 
     g.branch_stacking_probe = AsyncMock(
-        return_value=StackProbeResult(outcome=outcome, reason=reason)
+        return_value=StackProbeResult(outcome=outcome, reason=reason, details=details)
     )
     return g
 
@@ -1024,3 +1029,172 @@ async def test_a_stranded_base_is_not_told_a_direction_git_never_confirmed(
         "направление не подтверждено — значит и не называется"
     )
     assert "направление git не подтвердил" in body
+
+
+async def test_a_stranded_base_with_a_dead_branch_calls_a_human(
+    db: aiosqlite.Connection,
+) -> None:
+    # Найдено машинным ревью сдачи №2 (uid d670192f5bdb8a4d), high.
+    # Строка «PR открыт» с мёртвой ссылкой попадала в обход как обычный
+    # кандидат: проба отвечала unavailable, обход помнил unknown, а unknown
+    # старше clear — и ЛЮБАЯ доставка того же проекта, у которой нет своей
+    # явной стопки, уходила в транзитное удержание. Транзитное значит
+    # молчаливое, а ветку принятой задачи никто не вернёт: удержание вечное.
+    # Ровно тот кирпич, ради которого выше стоит пропуск чужих проектов.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+        details="task-1138/eslint-debt",
+    )
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited(), "непроверенная стопка не повод мержить"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "ни ждать (ветка не вернётся), ни мержить (это исходный инцидент) — "
+        "остаётся позвать человека"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "человеку называют, с какой задачей разбираться"
+    assert "task-1138/eslint-debt" in body
+
+
+async def test_the_unprobed_stranded_refusal_is_not_a_silent_wait(
+    db: aiosqlite.Connection,
+) -> None:
+    # Половина вступления в множество — это попасть в кортеж транзитных
+    # префиксов; вторая половина — НЕ попасть туда, когда ждать нечего.
+    # Мутация «добавить префикс в TRANSIENT_GATE_PREFIXES» роняет этот тест,
+    # и она же вернула бы молчаливое вечное удержание.
+    from hub import services
+
+    assert not services.UNPROBED_STRANDED_BASE_PREFIX.startswith(
+        services.TRANSIENT_GATE_PREFIXES
+    ), "удержание здесь было бы обещанием, которого хаб не может сдержать"
+    assert not services.UNPROBED_STRANDED_BASE_PREFIX.startswith(
+        services.STRANDED_BASE_PREFIX
+    ), (
+        "префикс не должен быть приставкой соседнего: рядом сравнивают "
+        "через startswith, и приставка молча попала бы в чужую ветку разбора"
+    )
+
+
+async def test_a_definite_stack_outranks_an_unprobed_stranded_base(
+    db: aiosqlite.Connection,
+) -> None:
+    # Непроверенный застрявший кандидат запоминается, а не возвращается сразу:
+    # настоящая стопка — более полезный ответ, и она называет, чего ждать.
+    # Проба отвечает по паре: мёртвой ссылке — unavailable, живому основанию —
+    # stacked. Мутация «возвращать непроверенного немедленно» роняет тест.
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    live = "task-1175/image-capture"
+    dead = "task-1138/eslint-debt"
+
+    async def _probe(_branch, other_branch, **_kw):
+        if other_branch == dead:
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=dead,
+            )
+        return StackProbeResult(outcome=StackProbeOutcome.stacked, reason="scripted")
+
+    g.branch_stacking_probe = _probe
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, dead)
+    live_id = await _base_task_in_review(db, live)
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "живое основание доставится само, поэтому это ожидание, а не решение"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{live_id}" in body and live in body
+
+
+async def test_our_own_unresolvable_branch_still_waits(
+    db: aiosqlite.Connection,
+) -> None:
+    # Точность правки, а не её широта. Не разрешилась НАША ветка — это про эту
+    # машину, а не про ту задачу: клон догонит, следующий цикл ответит. Такой
+    # случай обязан остаться повторяемым ожиданием, даже когда рядом лежит
+    # застрявший кандидат. Мутация «считать любой ref_unresolved застрявшим»
+    # роняет этот тест.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+        details="task-999/ours",
+    )
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "не разрешилась своя ветка — лечится следующим циклом, а не человеком"
+    )
+
+
+async def test_an_unprobed_stranded_base_outranks_a_plain_unknown(
+    db: aiosqlite.Connection,
+) -> None:
+    # Приоритет, а не украшение. Оба исхода значат «посмотреть не удалось»,
+    # но повторяемый unknown ЖДЁТ молча, а этот зовёт человека и называет
+    # задачу. Вернуть первый вместо второго — значит спрятать застрявшее
+    # основание навсегда: ветка не вернётся, и ожидание не кончится.
+    # Мутация «поменять порядок в _first_of» роняет этот тест; без него та
+    # мутация не роняла ничего, то есть приоритет не был проверен вовсе.
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    dead = "task-1138/eslint-debt"
+    live = "task-1175/image-capture"
+
+    async def _probe(_branch, other_branch, **_kw):
+        if other_branch == dead:
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=dead,
+            )
+        return StackProbeResult(
+            outcome=StackProbeOutcome.unavailable,
+            reason="rev_list_failed",
+            details=f"rc=1/0 for {other_branch}",
+        )
+
+    g.branch_stacking_probe = _probe
+    task_id = await _approved_pair_task(db)
+    stranded_id = await _stranded_base(db, dead)
+    await _base_task_in_review(db, live)
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "молчаливое ожидание рядом с застрявшим основанием — это и есть "
+        "способ его никогда не заметить"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{stranded_id}" in body

@@ -2007,6 +2007,12 @@ class StackAssessment:
     # has to derive "completed means undelivered here" from which query the
     # row came out of will eventually derive it wrong.
     base_can_deliver_itself: bool = True
+    # #1204 (found by the machine review of submission #2): the id of a
+    # STRANDED candidate whose own branch ref could not be resolved. Kept
+    # apart from a plain ``unknown`` because the two need opposite handling:
+    # a plain unknown is retryable and waits, while a terminal task's deleted
+    # branch will never come back — waiting on it is silent and permanent.
+    unprobed_stranded_task_id: int | None = None
 
     def as_advisory(self) -> dict[str, Any] | None:
         """The pre-#1186 shape: a dict for a stack, None for anything else."""
@@ -2025,6 +2031,75 @@ async def _project_id_for(db: aiosqlite.Connection, task_id: int) -> int | None:
     """The project a task belongs to, by the hub's one rule for that (#335)."""
     row = await repo.resolve_project_for_task(db, task_id)
     return dict(row)["id"] if row else None
+
+
+def _first_of(*answers: "StackAssessment | None") -> "StackAssessment | None":
+    """The walk's precedence, written once and in order (#1186, #1204).
+
+    A stranded row we could not probe outranks a plain unknown: both mean "we
+    could not look", but only that one names a task and says who has to act,
+    so returning the silent retryable one instead would hide it forever. And
+    unknown outranks a benign match for the reason #1186 gave: a row we could
+    not look at may be the dangerous one, and "the pair I DID look at is safe"
+    says nothing about it.
+    """
+    for answer in answers:
+        if answer is not None:
+            return answer
+    return None
+
+
+def _stranded_with_a_dead_ref(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    stranded: set[int],
+) -> "StackAssessment | None":
+    """A stranded candidate whose OWN branch ref no longer resolves (#1204).
+
+    Found by the machine review of submission #2, severity high. Such a row
+    cannot be handled the way a plain ``unknown`` is. The plain kind is
+    retryable on purpose: git blinked, the clone will catch up, the next cycle
+    answers. This kind never will — the task is terminal, so nobody is going
+    to push that branch back, and deleting the branch is what GitHub does by
+    default after a manual merge. Left as a retryable unknown it became a
+    SILENT, PERMANENT hold on every delivery in the project that had no
+    definite stack of its own: exactly the brick the foreign-project skip
+    prevents, re-entered through the candidate list this change introduced.
+
+    Merging is not the alternative — that is the other existing branch of
+    ``unknown``, and the whole point of the stranded question is that merging
+    on top of such a base carries its work into the base branch under our
+    number. So this becomes a refusal that CALLS A HUMAN, the same answer
+    ``stranded_base`` already gives and for the same reason.
+
+    Narrow on purpose: only when the candidate's OWN ref is the one that did
+    not resolve. A missing workspace or a failed rev-list is about this
+    machine rather than about that branch, would hit every candidate alike,
+    and really can pass by itself — so it stays retryable. Reading which name
+    failed means reading ``details``, which the probe fills with exactly that
+    list; an empty ``details`` falls through to the old behaviour rather than
+    guessing.
+    """
+    if int(other["id"]) not in stranded:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",")}
+    if other_branch not in unresolved:
+        return None
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"stranded_ref_unresolved: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        base_can_deliver_itself=False,
+        unprobed_stranded_task_id=int(other["id"]),
+    )
 
 
 async def assess_branch_stacking(
@@ -2113,6 +2188,8 @@ async def assess_branch_stacking(
         )
     )
     unknown: StackAssessment | None = None
+    # Held apart from ``unknown``: see StackAssessment.unprobed_stranded_task_id.
+    stranded_unprobed: StackAssessment | None = None
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
     # it finds, and while every match meant a refusal that was safe: order
@@ -2186,6 +2263,10 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
+            dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+            if dead is not None:
+                stranded_unprobed = stranded_unprobed or dead
+                continue
             # Remembered, not returned: a later row may still be a definite
             # stack, and a definite stack is the more useful answer. Only
             # after the whole walk finds none does the unknown stand.
@@ -2197,10 +2278,9 @@ async def assess_branch_stacking(
     # Unknown outranks benign for the same reason it outranks clear: a row we
     # could not look at may be the dangerous one, and "the pair I DID look at
     # is safe" says nothing about it.
-    if unknown is not None:
-        return unknown
-    if benign is not None:
-        return benign
+    answer = _first_of(stranded_unprobed, unknown, benign)
+    if answer is not None:
+        return answer
     return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
 
 
@@ -2666,6 +2746,28 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"работу #{assessment.base_task_id} в базовую ветку под этим "
             f"номером. Ждём доставки #{assessment.base_task_id}"
         )
+    if assessment.outcome == STACK_UNKNOWN and assessment.unprobed_stranded_task_id:
+        # #1204, по машинному ревью сдачи №2. Ни один из двух существующих
+        # исходов unknown здесь не годится, и это надо было увидеть до того,
+        # как класть застрявших в обход. Повторяемый unknown ЖДЁТ, а ждать
+        # тут нечего и вечно: задача терминальная, её ветку никто не вернёт.
+        # Неповторяемый unknown МЕРЖИТ с алертом, а мерж поверх застрявшего
+        # основания — ровно тот инцидент, ради которого условие написано.
+        # Значит третий исход: не ждать и не мержить, а позвать человека,
+        # назвав задачу и то, чего именно хаб не смог проверить.
+        return (
+            f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
+            f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
+            f"доставив (её PR открыт и не влит), а её ветку "
+            f"'{assessment.base_task_branch}' в клоне разрешить не удалось — "
+            f"скорее всего она удалена после ручного мержа. Поэтому хаб НЕ "
+            f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
+            f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
+            f"задача терминальна, её ветку никто не вернёт. Решение за "
+            f"человеком: доставить или закрыть PR задачи "
+            f"#{assessment.unprobed_stranded_task_id}, либо подтвердить, что "
+            f"эта ветка от неё не отведена"
+        )
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
@@ -2720,6 +2822,16 @@ STACKED_UNDETERMINED_PREFIX = "stacked_undetermined"
 # hub cannot keep, and transient refusals are silent, so nobody would ever
 # learn the promise had failed.
 STRANDED_BASE_PREFIX = "stranded_base"
+# #1204 (машинное ревью сдачи №2): тоже НЕ транзитный, и по обеим причинам
+# сразу. Ветка застрявшей задачи, которую не удалось разрешить, не вернётся
+# (ждать нечего — как у соседа выше), а мержить с алертом, как делает второй
+# существующий исход unknown, здесь нельзя: непроверенная стопка на
+# недоставляемом основании — это исходный инцидент #1186. Единственный
+# честный ответ — человек.
+# Значение НЕ начинается со "stranded_base" сознательно: соседние проверки
+# в этом файле сравнивают детали через startswith, и префикс, являющийся
+# приставкой другого, рано или поздно молча попадёт в чужую ветку разбора.
+UNPROBED_STRANDED_BASE_PREFIX = "unprobed_stranded_base"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
