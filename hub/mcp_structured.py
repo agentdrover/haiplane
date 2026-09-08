@@ -32,6 +32,9 @@ class HubRefineTaskStructured(BaseModel):
     dor_passed: bool | None = None
     no_op: bool = False
     # Full task as returned by REST /refine (TaskView), for machine consumers.
+    # Filled only when the caller passes include_task (#711): by default the
+    # summary above stands alone, so a bulk refine does not pay a task object
+    # per node for fields it just sent.
     task: dict[str, Any] | None = None
 
 
