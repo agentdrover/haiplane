@@ -2008,6 +2008,12 @@ class StackAssessment:
         }
 
 
+async def _project_id_for(db: aiosqlite.Connection, task_id: int) -> int | None:
+    """The project a task belongs to, by the hub's one rule for that (#335)."""
+    row = await repo.resolve_project_for_task(db, task_id)
+    return dict(row)["id"] if row else None
+
+
 async def assess_branch_stacking(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2067,14 +2073,46 @@ async def assess_branch_stacking(
     ctx = await project_git_context(db, task_id)
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
+    own_project = await _project_id_for(db, task_id)
     rows = await repo.list_unmerged_branch_tasks(
         db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
     )
     unknown: StackAssessment | None = None
+    # #1186 round 2: a match that says "the OTHER branch stands on ME" is
+    # benign — but only for that pair. The walk answers with the first match
+    # it finds, and while every match meant a refusal that was safe: order
+    # could not change the outcome. The moment one shape started meaning
+    # "merge", first-match became a way to merge without looking at the rest.
+    # Three tasks D <- X <- C, X delivering: if C's row comes first (rows are
+    # ordered by id, and id does not track git topology) X reads "I am the
+    # base", merges, and carries D's unmerged commits under its own number —
+    # the incident this whole condition exists to prevent, re-entered through
+    # its own fix. So a benign match is REMEMBERED and the walk continues; it
+    # stands only if nothing dangerous is found anywhere.
+    benign: StackAssessment | None = None
     for row in rows:
         other = dict(row)
         other_branch = (other.get("branch") or "").strip()
         if not other_branch or other_branch == branch:
+            continue
+        # Another project is another REPOSITORY (each carries its own
+        # workspace_path and clone), so its branch names mean nothing here.
+        # Skipped before the probe rather than after: the probe would try to
+        # resolve a foreign name in this repo, fail, and answer "unavailable"
+        # — which #1186 rightly ranks above "clear" and which would then hold
+        # a perfectly clean delivery. Since one such row is enough and it can
+        # NEVER resolve, the hold would be permanent, and it would be
+        # permanent for every delivery in every project at once. Nine active
+        # projects on prod at the time of writing, most of them with work in
+        # flight: this was a hub-wide brick, not an edge case.
+        #
+        # Asked of repo.resolve_project_for_task rather than of a project_id
+        # column: projects live on epics and descendants inherit (#335), so
+        # the column is null for most tasks and a SQL filter would have been a
+        # second, weaker copy of that rule. The walk is a local SQLite lookup
+        # and it REPLACES a git subprocess for every foreign row, so scoping
+        # makes the walk cheaper, not dearer.
+        if await _project_id_for(db, other["id"]) != own_project:
             continue
         try:
             result = await probe(branch, other_branch, base_branch=base, repo=repo_path)
@@ -2096,7 +2134,7 @@ async def assess_branch_stacking(
             other_id = other["id"]
             other_status = other.get("status") or ""
             relation = await _stack_ancestry(task_id, branch, other_branch, repo_path)
-            return StackAssessment(
+            found = StackAssessment(
                 outcome=STACK_STACKED,
                 reason=result.reason,
                 base_task_id=other_id,
@@ -2107,6 +2145,10 @@ async def assess_branch_stacking(
                     relation, branch, other_branch, other_id, other_status, base
                 ),
             )
+            if relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_ANCESTOR:
+                benign = benign or found
+                continue
+            return found
         if result.outcome is not StackProbeOutcome.clear:
             # Remembered, not returned: a later row may still be a definite
             # stack, and a definite stack is the more useful answer. Only
@@ -2116,8 +2158,13 @@ async def assess_branch_stacking(
                 reason=f"{result.reason}: {other_branch}",
                 retryable=result.outcome is StackProbeOutcome.unavailable,
             )
+    # Unknown outranks benign for the same reason it outranks clear: a row we
+    # could not look at may be the dangerous one, and "the pair I DID look at
+    # is safe" says nothing about it.
     if unknown is not None:
         return unknown
+    if benign is not None:
+        return benign
     return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
 
 

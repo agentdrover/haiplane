@@ -527,3 +527,115 @@ async def test_the_base_of_a_stack_merges_first_instead_of_asking(
         "у основания стопки нет ни того, кого ждать, ни того, что решать"
     )
     assert g.merge_pr.await_count == 1
+
+
+async def test_a_branch_from_another_project_never_holds_a_delivery(
+    db: aiosqlite.Connection,
+) -> None:
+    """Чужой проект — чужой репозиторий, и его имена веток здесь ничего не значат.
+
+    Самая тяжёлая находка ревью этой правки. Перечень кандидатов не
+    фильтровался по проекту, а на проде их девять, у каждого свой клон.
+    Ветка задачи из другого проекта в ЭТОМ репозитории не разрешается, проба
+    отвечает unavailable, а он по правилу #1186 старше clear — и держит
+    доставку. Строка никогда не разрешится, значит удержание вечное; одной
+    такой строки хватает, и держит она доставки ВО ВСЕХ проектах сразу.
+
+    Проверяется по исходу, а не по числу вызовов: доставка обязана пройти.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    # Проба честно не может разрешить чужую ссылку — ровно как настоящий git.
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.unavailable,
+            reason="ref_unresolved",
+            details="task-42/in-another-repo",
+        )
+    )
+    plugins.git_ops = g
+
+    other_project_id = await repo.create_project(
+        db,
+        slug="other-repo",
+        name="Other",
+        repo_name="acme/other",
+        workspace_path="/srv/other",
+    )
+    epic = await create_task(db, TaskCreate(title="Epic in another project"))
+    await repo.update_task(db, epic.id, project_id=other_project_id)
+    foreign = await create_task(db, TaskCreate(title="Work in another project"))
+    await repo.update_task(
+        db,
+        foreign.id,
+        status="review",
+        branch="task-42/in-another-repo",
+        parent_id=epic.id,
+    )
+    await db.commit()
+
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "ветка из чужого репозитория не может держать эту доставку"
+    )
+    assert g.merge_pr.await_count == 1
+
+
+async def test_being_someones_base_does_not_excuse_standing_on_someone_else(
+    db: aiosqlite.Connection,
+) -> None:
+    """Первое совпадение перестало быть безопасным, когда одно из них стало мержем.
+
+    Пока любое совпадение вело к отказу, порядок обхода ничего не решал. Ветка
+    «мы и есть основание» впервые сделала так, что одно совпадение может
+    закончиться НЕОБРАТИМЫМ мержем — и тогда порядок решает всё.
+
+    Три задачи: под нами настоящее несмерженное основание, а поверх нас стоит
+    ещё одна. Обе связи истинны одновременно. Строки идут по возрастанию id, а
+    id не повторяет топологию git — ветку можно перебазировать позже, задачу
+    пересоздать. Если безопасное совпадение окажется первым, а опасное вторым,
+    прежний код объявил бы нас основанием и влил бы чужую работу под нашим
+    номером: ровно тот инцидент, ради которого условие и заведено, только
+    вошедший через собственную починку.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+        )
+    )
+
+    async def ancestry(branch, other_branch, repo=None):
+        # Поверх нас — безопасно; под нами — опасно.
+        return "head_is_ancestor" if "on-top" in other_branch else "head_is_descendant"
+
+    g.branch_ancestry = AsyncMock(side_effect=ancestry)
+    plugins.git_ops = g
+
+    # Безопасная строка получает МЕНЬШИЙ id, то есть обходится первой.
+    on_top = await create_task(db, TaskCreate(title="Built on top of us"))
+    await repo.update_task(db, on_top.id, status="review", branch="task-C/on-top")
+    real_base = await create_task(db, TaskCreate(title="Our actual base"))
+    await repo.update_task(db, real_base.id, status="review", branch="task-D/under-us")
+    await db.commit()
+    assert on_top.id < real_base.id, "порядок обхода задан именно так"
+
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "ждём доставки настоящего основания"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{real_base.id}" in body, "названо то основание, что под нами"
