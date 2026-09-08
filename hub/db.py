@@ -1381,6 +1381,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
             delivery_path TEXT    NOT NULL DEFAULT '',
             disposition   TEXT    NOT NULL DEFAULT '',
             accepted_via  TEXT    NOT NULL DEFAULT '',
+            -- множество уже озвученных состояний через запятую (#294):
+            -- одна ячейка затиралась при дребезге провайдера
             alerted_state TEXT    NOT NULL DEFAULT '',
             first_seen_at TEXT    NOT NULL DEFAULT (datetime('now')),
             checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -1793,6 +1795,24 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_delivery_ack_reason",
         "ALTER TABLE delivery_discrepancies "
         "ADD COLUMN ack_reason TEXT NOT NULL DEFAULT ''",
+    ),
+    # acknowledged_state — ФАКТ, который признали законным, а не задача целиком.
+    # Решение владельца 08.09.2026 по неразрешённой находке ревью: признание
+    # относится к факту. Без этой колонки «PR держим открытым намеренно»
+    # глушило и следующее, никем не одобренное состояние — например «доставку
+    # подтвердить не удалось», — то есть одно суждение отнимало голос у
+    # другого. Обратная засыпка ниже держит уже признанные строки: пустое
+    # значение здесь означало бы «признано ни для какого состояния», а
+    # отсутствие нельзя записывать как значение (#762).
+    (
+        "add_delivery_acknowledged_state",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN acknowledged_state TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "backfill_delivery_acknowledged_state",
+        "UPDATE delivery_discrepancies SET acknowledged_state = state "
+        "WHERE acknowledged_at != '' AND acknowledged_state = ''",
     ),
     (
         "add_delivery_alerted_age_bucket",

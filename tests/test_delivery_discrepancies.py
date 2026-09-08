@@ -529,3 +529,131 @@ def _inbox_badge(html: str) -> int:
     number = re.search(r'topbar-stat-value">\s*(\d+)', block.group(0))
     assert number, "у счётчика Inbox нет значения"
     return int(number.group(1))
+
+
+# ---- Находки ревью #294, закрытые кодом ----
+
+
+async def test_a_flapping_provider_does_not_turn_the_card_into_a_metronome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Дребезг провайдера — не новость, а помеха. Говорить по разу на факт.
+
+    Память о сказанном была ОДНОЙ ячейкой: UNKNOWN затирал в ней «про PR_OPEN
+    уже сказали», и возврат в PR_OPEN снова считался новостью. При нестабильном
+    GitHub (пустой ответ gh читается как UNKNOWN — штатный случай, #802) это
+    давало голос на КАЖДОМ проходе свипа: алерт на карточке закрытой задачи и
+    событие в ленте, которая будит агентов.
+
+    Шесть проходов с чередованием обязаны дать ровно два голоса: по одному на
+    каждый настоящий факт. Возраст здесь не растёт, рубеж не переходится —
+    значит всё, что сверх двух, есть повтор.
+    """
+    task_id = await _completed_task(db, client, title="Дребезг", pr=920)
+    for tick in range(6):
+        _pr_states(monkeypatch, {920: "open"} if tick % 2 == 0 else {})
+        await scan_completed_deliveries(db)
+
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 2, alerts
+    assert sum("НЕ доставлена" in a for a in alerts) == 1, alerts
+    assert sum("НЕ УДАЛОСЬ" in a for a in alerts) == 1, alerts
+    # Будящих событий ровно столько же: лента не должна будить чаще, чем есть
+    # о чём разбудить.
+    assert len(await _events(db, task_id)) == 2
+
+
+async def test_an_acknowledged_fact_does_not_silence_a_different_one(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Признание относится к ФАКТУ, а не к задаче навсегда.
+
+    Решение владельца 08.09.2026. «PR держим открытым намеренно» — суждение о
+    том, что PR открыт. Когда хаб перестаёт видеть состояние PR, факт другой:
+    «доставку подтвердить НЕ УДАЛОСЬ». Его никто не одобрял, и молчать о нём
+    значит выдавать старое решение за оценку новой обстановки.
+    """
+    task_id = await _completed_task(db, client, title="Признанное", pr=910)
+    _pr_states(monkeypatch, {910: "open"})
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 1
+
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="держим открытым до релиза платы"
+    )
+    # Признанный факт молчит и на следующем проходе — это по-прежнему верно.
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 1
+
+    # Провайдер замолчал: факт сменился на тот, которого не признавали.
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    alerts = await _alerts(db, task_id)
+    assert any("НЕ УДАЛОСЬ" in a for a in alerts), alerts
+    # И признание не стёрто: оно всё ещё относится к своему факту.
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["ack_reason"] == "держим открытым до релиза платы"
+    assert row["acknowledged_state"] == "pr_open"
+
+
+async def test_the_last_counter_lets_the_board_say_all_clear(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Счётчиков внимания три, и разойтись им нельзя.
+
+    Топбар и заголовок секции признанные строки уже исключали, а total_inbox —
+    единственный вход в блок «All clear» — считал их по-прежнему. Разобрав
+    последнее дело, владелец не получал подтверждения, что дел не осталось:
+    счётчик, который не возвращается к нулю, никто не читает.
+    """
+    task_id = await _completed_task(db, client, title="Единственное дело", pr=930)
+    _pr_states(monkeypatch, {930: "open"})
+    await scan_completed_deliveries(db)
+    assert "All clear" not in (await client.get("/partials/inbox")).text
+
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="PR держим открытым намеренно"
+    )
+    body = (await client.get("/partials/inbox")).text
+    assert "All clear" in body
+    # Строка при этом НЕ исчезла: заткнуть можно, стереть нельзя.
+    assert f"inbox-undelivered-{task_id}" in body
+
+
+async def test_crossing_an_age_threshold_earns_every_fact_a_fresh_voice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Рубеж обнуляет память о сказанном — иначе он молчит про второй факт.
+
+    Набор озвученных состояний копится ВНУТРИ рубежа: это и глушит метроном.
+    Но сам рубеж существует ради права сказать «это длится дольше, чем вы
+    думали», и право это принадлежит КАЖДОМУ факту, а не первому успевшему.
+    Без обнуления состояние, прозвучавшее сутки назад, на новом рубеже
+    считалось бы уже сказанным и не звучало никогда.
+
+    Состояние достижимо обычной жизнью расхождения: строка живёт неделями, а
+    свип ходит по ней каждые DELIVERY_SCAN_MINUTES — возраст растёт сам, руками
+    его подкручивать не нужно ни на одном продакшн-пути.
+    """
+    task_id = await _completed_task(db, client, title="Долгое", pr=950)
+
+    # Первые сутки: оба факта уже прозвучали по разу.
+    _pr_states(monkeypatch, {950: "open"})
+    await scan_completed_deliveries(db)
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 2
+
+    # Рубеж суток пройден. Провайдер отвечает — звучит «не доставлено».
+    await _age(db, task_id, 30)
+    _pr_states(monkeypatch, {950: "open"})
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 3
+
+    # На том же рубеже провайдер снова замолчал: это ВТОРОЙ факт, и он тоже
+    # заслужил голос — сутки назад его сказали про другой возраст.
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 4, alerts
+    assert "30 ч" in alerts[-1], alerts[-1]

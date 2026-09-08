@@ -4371,6 +4371,13 @@ async def acknowledge_delivery_discrepancy(
     Запись не удаляется и состояние не подменяется: реестр по-прежнему
     показывает расхождение, к нему лишь приписано, кто и почему считает его
     законным. Заткнуть можно, стереть нельзя.
+
+    Признание запоминает ФАКТ, а не только задачу: ``acknowledged_state``
+    берётся из той же строки одним оператором, потому что читать состояние
+    отдельным запросом значит признать не то, что было на экране у человека.
+    Решение владельца 08.09.2026: «PR держим открытым намеренно» — суждение о
+    том, что PR открыт, и глушить им следующий, никем не одобренный факт
+    («доставку подтвердить не удалось») нельзя.
     """
     if not (reason or "").strip():
         return False
@@ -4379,7 +4386,8 @@ async def acknowledge_delivery_discrepancy(
         UPDATE delivery_discrepancies
            SET acknowledged_at = datetime('now'),
                acknowledged_by = ?,
-               ack_reason = ?
+               ack_reason = ?,
+               acknowledged_state = state
          WHERE task_id = ?
         """,
         ((by or "").strip(), reason.strip(), task_id),
@@ -4433,6 +4441,7 @@ async def list_delivery_discrepancies(
             d.task_id, d.pr_number, d.state, d.reason, d.delivery_path,
             d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
             d.acknowledged_at, d.acknowledged_by, d.ack_reason,
+            d.acknowledged_state,
             t.title, t.status, t.completed_at, t.human_owner, t.assigned_agent,
             CAST(
                 (julianday('now') - julianday(

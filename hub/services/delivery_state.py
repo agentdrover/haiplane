@@ -678,6 +678,9 @@ async def note_completion_without_delivery(
             accepted_via=via,
             # The alert below IS this state's alert, so the sweep must not
             # repeat it. Delivered rows carry no alert to suppress.
+            # ``alerted_state`` хранит МНОЖЕСТВО озвученных состояний через
+            # запятую (#294); одно имя — законное множество из одного, и
+            # свип дополнит его сам, когда заговорит о другом состоянии.
             alerted_state=(answer["state"] if answer["state"] != DELIVERED else ""),
         )
         if answer["state"] != DELIVERED:
@@ -740,7 +743,7 @@ def _discrepancy_voice(
     ``None`` означает молчание, и молчание здесь имеет три разные причины,
     которые нельзя путать:
 
-    * расхождение признано человеком законным — заткнули по решению, а не по
+    * ЭТОТ ФАКТ признан человеком законным — заткнули по решению, а не по
       усталости; строка остаётся в реестре с причиной;
     * об этом состоянии уже сказали, и возрастной рубеж с тех пор не пройден —
       повтор на каждом тике превращает карточку в ленту одинаковых строк, и
@@ -751,18 +754,38 @@ def _discrepancy_voice(
     «работа не доставлена» — то есть выдавал незнание за факт, ровно то, что
     реестр в своей выдаче делать отказывается.
     """
-    if (prior.get("acknowledged_at") or "").strip():
-        return None
     state = answer["state"]
     if state not in (PR_OPEN, UNKNOWN):
         return None
 
+    # Признание относится к ФАКТУ, а не к задаче навсегда (решение владельца
+    # 08.09.2026 по неразрешённой находке ревью #294). «PR держим открытым
+    # намеренно» — суждение о том, что PR открыт; когда факт сменился на
+    # «доставку подтвердить не удалось», это уже другое утверждение, которого
+    # никто не одобрял, и молчать о нём значит выдавать старое решение за
+    # оценку новой обстановки.
+    if (prior.get("acknowledged_at") or "").strip() and (
+        prior.get("acknowledged_state") or ""
+    ).strip() == state:
+        return None
+
     age_hours = _age_hours(task, prior)
     bucket = _crossed_bucket(age_hours)
-    said_state = (prior.get("alerted_state") or "").strip()
+    # Память о сказанном — МНОЖЕСТВО состояний, а не одна ячейка, и это не
+    # украшение. Рубеж принадлежит расхождению (его возрасту), а состояние —
+    # провайдеру, который моргает: при чередовании PR_OPEN и UNKNOWN одна
+    # ячейка затиралась, память о том, что про PR_OPEN уже сказали, пропадала,
+    # и голос звучал на каждом проходе свипа — ровно тот метроном, от которого
+    # задача защищает (#294, находка ревью). Рубеж по-прежнему обнуляет набор:
+    # перейти рубеж значит получить право сказать «это длится дольше, чем вы
+    # думали» — про каждое состояние заново.
     said_bucket = int(prior.get("alerted_age_bucket") or 0)
-    if said_state == state and bucket <= said_bucket:
+    said_states = {
+        part for part in (prior.get("alerted_state") or "").split(",") if part.strip()
+    }
+    if bucket <= said_bucket and state in said_states:
         return None
+    voiced = {state} if bucket > said_bucket else said_states | {state}
 
     pr = answer["pr_number"]
     where = f"PR #{pr}" if pr else "PR не закреплён"
@@ -786,7 +809,14 @@ def _discrepancy_voice(
             f"(#897). Если так и задумано — признайте его законным с "
             f"причиной, и оно замолчит, оставшись в реестре (#1198)."
         )
-    return {"text": text, "bucket": bucket, "age_hours": age_hours}
+    return {
+        "text": text,
+        "bucket": bucket,
+        "age_hours": age_hours,
+        # Отсортировано, чтобы одно и то же множество всегда писалось одной
+        # строкой: иначе «уже сказали» зависело бы от порядка обхода set.
+        "states": ",".join(sorted(voiced)),
+    }
 
 
 async def scan_completed_deliveries(
@@ -797,7 +827,8 @@ async def scan_completed_deliveries(
     Modelled on the stale-alert loop in ``hub/poller.py``: run on a timer, look
     only at rows that can still be news, and alert at most once per state so
     the owner is told something new rather than reminded every half minute.
-    Repeats are damped by ``alerted_state`` on the stored row rather than by
+    Repeats are damped by ``alerted_state`` (a comma-separated SET of states
+    already voiced at the current age bucket) on the stored row rather than by
     matching alert text — durable, and it survives an unrelated update landing
     on the task, which the text heuristic does not.
 
@@ -849,7 +880,7 @@ async def scan_completed_deliveries(
                 reason=answer["reason"],
                 pr_number=answer["pr_number"],
                 delivery_path=answer["delivery_path"],
-                alerted_state=(answer["state"] if voice else None),
+                alerted_state=(voice["states"] if voice else None),
                 alerted_age_bucket=(voice["bucket"] if voice else None),
             )
             if answer["state"] == PR_OPEN:
