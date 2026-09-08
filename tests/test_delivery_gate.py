@@ -994,3 +994,33 @@ async def test_a_nearer_ordinary_base_does_not_mask_a_stranded_one(
     assert f"Ждём доставки #{ordinary}" not in body, (
         "ближнее основание не должно закрывать собой то, которого не дождаться"
     )
+
+
+async def test_a_stranded_base_is_not_told_a_direction_git_never_confirmed(
+    db: aiosqlite.Connection,
+) -> None:
+    """Не утверждать больше, чем хаб знает — второй раз в том же месте.
+
+    Проверка застревания стоит выше вопроса о порядке мержа, значит она
+    ловит и формы, где ancestry ничего не сказала. Текст при этом утверждал
+    «ветка стоит на ветке задачи #N» безусловно — направленный факт, который
+    git не подтверждал. Тот же перебор уже чинили в алерте о непроверенной
+    стопке (#725), и он вернулся, потому что перестановка проверок расширила
+    охват сообщения, а само сообщение осталось прежним.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="unknown")
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "номер основания назван в любом случае"
+    assert "ветка стоит на ветке задачи" not in body, (
+        "направление не подтверждено — значит и не называется"
+    )
+    assert "направление git не подтвердил" in body

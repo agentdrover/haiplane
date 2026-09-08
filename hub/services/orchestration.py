@@ -2611,13 +2611,31 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             # way the rest of the ancestry reads, a base that will never be
             # delivered cannot be waited for, and naming a merge order would
             # only suggest that waiting is what is wanted.
+            # Направление называется ТОЛЬКО когда его подтвердил git.
+            # Найдено машинным ревью: проверка застревания стоит выше вопроса
+            # о порядке, значит она ловит и формы, где ancestry ничего не
+            # сказала, — а текст утверждал «ветка стоит на» безусловно. Это
+            # ровно тот же перебор, что уже чинили в алерте о непроверенной
+            # стопке: не утверждать больше, чем хаб знает (#725).
+            if assessment.relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
+                how = (
+                    f"ветка стоит на ветке задачи "
+                    f"#{assessment.base_task_id} "
+                    f"'{assessment.base_task_branch}'"
+                )
+            else:
+                how = (
+                    f"ветка делит несмерженные коммиты с веткой задачи "
+                    f"#{assessment.base_task_id} "
+                    f"'{assessment.base_task_branch}' (направление git не "
+                    f"подтвердил, сторону хаб не называет)"
+                )
             return (
-                f"{STRANDED_BASE_PREFIX}: ветка стоит на ветке задачи "
-                f"#{assessment.base_task_id} '{assessment.base_task_branch}', "
-                f"которую человек принял, НЕ доставив — её PR открыт и не "
-                f"влит. Ждать нечего: конвейер к принятой задаче не вернётся, "
-                f"а мерж сейчас унёс бы её работу в базовую ветку под номером "
-                f"этой задачи. Решение за человеком: доставить "
+                f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
+                f"НЕ доставив — её PR открыт и не влит. Ждать нечего: "
+                f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
+                f"бы её работу в базовую ветку под номером этой задачи. "
+                f"Решение за человеком: доставить "
                 f"#{assessment.base_task_id} или отвязать от неё эту ветку"
             )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
