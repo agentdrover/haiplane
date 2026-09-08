@@ -1198,3 +1198,39 @@ async def test_an_unprobed_stranded_base_outranks_a_plain_unknown(
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     body = " ".join(u.get("content") or "" for u in updates)
     assert f"#{stranded_id}" in body
+
+
+async def test_a_broken_clone_is_not_blamed_on_the_stranded_task(
+    db: aiosqlite.Connection,
+) -> None:
+    # #1204, найдено машинным ревью сдачи №3: регрессия, внесённая предыдущей
+    # правкой. Проба кладёт в details ВСЕ неразрешённые имена тройки — наше,
+    # кандидата и базы. Первая версия спрашивала, есть ли кандидат СРЕДИ них,
+    # поэтому сломанный клон, где не резолвится и наша ветка, объявлялся
+    # «ветка той задачи исчезла» и уводил задачу к человеку. Сбой машины бьёт
+    # всех кандидатов одинаково и проходит сам — он обязан остаться
+    # повторяемым ожиданием. Мутация «вернуть проверку вхождением вместо
+    # равенства» роняет этот тест.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+        details="task-999/ours, task-1138/eslint-debt",
+    )
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "не разрешилась и наша ветка — это про клон, а не про ту задачу"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ждать бесполезно" not in body, (
+        "человеку не сообщают как факт то, чего хаб не установил"
+    )

@@ -644,3 +644,66 @@ async def test_branch_ancestry_unresolvable_ref_is_unknown() -> None:
             "task-424/fix", "task-999/gone", repo="/tmp/repo"
         )
     assert relation == "unknown"
+
+
+async def test_probe_refreshes_a_missing_ref_before_calling_it_missing() -> None:
+    # #1204, найдено машинным ревью сдачи №3. Резолвер читает ТОЛЬКО локальные
+    # ссылки, поэтому «ветки нет в клоне» и «ветку сюда не тянули» давали один
+    # и тот же ref_unresolved. Пока ответ был advisory, разницы не было; гейт
+    # доставки начал на ней действовать и говорил человеку «эту ветку никто не
+    # вернёт» про ветку, которая всё это время лежала на origin.
+    fetched: list[str] = []
+    present = dict(_shas())
+    present.pop("task-392/base^{commit}")
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = present.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "fetch":
+            fetched.append(args[-1])
+            present["task-392/base^{commit}"] = "bbb222"
+            return (0, "", "")
+        if args[0] == "rev-list":
+            return (0, "3" if len(args) == 4 else "1", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert fetched == ["+refs/heads/task-392/base:refs/remotes/origin/task-392/base"], (
+        "обновляется ровно та ссылка, которой не хватило, и явным рефспеком"
+    )
+    assert probe.outcome is StackProbeOutcome.stacked, (
+        "после обновления ответ настоящий, а не «посмотреть не удалось»"
+    )
+
+
+async def test_probe_still_says_unresolved_when_the_refresh_does_not_help() -> None:
+    # Обратная сторона того же: ветки нет и на origin. Тогда ref_unresolved
+    # остаётся, но теперь он значит «сервер её тоже не знает», а не «мы не
+    # смотрели» — и только на таком ответе гейту можно что-то утверждать.
+    fetched: list[str] = []
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "fetch":
+            fetched.append(args[-1])
+            return (0, "", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert fetched, "попытка обновления обязана быть сделана до вывода"
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "ref_unresolved"
+    assert (probe.details or "").strip() == "task-999/gone", (
+        "в details только то, что не разрешилось ПОСЛЕ обновления"
+    )

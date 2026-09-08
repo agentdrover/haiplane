@@ -834,6 +834,18 @@ class GitOpsIntegration:
         Every way of NOT getting an answer is ``unavailable`` with the reason
         named, never ``clear``. The distinction is free for the advisory
         callers and load-bearing for the delivery gate, which merges on it.
+
+        A ref that resolves nowhere is REFRESHED ONCE before the answer is
+        formed (#1204, found by the machine review of submission #3). Without
+        that, ``ref_unresolved`` conflated two opposite facts: a branch deleted
+        on the server, and a branch this clone simply never fetched — the
+        resolver reads local refs only. Consumers cannot tell them apart, and
+        the delivery gate had started to act on the difference, telling a human
+        "nobody will bring that branch back" about a branch that was on origin
+        all along. Same line #954 drew for push status, and the targeted
+        refspec is copied from there for the same reason: plain
+        ``git fetch origin <branch>`` is not guaranteed to write
+        ``refs/remotes/origin/<branch>``.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -850,6 +862,26 @@ class GitOpsIntegration:
         other = await _resolve_ref_remote_first(other_branch, repo)
         base_name = _resolve_base(base_branch)
         base = await _resolve_ref_remote_first(base_name, repo)
+        if not (head and other and base):
+            # One targeted fetch per name that did not resolve, then ask
+            # again. Only what survives this is genuinely unknown to origin.
+            for name, ref in (
+                (branch, head),
+                (other_branch, other),
+                (base_name, base),
+            ):
+                if ref:
+                    continue
+                await _git(
+                    "fetch",
+                    "origin",
+                    f"+refs/heads/{name}:refs/remotes/origin/{name}",
+                    repo=repo,
+                    check=False,
+                )
+            head = head or await _resolve_ref_remote_first(branch, repo)
+            other = other or await _resolve_ref_remote_first(other_branch, repo)
+            base = base or await _resolve_ref_remote_first(base_name, repo)
         if not (head and other and base):
             unresolved = [
                 name

@@ -2073,13 +2073,21 @@ def _stranded_with_a_dead_ref(
     number. So this becomes a refusal that CALLS A HUMAN, the same answer
     ``stranded_base`` already gives and for the same reason.
 
-    Narrow on purpose: only when the candidate's OWN ref is the one that did
-    not resolve. A missing workspace or a failed rev-list is about this
+    Narrow on purpose: only when the candidate's OWN ref is the ONLY one that
+    did not resolve. A missing workspace or a failed rev-list is about this
     machine rather than about that branch, would hit every candidate alike,
     and really can pass by itself — so it stays retryable. Reading which name
-    failed means reading ``details``, which the probe fills with exactly that
-    list; an empty ``details`` falls through to the old behaviour rather than
-    guessing.
+    failed means reading ``details``, which the probe fills with every name it
+    could not resolve; an empty ``details`` falls through to the old behaviour
+    rather than guessing.
+
+    Equality, not membership (#1204, machine review of submission #3). The
+    first version asked whether the candidate was AMONG the unresolved names,
+    and a broken clone puts our own branch in that list beside it — so a
+    machine-level failure was being reported to a human as "that task's branch
+    is gone". The probe itself now refreshes a missing ref once before saying
+    it is missing, so surviving this check really does mean origin does not
+    have it either.
     """
     if int(other["id"]) not in stranded:
         return None
@@ -2087,8 +2095,8 @@ def _stranded_with_a_dead_ref(
         return None
     if result.reason != "ref_unresolved":
         return None
-    unresolved = {n.strip() for n in (result.details or "").split(",")}
-    if other_branch not in unresolved:
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
         return None
     return StackAssessment(
         outcome=STACK_UNKNOWN,
@@ -2759,8 +2767,9 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
             f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
             f"доставив (её PR открыт и не влит), а её ветку "
-            f"'{assessment.base_task_branch}' в клоне разрешить не удалось — "
-            f"скорее всего она удалена после ручного мержа. Поэтому хаб НЕ "
+            f"'{assessment.base_task_branch}' не разрешается даже после "
+            f"прицельного обновления ссылки — на origin её нет, обычно так "
+            f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
             f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
             f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
             f"задача терминальна, её ветку никто не вернёт. Решение за "
