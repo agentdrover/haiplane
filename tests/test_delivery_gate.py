@@ -698,3 +698,194 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
         await repo.update_task(db, base_id, status="completed", branch="")
         await repo.update_task(db, task_id, status="completed", branch="")
         await db.commit()
+
+
+async def _stranded_base(db: aiosqlite.Connection, branch: str) -> int:
+    """Задача, принятая человеком без доставки: свип нашёл её PR открытым."""
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title="Accepted, never delivered"))
+    await repo.update_task(db, tv.id, status="completed", branch=branch, pr_number=3)
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=tv.id,
+        state="pr_open",
+        reason="PR #3 открыт и не смержен — работа не в базовой ветке",
+        pr_number=3,
+        delivery_path="none",
+    )
+    await db.commit()
+    return tv.id
+
+
+async def test_an_accepted_but_undelivered_base_calls_a_human(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1: мерж не выполняется, и задача уходит к ЧЕЛОВЕКУ с названным
+    # номером основания — не в транзитное удержание, которое здесь было бы
+    # обещанием, которое хаб не может сдержать.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "ждать нечего: конвейер к принятой задаче не вернётся"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body
+    assert "task-1138/eslint-debt" in body
+
+
+async def test_a_delivered_base_does_not_hold_anything(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-2: то же основание, но доставленное — свип записал не pr_open.
+    # Поведение прежнее, ни удержания, ни вопроса.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, "task-1138/eslint-debt")
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=base_id,
+        state="merged",
+        reason="PR #3 влит",
+        pr_number=3,
+        delivery_path="gate",
+    )
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "у основания стопки нет ни того, кого ждать, ни того, что решать"
+    )
+    assert g.merge_pr.await_count == 1
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+
+
+async def test_delivered_tasks_are_not_candidates(db: aiosqlite.Connection) -> None:
+    # AC-3, переформулирован против постановки после замера. В постановке было
+    # «попадание определяется записью в pipeline_merges». Это оказалось неверно:
+    # pipeline_merges говорит, мержил ли ХАБ, и ручной мерж не оставляет строки —
+    # undelivered_blockers документирует это как допустимое ровно потому, что
+    # ГЕЙТ, КОТОРЫЙ ОНА КОРМИТ, ADVISORY. Этот — нет. Признак взят из
+    # delivery_discrepancies, который спрашивает состояние самого PR.
+    #
+    # Плюс вторая причина, которой в постановке не было: после доставки гейт
+    # УДАЛЯЕТ ветку, а tasks.branch остаётся заполненной. Возьми мы всех
+    # completed в кандидаты — сотни неразрешимых ссылок дали бы unavailable,
+    # который по правилу #1186 старше clear, и гейт встал бы навсегда.
+    delivered = await _stranded_base(db, "task-900/long-since-merged")
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=delivered,
+        state="merged",
+        reason="влит",
+        pr_number=3,
+        delivery_path="gate",
+    )
+    await db.commit()
+
+    rows = [
+        dict(r)
+        for r in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=999
+        )
+    ]
+
+    assert delivered not in [r["id"] for r in rows], (
+        "доставленное основание не кандидат, и признак — состояние PR, не статус"
+    )
+
+
+async def test_an_unanswerable_pr_state_is_not_a_candidate(
+    db: aiosqlite.Connection,
+) -> None:
+    # Названное слепое пятно, а не забытый случай. state=unknown значит, что
+    # провайдер не ответил — это не «не доставлено» (#725). В кандидаты такие
+    # строки не берутся сознательно: их ветки обычно давно удалены, проба
+    # ответила бы unavailable, а он по правилу #1186 старше clear — то есть
+    # гейт встал бы навсегда на горстке древних задач. Тест держит именно
+    # ЭТОТ выбор, чтобы следующий читатель не принял его за недосмотр.
+    unanswered = await _stranded_base(db, "task-878/flywheel")
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=unanswered,
+        state="unknown",
+        reason="состояние PR узнать не удалось: провайдер не ответил",
+        pr_number=443,
+        delivery_path="unknown",
+    )
+    await db.commit()
+
+    rows = [
+        dict(r)
+        for r in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=999
+        )
+    ]
+
+    assert unanswered not in [r["id"] for r in rows]
+
+
+async def test_the_undeliverable_base_is_not_worded_as_a_wait(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-4: у stacked_base сказано «ждём доставки #N» — там это правда.
+    # Здесь ждать нечего, и текст обязан говорить именно это, иначе читатель
+    # уйдёт ждать событие, которого не будет.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-1138/eslint-debt")
+
+    await _report_done(db, task_id)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "Ждём доставки" not in body, "обещание ожидания, которого не будет"
+    assert "Ждать нечего" in body
+    assert "Решение за человеком" in body
+
+
+async def test_a_stranded_task_built_on_top_of_us_does_not_block_us(
+    db: aiosqlite.Connection,
+) -> None:
+    """Застрявшая задача может стоять ПОВЕРХ нас, а не под нами.
+
+    Названо измерением gate-semantics при ревью #1204. Предикат стопки
+    симметричен, поэтому «застряло» и «мы на нём стоим» — разные вопросы, и
+    второй решает ancestry. Если человек принял без доставки ту задачу, что
+    отведена от НАШЕЙ ветки, мы ни на чём не стоим: мерж унесёт только наши
+    коммиты. Отказ здесь запер бы доставимую половину пары ради недоставимой
+    и предложил бы «отвязать» ветку, которая ни к чему не привязана.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_ancestor")
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-B/accepted-on-top-of-us")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "мы основание: ждать нечего и решать нечего, мержимся первыми"
+    )
+    assert g.merge_pr.await_count == 1

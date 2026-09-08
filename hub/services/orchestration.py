@@ -1999,6 +1999,14 @@ class StackAssessment:
     base_task_status: str = ""
     relation: str = ""
     message: str = ""
+    # #1204: can the base still reach the base branch on its own? Every base
+    # #1186 knew about could — that is why holding was the right answer there.
+    # A task a human accepted WITHOUT delivering never will, and the gate has
+    # to tell the two apart before it decides between waiting and asking.
+    # Carried explicitly rather than inferred from the status: a reader who
+    # has to derive "completed means undelivered here" from which query the
+    # row came out of will eventually derive it wrong.
+    base_can_deliver_itself: bool = True
 
     def as_advisory(self) -> dict[str, Any] | None:
         """The pre-#1186 shape: a dict for a stack, None for anything else."""
@@ -2079,9 +2087,22 @@ async def assess_branch_stacking(
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
     own_project = await _project_id_for(db, task_id)
-    rows = await repo.list_unmerged_branch_tasks(
-        db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
+    rows = list(
+        await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
+        )
     )
+    stranded: set[int] = set()
+    if statuses is not None:
+        # #1204: the delivery question only. The advisory callers keep asking
+        # "is someone working on top of me", and a task nobody is working on
+        # any more is not part of that question — but it is very much part of
+        # "is there work under mine that will never reach the base branch".
+        for row in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=task_id
+        ):
+            rows.append(row)
+            stranded.add(int(dict(row)["id"]))
     unknown: StackAssessment | None = None
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
@@ -2146,6 +2167,7 @@ async def assess_branch_stacking(
                 base_task_branch=other_branch,
                 base_task_status=other_status,
                 relation=relation,
+                base_can_deliver_itself=other_id not in stranded,
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
                 ),
@@ -2565,6 +2587,30 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             # this one, so delivering this task would have escalated instead
             # of merging.
             return ""
+        if not assessment.base_can_deliver_itself:
+            # #1204. Checked after the case above and before the one below,
+            # and both halves of that are load-bearing.
+            #
+            # AFTER "we are the base": a task accepted without delivery can
+            # perfectly well be the one built ON TOP of us. Then we are not
+            # standing on anything — merging carries only our own commits —
+            # and refusing here would strand the deliverable half of the pair
+            # over the undeliverable one. Found by the machine review of #1204,
+            # which named exactly this pair.
+            #
+            # BEFORE the order question: once we ARE standing on it, whichever
+            # way the rest of the ancestry reads, a base that will never be
+            # delivered cannot be waited for, and naming a merge order would
+            # only suggest that waiting is what is wanted.
+            return (
+                f"{STRANDED_BASE_PREFIX}: ветка стоит на ветке задачи "
+                f"#{assessment.base_task_id} '{assessment.base_task_branch}', "
+                f"которую человек принял, НЕ доставив — её PR открыт и не "
+                f"влит. Ждать нечего: конвейер к принятой задаче не вернётся, "
+                f"а мерж сейчас унёс бы её работу в базовую ветку под номером "
+                f"этой задачи. Решение за человеком: доставить "
+                f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+            )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting
             # is only an answer when there is a side to wait FOR. When the two
@@ -2640,6 +2686,13 @@ STACK_UNKNOWN_PREFIX = "stack_unknown"
 # silent. This one calls a human, like every other refusal nobody can resolve
 # by waiting.
 STACKED_UNDETERMINED_PREFIX = "stacked_undetermined"
+# #1204: also deliberately NOT transient, and for a sharper reason than the
+# one above. There the order is unknown; here the order is known and the base
+# is simply never going to move — a human accepted it without delivering it,
+# so the conveyor will not come back for it. A wait would be a promise the
+# hub cannot keep, and transient refusals are silent, so nobody would ever
+# learn the promise had failed.
+STRANDED_BASE_PREFIX = "stranded_base"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",

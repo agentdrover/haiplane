@@ -501,6 +501,52 @@ async def list_unmerged_branch_tasks(
     )
 
 
+async def list_undelivered_completed_branch_tasks(
+    db: aiosqlite.Connection,
+    *,
+    exclude_task_id: int,
+) -> list[aiosqlite.Row]:
+    """Completed tasks the sweep found still holding an OPEN pull request (#1204).
+
+    The sixth way a branch can be unmerged, and the only one no amount of
+    waiting will resolve: a human accepted the task without delivering it, so
+    the conveyor will never come back for it. Same shape as
+    ``list_unmerged_branch_tasks`` so the stacking walk can consume both.
+
+    Read from ``delivery_discrepancies``, which the timed sweep writes, rather
+    than derived here, for three reasons the alternatives get wrong:
+
+    * ``pipeline_merges`` says whether the HUB merged it. A merge made by hand
+      leaves no row, which ``undelivered_blockers`` documents as acceptable
+      precisely because the gate it feeds is advisory. This one is not: on a
+      project where manual merges happen, that reading would hold a delivery
+      whose base is long since in the base branch.
+    * asking the provider here would put a network call in the delivery path,
+      per candidate, on every poll. The sweep already pays it once per fifteen
+      minutes and stores the answer.
+    * ``state = 'pr_open'`` only. ``unknown`` is an answer the hub could not
+      get, and the existing reader keeps it apart for the same reason (#725).
+
+    TWO NAMED BLIND SPOTS, because a partial answer read as a complete one is
+    how this class of bug returns:
+    1. ``unknown`` rows are NOT candidates. They cannot be: such a task's
+       branch is usually long deleted, the probe would answer ``unavailable``,
+       and under #1186's rule that outranks ``clear`` — every delivery would
+       hold forever on a handful of ancient rows.
+    2. The sweep looks back DELIVERY_SCAN_LOOKBACK_DAYS. A task completed
+       before that window and never scanned has no row at all, and its absence
+       means "never asked", not "delivered".
+    """
+    return await fetchall(
+        db,
+        "SELECT t.id, t.title, t.status, t.branch "
+        "FROM delivery_discrepancies d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.state = 'pr_open' AND t.archived = 0 AND t.id != ? "
+        "AND t.branch IS NOT NULL AND TRIM(t.branch) != '' ORDER BY t.id",
+        (exclude_task_id,),
+    )
+
+
 async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
