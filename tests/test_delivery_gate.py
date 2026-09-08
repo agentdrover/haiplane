@@ -215,3 +215,486 @@ async def test_missing_run_after_window_escalates_with_named_fact(
     assert "ci_absent: no_workflow_runs" not in body
     assert "workflow есть" in body
     assert "head-sha-not-hex" in body
+
+
+# ---- #1186: mergeable is not deliverable when the base is still unmerged ----
+#
+# The incident, 06.09.2026 on spike-bo: task #1183's branch was cut from
+# #1175's, #1183 got an auto verdict and a green CI, and the gate squash-merged
+# its PR while #1175 was still in review. All five commits of the stack landed
+# in main under #1183's number; #1175's PR went empty and DIRTY, its task stuck
+# in review with a diff there was nowhere left to apply, and the attribution
+# is gone for good. The signal existed the whole time — detect_branch_stacking
+# — but only ever addressed a human. The gate asked about CI and mergeability
+# and merged, and said so in the feed: "Условия доставки были выполнены
+# целиком, ждать было нечего."
+
+
+async def _base_task_in_review(db: aiosqlite.Connection, branch: str) -> int:
+    """Another task whose branch is alive and unmerged — a stack's base."""
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title="Base of the stack"))
+    await repo.update_task(db, tv.id, status="review", branch=branch)
+    await db.commit()
+    return tv.id
+
+
+def _probes(g, outcome, reason: str = "scripted"):
+    """Script the stacking probe on a git double (#1186)."""
+    from hub.integrations.protocols import StackProbeResult
+
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(outcome=outcome, reason=reason)
+    )
+    return g
+
+
+async def test_delivery_holds_while_the_base_branch_is_unmerged(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1: approved, green CI, mergeable — and the branch stands on the
+    # unmerged branch of a task still in review. The merge is the irreversible
+    # step, so it does not happen, and the feed names WHICH task is being
+    # waited for. A hold, not an escalation: the base merges on its own and
+    # this delivery becomes possible the moment it does.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "an unmerged base is a wait, not a decision: needs_decision is a door "
+        "that only opens outward (#1030)"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "the feed must name the task being waited for"
+    assert "task-1175/image-capture" in body
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_delivery_proceeds_once_the_base_has_merged(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-2: the same stack, after the base has been delivered. A completed
+    # task owns no unmerged branch, so there is nothing left to compare
+    # against and the hold lifts by itself — no second signal to maintain.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_in_review(db, "task-1175/image-capture")
+    await repo.update_task(db, base_id, status="completed")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+
+
+async def test_delivery_unaffected_without_a_stack(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-3: another task's branch IS alive, and the probe looked and found
+    # them independent. Delivery behaves exactly as it did before #1186 —
+    # the new condition must not start holding ordinary deliveries.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.clear)
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-900/unrelated-work")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "стопк" not in body.lower(), (
+        "a delivery that was checked and found independent says nothing new"
+    )
+
+
+async def test_unknown_stacking_is_not_read_as_no_stacking(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-4. The trap this whole task is about, and the one the statement
+    # named one layer too shallow: the predicate returned a bool, so a git
+    # that could not answer — refs missing from the clone, rev-list failing,
+    # no workspace — came back with the very same False that means "checked,
+    # and they are independent". Advisory, that cost a missing hint. As a
+    # delivery condition it costs the base task its work.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+    )
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "a call that did not land is cured by asking again, not by a human"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ref_unresolved" in body, "the reason it could not look is named"
+
+
+async def test_bool_only_plugin_is_unknown_rather_than_clear(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-4, the other half: a plugin that predates the probe answers only
+    # True/False, and its False cannot distinguish the two. Delivery goes
+    # ahead — refusing would stall every delivery on such a plugin forever,
+    # which is the constraint's other side — but it is said out loud, so a
+    # reader can tell "we could not look" from "we looked and there was
+    # nothing". Today the two are the same silence.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    # A pre-#1186 plugin, declared the way this repo already declares one
+    # (tests/test_stack_advisory.py does the same to branch_ancestry): the
+    # attribute is simply not there to be found.
+    g.branch_stacking_probe = None
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", "an unanswerable plugin must not stall"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "подтвердить не удалось" in body
+    assert "legacy_bool_predicate" in body
+
+
+# ---- #1186, второй раунд: находки машинного ревью этой же правки ----
+
+
+async def _base_task_with_status(
+    db: aiosqlite.Connection, branch: str, status: str
+) -> int:
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title=f"Base in {status}"))
+    await repo.update_task(db, tv.id, status=status, branch=branch)
+    await db.commit()
+    return tv.id
+
+
+async def test_an_escalated_base_is_still_a_base(db: aiosqlite.Connection) -> None:
+    """Основание уходит из running/review не только через доставку.
+
+    Первая версия этой правки искала основание среди running/review на
+    посылке «оттуда выходят только доставившись». Посылка неверна: гейт
+    самой базовой задачи эскалирует её в needs_decision по красному CI, по
+    исчерпанному бюджету починки, по отказу мержа — и ветка при этом остаётся
+    ровно такой же несмерженной. Инцидент 06.09 воспроизводился бы через эту
+    дверь целиком, просто с другим триггером.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    for status in ("needs_decision", "fix_requested", "ci_check"):
+        g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+        g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+        task_id = await _approved_pair_task(db)
+        base_id = await _base_task_with_status(db, "task-1175/image-capture", status)
+
+        await _report_done(db, task_id)
+
+        g.merge_pr.assert_not_awaited()
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        body = " ".join(u.get("content") or "" for u in updates)
+        assert f"#{base_id}" in body, (
+            f"основание в статусе {status} владеет несмерженной веткой "
+            f"ровно так же, как в review"
+        )
+        # Both rows out of the candidate set before the next round. The walk
+        # answers with the FIRST stacked pair it finds, and the task just held
+        # is itself a running branch — leaving either behind would have the
+        # next round name a row from this one and test nothing new.
+        await repo.update_task(db, base_id, status="completed", branch="")
+        await repo.update_task(db, task_id, status="completed", branch="")
+        await db.commit()
+
+
+async def test_the_same_commit_under_two_names_never_waits_on_itself(
+    db: aiosqlite.Connection,
+) -> None:
+    """Взаимное удержание — это тишина навсегда, а не осторожность.
+
+    Когда две ветки указывают на один коммит, предикат истинен в ОБЕ
+    стороны: каждая видит другую своим основанием. Удержание транзитное, то
+    есть молчаливое по построению, — значит обе задачи встали бы навсегда и
+    никто бы об этом не узнал. Ждать здесь нечего и некого, и это вопрос к
+    человеку, а не к следующему циклу поллера.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="same_tip")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited(), "отказ от догадки — не разрешение мержить"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "ожидание с обеих сторон не разрешается ничем: тут нужен человек"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ждать нечего и некого" in body
+    assert "SAME commit" in body, "объяснение формы стопки берётся из #1193"
+
+
+async def test_a_held_delivery_is_not_told_to_wait_for_a_green_ci(
+    db: aiosqlite.Connection,
+) -> None:
+    """Попасть в кортеж транзитных отказов — только половина вступления в него.
+
+    У этого потребителя есть лесенка формулировок под каждую причину, и
+    непрописанный в ней член наследует фразу про CI. Здесь она ложна дважды:
+    CI уже зелёный, а совет «отчитайтесь о готовности снова» — ровно то
+    действие, которое сбросило бы вердикт (#612).
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "когда CI станет зелёным" not in body, (
+        "CI уже зелёный — ждут доставки другой задачи, а не проверки"
+    )
+    assert "Пересдавать НЕ нужно" in body
+
+
+async def test_the_base_of_a_stack_merges_first_instead_of_asking(
+    db: aiosqlite.Connection,
+) -> None:
+    """Нижняя ветка стопки доставляется, а не эскалируется.
+
+    Предикат стопки симметричен: основание видит собственного потомка как
+    «стопку». Первая версия этого гейта свалила head_is_ancestor в одну кучу
+    с формами, у которых порядок не выводится, и отправляла к человеку
+    ОСНОВАНИЕ каждой сознательной стопки — при том что собственная подсказка
+    хаба в этот же момент говорит обратное: «'{branch}' merges into '{base}'
+    FIRST» (#1184).
+
+    Проверено на настоящем репозитории, а не выведено: для нижней ветки
+    rev-list даёт total=2, excluded=1, то есть stacked=True, ancestry даёт
+    head_is_ancestor, а git diff develop..нижняя показывает ровно её
+    собственный файл. Мерж безопасен, ждать нечего, решать нечего.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_ancestor")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1204/built-on-top-of-me")
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "у основания стопки нет ни того, кого ждать, ни того, что решать"
+    )
+    assert g.merge_pr.await_count == 1
+
+
+async def test_a_branch_from_another_project_never_holds_a_delivery(
+    db: aiosqlite.Connection,
+) -> None:
+    """Чужой проект — чужой репозиторий, и его имена веток здесь ничего не значат.
+
+    Самая тяжёлая находка ревью этой правки. Перечень кандидатов не
+    фильтровался по проекту, а на проде их девять, у каждого свой клон.
+    Ветка задачи из другого проекта в ЭТОМ репозитории не разрешается, проба
+    отвечает unavailable, а он по правилу #1186 старше clear — и держит
+    доставку. Строка никогда не разрешится, значит удержание вечное; одной
+    такой строки хватает, и держит она доставки ВО ВСЕХ проектах сразу.
+
+    Проверяется по исходу, а не по числу вызовов: доставка обязана пройти.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    # Проба честно не может разрешить чужую ссылку — ровно как настоящий git.
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.unavailable,
+            reason="ref_unresolved",
+            details="task-42/in-another-repo",
+        )
+    )
+    plugins.git_ops = g
+
+    other_project_id = await repo.create_project(
+        db,
+        slug="other-repo",
+        name="Other",
+        repo_name="acme/other",
+        workspace_path="/srv/other",
+    )
+    epic = await create_task(db, TaskCreate(title="Epic in another project"))
+    await repo.update_task(db, epic.id, project_id=other_project_id)
+    foreign = await create_task(db, TaskCreate(title="Work in another project"))
+    await repo.update_task(
+        db,
+        foreign.id,
+        status="review",
+        branch="task-42/in-another-repo",
+        parent_id=epic.id,
+    )
+    await db.commit()
+
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "ветка из чужого репозитория не может держать эту доставку"
+    )
+    assert g.merge_pr.await_count == 1
+
+
+async def test_being_someones_base_does_not_excuse_standing_on_someone_else(
+    db: aiosqlite.Connection,
+) -> None:
+    """Первое совпадение перестало быть безопасным, когда одно из них стало мержем.
+
+    Пока любое совпадение вело к отказу, порядок обхода ничего не решал. Ветка
+    «мы и есть основание» впервые сделала так, что одно совпадение может
+    закончиться НЕОБРАТИМЫМ мержем — и тогда порядок решает всё.
+
+    Три задачи: под нами настоящее несмерженное основание, а поверх нас стоит
+    ещё одна. Обе связи истинны одновременно. Строки идут по возрастанию id, а
+    id не повторяет топологию git — ветку можно перебазировать позже, задачу
+    пересоздать. Если безопасное совпадение окажется первым, а опасное вторым,
+    прежний код объявил бы нас основанием и влил бы чужую работу под нашим
+    номером: ровно тот инцидент, ради которого условие и заведено, только
+    вошедший через собственную починку.
+    """
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    g.branch_stacking_probe = AsyncMock(
+        return_value=StackProbeResult(
+            outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+        )
+    )
+
+    async def ancestry(branch, other_branch, repo=None):
+        # Поверх нас — безопасно; под нами — опасно.
+        return "head_is_ancestor" if "on-top" in other_branch else "head_is_descendant"
+
+    g.branch_ancestry = AsyncMock(side_effect=ancestry)
+    plugins.git_ops = g
+
+    # Безопасная строка получает МЕНЬШИЙ id, то есть обходится первой.
+    on_top = await create_task(db, TaskCreate(title="Built on top of us"))
+    await repo.update_task(db, on_top.id, status="review", branch="task-C/on-top")
+    real_base = await create_task(db, TaskCreate(title="Our actual base"))
+    await repo.update_task(db, real_base.id, status="review", branch="task-D/under-us")
+    await db.commit()
+    assert on_top.id < real_base.id, "порядок обхода задан именно так"
+
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "ждём доставки настоящего основания"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{real_base.id}" in body, "названо то основание, что под нами"
+
+
+async def test_every_status_in_the_delivery_list_is_actually_seen(
+    db: aiosqlite.Connection,
+) -> None:
+    """Перечень статусов проверяется целиком, а не одним членом.
+
+    Мутационная проверка показала дыру: удаление pending_report из перечня не
+    роняло ни одного теста. То есть список рос от правки к правке, а держало
+    его только моё внимание — ровно то, что правило «правишь член множества —
+    проверь всё множество» и запрещает. Тест перебирает КАЖДЫЙ член, поэтому
+    удаление любого из них теперь видно.
+
+    Сам pending_report найден облачным ревьюером: та же дверь, что
+    needs_decision, и упущена по той же причине — список писался из тех
+    статусов, что были в голове, а не из перечисления.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+    from hub.services.orchestration import STACK_DELIVERY_STATUSES
+
+    # Перечень выписан ЗДЕСЬ, а не взят из проверяемого кода. Первая версия
+    # этого теста перебирала сам STACK_DELIVERY_STATUSES — и удаление члена
+    # меняло разом и код, и тест, поэтому мутация его не роняла. Тест,
+    # сверяющий код с самим собой, зелен по построению и не держит ничего.
+    expected = (
+        "running",
+        "review",
+        "ci_check",
+        "fix_requested",
+        "needs_decision",
+        "pending_report",
+    )
+    assert set(STACK_DELIVERY_STATUSES) == set(expected), (
+        "член добавлен или убран — решение осознанное, значит и здесь его надо "
+        "назвать, а не унаследовать молча"
+    )
+
+    for status in expected:
+        g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+        g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+        task_id = await _approved_pair_task(db)
+        base_id = await _base_task_in_review(db, f"task-base/{status}")
+        await repo.update_task(db, base_id, status=status)
+        await db.commit()
+
+        await _report_done(db, task_id)
+
+        g.merge_pr.assert_not_awaited()
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        body = " ".join(u.get("content") or "" for u in updates)
+        assert f"#{base_id}" in body, (
+            f"основание в статусе {status} владеет несмерженной веткой, "
+            f"и условие обязано его видеть"
+        )
+        # Обе строки — из перечня кандидатов долой, иначе следующий круг
+        # ответит основанием предыдущего и проверит тот же статус заново.
+        await repo.update_task(db, base_id, status="completed", branch="")
+        await repo.update_task(db, task_id, status="completed", branch="")
+        await db.commit()
