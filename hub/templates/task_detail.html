@@ -4,6 +4,30 @@
 {% block title %}Task #{{ task.id }} - {{ product_title }}{% endblock %}
 
 {% block content %}
+
+{# #1207: one statement block, two skins. Outside review every block is its
+   own card, exactly as before. In review the statement folds into a details
+   element inside one card BELOW the verdict: the reader approved it at DoR and
+   re-reads it second, while the submission takes the wide column. The inner
+   markup of each block is the same in both skins — only the wrapper changes. #}
+{% set review_board = task.status.value == 'review' and not task.review_job_id %}
+{% macro statement_block(title, folded, count=none, extra_class='', attrs='') %}
+{% if folded %}
+<details class="task-statement-item"{{ attrs|safe }}>
+    <summary>{{ title }}{% if count is not none %} <span class="task-statement-count">{{ count }}</span>{% endif %}</summary>
+    <div class="task-statement-body">{{ caller() }}</div>
+</details>
+{% else %}
+<section class="task-content-card{% if extra_class %} {{ extra_class }}{% endif %}"{{ attrs|safe }}>
+    <div class="task-card-header">
+        <h2>{{ title }}</h2>
+        {% if count is not none %}<span class="section-count">{{ count }}</span>{% endif %}
+    </div>
+{{ caller() }}
+</section>
+{% endif %}
+{% endmacro %}
+
 <article class="task-detail-page">
     {% if task.breadcrumb %}
     <nav class="breadcrumb task-detail-breadcrumb">
@@ -59,10 +83,16 @@
 
     <div class="task-detail-layout">
         <main class="task-detail-main">
-            <section class="task-content-card task-description-card">
+            {% if review_board %}
+            {% include "partials/task_review_board.html" %}
+
+            <section class="task-content-card task-statement">
                 <div class="task-card-header">
-                    <h2>Description</h2>
+                    <h2>Постановка</h2>
+                    <span class="task-card-header-meta">поколение {{ task.statement_generation }} · DoR {{ 'пройден' if readiness.dor_passed else 'не пройден' }}, score {{ readiness.score }} · раскрывается по разделам</span>
                 </div>
+            {% endif %}
+            {% call statement_block('Description', review_board, extra_class='task-description-card') %}
                 <div class="task-description-text u-pre-wrap">{{ task.description or 'No description' }}</div>
                 {% if task.rationale %}
                 <div class="task-rationale">
@@ -70,8 +100,9 @@
                     <div class="u-pre-wrap">{{ task.rationale }}</div>
                 </div>
                 {% endif %}
-            </section>
+            {% endcall %}
 
+            {% if not review_board %}
             <section class="task-content-card">
                 <div class="task-card-header">
                     <h2>Readiness</h2>
@@ -101,14 +132,14 @@
                 <div class="u-text-muted">No blocking readiness recommendations.</div>
                 {% endif %}
             </section>
+            {% endif %}
 
             {% set is_defect = task.work_type and task.work_type.value in ('bug', 'incident') %}
             {% set has_passport = task.caused_by_task_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
-            {% if is_defect or has_passport %}
-            <section class="task-content-card" data-defect-passport>
-                <div class="task-card-header">
-                    <h2>Паспорт дефекта</h2>
-                </div>
+            {# In review an unfilled passport is one line below the statement card
+               (#1207); a filled one stays a block, because it carries facts. #}
+            {% if (is_defect or has_passport) and not (review_board and not has_passport) %}
+            {% call statement_block('Паспорт дефекта', review_board, attrs=' data-defect-passport') %}
                 <dl class="task-meta-list task-detail-brief-list">
                     <dt>Где поймали</dt>
                     {% set stage_labels = {
@@ -138,16 +169,13 @@
                     <dd>{{ task.resolved_at }}</dd>
                     {% endif %}
                 </dl>
-            </section>
+            {% endcall %}
             {% endif %}
 
             {% set has_discovery = task.outcome_status or task.outcome_metric or task.outcome_indicator or task.outcome_deadline or task.outcome_revisit_condition or task.redesign_decision or task.agent_fit %}
             {% set has_brief = task.user_story or task.problem_statement or task.business_value or task.technical_hints or task.scope_in or task.scope_out or task.affected_areas or task.validation_commands or task.constraints or task.assumptions or task.out_of_scope_for_review %}
             {% if has_brief or has_discovery %}
-            <section class="task-content-card">
-                <div class="task-card-header">
-                    <h2>Developer Brief</h2>
-                </div>
+            {% call statement_block('Developer Brief', review_board) %}
                 <dl class="task-meta-list task-detail-brief-list">
                     {% if task.user_story %}
                     <dt>User Story</dt>
@@ -232,15 +260,13 @@
                     <dd><ul class="task-checklist">{% for item in task.out_of_scope_for_review %}<li>{{ item }}</li>{% endfor %}</ul></dd>
                     {% endif %}
                 </dl>
-            </section>
+            {% endcall %}
             {% endif %}
 
-            {% if task.acceptance_criteria %}
-            <section class="task-content-card">
-                <div class="task-card-header">
-                    <h2>Acceptance Criteria</h2>
-                    <span class="section-count">{{ task.acceptance_criteria | length }}</span>
-                </div>
+            {# In review the criteria are the rows of the evidence table above —
+               printing them here again would say each Then twice (#1207). #}
+            {% if task.acceptance_criteria and not (review_board and evidence) %}
+            {% call statement_block('Acceptance Criteria', review_board, count=task.acceptance_criteria | length) %}
                 <div class="task-ac-list">
                     {% for ac in task.acceptance_criteria %}
                     <article class="task-action-note">
@@ -253,15 +279,11 @@
                     </article>
                     {% endfor %}
                 </div>
-            </section>
+            {% endcall %}
             {% endif %}
 
             {% if task.risks %}
-            <section class="task-content-card">
-                <div class="task-card-header">
-                    <h2>Risks</h2>
-                    <span class="section-count">{{ task.risks | length }}</span>
-                </div>
+            {% call statement_block('Risks', review_board, count=task.risks | length) %}
                 <div class="task-ac-list">
                     {% for risk in task.risks %}
                     <article class="task-action-note">
@@ -277,21 +299,34 @@
                     </article>
                     {% endfor %}
                 </div>
-            </section>
+            {% endcall %}
             {% endif %}
 
             {% if task.review_checklist %}
-            <section class="task-content-card">
-                <div class="task-card-header">
-                    <h2>Review Checklist</h2>
-                    <span class="section-count">{{ task.review_checklist | length }}</span>
-                </div>
+            {% call statement_block('Review Checklist', review_board, count=task.review_checklist | length) %}
                 <ul class="task-checklist">
                     {% for item in task.review_checklist %}
                     <li>{{ item }}</li>
                     {% endfor %}
                 </ul>
+            {% endcall %}
+            {% endif %}
+            {% if review_board %}
             </section>
+
+            {# The facts these sections carried still get said — in one line.
+               A card that says "nothing here" every time stops being read; a
+               line that says it is read at the speed it deserves (#725, #814). #}
+            <div class="task-line">
+                <span class="task-line-label">Readiness</span>
+                <span>score={{ readiness.score }} dor={{ 'yes' if readiness.dor_passed else 'no' }}{% if readiness.missing_required %} · не хватает: {{ readiness.missing_required | join(', ') }}{% endif %}{% if readiness.recommendations %} · рекомендаций: {{ readiness.recommendations | length }}{% endif %}{% if analyst_ready.ready %} · Analyst Ready{% if analyst_ready.agent %}, prepared by {{ analyst_ready.agent }}{% endif %}{% endif %}</span>
+            </div>
+            {% if is_defect and not has_passport %}
+            <div class="task-line" data-defect-passport>
+                <span class="task-line-label">Паспорт дефекта</span>
+                <span>не заполнен: где поймали и что сломало — <span data-found-in="unknown">не записано</span></span>
+            </div>
+            {% endif %}
             {% endif %}
 
             {% if task.children %}
@@ -364,6 +399,12 @@
                Absence is stated, not implied — an empty block here reads as
                "nobody looked", which is exactly the fact the feature exists
                to surface. #}
+            {% if review_board and not live_checks %}
+            <div class="task-line" id="task-live-checks">
+                <span class="task-line-label">Живая проверка</span>
+                <span>Поведение в проде никто не наблюдал</span>
+            </div>
+            {% else %}
             <section class="task-content-card" id="task-live-checks">
                 <div class="task-card-header">
                     <h2>Живая проверка</h2>
@@ -413,10 +454,23 @@
                 </div>
                 {% endif %}
             </section>
+            {% endif %}
 
             {# Messages about this task (#775) — its own block, next to the
                update feed above and never merged into it: updates are the
                lifecycle journal, messages are the conversation. #}
+            {% if review_board and not task_messages %}
+            <div class="task-line task-line--form" id="task-messages">
+                <span class="task-line-label">Сообщения сессий</span>
+                <span>По этой задаче сессии ещё не переписывались</span>
+                <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-line-form">
+                    <input type="text" name="body" placeholder="Написать в канал задачи" required class="task-action-control">
+                    <input type="hidden" name="to_kind" value="task">
+                    <input type="hidden" name="kind" value="note">
+                    <button type="submit" class="btn btn-secondary btn-sm">Отправить</button>
+                </form>
+            </div>
+            {% else %}
             <section class="task-content-card" id="task-messages">
                 <div class="task-card-header">
                     <h2>Сообщения сессий</h2>
@@ -454,6 +508,7 @@
                     <button type="submit" class="btn btn-secondary btn-sm">Отправить</button>
                 </form>
             </section>
+            {% endif %}
 
             {% if task.result_text %}
             <section class="task-content-card">
@@ -498,6 +553,7 @@
         </main>
 
         <aside class="task-detail-sidebar">
+            {% if not review_board %}
             <section class="task-sidebar-card task-actions-card">
                 <div class="task-sidebar-title">Task Controls</div>
 
@@ -596,505 +652,6 @@
                     <button class="btn btn-warning task-action-btn" type="submit" name="action" value="rework">Send Back for Rework</button>
                 </form>
 
-                {% elif task.status.value == 'review' and not task.review_job_id %}
-                <div class="task-action-state task-action-state--danger">Review Required</div>
-                {% if review_in_flight %}
-                <div class="task-action-note task-action-note--warning">
-                    {{ review_in_flight.headline }}
-                </div>
-                {% endif %}
-
-                {# #823: доказательства выше пересказа. Всё, что ниже, уже
-                   считалось для ревью-брифа и доставалось только агенту-
-                   ревьюеру, а человек у кнопки читал сдаточный текст
-                   исполнителя. Первой строкой — сводка (#725): блок, который
-                   не смог посчитать, называет причину, потому что тишина
-                   здесь читается как «проверено, чисто». #}
-                {% if evidence %}
-                <div class="task-action-note">
-                    {% if evidence.review_in_flight %}
-                    <div class="task-action-note--warning">{{ evidence.review_in_flight.headline }}</div>
-                    {% endif %}
-                    <strong>Проверено по этой сдаче:</strong>
-                    <span class="badge badge--xs badge-{{ 'failed' if evidence.evidence_coverage.state == 'none' else ('pending' if evidence.evidence_coverage.state == 'partial' else 'test') }}">{{ evidence.evidence_coverage.state }}</span>
-                    {{ evidence.evidence_coverage.headline }}
-
-                    {% if evidence.acceptance_criteria %}
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Критерии:</span>
-                        <ul class="task-review-findings">
-                            {% for ac in evidence.acceptance_criteria %}
-                            {% set result = (evidence.ac_test_results | selectattr('ac_id', 'equalto', ac.id) | first) %}
-                            <li>{{ ac.id }}
-                                {% if ac.verifiable_by.value != 'test' %}
-                                <span class="badge badge--xs badge-{{ ac.verifiable_by.value }}">{{ ac.verifiable_by.value }}</span>
-                                <span class="muted">проверяется не тестом — результата в хабе нет по определению</span>
-                                {% elif result %}
-                                <span class="badge badge--xs badge-{{ 'test' if result.status == 'pass' else 'failed' }}">{{ result.status }}</span>
-                                {% if not result.is_current %}<span class="badge badge-failed">stale — работа пересдана</span>{% endif %}
-                                {% else %}
-                                <span class="badge badge-pending">результат не записан</span>
-                                <span class="muted">тест к критерию привязан, но за эту сдачу не прогонялся</span>
-                                {% endif %}
-                                <span class="u-text-muted">{{ ac.then }}</span>
-                                {# #825: критерий вместе со своими изменениями.
-                                   Зелёный тест при нуле относящихся изменений —
-                                   ровно то, что сегодня проходит гейт незамеченным. #}
-                                {% set bound = (change_map.by_ac or {}).get(ac.id) if change_map and not change_map.unavailable else None %}
-                                {% if bound %}
-                                {% if bound.files %}
-                                <div class="u-text-muted">изменения критерия:
-                                    {% for f in bound.files %}<code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }}){% if not loop.last %}, {% endif %}{% endfor %}
-                                    <span class="badge badge--xs badge-test">точная привязка</span>
-                                </div>
-                                {% elif bound.green_without_changes %}
-                                <div><span class="badge badge-failed">тест зелёный, изменений критерия нет</span>
-                                    <span class="muted">в этой сдаче файл теста {{ bound.test_file or '—' }} не менялся: критерий мог быть закрыт раньше, а мог быть не тронут вовсе</span>
-                                </div>
-                                {% else %}
-                                <div class="u-text-muted">изменений, привязанных к этому критерию, нет</div>
-                                {% endif %}
-                                {% endif %}
-                            </li>
-                            {% endfor %}
-                        </ul>
-                    </div>
-                    {% endif %}
-
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">CI по закреплённому коммиту:</span>
-                        <span class="badge badge--xs badge-{{ 'test' if evidence.ci_run_report.state == 'current' else 'failed' }}">{{ evidence.ci_run_report.state }}</span>
-                        {% if evidence.ci_run_report.state != 'current' %}<span class="muted">{{ evidence.ci_run_report.reason }}</span>{% endif %}
-                    </div>
-
-                    {# #875: КАКИЕ проверки прошли, а не только «прогон был».
-                       Право сказать ревьюеру «этот класс покрыт» даёт только
-                       шаг, выполнившийся и прошедший на этом коммите. #}
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Детерминированный предпас:</span>
-                        <span class="badge badge--xs badge-{{ 'test' if evidence.prepass.state == 'covered' else ('failed' if evidence.prepass.state == 'failed' else 'pending') }}">{{ evidence.prepass.state }}</span>
-                        {% if evidence.prepass.passed %}
-                        <span>прошли: {{ evidence.prepass.passed|join(', ') }}</span>
-                        {% endif %}
-                        {% if evidence.prepass.failed %}
-                        <span class="badge badge-failed">упали: {{ evidence.prepass.failed|join(', ') }}</span>
-                        {% endif %}
-                        {% if evidence.prepass.skipped %}
-                        <span class="muted">пропущены: {{ evidence.prepass.skipped|join(', ') }}</span>
-                        {% endif %}
-                        {% if evidence.prepass.state == 'unknown' %}<span class="muted">{{ evidence.prepass.reason }}</span>{% endif %}
-                    </div>
-
-                    {% if evidence.statement_freshness %}
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Свежесть постановки:</span>
-                        <span class="badge badge--xs badge-{{ 'test' if evidence.statement_freshness.state == 'no_overlap' else 'pending' }}">{{ evidence.statement_freshness.state }}</span>
-                        <span class="muted">{{ evidence.statement_freshness.reason }}</span>
-                    </div>
-                    {% endif %}
-
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Вызовы изменённых символов:</span>
-                        <span class="badge badge--xs badge-{{ 'test' if evidence.call_sites.status == 'analysed' else 'pending' }}">{{ evidence.call_sites.status }}</span>
-                        {% if evidence.call_sites.status == 'analysed' %}<span class="muted">{{ evidence.call_sites.summary }}</span>
-                        {% else %}<span class="muted">{{ evidence.call_sites.reason }}</span>{% endif %}
-                    </div>
-
-                    {% if change_map and change_map.unavailable %}
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Карта изменений:</span>
-                        <span class="badge badge-pending">не построена</span>
-                        <span class="muted">{{ change_map.unavailable }}</span>
-                    </div>
-                    {% elif change_map %}
-                    <div class="task-evidence-row">
-                        <span class="u-text-muted">Изменения, которых никто не просил:</span>
-                        {% if change_map.nobody %}
-                        <span class="badge badge-failed">{{ change_map.nobody | length }}</span>
-                        <ul class="task-review-findings">
-                            {% for f in change_map.nobody %}
-                            <li><code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }}) — ни один критерий не называл этот файл, и он вне объявленных областей</li>
-                            {% endfor %}
-                        </ul>
-                        {% else %}
-                        <span class="badge badge--xs badge-test">нет</span>
-                        <span class="muted">каждый изменённый файл либо привязан к критерию, либо объявлен в областях задачи</span>
-                        {% endif %}
-                    </div>
-                    {% if change_map.assumed %}
-                    <details>
-                        <summary class="project-edit-summary">предположительно по объявленным областям: {{ change_map.assumed | length }}</summary>
-                        <ul class="task-review-findings">
-                            {% for f in change_map.assumed %}
-                            <li><code class="code-sm">{{ f.path }}</code> (+{{ f.added }}/&minus;{{ f.removed }})
-                                {% if f.seen_by_review %}<span class="badge badge--xs badge-pending">названо находкой ревью</span>{% endif %}
-                                <span class="muted">файл в объявленных областях задачи — работа заказана, но к конкретному критерию не привязана</span></li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% endif %}
-                    {% endif %}
-                    {% if evidence.evidence_coverage.checks_missing %}
-                    <details>
-                        <summary class="project-edit-summary">не дали сигнала: {{ evidence.evidence_coverage.checks_missing | length }} — и почему</summary>
-                        <ul class="task-review-findings">
-                            {% for c in evidence.evidence_coverage.checks_missing %}
-                            <li>{{ c.check }} — {{ c.reason }}</li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% endif %}
-                    {% if evidence.evidence_coverage.checks_not_applicable %}
-                    <details>
-                        <summary class="project-edit-summary">нечего проверять: {{ evidence.evidence_coverage.checks_not_applicable | length }}</summary>
-                        <ul class="task-review-findings">
-                            {% for c in evidence.evidence_coverage.checks_not_applicable %}
-                            <li>{{ c.check }} — {{ c.reason }}</li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% endif %}
-                </div>
-                {% endif %}
-                {% if review_error %}
-                <div class="task-action-note">{{ review_error }}</div>
-                {% endif %}
-                {# #824: сами изменения, а не команда сходить за ними. По
-                   закреплённой sha: одобряют конкретную сдачу, и показанное
-                   обязано совпадать с одобряемым. #}
-                {% if task.submission_sha %}
-                <details class="task-action-note"
-                         hx-get="/tasks/{{ task.id }}/diff"
-                         hx-trigger="toggle once"
-                         hx-target="find .task-diff-slot"
-                         hx-swap="innerHTML">
-                    <summary class="project-edit-summary">изменения этой сдачи ({{ task.submission_sha[:12] }})</summary>
-                    <div class="task-diff-slot"><span class="u-text-muted">читаю дифф…</span></div>
-                </details>
-                {% endif %}
-                {% if machine_review_gap %}
-                <div class="task-action-note task-action-note--warning">
-                    {{ machine_review_gap }}
-                    <form method="post" action="/tasks/{{ task.id }}/web-request-machine-review" class="project-inline-form">
-                        <button class="btn btn-ghost" type="submit">Request machine review</button>
-                    </form>
-                </div>
-                {% endif %}
-                {# #808: пустое место у кнопки вердикта читалось как «претензий
-                   нет». Отсутствие ревью — это отсутствие данных, и оно должно
-                   быть написано словами (тот же урок, что #549 закрыл для
-                   «0 подтверждённых»). #}
-                {% if review_report and review_report.state == 'none' %}
-                <div class="task-action-note task-action-note--warning">
-                    Ревью за эту сдачу не проводилось — одобрение будет вынесено
-                    без независимой проверки.
-                </div>
-                {% endif %}
-                {% if review_report and review_report.state != 'none' %}
-                <div class="task-action-note">
-                    Проверялось: ветка {{ review_report.branch or '—' }},
-                    коммит {{ review_report.submission_sha[:12] or '—' }},
-                    {% if review_report.diff_files is not none %}
-                    {{ review_report.diff_files }} файлов / {{ review_report.diff_lines }} строк
-                    {% else %}
-                    <span class="muted">{{ review_report.diff_note or 'объём диффа неизвестен' }}</span>
-                    {% endif %}
-                    {% if machine_review and machine_review.model %}, модель {{ machine_review.model }}{% endif %}
-                </div>
-                {% endif %}
-                {# #893: цена задачи считается в ПРОГОНАХ. Порог входа одного
-                   прогона — 777k токенов по счёту провайдера, и размер диффа
-                   разброс не объясняет: пять пересдач стоят пять входов.
-                   Сумма одна этого не показывает, поэтому счётчик рядом. #}
-                {% if review_runs_cost and review_runs_cost.runs %}
-                <div class="task-action-note">
-                    Прогонов ревью: {{ review_runs_cost.runs }}
-                    {% if review_runs_cost.provider_total is not none %}
-                    &mdash; по счёту провайдера {{ '{:,}'.format(review_runs_cost.provider_total).replace(',', ' ') }} токенов
-                    {% if review_runs_cost.billed_runs < review_runs_cost.runs %}
-                    <span class="badge badge-self-approved">счёт есть у {{ review_runs_cost.billed_runs }} из {{ review_runs_cost.runs }}</span>
-                    {% endif %}
-                    {% else %}
-                    <span class="badge badge-self-approved">счёт провайдера неизвестен</span>
-                    {% endif %}
-                    <details>
-                        <summary class="project-edit-summary">прогоны по одному</summary>
-                        <ul class="tight-list">
-                            {% for run in review_runs %}
-                            <li>
-                                сдача #{{ run.generation }}, профиль {{ run.profile }} &mdash;
-                                {% if run.provider_tokens is not none %}
-                                {{ '{:,}'.format(run.provider_tokens).replace(',', ' ') }} токенов по счёту
-                                {% else %}
-                                <span class="muted">счёт неизвестен</span>
-                                {% endif %}
-                                {% if run.tokens_spent is not none %}
-                                <span class="muted">(самоотчёт {{ '{:,}'.format(run.tokens_spent).replace(',', ' ') }})</span>
-                                {% endif %}
-                            </li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                </div>
-                {% endif %}
-                {# #1106: что сказал бы стюард. РЕКОМЕНДАЦИЯ, а не решение:
-                   кликает по-прежнему человек, и в тени суждение не двигает
-                   задачу ни на шаг. Стоит здесь, у кнопок вердикта, потому
-                   что решение принимается здесь. #}
-                {% if steward_judgement %}
-                <div class="task-action-note">
-                    <span class="badge badge-self-approved">рекомендация стюарда</span>
-                    {{ steward_judgement.verdict }}
-                    {% if steward_judgement.confidence %}
-                    <span class="badge badge--xs">уверенность: {{ steward_judgement.confidence }}</span>
-                    {% endif %}
-                    {% if steward_judgement.model %}
-                    <span class="badge badge--xs">{{ steward_judgement.model }}</span>
-                    {% endif %}
-                    {% if steward_judgement.escalate_reason %}
-                    <span class="badge badge-failed">{{ steward_judgement.escalate_reason }}</span>
-                    {% endif %}
-                    <div class="muted">
-                        Решение остаётся человеческим: это то, что стюард
-                        сказал бы, а не то, что кто-то сделал.
-                    </div>
-                    {% if steward_judgement.grounds %}
-                    <details>
-                        <summary>основания ({{ steward_judgement.grounds|length }})</summary>
-                        <ul>
-                            {% for ground in steward_judgement.grounds %}
-                            <li>{{ ground.source }}{% if ground.detail %} — {{ ground.detail }}{% endif %}</li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% else %}
-                    <span class="muted">оснований не приложено</span>
-                    {% endif %}
-                </div>
-                {% endif %}
-                {% if machine_review %}
-                <div class="task-action-note">
-                    Machine review: {{ machine_review.raw_count }} raw &rarr;
-                    {{ machine_review.findings_confirmed|length }} confirmed /
-                    {{ machine_review.findings_rejected|length }} rejected
-                    {% if not machine_review.is_current %}
-                    <span class="badge badge-failed">stale — работа пересдана</span>
-                    {% endif %}
-                    {# #728: отчёт о собственной работе — не то же самое, что
-                       независимый, и об этом должно быть видно здесь, а не
-                       выясняться из имён в аудите. #}
-                    {% if machine_review.self_reviewed %}
-                    <span class="badge badge-failed">саморевью</span>
-                    {% endif %}
-                    {# #1012: одобрить можно, не заметив, что находки никто не
-                       разметил — так #987 и уехал в прод. Гейт остаётся
-                       человеческим; он просто перестаёт молчать. #}
-                    {% if mr_undisposed %}
-                    <span class="badge badge-failed">{{ mr_undisposed }} из {{ mr_confirmed }} находок без диспозиции</span>
-                    {% endif %}
-                    {# #549: «0 подтверждённых» значит что-то только рядом с полнотой
-                       прогона. Агенты и unresolved показаны здесь же, чтобы
-                       расхождение было видно глазом, а не выводилось из тишины. #}
-                    {% if machine_review.incomplete %}
-                    <span class="badge badge-failed">прогон неполный</span>
-                    {% elif machine_review.incomplete is none %}
-                    <span class="badge badge-self-approved">полнота не заявлена</span>
-                    {% endif %}
-                    {% if machine_review.agent_count %}
-                    <span class="badge badge--xs">{{ machine_review.agent_count }} агентов</span>
-                    {% endif %}
-                    {# #807: «0 находок на lite» и «0 находок на deep» — разные
-                       утверждения, поэтому профиль стоит рядом с числами. #}
-                    {% if machine_review.profile %}
-                    <span class="badge badge--xs">профиль {{ machine_review.profile }}</span>
-                    {% else %}
-                    <span class="badge badge-self-approved">профиль не заявлен</span>
-                    {% endif %}
-                    {% if machine_review.unresolved %}
-                    <span class="badge badge-failed">{{ machine_review.unresolved|length }} не проверено</span>
-                    {% endif %}
-                    {% if machine_review.lost_dimensions %}
-                    <span class="badge badge-failed">потеряно измерений: {{ machine_review.lost_dimensions|join(', ') }}</span>
-                    {% endif %}
-                    {% if machine_review.unresolved %}
-                    <details>
-                        <summary class="project-edit-summary">unresolved — НЕ опровергнуты, никто не смог судить</summary>
-                        <ul class="task-review-findings">
-                            {% for f in machine_review.unresolved %}
-                            <li>{{ f.title }}{% if f.why %} — {{ f.why }}{% endif %}</li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% endif %}
-                    {% if machine_review.findings_confirmed %}
-                    {# #876: находка без диспозиции — это находка, о судьбе
-                       которой никто не сказал. Пока её нет, precision и
-                       resolution rate считать не из чего, а «подтверждена»
-                       и «оказалась настоящей» — разные утверждения. #}
-                    {% set judged = {} %}
-                    {% for d in machine_review.dispositions %}
-                    {% if judged.update({d.finding_index: d}) %}{% endif %}
-                    {% endfor %}
-                    <details>
-                        <summary class="project-edit-summary">confirmed findings — {#
-                            #}размечено {{ machine_review.dispositions|length }} из {{ machine_review.findings_confirmed|length }}</summary>
-                        <form method="post"
-                              action="/tasks/{{ task.id }}/web-finding-dispositions">
-                            <p class="u-text-muted">
-                                Ложняк — описанного дефекта в коде НЕТ.
-                                Неважно — дефект есть, править не будем.
-                                Оставленное «не размечено» так и остаётся
-                                неразмеченным: значения по умолчанию нет.
-                            </p>
-                            <ul class="task-review-findings">
-                                {% for f in machine_review.findings_confirmed %}
-                                <li>[{{ f.severity }}{% if f.category %}/{{ f.category }}{% endif %}]
-                                    {% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %} — {% endif %}
-                                    {{ f.title }}
-                                    {% set ev = finding_touch[loop.index0] if finding_touch and loop.index0 < finding_touch|length else none %}
-                                    {% if ev %}
-                                    <span class="muted">
-                                        {% if ev.outcome == 'touched' %}
-                                        Место тронуто после отчёта:{% for c in ev.commits %}
-                                        {{ c.short }} {{ c.subject }}{% endfor %}
-                                        {% elif ev.outcome == 'untouched' %}
-                                        Место не тронуто после отчёта
-                                        {% else %}
-                                        Ответа нет: {{ ev.reason_label }}
-                                        {% endif %}
-                                    </span>
-                                    {% endif %}
-                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
-                                        value="fixed"
-                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'fixed' %}checked{% endif %}>
-                                        исправлено</label>
-                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
-                                        value="false_positive"
-                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'false_positive' %}checked{% endif %}>
-                                        ложняк</label>
-                                    <label><input type="radio" name="disposition-{{ loop.index0 }}"
-                                        value="wont_fix"
-                                        {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'wont_fix' %}checked{% endif %}>
-                                        неважно</label>
-                                    {% if not judged.get(loop.index0) %}
-                                    <span class="badge badge-self-approved">судьба не названа</span>
-                                    {% endif %}
-                                </li>
-                                {% endfor %}
-                            </ul>
-                            <button class="btn btn-ghost" type="submit">Сохранить диспозиции</button>
-                        </form>
-                    </details>
-                    {% endif %}
-                    {# #808: отклонённые находки — половина работы ревьюера, и
-                       раньше от неё оставался только счётчик. Человек, не
-                       читающий код, по ним и судит, насколько ревьюер разбирался
-                       в предмете, а не отмахивался. #}
-                    {% if machine_review.findings_rejected %}
-                    <details>
-                        <summary class="project-edit-summary">rejected findings — почему отклонены</summary>
-                        <ul class="task-review-findings">
-                            {% for f in machine_review.findings_rejected %}
-                            <li>{{ f.title }}{% if f.category %} [{{ f.category }}]{% endif %}
-                                {% if f.reason %} — {{ f.reason }}{% else %} — <span class="muted">причина не названа</span>{% endif %}</li>
-                            {% endfor %}
-                        </ul>
-                    </details>
-                    {% endif %}
-                </div>
-                {% endif %}
-                {% if task.latest_review %}
-                <div class="task-action-note">
-                    Last verdict: {{ task.latest_review.verdict.value|upper }}
-                    for submission #{{ task.latest_review.submission_generation }}
-                    ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
-                    {% if task.latest_review.self_approved %}
-                    <span class="badge badge-self-approved" title="Verdict submitted by the implementer via HAIPLANE_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
-                    {% endif %}
-                    {% if task.latest_review.findings %}
-                    <ul class="task-review-findings">
-                        {% for f in task.latest_review.findings %}
-                        <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}
-                            {%- if f.file %} <code class="code-sm">{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</code>{% endif %}
-                            {% if f.scope.value == 'out_of_scope' %}
-                            <span class="badge badge--xs badge-type-subtask">out of scope{% if f.linked_task_id %} &rarr; <a href="/tasks/{{ f.linked_task_id }}">#{{ f.linked_task_id }}</a>{% endif %}</span>
-                            {% endif %}
-                        </li>
-                        {% endfor %}
-                    </ul>
-                    {% endif %}
-                </div>
-                {% endif %}
-                {% if evidence and evidence.latest_submission_summary %}
-                <details class="task-action-note">
-                    <summary class="project-edit-summary">что говорит исполнитель</summary>
-                    <div class="u-pre-wrap">{{ evidence.latest_submission_summary }}</div>
-                </details>
-                {% endif %}
-                <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack" id="review-verdict-form">
-                    <label class="task-action-label" for="review-comments">Review comments</label>
-                    <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
-                    <button class="btn btn-success task-action-btn" type="submit" name="verdict" value="approved">Approve</button>
-                    <label class="task-action-label" for="review-findings">Findings (one per line: high: ... / medium: ... / low: ...; клик по строке диффа добавит «@ файл:строка»)</label>
-                    <textarea id="review-findings" name="findings_text" class="task-action-control task-action-textarea" placeholder="high: race condition in bump&#10;low: typo in docstring"></textarea>
-                    {# #1010: возврат работы обязан назвать причину. Сервер откажет
-                       в любом случае — это подсказка ДО отправки, чтобы человек не
-                       узнавал о требовании из ошибки после заполнения формы. #}
-                    <p class="task-action-note" id="review-cr-hint" hidden role="alert">
-                        «Request Changes» вернёт работу исполнителю — напишите, что
-                        править: одной строки в комментариях достаточно, находки
-                        необязательны.
-                    </p>
-                    {# #1057: повтор прошлого вердикта слово в слово хаб
-                       отклоняет. Повтор законен, когда дефект не починен, —
-                       тогда ревьюер отмечает это здесь и отправляет снова. #}
-                    <label class="task-action-label" for="review-ack-repeat">
-                        <input type="checkbox" id="review-ack-repeat" name="acknowledge_repeat" value="1">
-                        повторяю прошлый вердикт намеренно
-                    </label>
-                    <button class="btn btn-warning task-action-btn" type="submit" name="verdict" value="changes_requested">Request Changes</button>
-                </form>
-                <script>
-                // #1010: не пускаем пустой «Request Changes» дальше формы.
-                // Сервер отказывает независимо от этого — здесь только чтобы
-                // требование встретило ревьюера там, где он печатает.
-                document.addEventListener('submit', function (event) {
-                    var form = event.target.closest('#review-verdict-form');
-                    if (!form) return;
-                    var submitter = event.submitter;
-                    if (!submitter || submitter.value !== 'changes_requested') return;
-                    var comments = form.querySelector('#review-comments');
-                    var findings = form.querySelector('#review-findings');
-                    var filled = (comments && comments.value.trim())
-                        || (findings && findings.value.trim());
-                    if (filled) return;
-                    event.preventDefault();
-                    var hint = document.getElementById('review-cr-hint');
-                    if (hint) hint.hidden = false;
-                    if (comments) comments.focus();
-                });
-                document.addEventListener('click', function (event) {
-                    var line = event.target.closest('.task-diff-line--anchorable');
-                    if (!line) return;
-                    var box = document.getElementById('review-findings');
-                    if (!box) return;
-                    var address = ' @ ' + line.dataset.file + ':' + line.dataset.line;
-                    var text = box.value.replace(/\s+$/, '');
-                    // Appending to the line being written keeps one finding one
-                    // line; a second click on the same finding replaces the
-                    // address rather than stacking two.
-                    var parts = text.split('\n');
-                    var last = parts.length ? parts[parts.length - 1] : '';
-                    if (!last.trim()) {
-                        parts[parts.length - 1] = 'medium: ' + address.trim();
-                    } else {
-                        parts[parts.length - 1] = last.replace(/\s*@\s*\S+:\d+$/, '') + address;
-                    }
-                    box.value = parts.join('\n');
-                    box.focus();
-                });
-                </script>
-
                 {% elif task.status.value in ('running', 'review', 'fix_requested', 'ci_check') %}
                 <div class="task-action-state">In Progress</div>
                 {# #826: адрес правки нужен ИСПОЛНИТЕЛЮ, а он смотрит на карточку
@@ -1129,6 +686,7 @@
                 <a href="/tasks" class="btn btn-ghost task-action-btn">Back to Tasks</a>
                 {% endif %}
             </section>
+            {% endif %}
 
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Task Metadata</div>
@@ -1137,6 +695,7 @@
                     <dt>Project</dt>
                     <dd><span class="badge badge-type-epic">{{ task.project.slug }}</span></dd>
                     {% endif %}
+                    {% if not review_board %}
                     <dt>Status</dt>
                     <dd><span class="badge badge-{{ task.status.value }}">{{ task.status.value }}</span></dd>
                     <dt>Type</dt>
@@ -1145,6 +704,10 @@
                     <dd><span class="badge badge-priority-{{ task.priority.value }}">{{ task.priority.value }}</span></dd>
                     <dt>Source</dt>
                     <dd><span class="badge badge-{{ task.source.value }}">{{ task.source.value }}</span>{% if task.assigned_agent %}<span class="task-meta-muted">{{ task.assigned_agent }}</span>{% endif %}</dd>
+                    {% elif task.assigned_agent %}
+                    <dt>Agent</dt>
+                    <dd>{{ task.assigned_agent }}</dd>
+                    {% endif %}
                     {% if task.human_owner %}
                     <dt>Owner</dt>
                     <dd>{{ task.human_owner }}</dd>
@@ -1153,8 +716,10 @@
                     <dt>Reviewer</dt>
                     <dd>{{ task.human_reviewer }}</dd>
                     {% endif %}
+                    {% if not review_board %}
                     <dt>Runtime</dt>
                     <dd><span class="badge badge-{{ task.runtime.value }}">{{ task.runtime.value }}</span></dd>
+                    {% endif %}
                     {% if task.job_id %}
                     <dt>Job ID</dt>
                     <dd><code class="code-sm">{{ task.job_id }}</code></dd>
@@ -1192,10 +757,52 @@
                     {% endif %}
                     <dt>Created</dt>
                     <dd>{{ task.created_at }}</dd>
+                    {% if not review_board %}
                     <dt>Updated</dt>
                     <dd>{{ task.updated_at }}</dd>
+                    {% endif %}
                 </dl>
             </section>
+
+            {# #893: цена задачи считается в ПРОГОНАХ. Порог входа одного
+               прогона — 777k токенов по счёту провайдера, и размер диффа
+               разброс не объясняет: пять пересдач стоят пять входов.
+               Сумма одна этого не показывает, поэтому счётчик рядом.
+               #1207: в review стоит в сайдбаре — это справка, не свидетельство. #}
+            {% if review_board and review_runs_cost and review_runs_cost.runs %}
+            <section class="task-sidebar-card">
+                <div class="task-sidebar-title">Стоимость ревью</div>
+                <div class="task-action-note">
+                    Прогонов ревью: {{ review_runs_cost.runs }}
+                    {% if review_runs_cost.provider_total is not none %}
+                    &mdash; по счёту провайдера {{ '{:,}'.format(review_runs_cost.provider_total).replace(',', ' ') }} токенов
+                    {% if review_runs_cost.billed_runs < review_runs_cost.runs %}
+                    <span class="badge badge-self-approved">счёт есть у {{ review_runs_cost.billed_runs }} из {{ review_runs_cost.runs }}</span>
+                    {% endif %}
+                    {% else %}
+                    <span class="badge badge-self-approved">счёт провайдера неизвестен</span>
+                    {% endif %}
+                    <details>
+                        <summary class="project-edit-summary">прогоны по одному</summary>
+                        <ul class="tight-list">
+                            {% for run in review_runs %}
+                            <li>
+                                сдача #{{ run.generation }}, профиль {{ run.profile }} &mdash;
+                                {% if run.provider_tokens is not none %}
+                                {{ '{:,}'.format(run.provider_tokens).replace(',', ' ') }} токенов по счёту
+                                {% else %}
+                                <span class="muted">счёт неизвестен</span>
+                                {% endif %}
+                                {% if run.tokens_spent is not none %}
+                                <span class="muted">(самоотчёт {{ '{:,}'.format(run.tokens_spent).replace(',', ' ') }})</span>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                </div>
+            </section>
+            {% endif %}
 
             {% if can_archive or can_delete %}
             <section class="task-sidebar-card task-danger-card">
