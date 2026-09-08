@@ -29,6 +29,8 @@ from hub.services.steward_dispatch import (
     RUN_OPEN,
     RUN_REFUSED,
     RUN_SUPERSEDED,
+    PENDING_PREFIX,
+    RUN_NEVER_STARTED,
     RUN_TIMEOUT,
     close_finished_runs,
     open_run,
@@ -191,6 +193,10 @@ async def test_hung_run_closes_on_timeout(db: aiosqlite.Connection):
 
     review:client — человеческий слот без дедлайна, поэтому зависший прогон
     иначе не эскалирует никогда: он просто стоит и выглядит заказанным.
+
+    Заказ здесь НЕ начинался, поэтому с #1181 он закрывается как
+    never_started, а не timeout. Прежнее ожидание закрепляло неточность:
+    таймаут судьи писался тому, кто не работал ни секунды.
     """
     project_id = await _project(db, "steward-timeout", steward=True)
     task_id = await _submitted_task(db, project_id)
@@ -206,7 +212,7 @@ async def test_hung_run_closes_on_timeout(db: aiosqlite.Connection):
 
     assert closed == 1
     rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],))
-    assert dict(rows[0])["status"] == RUN_TIMEOUT
+    assert dict(rows[0])["status"] == RUN_NEVER_STARTED
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "review", "диспетчер не двигает задачу — это F4"
 
@@ -1092,3 +1098,103 @@ async def test_an_approved_draft_releases_its_open_slot(db: aiosqlite.Connection
     runs = await _runs(db, task_id)
     assert [r["status"] for r in runs] == [RUN_SUPERSEDED]
     assert "больше не драфт" in runs[0]["closed_reason"]
+
+
+# --- #1181: окно судьи отмеряется от РАБОТЫ, а не от заказа ---------------
+#
+# Первый прогон стюарда: заказан 06:20:32, стартовал 06:38:20, закрыт
+# 06:50:50 с причиной «не вернул суждение». Семнадцать минут съели повторные
+# попытки старта, судье досталось двенадцать минут из тридцати — и вина
+# досталась ему же.
+
+
+async def _started(db: aiosqlite.Connection, run_id: int, agent: str = "bc-1") -> None:
+    """Отметить прогон начатым так же, как это делает захват слота."""
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, run_id=? WHERE id=?",
+        (agent, "run-1", run_id),
+    )
+    await db.commit()
+
+
+async def test_never_started_closes_as_never_started(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1181 AC-2: не начавшийся заказ закрывается СВОИМ исходом.
+
+    Различие обязано быть в записи, а не в словах: надзор F7 считает по
+    статусу, и «не смог стартовать» в графе «судья не справился» — это
+    испорченная статистика, а не мелочь формулировки.
+    """
+    monkeypatch.setattr(config, "STEWARD_START_DEADLINE_MIN", 30)
+    project_id = await _project(db, "steward-never", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    row = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
+    )
+    assert row["status"] == RUN_NEVER_STARTED
+    assert row["status"] != RUN_TIMEOUT, "таймаут судьи — обвинение того, кто работал"
+    assert "не удалось начать" in row["closed_reason"]
+
+
+async def test_a_started_run_still_times_out(db: aiosqlite.Connection, monkeypatch):
+    """#1181 AC-3: сдвиг точки отсчёта не отменяет самого дедлайна.
+
+    Иначе правка тихо превращается в «никогда не закрывать», и слот живёт
+    вечно — цена, которой окно судьи не стоит.
+    """
+    monkeypatch.setattr(config, "STEWARD_RUN_DEADLINE_MIN", 30)
+    project_id = await _project(db, "steward-still-times-out", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await _started(db, run["id"], agent="bc-worked")
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    row = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
+    )
+    assert row["status"] == RUN_TIMEOUT, "работавший и не ответивший — это таймаут"
+    assert "не вернул суждение" in row["closed_reason"]
+
+
+async def test_a_pending_claim_is_not_a_started_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1181: метка захвата — намерение, а не работа.
+
+    Между меткой и подтверждённым стартом лежит вызов провайдера, который
+    может не состояться вовсе (#1195). Считать метку началом работы значило
+    бы записать таймаут судьи тому, кого так и не создали.
+    """
+    monkeypatch.setattr(config, "STEWARD_START_DEADLINE_MIN", 30)
+    project_id = await _project(db, "steward-pending", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, deadline_at=datetime('now','-1 minute') "
+        "WHERE id=?",
+        (f"{PENDING_PREFIX}{run['id']}", run["id"]),
+    )
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    row = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
+    )
+    assert row["status"] == RUN_NEVER_STARTED

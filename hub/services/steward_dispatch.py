@@ -79,6 +79,19 @@ RUN_SUPERSEDED = "superseded"
 # заказ на ту же генерацию невозможным по уникальному индексу (отчёт 212).
 RUN_REFUSED = "refused"
 
+# Заказ, который так и не начал работу за отведённое ожидание (#1181).
+# Отдельное слово, а не RUN_TIMEOUT: таймаут обвиняет судью, а этот судья
+# не работал ни секунды. Надзор F7 считает по этим строкам, и «не смог
+# стартовать» в графе «не справился» — испорченная статистика, а не
+# мелочь формулировки. Ни один читатель терминальные статусы не
+# перечисляет — проверено поимённо, все сравнивают только с RUN_OPEN.
+RUN_NEVER_STARTED = "never_started"
+
+# The lock is taken BEFORE the provider is called and holds this marker until
+# the real agent id replaces it. Anything else would pay first and claim
+# second — the inversion of claim_arbiter_dispatch (#421).
+PENDING_PREFIX = "pending:"
+
 # Refusal codes. They are the vocabulary of the escalate reasons the contract
 # already closes over (#1022), so a refusal here and an escalation there mean
 # the same thing by name rather than by resemblance.
@@ -262,7 +275,9 @@ async def order_run(
                 RUN_OPEN,
                 config.STEWARD_MODEL,
                 project_id,
-                f"+{config.STEWARD_RUN_DEADLINE_MIN} minutes",
+                # Пока заказ не начат, срок отмеряет ожидание ВОЗМОЖНОСТИ, а не
+                # работу судьи. Рабочее окно поставит захват слота (#1181).
+                f"+{config.STEWARD_START_DEADLINE_MIN} minutes",
             ),
         )
     except aiosqlite.IntegrityError:
@@ -637,11 +652,21 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             (run["id"],),
         )
         if overdue:
+            # Два исхода, а не один. Прогон, который работал и не ответил, и
+            # заказ, который не начался вовсе, — разные события, и запись
+            # обязана их различать: на этом различии стоит статистика надзора.
+            started = bool((run.get("agent_id") or "").strip()) and not str(
+                run.get("agent_id") or ""
+            ).startswith(PENDING_PREFIX)
             if await close_run(
                 db,
                 run,
-                RUN_TIMEOUT,
-                "прогон не вернул суждение до дедлайна слота",
+                RUN_TIMEOUT if started else RUN_NEVER_STARTED,
+                "прогон не вернул суждение до дедлайна слота"
+                if started
+                else "заказ не удалось начать за отведённое ожидание — "
+                "судья не работал, и таймаут судьи здесь был бы обвинением "
+                "того, кто не начинал",
             ):
                 closed += 1
     return closed
