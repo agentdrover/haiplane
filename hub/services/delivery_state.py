@@ -764,8 +764,8 @@ def _discrepancy_voice(
     # «доставку подтвердить не удалось», это уже другое утверждение, которого
     # никто не одобрял, и молчать о нём значит выдавать старое решение за
     # оценку новой обстановки.
-    acknowledged = bool((prior.get("acknowledged_at") or "").strip())
-    if acknowledged and (prior.get("acknowledged_state") or "").strip() == state:
+    settled_fact = (prior.get("acknowledged_state") or "").strip()
+    if (prior.get("acknowledged_at") or "").strip() and settled_fact == state:
         return None
 
     age_hours = _age_hours(task, prior)
@@ -782,13 +782,14 @@ def _discrepancy_voice(
     said_states = {
         part for part in (prior.get("alerted_state") or "").split(",") if part.strip()
     }
-    # Признанной строке рубежи напоминаний НЕ положены, и это не мелочь.
-    # Возрастной рубеж говорит «это длится дольше, чем вы думали» — упрёк
-    # тому, кто не разобрал. Разобравший сказал своё слово; про новый факт он
-    # услышит один раз, и всё. Иначе строка, чей факт сменился, кричала бы на
-    # каждом рубеже вечно — а с доски её в этот момент не видно и заткнуть
-    # нечем, потому что секция инбокса показывает только pr_open (#294).
-    fresh_round = bucket > said_bucket and not acknowledged
+    # Рубеж принадлежит ФАКТУ, а не строке. Соблазн «признавшего рубежами не
+    # беспокоить» я уже реализовал и он оказался неверен ровно наоборот:
+    # проверка выше уже вернула None для признанного факта, значит сюда
+    # доходит только тот, которого никто не одобрял, — и глушить ЕГО
+    # эскалацию значит второй раз построить «одно суждение отнимает голос у
+    # другого». До этой правки все три рубежа по такому факту молчали
+    # навсегда (#294, раунд 3).
+    fresh_round = bucket > said_bucket
     if state in said_states and not fresh_round:
         return None
     voiced = {state} if fresh_round else said_states | {state}

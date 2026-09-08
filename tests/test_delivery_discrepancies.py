@@ -694,6 +694,10 @@ async def test_a_row_that_speaks_is_never_drawn_as_settled(
     assert "badge-muted" not in body, body[body.find("inbox-undelivered") :][:400]
     assert "web-acknowledge-delivery" in body
     assert "All clear" not in body
+    # И прежнее решение человека с доски не пропадает: иначе он видит крик и
+    # не понимает, куда делось то, что он уже решал.
+    assert "признавалось для другого факта" in body
+    assert "GitHub лежит" in body
 
     # И топбар на «/» — третий счётчик внимания. Он живёт в другом файле и
     # именно поэтому уже дважды отставал от остальных.
@@ -753,16 +757,17 @@ async def test_one_name_written_by_the_neighbour_reads_as_a_set_of_one(
     assert len(await _alerts(db, task_id)) == spoken, "свип повторил сказанное соседом"
 
 
-async def test_a_settled_row_hears_about_a_new_fact_once_and_not_on_every_threshold(
+async def test_an_unsettled_fact_keeps_escalating_even_beside_a_settled_one(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Признавший услышит про новый факт один раз — и рубежи ему не положены.
+    """Рубеж принадлежит ФАКТУ, а не строке.
 
-    Возрастной рубеж говорит «это длится дольше, чем вы думали»: упрёк тому,
-    кто не разобрал. Разобравший своё слово сказал. Оставить ему рубежи значит
-    вернуть метроном с другого конца — на сутках, трёх сутках и неделе, — и
-    вернуть в самом неудобном виде: секция инбокса показывает только pr_open,
-    так что в момент крика строки на доске может не быть вовсе.
+    Я сперва написал здесь обратное — «признавшему рубежи не положены» — и это
+    оказалось неверно ровно наоборот. Проверка признания возвращает молчание
+    раньше, значит до рубежей доходит ТОЛЬКО факт, которого никто не одобрял.
+    Глушить его эскалацию — второй раз построить «одно суждение отнимает голос
+    у другого», от чего задача и защищает. Признанный факт при этом молчит
+    по-прежнему: у него своя, ранняя дверь.
     """
     task_id = await _completed_task(db, client, title="Разобрано", pr=980)
     _pr_states(monkeypatch, {980: "open"})
@@ -777,8 +782,88 @@ async def test_a_settled_row_hears_about_a_new_fact_once_and_not_on_every_thresh
     after_news = len(await _alerts(db, task_id))
     assert any("НЕ УДАЛОСЬ" in a for a in await _alerts(db, task_id))
 
-    # Сутки, трое суток, неделя — и ни одного повтора.
+    # Сутки, трое суток, неделя — по одному напоминанию на рубеж: факт живой и
+    # неодобренный, а «это длится дольше, чем вы думали» — про него.
     for hours in (30, 80, 200):
         await _age(db, task_id, hours)
         await scan_completed_deliveries(db)
-    assert len(await _alerts(db, task_id)) == after_news, await _alerts(db, task_id)
+    assert len(await _alerts(db, task_id)) == after_news + 3
+
+    # А признанный факт молчит и через неделю: рубежи ему не открывают дверь.
+    _pr_states(monkeypatch, {980: "open"})
+    await scan_completed_deliveries(db)
+    settled = len(await _alerts(db, task_id))
+    await _age(db, task_id, 400)
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == settled
+
+
+async def test_a_fact_heard_before_the_decision_still_speaks_after_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Решение человека — точка отсчёта заново, а не пломба на всю историю.
+
+    Память о сказанном копит ВСЕ когда-либо озвученные состояния, а признание
+    навсегда снимает возрастные рубежи, которые её сбрасывали. Значит факт,
+    прозвучавший ДО признания, при возврате читался как «уже сказанный» и
+    молчал вечно — хотя одобряли не его. Хуже всего то, что на доске строка
+    при этом выглядит правильно: кнопка вернулась, счётчик считает. Молчал бы
+    только канал, который будит, — то есть тот единственный, ради которого
+    задача заведена.
+    """
+    task_id = await _completed_task(db, client, title="Два факта", pr=990)
+    _pr_states(monkeypatch, {990: "open"})
+    await scan_completed_deliveries(db)
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 2
+
+    # Владелец признаёт то, что видит СЕЙЧАС: «подтвердить не удалось».
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="GitHub лежит, разберусь как встанет"
+    )
+
+    # Сутки спустя провайдер ожил: PR открыт. Этого никто не признавал.
+    await _age(db, task_id, 30)
+    _pr_states(monkeypatch, {990: "open"})
+    await scan_completed_deliveries(db)
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 3, alerts
+    assert "НЕ доставлена" in alerts[-1]
+    # Дальше он эскалирует как обычный неодобренный факт — по разу на рубеж.
+    for hours in (80, 200):
+        await _age(db, task_id, hours)
+        await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 5
+
+
+async def test_a_decision_restarts_the_record_of_what_was_said(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Решение человека — точка отсчёта заново, и ждать рубежа оно не должно.
+
+    Без обнуления памяти факт, звучавший ДО признания, при возврате читался
+    как «уже сказанный» и молчал до ближайшего возрастного рубежа — то есть до
+    суток. Это та же болезнь, от которой заведена задача, просто в меньшей
+    дозе: недоставленная работа стоит непрозвучавшей, пока не состарится.
+    Здесь возраст НЕ подкручивается намеренно — проверяется именно тот же день.
+    """
+    task_id = await _completed_task(db, client, title="В тот же день", pr=991)
+    _pr_states(monkeypatch, {991: "open"})
+    await scan_completed_deliveries(db)
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == 2
+
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="GitHub лежит, разберусь как встанет"
+    )
+    said = (await repo.get_delivery_discrepancy(db, task_id))["alerted_state"]
+    assert said == "", f"память о сказанном не обнулена: {said!r}"
+
+    # Провайдер ожил в тот же час. Рубеж не пройден — но факт неодобренный.
+    _pr_states(monkeypatch, {991: "open"})
+    await scan_completed_deliveries(db)
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 3, alerts
+    assert "НЕ доставлена" in alerts[-1]

@@ -311,6 +311,15 @@
             <a href="/tasks/{{ d.task_id }}" class="btn btn-secondary btn-xs">Открыть</a>
         </div>
         {% else %}
+        {% if d.acknowledged_at %}
+        {# Прежнее решение не прячем, даже когда оно перестало применяться:
+           иначе человек видит, что строка снова кричит, и не понимает почему,
+           а причину для новой формы вводит вслепую. Тишина о своём же
+           суждении неотличима от того, что доска его потеряла (#294). #}
+        <div class="inbox-item-meta">
+            признавалось для другого факта{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }} — обстоятельства изменились, решение нужно принять заново
+        </div>
+        {% endif %}
         <div class="inbox-item-actions">
             <a href="/tasks/{{ d.task_id }}" class="btn btn-warning btn-xs">Разобрать</a>
         </div>
