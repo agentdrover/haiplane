@@ -1274,7 +1274,13 @@ async def web_provision_project(project_id: int, request: Request):
         return _projects_error_redirect("project not found")
     result = await services.provision_project(db, project_id, actor=identity.username)
     if result["provision_status"] != "ok":
-        return _projects_error_redirect(f"Provision: {result['provision_detail']}")
+        # Проект известен — значит отказ показывается У ЕГО КАРТОЧКИ, как и
+        # отказ формы (найдено ревью, находка cbab9718). Инвариант, введённый
+        # этой же задачей, нарушался соседним вызовом в том же файле: нота
+        # снова уезжала последним блоком страницы, где её и не видят.
+        return _projects_error_redirect(
+            f"Provision: {result['provision_detail']}", project_id
+        )
     return RedirectResponse("/projects", status_code=303)
 
 

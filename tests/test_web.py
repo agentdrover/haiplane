@@ -1808,6 +1808,12 @@ async def test_web_provision_button_and_status(client: AsyncClient, db):
     assert "project_error=" in resp.headers["location"]
     page = await client.get(resp.headers["location"])
     assert "remote not accessible" in page.text
+    # #1188: отказ, у которого есть проект, живёт у его карточки — как и
+    # отказ формы. Инвариант ввела та же задача, и этот вызов её нарушал.
+    assert "project_error_id=" in resp.headers["location"]
+    assert "project-error-note" in _card(page.text, "provui"), (
+        "нота обязана стоять у карточки своего проекта, а не под всеми"
+    )
     page = await client.get("/projects")
     # #622: the badge is Russian now and the CAUSE is visible text — it used to
     # live only in a title attribute, which a phone never shows.
