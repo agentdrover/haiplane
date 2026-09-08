@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -25,6 +25,10 @@ from hub import brand, config
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+#: Создание агента отдельно: наблюдено 06.09, что провайдер отвечал 59 секунд
+#: при общем терпении в 30, и клиент бросал вызов, который на деле удался
+#: (#1199). Остальные вызовы модуля — короткие GET, им общий срок годится.
+_CREATE_TIMEOUT = 120.0
 
 
 def is_configured() -> bool:
@@ -62,7 +66,10 @@ class Refusal:
 
 
 async def _attempt(
-    method: str, path: str, json_body: dict[str, Any] | None = None
+    method: str,
+    path: str,
+    json_body: dict[str, Any] | None = None,
+    timeout: float = _TIMEOUT,
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
     """Один защищённый заход: ``(тело, отказ)``, и ровно одно из них не None.
 
@@ -74,7 +81,7 @@ async def _attempt(
     url = f"{(config.CURSOR_API_URL or 'https://api.cursor.com').rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {config.CURSOR_API_KEY.strip()}"}
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, json=json_body, headers=headers)
         if resp.status_code // 100 != 2:
             log.warning(
@@ -95,8 +102,13 @@ async def _attempt(
             return None, Refusal(status=resp.status_code, detail="тело не объект")
         return body, None
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
-        log.warning("cursor cloud %s %s failed: %s", method, path, exc)
-        return None, Refusal(detail=str(exc)[:300])
+        # Класс, а не только текст (#1199). У таймаутов httpx/httpcore
+        # ``str(exc)`` ПУСТ — в журнале оставалось «failed:» и ничего, и
+        # причину пришлось восстанавливать по арифметике времени. Класс
+        # называет её сразу: ReadTimeout и ConnectError — разные разговоры.
+        detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":").strip()
+        log.warning("cursor cloud %s %s failed: %s", method, path, detail)
+        return None, Refusal(detail=detail[:300])
 
 
 def _error_code(resp: httpx.Response) -> str:
@@ -132,6 +144,109 @@ async def _request(
     return body
 
 
+#: Префикс имени, по которому хаб узнаёт агента, которого заказал сам.
+#: Провайдер иначе придумывает имя из промта, и полагаться на него нельзя:
+#: из трёх осиротевших агентов 06.09 двое не называли задачу вовсе
+#: («Суждение стюарда гейта», «Код-ревью задачи haiplane»).
+AGENT_MARKER_PREFIX = "haiplane"
+
+
+def agent_marker(kind: str, task_id: int, generation: int, attempt: int = 1) -> str:
+    """Имя агента: читаемое человеку и разбираемое машиной (#1199).
+
+    Одна строка служит двум разным читателям, и это осознанный компромисс,
+    а не небрежность: имя видно в интерфейсе Cursor, где по нему ищет
+    человек, и оно же — единственный признак, по которому хаб может узнать
+    СВОЙ заказ, если ответ на создание не дошёл. Отдельного поля под метку
+    у провайдера нет: тело запроса проверяется строго, незнакомый ключ
+    отвергается с ``Unrecognized key(s)`` (проверено пробой 07.09.2026).
+
+    Формат намеренно скучный и без пробелов вокруг разделителей — по нему
+    сравнивают на равенство, а не разбирают регулярным выражением.
+
+    ``attempt`` обязателен по смыслу, хотя и со значением по умолчанию
+    (находка ревью №269, high). Добор лестницы (#879) заказывает ВТОРОГО
+    ревьюера на ТУ ЖЕ генерацию, то есть под тем же именем, — и сверка
+    после оборвавшегося добора подобрала бы агента первого, дешёвого
+    прогона. Второго POST при этом не случилось бы, но сдача получила бы
+    чужого судью, а настоящий остался бы сиротой. Ровно этого запрещает
+    AC-4: подбор похожего хуже, чем неподбор.
+    """
+    return (
+        f"{AGENT_MARKER_PREFIX}:{kind}:t{int(task_id)}"
+        f":g{int(generation)}:a{int(attempt)}"
+    )
+
+
+async def list_agents(limit: int = 50, cursor: str = "") -> dict[str, Any] | None:
+    """Страница списка агентов; ``None`` — не смогли спросить.
+
+    Ответ несёт ключ ``items`` (НЕ ``agents`` и не ``data``) и ``nextCursor``
+    для следующей страницы — проверено вызовом 06.09.2026. Разбирать надо
+    именно эту форму: выдуманная дала бы пустой список, а пустой список
+    здесь означал бы «агента нет» и разрешил бы купить второго.
+    """
+    path = f"/v1/agents?limit={int(limit)}"
+    if cursor:
+        path += f"&cursor={cursor}"
+    return await _request("GET", path)
+
+
+class Reconciliation(NamedTuple):
+    """Чем кончилась сверка с провайдером (#1199).
+
+    Два поля, потому что вопросов два, и один ответ на оба уже стоил нам
+    поколения: «агента нет» разрешает повторить вызов, а «не смогли
+    спросить» не разрешает ничего — угаданный агент хуже пропущенного.
+    Возвращать на оба случая один ``None`` значило бы повторить ошибку
+    #1185 в новом месте.
+    """
+
+    #: Идентификатор нашего агента; пусто — не найден.
+    agent_id: str
+    #: Его последний прогон: список отдаёт latestRunId, и без него подбор
+    #: половинчатый — свип не увидит статус и не восстановит отчёт (#269).
+    run_id: str
+    #: Удалось ли вообще прочитать список. False — ответа нет, а не «нет».
+    asked: bool
+
+
+async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
+    """Найти агента с ТОЧНО таким именем и сказать, спросить ли удалось.
+
+    Сравнение на РАВЕНСТВО, не на вхождение: «похожий» агент хуже второго
+    агента, потому что второй хотя бы честно свой. Метка соседнего
+    поколения отличается одним символом, и вхождение отдало бы сдаче
+    чужого судью.
+    """
+    if not name:
+        return Reconciliation("", "", True)
+    cursor = ""
+    for _ in range(max(1, pages)):
+        page = await list_agents(cursor=cursor)
+        if page is None:
+            return Reconciliation("", "", False)
+        items = page.get("items")
+        if not isinstance(items, list):
+            # Тело не той формы — это «прочитать не смог», а не «пусто»
+            # (находка ревью №269). Пустой обход по чужой форме дал бы
+            # подтверждённую пустоту, а она разрешает купить второго
+            # агента: отсутствие данных снова стало бы значением (#762).
+            log.warning("cursor cloud /v1/agents: no items list in body")
+            return Reconciliation("", "", False)
+        for item in items:
+            if isinstance(item, dict) and item.get("name") == name:
+                found = str(item.get("id") or "").strip()
+                if found:
+                    return Reconciliation(
+                        found, str(item.get("latestRunId") or "").strip(), True
+                    )
+        cursor = str(page.get("nextCursor") or "")
+        if not cursor:
+            break
+    return Reconciliation("", "", True)
+
+
 async def create_review_agent(
     *,
     repo_url: str,
@@ -140,6 +255,7 @@ async def create_review_agent(
     prompt_text: str,
     hub_mcp_url: str,
     reviewer_token: str,
+    name: str = "",
 ) -> dict[str, Any] | None:
     """Queue a cloud agent that reviews ``starting_ref`` of ``repo_url``.
 
@@ -156,6 +272,7 @@ async def create_review_agent(
         prompt_text=prompt_text,
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
+        name=name,
     )
     return created
 
@@ -168,6 +285,7 @@ async def create_agent_attempt(
     prompt_text: str,
     hub_mcp_url: str,
     reviewer_token: str,
+    name: str = "",
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
     """То же, что :func:`create_review_agent`, но с причиной отказа (#1182).
 
@@ -192,7 +310,14 @@ async def create_agent_attempt(
             }
         ],
     }
-    return await _attempt("POST", "/v1/agents", body)
+    if name:
+        # Метка кладётся ТОЛЬКО когда её попросили: пустое имя означает, что
+        # вызывающий подбирать не собирается, и придумывать за него метку —
+        # значит обещать восстановление, которого никто не делает.
+        body["name"] = name
+    # Создание ждёт дольше остальных вызовов: брошенный на 30-й секунде
+    # запрос всё равно создавал агента, и хаб терял его идентификатор.
+    return await _attempt("POST", "/v1/agents", body, timeout=_CREATE_TIMEOUT)
 
 
 async def get_run(agent_id: str, run_id: str) -> dict[str, Any] | None:
