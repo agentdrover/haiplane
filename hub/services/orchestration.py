@@ -2087,22 +2087,31 @@ async def assess_branch_stacking(
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
     own_project = await _project_id_for(db, task_id)
-    rows = list(
-        await repo.list_unmerged_branch_tasks(
-            db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
-        )
-    )
+    rows: list[Any] = []
     stranded: set[int] = set()
     if statuses is not None:
         # #1204: the delivery question only. The advisory callers keep asking
         # "is someone working on top of me", and a task nobody is working on
         # any more is not part of that question — but it is very much part of
         # "is there work under mine that will never reach the base branch".
+        #
+        # FIRST in the walk, not appended after. The loop answers with the
+        # first stacked row it finds, so walk order IS priority — and putting
+        # these last meant a nearer ordinary base masked a stranded one deeper
+        # in the same stack: the reader got "waiting for #A", a silent retry,
+        # while under them sat a base no wait would ever deliver. Found by the
+        # machine review of this very change; the comment below already
+        # claimed this precedence, and only the order made it true.
         for row in await repo.list_undelivered_completed_branch_tasks(
             db, exclude_task_id=task_id
         ):
             rows.append(row)
             stranded.add(int(dict(row)["id"]))
+    rows.extend(
+        await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
+        )
+    )
     unknown: StackAssessment | None = None
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
