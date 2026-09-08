@@ -117,11 +117,21 @@ def foreign_paths(dirty: list[str], affected_areas: list[str]) -> list[str]:
 TEST_DIRS = frozenset({"tests", "test", "__tests__"})
 
 # Filename markers of the dot-separated convention: the segment right before
-# the extension. Suffixes of the NAME rather than extensions of one language,
-# so .test.js and .spec.jsx are already covered and the next project does not
-# come back here for a third edit. Languages beyond Python and JS/TS are left
-# out on purpose — added when a project measures the need, not in advance.
+# the extension. Suffixes of the NAME rather than one hard-coded extension, so
+# .test.js and .spec.jsx are covered by the same rule as .test.tsx. Languages
+# beyond Python and JS/TS are left out on purpose — added when a project
+# measures the need, not in advance.
 TEST_NAME_MARKERS = frozenset({"test", "spec"})
+
+# ...but only in front of a JS/TS source extension. Found by the machine
+# review of #1179: with the marker alone, docs/api.spec.md and
+# contracts/openapi.spec.yaml read as tests, code_without_tests came back
+# empty, and the gate wrote "проверено, чисто" about a diff that brought a
+# specification instead of a test. That is the silent failure AC-3 is about —
+# a wrong "a test is here" is what nobody goes looking for.
+TEST_MARKER_EXTENSIONS = frozenset(
+    {"js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"}
+)
 
 
 def is_test_path(path: str) -> bool:
@@ -152,12 +162,17 @@ def is_test_path(path: str) -> bool:
     if name.startswith("test_") or name.endswith("_test.py"):
         return True
     # foo.test.ts, foo.spec.tsx: the marker must be the segment IMMEDIATELY
-    # before the extension. Matched anywhere in the name it would swallow
-    # latest.test.helpers.ts, and a rule that wrongly says "a test is here"
-    # is worse than one that wrongly says none is — nobody goes looking for
-    # the check that stayed quiet.
+    # before the extension, and the extension must be JS/TS source. Matched
+    # anywhere in the name it would swallow latest.test.helpers.ts; matched in
+    # front of any extension it swallowed api.spec.md. A rule that wrongly
+    # says "a test is here" is worse than one that wrongly says none is —
+    # nobody goes looking for the check that stayed quiet.
     segments = name.split(".")
-    return len(segments) >= 3 and segments[-2] in TEST_NAME_MARKERS
+    return (
+        len(segments) >= 3
+        and segments[-2] in TEST_NAME_MARKERS
+        and segments[-1].lower() in TEST_MARKER_EXTENSIONS
+    )
 
 
 def code_without_tests(paths: list[str]) -> list[str]:

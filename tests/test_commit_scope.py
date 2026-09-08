@@ -202,6 +202,31 @@ def test_lookalike_paths_are_not_tests():
     assert not commit_scope.is_test_path("hub/protest.py")
 
 
+def test_a_specification_is_not_a_test():
+    # Found by the machine review of the first submission: the marker in front
+    # of ANY extension made a spec document pass for a test. The consumer is
+    # asserted too, because that is where the damage lands — an empty answer
+    # is reported as "проверено, чисто", which nobody comes back to check.
+    for path in (
+        "docs/api.spec.md",
+        "contracts/openapi.spec.yaml",
+        "contracts/openapi.spec.yml",
+        "config/routes.test.json",
+        "docs/plan.test.md",
+    ):
+        assert not commit_scope.is_test_path(path), path
+
+    with_spec = ["hub/app.py", "docs/api.spec.md"]
+    assert commit_scope.code_without_tests(with_spec) == with_spec
+    with_openapi = ["frontend/src/api.ts", "contracts/openapi.spec.yaml"]
+    assert commit_scope.code_without_tests(with_openapi) == with_openapi
+    # The real thing next to the lookalike still silences the rule.
+    assert (
+        commit_scope.code_without_tests(with_openapi + ["frontend/src/api.spec.ts"])
+        == []
+    )
+
+
 def test_python_conventions_are_untouched():
     # AC-4. For a Python project the change is observably nothing: the forms
     # that were tests still are, and the code that was not still is not.
