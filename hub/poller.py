@@ -541,6 +541,12 @@ async def _deliver_approved_review(db, task: dict) -> None:
                 # seconds is how a real signal gets muted (#534).
                 await _note_pair_delivery_wait(db, task["id"], pr_num, stacked)
                 return
+            # The hold is over. Clearing the ledger entry is what the pair path
+            # does on its own success (line ~1678); writing into a shared dict
+            # from a second path without clearing it there too is how the dict
+            # grows for the lifetime of the process — and how the NEXT hold on
+            # this task would be silently swallowed as a repeat of this one.
+            _pair_delivery_waits.pop(task["id"], None)
             merged = await plugins.git_ops.merge_pr(
                 pr_num,
                 task["id"],

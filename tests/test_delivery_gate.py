@@ -262,6 +262,7 @@ async def test_delivery_holds_while_the_base_branch_is_unmerged(
     from hub.integrations.protocols import StackProbeOutcome
 
     g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
     task_id = await _approved_pair_task(db)
     base_id = await _base_task_in_review(db, "task-1175/image-capture")
 
@@ -382,5 +383,114 @@ async def test_bool_only_plugin_is_unknown_rather_than_clear(
     assert task["status"] == "completed", "an unanswerable plugin must not stall"
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     body = " ".join(u.get("content") or "" for u in updates)
-    assert "проверить было нечем" in body
+    assert "подтвердить не удалось" in body
     assert "legacy_bool_predicate" in body
+
+
+# ---- #1186, второй раунд: находки машинного ревью этой же правки ----
+
+
+async def _base_task_with_status(
+    db: aiosqlite.Connection, branch: str, status: str
+) -> int:
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title=f"Base in {status}"))
+    await repo.update_task(db, tv.id, status=status, branch=branch)
+    await db.commit()
+    return tv.id
+
+
+async def test_an_escalated_base_is_still_a_base(db: aiosqlite.Connection) -> None:
+    """Основание уходит из running/review не только через доставку.
+
+    Первая версия этой правки искала основание среди running/review на
+    посылке «оттуда выходят только доставившись». Посылка неверна: гейт
+    самой базовой задачи эскалирует её в needs_decision по красному CI, по
+    исчерпанному бюджету починки, по отказу мержа — и ветка при этом остаётся
+    ровно такой же несмерженной. Инцидент 06.09 воспроизводился бы через эту
+    дверь целиком, просто с другим триггером.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    for status in ("needs_decision", "fix_requested", "ci_check"):
+        g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+        g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+        task_id = await _approved_pair_task(db)
+        base_id = await _base_task_with_status(db, "task-1175/image-capture", status)
+
+        await _report_done(db, task_id)
+
+        g.merge_pr.assert_not_awaited()
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        body = " ".join(u.get("content") or "" for u in updates)
+        assert f"#{base_id}" in body, (
+            f"основание в статусе {status} владеет несмерженной веткой "
+            f"ровно так же, как в review"
+        )
+        # Both rows out of the candidate set before the next round. The walk
+        # answers with the FIRST stacked pair it finds, and the task just held
+        # is itself a running branch — leaving either behind would have the
+        # next round name a row from this one and test nothing new.
+        await repo.update_task(db, base_id, status="completed", branch="")
+        await repo.update_task(db, task_id, status="completed", branch="")
+        await db.commit()
+
+
+async def test_the_same_commit_under_two_names_never_waits_on_itself(
+    db: aiosqlite.Connection,
+) -> None:
+    """Взаимное удержание — это тишина навсегда, а не осторожность.
+
+    Когда две ветки указывают на один коммит, предикат истинен в ОБЕ
+    стороны: каждая видит другую своим основанием. Удержание транзитное, то
+    есть молчаливое по построению, — значит обе задачи встали бы навсегда и
+    никто бы об этом не узнал. Ждать здесь нечего и некого, и это вопрос к
+    человеку, а не к следующему циклу поллера.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="same_tip")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited(), "отказ от догадки — не разрешение мержить"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "ожидание с обеих сторон не разрешается ничем: тут нужен человек"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "ждать нечего и некого" in body
+    assert "SAME commit" in body, "объяснение формы стопки берётся из #1193"
+
+
+async def test_a_held_delivery_is_not_told_to_wait_for_a_green_ci(
+    db: aiosqlite.Connection,
+) -> None:
+    """Попасть в кортеж транзитных отказов — только половина вступления в него.
+
+    У этого потребителя есть лесенка формулировок под каждую причину, и
+    непрописанный в ней член наследует фразу про CI. Здесь она ложна дважды:
+    CI уже зелёный, а совет «отчитайтесь о готовности снова» — ровно то
+    действие, которое сбросило бы вердикт (#612).
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    await _base_task_in_review(db, "task-1175/image-capture")
+
+    await _report_done(db, task_id)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert "когда CI станет зелёным" not in body, (
+        "CI уже зелёный — ждут доставки другой задачи, а не проверки"
+    )
+    assert "Пересдавать НЕ нужно" in body

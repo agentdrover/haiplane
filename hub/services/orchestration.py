@@ -1930,6 +1930,41 @@ async def switch_pair_workspace_to_task(
 # #392 produced (#424→#425→#426 on top of unmerged task-392).
 STACK_ADVISORY_STATUSES = ["running", "review"]
 
+# #1186, found by the machine review of this very change. The advisory set
+# above answers "is someone working on top of me right now", and two statuses
+# are enough for a hint. A DELIVERY condition asks a different question — "is
+# there work under mine that is not in the base branch yet" — and the first
+# version of this fix answered it with the advisory set, on the premise that a
+# task leaves running/review only by being delivered. That premise is false,
+# and its falseness re-opens the exact incident from a second door: a base that
+# escalated, or is being reworked, still owns an unmerged branch while sitting
+# in a status the walk could not see, and the dependent branch merged over it.
+#
+# Judged by status rather than by pipeline_merges on purpose: git has the final
+# word either way (a delivered base carries no commits outside the base branch,
+# so the probe answers "clear" on its own), and the status list only decides
+# whom to ask. Each member is here for a named reason:
+#   running / review — the original two: work in flight.
+#   ci_check         — between submission and review; the branch exists and is
+#                      pushed, which is the whole precondition for a stack.
+#   fix_requested    — rework after CHANGES_REQUESTED: the branch is alive and
+#                      about to grow more commits.
+#   needs_decision   — an escalated base. The most dangerous member, because
+#                      escalation is ordinary (red CI, exhausted budget, a
+#                      refused merge) and it used to make the base invisible.
+# Deliberately NOT here: `completed` without a delivery — a base accepted by a
+# human but never merged. It is reachable and it is dangerous, but waiting can
+# never resolve it, so it needs a human rather than a hold; the hub already
+# tracks that state separately (hub_undelivered_completed). Carried out as its
+# own task rather than smuggled in under a wait that would never end.
+STACK_DELIVERY_STATUSES = [
+    "running",
+    "review",
+    "ci_check",
+    "fix_requested",
+    "needs_decision",
+]
+
 
 # #1186: the three answers the delivery gate needs and the advisory hint
 # never did. "clear" and "unknown" were one value (None) for as long as the
@@ -1977,6 +2012,7 @@ async def assess_branch_stacking(
     db: aiosqlite.Connection,
     task_id: int,
     branch: str,
+    statuses: list[str] | None = None,
 ) -> StackAssessment:
     """Is ``branch`` stacked on another task's unmerged branch — or unknown (#1186)?
 
@@ -2032,7 +2068,7 @@ async def assess_branch_stacking(
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
     rows = await repo.list_unmerged_branch_tasks(
-        db, exclude_task_id=task_id, statuses=STACK_ADVISORY_STATUSES
+        db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
     )
     unknown: StackAssessment | None = None
     for row in rows:
@@ -2449,12 +2485,37 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
       "checked, and there was none", which today they cannot (#1197 drew the
       same line between ``unavailable`` and ``unsupported``).
 
-    A merged base is not a stack: ``list_unmerged_branch_tasks`` only offers
-    branches still in running/review, so a delivered base leaves nothing to
-    compare against and the walk comes back clear on its own.
+    A merged base is not a stack, and this does NOT rest on the base having
+    left some status: git answers it. A delivered base owns no commits outside
+    the base branch, so the probe returns ``clear`` whatever status its task
+    sits in, and the hold lifts by itself. The status list (see
+    ``STACK_DELIVERY_STATUSES``) only decides whom it is worth asking about.
     """
-    assessment = await assess_branch_stacking(db, task["id"], task.get("branch") or "")
+    assessment = await assess_branch_stacking(
+        db, task["id"], task.get("branch") or "", statuses=STACK_DELIVERY_STATUSES
+    )
     if assessment.outcome == STACK_STACKED:
+        if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
+            # #1186, found by the machine review of this very change. Waiting
+            # is only an answer when there is a side to wait FOR. When the two
+            # branches point at the same commit the predicate is true in BOTH
+            # directions — each sees the other as its base — so holding both is
+            # a deadlock neither can leave: the wait is silent by construction
+            # (transient refusals never call anyone) and nothing merges, ever.
+            # The same is possible whenever ancestry names no side. So the
+            # hold is spent only on the one shape it can actually resolve —
+            # this branch standing ON TOP of that one — and every other shape
+            # goes to a human with the message that already explains it
+            # (#1184, #1193). Not a merge either way: refusing to guess a side
+            # is not permission to carry the other task's work into the base.
+            return (
+                f"{STACKED_UNDETERMINED_PREFIX}: ветка делит несмерженные "
+                f"коммиты с веткой задачи #{assessment.base_task_id} "
+                f"'{assessment.base_task_branch}', но порядок мержа из "
+                f"истории не следует, поэтому ждать нечего и некого — "
+                f"ожидание здесь встало бы с обеих сторон. "
+                f"{assessment.message}"
+            )
         return (
             f"{STACKED_BASE_PREFIX}: ветка стоит на несмерженной ветке задачи "
             f"#{assessment.base_task_id} '{assessment.base_task_branch}' "
@@ -2476,11 +2537,14 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             task["id"],
             "hub",
             "alert",
-            f"Стопку веток проверить было нечем ({assessment.reason}) — "
+            f"Стопку веток подтвердить не удалось ({assessment.reason}) — "
             f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
-            f"значит, что вопрос никто не задал. Если ветка отведена от чужой "
-            f"несмерженной ветки, её работа уедет в базовую ветку под номером "
-            f"этой задачи (#1186).",
+            f"значит, что ответа, на который можно опереться, хаб не получил. "
+            f"Плагин мог и проверить — старое «да/нет» просто не различает "
+            f"«проверил, независимы» и «проверить не смог», и опираться на "
+            f"такое «нет» перед необратимым мержем нельзя. Если ветка "
+            f"отведена от чужой несмерженной ветки, её работа уедет в базовую "
+            f"ветку под номером этой задачи (#1186).",
         )
     return ""
 
@@ -2501,6 +2565,11 @@ PR_DRAFT_PREFIX = "pr_draft"
 # refuse at all.
 STACKED_BASE_PREFIX = "stacked_base"
 STACK_UNKNOWN_PREFIX = "stack_unknown"
+# Deliberately NOT in TRANSIENT_GATE_PREFIXES: a stack whose order does not
+# follow from ancestry has nothing to wait for, and a wait would be mutual and
+# silent. This one calls a human, like every other refusal nobody can resolve
+# by waiting.
+STACKED_UNDETERMINED_PREFIX = "stacked_undetermined"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -2513,6 +2582,12 @@ TRANSIENT_GATE_PREFIXES = (
     # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
     # нечего. Лечится следующим циклом, а не решением.
     MERGE_UNCONFIRMED,
+)
+STACKED_BASE_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: хаб доставит "
+    "задачу, как только её основание уедет в базовую ветку. Пересдавать НЕ "
+    "нужно и вредно — CI уже зелёный, новых коммитов нет, а пересдача сбросит "
+    "вердикт (#612). Если ждать нечего, доставьте основание раньше."
 )
 PR_DRAFT_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб пометит "
@@ -3048,6 +3123,17 @@ async def _deliver_completed_pair_task(
             # already green, and resubmitting would stale the verdict.
             if detail.startswith(PR_DRAFT_PREFIX):
                 cause = PR_DRAFT_WAIT_HINT
+            elif detail.startswith((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX)):
+                # #1186, found by the machine review of the change that added
+                # these two: putting a prefix in TRANSIENT_GATE_PREFIXES is
+                # only half of joining that set. This ladder words the wait per
+                # cause, and an unlisted member inherits the CI sentence — here
+                # a false one, because the CI is already green and the wait is
+                # for another task. Worse than false: it tells the executor to
+                # report done again, which is the one action that would stale
+                # the verdict (#612) — the very trap PR_DRAFT_WAIT_HINT exists
+                # to avoid, re-opened for the neighbour added beside it.
+                cause = STACKED_BASE_WAIT_HINT
             elif delivery_pr.established:
                 cause = (
                     "Это временное состояние, решение человека не требуется: "
@@ -3068,7 +3154,7 @@ async def _deliver_completed_pair_task(
                 f"Доставка отложена: PR #{task['pr_number']} — {detail}. {cause}",
             )
             log.info(
-                "Task #%d stays running: merge gate waiting on CI (%s)",
+                "Task #%d stays running: merge gate waiting (%s)",
                 task_id,
                 detail,
             )
