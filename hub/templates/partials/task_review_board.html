@@ -58,16 +58,35 @@
         <div class="task-review-tile-value">{{ ci_words.get(evidence.ci_run_report.state, evidence.ci_run_report.state) }}</div>
         <div class="task-review-tile-sub">{% if evidence.ci_run_report.state == 'current' %}прогон на закреплённом коммите{% else %}{{ evidence.ci_run_report.reason }}{% endif %}</div>
     </div>
-    <div class="task-review-tile {{ 'task-review-tile--ok' if evidence.prepass.state == 'covered' else ('task-review-tile--bad' if evidence.prepass.state == 'failed' else 'task-review-tile--warn') }}">
+    {# Finding 793e30a0 (grok-4.6, сдача #1): covered значит «хотя бы один шаг
+       прошёл», не «все зелёные». Знаменатель — все названные шаги, зелёный
+       цвет — только когда ни упавших, ни пропущенных. #}
+    {% set pp = evidence.prepass %}
+    {% set pp_total = pp.passed|length + pp.failed|length + pp.skipped|length %}
+    {% set pp_clean = pp.state == 'covered' and not pp.failed and not pp.skipped %}
+    <div class="task-review-tile {{ 'task-review-tile--ok' if pp_clean else ('task-review-tile--bad' if (pp.failed or pp.state == 'failed') else 'task-review-tile--warn') }}">
         <div class="task-review-tile-label">Предпас</div>
-        <div class="task-review-tile-value">{% if evidence.prepass.state == 'covered' %}{{ evidence.prepass.passed|length }} из {{ evidence.prepass.passed|length }}{% elif evidence.prepass.state == 'failed' %}упал{% else %}нет сигнала{% endif %}</div>
-        <div class="task-review-tile-sub">{% if evidence.prepass.passed %}{{ evidence.prepass.passed|join(' · ') }}{% elif evidence.prepass.failed %}упали: {{ evidence.prepass.failed|join(', ') }}{% else %}{{ evidence.prepass.reason }}{% endif %}</div>
+        <div class="task-review-tile-value">{% if pp_total %}{{ pp.passed|length }} из {{ pp_total }}{% elif pp.state == 'failed' %}упал{% else %}нет сигнала{% endif %}</div>
+        <div class="task-review-tile-sub">{% if pp.passed %}прошли: {{ pp.passed|join(', ') }}{% endif %}{% if pp.failed %}{% if pp.passed %} · {% endif %}упали: {{ pp.failed|join(', ') }}{% endif %}{% if pp.skipped %}{% if pp.passed or pp.failed %} · {% endif %}пропущены: {{ pp.skipped|join(', ') }}{% endif %}{% if not pp_total %}{{ pp.reason }}{% endif %}</div>
     </div>
     {% if machine_review %}
-    <div class="task-review-tile {{ 'task-review-tile--bad' if machine_review.findings_confirmed or not machine_review.is_current else 'task-review-tile--neutral' }}">
+    {# Finding 43845acc (grok-4.6, сдача #1): «0 / N» на неполном прогоне или
+       саморевью читалось с полосы как чистое ревью — та самая подмена, что
+       #549 и #728 закрыли в блоке ниже. Плитка повторяет каждый флаг словами
+       и красится зелёным только при полном, текущем, независимом отчёте. #}
+    {% set mr = machine_review %}
+    {% set mr_flags = [] %}
+    {% if not mr.is_current %}{% if mr_flags.append('устарело, работа пересдана') %}{% endif %}{% endif %}
+    {% if mr.self_reviewed %}{% if mr_flags.append('саморевью') %}{% endif %}{% endif %}
+    {% if mr.incomplete %}{% if mr_flags.append('прогон неполный') %}{% endif %}{% elif mr.incomplete is none %}{% if mr_flags.append('полнота не заявлена') %}{% endif %}{% endif %}
+    {% if mr.unresolved %}{% if mr_flags.append((mr.unresolved|length ~ ' не проверено')) %}{% endif %}{% endif %}
+    {% if mr.lost_dimensions %}{% if mr_flags.append('потеряно измерений: ' ~ mr.lost_dimensions|join(', ')) %}{% endif %}{% endif %}
+    {% if mr_undisposed %}{% if mr_flags.append(mr_undisposed ~ ' из ' ~ mr_confirmed ~ ' без диспозиции') %}{% endif %}{% endif %}
+    {% set mr_bad = mr.findings_confirmed or not mr.is_current or mr.self_reviewed or mr.incomplete or mr.unresolved %}
+    <div class="task-review-tile {{ 'task-review-tile--bad' if mr_bad else ('task-review-tile--warn' if mr_flags else 'task-review-tile--ok') }}">
         <div class="task-review-tile-label">Машинное ревью</div>
-        <div class="task-review-tile-value">{{ machine_review.findings_confirmed|length }} / {{ machine_review.raw_count }}</div>
-        <div class="task-review-tile-sub">{% if not machine_review.is_current %}устарело, работа пересдана · {% endif %}подтверждено из сырых{% if machine_review.profile %} · {{ machine_review.profile }}{% endif %}{% if machine_review.model %} · {{ machine_review.model }}{% endif %}</div>
+        <div class="task-review-tile-value">{{ mr.findings_confirmed|length }} / {{ mr.raw_count }}</div>
+        <div class="task-review-tile-sub">подтверждено из сырых{% if mr.profile %} · {{ mr.profile }}{% endif %}{% if mr.model %} · {{ mr.model }}{% endif %}{% for flag in mr_flags %} · {{ flag }}{% endfor %}</div>
     </div>
     {% else %}
     <div class="task-review-tile task-review-tile--warn">

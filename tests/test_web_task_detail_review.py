@@ -17,7 +17,11 @@ import re
 
 from httpx import AsyncClient
 
-from tests.test_web import _web_task_in_review, _web_task_in_review_with_test_ac
+from tests.test_web import (
+    _machine_report,
+    _web_task_in_review,
+    _web_task_in_review_with_test_ac,
+)
 
 STRIP_MARKER = "task-review-strip"
 
@@ -245,3 +249,32 @@ async def test_empty_sections_collapse_to_a_line_but_stay_named(client: AsyncCli
         assert "task-content-card" not in element.split(">", 1)[0]
     # The message form survives the collapse: a line is not a dead end.
     assert f"/tasks/{task_id}/web-message" in page
+
+
+# ---- Finding 43845acc (machine review of submission #1): the strip must not
+# read "0 / N" as a clean review when the run was incomplete, left findings
+# unjudged, or was the implementer's own. The block below says all that in
+# words (#549, #728); the tile is what the eye reads first, so it says it too.
+
+
+async def test_strip_names_incomplete_and_unresolved_review(client: AsyncClient, db):
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    await _machine_report(
+        client,
+        task_id,
+        findings_confirmed=[],
+        incomplete=True,
+        unresolved=[{"title": "shadow path", "why": "no agent could judge it"}],
+    )
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    strip = page[page.index(STRIP_MARKER) : page.index("task-evidence")]
+    assert "0 / " in strip
+    assert "прогон неполный" in strip
+    assert "1 не проверено" in strip
+    tile_at = strip.index("Машинное ревью")
+    tile_open = strip.rfind('<div class="task-review-tile', 0, tile_at)
+    assert "task-review-tile--ok" not in strip[tile_open:tile_at], (
+        "an incomplete run with unjudged findings is not a green tile"
+    )
