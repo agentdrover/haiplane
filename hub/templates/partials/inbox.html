@@ -5,7 +5,7 @@
 {# #1198: признанные расхождения не считаются НИ ОДНИМ счётчиком внимания.
    Их три — этот, топбар на GET / и заголовок секции, — и правка, закрывшая
    два из трёх, оставила «All clear» невозможным навсегда (#294). #}
-{% set undelivered_unacked = undelivered | rejectattr("acknowledged_at") | list %}
+{% set undelivered_unacked = undelivered | rejectattr("acknowledged_now") | list %}
 {% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered_unacked|length + (1 if unjudged_findings.findings else 0) %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
@@ -291,16 +291,19 @@
     <article class="inbox-item" id="inbox-undelivered-{{ d.task_id }}">
         <div class="inbox-item-header">
             <a href="/tasks/{{ d.task_id }}" class="inbox-item-link">#{{ d.task_id }} {{ d.title[:60] }}{% if d.title|length > 60 %}…{% endif %}</a>
-            <span class="badge {% if d.acknowledged_at %}badge-muted{% else %}badge-failed{% endif %}">PR #{{ d.pr_number }} открыт</span>
+            <span class="badge {% if d.acknowledged_now %}badge-muted{% else %}badge-failed{% endif %}">PR #{{ d.pr_number }} открыт</span>
         </div>
         <div class="inbox-item-meta">
             расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}
         </div>
         <div class="inbox-item-desc">{{ d.reason }}</div>
-        {% if d.acknowledged_at %}
+        {% if d.acknowledged_now %}
         {# Признанное расхождение не исчезает из списка: заткнуть можно,
            стереть нельзя. Оно лишь перестаёт кричать — и видно, ЧЬЁ это
-           решение и почему, иначе тишина неотличима от забывчивости. #}
+           решение и почему, иначе тишина неотличима от забывчивости.
+           Спрашиваем acknowledged_now, а не сам факт признания: решение
+           относится к ФАКТУ, и если факт сменился, строке снова нужна кнопка,
+           иначе она кричит в ленту и молчит на доске одновременно (#294). #}
         <div class="inbox-item-meta">
             признано законным{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }}
         </div>

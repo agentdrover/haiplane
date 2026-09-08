@@ -28,6 +28,7 @@ from httpx import AsyncClient
 from hub import repository as repo
 from hub.services.delivery_state import (
     DISCREPANCY_EVENT,
+    note_completion_without_delivery,
     scan_completed_deliveries,
     undelivered_completed_tasks,
 )
@@ -657,3 +658,127 @@ async def test_crossing_an_age_threshold_earns_every_fact_a_fresh_voice(
     alerts = await _alerts(db, task_id)
     assert len(alerts) == 4, alerts
     assert "30 ч" in alerts[-1], alerts[-1]
+
+
+# ---- Второй раунд ревью: находки, внесённые самой починкой ----
+
+
+async def test_a_row_that_speaks_is_never_drawn_as_settled(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Голос и доска обязаны спрашивать ОДНО И ТО ЖЕ.
+
+    Правило «признан только тот факт, который признавали» стояло в алертере, а
+    три места, решающие, ВИДЕН ли сигнал человеку, спрашивали грубее — просто
+    «признание было». Разъехавшись, они дали худшее из возможного: карточка
+    будила агентов, а доска рисовала строку приглушённой, без кнопки, и
+    считала её нулём. Счётчик возвращался к нулю раньше, чем факт закрыт.
+    """
+    task_id = await _completed_task(db, client, title="Разъезд", pr=970)
+    # Провайдер молчит: расхождение начинается как «подтвердить не удалось».
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="GitHub лежит, разберусь как встанет"
+    )
+
+    # Провайдер ожил: PR открыт. Это ДРУГОЙ факт, его никто не признавал.
+    _pr_states(monkeypatch, {970: "open"})
+    await scan_completed_deliveries(db)
+    assert any("НЕ доставлена" in a for a in await _alerts(db, task_id))
+
+    body = (await client.get("/partials/inbox")).text
+    assert f"inbox-undelivered-{task_id}" in body
+    # Раз голос прозвучал — строка обязана выглядеть требующей внимания и
+    # снова предлагать кнопку, иначе заткнуть её человеку нечем.
+    assert "badge-muted" not in body, body[body.find("inbox-undelivered") :][:400]
+    assert "web-acknowledge-delivery" in body
+    assert "All clear" not in body
+
+    # И топбар на «/» — третий счётчик внимания. Он живёт в другом файле и
+    # именно поэтому уже дважды отставал от остальных.
+    assert _inbox_badge((await client.get("/")).text) == 1
+
+
+async def test_settled_rows_never_crowd_a_live_one_out_of_the_board(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Признанные строки не вытесняют непризнанные за край выдачи.
+
+    Признанные живут вечно и они же самые старые. При сортировке только по
+    возрасту они занимали всё окно, а счёт, взятый с усечённой страницы,
+    говорил «ноль» — то есть доска УТВЕРЖДАЛА «всё чисто» при живом
+    неразобранном расхождении. Промолчать было бы честнее, чем соврать.
+    """
+    answers: dict[int, str] = {}
+    for n in range(20):
+        old_id = await _completed_task(db, client, title=f"Старое {n}", pr=800 + n)
+        answers[800 + n] = "open"
+        _pr_states(monkeypatch, answers)
+        await _age(db, old_id, 500 + n)
+        await scan_completed_deliveries(db)
+        await repo.acknowledge_delivery_discrepancy(
+            db, old_id, by="denis", reason="держим открытым намеренно"
+        )
+
+    fresh_id = await _completed_task(db, client, title="Свежее и живое", pr=899)
+    answers[899] = "open"
+    _pr_states(monkeypatch, answers)
+    await scan_completed_deliveries(db)
+
+    body = (await client.get("/partials/inbox")).text
+    assert "All clear" not in body, "доска соврала при живом расхождении"
+    assert f"inbox-undelivered-{fresh_id}" in body, "живая строка вытеснена за LIMIT"
+
+
+async def test_one_name_written_by_the_neighbour_reads_as_a_set_of_one(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Соседний писатель кладёт ОДНО имя — читатель ждёт множество.
+
+    ``note_completion_without_delivery`` (ручное принятие, force-complete,
+    done-отчёт без ревью) пишет в память о сказанном одно имя состояния, а
+    свип читает её как множество через запятую. Стык двух писателей одного
+    поля — ровно тот класс, на котором эта задача спотыкалась дважды, и
+    держать его на честном слове нельзя.
+    """
+    task_id = await _completed_task(db, client, title="Ручное", pr=960)
+    _pr_states(monkeypatch, {960: "open"})
+    await note_completion_without_delivery(db, task_id, via="human_accept")
+    said = (await repo.get_delivery_discrepancy(db, task_id))["alerted_state"]
+    assert said == "pr_open", said
+
+    spoken = len(await _alerts(db, task_id))
+    await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == spoken, "свип повторил сказанное соседом"
+
+
+async def test_a_settled_row_hears_about_a_new_fact_once_and_not_on_every_threshold(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Признавший услышит про новый факт один раз — и рубежи ему не положены.
+
+    Возрастной рубеж говорит «это длится дольше, чем вы думали»: упрёк тому,
+    кто не разобрал. Разобравший своё слово сказал. Оставить ему рубежи значит
+    вернуть метроном с другого конца — на сутках, трёх сутках и неделе, — и
+    вернуть в самом неудобном виде: секция инбокса показывает только pr_open,
+    так что в момент крика строки на доске может не быть вовсе.
+    """
+    task_id = await _completed_task(db, client, title="Разобрано", pr=980)
+    _pr_states(monkeypatch, {980: "open"})
+    await scan_completed_deliveries(db)
+    await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by="denis", reason="держим открытым до релиза платы"
+    )
+
+    # Провайдер замолчал: факт другой, его никто не признавал — голос один.
+    _pr_states(monkeypatch, {})
+    await scan_completed_deliveries(db)
+    after_news = len(await _alerts(db, task_id))
+    assert any("НЕ УДАЛОСЬ" in a for a in await _alerts(db, task_id))
+
+    # Сутки, трое суток, неделя — и ни одного повтора.
+    for hours in (30, 80, 200):
+        await _age(db, task_id, hours)
+        await scan_completed_deliveries(db)
+    assert len(await _alerts(db, task_id)) == after_news, await _alerts(db, task_id)

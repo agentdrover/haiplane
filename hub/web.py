@@ -912,7 +912,11 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         # judged legitimate must not keep pushing the badge up: a counter that
         # never returns to zero is a counter nobody reads, which is the exact
         # death this task exists to prevent.
-        + len([d for d in inbox["undelivered"] if not (d.get("acknowledged_at") or "")])
+        # #294: «признано» спрашивается ОДНИМ определением из репозитория
+        # (acknowledged_now), а не своим здесь. Своё уже разъехалось с голосом:
+        # строка, признанная для другого факта, будила агентов и одновременно
+        # считалась нулём.
+        + len([d for d in inbox["undelivered"] if not d.get("acknowledged_now")])
     )
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session
