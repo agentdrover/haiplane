@@ -42,6 +42,15 @@
         <span class="badge badge-review">сравнивать не с чем</span>
         {{ view.diff.note }}
     </p>
+    {# Запись, сделанная до #1169, дифа не несёт. Без своей ветки она попадала в
+       else и рисовалась как «К активной версии v: +  строк, −  строк» — диф,
+       в котором ничего не изменилось, к версии без номера. Полуправда читается
+       как факт, а молчание — нет. #}
+    {% elif view.diff.baseline == baseline_unrecorded %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">дифа в записи нет</span>
+        {{ view.diff.note }}
+    </p>
     {% else %}
     <p class="skill-publish-summary">
         К активной версии v{{ view.diff.baseline_version }}:
@@ -59,6 +68,11 @@
         </li>
         {% endfor %}
     </ul>
+    {# ``rules_triggered is none`` — то же различение, что у счётчиков сводки:
+       пустой список означает «ни одно правило не совпало», а отсутствие
+       вердикта — что его тогда не считали вовсе. #}
+    {% elif view.scan.rules_triggered is none %}
+    <p class="skill-scan-empty small muted">Вердикта в записи нет.</p>
     {% else %}
     <p class="skill-scan-empty small muted">Сработавших правил нет.</p>
     {% endif %}

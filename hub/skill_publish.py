@@ -31,8 +31,21 @@ from dataclasses import dataclass
 # «прежней активной версии не было».
 BASELINE_ABSENT = "absent"
 BASELINE_VERSION = "version"
+# Третье состояние — и оно не про расчёт, а про ЧТЕНИЕ записи: событие
+# ``skill_activated``, написанное до #1169, несёт только имя и версию. «Дифа в
+# записи нет» и «диф, в котором ничего не изменилось» — разные ответы, и
+# показывать второй вместо первого значит утверждать факт, которого нет.
+BASELINE_UNRECORDED = "unrecorded"
 
 BASELINE_ABSENT_NOTE = "прежней активной версии нет — сравнивать не с чем"
+BASELINE_UNRECORDED_NOTE = (
+    "запись о публикации сделана до того, как хаб начал записывать диф: что "
+    "именно изменилось тогда, не записано"
+)
+SCAN_UNRECORDED_NOTE = (
+    "вердикта в этой записи нет: она сделана до того, как хаб начал его "
+    "записывать — это не «правил не сработало»"
+)
 SCAN_NOTE = (
     "перечень сработавших правил, а не оценка безопасности: пустой список "
     "означает «ни одно правило не совпало», а не «проверено»"
@@ -216,17 +229,28 @@ def summarize_change(
     """
     if previous_content is None:
         return DiffSummary(BASELINE_ABSENT, None, None, None)
+    # Считать по опкодам, а не по префиксам строк дифа. Разбор «строка
+    # начинается с +, но не с +++» разделяет заголовки дифа и содержимое по
+    # виду, а вид у них общий: строка текста ``---`` превращается в ``----`` и
+    # проходит проверку на заголовок, после чего в счётчик не попадает. Замер:
+    # ``hello\n---\nworld`` → ``hello\nworld`` давало «+0/−0» при непустом
+    # unified diff — то есть сводка, стоящая ПЕРЕД дифом ровно затем, чтобы
+    # отличить правку от переписывания, говорила «правок нет» о настоящей
+    # правке (#1169, находка ревью #317). Markdown-разделители и вставленные в
+    # текст скилла куски диффов — обычное содержимое, а не редкость.
+    #
+    # ``SequenceMatcher`` берётся с теми же параметрами, что и внутри
+    # ``difflib.unified_diff``, чтобы сводка и показанный под ней диф не
+    # разошлись между собой.
+    matcher = difflib.SequenceMatcher(
+        None, previous_content.splitlines(), content.splitlines()
+    )
     added = removed = 0
-    for line in difflib.unified_diff(
-        previous_content.splitlines(),
-        content.splitlines(),
-        lineterm="",
-        n=0,
-    ):
-        if line.startswith("+") and not line.startswith("+++"):
-            added += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            removed += 1
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        removed += i2 - i1
+        added += j2 - j1
     return DiffSummary(BASELINE_VERSION, previous_version, added, removed)
 
 

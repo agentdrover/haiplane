@@ -1620,21 +1620,28 @@ async def _skill_publish_views(
     нужно видеть словами, что сравнивать не с чем, а не пустое место, из
     которого одинаково читаются «ничего не изменилось» и «блок не построился».
     """
-    baseline_content = None if active is None else active.content
-    baseline_version = None if active is None else active.version
+    # Основание сравнения для драфтов — активная версия, и оно ОДНО на весь
+    # цикл. Держать его в переменных, которые ветка активной версии потом
+    # переиспользует, нельзя: `list_skill_versions` отдаёт версии по убыванию,
+    # активная встречается раньше драфтов с меньшим номером, и после отката
+    # (сид демоутит свою прежнюю версию в draft) превью подписывалось номером
+    # из ЧУЖОЙ записи — «К активной версии v1» при дифе к v2, а unified diff
+    # выходил с заголовком `--- v1 / +++ v1` (#1169, находка ревью #317).
+    active_content = None if active is None else active.content
+    active_version = None if active is None else active.version
     views: dict[int, dict[str, Any]] = {}
     for version in versions:
         if version.status != "active":
             views[version.version] = {
                 "when": "before",
                 "diff": skill_publish.summarize_change(
-                    previous_content=baseline_content,
-                    previous_version=baseline_version,
+                    previous_content=active_content,
+                    previous_version=active_version,
                     content=version.content,
                 ).as_dict(),
                 "unified": skill_publish.unified_diff(
-                    previous_content=baseline_content,
-                    previous_version=baseline_version,
+                    previous_content=active_content,
+                    previous_version=active_version,
                     content=version.content,
                     version=version.version,
                 ),
@@ -1646,10 +1653,10 @@ async def _skill_publish_views(
         )
         if recorded is None:
             continue
-        diff = recorded.get("diff") or {}
-        baseline_version = diff.get("baseline_version")
+        diff = _recorded_diff(recorded)
+        recorded_baseline = diff.get("baseline_version")
         baseline = next(
-            (v for v in versions if v.version == baseline_version),
+            (v for v in versions if v.version == recorded_baseline),
             None,
         )
         views[version.version] = {
@@ -1669,9 +1676,45 @@ async def _skill_publish_views(
                     version=version.version,
                 )
             ),
-            "scan": recorded.get("content_scan") or {},
+            "scan": _recorded_scan(recorded),
         }
     return views
+
+
+def _recorded_diff(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Сводка из записи — или прямое «дифа в записи нет» (#1169).
+
+    События ``skill_activated``, написанные ДО этой задачи, несут только имя и
+    номер версии. Пустой словарь на их месте рисовался шаблоном как «К
+    активной версии v: + строк, − строк» — то есть как диф, в котором ничего
+    не изменилось, к версии без номера. Это хуже молчания: полуправда читается
+    как факт. В день выката такую запись имеет КАЖДАЯ активная версия в
+    реестре, так что ветка не гипотетическая.
+    """
+    diff = recorded.get("diff")
+    if isinstance(diff, dict) and diff.get("baseline"):
+        return diff
+    return {
+        "baseline": skill_publish.BASELINE_UNRECORDED,
+        "note": skill_publish.BASELINE_UNRECORDED_NOTE,
+    }
+
+
+def _recorded_scan(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Вердикт из записи — или прямое «вердикта в записи нет» (#1169).
+
+    ``rules_triggered is None`` — то же различение, что у счётчиков
+    ``DiffSummary``: пустой список означает «ни одно правило не совпало», а
+    отсутствие вердикта — что его тогда не считали вовсе. Рисовать второе как
+    первое значит утверждать проверку, которой не было.
+    """
+    scan = recorded.get("content_scan")
+    if isinstance(scan, dict) and isinstance(scan.get("rules_triggered"), list):
+        return scan
+    return {
+        "rules_triggered": None,
+        "note": skill_publish.SCAN_UNRECORDED_NOTE,
+    }
 
 
 @router.get("/skills/{name}", response_class=HTMLResponse)
@@ -1698,6 +1741,7 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
                 request, name, versions, published
             ),
             "baseline_absent": skill_publish.BASELINE_ABSENT,
+            "baseline_unrecorded": skill_publish.BASELINE_UNRECORDED,
             "skill_error": skill_error,
         },
     )
