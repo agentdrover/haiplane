@@ -24,6 +24,8 @@ __all__ = [
     "ROUTINE_PATHS",
     "SCOPE_GROWTH_MARKER",
     "is_test_path",
+    "TEST_DIRS",
+    "TEST_NAME_MARKERS",
     "code_without_tests",
     "tests_only",
 ]
@@ -110,23 +112,67 @@ def foreign_paths(dirty: list[str], affected_areas: list[str]) -> list[str]:
     return out
 
 
+# Directory names that make everything beneath them a test (#1179). Python
+# puts tests in tests/, the JS world adds __tests__/ next to the code.
+TEST_DIRS = frozenset({"tests", "test", "__tests__"})
+
+# Filename markers of the dot-separated convention: the segment right before
+# the extension. Suffixes of the NAME rather than one hard-coded extension, so
+# .test.js and .spec.jsx are covered by the same rule as .test.tsx. Languages
+# beyond Python and JS/TS are left out on purpose — added when a project
+# measures the need, not in advance.
+TEST_NAME_MARKERS = frozenset({"test", "spec"})
+
+# ...but only in front of a JS/TS source extension. Found by the machine
+# review of #1179: with the marker alone, docs/api.spec.md and
+# contracts/openapi.spec.yaml read as tests, code_without_tests came back
+# empty, and the gate wrote "проверено, чисто" about a diff that brought a
+# specification instead of a test. That is the silent failure AC-3 is about —
+# a wrong "a test is here" is what nobody goes looking for.
+TEST_MARKER_EXTENSIONS = frozenset(
+    {"js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"}
+)
+
+
 def is_test_path(path: str) -> bool:
-    """Whether a repo path is a test file (#855).
+    """Whether a repo path is a test file (#855, #1179).
 
     By location and filename, never by content: the rule must be decidable
     from the diff alone, without reading or running anything. It answers
     "was a test touched", not "is the test any good" — the second question
     belongs to a reviewer, and pretending a path check answers it is how a
     cheap layer starts being read as an expensive one.
+
+    It also has to know the conventions of the repo it is pointed at. Until
+    #1179 it knew only Python's, so on snip-portal — the first non-Python
+    project to reach the submission gate — no path in a frontend diff read as
+    a test, :func:`code_without_tests` never took its "a test was touched"
+    branch, and the report handed back the WHOLE diff as code without tests,
+    listing three .test.tsx files as the proof that no test was there. A
+    self-contradicting line does more damage than a missing one: a reader who
+    unpicks it once stops believing the true lines standing next to it.
     """
     norm = _normalize(path)
     if not norm:
         return False
     parts = norm.split("/")
-    if any(part in {"tests", "test"} for part in parts[:-1]):
+    if any(part in TEST_DIRS for part in parts[:-1]):
         return True
     name = parts[-1]
-    return name.startswith("test_") or name.endswith("_test.py")
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    # foo.test.ts, foo.spec.tsx: the marker must be the segment IMMEDIATELY
+    # before the extension, and the extension must be JS/TS source. Matched
+    # anywhere in the name it would swallow latest.test.helpers.ts; matched in
+    # front of any extension it swallowed api.spec.md. A rule that wrongly
+    # says "a test is here" is worse than one that wrongly says none is —
+    # nobody goes looking for the check that stayed quiet.
+    segments = name.split(".")
+    return (
+        len(segments) >= 3
+        and segments[-2] in TEST_NAME_MARKERS
+        and segments[-1].lower() in TEST_MARKER_EXTENSIONS
+    )
 
 
 def code_without_tests(paths: list[str]) -> list[str]:

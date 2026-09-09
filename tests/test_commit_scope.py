@@ -144,3 +144,116 @@ def test_tests_only_is_a_signal_about_bug_fixes():
     assert commit_scope.tests_only(["tests/test_api.py", "uv.lock"])
     assert not commit_scope.tests_only(["tests/test_api.py", "hub/app.py"])
     assert not commit_scope.tests_only([])
+
+
+# ---- #1179: the rule has to know the conventions of the repo it points at ----
+
+# The submission that exposed the defect: task #1128 on snip-portal, 05.09.2026.
+# Copied verbatim from the hub's own alert "Отчёт проверок на сдаче" (update
+# 5354), which listed all ten of these as "code that touched no test" — three
+# of them being the tests. A stand taken from the live failure, not invented:
+# an invented one would have been built to pass.
+SUBMISSION_1128_DIFF = [
+    "frontend/src/app/inspections/[id]/page.tsx",
+    "frontend/src/components/AppShell.test.tsx",
+    "frontend/src/components/AppShell.tsx",
+    "frontend/src/components/InspectionsInbox.tsx",
+    "frontend/src/components/RecordInspectionVisit.test.tsx",
+    "frontend/src/components/RecordInspectionVisit.tsx",
+    "frontend/src/lib/presentation.ts",
+    "frontend/src/lib/recent-inspections.test.ts",
+    "frontend/src/lib/recent-inspections.ts",
+    "frontend/src/styles/shell.css",
+]
+
+
+def test_js_tests_in_the_diff_silence_the_rule():
+    # AC-1. Three tests came with this diff, so the rule has nothing to say —
+    # and above all must not name those three as the evidence that none came.
+    assert commit_scope.code_without_tests(SUBMISSION_1128_DIFF) == []
+
+    # The same diff with its tests taken out still speaks: the fix must not
+    # buy silence by making the rule blind.
+    without = [p for p in SUBMISSION_1128_DIFF if ".test." not in p]
+    assert commit_scope.code_without_tests(without) == without
+
+
+def test_js_test_conventions_are_recognised():
+    # AC-2. Decided by path alone — none of these files exists here to read.
+    assert commit_scope.is_test_path("frontend/src/lib/recent-inspections.test.ts")
+    assert commit_scope.is_test_path("frontend/src/components/AppShell.test.tsx")
+    assert commit_scope.is_test_path("frontend/src/lib/api.spec.ts")
+    assert commit_scope.is_test_path("frontend/src/components/Nav.spec.tsx")
+    assert commit_scope.is_test_path("frontend/src/__tests__/render.tsx")
+    # Suffixes of the name, not extensions of one language: plain JS is in.
+    assert commit_scope.is_test_path("frontend/src/lib/store.test.js")
+    assert commit_scope.is_test_path("frontend/src/lib/store.spec.jsx")
+
+
+def test_lookalike_paths_are_not_tests():
+    # AC-3. "test" appears in every one of these and none of them is a test.
+    # A rule that wrongly says "a test is here" fails silently — the whole
+    # point of the check is lost with nobody noticing, so lookalikes matter
+    # more here than the recognised forms do.
+    assert not commit_scope.is_test_path("frontend/src/lib/latest.test.helpers.ts")
+    assert not commit_scope.is_test_path("frontend/src/contest/page.tsx")
+    assert not commit_scope.is_test_path("docs/testing.md")
+    assert not commit_scope.is_test_path("frontend/src/lib/spectrum.ts")
+    assert not commit_scope.is_test_path("hub/protest.py")
+
+
+def test_a_specification_is_not_a_test():
+    # Found by the machine review of the first submission: the marker in front
+    # of ANY extension made a spec document pass for a test. The consumer is
+    # asserted too, because that is where the damage lands — an empty answer
+    # is reported as "проверено, чисто", which nobody comes back to check.
+    for path in (
+        "docs/api.spec.md",
+        "contracts/openapi.spec.yaml",
+        "contracts/openapi.spec.yml",
+        "config/routes.test.json",
+        "docs/plan.test.md",
+    ):
+        assert not commit_scope.is_test_path(path), path
+
+    with_spec = ["hub/app.py", "docs/api.spec.md"]
+    assert commit_scope.code_without_tests(with_spec) == with_spec
+    with_openapi = ["frontend/src/api.ts", "contracts/openapi.spec.yaml"]
+    assert commit_scope.code_without_tests(with_openapi) == with_openapi
+    # The real thing next to the lookalike still silences the rule.
+    assert (
+        commit_scope.code_without_tests(with_openapi + ["frontend/src/api.spec.ts"])
+        == []
+    )
+
+
+def test_python_conventions_are_untouched():
+    # AC-4. For a Python project the change is observably nothing: the forms
+    # that were tests still are, and the code that was not still is not.
+    assert commit_scope.is_test_path("tests/test_api.py")
+    assert commit_scope.is_test_path("hub/services/tests/test_thing.py")
+    assert commit_scope.is_test_path("pkg/thing_test.py")
+    assert not commit_scope.is_test_path("hub/services/lifecycle.py")
+    assert not commit_scope.is_test_path("hub/testing_helpers.py")
+    assert not commit_scope.is_test_path("")
+
+    python_diff = ["hub/app.py", "hub/db.py", "uv.lock"]
+    assert commit_scope.code_without_tests(python_diff) == ["hub/app.py", "hub/db.py"]
+    assert commit_scope.code_without_tests(python_diff + ["tests/test_api.py"]) == []
+    assert commit_scope.tests_only(["tests/test_api.py", "uv.lock"])
+    assert not commit_scope.tests_only(["tests/test_api.py", "hub/app.py"])
+
+
+def test_tests_only_reads_a_js_diff_the_same_way():
+    # The other consumer of the same decision: a bug fix that brought only
+    # frontend tests must read as tests-only, or the signal fires on Python
+    # bugs and stays silent on JS ones.
+    assert commit_scope.tests_only(
+        ["frontend/src/lib/recent-inspections.test.ts", "package-lock.json"]
+    )
+    assert not commit_scope.tests_only(
+        [
+            "frontend/src/lib/recent-inspections.test.ts",
+            "frontend/src/lib/recent-inspections.ts",
+        ]
+    )
