@@ -185,6 +185,11 @@ async def record_machine_review(
         ),
         submitted_by=(body.agent or username)[:100],
         incomplete=incomplete,
+        # #1238: the cause travels beside the flag, taken verbatim from the
+        # vocabulary the reviewer chose from. Stored even when `incomplete`
+        # is false — the row records what was declared, and the readers below
+        # ask for both before they call anything an environment refusal.
+        incomplete_reason=body.incomplete_reason,
         unresolved=_json.dumps(
             [f.model_dump(exclude_none=True) for f in body.unresolved],
             ensure_ascii=False,
@@ -240,6 +245,41 @@ async def record_machine_review(
                     "«чисто» не подтверждено (#750)."
                 ),
             )
+    # #1238: an environment refusal is named ON THE CARD, because the card is
+    # the only place a human meets this report — the gate reads the report,
+    # not the code. Without this line "0 подтверждённых" on a deep run reads
+    # as clean, when what happened is that the reviewer had nothing to look
+    # with: no tool to run the tests, or no base to compare against. And it
+    # says the one thing the existing incompleteness badge cannot: a second
+    # run buys the same refusal, so the answer is configuration, not a retry.
+    # Через тот же предикат, что читает уже сохранённые строки: два ответа на
+    # вопрос «это отказ среды?» рано или поздно разъедутся, и разъедутся они
+    # молча — карточка скажет одно, счётчик покажет другое.
+    from hub.services.review_dispatch import is_environment_refusal
+
+    if is_environment_refusal(
+        {"incomplete": incomplete, "incomplete_reason": body.incomplete_reason}
+    ):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            (
+                "Неполный отчёт по ОТКАЗУ СРЕДЫ: ревьюер заявил, что смотреть "
+                "было НЕЧЕМ — "
+                + (
+                    "; ".join(body.lost_dimensions[:5])
+                    if body.lost_dimensions
+                    else "перечень потерянных измерений не приложен"
+                )
+                + ". Это не исчерпание профиля: второй прогон в той же среде "
+                "даст тот же отказ, лечится настройкой окружения ревьюера. "
+                "Ноль находок здесь означает «смотреть было нечем», а не "
+                "«чисто» (#1238)."
+            ),
+        )
+
     # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one
     # generation is a real shape (#879) — but it must not arrive silently:

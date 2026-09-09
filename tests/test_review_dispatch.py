@@ -22,16 +22,20 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import TaskRefine, TaskSubmitReview
+from hub.models import MachineReviewView, TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.model_family import family
 from hub.services.review_dispatch import (
     DEEP,
+    ENVIRONMENT_REFUSAL_NOTE,
+    _ladder_cause_note,
     _REVIEW_MODEL_PREFERENCES,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
+    count_environment_refusals,
     diff_plan,
     file_line_counts,
+    is_environment_refusal,
     is_generated,
     maybe_dispatch_review,
     pick_review_model,
@@ -4208,3 +4212,194 @@ async def test_a_dispatched_project_gets_no_extra_notice(
     assert len(await _dispatch_notices(db, task_id)) == 1, (
         "и записей про диспетч по-прежнему одна"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1238 — почему отчёт неполон: отказ среды против исчерпания профиля
+# ---------------------------------------------------------------------------
+#
+# Повод — отчёт #334 (задача #1169, профиль deep, 12 агентов, счёт провайдера
+# 1 238 071 токен). Он честно записал в lost_dimensions «в среде нет
+# uv/pytest — сюит не исполнялся, только чтение» и «локальный ref develop не
+# резолвится», то есть потерял два измерения из-за среды, а не из-за кода. В
+# карточке это выглядело так же, как любая другая неполнота, и ноль
+# подтверждённых находок читался как «чисто».
+
+
+async def _seed_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    incomplete: bool,
+    reason: str | None,
+) -> int:
+    """Отчёт прямо в таблицу. ``reason=None`` — отчёт СТАРОГО образца.
+
+    None здесь не «пустая причина», а «поля не было вовсе»: аргумент не
+    передаётся, и колонка берёт свой DEFAULT. Именно эти строки не должны
+    задним числом становиться отказом среды.
+    """
+    task = dict(await repo.get_task(db, task_id))
+    kwargs = {} if reason is None else {"incomplete_reason": reason}
+    return await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=int(task["submission_generation"] or 0),
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([]),
+        incomplete=incomplete,
+        submitted_by="cursor-cloud-reviewer",
+        **kwargs,
+    )
+
+
+async def test_an_environment_refusal_is_not_an_exhausted_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1238): причина названа, и она отличается от исчерпания профиля.
+
+    Проверяется не хранение ради хранения, а то, что человек прочитает в
+    карточке: отказ среды говорит про настройку окружения, исчерпание
+    профиля — нет. Мутация «считать любую неполноту отказом среды» роняет
+    вторую половину теста, мутация «не различать причину вовсе» — первую.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e1"}, "run": {"id": "run-e1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-env-refusal")
+
+    report = {
+        "harness_skill": "multi-agent-review",
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "incomplete": True,
+        "incomplete_reason": "environment",
+        "unresolved": [],
+        "lost_dimensions": ["прогон тестов: в среде нет uv/pytest"],
+        "agent": "cursor-cloud-reviewer",
+        "model": "grok-4.6",
+    }
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == "environment"
+    assert is_environment_refusal(stored) is True
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    refusal = [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert len(refusal) == 1, [u["content"] for u in updates]
+    text = refusal[0]["content"]
+    # Карточка обязана сказать не только ЧТО, но и что с этим делать: второй
+    # прогон в той же среде даст тот же отказ.
+    assert "второй прогон" in text and "настройкой" in text
+    assert "в среде нет uv/pytest" in text
+    # Тот же вывод — в алерте лестницы (#879): её перечень исходов не
+    # меняется, меняется только то, что человек в нём прочитает.
+    assert ENVIRONMENT_REFUSAL_NOTE in _ladder_cause_note(stored)
+
+    # Тот же отчёт, но с исчерпанием профиля, такой строки не порождает:
+    # это ровно тот случай, который лечит добор.
+    other_id = await _submitted(client, db, "spike-profile-exhausted")
+    report["incomplete_reason"] = "profile"
+    report["lost_dimensions"] = ["20 файлов не дочитаны"]
+    resp = await client.post(f"/api/tasks/{other_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+    other_stored = dict(await repo.get_latest_machine_review(db, other_id))
+    assert other_stored["incomplete_reason"] == "profile"
+    assert is_environment_refusal(other_stored) is False
+    other_updates = [dict(u) for u in await repo.get_task_updates(db, other_id)]
+    assert not [u for u in other_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert _ladder_cause_note(other_stored) == ""
+
+    # И причина, которую хаб не знает, не становится отказом среды по
+    # похожести слов: «нет pytest» — это проза, а поле заведено ровно затем,
+    # чтобы прозу не разбирать. Отчёт при этом не теряется — только причина
+    # остаётся незаявленной.
+    third_id = await _submitted(client, db, "spike-unknown-reason")
+    report["incomplete_reason"] = "в среде нет pytest"
+    resp = await client.post(f"/api/tasks/{third_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+    third_stored = dict(await repo.get_latest_machine_review(db, third_id))
+    assert third_stored["incomplete_reason"] == ""
+    assert is_environment_refusal(third_stored) is False
+    third_updates = [dict(u) for u in await repo.get_task_updates(db, third_id)]
+    assert not [u for u in third_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+
+async def test_environment_refusals_are_counted_with_their_sample_size(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1238): счёт повторяемости, и рядом — размер выборки.
+
+    Два случая за 09.09.2026 заметил человек, читавший карточки подряд.
+    Механизма, который считает такие отчёты, не было вовсе; здесь он есть, и
+    он не имеет права печатать долю, не сказав, из чего она взята.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e2"}, "run": {"id": "run-e2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-refusal-count")
+
+    # Пока причину не назвал никто, доли нет — есть слово «недобор».
+    await _seed_report(db, task_id, incomplete=True, reason=None)
+    await _seed_report(db, task_id, incomplete=False, reason=None)
+    empty = await count_environment_refusals(db, since_days=30)
+    assert empty["environment_refusals"] == 0
+    assert empty["reason_declared"] == 0
+    assert empty["environment_share"] is None
+    assert "недобор" in empty["share_note"]
+
+    await _seed_report(db, task_id, incomplete=True, reason="environment")
+    await _seed_report(db, task_id, incomplete=True, reason="environment")
+    await _seed_report(db, task_id, incomplete=True, reason="profile")
+    counted = await count_environment_refusals(db, since_days=30)
+
+    assert counted["environment_refusals"] == 2
+    assert counted["profile_exhausted"] == 1
+    assert counted["reason_declared"] == 3
+    assert counted["reason_unstated"] == 1
+    assert counted["incomplete_total"] == 4
+    assert counted["reports_total"] == 5
+    assert counted["environment_share"] == round(2 / 3, 3)
+    # Размер выборки идёт вместе с числом, а не отдельной строкой ниже
+    # (#1153): «2» без «из 3 назвавших причину» решения не выдерживает.
+    note = counted["share_note"]
+    assert "2 из 3" in note
+    assert "4" in note and "5" in note
+    assert "недобор" not in note
+
+
+async def test_reports_without_the_field_are_not_counted_as_refusals(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1238): старые отчёты читаются и НЕ становятся отказом среды.
+
+    МУТАЦИЯ, которую обязан ловить этот тест: трактовать пустую причину как
+    отказ среды. Тогда каждый неполный отчёт, написанный до появления поля,
+    задним числом получил бы показание, которого никто не давал, — та же
+    подмена «не измерено» на «измерено», ради которой всё это заведено.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e3"}, "run": {"id": "run-e3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-old-reports")
+
+    for _ in range(3):
+        await _seed_report(db, task_id, incomplete=True, reason=None)
+
+    stats = await count_environment_refusals(db, since_days=30)
+    assert stats["incomplete_total"] == 3
+    assert stats["environment_refusals"] == 0
+    assert stats["profile_exhausted"] == 0
+    assert stats["reason_unstated"] == 3
+    assert stats["environment_share"] is None
+    assert "недобор" in stats["share_note"]
+
+    # Чтение таких строк не ломается: причина пустая, а не отсутствующая.
+    row = dict(await repo.get_latest_machine_review(db, task_id))
+    assert row["incomplete_reason"] == ""
+    assert is_environment_refusal(row) is False
+    view = MachineReviewView(**row)
+    assert view.incomplete_reason == ""
+    assert view.incomplete is True

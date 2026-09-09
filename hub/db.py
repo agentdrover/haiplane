@@ -662,6 +662,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
         "NOT NULL DEFAULT '[]'",
     ),
+    # #1238. WHY the run called itself incomplete, from a fixed vocabulary.
+    # The empty default is the honest value for history: every row written
+    # before this column made no claim about the cause, and back-filling
+    # either word would put one in its mouth — the same reasoning that left
+    # `incomplete` nullable above. Nothing reads the cause out of prose.
+    (
+        "add_machine_reviews_incomplete_reason_column",
+        "ALTER TABLE machine_reviews ADD COLUMN incomplete_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
     (
         "add_task_updates_principal_id",
         "ALTER TABLE task_updates ADD COLUMN principal_id INTEGER",
@@ -2790,6 +2800,17 @@ HAIPLANE_MACHINE_REVIEW=require
    НЕ идут в `findings_rejected`, потому что «никто не голосовал» и «кто-то
    опроверг» — противоположные исходы. `lost_dimensions` — измерения, не
    вернувшие результат.
+
+   `incomplete_reason` (#1238) — ПОЧЕМУ прогон неполон, одним словом из
+   двух: `environment` — смотреть было нечем (нечем запустить тесты, ссылка
+   на базовую ветку не разрешается, сравнить не с чем), лечится настройкой
+   окружения, а не вторым прогоном; `profile` — инструменты были, охвата не
+   хватило на объём диффа. Пропуск поля означает «причина не заявлена» и НЕ
+   читается ни как одно, ни как другое. Прозу по-прежнему пиши в
+   `lost_dimensions`: причина берётся из этого слова, а не угадывается по
+   тексту. Поле едет в ТЕЛЕ отчёта — HTTP `POST /api/tasks/<id>/machine-review`
+   и текстовый блок прогона; в MCP-инструменте его пока нет, каталог упёрся в
+   свой потолок (#780), и подъём потолка — отдельное решение.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 

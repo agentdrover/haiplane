@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
@@ -38,7 +39,11 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
-from hub.models import RiskClass
+from hub.models import (
+    INCOMPLETE_REASON_ENVIRONMENT,
+    INCOMPLETE_REASON_PROFILE,
+    RiskClass,
+)
 from hub.services import project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -744,14 +749,47 @@ REPORT_BLOCK_INSTRUCTION = (
     '"start_line": 1, "detail": "..."}], '
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
-    '"lost_dimensions": ["..."], "harness_skill": "...", '
+    '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
+    '"harness_skill": "...", '
     '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
     "```\n"
     "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
     "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
     "никто не смог рассудить, идёт в unresolved, а НЕ в findings_rejected. "
+    "При incomplete=true назови ПРИЧИНУ одним словом в incomplete_reason: "
+    "«environment» — смотреть было нечем (нет чем запустить проверки, не "
+    "разрешается база для сравнения), «profile» — инструменты были, а охвата "
+    "на объём диффа не хватило. Это РАЗНЫЕ ответы человека: первое лечится "
+    "настройкой окружения, второе — ещё одним прогоном. Не заявишь — причина "
+    "останется неизвестной, и угадывать её по твоему тексту никто не будет. "
     "Если инструменты хаба недоступны — этот блок единственный способ "
     "доставить работу, и без него прогон пропадёт целиком."
+)
+
+
+# #1238. Что делать ДО того, как объявить, что среда не дала измерить.
+#
+# Заведено по отчёту #334 (задача #1169, профиль deep, 12 агентов): прогон
+# честно записал «в среде нет uv/pytest — сюит не исполнялся, только чтение»
+# и «локальный ref develop не резолвится». Ни того, ни другого никто не
+# просил попробовать обойти, и оба измерения пропали при полной оплате.
+#
+# Обещаний про среду провайдера здесь нет — только порядок попыток и
+# требование назвать отказ отказом, если ни одна не сработала. Сработает ли
+# он, покажет счётчик отказов среды, а не этот комментарий.
+ENVIRONMENT_ATTEMPT_BLOCK = (
+    "ЧЕМ СМОТРЕТЬ — СНАЧАЛА ПОПРОБУЙ, ПОТОМ ЗАЯВЛЯЙ ОТКАЗ.\n"
+    "Тесты: `uv run pytest -q`; нет uv — `python -m pytest -q`; нет pytest — "
+    "`python -m pip install -q pytest` и повтори. Код возврата смотри "
+    "отдельным `echo $?`, а не по хвосту вывода.\n"
+    "База для сравнения: если ссылка на базовую ветку не разрешается, "
+    "`git fetch origin <база>` и сравнивай с `origin/<база>`. Взять ДРУГОЙ "
+    "диапазон — значит судить о другом наборе изменений; если пришлось, "
+    "скажи об этом прямо.\n"
+    "Если после попыток измерение так и не сделано — incomplete=true и "
+    'incomplete_reason="environment", а в lost_dimensions перечисли, чего '
+    "именно не хватило. Чтение кода вместо прогона тестов прогоном не "
+    "называется.\n\n"
 )
 
 
@@ -810,12 +848,16 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1238: and the order of attempts before "the environment refused".
+        # Both profiles get it: the deep harness lost the test dimension on
+        # exactly the same missing tool as a cheap one would.
+        + ENVIRONMENT_ATTEMPT_BLOCK
         # #1036: the report has to survive a run with no MCP. Since 22.08 the
         # hub's MCP stopped reaching cloud runs at all — the reviewer works,
         # finishes, and its findings die in the final text nobody parses. So
         # the text becomes a second, weaker delivery: same fields, stated
         # once, at the very end, where a machine can find them.
-        f"{delivery_block}"
+        + f"{delivery_block}"
         # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
         # скобках, и форматирование прочитало бы "raw_count" как поле.
         + REPORT_BLOCK_INSTRUCTION.replace(
@@ -911,6 +953,108 @@ async def _submission_diff(
 REVIEW_LADDER_MAX_STEPS = 2
 
 
+#: Окно, за которое считается повторяемость отказов среды (#1238).
+ENVIRONMENT_REFUSAL_WINDOW_DAYS = 30
+
+
+def is_environment_refusal(report: Mapping[str, Any] | None) -> bool:
+    """Отчёт неполон ПОТОМУ ЧТО среда отказала — по заявлению ревьюера (#1238).
+
+    ЕДИНСТВЕННОЕ место, где это решается. Два условия, и оба обязательны:
+    прогон объявил себя неполным И назвал причиной ``environment``. Пустая
+    причина — «не заявлена»; так выглядят все отчёты, написанные до
+    появления поля, и засчитать их отказом среды задним числом значило бы
+    сочинить за них показание.
+
+    Ничего не выводится из ``lost_dimensions``: разбор прозы по подстрокам
+    и есть то угадывание, ради замены которого поле заведено.
+    """
+    if report is None:
+        return False
+    if not report.get("incomplete"):
+        return False
+    return (report.get("incomplete_reason") or "") == INCOMPLETE_REASON_ENVIRONMENT
+
+
+#: Хвост алерта лестницы, когда неполнота — отказ среды (#1238).
+#:
+#: Лестница (#879) от этого не меняется: она и до, и после решает по профилю
+#: и по потолку — перечень её исходов вне области этой задачи. Меняется
+#: только то, ЧТО человек прочитает в карточке, когда за отказ примутся.
+ENVIRONMENT_REFUSAL_NOTE = (
+    " ПРИЧИНА — ОТКАЗ СРЕДЫ по заявлению ревьюера: смотреть было нечем "
+    "(нечем запустить проверки или не с чем сравнить дифф). Повтор прогона "
+    "в той же среде даст тот же отказ — лечится настройкой окружения "
+    "ревьюера, а не ещё одним ревью (#1238)."
+)
+
+
+def _ladder_cause_note(report: Mapping[str, Any] | None) -> str:
+    """Что дописать в алерт лестницы про ПРИЧИНУ неполноты (#1238)."""
+    if is_environment_refusal(report):
+        return ENVIRONMENT_REFUSAL_NOTE
+    return ""
+
+
+async def count_environment_refusals(
+    db: aiosqlite.Connection,
+    since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Сколько отчётов за окно неполны по отказу среды — с размером выборки.
+
+    Повторяемость до этой задачи не считал никто: два случая за 09.09.2026
+    заметил человек, читавший карточки подряд, а не механизм. Считается
+    здесь, рядом с определением отказа, чтобы счёт и признак не разъехались.
+
+    Доля печатается ТОЛЬКО когда есть от чего её брать. Знаменатель — не
+    все неполные отчёты, а те из них, что назвали причину: пока причину не
+    назвал никто, «0 отказов среды из 48 неполных» читалось бы как «со
+    средой всё хорошо», хотя измерено ровно ничего. Такой случай называется
+    словом «недобор» (#1153), а не нулём.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT incomplete, incomplete_reason FROM machine_reviews "
+        "WHERE created_at >= datetime('now', ?)",
+        (f"-{int(since_days)} days",),
+    )
+    reports_total = len(rows)
+    incomplete_rows = [dict(row) for row in rows if row["incomplete"]]
+    environment = sum(1 for row in incomplete_rows if is_environment_refusal(row))
+    profile_exhausted = sum(
+        1
+        for row in incomplete_rows
+        if (row.get("incomplete_reason") or "") == INCOMPLETE_REASON_PROFILE
+    )
+    declared = environment + profile_exhausted
+    incomplete_total = len(incomplete_rows)
+    if declared:
+        share_note = (
+            f"отказ среды: {environment} из {declared} неполных отчётов, "
+            f"назвавших причину (неполных всего {incomplete_total} из "
+            f"{reports_total} отчётов за {since_days} дн.)"
+        )
+    else:
+        share_note = (
+            f"недобор: причину неполноты не назвал ни один отчёт (неполных "
+            f"{incomplete_total} из {reports_total} за {since_days} дн.), "
+            "поэтому доля отказов среды не измерена — это не ноль"
+        )
+    return {
+        "since_days": int(since_days),
+        "reports_total": reports_total,
+        "incomplete_total": incomplete_total,
+        "reason_declared": declared,
+        "reason_unstated": incomplete_total - declared,
+        "environment_refusals": environment,
+        "profile_exhausted": profile_exhausted,
+        # Доля есть только при непустом знаменателе; иначе её нет, и вместо
+        # числа стоит None рядом со словом «недобор» в share_note.
+        "environment_share": (round(environment / declared, 3) if declared else None),
+        "share_note": share_note,
+    }
+
+
 async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
     """Buy the heavy profile when the cheap run said it did not finish (#879).
 
@@ -960,7 +1104,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             f"Неполный отчёт после {steps} прогон(ов): потолок лестницы "
             f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
             "Ревью этой сдачи так и не состоялось полностью — решение за "
-            "человеком (#879).",
+            "человеком (#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False
@@ -978,7 +1122,8 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             "alert",
             "Неполный отчёт, добор не положен: профиль "
             + (f"«{profile}»" if profile else "не заявлен")
-            + " — выше дешёвого подниматься некуда. Решение за человеком (#879).",
+            + " — выше дешёвого подниматься некуда. Решение за человеком "
+            "(#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from enum import Enum
 from typing import Any, Literal
 
@@ -9,6 +10,8 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+
+_models_log = logging.getLogger("hub")
 
 _SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
@@ -2291,6 +2294,53 @@ class OutcomeAnswerView(BaseModel):
     hypothesis_snapshot: str | None = None
 
 
+#: Почему машинное ревью объявило себя неполным — СО СЛОВ ревьюера (#1238).
+#:
+#: Два случая, неразличимые в карточке до этой задачи, требуют разных ответов
+#: человека и разных денег:
+#:
+#: * ``environment`` — ОТКАЗ СРЕДЫ. Ревьюеру было нечем смотреть: в среде нет
+#:   инструмента, которым запускают тесты, или ссылка на базовую ветку не
+#:   разрешается и дифф не с чем сравнить. Второй прогон в той же среде даст
+#:   тот же отказ: это лечится настройкой, а не повтором.
+#: * ``profile`` — ИСЧЕРПАНИЕ ПРОФИЛЯ. Инструменты были, охвата не хватило:
+#:   дифф больше, чем один проход. Ровно это и покупает добор (#879).
+#:
+#: Пустая строка — «не заявлена». Это НЕ третья причина и не «со средой всё
+#: хорошо»: так выглядят все отчёты, написанные до появления поля.
+INCOMPLETE_REASON_ENVIRONMENT = "environment"
+INCOMPLETE_REASON_PROFILE = "profile"
+INCOMPLETE_REASON_UNSTATED = ""
+INCOMPLETE_REASONS: tuple[str, ...] = (
+    INCOMPLETE_REASON_ENVIRONMENT,
+    INCOMPLETE_REASON_PROFILE,
+)
+
+
+def normalise_incomplete_reason(value: Any) -> str:
+    """The declared cause, or ``""`` when nothing recognisable was declared.
+
+    Guessing is what this field exists to replace, so nothing here reads the
+    reviewer's prose: a word outside the vocabulary is dropped to "not
+    stated" and logged, never mapped to the nearest-looking cause. The prose
+    itself is not lost — it stays in ``lost_dimensions``, where the reviewer
+    wrote it.
+    """
+    if value is None:
+        return INCOMPLETE_REASON_UNSTATED
+    text = str(value).strip().lower()
+    if not text:
+        return INCOMPLETE_REASON_UNSTATED
+    if text in INCOMPLETE_REASONS:
+        return text
+    _models_log.warning(
+        "machine review declared an unknown incomplete_reason %r; recorded as "
+        "not stated",
+        text[:40],
+    )
+    return INCOMPLETE_REASON_UNSTATED
+
+
 class MachineReviewSubmit(BaseModel):
     """Structured multi-agent review report (#381).
 
@@ -2317,11 +2367,29 @@ class MachineReviewSubmit(BaseModel):
     # the substitution this field exists to prevent: a run that lost agents
     # reading as a clean one. Forgetting must fail loudly at the schema.
     incomplete: bool
+    # WHY it is incomplete, in the reviewer's own words from a fixed
+    # vocabulary (#1238). Two causes that look identical in the card today
+    # need opposite answers: an environment refusal is not cured by a second
+    # run in the same environment, an exhausted profile is exactly what the
+    # ladder (#879) buys another run for.
+    #
+    # Optional, and empty means "not stated" — never "environment was fine".
+    # Required would have been louder, but the only path the cloud reviewer
+    # actually has is the text block, and parse_report_block drops a report
+    # whose fields the contract refuses: a missing cause would then cost the
+    # findings too. A cause the hub does not know is normalised to "not
+    # stated" for the same reason, and logged — see the validator.
+    incomplete_reason: str = Field("", max_length=40)
     unresolved: list[MachineUnresolvedFinding] = Field(
         default_factory=list, max_length=200
     )
     lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
+
+    @field_validator("incomplete_reason", mode="before")
+    @classmethod
+    def _known_incomplete_reason(cls, v: Any) -> str:
+        return normalise_incomplete_reason(v)
 
 
 class CategoryCheckSubmit(BaseModel):
@@ -2540,6 +2608,11 @@ class MachineReviewView(BaseModel):
     # field existed made no such claim, and back-filling false would put words
     # in their mouth (#549).
     incomplete: bool | None = None
+    # #1238. Empty means the reviewer never said why — which is where every
+    # report written before this field existed sits, and which must never be
+    # read as either cause. Only ``INCOMPLETE_REASON_ENVIRONMENT`` says the
+    # environment refused; nothing is inferred from prose.
+    incomplete_reason: str = ""
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
     # Which profile produced this report (#807). Set by the hub from the
