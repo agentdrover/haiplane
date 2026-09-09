@@ -665,6 +665,33 @@ async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     return None
 
 
+async def _diff_ends(base: str, sha: str, repo: str) -> tuple[str, str] | None:
+    """Both ends of a ``base...sha`` comparison, as SHAs, origin-first (#1239).
+
+    ``None`` when either end resolves nowhere — the caller then says "could not
+    read", never "nothing changed". No fallback to the bare names is attempted
+    on that path on purpose: a comparison the hub shows a human must not
+    silently degrade into a comparison against whatever an old checkout left
+    behind, which is precisely the answer this helper exists to stop.
+
+    ``_resolve_ref_remote_first`` is reused rather than reimplemented: it is
+    the resolver ``branch_diff`` and ``branch_diff_paths`` have used since
+    #762/#1055, and its own local fallback (used only when ``origin/<name>``
+    does not exist at all) keeps a local-only clone working. A pinned sha
+    resolves through it too — ``origin/<sha>`` misses, the bare sha hits.
+    """
+    base_sha = await _resolve_ref_remote_first(base, repo)
+    head_sha = await _resolve_ref_remote_first(sha, repo)
+    if base_sha is None or head_sha is None:
+        log.warning(
+            "_diff_ends: %r not found in %s",
+            base if base_sha is None else sha,
+            repo,
+        )
+        return None
+    return base_sha, head_sha
+
+
 # Ancestry between two task branches (#1184). The names say which side of the
 # pair the HEAD branch — the one being submitted — sits on, so a caller never
 # has to remember argument order to read the answer.
@@ -1676,15 +1703,62 @@ class GitOpsIntegration:
         one submission, and a branch that moved after it would show the human
         code they are not approving. Carries real context lines — this diff is
         read by a person, unlike the ``-U0`` one call-site analysis parses.
+
+        Both ends go through ``_diff_ends`` since #1239. Until then the names
+        were interpolated verbatim, and the bare base name is not the base the
+        hub judges against: in the shared clone the local ``develop`` trails
+        ``origin/develop`` — nothing ever moves the local ref — so the card
+        showed the submission against a point in the past. Observed on a
+        purpose-built clone: the same commit gives 2 files against the stale
+        local ``develop`` and 0 against ``origin/develop``. Whichever of the
+        two the reader got, nobody told them which one they were looking at.
         """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
         rc, out, _ = await _git(
             "diff",
             f"-U{int(context)}",
-            f"{base}...{sha}",
+            f"{base_sha}...{head_sha}",
             repo=repo,
             check=False,
         )
         return out if rc == 0 else None
+
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None:
+        """Is ``sha`` already inside the history of the base? (#1239)
+
+        THE question a caller must ask before reading an empty three-dot diff
+        as "this changed nothing". ``base...sha`` is computed from the merge
+        base, so once the commit lands in the base's history the merge base IS
+        the commit and the diff is empty ALWAYS — whatever the submission
+        actually touched. Verified on a purpose-built clone: after the branch
+        was merged, ``git diff --name-only origin/develop...<sha>`` returns 0
+        files for a commit that adds two.
+
+        Three answers, never two, exactly as ``is_ancestor``: ``None`` means
+        the question could not be asked, and it must not collapse into "no" —
+        "we did not check" printed as "not merged" would send the reader back
+        to trusting an empty screen.
+
+        The ancestry is asked of the SAME tip the diff was computed against —
+        both go through ``_diff_ends`` — because on a bare name they disagree:
+        in the clone above ``merge-base --is-ancestor <sha> develop`` answers
+        rc=1 (not an ancestor) while ``origin/develop`` answers rc=0. Asking
+        the bare name would leave the collapse unrecognised.
+
+        One detector, shared: the card (``task_diff``) and the live evidence
+        packet (``steward_evidence``) both call this, rather than each
+        rebuilding the ref juggling that the disagreement above punishes.
+        """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
+        return await self.is_ancestor(repo, head_sha, base_sha)
 
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
@@ -1756,9 +1830,18 @@ class GitOpsIntegration:
         touched to lay criteria against them; reading every hunk for that would
         put the cost of the full diff on every gate render, and the full diff
         is already loaded on demand (#824).
+
+        Both ends resolved origin-first through ``_diff_ends`` (#1239), for the
+        same reason ``commit_diff`` does it: the change map and the diff below
+        it must describe one and the same comparison, and until #1239 they
+        agreed only by accident — both were wrong in the same way.
         """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
         rc, out, _ = await _git(
-            "diff", "--numstat", f"{base}...{sha}", repo=repo, check=False
+            "diff", "--numstat", f"{base_sha}...{head_sha}", repo=repo, check=False
         )
         if rc != 0:
             return None
