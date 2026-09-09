@@ -407,8 +407,14 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
     )
 
 
-async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
-    """What this task waits for, judged by DELIVERY rather than status (#484/#485)."""
+async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
+    """What this task waits for, judged by DELIVERY rather than status (#484/#485).
+
+    Public because the draft packet (#1158) assembles the same fact from the
+    same edges: two builders of one source would drift, and a steward reading
+    "blocked by nothing" from two different computations could not be told
+    which one it read.
+    """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
     blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
@@ -468,7 +474,7 @@ async def build_evidence_packet(
             await _risk_fact(db, task, diff_paths, diff_reason),
             _locator_fact(brief),
             await _base_fact(db, project_row),
-            await _dependency_fact(db, task_id),
+            await dependency_fact(db, task_id),
         ]
     }
     return EvidencePacket(
