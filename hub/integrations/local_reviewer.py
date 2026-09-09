@@ -173,6 +173,15 @@ _PODMAN_HINT = (
     "не сможет, хотя напишет в ленту, что снял. Добавьте --timeout "
     "<секунды> — с ним контейнер умирает сам — см. deploy/LOCAL-REVIEW.md"
 )
+_PODMAN_DEADLINE_HINT = (
+    "LOCAL_REVIEW_SANDBOX: podman run --timeout «{value}» срока жизни "
+    "контейнеру НЕ задаёт. Срок — целое число секунд больше нуля; ноль это "
+    "подман-умолчание, а умолчание задокументировано словами «By default "
+    "containers run until they exit or are stopped by podman stop» "
+    "(podman-run(1)). Токен в строке есть, а снять прогон по таймауту хаб "
+    "по-прежнему не сможет — тот же случай, что --timeout после образа. "
+    "Поставьте --timeout <секунды> — см. deploy/LOCAL-REVIEW.md"
+)
 _DOCKER_HINT = (
     "LOCAL_REVIEW_SANDBOX: docker run отсоединяет контейнер от хаба так же, "
     "как podman, но флага собственного срока жизни (аналога podman "
@@ -314,12 +323,19 @@ _RUN_VALUE_FLAGS: frozenset[str] = frozenset(
 )
 
 
-def _container_run_flags(parts: list[str], engine: str) -> list[str] | None:
+def _container_run_flags(
+    parts: list[str], engine: str
+) -> list[tuple[str, str | None]] | None:
     """Флаги самого ``<engine> run`` — до образа. ``None``, если это не run.
 
     Возвращается именно окно флагов запуска, а не вся строка: судить о сроке
     жизни контейнера по токенам ПОСЛЕ образа нельзя, там уже команда внутри
     контейнера.
+
+    Каждый флаг отдаётся ВМЕСТЕ СО ЗНАЧЕНИЕМ (``None``, если значения нет):
+    у ``--timeout`` вопрос не «есть ли флаг», а «названо ли им время», и без
+    значения на него не ответить (найдено машинным ревью 09.09.2026, находка
+    fee582c0e918a6a6).
     """
     global_value_flags = _ENGINE_GLOBAL_VALUE_FLAGS.get(engine, frozenset())
     for i, part in enumerate(parts):
@@ -330,17 +346,47 @@ def _container_run_flags(parts: list[str], engine: str) -> list[str] | None:
             j += 2 if parts[j] in global_value_flags else 1
         if j >= len(parts) or parts[j] != "run":
             return None
-        own: list[str] = []
+        own: list[tuple[str, str | None]] = []
         k = j + 1
         while k < len(parts) and parts[k].startswith("-"):
-            own.append(parts[k])
-            k += 2 if parts[k] in _RUN_VALUE_FLAGS else 1
+            if parts[k] in _RUN_VALUE_FLAGS:
+                own.append((parts[k], parts[k + 1] if k + 1 < len(parts) else None))
+                k += 2
+            else:
+                name, sep, value = parts[k].partition("=")
+                own.append((name, value if sep else None))
+                k += 1
         return own
     return None
 
 
-def _has_flag(parts: list[str], flag: str) -> bool:
-    return any(part == flag or part.startswith(flag + "=") for part in parts)
+_FLAG_ABSENT = object()
+
+
+def _flag_value(flags: list[tuple[str, str | None]], flag: str) -> Any:
+    """Значение флага среди флагов run; ``_FLAG_ABSENT``, если флага нет.
+
+    «Флага нет» и «флаг есть, а времени в нём нет» — разные отказы, и путать
+    их нельзя: первый чинится дописыванием флага, второй — исправлением его
+    значения, и подсказка обязана называть именно то, что делать.
+    """
+    for name, value in flags:
+        if name == flag:
+            return value
+    return _FLAG_ABSENT
+
+
+def _names_a_deadline(value: str | None) -> bool:
+    """Значение ``--timeout`` действительно задаёт срок жизни контейнера.
+
+    Срок — целое число секунд БОЛЬШЕ НУЛЯ. Ноль сроком не является: это
+    подман-умолчание, а умолчание задокументировано словами «By default
+    containers run until they exit or are stopped by ``podman stop``»
+    (podman-run(1)). То есть ``--timeout 0`` — тот же класс «токен в строке
+    есть, срока жизни нет», что и ``--timeout`` после образа, и пропускать
+    его значит вернуть ровно ту дыру, ради которой страж написан.
+    """
+    return value is not None and value.isdigit() and int(value) > 0
 
 
 def detaching_sandbox() -> list[str]:
@@ -350,8 +396,15 @@ def detaching_sandbox() -> list[str]:
     if _runs_tool(parts, "systemd-run") and "--scope" not in parts:
         reasons.append(_SCOPE_HINT)
     podman_flags = _container_run_flags(parts, "podman")
-    if podman_flags is not None and not _has_flag(podman_flags, "--timeout"):
-        reasons.append(_PODMAN_HINT)
+    if podman_flags is not None:
+        deadline = _flag_value(podman_flags, "--timeout")
+        if deadline is _FLAG_ABSENT:
+            reasons.append(_PODMAN_HINT)
+        elif not _names_a_deadline(deadline):
+            # Значения нет вовсе (флаг последним токеном) — так и сказать, а
+            # не показать оператору «None», которого он в строке не писал.
+            shown = "<значения нет>" if deadline is None else deadline
+            reasons.append(_PODMAN_DEADLINE_HINT.format(value=shown))
     if _container_run_flags(parts, "docker") is not None:
         reasons.append(_DOCKER_HINT)
     return reasons

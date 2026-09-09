@@ -4243,6 +4243,39 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
     )
     assert local_reviewer.detaching_sandbox() == []
 
+    # ``--timeout 0`` — токен в строке есть, срока жизни нет: ноль это
+    # подман-умолчание, а умолчание задокументировано словами «By default
+    # containers run until they exit or are stopped by podman stop»
+    # (podman-run(1)). Тот же класс, что --timeout после образа, и пропускать
+    # его значит вернуть дыру, ради которой страж написан (найдено машинным
+    # ревью 09.09.2026, находка fee582c0e918a6a6).
+    for no_deadline in (
+        "/usr/bin/podman run --rm -i --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 00 img",
+        # Нечисловое значение сроком тоже не является — и молча пройти не должно.
+        "/usr/bin/podman run --rm -i --timeout abc img",
+        # Флаг последним токеном: значения нет вовсе.
+        "/usr/bin/podman run --rm -i --timeout",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", no_deadline)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"«{no_deadline}» задаёт контейнеру НЕ срок жизни, а подман-"
+            f"умолчание «работать до выхода»: {reasons}"
+        )
+
+    # А положительное число — задаёт, и отвергаться не должно.
+    for ok_deadline in (
+        "/usr/bin/podman run --rm -i --timeout 1 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok_deadline)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{ok_deadline}» называет срок жизни целым числом секунд больше "
+            "нуля — это рабочая форма, а не отказ"
+        )
+
     # ``podman ps`` — не запуск контейнера, и судить о нём нечего.
     monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman ps")
     assert local_reviewer.detaching_sandbox() == []
@@ -4380,4 +4413,147 @@ def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> No
             "CLI, а хаб запускает песочницу вместе с ним "
             f"({key[:-7]}CMD). Такая проба пройдёт там, где живой запуск "
             "пойдёт другой командой"
+        )
+
+
+def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch) -> None:
+    """Срок жизни контейнера в скелете враппера держится тестом, а не текстом.
+
+    Рекомендованная песочница — ``sudo … /usr/local/bin/haiplane-review-run``,
+    и стражам хаба она непрозрачна: podman лежит ВНУТРИ скрипта. Значит на
+    рекомендованном рецепте единственное место, где срок жизни вообще
+    существует, — это скелет враппера в документе. Замер: вычеркнуть из него
+    ``--timeout 1800`` — и весь набор оставался зелёным, включая AC-1..AC-4,
+    тест argv и тест пробы (09.09.2026, находка машинного ревью
+    b3a35600e66e971d). То есть флаг, ради которого писан страж, на
+    рекомендованном пути не держался ничем.
+
+    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА и
+    прогоняется через САМОГО стража хаба — то же правило, что AC-4 применяет
+    к песочнице, применённое там, где на этом рецепте живёт срок жизни.
+    """
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    joined = textwrap.dedent(blocks[0]).replace("\\\n", " ")
+    launches = [line for line in joined.splitlines() if "podman run" in line]
+    assert len(launches) == 1, (
+        f"в скелете враппера ожидалась ровно одна строка запуска podman, "
+        f"найдено {len(launches)}: {launches}"
+    )
+    # ``exec`` и хвостовой ``"$@"`` — оболочка запуска, а не флаги podman.
+    launch = launches[0].strip().removeprefix("exec ").removesuffix(' "$@"')
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
+    assert local_reviewer.detaching_sandbox() == [], (
+        f"скелет враппера из документа запускает «{launch}», и хаб отверг бы "
+        f"эту строку: {local_reviewer.detaching_sandbox()}. Внутри обёртки "
+        "страж её не увидит — а значит прогон нельзя будет снять, и хаб "
+        "напишет в ленту, что снял"
+    )
+
+
+def test_the_doc_probe_passes_the_cli_argv_as_arguments(monkeypatch) -> None:
+    """В пробе ``$CMD`` — ПОЗИЦИОННЫЙ аргумент враппера, а не что попало.
+
+    Прежняя проверка требовала лишь подстроки ``$CMD`` в строке. Замер: строка
+    ``CMD=$CMD /usr/local/bin/haiplane-review-run`` — то есть враппер запущен
+    ГОЛЫМ, ровно та регрессия, ради которой тест писан, — оставляла весь набор
+    зелёным (09.09.2026, находка машинного ревью dc051e23e80f3cdd). Подстрока
+    не отличает аргумент от присваивания перед командой и от ``<<<"$CMD"``.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        # Продолжения строк склеиваются: проба разнесена по строкам обратным
+        # слешем, и разорванную строку токенами не разобрать.
+        for line in block.replace("\\\n", " ").splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        tokens = shlex.split(line, comments=True)
+        assert wrapper in tokens, (
+            f"в пробе «{line.strip()}» {wrapper} — не отдельное слово команды: "
+            "разобрать такую пробу нельзя, и что она запускает, неизвестно"
+        )
+        tail = tokens[tokens.index(wrapper) + 1 :]
+        assert "$CMD" in tail, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            f"CLI ПОЗИЦИОННЫМ аргументом, а хаб запускает песочницу именно "
+            f"так ({key[:-7]}CMD дописывается хвостом argv). Присваивание "
+            "перед командой или подача через heredoc сюда не годятся: "
+            "враппер получит пустой argv, и проба пройдёт там, где живой "
+            "запуск пойдёт другой командой"
+        )
+
+
+def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
+    monkeypatch, tmp_path
+) -> None:
+    """Рецепт ИЗ ДОКУМЕНТА прогоняется через not_ready(), а не через страж.
+
+    AC-2 проверяет sandbox_uid() прямым вызовом — и этого мало: решение о
+    запуске принимает not_ready(), а его единственная интеграционная проверка
+    кормили формой ``systemd-run --uid=``. Замер: вернуть в _uid_outside_group
+    разбор ТОЛЬКО ``--uid`` — sandbox_uid() на sudo остаётся верным, AC-2 и
+    AC-4 зелёные, весь набор зелёный (rc=0), а not_ready() на рецепте из
+    документа возвращает [] и прогон упирается в EACCES внутри чужого
+    процесса, где причину уже никто не назовёт (09.09.2026, находка машинного
+    ревью 2bdf3c910e8d581c). Ровно то же расхождение, что и на #1155: дверь
+    заперта по прямому вызову и открыта по дороге, которой ходят.
+
+    Форма берётся ИЗ ДОКУМЕНТА; подменяется только имя пользователя — оно на
+    машине проверки не заведено, а проверяется здесь не оно, а то, что
+    проверка вообще СРАБАТЫВАЕТ на рекомендованной форме записи.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for line in _DEPLOY_DOC.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+
+    import os
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(shared))
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        named = local_reviewer.sandbox_uid()
+        assert named, (
+            f"в рекомендованной строке «{sandbox}» страж не видит пользователя"
+        )
+        # «nobody» есть на обеих системах, где это гоняется, и в группе
+        # каталога не состоит — как и в соседней проверке 45971e09.
+        probe = sandbox.replace(named, "nobody")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", probe)
+        assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
+            f"на рекомендованной форме «{probe}» not_ready() НЕ назвал "
+            "проблему с группой каталога прогонов: значит проверка, заведённая "
+            "ради 45971e09, на рецепте из документа молча не срабатывает — "
+            f"ровно как было до #1208. Вернулось: {local_reviewer.not_ready()}"
         )
