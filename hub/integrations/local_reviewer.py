@@ -187,16 +187,156 @@ def _runs_tool(parts: list[str], name: str) -> bool:
     return any(part.rsplit("/", 1)[-1] == name for part in parts)
 
 
-def _container_run(parts: list[str], engine: str) -> bool:
-    """``<engine> run`` — именно запуск контейнера, а не ``podman ps``."""
+# Глобальные флаги движка, которые берут значение ОТДЕЛЬНЫМ токеном. Без них
+# ``podman --log-level debug run --rm -i img`` читается как подкоманда
+# «debug», запуск контейнера стражу невидим и проходит без своего срока жизни
+# (найдено машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1). Список ПО
+# ИМЕНИ, как и всё в этом модуле: глобальный флаг, которого здесь нет, съест
+# подкоманду по-прежнему — это названный пропуск, он записан в
+# deploy/LOCAL-REVIEW.md. Форма ``--flag=value`` от списка не зависит вовсе.
+_ENGINE_GLOBAL_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "podman": frozenset(
+        {
+            "--cgroup-manager",
+            "--conmon",
+            "--connection",
+            "-c",
+            "--db-backend",
+            "--events-backend",
+            "--hooks-dir",
+            "--identity",
+            "--imagestore",
+            "--log-level",
+            "--module",
+            "--namespace",
+            "--network-cmd-path",
+            "--root",
+            "--runroot",
+            "--runtime",
+            "--runtime-flag",
+            "--ssh",
+            "--storage-driver",
+            "--storage-opt",
+            "--tmpdir",
+            "--url",
+            "--volumepath",
+        }
+    ),
+    "docker": frozenset(
+        {
+            "--config",
+            "--context",
+            "-c",
+            "--host",
+            "-H",
+            "--log-level",
+            "-l",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+        }
+    ),
+}
+
+# Флаги самого ``<engine> run``, которые берут значение ОТДЕЛЬНЫМ токеном.
+# Нужны, чтобы найти ОБРАЗ: всё, что стоит после образа, — команда полезной
+# нагрузки, и её ``--timeout`` сроком жизни контейнера не является (найдено
+# машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1: ``podman run --rm -i
+# img cursor-agent --timeout 60`` проходил как запуск со своим сроком).
+#
+# Неизвестный флаг здесь считается булевым, и если он на самом деле берёт
+# значение, его значение будет принято за образ. Ошибка тогда идёт в сторону
+# ОТКАЗА с названным флагом, а не в сторону молчаливого разрешения: отказ
+# оператор увидит в карточке и поправит, а разрешение не увидит никто.
+_RUN_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "--add-host",
+        "--annotation",
+        "--arch",
+        "--cap-add",
+        "--cap-drop",
+        "--cgroup-parent",
+        "--cgroups",
+        "--cidfile",
+        "--cpu-shares",
+        "--cpus",
+        "--cpuset-cpus",
+        "--cpuset-mems",
+        "--device",
+        "--dns",
+        "--entrypoint",
+        "--env",
+        "-e",
+        "--env-file",
+        "--gidmap",
+        "--health-cmd",
+        "--hostname",
+        "-h",
+        "--ipc",
+        "--label",
+        "-l",
+        "--log-driver",
+        "--log-opt",
+        "--memory",
+        "-m",
+        "--memory-swap",
+        "--name",
+        "--network",
+        "--os",
+        "--pid",
+        "--pids-limit",
+        "--platform",
+        "--publish",
+        "-p",
+        "--pull",
+        "--restart",
+        "--secret",
+        "--security-opt",
+        "--shm-size",
+        "--stop-signal",
+        "--stop-timeout",
+        "--sysctl",
+        "--timeout",
+        "--tmpfs",
+        "--tz",
+        "--uidmap",
+        "--ulimit",
+        "--umask",
+        "--user",
+        "-u",
+        "--userns",
+        "--variant",
+        "--volume",
+        "-v",
+        "--workdir",
+        "-w",
+    }
+)
+
+
+def _container_run_flags(parts: list[str], engine: str) -> list[str] | None:
+    """Флаги самого ``<engine> run`` — до образа. ``None``, если это не run.
+
+    Возвращается именно окно флагов запуска, а не вся строка: судить о сроке
+    жизни контейнера по токенам ПОСЛЕ образа нельзя, там уже команда внутри
+    контейнера.
+    """
+    global_value_flags = _ENGINE_GLOBAL_VALUE_FLAGS.get(engine, frozenset())
     for i, part in enumerate(parts):
         if part.rsplit("/", 1)[-1] != engine:
             continue
-        for later in parts[i + 1 :]:
-            if later.startswith("-"):
-                continue
-            return later == "run"
-    return False
+        j = i + 1
+        while j < len(parts) and parts[j].startswith("-"):
+            j += 2 if parts[j] in global_value_flags else 1
+        if j >= len(parts) or parts[j] != "run":
+            return None
+        own: list[str] = []
+        k = j + 1
+        while k < len(parts) and parts[k].startswith("-"):
+            own.append(parts[k])
+            k += 2 if parts[k] in _RUN_VALUE_FLAGS else 1
+        return own
+    return None
 
 
 def _has_flag(parts: list[str], flag: str) -> bool:
@@ -209,9 +349,10 @@ def detaching_sandbox() -> list[str]:
     reasons: list[str] = []
     if _runs_tool(parts, "systemd-run") and "--scope" not in parts:
         reasons.append(_SCOPE_HINT)
-    if _container_run(parts, "podman") and not _has_flag(parts, "--timeout"):
+    podman_flags = _container_run_flags(parts, "podman")
+    if podman_flags is not None and not _has_flag(podman_flags, "--timeout"):
         reasons.append(_PODMAN_HINT)
-    if _container_run(parts, "docker"):
+    if _container_run_flags(parts, "docker") is not None:
         reasons.append(_DOCKER_HINT)
     return reasons
 
@@ -235,6 +376,32 @@ _USER_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Короткие флаги sudo, НЕ берущие значения: только из таких букв может
+# состоять слипшийся пучок перед ``-u``. ``sudo -nu X`` — обычная запись тех
+# же ``-n`` и ``-u``, и на ней страж возвращал пустую строку, то есть молча
+# снимал проверку членства в группе (найдено машинным ревью 09.09.2026,
+# находка f4286f03c34368d3). А вот в ``sudo -pu X`` буква ``u`` — уже
+# значение ``-p``, а не флаг, и такой пучок здесь НЕ признаётся: угадать тут
+# значит проверить группу не того пользователя.
+_SUDO_VALUELESS_SHORT = frozenset("AbEeHiKklnPSsVv")
+
+
+def _bundled_short_value(
+    token: str, letter: str, parts: list[str], i: int
+) -> str | None:
+    """Значение слипшегося короткого флага: ``-nu X``, ``-uX``, ``-nuX``."""
+    if not token.startswith("-") or token.startswith("--"):
+        return None
+    body = token[1:]
+    pos = body.find(letter)
+    if pos < 0 or any(ch not in _SUDO_VALUELESS_SHORT for ch in body[:pos]):
+        return None
+    rest = body[pos + 1 :]
+    if rest:
+        return rest
+    return parts[i + 1] if i + 1 < len(parts) else None
+
+
 def sandbox_uid() -> str:
     """Пользователь ХОСТА, названный в песочнице, или "".
 
@@ -254,6 +421,10 @@ def sandbox_uid() -> str:
                 return part.split("=", 1)[1]
             if part == flag and i + 1 < len(parts):
                 return parts[i + 1]
+            if len(flag) == 2 and not flag.startswith("--"):
+                bundled = _bundled_short_value(part, flag[1], parts, i)
+                if bundled:
+                    return bundled
     return ""
 
 

@@ -11,6 +11,9 @@ import ast
 import asyncio
 import json
 import re
+import shlex
+import subprocess
+import textwrap
 from pathlib import Path
 
 import aiosqlite
@@ -4120,6 +4123,18 @@ def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
         "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
         "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
         "sudo -u 1234 /usr/local/bin/wrap": "1234",
+        # Слипшаяся запись тех же -n и -u — обычная форма, на которой страж
+        # возвращал пустую строку и молча снимал проверку группы (найдено
+        # машинным ревью 09.09.2026, находка f4286f03c34368d3).
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        "/usr/bin/sudo -nuhaiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        "/usr/bin/sudo -uhaiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        "/usr/bin/sudo -niu haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        # А здесь угадывать нельзя: -p берёт значение, то есть «u» — уже текст
+        # приглашения, а не флаг, и пользователя строка не называет вовсе.
+        # Принять его значило бы проверить членство в группе не того.
+        "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap": "",
+        "/usr/bin/sudo -n -g haiplane /usr/local/bin/wrap": "",
         # Старая форма НЕ сломана — иначе починено одно ценой другого.
         "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --": "haiplane-reviewer",
         "/usr/bin/systemd-run --scope --uid haiplane-reviewer --": "haiplane-reviewer",
@@ -4172,10 +4187,37 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
     for ok in (
         "/usr/bin/podman run --rm -i --timeout 1800 img",
         "/usr/bin/podman run --rm -i --timeout=1800 img",
+        # Флаг стоит среди флагов run, а между ним и образом — флаги со
+        # значениями: их значения за образ приниматься не должны.
+        "/usr/bin/podman run --rm -i -m 1500m --cpus 1.5 --pids-limit 512 "
+        "--env-file /etc/haiplane-review/env --network none --timeout 1800 img",
+        # Глобальный флаг движка со значением отдельным токеном: подкоманда
+        # «run» стоит за ним, и хаб обязан её увидеть.
+        "/usr/bin/podman --log-level debug run --rm -i --timeout 1800 img",
+        "/usr/bin/podman --url unix:///run/x run --rm -i --timeout 1800 img",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
         assert local_reviewer.detaching_sandbox() == [], (
             f"«{ok}» имеет собственный срок жизни и отвергаться не должен"
+        )
+
+    # --timeout ПОСЛЕ образа принадлежит команде внутри контейнера, а не
+    # podman run: conmon переживает убийство группы ровно так же, и принять
+    # чужой флаг за срок жизни значит разрешить прогон, который снять нельзя
+    # (найдено машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1).
+    for detaching in (
+        "/usr/bin/podman run --rm -i img cursor-agent --timeout 60",
+        "/usr/bin/podman run --rm -i img agent --timeout=60",
+        # Тот же промах с другой стороны: глобальный флаг движка съедал
+        # подкоманду, и «run» страж не находил вовсе.
+        "/usr/bin/podman --log-level debug run --rm -i img",
+        "/usr/bin/podman -c remote run --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", detaching)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"«{detaching}» — контейнер БЕЗ собственного срока жизни, и отказ "
+            f"обязан назвать недостающий --timeout: {reasons}"
         )
 
     # У docker штатного аналога --timeout нет вовсе, поэтому честнее назвать
@@ -4237,4 +4279,103 @@ def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
             "пользователя — значит проверка его членства в группе каталога "
             "прогонов на этой конфигурации молча не сработает вовсе, ровно "
             "как было до #1208"
+        )
+
+
+def test_the_doc_wrapper_carries_the_argv_the_hub_appends(monkeypatch, tmp_path) -> None:
+    """Скелет враппера ИЗ ДОКУМЕНТА доносит до движка argv, дописанный хабом.
+
+    Хаб запускает ``shlex.split(SANDBOX) + shlex.split(CMD)``. Враппер без
+    ``"$@"`` этот хвост молча выбрасывает: измерено на прежней редакции
+    скелета — ``haiplane-review-run cursor-agent --print`` доходило до podman
+    строкой БЕЗ ``cursor-agent``, код возврата 0, ни ошибки, ни следа.
+    Запускалось бы то, что зашито в образ, а не то, что стоит в настройке —
+    тот же класс отказа, который чинила задача: не ломает, а тихо подменяет
+    (найдено машинным ревью 09.09.2026, находка 8d363dc407782056).
+
+    Скелет берётся ИЗ ФАЙЛА и ИСПОЛНЯЕТСЯ, а не читается глазами: переписанный
+    в тест, он проверял бы тест, а прочитанный — ничего.
+    """
+    # 1. Хаб действительно дописывает CMD к SANDBOX — это наблюдение, а не
+    #    посылка: на ней держится всё остальное в этом тесте.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /wrap")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    assert local_reviewer.argv() == [
+        "/usr/bin/sudo",
+        "-n",
+        "-u",
+        "r",
+        "/wrap",
+        "cursor-agent",
+        "--print",
+    ], "хаб склеивает песочницу и CMD — если это не так, весь тест ниже мимо"
+
+    # 2. Скелет враппера из документа, с подменённым движком на заглушку,
+    #    печатающую свой argv.
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    stub = tmp_path / "podman"
+    stub.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    cmd = ["cursor-agent", "--print", "--model", "grok-4.6"]
+    done = subprocess.run(
+        [str(wrapper), *cmd], capture_output=True, text=True, timeout=30
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = done.stdout.split("\n")
+    assert seen[-1 - len(cmd) : -1] == cmd, (
+        "скелет враппера из документа НЕ донёс до движка argv, который хаб к "
+        f"нему дописал: движок получил {seen[:-1]}, а хвостом обязан был "
+        f"стоять {cmd}. Молча: код возврата 0. Добавьте \"$@\" последним "
+        "аргументом podman run"
+    )
+
+
+def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> None:
+    """Проба песочницы в документе гоняет тот же argv, что и живой запуск.
+
+    Проба, которая запускает враппер голым, проходит и на скелете, молча
+    выбрасывающем argv, — то есть доказывает не то, что проверяет.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        for line in block.splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        assert "$CMD" in line, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            "CLI, а хаб запускает песочницу вместе с ним "
+            f"({key[:-7]}CMD). Такая проба пройдёт там, где живой запуск "
+            "пойдёт другой командой"
         )
