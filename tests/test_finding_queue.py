@@ -992,3 +992,49 @@ def test_the_recheck_counts_divergence_and_names_the_unanswered():
     agreed = compare_recheck(first, {"a": "fixed"}, ["a"])
     assert agreed["share"] == 0.0
     assert agreed["stamped"] is False
+
+
+async def test_the_uid_survives_a_partial_queue(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Личность находки берётся из ОТЧЁТА, а не из того, что очередь показывает.
+
+    Очередь показывает подмножество всегда: разобранное из неё уходит, а
+    фильтр по категории сужает её дальше. Близнецы — находки с одинаковыми
+    категорией, файлом, заголовком и строкой — различаются порядковым номером
+    ВНУТРИ отчёта (#1007), и по обрезанному списку второй близнец получил бы
+    uid первого. Слово автора тогда искалось бы по ключу, которого оно
+    никогда не носило: на экране «автор: исправил» встало бы у чужой находки.
+    """
+    twin = _finding("одинаковая находка")
+    await _task(db, 69, "completed", 1)
+    await _report(db, 128, 69, 1, [twin, dict(twin)])
+    uids = finding_uids([twin, dict(twin)])
+    assert uids[0] != uids[1], "близнецы обязаны различаться порядковым номером"
+    # Первый близнец уже разобран — в очереди остаётся ТОЛЬКО второй.
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (128, 69, 1, 0, ?, 'fixed', 'denis')",
+        (uids[0],),
+    )
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=128,
+        task_id=69,
+        submission_generation=1,
+        finding_uid=uids[1],
+        finding_index=1,
+        finding_title=twin["title"],
+        outcome="wont_fix",
+        note="второй такой же",
+        linked_task_id=None,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    assert "автор: чинить не стал" in page, (
+        "слово автора о ВТОРОМ близнеце обязано найтись, хотя первый уже ушёл "
+        "из очереди"
+    )

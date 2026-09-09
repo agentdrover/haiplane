@@ -13,9 +13,9 @@
    на находку. Число у ссылки — сток этой категории за всё время, не выборка
    окна. #}
 <nav class="finding-categories muted">
-    <a href="/findings{% if project %}?project={{ project }}{% endif %}"{% if not category %} class="active"{% endif %}>все ({{ total }})</a>
+    <a href="/findings{% if project %}?project={{ project | urlencode }}{% endif %}"{% if not category %} class="active"{% endif %}>все ({{ total }})</a>
     {% for c in categories %}
-    <a href="/findings?category={{ c.category | urlencode }}{% if project %}&amp;project={{ project }}{% endif %}"{% if category == c.category %} class="active"{% endif %}>{{ c.category }} ({{ c.findings }})</a>
+    <a href="/findings?category={{ c.category | urlencode }}{% if project %}&amp;project={{ project | urlencode }}{% endif %}"{% if category == c.category %} class="active"{% endif %}>{{ c.category }} ({{ c.findings }})</a>
     {% endfor %}
 </nav>
 {% if category %}

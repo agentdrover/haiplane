@@ -1448,6 +1448,27 @@ def _findings_queue_groups(rows: list[Any]) -> list[dict[str, Any]]:
     return groups
 
 
+def _confirmed_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Полный список подтверждённых находок отчёта — материал для uid."""
+    try:
+        parsed = json.loads(review.get("findings_confirmed") or "[]")
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [f if isinstance(f, dict) else {} for f in parsed]
+
+
+def _author_said(row: dict[str, Any] | None) -> dict[str, str] | None:
+    if row is None:
+        return None
+    return {
+        "label": _AUTHOR_OUTCOME_LABELS.get(str(row["outcome"]), str(row["outcome"])),
+        "note": str(row.get("note") or ""),
+        "by": str(row.get("reported_by") or ""),
+    }
+
+
 async def _attach_queue_inputs(db, groups: list[dict[str, Any]]) -> None:
     """Оба ВХОДА рядом с находкой: факт касания и слово автора (#1171).
 
@@ -1456,34 +1477,35 @@ async def _attach_queue_inputs(db, groups: list[dict[str, Any]]) -> None:
     автора (#911) хранится в своей таблице и диспозицией не становится ни
     одним путём. Показаны вместе потому, что по одному их и так приходилось
     искать руками; подписаны порознь потому, что это разные вопросы.
+
+    uid считается по ПОЛНОМУ списку подтверждённых находок отчёта, а не по
+    тем строкам, которые очередь показывает сейчас. Очередь показывает
+    подмножество всегда — разобранное из неё уходит, а фильтр по категории
+    сужает её дальше, — и личность близнецов (одинаковые категория, файл,
+    заголовок и строка) различается порядковым номером ВНУТРИ отчёта (#1007).
+    Считать uid по обрезанному списку значило бы искать слово автора по
+    ключу, которого он никогда не носил.
     """
     for group in groups:
-        payload = [item["f"] for item in group["findings"]]
+        row = await repo.get_machine_review(db, int(group["review_id"]))
+        confirmed = _confirmed_findings(dict(row)) if row is not None else []
+        uids = finding_uids(confirmed)
         by_uid = await evidence_for_report(
             db,
             int(group["task_id"]),
-            payload,
+            confirmed,
             generation=int(group["generation"]),
         )
         author = {
             str(dict(r)["finding_uid"]): dict(r)
             for r in await repo.list_finding_outcomes(db, int(group["review_id"]))
         }
-        for item, uid in zip(group["findings"], finding_uids(payload), strict=True):
-            item["evidence"] = by_uid.get(uid)
+        for item in group["findings"]:
+            index = int(item["index"])
+            uid = uids[index] if index < len(uids) else ""
             item["uid"] = uid
-            said = author.get(uid)
-            item["author"] = (
-                {
-                    "label": _AUTHOR_OUTCOME_LABELS.get(
-                        str(said["outcome"]), str(said["outcome"])
-                    ),
-                    "note": str(said.get("note") or ""),
-                    "by": str(said.get("reported_by") or ""),
-                }
-                if said
-                else None
-            )
+            item["evidence"] = by_uid.get(uid)
+            item["author"] = _author_said(author.get(uid))
 
 
 @router.get("/findings", response_class=HTMLResponse)
