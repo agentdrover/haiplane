@@ -33,6 +33,16 @@
    потому что он длинный, а не потому что второстепенный. #}
 {% macro publish_block(view) %}
 <div class="skill-publish">
+    {# Записи о публикации нет вовсе — не «дифа в записи нет», а «записи нет».
+       Ветка стоит первой и уходит из макроса сразу: показывать по ней «что
+       было опубликовано», сводку и вердикт нечего, а рисовать вокруг пустоты
+       разметку значит намекать на сведения, которых нет. #}
+    {% if view.diff.baseline == baseline_no_record %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">записи о публикации нет</span>
+        {{ view.diff.note }}
+    </p>
+    {% else %}
     <p class="skill-publish-when small muted">
         {% if view.when == 'before' %}Что изменится, если активировать эту версию — до нажатия
         {% else %}Что было опубликовано — по записи события в момент публикации{% endif %}
@@ -82,6 +92,7 @@
         <summary class="project-edit-summary">Показать unified diff</summary>
         <pre class="u-pre-wrap skill-diff">{{ view.unified }}</pre>
     </details>
+    {% endif %}
     {% endif %}
 </div>
 {% endmacro %}

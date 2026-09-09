@@ -1652,6 +1652,23 @@ async def _skill_publish_views(
             _db(request), name, version.version
         )
         if recorded is None:
+            # Записи нет вовсе — и это не повод показать пустое место. Ровно
+            # так выглядят обе версии реестра хаба в день выката: сид до #1169
+            # не писал ``skill_activated``, а сид case 1 (активный текст уже
+            # совпадает с константой) события задним числом не допишет. Пустой
+            # блок читается и как «ничего не менялось», и как «блок не
+            # построился»; отсутствие записи надо назвать словами — тем же
+            # приёмом, каким уже названы «дифа в записи нет» и «вердикта в
+            # записи нет» (#1169, находка ревью #327).
+            views[version.version] = {
+                "when": "after",
+                "diff": {
+                    "baseline": skill_publish.BASELINE_NO_RECORD,
+                    "note": skill_publish.BASELINE_NO_RECORD_NOTE,
+                },
+                "unified": "",
+                "scan": {"rules_triggered": None, "note": ""},
+            }
             continue
         diff = _recorded_diff(recorded)
         recorded_baseline = diff.get("baseline_version")
@@ -1742,6 +1759,7 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
             ),
             "baseline_absent": skill_publish.BASELINE_ABSENT,
             "baseline_unrecorded": skill_publish.BASELINE_UNRECORDED,
+            "baseline_no_record": skill_publish.BASELINE_NO_RECORD,
             "skill_error": skill_error,
         },
     )

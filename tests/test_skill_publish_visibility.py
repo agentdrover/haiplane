@@ -219,6 +219,69 @@ async def test_a_record_without_a_diff_says_so_instead_of_drawing_zeroes(
     )
 
 
+async def test_an_empty_verdict_says_no_rule_fired_not_that_it_was_checked(
+    client: AsyncClient, db
+):
+    """Пустой перечень назван словами — иначе он неотличим от «не считали».
+
+    Это обратная половина теста выше, и до сих пор её держала только
+    ОТРИЦАТЕЛЬНАЯ проверка: «Сработавших правил нет» не должно быть там, где
+    вердикта нет. Что эта строка ЕСТЬ там, где вердикт есть и пуст, не
+    требовал никто — замена её на «Проверено.» переживала весь файл (измерено
+    мутацией, находка ревью #327). Разница между двумя строками и есть предмет
+    задачи: «ни одно правило не совпало» — факт о прогоне скана, «проверено» —
+    утверждение о безопасности, которого стартовый набор не делает.
+    """
+    await _install(db, "quiet-skill", [(1, OLD, "active", "denis", "denis")])
+    await _record_publication(db, "quiet-skill", version=1, baseline_version=None)
+
+    page = (await client.get("/skills/quiet-skill")).text
+    # Абзац целиком, а не подстрока: проверяется именно ЧТО написано на месте
+    # пустого перечня. Подстрока пережила бы дописывание к ней чего угодно, а
+    # замена абзаца — то, чем эта ветка и ломается.
+    assert (
+        '<p class="skill-scan-empty small muted">Сработавших правил нет.</p>' in page
+    ), "пустой вердикт обязан быть назван, а не показан пустым местом"
+    assert "Вердикта в записи нет" not in page, (
+        "пустой перечень — не отсутствующий вердикт"
+    )
+    assert skill_publish.SCAN_NOTE in page, (
+        "оговорка едет вместе с пустым перечнем, а не вместо него: без неё "
+        "«сработавших правил нет» читается как «проверено»"
+    )
+
+
+async def test_an_active_version_with_no_record_at_all_says_so(client: AsyncClient, db):
+    """Записи нет вовсе — и это сказано, а не показано пустым местом.
+
+    Популяция не гипотетическая, а ровно та, что лежит на проде в день
+    выката: сид до #1169 не писал ``skill_activated``, поэтому обе версии
+    реестра хаба активны без единого события, а сид case 1 (активный текст
+    уже совпадает с константой) события задним числом не допишет. До правки
+    ветка `recorded is None` просто пропускала версию, и человек видел пустое
+    место — одинаково читаемое как «ничего не менялось» и как «блок не
+    построился» (находка ревью #327).
+
+    Ретро-расчёта здесь нет и быть не должно: диф к неизвестному основанию —
+    это выдумка, а не сведения. Названо ровно то, что известно: записи нет.
+    """
+    await _install(db, "unrecorded-skill", [(1, OLD, "active", "seed", "seed")])
+    events_before = await _events(db, "unrecorded-skill")
+    assert events_before == [], "предпосылка ветки: события о публикации нет"
+
+    page = (await client.get("/skills/unrecorded-skill")).text
+    assert "записи о публикации нет" in page, (
+        "отсутствие записи названо словами, а не оставлено пустым местом"
+    )
+    assert skill_publish.BASELINE_NO_RECORD_NOTE in page
+    assert "дифа в записи нет" not in page, (
+        "«записи нет» и «в записи нет дифа» — разные состояния: во втором запись есть"
+    )
+    assert "К активной версии" not in page and "Сработавших правил нет" not in page, (
+        "по отсутствующей записи не показывается ни сводка, ни вердикт"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC-2 — путь 1: человек создаёт версию сразу активной
 # ---------------------------------------------------------------------------
@@ -340,6 +403,49 @@ async def test_seed_into_an_empty_library_records_the_first_publication(
         assert len(await _events(db, name)) == 1, (
             "сид зовётся на каждом коннекте — холостой прогон молчит и здесь"
         )
+
+
+async def test_seed_case_two_records_nothing_when_a_person_holds_active(
+    db: aiosqlite.Connection,
+):
+    """Сид положил драфт рядом — но не опубликовал, и говорить обратное нечего.
+
+    Case 2: активную версию держит ЧЕЛОВЕК, константа сида другая. Сид тогда
+    ничего не публикует — он кладёт свой текст драфтом и уходит, потому что
+    правило #380 запрещает переписывать опубликованное человеком. Раздаваемый
+    агентам текст не меняется, а значит событию взяться неоткуда.
+
+    Канонические тесты этой ветки (``test_operator_edit_is_never_overwritten``,
+    ``test_human_activation_of_a_seeded_draft_is_respected``) считают
+    раздаваемый текст и наличие драфта, но не события; тесты пути 3 в этом
+    файле заходят в case 3 и проверяют событие на РЕАЛЬНОЙ смене. Ноль событий
+    там, где менять нечего, не требовал никто: вставка ``_record_seed_activation``
+    в эту ветку переживала 377 тестов (измерено мутацией, находка ревью #327).
+    Цена ложной записи прямая — в фиде появляется публикация версии, которую
+    агенты не читают.
+    """
+    await _install(db, "multi-agent-review", [(1, OLD, "active", "denis", "denis")])
+    await seed_default_skills(db)
+
+    rows = await fetchall(
+        db,
+        "SELECT version, status FROM skills WHERE name='multi-agent-review' "
+        "ORDER BY version",
+    )
+    assert [(int(r["version"]), str(r["status"])) for r in rows] == [
+        (1, "active"),
+        (2, "draft"),
+    ], "предпосылка case 2: текст человека остаётся активным, наш ждёт драфтом"
+
+    assert await _events(db, "multi-agent-review") == [], (
+        "сид ничего не опубликовал — раздаваемый агентам текст тот же, "
+        "и записи о публикации быть не должно"
+    )
+
+    await seed_default_skills(db)
+    assert await _events(db, "multi-agent-review") == [], (
+        "сид зовётся на каждом коннекте: молчание держится и на повторе"
+    )
 
 
 async def test_seed_publishes_text_that_triggers_rules_without_blocking(
@@ -501,6 +607,25 @@ async def test_absent_baseline_is_its_own_state(client: AsyncClient, db):
         "UI обязан назвать отсутствие основания, а не показать пустое место"
     )
     assert "Activate v1" in page, "предпосылка: кнопка активации на месте"
+
+    # И в СОБЫТИИ пути 2 — то есть после нажатия этой самой кнопки. AC-4
+    # требует состояние «сравнивать не с чем» на ЛЮБОМ из трёх путей, а
+    # проверялось оно в событии только на пути 1 и в сиде; путь 2 держался
+    # общим кодом, а не наблюдением. Мутация ``get_active_skill(...) or row``
+    # в ``api_activate_skill`` — то есть версия становится основанием самой
+    # себе — переживала 364 теста, подменяя честное «сравнивать не с чем» на
+    # правдоподобное «+0/−0 к v1» (находка ревью #327).
+    activated = await client.patch("/api/skills/draft-only/versions/1/activate")
+    assert activated.status_code == 200, activated.text
+    published = await _events(db, "draft-only")
+    assert len(published) == 1
+    assert published[0]["diff"]["baseline"] == skill_publish.BASELINE_ABSENT, (
+        "активной версии не было — событие пути 2 обязано сказать это тем же "
+        "состоянием, что и путь 1, а не дифом версии к самой себе"
+    )
+    assert published[0]["diff"]["baseline_version"] is None
+    assert published[0]["diff"]["added_lines"] is None
+    assert published[0]["diff"]["removed_lines"] is None
 
 
 async def test_summary_counts_lines_that_look_like_diff_headers():
@@ -703,9 +828,17 @@ async def test_verdict_never_blocks_on_any_of_three_paths(client: AsyncClient, d
 
     events = await _events(db, "loud")
     assert len(events) == 2
-    assert all(e["content_scan"]["rules_triggered"] for e in events), (
-        "вердикт записан на обоих путях — он именно показан, а не применён"
-    )
+    # Не «список непуст», а ИМЕНА всех сработавших правил. Вердикт заведён
+    # затем, чтобы указать место внутри дифа, — усечённый перечень уводит
+    # взгляд мимо остальных мест и при этом выглядит вердиктом. Проверка на
+    # truthy этого не видела: усечение перечня до первого правила в
+    # ``api_activate_skill`` переживало 364 теста (измерено мутацией, находка
+    # ревью #327). Путь 3 полный набор уже требовал, пути 1 и 2 — нет.
+    expected = {r.name for r in skill_publish.RULES}
+    for path, event in zip(("создание человеком", "активация драфта"), events):
+        assert {h["rule"] for h in event["content_scan"]["rules_triggered"]} == (
+            expected
+        ), f"вердикт пути «{path}» записан целиком — он показан, а не применён"
 
 
 # ---------------------------------------------------------------------------
