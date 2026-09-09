@@ -843,6 +843,9 @@ def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) ->
 
 HISTORICAL_NO_SHA = "no_submission_sha"
 HISTORICAL_SHA_UNRESOLVED = "sha_unresolved"
+#: Вердикт по генерации, чей коммит задача уже не помнит: поле одно на
+#: задачу, и пересдача его перезаписывает.
+HISTORICAL_SHA_OTHER_GENERATION = "sha_other_generation"
 HISTORICAL_NO_WORKSPACE = "no_workspace"
 HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
 # Факты, которые сегодняшнее состояние мира восстановить не может в принципе:
@@ -980,6 +983,18 @@ async def build_historical_packet(
     if row is None:
         raise CorpusExclusion("no_task", f"задачи #{task_id} нет")
     task = dict(row)
+    # Задача хранит sha ПОСЛЕДНЕЙ сдачи, а не каждой. Если человек судил
+    # вторую генерацию, а после неё была третья, закреплённый коммит уже про
+    # другой код — и пакет описывал бы не то, о чём был вердикт. Это не
+    # «неточность», а та же утечка будущего, только через поле задачи, и
+    # лечится она так же: сдача выбывает из корпуса с названной причиной.
+    current = int(task.get("submission_generation") or 0)
+    if current != int(generation):
+        raise CorpusExclusion(
+            HISTORICAL_SHA_OTHER_GENERATION,
+            f"закреплён коммит генерации {current}, судится {generation} — "
+            "sha этой сдачи не сохранён",
+        )
     pinned_sha = (task.get("submission_sha") or "").strip()
     if not pinned_sha:
         raise CorpusExclusion(HISTORICAL_NO_SHA, "сдача не закрепила коммит")

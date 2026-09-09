@@ -1701,6 +1701,17 @@ async def test_historical_packet_rebuilt_from_sha_not_branch(
         await build_historical_packet(db, task_id, 1, cutoff)
     assert gone.value.reason == "sha_unresolved"
 
+    # И третий выход: задача пересдана, поле submission_sha перезаписано, и
+    # закреплённый коммит уже про ДРУГОЙ код. Судить по нему вердикт о
+    # первой генерации — та же утечка будущего, только через поле задачи.
+    monkeypatch.setattr(plugins, "git_ops", git)
+    await repo.update_task(
+        db, task_id, submission_generation=2, submission_sha="d" * 40
+    )
+    with pytest.raises(CorpusExclusion) as stale:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert stale.value.reason == "sha_other_generation"
+
 
 async def test_historical_rows_do_not_clear_act_refusals(db: aiosqlite.Connection):
     """#1167 AC-4: сколько ни залей истории — sample_too_small остаётся.
