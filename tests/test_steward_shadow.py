@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -1993,3 +1993,257 @@ async def test_replay_without_policy_uses_the_live_token_budget(
     report = sh.replay(cases, excluded=excluded)
     assert dict(report.reasons).get("report_token_budget") == 1
     assert report.table.both_approve == 0
+# Восстановление захвата, оставленного мёртвым процессом (#1195)
+# ---------------------------------------------------------------------------
+#
+# Измерено на #1190: заказ размещён в 08:49:05 UTC, служба перезапущена в
+# 08:49:07, одноразовый код обменян в 08:49:20 — агент у провайдера создан и
+# оплачен. Строка осталась с agent_id='pending:6', и выборка исполнителя,
+# отбирающая по agent_id='', не видела её никогда.
+
+
+async def _claimed(db: aiosqlite.Connection, run_id: int) -> None:
+    """Захват ровно в той форме, в какой его ставит start_run."""
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=? WHERE id=?",
+        (f"{sh.PENDING_PREFIX}{run_id}", run_id),
+    )
+    await db.commit()
+
+
+async def test_a_claim_from_a_dead_process_is_recovered_at_startup(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1195 AC-1: метка снята, и ближайший тик стартует заказ как обычный.
+
+    Проверяется не «снялась ли метка», а то, ради чего она снимается:
+    поколение получает назад свой единственный слот. Поэтому после
+    восстановления здесь идёт настоящий start_due_runs — без него тест
+    подтвердил бы косметику.
+    """
+    project_id = await _project(db, "shadow-recover")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    assert await sh.recover_dead_process_claims(db) == 1
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ):
+        assert await start_due_runs(db) == 1
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN
+    assert run["agent_id"] == "agent-1", "заказ вернулся в работу и стартовал"
+
+
+async def test_the_recovery_names_the_orphan_risk(db: aiosqlite.Connection):
+    """#1195 AC-2: событие называет риск, а не только факт снятия метки.
+
+    Тихое восстановление прячет оплаченного агента ровно так же, как прятала
+    метка. На #1190 агент был не гипотетическим: сверка выдачи провайдера
+    нашла bc-953df24a, созданного в 08:49:06Z с живым допуском на два часа, о
+    котором хаб не знает ничего.
+    """
+    project_id = await _project(db, "shadow-recover-event")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    await sh.recover_dead_process_claims(db)
+
+    events = await _events(db, sh.EVENT_CLAIM_RECOVERED)
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["run_id"] == order["id"], "заказ назван номером"
+    assert payload["generation"] == 1
+    assert payload["orphan_risk"] is True
+    detail = payload["detail"]
+    assert "оплачен" in detail, "риск оплаченного агента назван словами"
+    assert "идентификатор" in detail, "и сказано, что его не сопоставить"
+
+
+async def test_recovery_never_reopens_a_closed_order(db: aiosqlite.Connection):
+    """#1195 AC-3: закрытый заказ не оживает — ни один вид закрытия.
+
+    На ВСЕ виды сразу, а не на один: восстановление возвращает в работу
+    недоделанное, и «недоделанное» здесь — это статус, а не форма метки.
+    Проверка на одном виде закрытия пропустила бы остальные четыре, а
+    оживший superseded позвал бы судью к вопросу, на который уже ответили.
+    """
+    from hub.services.steward_dispatch import RUN_JUDGED, RUN_SUPERSEDED
+
+    project_id = await _project(db, "shadow-recover-closed")
+    closed_statuses = [
+        RUN_JUDGED,
+        RUN_TIMEOUT,
+        RUN_SUPERSEDED,
+        RUN_REFUSED,
+        RUN_NEVER_STARTED,
+    ]
+    orders = []
+    for index, status in enumerate(closed_statuses):
+        task_id = await _task(db, project_id)
+        order = await order_run(db, task_id, 1)
+        assert order is not None
+        await _claimed(db, order["id"])
+        await db.execute(
+            "UPDATE steward_runs SET status=? WHERE id=?", (status, order["id"])
+        )
+        await db.commit()
+        orders.append((order["id"], status))
+
+    assert await sh.recover_dead_process_claims(db) == 0
+
+    for run_id, status in orders:
+        rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run_id,))
+        row = dict(rows[0])
+        assert row["status"] == status, f"{status} не должен был ожить"
+        assert row["agent_id"].startswith(sh.PENDING_PREFIX), (
+            f"метка закрытого заказа ({status}) не трогается"
+        )
+    assert await _events(db, sh.EVENT_CLAIM_RECOVERED) == []
+
+
+async def test_startup_actually_runs_the_recovery():
+    """#1195: восстановление зовёт ПОДЪЁМ, а не только тест.
+
+    Отдельным тестом и через НАСТОЯЩИЙ lifespan, потому что три AC выше
+    проходят и на функции, которую никто не вызывает: они зовут её сами.
+    Признак задачи — старт процесса, и непроверенный крючок сделал бы всю
+    работу мёртвым кодом.
+
+    Заодно проверяется порядок: восстановление до поллера. Метка, снятая
+    после первого тика, стоила бы поколению ещё одного круга ожидания.
+    """
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from hub.db import _SCHEMA, _migrate
+
+    @asynccontextmanager
+    async def _noop_lifespan(_app):
+        yield
+
+    order: list[str] = []
+
+    async def _spy(_conn):
+        order.append("recovery")
+        return 0
+
+    def _poller(_app):
+        order.append("poller")
+        # MagicMock, а не AsyncMock: lifespan на выходе зовёт poll_task.cancel(),
+        # и вызванный AsyncMock оставил бы неожиданную корутину.
+        return MagicMock()
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.executescript(_SCHEMA)
+    await _migrate(conn)
+
+    from hub.app import app, lifespan
+
+    with (
+        patch("hub.app.get_db", AsyncMock(return_value=conn)),
+        patch("hub.app.start_poller", _poller),
+        patch(
+            "hub.app._mcp_streamable_app",
+            SimpleNamespace(router=SimpleNamespace(lifespan_context=_noop_lifespan)),
+        ),
+        patch.object(sh, "recover_dead_process_claims", _spy),
+    ):
+        async with lifespan(app):
+            pass
+
+    assert order == ["recovery", "poller"], (
+        "восстановление зовётся при подъёме и ДО поллера"
+    )
+
+
+async def test_a_failed_recovery_does_not_hold_the_write_lock(
+    db: aiosqlite.Connection,
+):
+    """#1195 (ревью #304): сбой на полпути не оставляет открытую транзакцию.
+
+    Соединение подъёма живёт весь процесс, а isolation_level="IMMEDIATE"
+    (#1065) открывает write-транзакцию на первом же UPDATE. Если запись
+    события упадёт между UPDATE и commit, а откатить некому, то соединение
+    держит write-лок ВСЕЙ базы до перезапуска: поллер и обработчики ходят
+    своими соединениями и после busy_timeout получают «database is locked».
+    Восстановление, задуманное как best-effort сигнал, тогда останавливает
+    запись в хаб — цена сбоя больше, чем сам сбой. Поллер откатывает свой
+    хвост тика ровно от этого (hub/poller.py), здесь коммит один на пачку и
+    окно шире.
+
+    Проверяется наблюдаемое состояние соединения, а не текст лога.
+    """
+    project_id = await _project(db, "shadow-recover-rollback")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    boom = AsyncMock(side_effect=RuntimeError("лента событий недоступна"))
+    with patch.object(repo, "insert_event", boom):
+        with pytest.raises(RuntimeError):
+            await sh.recover_dead_process_claims(db)
+
+    assert not db.in_transaction, (
+        "сбой восстановления оставил открытую транзакцию: write-лок всей базы"
+    )
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],))
+    assert dict(rows[0])["agent_id"].startswith(sh.PENDING_PREFIX), (
+        "откат вернул метку: незаписанное восстановление не считается сделанным"
+    )
+
+
+async def test_a_recovery_that_recovers_nothing_does_not_hold_the_write_lock(
+    db: aiosqlite.Connection,
+):
+    """#1195 (ревью #305): нулевая жатва тоже закрывает транзакцию.
+
+    Соседний путь того же класса, что и сбойный. UPDATE, не сменивший ни
+    одной строки, всё равно открывает write-транзакцию: isolation_level=
+    "IMMEDIATE" (#1065) начинает её на ЛЮБОМ DML, а не на удачном. Если
+    гонка забрала все выбранные строки, recovered остаётся нулём — и коммит
+    за условием `if recovered` не выполняется. Тогда успешный, ничего не
+    нашедший подъём держал бы write-лок всей базы до перезапуска.
+
+    Гонка здесь настоящая, а не воображаемая: заказ закрывают между SELECT и
+    UPDATE — ровно та ветка, ради которой в коде стоит `rowcount != 1`.
+    Сосед по файлу (start_run) свой нулевой UPDATE откатывает сразу же.
+    """
+    from hub.services.steward_dispatch import RUN_SUPERSEDED
+
+    project_id = await _project(db, "shadow-recover-zero")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    real_fetchall = sh.fetchall
+
+    async def _closed_underneath(conn, sql, parameters=()):
+        rows = await real_fetchall(conn, sql, parameters)
+        # Вердикт пришёл раньше: слот закрыт после выборки, но до записи.
+        await conn.execute(
+            "UPDATE steward_runs SET status=? WHERE id=?",
+            (RUN_SUPERSEDED, order["id"]),
+        )
+        await conn.commit()
+        return rows
+
+    with patch.object(sh, "fetchall", _closed_underneath):
+        assert await sh.recover_dead_process_claims(db) == 0
+
+    assert not db.in_transaction, (
+        "подъём без единого восстановления оставил открытую транзакцию"
+    )
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],))
+    row = dict(rows[0])
+    assert row["status"] == RUN_SUPERSEDED, "закрытый заказ остался закрытым"
+    assert row["agent_id"].startswith(sh.PENDING_PREFIX), "метку никто не трогал"
