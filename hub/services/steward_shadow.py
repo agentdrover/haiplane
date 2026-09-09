@@ -1402,12 +1402,15 @@ async def collect_corpus(db: aiosqlite.Connection, days: int = 60) -> list[Corpu
         if task_row is None:
             continue
         task = dict(task_row)
-        review_row = await repo.get_latest_machine_review(db, row["task_id"])
-        review = dict(review_row) if review_row is not None else {}
+        # Отчёты ИМЕННО ЭТОЙ генерации, а не последний отчёт задачи: у
+        # возвращённой человеком работы почти всегда есть пересдача, и
+        # «последний» описывал бы другой код. Последний из своих — тот, что
+        # лежал на столе, когда человек решал (лестница #879 даёт два).
+        reviews = await repo.machine_reviews_of_generation(
+            db, row["task_id"], row["generation"]
+        )
+        review = dict(reviews[-1]) if reviews else {}
         review_id = review.get("id")
-        if (review.get("submission_generation") or 0) != row["generation"]:
-            review = {}
-            review_id = None
         entries.append(
             CorpusEntry(
                 task_id=row["task_id"],

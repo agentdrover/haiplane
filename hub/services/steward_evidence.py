@@ -195,6 +195,16 @@ async def _report_fact(
             f"последний отчёт покрывает генерацию {reported_generation}, "
             f"судится {generation}",
         )
+    return _report_present(review, generation)
+
+
+def _report_present(review: dict[str, Any], generation: int) -> EvidenceFact:
+    """Один отчёт, разложенный в факт. Общий для живого и исторического пути.
+
+    Вынесено ради одного: два места, раскладывающие один и тот же отчёт,
+    разъезжаются полем — и разъедется то, которого не хватит именно судье.
+    """
+    source = "machine_review_report"
     confirmed = _finding_dicts(review.get("findings_confirmed"))
     unresolved = _finding_dicts(review.get("unresolved"))
     rejected = _finding_dicts(review.get("findings_rejected"))
@@ -841,11 +851,11 @@ def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) ->
 # означает: судье показывают то же, что лежало на столе у человека, и ни
 # строкой больше.
 
-HISTORICAL_NO_SHA = "no_submission_sha"
 HISTORICAL_SHA_UNRESOLVED = "sha_unresolved"
-#: Вердикт по генерации, чей коммит задача уже не помнит: поле одно на
-#: задачу, и пересдача его перезаписывает.
-HISTORICAL_SHA_OTHER_GENERATION = "sha_other_generation"
+#: Коммит этой генерации не нашёлся НИГДЕ: ни строкой в леджере сдач, ни в
+#: поле задачи. Не «задача помнит другую генерацию» — леджер #880 помнит
+#: каждую, и вердикт по пересданной работе восстанавливается из него.
+HISTORICAL_SHA_UNRECORDED = "sha_unrecorded"
 HISTORICAL_NO_WORKSPACE = "no_workspace"
 HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
 # Факты, которые сегодняшнее состояние мира восстановить не может в принципе:
@@ -933,13 +943,32 @@ def assert_within(cutoff: str, provenance: list[tuple[str, str]]) -> None:
 async def _historical_report_fact(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> tuple[EvidenceFact, list[tuple[str, str]]]:
-    """Отчёт этой генерации плюс отметка времени для сторожа."""
-    fact = await _report_fact(db, task_id, generation)
-    if fact.is_absent:
-        return fact, []
-    row = await repo.get_latest_machine_review(db, task_id)
-    created = dict(row).get("created_at") if row is not None else ""
-    return fact, [("machine_review_report", created or "")]
+    """Отчёт ИМЕННО ЭТОЙ генерации плюс отметка времени для сторожа.
+
+    Живой путь спрашивает последний отчёт задачи и объявляет отсутствие,
+    когда тот покрывает другую генерацию: у живой сдачи последний отчёт и
+    есть отчёт о ней. В истории это не так. Задача, которую человек вернул,
+    почти всегда пересдана, у неё есть более поздние отчёты — и «последний»
+    вернул бы absent на каждой такой сдаче. Тогда корпус наполнился бы
+    эскалациями ровно там, где лежит вся его ценность.
+    """
+    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
+    if not rows:
+        return (
+            absent(
+                "machine_review_report",
+                NO_REPORT,
+                f"отчёта о генерации {generation} нет",
+            ),
+            [],
+        )
+    # Последний из отчётов ЭТОЙ генерации: лестница (#879) может дать два, и
+    # судили по тому, который лежал на столе последним.
+    review = dict(rows[-1])
+    return (
+        _report_present(review, generation),
+        [("machine_review_report", review.get("created_at") or "")],
+    )
 
 
 def _historical_tip_fact(pinned_sha: str) -> EvidenceFact:
@@ -963,6 +992,33 @@ def _historical_tip_fact(pinned_sha: str) -> EvidenceFact:
     )
 
 
+async def _generation_commit(
+    db: aiosqlite.Connection, task: dict[str, Any], generation: int
+) -> tuple[str, str]:
+    """Коммит и база ИМЕННО этой генерации: сначала леджер, потом поле задачи.
+
+    ``tasks.submission_sha`` — одно поле на задачу, и пересдача его
+    перезаписывает. Читать только его значило бы выбрасывать из корпуса
+    ровно те сдачи, ради которых он строится: человеческий возврат почти
+    всегда сопровождается пересдачей, и после неё поле описывает уже
+    следующий код.
+
+    Леджер сдач (#880) помнит каждую генерацию отдельно и пишется в той же
+    транзакции, что пинит поле, — тем же путём восстанавливает коммит
+    ``finding_evidence``. Поле задачи остаётся запасным ответом и годится
+    только когда генерация СОВПАДАЕТ: иначе это чужой код.
+    """
+    ledger = await repo.get_submission(db, int(task["id"]), int(generation))
+    if ledger is not None:
+        row = dict(ledger)
+        sha = (row.get("sha") or "").strip()
+        if sha:
+            return sha, (row.get("base_branch") or "").strip()
+    if int(task.get("submission_generation") or 0) == int(generation):
+        return (task.get("submission_sha") or "").strip(), ""
+    return "", ""
+
+
 async def build_historical_packet(
     db: aiosqlite.Connection,
     task_id: int,
@@ -983,21 +1039,14 @@ async def build_historical_packet(
     if row is None:
         raise CorpusExclusion("no_task", f"задачи #{task_id} нет")
     task = dict(row)
-    # Задача хранит sha ПОСЛЕДНЕЙ сдачи, а не каждой. Если человек судил
-    # вторую генерацию, а после неё была третья, закреплённый коммит уже про
-    # другой код — и пакет описывал бы не то, о чём был вердикт. Это не
-    # «неточность», а та же утечка будущего, только через поле задачи, и
-    # лечится она так же: сдача выбывает из корпуса с названной причиной.
-    current = int(task.get("submission_generation") or 0)
-    if current != int(generation):
-        raise CorpusExclusion(
-            HISTORICAL_SHA_OTHER_GENERATION,
-            f"закреплён коммит генерации {current}, судится {generation} — "
-            "sha этой сдачи не сохранён",
-        )
-    pinned_sha = (task.get("submission_sha") or "").strip()
+    pinned_sha, ledger_base = await _generation_commit(db, task, generation)
     if not pinned_sha:
-        raise CorpusExclusion(HISTORICAL_NO_SHA, "сдача не закрепила коммит")
+        raise CorpusExclusion(
+            HISTORICAL_SHA_UNRECORDED,
+            f"коммит генерации {generation} не записан ни в леджере сдач, "
+            f"ни в поле задачи (она помнит генерацию "
+            f"{int(task.get('submission_generation') or 0)})",
+        )
 
     ctx = await project_git_context(db, task_id)
     workspace = (ctx.get("repo") or "").strip()
@@ -1017,8 +1066,13 @@ async def build_historical_packet(
     # Дифф — ПО SHA, а не по имени ветки. ``branch_diff_paths`` резолвит и то
     # и другое одним резолвером (#1055), поэтому нового git-слоя здесь нет:
     # меняется аргумент, а не механизм.
+    # База — та, против которой сдачу и судили. Леджер записал её вместе с
+    # коммитом; сегодняшняя база проекта могла с тех пор смениться, и дифф
+    # против неё описывал бы не ту работу.
     diff_paths = await plugins.git_ops.branch_diff_paths(
-        pinned_sha, base_branch=ctx.get("base_branch"), repo=workspace
+        pinned_sha,
+        base_branch=ledger_base or ctx.get("base_branch"),
+        repo=workspace,
     )
     diff_reason = (
         "" if diff_paths is not None else f"дифф по {pinned_sha[:12]} не прочитать"

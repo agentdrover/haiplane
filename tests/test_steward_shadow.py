@@ -1701,16 +1701,77 @@ async def test_historical_packet_rebuilt_from_sha_not_branch(
         await build_historical_packet(db, task_id, 1, cutoff)
     assert gone.value.reason == "sha_unresolved"
 
-    # И третий выход: задача пересдана, поле submission_sha перезаписано, и
-    # закреплённый коммит уже про ДРУГОЙ код. Судить по нему вердикт о
-    # первой генерации — та же утечка будущего, только через поле задачи.
+    # Третий выход: коммит генерации не записан НИГДЕ. Не «задача помнит
+    # другую генерацию» — леджер сдач помнит каждую, и следующий тест это
+    # проверяет; сюда попадают только сдачи без единой записи о коммите.
     monkeypatch.setattr(plugins, "git_ops", git)
     await repo.update_task(
         db, task_id, submission_generation=2, submission_sha="d" * 40
     )
     with pytest.raises(CorpusExclusion) as stale:
         await build_historical_packet(db, task_id, 1, cutoff)
-    assert stale.value.reason == "sha_other_generation"
+    assert stale.value.reason == "sha_unrecorded"
+
+
+async def test_resubmitted_task_keeps_its_own_generation_sha(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: возврат человеком почти всегда влечёт пересдачу — и корпус
+    обязан пережить её, иначе он теряет ровно ту половину, ради которой
+    существует.
+
+    tasks.submission_sha — одно поле, пересдача его перезаписывает. Леджер
+    сдач (#880) помнит каждую генерацию, и коммит берётся оттуда: тем же
+    путём восстанавливает sha finding_evidence. Тест ведёт сдачу через
+    collect_corpus → build_cases, а не только через сборщик: подмена
+    аргумента в проводке вернула бы утечку при зелёном юните.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-resubmit")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+
+    # Леджер помнит коммит первой генерации; задача уже пересдана и помнит
+    # третий, а второй сдачи не было вовсе.
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'develop')",
+        (task_id, _SHA),
+    )
+    await repo.update_task(
+        db, task_id, submission_generation=3, submission_sha="e" * 40
+    )
+    # И у пересдачи есть свой, более поздний отчёт. «Последний отчёт задачи»
+    # описывал бы именно его — то есть другой код.
+    later = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=3,
+        model="grok-4.6",
+        raw_count=9,
+        findings_confirmed='[{"title": "находка о другом коде"}]',
+    )
+    await db.commit()
+
+    entries = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+
+    assert excluded == [], f"сдача выброшена зря: {excluded}"
+    assert len(cases) == 1
+    # Механизм зафиксирован ЧИСЛАМИ, а не отсутствием исключения: дифф
+    # спрошен по коммиту ПЕРВОЙ генерации, и отчёт взят её же, а не поздний.
+    assert git.asked == [_SHA]
+    report = cases[0].packet.fact("machine_review_report")
+    assert report.is_present, "отчёт своей генерации потерян — корпус выродится"
+    assert report.value["review_id"] != later
+    assert report.value["generation"] == 1
+    assert cases[0].packet.fact("branch_tip").value["tip"] == _SHA
+    # И решение по такой сдаче — настоящее, а не эскалация-артефакт.
+    report_only = sh.replay(cases, excluded=excluded)
+    assert report_only.table.escalated == 0
+    assert report_only.table.both_approve == 1
 
 
 async def test_historical_rows_do_not_clear_act_refusals(db: aiosqlite.Connection):
